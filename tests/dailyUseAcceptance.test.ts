@@ -89,9 +89,17 @@ describe("DailyUseAcceptanceV1", () => {
     assert.equal(contract.requestedArtifacts.includes("linear:project"), false);
     assert.equal(contract.requiredProofs.includes("linear:hierarchy_readback"), false);
     assert.ok(DAILY_USE_ACCEPTANCE_V1["DU-06"].requestedArtifacts.includes("linear:initiative"));
-    // Unattended set-loose: no approval stops, and cleanup runs after the
-    // acceptance record, so both stay empty rather than being asserted unseen.
-    assert.deepEqual(contract.approvalBoundaries, []);
+    // Set-loose still pauses for the exact prepared Linear mutation. GitHub
+    // creation is private-only and guarded separately; cleanup runs after the
+    // acceptance record, so cleanup stays empty rather than being asserted unseen.
+    assert.deepEqual(
+      contract.approvalBoundaries,
+      ["approval:linear_issue_create"],
+    );
+    assert.deepEqual(
+      contract.approvalBoundaries,
+      FLOW_REAL_01_ACCEPTANCE_TOKENS.approvals,
+    );
     assert.deepEqual(contract.cleanupObligations, []);
     assert.deepEqual(contract.requestedArtifacts, FLOW_REAL_01_ACCEPTANCE_TOKENS.artifacts);
     assert.deepEqual(contract.requiredProofs, FLOW_REAL_01_ACCEPTANCE_TOKENS.proofs);

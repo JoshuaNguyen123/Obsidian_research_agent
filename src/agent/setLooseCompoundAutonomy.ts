@@ -1,6 +1,8 @@
 /**
- * Set-loose compound autonomy: Bound Linear/code/GitHub without Chat grants,
- * stage time budgets, 100k context floor, and raised vault semantic caps.
+ * Set-loose compound autonomy: Bound local-code/private-GitHub work may use
+ * scoped automatic authority, while Linear mutations retain an exact prepared
+ * preview/approval. Also owns stage budgets, the 100k context floor, and raised
+ * vault semantic caps.
  */
 
 import {
@@ -21,12 +23,14 @@ import {
   PROJECT_LIFECYCLE_STAGES,
   type ProjectLifecycleStageV1,
 } from "./projectLifecycle";
-import { REPORT_PROGRESS_TO_LINEAR_TOOL_NAME } from "../tools/reportProgressToLinearTool";
 import { parseAcceptedResearchArtifactV1 } from "../integrations/linear/AcceptedResearchArtifactV1";
 import { parseExternalWorkItemBindingV1 } from "../integrations/linear/ExternalWorkItemBindingV1";
 import { parseWorkItemLineageV1 } from "../integrations/linear/WorkItemLineageV1";
 import { parseRenderedCompatibleWorkItemSpec } from "../integrations/linear/WorkItemParser";
 import { resolveExplicitRepositoryVisibilityChoiceV1 } from "../integrations/github/RepositoryVisibility";
+import { hasMeaningfulReflectionContentV1 } from "../../packages/core-api/src/reflectionContentV1";
+import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
+import { hasJupyterReflectionIntentV1 } from "./jupyterReflectionIntent";
 
 export type { BundledStageGrantV1 };
 export { boundMayAutoUnderBundledGrant };
@@ -36,7 +40,9 @@ export const SET_LOOSE_DELIVERY_STAGES = [
   "accepted_research",
   "linear_hierarchy",
   "code_execution",
+  "code_validation",
   "private_github_publication",
+  "reflection",
 ] as const satisfies readonly ProjectLifecycleStageV1[];
 
 const RECONCILIATION_CLEANUP_TOOLS = new Set<string>(
@@ -57,6 +63,15 @@ const STAGE_PAID_LINEAR_HIERARCHY = new Set<string>([
 
 /** Successful tools that pay `code_execution`. */
 const STAGE_PAID_CODE_EXECUTION = new Set<string>([
+  "code_workspace_create_file",
+  "code_workspace_append",
+  "code_workspace_patch",
+  "code_workspace_write_expected",
+  "code_workspace_export_directory",
+]);
+
+/** Successful verified commit closes the separate validation stage. */
+const STAGE_PAID_CODE_VALIDATION = new Set<string>([
   "code_commit_verified",
 ]);
 
@@ -69,6 +84,23 @@ const STAGE_PAID_PRIVATE_GITHUB = new Set<string>([
   "github_create_private_repository",
   "github_publish_verified_branch",
   "publish_verified_code_to_github",
+]);
+
+/**
+ * Linear mutations always keep their exact prepared preview/approval boundary.
+ * A family-level bundle or Automatic mode is not specific enough to authorize
+ * provider-visible ticket content.
+ */
+export const LINEAR_MUTATION_TOOL_NAMES_REQUIRING_EXACT_APPROVAL = new Set<string>([
+  "publish_research_to_linear",
+  "publish_research_project_to_linear",
+  "linear_create_issue",
+  "linear_update_issue",
+]);
+
+const STAGE_PAID_REFLECTION = new Set<string>([
+  "append_jupyter_reflection",
+  "write_project_results",
 ]);
 
 /** Bound tools that may auto-run under set-loose automatic (not Hard). */
@@ -134,6 +166,15 @@ export function boundMayAutoWithoutGrant(input: {
   if (!isSetLooseEnabled(input)) return false;
   const toolName = input.toolName.trim();
   if (!toolName) return false;
+  if (
+    toolName === "append_jupyter_reflection" &&
+    !hasJupyterReflectionIntentV1(input.currentPrompt ?? "")
+  ) {
+    return false;
+  }
+  if (LINEAR_MUTATION_TOOL_NAMES_REQUIRING_EXACT_APPROVAL.has(toolName)) {
+    return false;
+  }
   if (publicGitHubMutationRequiresInteractiveApprovalV1(input)) return false;
   // Hard (trash/delete/merge/cleanup) never auto under set-loose.
   if (effectClassForTool(toolName) === "hard") return false;
@@ -161,6 +202,19 @@ export function boundMayAutoWithoutChatGrant(input: {
   toolArguments?: Readonly<Record<string, unknown>>;
 }): boolean {
   if (effectClassForTool(input.toolName) === "hard") return false;
+  if (
+    input.toolName.trim() === "append_jupyter_reflection" &&
+    !hasJupyterReflectionIntentV1(input.currentPrompt ?? "")
+  ) {
+    return false;
+  }
+  if (
+    LINEAR_MUTATION_TOOL_NAMES_REQUIRING_EXACT_APPROVAL.has(
+      input.toolName.trim(),
+    )
+  ) {
+    return false;
+  }
   if (publicGitHubMutationRequiresInteractiveApprovalV1(input)) return false;
   if (
     boundMayAutoUnderBundledGrant({
@@ -629,9 +683,11 @@ export function lifecycleStagePaidBySuccessfulTool(input: {
   if (STAGE_PAID_ACCEPTED_RESEARCH.has(toolName)) return "accepted_research";
   if (STAGE_PAID_LINEAR_HIERARCHY.has(toolName)) return "linear_hierarchy";
   if (STAGE_PAID_CODE_EXECUTION.has(toolName)) return "code_execution";
+  if (STAGE_PAID_CODE_VALIDATION.has(toolName)) return "code_validation";
   if (STAGE_PAID_PRIVATE_GITHUB.has(toolName)) {
     return "private_github_publication";
   }
+  if (STAGE_PAID_REFLECTION.has(toolName)) return "reflection";
   return null;
 }
 
@@ -657,6 +713,8 @@ export type SetLooseDeliveryProofsV1 = {
   acceptedResearchPublication?: boolean;
   linearIssueUrlOrId?: boolean;
   codeWorkspaceReadback?: boolean;
+  codeImplementationReadback?: boolean;
+  codeValidationAndCommit?: boolean;
   githubPrivateRepoOrPrUrl?: boolean;
   noteReflectionWithMarkers?: boolean;
 };
@@ -1055,10 +1113,34 @@ export function isCompletedAcceptedResearchPublicationReceipt(
 /** Exact cross-system markers required before final set-loose note reflection pays. */
 export function hasCompleteSetLooseNoteReflectionProof(text: string): boolean {
   return (
+    hasMeaningfulReflectionContentV1(text) &&
     /\b(?:FLOW_REAL|COMPOUND|BYOK_AUTONOMOUS)_[A-Za-z0-9_]+\b/u.test(text) &&
     /https:\/\/linear\.app\/[^\s)\]"'<>]+/iu.test(text) &&
-    /https:\/\/github\.com\/[^\s)\]"'<>]+\/pull\/\d+/iu.test(text)
+    /https:\/\/github\.com\/[^\s)\]"'<>]+\/pull\/\d+/iu.test(text) &&
+    /### Verified code example/iu.test(text) &&
+    /at commit `(?:[0-9a-f]{12}|[0-9a-f]{40}|[0-9a-f]{64})` \(file hash `[0-9a-f]{12}`; excerpt hash `sha256:[0-9a-f]{64}`\)/iu.test(text) &&
+    hasExactVerifiedCodeExampleExcerptHashes(text)
   );
+}
+
+/**
+ * Require every rendered example to carry the exact hash of its fenced bytes.
+ * The metadata hash is host-provided; recomputing it here prevents an arbitrary
+ * hash-shaped string from paying the terminal reflection proof.
+ */
+function hasExactVerifiedCodeExampleExcerptHashes(text: string): boolean {
+  const headerCount = (text.match(/^### Verified code example\s*$/gimu) ?? []).length;
+  if (headerCount === 0) return false;
+
+  const renderedExample = /^### Verified code example\s*\r?\n[^\r\n]*?excerpt hash `(sha256:[0-9a-f]{64})`\)\.\s*\r?\n(`{3,})[^\r\n]*\r?\n([^]*?)\r?\n\2(?=\r?\n|$)/gimu;
+  let verifiedCount = 0;
+  for (const match of text.matchAll(renderedExample)) {
+    const expected = match[1];
+    const code = match[3] ?? "";
+    if (expected !== `sha256:${portableSha256Text(code)}`) return false;
+    verifiedCount += 1;
+  }
+  return verifiedCount === headerCount;
 }
 
 /**
@@ -1099,6 +1181,10 @@ export function applySetLooseDeliveryProofFromSuccessfulTool(input: {
   if (toolName === "code_commit_verified") {
     // Code delivery requires a verified commit, not a mere workspace read.
     next.codeWorkspaceReadback = true;
+    next.codeValidationAndCommit = true;
+  }
+  if (STAGE_PAID_CODE_EXECUTION.has(toolName)) {
+    next.codeImplementationReadback = true;
   }
   // Draft PR URL evidence only — create-only repo and publish-without-PR must not pay.
   const pullRequestUrl =
@@ -1137,7 +1223,18 @@ export function applySetLooseDeliveryProofFromSuccessfulTool(input: {
   if (
     (toolName === "append_to_current_file" ||
       toolName === "replace_current_file") &&
+    outputRecord?.kind === "verified_reflection_writeback" &&
+    outputRecord?.readbackVerified === true &&
+    (outputRecord?.status === "committed" ||
+      outputRecord?.status === "already_applied") &&
     hasCompleteSetLooseNoteReflectionProof(combinedText)
+  ) {
+    next.noteReflectionWithMarkers = true;
+  }
+  if (
+    (toolName === "write_project_results" ||
+      toolName === "append_jupyter_reflection") &&
+    outputRecord?.readbackVerified === true
   ) {
     next.noteReflectionWithMarkers = true;
   }
@@ -1196,6 +1293,17 @@ export function seedSetLooseDeliveryStateFromReceipts(
     ) {
       proofs.linearIssueUrlOrId = true;
     }
+    if (
+      (toolName === "write_project_results" ||
+        toolName === "append_jupyter_reflection") &&
+      resourceSystem === "vault" &&
+      receipt.readback?.status === "verified" &&
+      typeof receipt.path === "string" &&
+      (receipt.path.toLowerCase().endsWith(".md") ||
+        receipt.path.toLowerCase().endsWith(".ipynb"))
+    ) {
+      proofs.noteReflectionWithMarkers = true;
+    }
   }
   return {
     paidStages: [...paidStages],
@@ -1228,9 +1336,18 @@ export function setLooseDeliveryComplete(input: {
   }
   if (
     planStages.has("code_execution") &&
+    input.proofs.codeImplementationReadback !== true &&
+    // Legacy durable receipts paid the combined code stage only at commit.
     input.proofs.codeWorkspaceReadback !== true
   ) {
     unpaid.push("code_execution");
+  }
+  if (
+    planStages.has("code_validation") &&
+    input.proofs.codeValidationAndCommit !== true &&
+    input.proofs.codeWorkspaceReadback !== true
+  ) {
+    unpaid.push("code_validation");
   }
   if (
     planStages.has("private_github_publication") &&
@@ -1242,8 +1359,7 @@ export function setLooseDeliveryComplete(input: {
   // This proof requires a draft-PR URL. Charging it to a bounded
   // Research -> Linear phase makes that phase structurally impossible to
   // complete because GitHub is intentionally absent.
-  const requiresNoteReflection =
-    planStages.has("private_github_publication");
+  const requiresNoteReflection = planStages.has("reflection");
   if (
     requiresNoteReflection &&
     input.proofs.noteReflectionWithMarkers !== true
@@ -1289,7 +1405,6 @@ export function pendingToolsForUnpaidSetLooseDelivery(
           "linear_create_issue",
           "linear_get_issue",
           "linear_search_issues",
-          REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
         );
         break;
       case "code_execution":
@@ -1298,6 +1413,9 @@ export function pendingToolsForUnpaidSetLooseDelivery(
         // MissionGraph before any workspace existed.
         tools.push(...CODE_EXECUTION_TOOL_ALLOW);
         break;
+      case "code_validation":
+        tools.push(...toolsAllowedForLifecycleStage("code_validation"));
+        break;
       case "private_github_publication":
         tools.push(
           "github_create_repository",
@@ -1305,10 +1423,13 @@ export function pendingToolsForUnpaidSetLooseDelivery(
         );
         break;
       case "note_reflection":
-        // The reflection moment: the note write, and the report back to the
-        // issue that started the work. This switch — not the lifecycle
-        // allowlists — is what actually reaches a set-loose frontier.
-        tools.push("append_to_current_file", REPORT_PROGRESS_TO_LINEAR_TOOL_NAME);
+        // The host-owned Results writer is the default reflection surface.
+        // It creates one mission-bound note without redirecting the write to
+        // whichever note happens to be active at completion time.
+        tools.push("write_project_results");
+        break;
+      case "reflection":
+        tools.push(...toolsAllowedForLifecycleStage("reflection"));
         break;
       default:
         break;
@@ -1336,6 +1457,7 @@ export function toolsOfferedForSetLooseTurn(input: {
     "accepted_research",
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
     "note_reflection",
   ].find((key) => unpaidKeys.includes(key));
@@ -1343,10 +1465,10 @@ export function toolsOfferedForSetLooseTurn(input: {
     ? pendingToolsForUnpaidSetLooseDelivery([earliestUnpaid])
     : [];
   const base =
-    earliestUnpaid === "code_execution"
+    earliestUnpaid === "code_execution" || earliestUnpaid === "code_validation"
       ? toolsOfferedForSetLooseCodeStage({
           stages: input.stages,
-          currentStage: "code_execution",
+          currentStage: earliestUnpaid,
           passedFastRepairCycle: input.passedFastRepairCycle,
           codeDeliveryPaid: false,
         })
@@ -1363,7 +1485,7 @@ export function toolsOfferedForSetLooseTurn(input: {
     ...unpaidTools,
     ...(SET_LOOSE_STAGE_SOFT_COMPANIONS as readonly string[]),
   ]);
-  if (earliestUnpaid !== "code_execution") {
+  if (earliestUnpaid !== "code_execution" && earliestUnpaid !== "code_validation") {
     for (const tool of CODE_EXECUTION_TOOL_ALLOW) {
       offered.delete(tool);
     }

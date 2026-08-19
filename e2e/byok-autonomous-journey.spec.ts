@@ -23,6 +23,7 @@ import {
   parseMissionGraphV3,
   type MissionNodeV3,
 } from "../src/agent/missionGraphV3";
+import type { PreparedAction } from "../src/agent/actions";
 import {
   BYOK_01_ACCEPTANCE_TOKENS,
   type ByokAcceptanceObservationCategory,
@@ -65,7 +66,10 @@ import {
 } from "./fixtures/dailyUseAcceptance";
 import type { MissionScorecardV1 } from "../src/agent/missionScorecard";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
-import { extractVisibleCompletionReflection } from "./fixtures/reflectionAssertions";
+import {
+  assertVerifiedCommitBoundCodeExamplesV1,
+  extractVisibleCompletionReflection,
+} from "./fixtures/reflectionAssertions";
 import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import {
@@ -116,6 +120,26 @@ const REPOSITORY_FILE_MUTATION_TOOLS = new Set([
   "code_workspace_trash",
   "code_workspace_restore",
 ]);
+
+const BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS = Object.freeze([
+  "publish_research_to_linear",
+  "linear_create_issue",
+  "code_workspace_create",
+  "code_workspace_create_file",
+  "code_workspace_write_expected",
+  "code_validate_fast",
+  "code_validate_targeted",
+  "code_validate_full",
+  "code_repair_record_cycle",
+  "code_commit_verified",
+  "code_workspace_export_directory",
+  "github_create_repository",
+  "publish_verified_code_to_github",
+  "finalize_github_links_in_obsidian",
+  "finalize_github_link_in_linear",
+  "finalize_linear_issue_completion",
+  "append_to_current_file",
+] as const);
 
 const TRUSTED_REPOSITORY_WRITE_PATHS = [
   "README.md",
@@ -320,6 +344,10 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
   const suffix = randomUUID().replace(/-/gu, "").slice(0, 12);
   const marker = `BYOK_AUTONOMOUS_${suffix}`;
   const notePath = `E2E Agent Tests/BYOK-AUTONOMOUS-${suffix}.md`;
+  const notebookPath =
+    `E2E Agent Tests/BYOK-AUTONOMOUS-${suffix}-reflection.ipynb`;
+  const initialNotebook = buildByokReflectionNotebook(marker);
+  const initialNotebookContent = `${JSON.stringify(initialNotebook, null, 2)}\n`;
   const repository = safeDisposableRepositoryName(
     `e2e-byok-autonomous-${suffix}`,
   );
@@ -678,6 +706,9 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     });
     approvalCount += await harness.approveUntilMissionComplete(70 * 60_000, {
       maxContinuations: 4,
+      allowedApprovalToolNames: BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS,
+      requirePrivateRepositoryApproval: true,
+      requireExactPreparedActionApproval: true,
     });
     const phaseAProgressCounters = harness.readProgressCounters();
     expect(phaseAProgressCounters.approvals).toBe(approvalCount);
@@ -738,6 +769,20 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       "Phase A must retain four distinct usable fetched-source evidence records",
     ).toBeGreaterThanOrEqual(4);
     observations.observe("proofs", "research:four_distinct_sources");
+    const projectIdeaAttestation = phaseASnapshot.missionEvidence.find(
+      (item: any) =>
+        /^project_idea:sha256:[a-f0-9]{64}:grounded:selected:promoted$/u.test(
+          String(item?.id ?? ""),
+        ),
+    );
+    expect(
+      projectIdeaAttestation,
+      "Phase A must retain the real grounded, selected, promoted project-idea tool result",
+    ).toBeTruthy();
+    observations.observe(
+      "proofs",
+      "research:grounded_selected_project_idea",
+    );
 
     const phaseAObservedTools = await readToolExecutionObserver(
       harness.page,
@@ -752,6 +797,12 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
         (event) => event.ok && event.name === "web_fetch",
       ).length,
     ).toBeGreaterThanOrEqual(4);
+    expect(
+      phaseAObservedTools.filter(
+        (event) => event.ok && event.name === "create_project_idea_brief",
+      ),
+      JSON.stringify(phaseAObservedTools),
+    ).toHaveLength(1);
     expect(
       phaseAObservedTools.some(
         (event) =>
@@ -783,6 +834,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       [
         { toolName: "web_search", minimumEvents: 1 },
         { toolName: "web_fetch", minimumEvents: 4 },
+        { toolName: "create_project_idea_brief", minimumEvents: 1 },
         { toolName: "publish_research_to_linear", minimumEvents: 1 },
       ],
       "Phase A",
@@ -897,6 +949,11 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     await clearModelChatAndActiveNoteContext(harness);
     await harness.relaunch();
     await installToolExecutionObserver(harness.page, observedToolJournal);
+    await createExactVaultFile(
+      harness.page,
+      notebookPath,
+      initialNotebookContent,
+    );
     expect(await visibleChatText(harness.page)).not.toContain(marker);
     const beforePhaseBObservedTools = await readToolExecutionObserver(
       harness.page,
@@ -910,7 +967,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
 
     const phaseBPrompt = [
       `Review and implement Linear issue ${issueId}. Begin with an independent linear_get_issue read of that exact identity and treat its signed accepted-research contract as the sole product specification.`,
-      "When the work is complete, write exactly one 35-100 word human reflection to the accepted research's initiating note through its durable lineage. Mention the research, Linear issue, code outcome, tests, draft pull request, and one honest remaining limitation without tool, receipt, run, or internal-path jargon.",
+      `When the work is complete, write one 35-100 word human reflection to the accepted research's initiating note through its durable lineage and append one prose-only 35-100 word reflection to the existing notebook \`${notebookPath}\` through append_jupyter_reflection. Mention the research, Linear issue, code outcome, tests, draft pull request, and one honest remaining limitation without tool, receipt, run, or internal-path jargon. Put no code syntax in the notebook markdown; the host must attach one or two concise examples from the exact verified commit without executing any cell.`,
       "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it.",
       "Implement the requested Python library in its bound trusted repository and honor the issue-required public artifacts while choosing the internal design yourself. Create an additional implementation file only when the independently read issue contract or latest validator diagnostic requires it, only within repositoryWriteScope.allowedPaths, and never use a substitute helper or validator file as recovery. Inspect protected acceptance material as needed, validate against the issue contract before committing, and create one verified local commit.",
       "Deliver the final verified working directory to a new absolute Desktop folder that a normal IDE can open. Do not overwrite an existing folder.",
@@ -956,6 +1013,9 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     try {
       await harness.approveUntilMissionComplete(70 * 60_000, {
         maxContinuations: 18,
+        allowedApprovalToolNames: BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS,
+        requirePrivateRepositoryApproval: true,
+        requireExactPreparedActionApproval: true,
       });
     } catch (error) {
       if (!isOwnedObsidianPageClosure(error)) throw error;
@@ -988,6 +1048,9 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
         .toBe(phaseBRunId);
       await harness.approveUntilMissionComplete(70 * 60_000, {
         maxContinuations: remainingContinuations,
+        allowedApprovalToolNames: BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS,
+        requirePrivateRepositoryApproval: true,
+        requireExactPreparedActionApproval: true,
       });
     }
     const progressCounters = harness.readProgressCounters();
@@ -1107,6 +1170,10 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
           toolName: "publish_verified_code_to_github",
           minimumEvents: 1,
         },
+        {
+          toolName: "append_jupyter_reflection",
+          minimumEvents: 1,
+        },
       ],
       "Phase B",
     );
@@ -1138,9 +1205,11 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       expect.arrayContaining([
         "code_validate_targeted",
         "code_validate_full",
+        "append_jupyter_reflection",
       ]),
     );
     observations.observe("approvals", "authorization:sandbox_execution");
+    observations.observe("approvals", "approval:jupyter_reflection");
     expect(authorityEvidence.nestedApprovedTools).toContain(
       "github_create_repository",
     );
@@ -1482,9 +1551,108 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     expect(reflection.visible).not.toMatch(
       /\breceipts?\b|\btool(?:ing|s)?\b|\brun(?: id)?\b|\bfingerprint\b|\bworkspace(?: id)?\b|\bhost[- ]verified\b/iu,
     );
+    const reflectionCodeExamples =
+      await assertVerifiedCommitBoundCodeExamplesV1({
+        note: finalNoteViaFilesystem,
+        repositoryRoot: workspaceRoot,
+        expectedCommitSha: handoff.commitSha,
+      });
+    expect(reflectionCodeExamples.length).toBeGreaterThanOrEqual(1);
+    expect(reflectionCodeExamples.length).toBeLessThanOrEqual(2);
+    expect(
+      reflectionCodeExamples.some((example) =>
+        example.path === "crdt_sync.py" &&
+        /GCounter|ORSet|CRDT/u.test(example.code)
+      ),
+      "reflection must show concise code read from crdt_sync.py at the published commit",
+    ).toBe(true);
+
+    const jupyterEvents = phaseBObservedTools.filter(
+      (event) =>
+        event.ok && event.name === "append_jupyter_reflection",
+    );
+    expect(
+      jupyterEvents,
+      "the joined workflow must append exactly one prepared Jupyter reflection",
+    ).toHaveLength(1);
+    const jupyterEvent = jupyterEvents[0]!;
+    expect(jupyterEvent.phase).toBe("executePrepared");
+    expect(jupyterEvent.preparedAction?.path).toBe(notebookPath);
+    expect(jupyterEvent.receipt).toMatchObject({
+      toolName: "append_jupyter_reflection",
+      operation: "append",
+      path: notebookPath,
+      readbackStatus: "verified",
+    });
+    const finalNotebookViaProvider = await readVaultNote(
+      harness.page,
+      notebookPath,
+    );
+    const finalNotebookViaFilesystem = await readFile(
+      path.join(harness.vaultRoot, ...notebookPath.split("/")),
+      "utf8",
+    );
+    expect(finalNotebookViaFilesystem).toBe(finalNotebookViaProvider);
+    const finalNotebook = JSON.parse(finalNotebookViaFilesystem) as any;
+    expect(finalNotebook.nbformat).toBe(4);
+    expect(finalNotebook.nbformat_minor).toBe(initialNotebook.nbformat_minor);
+    expect(finalNotebook.metadata).toEqual(initialNotebook.metadata);
+    expect(finalNotebook.cells.slice(0, initialNotebook.cells.length)).toEqual(
+      initialNotebook.cells,
+    );
+    const appendedNotebookCells = finalNotebook.cells.slice(
+      initialNotebook.cells.length,
+    );
+    const summaryCells = appendedNotebookCells.filter(
+      (cell: any) =>
+        cell?.metadata?.agentic_researcher_reflection?.kind === "summary",
+    );
+    expect(summaryCells).toHaveLength(1);
+    expect(joinNotebookSource(summaryCells[0]?.source)).toMatch(
+      /agentic-jupyter-reflection:/u,
+    );
+    const verifiedNotebookCodeCells = appendedNotebookCells.filter(
+      (cell: any) =>
+        cell?.metadata?.agentic_researcher_reflection?.kind ===
+        "verified_code_example",
+    );
+    expect(verifiedNotebookCodeCells.length).toBeGreaterThanOrEqual(1);
+    expect(verifiedNotebookCodeCells.length).toBeLessThanOrEqual(2);
+    for (const cell of verifiedNotebookCodeCells) {
+      const provenance = cell.metadata.agentic_researcher_reflection;
+      expect(cell.execution_count).toBeNull();
+      expect(cell.outputs).toEqual([]);
+      expect(provenance.commitSha).toBe(handoff.commitSha);
+      expect(provenance.artifactSha256).toMatch(/^sha256:[a-f0-9]{64}$/u);
+      expect(provenance.codeSha256).toMatch(/^sha256:[a-f0-9]{64}$/u);
+      expect(provenance.endLine - provenance.startLine + 1).toBeLessThanOrEqual(
+        20,
+      );
+      const committedSource = (
+        await execFileAsync(
+          "git",
+          ["cat-file", "blob", `${handoff.commitSha}:${provenance.path}`],
+          { cwd: workspaceRoot, windowsHide: true },
+        )
+      ).stdout;
+      expect(sha256Text(committedSource)).toBe(provenance.artifactSha256);
+      const committedLines = sourceLinesV1(committedSource);
+      const expectedCode = committedLines
+        .slice(provenance.startLine - 1, provenance.endLine)
+        .join("\n");
+      const observedCode = joinNotebookSource(cell.source).replace(/\n$/u, "");
+      expect(observedCode).toBe(expectedCode);
+      expect(sha256Text(observedCode)).toBe(provenance.codeSha256);
+    }
     observations.observe("artifacts", "vault:completion_reflection");
+    observations.observe("artifacts", "vault:jupyter_completion_reflection");
     observations.observe("proofs", "reflection:human_35_100_words");
+    observations.observe(
+      "proofs",
+      "reflection:verified_commit_bound_code_example",
+    );
     observations.observe("bindings", "binding:note_pr");
+    observations.observe("bindings", "binding:jupyter_commit");
 
     const finalPublications = await readCompleteResearchPublications(
       harness.page,
@@ -1513,6 +1681,41 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       reflection.count,
       "idempotency requires one visible completion reflection",
     ).toBe(1);
+
+    const preparedJupyterAction = await readCapturedJupyterPreparedAction(
+      harness.page,
+    );
+    expect(preparedJupyterAction?.id).toBe(jupyterEvent.preparedAction?.id);
+    const notebookShaBeforeRestart = sha256Text(finalNotebookViaFilesystem);
+    const observerRestore = await restoreToolExecutionObserver(harness.page);
+    expect(observerRestore.observerRestored).toBe(true);
+    await harness.relaunch();
+    const reconciliation = await reconcileJupyterAfterRestart({
+      page: harness.page,
+      action: preparedJupyterAction,
+      originalPrompt: phaseBPrompt,
+    });
+    expect(reconciliation).toMatchObject({
+      outcome: "committed",
+      receipt: {
+        actionId: preparedJupyterAction.id,
+        payloadFingerprint: preparedJupyterAction.payloadFingerprint,
+        commitKind: "reconciled",
+        readback: { status: "verified" },
+      },
+    });
+    const notebookAfterReconciliation = await readVaultNote(
+      harness.page,
+      notebookPath,
+    );
+    expect(sha256Text(notebookAfterReconciliation)).toBe(
+      notebookShaBeforeRestart,
+    );
+    expect(notebookAfterReconciliation).toBe(finalNotebookViaFilesystem);
+    observations.observe(
+      "proofs",
+      "reflection:jupyter_no_execution_readback",
+    );
     observations.observe("proofs", "idempotency:no_duplicates");
     observations.observe("proofs", "authority:no_unapproved_mutations");
 
@@ -3042,6 +3245,132 @@ async function readVaultNote(page: Page, notePath: string): Promise<string> {
   }, { notePath });
 }
 
+async function createExactVaultFile(
+  page: Page,
+  filePath: string,
+  content: string,
+): Promise<void> {
+  await page.evaluate(
+    async ({ filePath, content }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      if (!app?.vault) throw new Error("Obsidian vault is unavailable.");
+      if (app.vault.getAbstractFileByPath?.(filePath)) {
+        throw new Error(`Refusing to overwrite existing vault file ${filePath}.`);
+      }
+      const created = await app.vault.create(filePath, content);
+      const readback = await app.vault.read(created);
+      if (readback !== content) {
+        throw new Error(`Vault file readback drifted for ${filePath}.`);
+      }
+    },
+    { filePath, content },
+  );
+}
+
+function buildByokReflectionNotebook(marker: string) {
+  return {
+    cells: [
+      {
+        cell_type: "markdown",
+        metadata: { tags: ["preexisting", "audit"] },
+        source: [`# Existing CRDT analysis ${marker}\n`],
+      },
+      {
+        cell_type: "code",
+        execution_count: 7,
+        metadata: { trusted_fixture: true },
+        outputs: [
+          {
+            name: "stdout",
+            output_type: "stream",
+            text: ["preexisting-output\n"],
+          },
+        ],
+        source: ["preexisting_value = 7\n", "print(preexisting_value)\n"],
+      },
+    ],
+    metadata: {
+      kernelspec: {
+        display_name: "Python 3",
+        language: "python",
+        name: "python3",
+      },
+      language_info: { name: "python" },
+      workflow_audit: { marker, preserve: true },
+    },
+    nbformat: 4,
+    nbformat_minor: 5,
+  };
+}
+
+function joinNotebookSource(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.every((line) => typeof line === "string")) {
+    return value.join("");
+  }
+  throw new Error("Notebook cell source must be text or a text array.");
+}
+
+function sourceLinesV1(content: string): string[] {
+  const lines = content.replace(/\r\n?/gu, "\n").split("\n");
+  if (lines.length > 1 && lines.at(-1) === "") lines.pop();
+  return lines.length > 0 ? lines : [""];
+}
+
+function sha256Text(content: string): string {
+  return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+}
+
+async function readCapturedJupyterPreparedAction(
+  page: Page,
+): Promise<PreparedAction> {
+  const value = await page.evaluate(() =>
+    (window as typeof window & {
+      __byokJupyterPreparedAction?: PreparedAction;
+    }).__byokJupyterPreparedAction ?? null,
+  );
+  if (
+    !value ||
+    value.toolName !== "append_jupyter_reflection" ||
+    !value.id ||
+    !value.payloadFingerprint
+  ) {
+    throw new Error(
+      "The live tool observer did not retain the exact Jupyter prepared action.",
+    );
+  }
+  return value;
+}
+
+async function reconcileJupyterAfterRestart(input: {
+  page: Page;
+  action: PreparedAction;
+  originalPrompt: string;
+}): Promise<any> {
+  return input.page.evaluate(
+    async (payload: any) => {
+      const { pluginId, action, originalPrompt } = payload;
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      if (!plugin?.createToolRegistry || !plugin?.createToolExecutionContext) {
+        throw new Error("Native Jupyter reconciliation APIs are unavailable.");
+      }
+      const context = {
+        ...plugin.createToolExecutionContext(originalPrompt),
+        runId: action.runId,
+        rootMissionId: action.runId,
+        operationId: action.toolCallId,
+      };
+      return plugin.createToolRegistry().reconcile(action, context);
+    },
+    {
+      pluginId: NATIVE_CORE_PLUGIN_ID,
+      action: input.action,
+      originalPrompt: input.originalPrompt,
+    } as any,
+  );
+}
+
 async function clearModelChatAndActiveNoteContext(
   harness: RealAiHarness,
 ): Promise<void> {
@@ -3169,6 +3498,7 @@ async function installToolExecutionObserver(
       app?: any;
       __byokToolObserverRestore?: () => void;
       __byokToolEvents?: ObservedToolExecution[];
+      __byokJupyterPreparedAction?: unknown;
       __byokToolEventSinkV1?: (
         event: ObservedToolExecution,
       ) => Promise<void>;
@@ -3520,6 +3850,15 @@ async function installToolExecutionObserver(
                 }
               : {}),
           };
+          if (event.name === "append_jupyter_reflection") {
+            try {
+              w.__byokJupyterPreparedAction = JSON.parse(
+                JSON.stringify(action),
+              );
+            } catch {
+              delete w.__byokJupyterPreparedAction;
+            }
+          }
           try {
             const result = await originalExecutePrepared(
               action,

@@ -7,6 +7,10 @@ import {
   type VerifiedCodePublicationHandoffV1,
   type VerifiedLocalCommitForPublicationV1,
 } from "../packages/core-api/src/verifiedCodePublicationHandoffV1";
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import type { ActionReceipt } from "../src/agent/actions";
 import { createPendingExternalActionStateV2 } from "../src/integrations/PendingExternalActionStateV2";
 import {
@@ -329,6 +333,12 @@ function handoff(repaired: boolean): VerifiedCodePublicationHandoffV1 {
     changedPaths: ["src/fix.ts"],
     artifactHashes: [{ path: "src/fix.ts", sha256: repaired ? FP_C : FP_A, bytes: 42 }],
     changedArtifacts: [{ path: "src/fix.ts", sha256: repaired ? FP_C : FP_A }],
+    identity: {
+      authorName: AGENT_GIT_COMMIT_NAME_V1,
+      authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+      committerName: AGENT_GIT_COMMIT_NAME_V1,
+      committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+    },
     targetedValidationReceiptId: repaired ? "targeted-repair" : "targeted-original",
     fullValidationReceiptId: repaired ? "full-repair" : "full-original",
     targetedValidationFingerprint: repaired ? FP_B : FP_A,

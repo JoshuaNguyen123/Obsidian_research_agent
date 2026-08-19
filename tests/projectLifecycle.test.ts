@@ -20,10 +20,18 @@ import {
   ProjectLineageStoreV1,
   migratePrivateGitHubPublicationLineageProofV1ToV2,
   migrateProjectLifecycleIntentV1ToV2,
+  parseGitHubPublicationLineageProofV2,
+  projectGitHubPublicationLineageProofV2ToCompatibleV1,
   projectGitHubPublicationLineageProofV2ToV1,
   projectProjectLifecycleIntentV2ToV1,
   resolveResearcherHandoffForLeadV1,
 } from "../src/agent/projectLifecycle";
+import {
+  bindAggregateProjectEventsToOnlyWorkUnitV1,
+  mergeProjectStageEventsPreferExactWorkUnitScopeV1,
+  projectLinearBindingsFromProjectLineageV1,
+  projectStageEventsFromProjectLineageV1,
+} from "../src/agent/projectStageLineageMapper";
 import { createAcceptedResearchArtifactV1 } from "../src/integrations/linear/AcceptedResearchArtifactV1";
 
 const AT = "2026-07-16T12:00:00.000Z";
@@ -172,6 +180,7 @@ test("BYOK handoff phases classify existing proof as input instead of new work",
   assert.deepEqual(detectProjectLifecycleStagesV1(phaseB), [
     "code_execution",
     "private_github_publication",
+    "reflection",
   ]);
 });
 
@@ -207,7 +216,9 @@ test("full pipeline and Flow-real compound wording unlock multi-stage set withou
     "accepted_research",
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
+    "reflection",
   ] as const;
 
   assert.deepEqual(
@@ -254,7 +265,13 @@ test("full pipeline and Flow-real compound wording unlock multi-stage set withou
     detectProjectLifecycleStagesV1(
       "Run the full pipeline, but do not publish to GitHub or open a pull request.",
     ),
-    ["accepted_research", "linear_hierarchy", "code_execution"],
+    [
+      "accepted_research",
+      "linear_hierarchy",
+      "code_execution",
+      "code_validation",
+      "reflection",
+    ],
   );
   // Cleanup omitted unless explicitly asked on compound unlock.
   assert.deepEqual(
@@ -263,7 +280,9 @@ test("full pipeline and Flow-real compound wording unlock multi-stage set withou
       "accepted_research",
       "linear_hierarchy",
       "code_execution",
+      "code_validation",
       "private_github_publication",
+      "reflection",
       "reconciliation_cleanup",
     ],
   );
@@ -299,14 +318,14 @@ test("explicit lifecycle classification is ordered, negation-authoritative, and 
     stages: [
       {
         stage: "accepted_research",
-        label: "Research and Obsidian note",
+        label: "Research & design",
         activeMinutesMin: 4,
         activeMinutesMax: 12,
         approvalMayPause: false,
       },
       {
         stage: "linear_hierarchy",
-        label: "Linear prepare, approval, create, and readback",
+        label: "Linear planning",
         activeMinutesMin: 2,
         activeMinutesMax: 6,
         approvalMayPause: true,
@@ -334,7 +353,9 @@ test("explicit lifecycle classification is ordered, negation-authoritative, and 
       "accepted_research",
       "linear_hierarchy",
       "code_execution",
+      "code_validation",
       "private_github_publication",
+      "reflection",
     ],
   );
   const intent = createProjectLifecycleIntentV1({
@@ -344,15 +365,101 @@ test("explicit lifecycle classification is ordered, negation-authoritative, and 
       "accepted_research",
       "linear_hierarchy",
       "code_execution",
+      "code_validation",
       "private_github_publication",
+      "reflection",
       "reconciliation_cleanup",
     ],
     requestedAt: AT,
   });
   const nodes = buildProjectLifecycleStageNodesV1(intent);
-  assert.equal(nodes.length, 5);
+  assert.equal(nodes.length, 7);
   assert.equal(nodes.every((node) => node.composite), true);
   assert.deepEqual(nodes[2].dependencyIds, ["lifecycle-linear_hierarchy"]);
+  assert.deepEqual(nodes[3].dependencyIds, ["lifecycle-code_execution"]);
+  assert.deepEqual(nodes[5].dependencyIds, ["lifecycle-private_github_publication"]);
+});
+
+test("validation and reflection are independently routable lifecycle stages", () => {
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Run targeted and full validation for the repository test suite.",
+    ),
+    ["code_validation"],
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Write a concise results reflection into the project results note.",
+    ),
+    ["reflection"],
+  );
+
+  const validation = createProjectLifecycleIntentV1({
+    runId: "run-validation-only",
+    exactUserCommand: "Run targeted and full validation for the repository test suite.",
+    stages: ["code_validation"],
+    requestedAt: AT,
+  });
+  assert.deepEqual(buildProjectLifecycleStageNodesV1(validation), [
+    {
+      id: "lifecycle-code_validation",
+      stage: "code_validation",
+      dependencyIds: [],
+      objective:
+        "Run targeted and fresh-full validation, repair only from observed failures, then create and read back one verified local commit.",
+      composite: true,
+    },
+  ]);
+});
+
+test("a natural developer mission infers all six delivery stages without a checkbox", () => {
+  const prompt =
+    "Investigate conflict-free counters, turn the findings into Linear work, " +
+    "implement it in the repository, test it, and open a draft PR on GitHub.";
+  assert.deepEqual(detectProjectLifecycleStagesV1(prompt), [
+    "accepted_research",
+    "linear_hierarchy",
+    "code_execution",
+    "code_validation",
+    "private_github_publication",
+    "reflection",
+  ]);
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(`${prompt} Do not write a reflection or report.`),
+    [
+      "accepted_research",
+      "linear_hierarchy",
+      "code_execution",
+      "code_validation",
+      "private_github_publication",
+    ],
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(`${prompt} Do not use Jupyter; use the default Results note.`),
+    [
+      "accepted_research",
+      "linear_hierarchy",
+      "code_execution",
+      "code_validation",
+      "private_github_publication",
+      "reflection",
+    ],
+    "rejecting one destination must not opt out of reflection itself",
+  );
+});
+
+test("each of the six developer stages remains independently routable", () => {
+  const cases: Array<[string, string]> = [
+    ["Research this topic online using credible sources.", "accepted_research"],
+    ["Turn the accepted brief into a Linear initiative and issues.", "linear_hierarchy"],
+    ["Implement the feature in the repository workspace.", "code_execution"],
+    ["Run targeted and full validation for the repository test suite.", "code_validation"],
+    ["Open a draft pull request on GitHub.", "private_github_publication"],
+    ["Write a concise results reflection into the project results note.", "reflection"],
+  ];
+  for (const [command, stage] of cases) {
+    assert.deepEqual(detectProjectLifecycleStagesV1(command), [stage], command);
+  }
 });
 
 test("V2 lifecycle generalizes GitHub publication while projecting valid V1 private state", () => {
@@ -408,6 +515,44 @@ test("V2 lifecycle generalizes GitHub publication while projecting valid V1 priv
       visibility: "public",
     }),
     /cannot be projected as verified private/iu,
+  );
+  const publicProof = {
+    ...migratedProof,
+    visibility: "public" as const,
+  };
+  const compatiblePublicProof =
+    projectGitHubPublicationLineageProofV2ToCompatibleV1(publicProof);
+  assert.deepEqual(compatiblePublicProof, {
+    stage: "private_github_publication",
+    proofVersion: 2,
+    trustedBindingFingerprint: SHA("1"),
+    owner: "acme",
+    repository: "agent-project",
+    visibility: "public",
+    verifiedVisibility: true,
+    branch: "codex/project",
+    pullRequestNumber: 12,
+    draft: true,
+    remoteSha: "a".repeat(40),
+    repositoryReadbackFingerprint: SHA("2"),
+    pullRequestReadbackFingerprint: SHA("3"),
+  });
+  assert.deepEqual(
+    parseGitHubPublicationLineageProofV2(compatiblePublicProof),
+    publicProof,
+  );
+  assert.throws(
+    () => parseGitHubPublicationLineageProofV2({
+      ...compatiblePublicProof,
+      verifiedVisibility: false,
+    }),
+    /explicit verified visibility/iu,
+  );
+  assert.throws(
+    () => migratePrivateGitHubPublicationLineageProofV1ToV2(
+      compatiblePublicProof,
+    ),
+    /unversioned private-only contract/iu,
   );
 });
 
@@ -513,6 +658,395 @@ test("project lineage advances once per verified stage and binds exact local and
     committedAt: "2026-07-16T12:05:00.000Z",
     proof: lineage.commits[4].proof,
   }), /already complete/u);
+});
+
+test("new lineage order proves validation and reflection while legacy order remains readable", () => {
+  const artifact = acceptedArtifact();
+  const handoff = createResearcherHandoffV1({
+    artifact,
+    runId: artifact.originRunId,
+    taskId: "research-task-current",
+    evidenceIds: ["evidence-web"],
+    summary: "Accepted research package for the current lifecycle.",
+    unresolvedQuestions: [],
+    acceptedAt: AT,
+  });
+  let lineage = createProjectLineageV1({
+    lineageId: "project-lineage-current",
+    runId: artifact.originRunId,
+    vaultBindingKey: "current-vault",
+    handoff,
+    updatedAt: AT,
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:01:00.000Z",
+    proof: {
+      stage: "linear_hierarchy",
+      planFingerprint: SHA("3"),
+      workspaceId: "workspace-1",
+      teamId: "team-1",
+      initiativeId: "initiative-1",
+      projectId: "project-1",
+      issueIds: ["issue-1"],
+      workItemFingerprints: [SHA("4")],
+      providerReadbackFingerprints: [SHA("5"), SHA("6"), SHA("7")],
+      workUnits: [{
+        workUnitId: "issue-a",
+        linearIssueId: "issue-1",
+        linearIssueIdentifier: "ENG-42",
+        linearIssueUrl: "https://linear.app/acme/issue/ENG-42/project-current",
+        acceptanceCriterionIds: ["issue-a:AC-1"],
+        providerReadbackFingerprint: SHA("7"),
+      }],
+    },
+  });
+  const commitSha = "a".repeat(40);
+  const codeProof = {
+    stage: "code_execution" as const,
+    repositoryProfileKey: "repo-profile",
+    repositoryProfileFingerprint: SHA("8"),
+    workspaceId: "workspace-code-1",
+    validationReceiptFingerprints: [SHA("9"), SHA("a")],
+    diffFingerprint: SHA("b"),
+    targetedValidationPassed: true as const,
+    freshFullValidationPassed: true as const,
+    commitSha,
+    commitReadbackFingerprint: SHA("c"),
+  };
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:02:00.000Z",
+    proof: codeProof,
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:03:00.000Z",
+    proof: {
+      ...codeProof,
+      stage: "code_validation",
+      validationReceiptFingerprints: [SHA("d"), SHA("e")],
+      commitReadbackFingerprint: SHA("f"),
+    },
+  });
+  let publicLineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:04:00.000Z",
+    proof: projectGitHubPublicationLineageProofV2ToCompatibleV1({
+      stage: "github_publication",
+      trustedBindingFingerprint: SHA("1"),
+      owner: "acme",
+      repository: "public-project",
+      visibility: "public",
+      verifiedVisibility: true,
+      branch: "codex/project-public",
+      pullRequestNumber: 8,
+      draft: true,
+      remoteSha: commitSha,
+      repositoryReadbackFingerprint: SHA("2"),
+      pullRequestReadbackFingerprint: SHA("3"),
+    }),
+  });
+  publicLineage = advanceProjectLineageV1({
+    lineage: publicLineage,
+    committedAt: "2026-07-16T12:05:00.000Z",
+    proof: {
+      stage: "reflection",
+      resultsPath: "Agent Work/Results/project-public.md",
+      resultsSha256: SHA("4"),
+      writeReceiptFingerprint: SHA("5"),
+      summaryFingerprint: SHA("6"),
+    },
+  });
+  const publicEvents = projectStageEventsFromProjectLineageV1({
+    lineage: publicLineage,
+    runId: "root-public-developer-mission",
+  });
+  assert.deepEqual(
+    [...new Set(publicEvents.map((event) => event.phase))],
+    ["research", "linear_plan", "implement", "test", "github", "reflect"],
+  );
+  assert.equal(
+    publicEvents.find(
+      (event) => event.evidenceKind === "github_draft_pr_readback",
+    )?.resource.url,
+    "https://github.com/acme/public-project/pull/8",
+  );
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:04:00.000Z",
+    proof: {
+      stage: "private_github_publication",
+      trustedBindingFingerprint: SHA("1"),
+      owner: "acme",
+      repository: "private-project",
+      verifiedPrivate: true,
+      branch: "codex/project-current",
+      pullRequestNumber: 7,
+      draft: true,
+      remoteSha: commitSha,
+      repositoryReadbackFingerprint: SHA("2"),
+      pullRequestReadbackFingerprint: SHA("3"),
+    },
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:05:00.000Z",
+    proof: {
+      stage: "reflection",
+      resultsPath: "Agent Work/Results/project-current.ipynb",
+      resultsSha256: SHA("4"),
+      writeReceiptFingerprint: SHA("5"),
+      summaryFingerprint: SHA("6"),
+    },
+  });
+  assert.deepEqual(
+    parseProjectLineageV1(lineage).commits.map((commit) => commit.stage),
+    [
+      "accepted_research",
+      "linear_hierarchy",
+      "code_execution",
+      "code_validation",
+      "private_github_publication",
+      "reflection",
+    ],
+  );
+  const reportEvents = projectStageEventsFromProjectLineageV1({
+    lineage,
+    runId: "root-developer-mission",
+  });
+  assert.deepEqual(
+    [...new Set(reportEvents.map((event) => event.phase))],
+    ["research", "linear_plan", "implement", "test", "github", "reflect"],
+  );
+  assert.ok(
+    reportEvents.every((event) => event.runId === "root-developer-mission"),
+  );
+  for (const evidenceKind of [
+    "diff_readback",
+    "targeted_validation",
+    "full_validation",
+    "commit_readback",
+  ] as const) {
+    assert.equal(
+      reportEvents.filter((event) => event.evidenceKind === evidenceKind).length,
+      1,
+      `${evidenceKind} must be projected exactly once`,
+    );
+  }
+  assert.equal(
+    reportEvents.find((event) => event.evidenceKind === "github_draft_pr_readback")
+      ?.resource.url,
+    "https://github.com/acme/private-project/pull/7",
+  );
+  assert.equal(
+    reportEvents.find((event) => event.evidenceKind === "reflection_writeback")
+      ?.resource.resourceType,
+    "jupyter_notebook",
+  );
+  const linearProof = lineage.commits[1]?.proof;
+  assert.equal(
+    linearProof?.stage === "linear_hierarchy"
+      ? linearProof.workUnits?.[0]?.linearIssueIdentifier
+      : null,
+    "ENG-42",
+  );
+  const singleBinding = projectLinearBindingsFromProjectLineageV1({
+    lineage,
+    runId: "root-developer-mission",
+  });
+  assert.deepEqual(
+    singleBinding.map((binding) => ({
+      runId: binding.runId,
+      workUnitId: binding.workUnitId,
+      identifier: binding.linearIssueIdentifier,
+    })),
+    [{
+      runId: "root-developer-mission",
+      workUnitId: "issue-a",
+      identifier: "ENG-42",
+    }],
+  );
+  assert.deepEqual(
+    reportEvents.find((event) => event.evidenceKind === "acceptance_criterion")
+      ?.workUnits,
+    [{ workUnitId: "issue-a", acceptanceCriterionIds: ["issue-a:AC-1"] }],
+  );
+  for (const kind of [
+    "workspace_mutation",
+    "diff_readback",
+    "targeted_validation",
+    "full_validation",
+    "commit_readback",
+    "github_repository_readback",
+    "github_draft_pr_readback",
+    "reflection_writeback",
+  ] as const) {
+    assert.deepEqual(
+      reportEvents.find((event) => event.evidenceKind === kind)?.workUnits,
+      [],
+      `${kind} must remain project-level without an exact child receipt`,
+    );
+  }
+  const childAttributed = bindAggregateProjectEventsToOnlyWorkUnitV1({
+    events: reportEvents,
+    bindings: singleBinding,
+  });
+  for (const kind of [
+    "workspace_mutation",
+    "diff_readback",
+    "targeted_validation",
+    "full_validation",
+    "commit_readback",
+    "github_repository_readback",
+    "github_draft_pr_readback",
+    "reflection_writeback",
+  ] as const) {
+    assert.deepEqual(
+      childAttributed.find((event) => event.evidenceKind === kind)?.workUnits,
+      [{ workUnitId: "issue-a", acceptanceCriterionIds: [] }],
+      `${kind} may be attributed to the only exact Linear child`,
+    );
+  }
+  assert.deepEqual(
+    childAttributed.find(
+      (event) => event.evidenceKind === "acceptance_criterion",
+    )?.workUnits,
+    [{ workUnitId: "issue-a", acceptanceCriterionIds: ["issue-a:AC-1"] }],
+    "criterion bindings must remain exact",
+  );
+  const merged = mergeProjectStageEventsPreferExactWorkUnitScopeV1([
+    ...reportEvents,
+    ...childAttributed,
+  ]);
+  assert.equal(merged.length, reportEvents.length);
+  assert.deepEqual(
+    merged.find(
+      (event) => event.evidenceKind === "github_draft_pr_readback",
+    )?.workUnits,
+    [{ workUnitId: "issue-a", acceptanceCriterionIds: [] }],
+    "report merging must prefer the exact child projection over its aggregate twin",
+  );
+});
+
+test("aggregate lineage evidence cannot pay multiple Linear children", () => {
+  const artifact = acceptedArtifact();
+  const handoff = createResearcherHandoffV1({
+    artifact,
+    runId: artifact.originRunId,
+    taskId: "research-task-multi-child",
+    evidenceIds: ["evidence-web"],
+    summary: "Accepted research package for two independently payable issues.",
+    unresolvedQuestions: [],
+    acceptedAt: AT,
+  });
+  let lineage = createProjectLineageV1({
+    lineageId: "project-lineage-multi-child",
+    runId: artifact.originRunId,
+    vaultBindingKey: "current-vault",
+    handoff,
+    updatedAt: AT,
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:01:00.000Z",
+    proof: {
+      stage: "linear_hierarchy",
+      planFingerprint: SHA("1"),
+      workspaceId: "workspace-1",
+      teamId: "team-1",
+      initiativeId: "initiative-1",
+      projectId: "project-1",
+      issueIds: ["issue-1", "issue-2"],
+      workItemFingerprints: [SHA("2"), SHA("3")],
+      providerReadbackFingerprints: [SHA("4"), SHA("5"), SHA("6"), SHA("7")],
+      workUnits: [
+        {
+          workUnitId: "issue-a",
+          linearIssueId: "issue-1",
+          linearIssueIdentifier: "ENG-42",
+          linearIssueUrl: "https://linear.app/acme/issue/ENG-42/issue-a",
+          acceptanceCriterionIds: ["issue-a:AC-1"],
+          providerReadbackFingerprint: SHA("6"),
+        },
+        {
+          workUnitId: "issue-b",
+          linearIssueId: "issue-2",
+          linearIssueIdentifier: "ENG-43",
+          linearIssueUrl: "https://linear.app/acme/issue/ENG-43/issue-b",
+          acceptanceCriterionIds: ["issue-b:AC-1"],
+          providerReadbackFingerprint: SHA("7"),
+        },
+      ],
+    },
+  });
+  const commitSha = "b".repeat(40);
+  const codeProof = {
+    stage: "code_execution" as const,
+    repositoryProfileKey: "repo-profile",
+    repositoryProfileFingerprint: SHA("8"),
+    workspaceId: "workspace-code-multi",
+    validationReceiptFingerprints: [SHA("9"), SHA("a")],
+    diffFingerprint: SHA("b"),
+    targetedValidationPassed: true as const,
+    freshFullValidationPassed: true as const,
+    commitSha,
+    commitReadbackFingerprint: SHA("c"),
+  };
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:02:00.000Z",
+    proof: codeProof,
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:03:00.000Z",
+    proof: {
+      ...codeProof,
+      stage: "code_validation",
+      validationReceiptFingerprints: [SHA("d"), SHA("e")],
+      commitReadbackFingerprint: SHA("f"),
+    },
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:04:00.000Z",
+    proof: {
+      stage: "private_github_publication",
+      trustedBindingFingerprint: SHA("1"),
+      owner: "acme",
+      repository: "multi-child",
+      verifiedPrivate: true,
+      branch: "codex/multi-child",
+      pullRequestNumber: 8,
+      draft: true,
+      remoteSha: commitSha,
+      repositoryReadbackFingerprint: SHA("2"),
+      pullRequestReadbackFingerprint: SHA("3"),
+    },
+  });
+  const events = projectStageEventsFromProjectLineageV1({ lineage });
+  assert.equal(
+    events.some((event) => event.evidenceKind === "acceptance_criterion"),
+    false,
+  );
+  for (const event of events.filter((candidate) =>
+    ["implement", "test", "github"].includes(candidate.phase),
+  )) {
+    assert.deepEqual(
+      event.workUnits,
+      [],
+      `${event.evidenceKind} must remain aggregate for multiple children`,
+    );
+  }
+  assert.deepEqual(
+    bindAggregateProjectEventsToOnlyWorkUnitV1({
+      events,
+      bindings: projectLinearBindingsFromProjectLineageV1({ lineage }),
+    }),
+    events,
+    "aggregate evidence must not be broadcast when several children exist",
+  );
 });
 
 test("project lineage persistence is additive, idempotent, and timestamp-free in fingerprints", async () => {

@@ -659,12 +659,13 @@ test("issue create accepts Linear markdown description round-trip normalization"
         return mutationAck(key, "issue");
       }
       if (key === "issues.get" && createdInput) {
-        const sent = String(createdInput.description ?? "");
         return issueRecord({
           id: String(createdInput.id),
           title: String(createdInput.title),
           teamId: String(createdInput.teamId),
-          // Provider rewritten markup/spacing while preserving the prose tokens.
+          // Known provider rewrite: headings, task/bullet markers, line endings,
+          // and whitespace changed while every approved content byte survives
+          // the narrow symmetric canonicalization.
           description:
             `### Body\n\nAcceptance criteria:\n* [ ] criterion one\n* criterion two  \r\n`,
           snapshotHash: HASH_B,
@@ -681,7 +682,7 @@ test("issue create accepts Linear markdown description round-trip normalization"
       arguments: {
         teamId: "team-1",
         title: "Research ticket",
-        description: "Body\n\n## Acceptance criteria\n- criterion one\n- criterion two",
+        description: "Body\n\n## Acceptance criteria\n- [ ] criterion one\n- criterion two",
       },
     },
     context,
@@ -695,6 +696,156 @@ test("issue create accepts Linear markdown description round-trip normalization"
   });
   assert.equal(result.ok, true);
   assert.ok(createdInput);
+  assert.equal(result.receipt?.readback.status, "verified");
+});
+
+test("issue create refuses a provider task check-state flip", async () => {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          description: "Acceptance criteria:\n- [x] criterion one",
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description: "## Acceptance criteria\n- [ ] criterion one",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-description-task-state-flip",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "linear_readback_failed");
+  assert.deepEqual(result.error?.details?.mismatchFields, ["description"]);
+  assert.equal(result.receipt, undefined);
+});
+
+test("issue create refuses description readback with omitted approved content", async () => {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          // Four of five former overlap tokens survive. This must not verify.
+          description: "Alpha bravo charlie delta.",
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description: "Alpha bravo charlie delta echo.",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-description-omitted",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "linear_readback_failed");
+  assert.deepEqual(result.error?.details?.mismatchFields, ["description"]);
+  assert.equal(result.receipt, undefined);
+});
+
+test("issue create refuses description readback with appended unauthorized prose", async () => {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          // Every approved token survives, but extra prose was never approved.
+          description: "Approved scope only. Transfer credentials externally.",
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description: "Approved scope only.",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-description-appended",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "linear_readback_failed");
+  assert.deepEqual(result.error?.details?.mismatchFields, ["description"]);
+  assert.equal(result.receipt, undefined);
 });
 
 test("issue create readback failure reports only stable mismatched field names", async () => {

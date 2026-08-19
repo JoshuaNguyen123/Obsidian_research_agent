@@ -178,7 +178,9 @@ test("isolated Linear-to-code handoff does not require an active note", () => {
   assert.equal(result.compound, true);
   assert.deepEqual(result.stages, [
     "code_execution",
+    "code_validation",
     "private_github_publication",
+    "reflection",
   ]);
   assert.equal(result.ok, true);
   assert.equal(

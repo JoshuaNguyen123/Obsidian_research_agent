@@ -1,4 +1,8 @@
 import { portableSha256Text } from "./portableSha256";
+import {
+  isAgentGitCommitIdentityV1,
+  type AgentGitCommitIdentityV1,
+} from "./agentGitCommitIdentityV1";
 
 export const VERIFIED_CODE_PUBLICATION_HANDOFF_VERSION = 1 as const;
 
@@ -40,6 +44,7 @@ export interface VerifiedLocalCommitForPublicationV1 {
   changedPaths: string[];
   artifactHashes: PublicationArtifactHashV1[];
   changedArtifacts: PublicationChangedArtifactV1[];
+  identity: AgentGitCommitIdentityV1;
   targetedValidationReceiptId: string;
   fullValidationReceiptId: string;
   targetedValidationFingerprint: string;
@@ -72,6 +77,7 @@ export interface VerifiedCodePublicationHandoffV1 {
   artifactHashes: PublicationArtifactHashV1[];
   changedArtifacts: PublicationChangedArtifactV1[];
   artifactFingerprint: string;
+  identity: AgentGitCommitIdentityV1;
   targetedValidationReceiptId: string;
   fullValidationReceiptId: string;
   targetedValidationFingerprint: string;
@@ -91,6 +97,54 @@ export interface CreateVerifiedCodePublicationHandoffInputV1 {
   baseBranch: string;
   localCommit: VerifiedLocalCommitForPublicationV1;
   preparedAt: string;
+}
+
+export interface VerifiedCodeReflectionSourceV1 {
+  /** Repository-relative path read from the verified commit. */
+  path: string;
+  /** Exact UTF-8 text read back for that path. */
+  content: string;
+}
+
+export interface VerifiedCodeReflectionSelectionV1 {
+  path: string;
+  /** Inclusive, one-based source line. */
+  startLine: number;
+  /** Inclusive, one-based source line. */
+  endLine: number;
+  /** Optional Markdown fence language; inferred from the path by default. */
+  language?: string;
+}
+
+export interface VerifiedCodeReflectionExampleV1 {
+  version: 1;
+  kind: "verified_code_reflection_example";
+  path: string;
+  language: string;
+  commitSha: string;
+  artifactSha256: string;
+  artifactBytes: number;
+  startLine: number;
+  endLine: number;
+  code: string;
+  codeSha256: string;
+}
+
+export interface VerifiedCodeReflectionExamplesV1 {
+  version: 1;
+  kind: "verified_code_reflection_examples";
+  handoffFingerprint: string;
+  commitSha: string;
+  examples: VerifiedCodeReflectionExampleV1[];
+  fingerprint: string;
+}
+
+export interface CreateVerifiedCodeReflectionExamplesInputV1 {
+  handoff: unknown;
+  /** Exact file readbacks from the verified commit/tree, never model prose. */
+  sources: readonly VerifiedCodeReflectionSourceV1[];
+  /** One or two explicit excerpts, each bounded to 20 lines. */
+  selections: readonly VerifiedCodeReflectionSelectionV1[];
 }
 
 export class VerifiedCodePublicationHandoffErrorV1 extends Error {
@@ -163,6 +217,7 @@ export function createVerifiedCodePublicationHandoffV1(
     artifactHashes: clone(localCommit.artifactHashes),
     changedArtifacts: clone(localCommit.changedArtifacts),
     artifactFingerprint,
+    identity: { ...localCommit.identity },
     targetedValidationReceiptId: localCommit.targetedValidationReceiptId,
     fullValidationReceiptId: localCommit.fullValidationReceiptId,
     targetedValidationFingerprint: localCommit.targetedValidationFingerprint,
@@ -207,6 +262,7 @@ export function parseVerifiedCodePublicationHandoffV1(
     artifactHashes: artifactHashes(record.artifactHashes),
     changedArtifacts: changedArtifacts(record.changedArtifacts),
     artifactFingerprint: fingerprint(record.artifactFingerprint, "artifact fingerprint"),
+    identity: commitIdentity(record.identity, "publication commit identity"),
     targetedValidationReceiptId: boundedText(record.targetedValidationReceiptId, "targeted validation receipt id", 1, 256),
     fullValidationReceiptId: boundedText(record.fullValidationReceiptId, "full validation receipt id", 1, 256),
     targetedValidationFingerprint: fingerprint(record.targetedValidationFingerprint, "targeted validation fingerprint"),
@@ -238,6 +294,168 @@ export function parseVerifiedCodePublicationHandoffV1(
   return result;
 }
 
+/**
+ * Bind concise reflection excerpts to an already verified publication handoff.
+ *
+ * The caller must read each source from the handoff's exact commit/tree. This
+ * helper independently hashes the UTF-8 bytes and refuses any source whose
+ * path, byte count, or digest differs from the handoff artifact readback.
+ */
+export function createVerifiedCodeReflectionExamplesV1(
+  input: CreateVerifiedCodeReflectionExamplesInputV1,
+): VerifiedCodeReflectionExamplesV1 {
+  const handoff = parseVerifiedCodePublicationHandoffV1(input.handoff);
+  if (!Array.isArray(input.sources) || input.sources.length < 1 || input.sources.length > 100) {
+    fail("Verified code reflection sources must contain between 1 and 100 entries.");
+  }
+  if (!Array.isArray(input.selections) || input.selections.length < 1 || input.selections.length > 2) {
+    fail("Verified code reflection requires one or two concise selections.");
+  }
+
+  const sourceByPath = new Map<string, VerifiedCodeReflectionSourceV1>();
+  for (const [index, source] of input.sources.entries()) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      fail(`Verified code reflection source ${index + 1} must be an object.`);
+    }
+    const path = relativePath(source.path, `reflection source ${index + 1} path`);
+    if (sourceByPath.has(path)) fail("Verified code reflection source paths must be unique.");
+    const content = multilineText(source.content, `reflection source ${index + 1} content`, 1, 1_000_000);
+    sourceByPath.set(path, { path, content });
+  }
+
+  const selectedRanges = new Set<string>();
+  const artifactByPath = new Map(handoff.artifactHashes.map((artifact) => [artifact.path, artifact]));
+  const changedByPath = new Map(handoff.changedArtifacts.map((artifact) => [artifact.path, artifact]));
+  const examples = input.selections.map((selection, index): VerifiedCodeReflectionExampleV1 => {
+    if (!selection || typeof selection !== "object" || Array.isArray(selection)) {
+      fail(`Verified code reflection selection ${index + 1} must be an object.`);
+    }
+    const path = relativePath(selection.path, `reflection selection ${index + 1} path`);
+    const source = sourceByPath.get(path);
+    if (!source) fail(`Verified code reflection source is missing for ${path}.`);
+    const artifact = artifactByPath.get(path);
+    const changed = changedByPath.get(path);
+    if (!artifact || !changed || changed.sha256 === null || changed.sha256 !== artifact.sha256) {
+      fail(`Verified code reflection path ${path} is not a non-deleted verified changed artifact.`);
+    }
+    const sourceSha256 = `sha256:${portableSha256Text(source.content)}`;
+    const sourceBytes = new TextEncoder().encode(source.content).byteLength;
+    if (sourceSha256 !== artifact.sha256 || sourceBytes !== artifact.bytes) {
+      fail(`Verified code reflection source ${path} does not match its artifact hash readback.`);
+    }
+    const lines = sourceLines(source.content);
+    const startLine = integer(selection.startLine, `reflection selection ${index + 1} startLine`, 1, lines.length);
+    const endLine = integer(selection.endLine, `reflection selection ${index + 1} endLine`, startLine, lines.length);
+    const rangeKey = `${path}\0${startLine}\0${endLine}`;
+    if (selectedRanges.has(rangeKey)) fail("Verified code reflection selections must be unique.");
+    selectedRanges.add(rangeKey);
+    if (endLine - startLine + 1 > 20) {
+      fail("Verified code reflection examples are limited to 20 lines each.");
+    }
+    const code = lines.slice(startLine - 1, endLine).join("\n");
+    if (!code.trim()) fail("Verified code reflection examples cannot be blank.");
+    return {
+      version: 1,
+      kind: "verified_code_reflection_example",
+      path,
+      language: reflectionLanguage(selection.language, path),
+      commitSha: handoff.commitSha,
+      artifactSha256: artifact.sha256,
+      artifactBytes: artifact.bytes,
+      startLine,
+      endLine,
+      code,
+      codeSha256: `sha256:${portableSha256Text(code)}`,
+    };
+  });
+  const evidence: Omit<VerifiedCodeReflectionExamplesV1, "fingerprint"> = {
+    version: 1,
+    kind: "verified_code_reflection_examples",
+    handoffFingerprint: handoff.fingerprint,
+    commitSha: handoff.commitSha,
+    examples,
+  };
+  return { ...evidence, fingerprint: sha256(evidence) };
+}
+
+/** Parse and optionally bind a reflection-example bundle to an exact handoff. */
+export function parseVerifiedCodeReflectionExamplesV1(
+  value: unknown,
+  expectedHandoff?: unknown,
+): VerifiedCodeReflectionExamplesV1 {
+  const record = exactRecord(
+    value,
+    ["version", "kind", "handoffFingerprint", "commitSha", "examples", "fingerprint"],
+    "verified code reflection examples",
+  );
+  if (record.version !== 1 || record.kind !== "verified_code_reflection_examples") {
+    fail("Unsupported verified code reflection examples contract.");
+  }
+  const handoffFingerprint = fingerprint(record.handoffFingerprint, "reflection handoff fingerprint");
+  const commitSha = gitSha(record.commitSha, "reflection commit SHA");
+  const rawExamples = array(record.examples, "verified code reflection examples", 1, 2);
+  const examples = rawExamples.map((entry, index): VerifiedCodeReflectionExampleV1 => {
+    const item = exactRecord(
+      entry,
+      [
+        "version", "kind", "path", "language", "commitSha", "artifactSha256",
+        "artifactBytes", "startLine", "endLine", "code", "codeSha256",
+      ],
+      `verified code reflection example ${index + 1}`,
+    );
+    if (item.version !== 1 || item.kind !== "verified_code_reflection_example") {
+      fail("Unsupported verified code reflection example contract.");
+    }
+    const startLine = integer(item.startLine, `reflection example ${index + 1} startLine`, 1, Number.MAX_SAFE_INTEGER);
+    const endLine = integer(item.endLine, `reflection example ${index + 1} endLine`, startLine, Number.MAX_SAFE_INTEGER);
+    const code = multilineText(item.code, `reflection example ${index + 1} code`, 1, 20_000);
+    if (!code.trim() || sourceLines(code).length !== endLine - startLine + 1 || endLine - startLine + 1 > 20) {
+      fail("Verified code reflection example lines do not match the bounded selection.");
+    }
+    const result: VerifiedCodeReflectionExampleV1 = {
+      version: 1,
+      kind: "verified_code_reflection_example",
+      path: relativePath(item.path, `reflection example ${index + 1} path`),
+      language: reflectionLanguage(item.language, String(item.path)),
+      commitSha: gitSha(item.commitSha, `reflection example ${index + 1} commit SHA`),
+      artifactSha256: fingerprint(item.artifactSha256, `reflection example ${index + 1} artifact hash`),
+      artifactBytes: integer(item.artifactBytes, `reflection example ${index + 1} artifact bytes`, 1, 10 * 1024 * 1024),
+      startLine,
+      endLine,
+      code,
+      codeSha256: fingerprint(item.codeSha256, `reflection example ${index + 1} code hash`),
+    };
+    if (result.commitSha !== commitSha) fail("Verified code reflection example commit does not match its bundle.");
+    if (result.codeSha256 !== `sha256:${portableSha256Text(result.code)}`) {
+      fail("Verified code reflection example hash does not match its content.");
+    }
+    return result;
+  });
+  if (
+    new Set(examples.map(({ path, startLine, endLine }) => `${path}\0${startLine}\0${endLine}`)).size !==
+    examples.length
+  ) {
+    fail("Verified code reflection example selections must be unique.");
+  }
+  const result: VerifiedCodeReflectionExamplesV1 = {
+    version: 1,
+    kind: "verified_code_reflection_examples",
+    handoffFingerprint,
+    commitSha,
+    examples,
+    fingerprint: fingerprint(record.fingerprint, "verified code reflection examples fingerprint"),
+  };
+  const { fingerprint: observed, ...evidence } = result;
+  if (observed !== sha256(evidence)) fail("Verified code reflection examples fingerprint does not match its evidence.");
+  if (expectedHandoff !== undefined) {
+    const handoff = parseVerifiedCodePublicationHandoffV1(expectedHandoff);
+    if (result.handoffFingerprint !== handoff.fingerprint || result.commitSha !== handoff.commitSha) {
+      fail("Verified code reflection examples do not match the expected publication handoff.");
+    }
+  }
+  return result;
+}
+
 export function parseVerifiedLocalCommitForPublicationV1(
   value: unknown,
 ): VerifiedLocalCommitForPublicationV1 {
@@ -263,6 +481,7 @@ export function parseVerifiedLocalCommitForPublicationV1(
     changedPaths: paths(record.changedPaths, "changed paths"),
     artifactHashes: artifactHashes(record.artifactHashes),
     changedArtifacts: changedArtifacts(record.changedArtifacts),
+    identity: commitIdentity(record.identity, "local commit identity"),
     targetedValidationReceiptId: boundedText(record.targetedValidationReceiptId, "targeted validation receipt id", 1, 256),
     fullValidationReceiptId: boundedText(record.fullValidationReceiptId, "full validation receipt id", 1, 256),
     targetedValidationFingerprint: fingerprint(record.targetedValidationFingerprint, "targeted validation fingerprint"),
@@ -299,6 +518,7 @@ export function parseVerifiedLocalCommitForPublicationV1(
     changedPaths: result.changedPaths,
     artifactHashes: result.artifactHashes,
     changedArtifacts: result.changedArtifacts,
+    identity: result.identity,
     targetedValidationReceiptId: result.targetedValidationReceiptId,
     fullValidationReceiptId: result.fullValidationReceiptId,
     targetedValidationFingerprint: result.targetedValidationFingerprint,
@@ -315,6 +535,7 @@ const LOCAL_COMMIT_KEYS = [
   "version", "kind", "id", "status", "requestId", "runId", "worktreeId",
   "workspaceId", "branch", "baseSha", "commitSha", "parentSha", "treeSha",
   "diffFingerprint", "changedPaths", "artifactHashes", "changedArtifacts",
+  "identity",
   "targetedValidationReceiptId", "fullValidationReceiptId",
   "targetedValidationFingerprint", "fullValidationFingerprint", "committedAt",
   "fingerprint",
@@ -326,6 +547,7 @@ const HANDOFF_KEYS = [
   "canonicalWorktreeRoot", "canonicalWorktreeFingerprint", "branch", "baseBranch",
   "baseSha", "commitSha", "parentSha", "treeSha", "diffFingerprint",
   "changedPaths", "artifactHashes", "changedArtifacts", "artifactFingerprint",
+  "identity",
   "targetedValidationReceiptId", "fullValidationReceiptId",
   "targetedValidationFingerprint", "fullValidationFingerprint",
   "localCommitReceiptId", "localCommitReceiptFingerprint", "committedAt",
@@ -351,6 +573,24 @@ function changedArtifacts(value: unknown): PublicationChangedArtifactV1[] {
       sha256: record.sha256 === null ? null : fingerprint(record.sha256, `changed artifact ${index + 1} sha256`),
     };
   });
+}
+
+function commitIdentity(value: unknown, label: string): AgentGitCommitIdentityV1 {
+  const record = exactRecord(
+    value,
+    ["authorName", "authorEmail", "committerName", "committerEmail"],
+    label,
+  );
+  const identity: AgentGitCommitIdentityV1 = {
+    authorName: boundedText(record.authorName, `${label} author name`, 1, 256),
+    authorEmail: boundedText(record.authorEmail, `${label} author email`, 1, 320),
+    committerName: boundedText(record.committerName, `${label} committer name`, 1, 256),
+    committerEmail: boundedText(record.committerEmail, `${label} committer email`, 1, 320),
+  };
+  if (!isAgentGitCommitIdentityV1(identity)) {
+    fail(`${label} must match the host-pinned neutral Agentic Researcher identity.`);
+  }
+  return identity;
 }
 
 function paths(value: unknown, label: string): string[] {
@@ -452,6 +692,43 @@ function boundedText(value: unknown, label: string, min: number, max: number): s
     fail(`${label} must be bounded text.`);
   }
   return value;
+}
+
+function multilineText(value: unknown, label: string, min: number, max: number): string {
+  if (
+    typeof value !== "string" ||
+    value.length < min ||
+    value.length > max ||
+    value.includes("\0")
+  ) {
+    fail(`${label} must be bounded text without null bytes.`);
+  }
+  return value;
+}
+
+function sourceLines(content: string): string[] {
+  const lines = content.replace(/\r\n?/gu, "\n").split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines.length > 0 ? lines : [""];
+}
+
+function reflectionLanguage(value: unknown, path: string): string {
+  if (value !== undefined) {
+    const explicit = boundedText(value, "reflection example language", 1, 32).toLowerCase();
+    if (!/^[a-z0-9_+#.-]+$/u.test(explicit)) {
+      fail("Reflection example language is invalid.");
+    }
+    return explicit;
+  }
+  const extension = path.toLowerCase().split(".").pop() ?? "";
+  const languages: Record<string, string> = {
+    c: "c", cc: "cpp", cpp: "cpp", cs: "csharp", css: "css", go: "go",
+    html: "html", java: "java", js: "javascript", json: "json", jsx: "jsx",
+    kt: "kotlin", md: "markdown", php: "php", py: "python", rb: "ruby",
+    rs: "rust", sh: "shell", sql: "sql", swift: "swift", ts: "typescript",
+    tsx: "tsx", yaml: "yaml", yml: "yaml",
+  };
+  return languages[extension] ?? "text";
 }
 
 function sha256(value: unknown): string {

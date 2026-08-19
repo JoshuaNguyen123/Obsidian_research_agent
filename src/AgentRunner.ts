@@ -113,6 +113,14 @@ import {
   hasExplicitResearchPublicationIntent,
   PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
 } from "./tools/researchPublicationTool";
+import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "./tools/projectIdeaBriefTool";
+import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "./tools/jupyterReflectionTool";
+import { WRITE_PROJECT_RESULTS_TOOL_NAME } from "./tools/projectResultsTool";
+import { REPORT_PROGRESS_TO_LINEAR_TOOL_NAME } from "./tools/reportProgressToLinearTool";
+import {
+  extractExplicitJupyterNotebookPathsV1,
+  hasJupyterReflectionIntentV1,
+} from "./agent/jupyterReflectionIntent";
 import {
   hasExplicitResearchProjectHierarchyIntent,
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
@@ -138,6 +146,7 @@ import {
   estimateProjectLifecycleV1,
   getProjectLineageFingerprintHistoryV1,
   type ProjectLifecycleEstimateV1,
+  type ProjectLineageV1,
   type ProjectLifecycleStageV1,
 } from "./agent/projectLifecycle";
 import {
@@ -159,7 +168,7 @@ import {
   planCompoundCompletionReflection,
   reflectMissionCompletion,
 } from "./agent/completionReflection";
-import { appendInitiatingNoteReflectionMarkdown } from "./agent/initiatingNoteReflection";
+import { appendMarkdownReflectionWritebackV1 } from "./agent/reflectionWriteback";
 import {
   buildPipelineLineageV1,
   buildReflectionContextV1,
@@ -378,6 +387,7 @@ import {
   getModelLinearIssueTemplateStructureProblem,
   getUnsafeModelLinearIssueCreateOutputMessage,
   hasAffirmativeCodePathAction,
+  hasAffirmativeJoinedDeveloperLifecycleIntent,
   hasAmbiguousDatePrompt,
   hasAppendIntent,
   hasBrowserAutomationIntent,
@@ -429,6 +439,7 @@ import {
   hasOpenWebSourceIntent,
   hasPathTargetIntent,
   hasPreparedBackgroundCodeValidationCommitIntent,
+  hasProjectIdeationIntent,
   hasPriorAssistantResponseWritebackIntent,
   hasReplaceIntent,
   hasRepositoryCodeEditIntent,
@@ -801,13 +812,14 @@ import {
   resolvePolicyRoutedIntent,
   type PolicyDecision,
 } from "./agent/policyEngine";
-import type {
-  ActionReceipt,
-  AuthorizedActionContext,
-  PreparedAction,
-  ResourceAction,
-  ResourceRef,
-  ToolDescriptor,
+import {
+  withPreparedActionFingerprint,
+  type ActionReceipt,
+  type AuthorizedActionContext,
+  type PreparedAction,
+  type ResourceAction,
+  type ResourceRef,
+  type ToolDescriptor,
 } from "./agent/actions";
 import {
   consumeAuthorityGrant,
@@ -916,6 +928,27 @@ import {
 } from "./agent/missionGraphLegacyProjection";
 import { migrateLegacyPlanWithHostAuthority } from "./agent/missionGraphLegacyHostMigration";
 import { sha256Fingerprint as sha256MissionFingerprint } from "../packages/headless-runtime/src/canonicalize";
+import { portableSha256Text } from "../packages/core-api/src/portableSha256";
+import {
+  parseVerifiedCodeReflectionExamplesV1,
+  type VerifiedCodeReflectionExamplesV1,
+} from "../packages/core-api/src/verifiedCodePublicationHandoffV1";
+import {
+  bindAggregateProjectEventsToOnlyWorkUnitV1,
+  projectLinearBindingsFromProjectLineageV1,
+  projectStageEventsFromProjectLineageV1,
+} from "./agent/projectStageLineageMapper";
+import {
+  projectStageEventFromReceiptObservationV1,
+  type ProjectReceiptObservationV1,
+} from "./agent/projectStageReceiptMapper";
+import {
+  parseProjectStageEventV1,
+  type ProjectStageEventV1,
+} from "./agent/projectRunReport";
+import {
+  assertMeaningfulReflectionContentV1,
+} from "../packages/core-api/src/reflectionContentV1";
 import { buildBackgroundAuthorizationV1 } from "../packages/headless-runtime/src/backgroundContinuation";
 import { buildPreparedLinearIssueStateUpdateHandoffV1 } from "./agent/preparedExternalActionHandoff";
 import {
@@ -3041,6 +3074,23 @@ export async function runAgentMission({
   const currentSegmentSuccessfulToolNames: string[] = [];
   const failedToolNames: string[] = [];
   const writeReceipts: AgentRunReceipt[] = [];
+  const getPersistedProjectStageEvents = runToolContext.getProjectStageEvents;
+  runToolContext = {
+    ...runToolContext,
+    getProjectStageEvents: (requestedRunId) => {
+      const projectRunId =
+        requestedRunId?.trim() ||
+        runToolContext.rootMissionId?.trim() ||
+        runToolContext.runId?.trim() ||
+        runId;
+      return collectProjectStageEventsV1({
+        runId: projectRunId,
+        receiptEvents: writeReceipts,
+        lineages: runToolContext.getProjectLineages?.() ?? [],
+        hostEvents: getPersistedProjectStageEvents?.(projectRunId) ?? [],
+      });
+    },
+  };
   // Live receipt array: streamed writer.buildReceipt and tool writes push here
   // before any reflexController.evaluate / acceptance check on the same turn.
   let preparedStreamingSectionEdit: PreparedStreamingSectionEdit | null = null;
@@ -7959,7 +8009,7 @@ export async function runAgentMission({
       setLooseCompoundEnabled && !setLooseDeliveryGate.complete;
     // Unpaid set-loose delivery must stay resumable: downgrade soft terminals
     // (including clarifying) to budget so multi-segment auto-continue can run.
-    const effectiveStopReason = resolveEffectiveTerminalStopReasonV1({
+    let effectiveStopReason = resolveEffectiveTerminalStopReasonV1({
       terminalProjectionsAgree,
       setLooseDeliveryUnpaid,
       stopReason,
@@ -8014,6 +8064,700 @@ export async function runAgentMission({
         }
       }
     }
+    // Completion reflection is a required terminal mutation for a requested
+    // compound workflow. Perform and verify it before accepting or persisting
+    // a terminal mission state, so a failed append can never leave a durable
+    // `done` ledger behind.
+    const proofDebtSnapshot = runtimeSnapshot
+      ? proofDebtSnapshotFromRuntime(runtimeSnapshot, {
+          blockers: missionLedger?.blockers,
+          blockerCategory: missionLedger?.blockerCategory,
+          acceptance,
+        })
+      : missionLedger
+        ? proofDebtSnapshotFromLedger(missionLedger, { acceptance })
+        : {
+            acceptance,
+            missionPlan,
+            researchPlan,
+          };
+    const acceptanceForDebt = {
+      ...(proofDebtSnapshot.acceptance ?? acceptance),
+      missing: [
+        ...new Set([
+          ...((proofDebtSnapshot.acceptance?.missing ??
+            acceptance.missing) ??
+            []),
+          ...orchestratorHandoffMissing,
+        ]),
+      ],
+    };
+    let proofDebtForFinish = computeProofDebt({
+      ...proofDebtSnapshot,
+      acceptance: acceptanceForDebt,
+    });
+    const pendingGoalIds = Object.entries(operationGoals.goals)
+      .filter(([, state]) => state === "pending" || state === "failed")
+      .map(([goalId]) => goalId);
+    const explicitJupyterReflection =
+      hasJupyterReflectionIntentV1(activeIntentPrompt);
+    const lifecycleReflectionRequested =
+      compoundLifecycleStages.includes("reflection");
+    const reflectionMentioned =
+      explicitJupyterReflection ||
+      lifecycleReflectionRequested ||
+      /\breflect(?:ion|ive)?\b/iu.test(activeIntentPrompt);
+    const boundInitiatingNotePath =
+      runtimeSnapshot?.currentNotePath?.trim() ||
+      pinnedCurrentMarkdownPathForRun?.trim() ||
+      null;
+    const reflectionWriteReceipt = [...writeReceipts]
+      .reverse()
+      .find((receipt) => {
+        if (explicitJupyterReflection) {
+          return (
+            receipt.toolName === APPEND_JUPYTER_REFLECTION_TOOL_NAME &&
+            Boolean(receipt.path) &&
+            Boolean(
+              receipt.readback?.observedFingerprint ??
+                receipt.payloadFingerprint,
+            )
+          );
+        }
+        if (receipt.toolName === WRITE_PROJECT_RESULTS_TOOL_NAME) {
+          return Boolean(
+            receipt.path &&
+              (receipt.readback?.observedFingerprint ??
+                receipt.payloadFingerprint),
+          );
+        }
+        return (
+          Boolean(boundInitiatingNotePath) &&
+          receipt.path === boundInitiatingNotePath &&
+          Boolean(receipt.payloadFingerprint) &&
+          (receipt.toolName === "append_research_memory" ||
+            receipt.toolName === "append_to_current_file" ||
+            receipt.toolName === "replace_current_file")
+        );
+      });
+    let reflectionPersistence: PipelineLineageReflectionV1 =
+      !reflectionMentioned
+        ? { state: "not_requested" }
+        : missionIntent.explicitPersistence ||
+            missionIntent.requireWriteCompletion
+          ? reflectionWriteReceipt
+            ? {
+                state: "verified",
+                path: reflectionWriteReceipt.path!,
+                contentHash:
+                  reflectionWriteReceipt.readback?.observedFingerprint ??
+                  reflectionWriteReceipt.payloadFingerprint!,
+              }
+            : { state: "missing" }
+          : { state: "chat_only_not_persisted" };
+    let pipelineLineage: PipelineLineageV1 | null = null;
+    let projectLineageForReflection:
+      | Parameters<typeof buildPipelineLineageV1>[0]["lineage"]
+      | null = null;
+    let verifiedReflectionCodeExamples: VerifiedCodeReflectionExamplesV1 | null = null;
+    let reflectionCodeExamplesRequired = false;
+    let reflectionCodeExamplesFailure: string | null = null;
+    try {
+      const acceptedRunIds = new Set(
+        [runToolContext.rootMissionId, runToolContext.runId, runId]
+          .filter((value): value is string => Boolean(value?.trim()))
+          .map((value) => value.trim()),
+      );
+      const projectLineage = (runToolContext.getProjectLineages?.() ?? [])
+        .filter((candidate) => acceptedRunIds.has(candidate.runId))
+        .sort((left, right) => right.commits.length - left.commits.length)[0];
+      if (projectLineage) {
+        projectLineageForReflection = projectLineage;
+        const codeCommit = projectLineage.commits.find(
+          (commit) => commit.proof.stage === "code_execution",
+        );
+        if (codeCommit?.proof.stage === "code_execution") {
+          reflectionCodeExamplesRequired = true;
+          const resolver = runToolContext.resolveVerifiedCodeReflectionExamples;
+          if (!resolver) {
+            reflectionCodeExamplesFailure =
+              "The host cannot resolve exact-commit code examples for reflection.";
+          } else {
+            try {
+              const resolved = await resolver({
+                repositoryProfileKey: codeCommit.proof.repositoryProfileKey,
+                commitSha: codeCommit.proof.commitSha,
+              });
+              if (!resolved) {
+                reflectionCodeExamplesFailure =
+                  "Exact-commit code examples are unavailable for the verified code lineage.";
+              } else {
+                const parsed = parseVerifiedCodeReflectionExamplesV1(resolved);
+                if (parsed.commitSha !== codeCommit.proof.commitSha) {
+                  throw new Error(
+                    "Resolved reflection examples do not match the verified code commit.",
+                  );
+                }
+                verifiedReflectionCodeExamples = parsed;
+              }
+            } catch (error) {
+              reflectionCodeExamplesFailure = getUnknownErrorMessage(error);
+            }
+          }
+        }
+        pipelineLineage = buildPipelineLineageV1({
+          lineage: projectLineage,
+          reflection: reflectionPersistence,
+        });
+        events.onTrace?.({
+          id: `pipeline-lineage-${step}`,
+          kind: "verification",
+          step,
+          message: formatPipelineTimelineV1(pipelineLineage),
+          outputPreview: pipelineLineage,
+        });
+      }
+    } catch (error) {
+      events.onTrace?.({
+        id: `pipeline-lineage-${step}-unavailable`,
+        kind: "error",
+        step,
+        message:
+          "Pipeline lineage could not be projected from the host-owned ledger.",
+        error: {
+          code: "pipeline_lineage_projection_failed",
+          message: getUnknownErrorMessage(error),
+        },
+      });
+    }
+    let reflectionContext = buildReflectionContextV1({
+      runId,
+      ledger: missionLedger,
+      pipeline: pipelineLineage,
+      persistence: reflectionPersistence.state,
+    });
+    // Plan prose against the state that will exist only after exact readback,
+    // while keeping the observable lineage truthfully `missing` until commit.
+    // This avoids writing "reflection verification is still open" inside the
+    // very reflection whose successful append pays that proof.
+    const planningPipelineLineage =
+      reflectionPersistence.state === "missing" &&
+      projectLineageForReflection &&
+      boundInitiatingNotePath
+        ? buildPipelineLineageV1({
+            lineage: projectLineageForReflection,
+            reflection: {
+              state: "verified",
+              path: boundInitiatingNotePath,
+              contentHash: `sha256:${"0".repeat(64)}`,
+            },
+          })
+        : pipelineLineage;
+    const planningReflectionContext = buildReflectionContextV1({
+      runId,
+      ledger: missionLedger,
+      pipeline: planningPipelineLineage,
+      persistence: reflectionPersistence.state,
+    });
+    const reflectionRootMarkerId =
+      runtimeSnapshot?.lineage.rootRunId?.trim() ||
+      runToolContext.rootMissionId?.trim() ||
+      runId;
+    const successfulTerminalForInitiatingReflection =
+      effectiveStopReason === "final" ||
+      effectiveStopReason === "write_completed";
+    const reflectionWritebackPreconditionFailure =
+      compoundLifecycleDetected &&
+      !setLooseCompoundEnabled &&
+      successfulTerminalForInitiatingReflection &&
+      reflectionCodeExamplesRequired &&
+      !verifiedReflectionCodeExamples
+        ? reflectionCodeExamplesFailure ??
+          "Verified code examples are required for a code-completion reflection."
+        : null;
+    if (reflectionWritebackPreconditionFailure) {
+      effectiveStopReason = "budget";
+      acceptance = {
+        ...acceptance,
+        status: acceptance.status === "fail" ? "fail" : "needs_more_work",
+        missing: [
+          ...new Set([
+            ...acceptance.missing,
+            "verified_code_reflection_examples",
+            "reflection_writeback_receipt",
+          ]),
+        ],
+        reasons: [
+          ...new Set([
+            ...acceptance.reasons,
+            "verified_code_reflection_examples_unavailable",
+          ]),
+        ],
+        nextAction:
+          "Reconcile the exact verified code handoff, then retry completion reflection.",
+      };
+      events.onTrace?.({
+        id: `initiating-note-reflection-${step}:examples-unavailable`,
+        kind: "error",
+        step,
+        message:
+          "Terminal completion was blocked because immutable, commit-bound code examples were unavailable.",
+        error: {
+          code: "reflection_code_examples_unavailable",
+          message: reflectionWritebackPreconditionFailure,
+        },
+      });
+    }
+    const canonicalLifecycleReflectionPaid = (() => {
+      const durableReflectionReceiptIds = new Set([
+        ...(missionLedger?.receipts ?? []),
+        ...(resumeLedger?.receipts ?? []),
+      ]);
+      const acceptedReflectionRunIds = new Set(
+        [
+          runtimeSnapshot?.lineage.rootRunId,
+          runToolContext.rootMissionId,
+          runToolContext.runId,
+          runId,
+        ]
+          .filter((value): value is string => Boolean(value?.trim()))
+          .map((value) => value.trim()),
+      );
+      const durableLifecycleReflectionPaid = (
+        runToolContext.getProjectLineages?.() ?? []
+      ).some(
+        (candidate) =>
+          acceptedReflectionRunIds.has(candidate.runId) &&
+          candidate.commits.some((commit) => commit.stage === "reflection"),
+      );
+      return (
+        writeReceipts.some(
+          (receipt) =>
+            canonicalLifecycleReflectionReceiptPaysV1(receipt) &&
+            (durableReflectionReceiptIds.size === 0 ||
+              !receipt.id ||
+              durableReflectionReceiptIds.has(receipt.id)),
+        ) || durableLifecycleReflectionPaid
+      );
+    })();
+    let projectLifecycleCompletionFailure: string | null = null;
+    const requiresTerminalProjectLinearDrain =
+      compoundLifecycleStages.includes("linear_hierarchy") &&
+      compoundLifecycleStages.includes("reflection");
+    if (
+      canonicalLifecycleReflectionPaid &&
+      requiresTerminalProjectLinearDrain &&
+      effectiveStopReason !== "user_stopped"
+    ) {
+      try {
+        if (!runToolContext.verifyProjectLifecycleCompletion) {
+          throw new Error(
+            "The host cannot verify terminal Linear project progress.",
+          );
+        }
+        await runToolContext.verifyProjectLifecycleCompletion(runToolContext);
+      } catch (error) {
+        projectLifecycleCompletionFailure = getUnknownErrorMessage(error);
+        effectiveStopReason = "budget";
+        acceptance = {
+          ...acceptance,
+          status: acceptance.status === "fail" ? "fail" : "needs_more_work",
+          missing: [
+            ...new Set([
+              ...acceptance.missing,
+              "linear_project_progress_terminal_readback",
+            ]),
+          ],
+          reasons: [
+            ...new Set([
+              ...acceptance.reasons,
+              "project_lifecycle_completion_not_verified",
+            ]),
+          ],
+          nextAction:
+            "Reconcile the durable Linear progress outbox; do not rewrite the verified Results artifact.",
+        };
+        proofDebtForFinish = computeProofDebt({
+          ...proofDebtSnapshot,
+          acceptance: {
+            ...acceptance,
+            missing: [
+              ...new Set([
+                ...acceptance.missing,
+                ...orchestratorHandoffMissing,
+              ]),
+            ],
+          },
+        });
+        events.onStatus?.(
+          `Developer mission completion is waiting on Linear readback: ${projectLifecycleCompletionFailure}`,
+        );
+        events.onTrace?.({
+          id: `project-lifecycle-completion-${step}:deferred`,
+          kind: "error",
+          step,
+          message:
+            "The canonical reflection is durable; only the receipt-derived Linear completion projection will be retried.",
+          error: {
+            code: "project_lifecycle_completion_not_verified",
+            message: projectLifecycleCompletionFailure,
+          },
+        });
+      }
+    }
+    const compoundCompletionPlan = shouldPlanGenericInitiatingNoteReflectionV1({
+      compoundLifecycleDetected,
+      pipelineLineagePresent: Boolean(pipelineLineage),
+      successfulTerminal: successfulTerminalForInitiatingReflection,
+      reflectionWritebackPreconditionFailed: Boolean(
+        reflectionWritebackPreconditionFailure,
+      ),
+      explicitJupyterReflection,
+      canonicalLifecycleReflectionPaid,
+      setLooseCompoundEnabled,
+    })
+        ? planCompoundCompletionReflection({
+            prompt: activeIntentPrompt,
+            acceptance,
+            proofDebt: proofDebtForFinish,
+            writeReceiptCount: writeReceipts.length,
+            pendingGoalIds,
+            missionPlanStatus: missionPlan?.status,
+            reflectionContext: planningReflectionContext,
+            runId,
+            markerId: reflectionRootMarkerId,
+            initiatingNotePath: boundInitiatingNotePath,
+            workingMode: runToolContext.settings?.workingMode,
+            forceChatOnly: shouldForceCurrentPromptChatOnly(),
+            persistence: reflectionPersistence.state,
+            codeExamples: verifiedReflectionCodeExamples,
+          })
+        : null;
+    const completionReflection =
+      compoundCompletionPlan?.completion ??
+      reflectMissionCompletion({
+        prompt: activeIntentPrompt,
+        acceptance,
+        proofDebt: proofDebtForFinish,
+        writeReceiptCount: writeReceipts.length,
+        pendingGoalIds,
+        missionPlanStatus: missionPlan?.status,
+        reflectionContext,
+      });
+    let reflectionWritebackFailure: string | null =
+      reflectionWritebackPreconditionFailure;
+    // Host-owned, ledger-cited initiating-note reflection. The target is the
+    // note pinned when the mission began (or its receipt-backed rename), never
+    // whichever editor happens to be active when a long run ends.
+    if (compoundCompletionPlan) {
+      const notePlan = compoundCompletionPlan.initiatingNote;
+      if (notePlan.shouldWriteNote && notePlan.destination.kind === "initiating_note") {
+        try {
+          const notePath = notePlan.destination.notePath;
+          const store = {
+            read: async (path: string): Promise<string> => {
+              const file = runToolContext.app.vault.getFileByPath(path);
+              if (!file || file.extension.toLowerCase() !== "md") {
+                throw new Error(`Reflection target is unavailable: ${path}`);
+              }
+              return runToolContext.app.vault.read(file);
+            },
+            modify: async (path: string, content: string): Promise<void> => {
+              const file = runToolContext.app.vault.getFileByPath(path);
+              if (!file || file.extension.toLowerCase() !== "md") {
+                throw new Error(`Reflection target is unavailable: ${path}`);
+              }
+              await runToolContext.app.vault.modify(file, content);
+            },
+          };
+          const current = await store.read(notePath);
+          const expectedBeforeSha256 =
+            `sha256:${portableSha256Text(current)}`;
+          const operationId = `reflection-${portableSha256Text(
+            `${reflectionRootMarkerId}:${notePath}`,
+          ).slice(0, 32)}`;
+          const preparedAt = (runToolContext.now?.() ?? new Date()).toISOString();
+          const preparedAction = await withPreparedActionFingerprint({
+            version: 1,
+            id: operationId,
+            runId,
+            toolCallId: operationId,
+            toolName: "append_to_current_file",
+            target: {
+              system: "vault",
+              resourceType: "markdown_file",
+              id: notePath,
+              path: notePath,
+              revision: expectedBeforeSha256,
+            },
+            relatedResources: [],
+            normalizedArgs: {
+              path: notePath,
+              marker: notePlan.marker,
+              expectedBeforeSha256,
+              markdownSha256: `sha256:${portableSha256Text(notePlan.markdown)}`,
+            },
+            preview: {
+              summary: `Append the verified mission-completion reflection to ${notePath}.`,
+              destination: notePath,
+              outboundPayload: {
+                marker: notePlan.marker,
+                markdown: notePlan.markdown,
+              },
+              warnings: [],
+              outboundBytes: new TextEncoder().encode(notePlan.markdown).byteLength,
+            },
+            expectedTargetRevision: expectedBeforeSha256,
+            idempotencyKey: `completion-reflection:${reflectionRootMarkerId}:${expectedBeforeSha256}`,
+            preparedAt,
+            expiresAt: new Date(Date.parse(preparedAt) + 120_000).toISOString(),
+          });
+          const approval = await requestRunnerToolApproval({
+            toolCall: {
+              name: "append_to_current_file",
+              arguments: { path: notePath, marker: notePlan.marker },
+              id: operationId,
+            },
+            step,
+            action: preparedAction.preview.summary,
+            reason:
+              "Approve the exact initiating-note hash and completion-reflection bytes; target drift invalidates this approval.",
+            policyTags: ["vault_write", "completion_reflection", "exact"],
+            timeoutMs: 120_000,
+            preparedAction,
+            confirmationIndex: 1,
+            requiredConfirmations: 1,
+          });
+          const approvedFingerprint =
+            approval.request.payloadFingerprint ??
+            approval.request.preparedAction?.payloadFingerprint ??
+            "";
+          if (
+            approval.decision !== "approved" ||
+            approvedFingerprint !== preparedAction.payloadFingerprint
+          ) {
+            throw new Error(
+              "Completion-reflection approval was denied, expired, or did not match the prepared bytes.",
+            );
+          }
+          const completedAt = (runToolContext.now?.() ?? new Date()).toISOString();
+          const writeback = await appendMarkdownReflectionWritebackV1({
+            operationId,
+            target: { kind: "markdown_note", notePath },
+            expectedBeforeSha256,
+            plan: notePlan,
+            completedAt,
+            store,
+          });
+          const receipt: AgentRunReceipt = {
+            version: 1,
+            id: writeback.id,
+            runId,
+            actionId: preparedAction.id,
+            toolName: "append_to_current_file",
+            operation: "append",
+            message: `Verified initiating-note reflection at ${notePath}.`,
+            resource: {
+              system: "vault",
+              resourceType: "markdown_file",
+              id: notePath,
+              path: notePath,
+              revision: writeback.afterSha256,
+            },
+            payloadFingerprint: preparedAction.payloadFingerprint,
+            grantId: approval.request.id,
+            idempotencyKey: preparedAction.idempotencyKey,
+            committedAt: writeback.completedAt,
+            commitKind:
+              writeback.status === "already_applied"
+                ? "reconciled"
+                : "committed",
+            readback: {
+              status: "verified",
+              checkedAt: writeback.completedAt,
+              observedFingerprint: writeback.afterSha256,
+              observedRevision: writeback.afterSha256,
+            },
+            effects: {
+              bytesWritten: writeback.bytesWritten,
+              affectedCount: writeback.status === "already_applied" ? 0 : 1,
+            },
+            path: notePath,
+            bytesWritten: writeback.bytesWritten,
+            output: {
+              ...writeback,
+              preparedActionFingerprint: preparedAction.payloadFingerprint,
+            },
+          };
+          writeReceipts.push(receipt);
+          events.onReceipt?.(receipt);
+          await recordLedgerReceipt(receipt, step);
+          reflectionPersistence = {
+            state: "verified",
+            path: notePath,
+            contentHash: writeback.afterSha256,
+          };
+          if (projectLineageForReflection) {
+            pipelineLineage = buildPipelineLineageV1({
+              lineage: projectLineageForReflection,
+              reflection: reflectionPersistence,
+            });
+            reflectionContext = buildReflectionContextV1({
+              runId,
+              ledger: missionLedger,
+              pipeline: pipelineLineage,
+              persistence: reflectionPersistence.state,
+            });
+            events.onTrace?.({
+              id: `pipeline-lineage-${step}:reflection-verified`,
+              kind: "verification",
+              step,
+              message: formatPipelineTimelineV1(pipelineLineage),
+              outputPreview: pipelineLineage,
+            });
+          }
+          events.onStatus?.(
+            `Initiating-note reflection verified at ${notePath}.`,
+          );
+        } catch (error) {
+          reflectionWritebackFailure = getUnknownErrorMessage(error);
+          effectiveStopReason = "budget";
+          acceptance = {
+            ...acceptance,
+            status:
+              acceptance.status === "fail" ? "fail" : "needs_more_work",
+            missing: [
+              ...new Set([
+                ...acceptance.missing,
+                "reflection_writeback_receipt",
+              ]),
+            ],
+            reasons: [
+              ...new Set([
+                ...acceptance.reasons,
+                "initiating_note_reflection_failed",
+              ]),
+            ],
+            nextAction:
+              "Retry the exact initiating-note reflection after resolving its writeback blocker.",
+          };
+          events.onStatus?.(
+            `Initiating-note reflection failed: ${reflectionWritebackFailure}`,
+          );
+          events.onTrace?.({
+            id: `initiating-note-reflection-${step}:failed`,
+            kind: "error",
+            step,
+            message:
+              "Terminal completion was blocked because the exact initiating-note reflection did not commit and read back.",
+            error: {
+              code: "reflection_writeback_failed",
+              message: reflectionWritebackFailure,
+            },
+          });
+        }
+      } else if (notePlan.chatSummary.trim()) {
+        events.onStatus?.(notePlan.chatSummary);
+      }
+    }
+    // Set-loose compound: unpaid delivery proofs must not Idle as success.
+    const completionReflectionForContinue =
+      reflectionWritebackFailure
+        ? {
+            ...completionReflection,
+            done: false,
+            confidence: Math.min(completionReflection.confidence, 0.35),
+            reason: "reflection_writeback_failed",
+            remainingActions: [
+              ...new Set([
+                ...completionReflection.remainingActions,
+                "Retry the exact initiating-note reflection writeback.",
+              ]),
+            ],
+            context: reflectionContext,
+          }
+        : setLooseCompoundEnabled && !setLooseDeliveryGate.complete
+        ? {
+            ...completionReflection,
+            done: false,
+            reason: setLooseDeliveryGate.reason,
+            remainingActions: [
+              ...new Set([
+                ...completionReflection.remainingActions,
+                ...setLooseDeliveryGate.unpaid,
+                ...setLooseUnpaidStages,
+              ]),
+            ],
+          }
+        : {
+            ...completionReflection,
+            context: reflectionContext,
+          };
+    if (
+      setLooseCompoundEnabled &&
+      !setLooseDeliveryGate.complete
+    ) {
+      events.onStatus?.(
+        `set_loose_delivery_unpaid=${setLooseDeliveryGate.unpaid.join(",")}`,
+      );
+      events.onTrace?.({
+        id: `set-loose-delivery-gate-${step}`,
+        kind: "status",
+        step,
+        message: `set_loose_delivery_unpaid=${setLooseDeliveryGate.unpaid.join(",")}`,
+        outputPreview: {
+          proofs: setLooseDeliveryProofs,
+          unpaid: setLooseDeliveryGate.unpaid,
+          unpaidStages: setLooseUnpaidStages,
+          reason: setLooseDeliveryGate.reason,
+        },
+      });
+    }
+    if (
+      !completionReflectionForContinue.done &&
+      effectiveStopReason === "budget"
+    ) {
+      events.onTrace?.({
+        id: `completion-reflection-${step}`,
+        kind: "status",
+        step,
+        message: `Completion reflection: ${completionReflectionForContinue.reason}`,
+        outputPreview: completionReflectionForContinue,
+      });
+    }
+    const setLooseDeliveryPendingTools = setLooseDeliveryUnpaid
+      ? pendingToolsForUnpaidSetLooseDelivery(setLooseDeliveryGate.unpaid)
+      : [];
+    const pendingToolNames = resolvePendingToolsForAutoContinuation({
+      debtPendingToolNames: [
+        ...(proofDebtForFinish.nextAction.toolName
+          ? [proofDebtForFinish.nextAction.toolName]
+          : []),
+        ...setLooseDeliveryPendingTools,
+      ],
+      pendingRequiredWrites: getPendingRequiredWriteToolNames(
+        operationGoals,
+        requiredWriteTools,
+      ),
+    });
+    const acceptanceForAutoContinue =
+      setLooseDeliveryUnpaid
+        ? {
+            ...acceptance,
+            status:
+              acceptance.status === "pass"
+                ? "needs_more_work"
+                : acceptance.status,
+            missing: [
+              ...new Set([
+                ...(acceptance.missing ?? []),
+                ...setLooseDeliveryGate.unpaid.map(
+                  (item) => `set_loose_delivery:${item}`,
+                ),
+              ]),
+            ],
+          }
+        : acceptance;
     await recordMissionAcceptance(acceptance, step, {
       // A budget/user stop is resumable. Persist the acceptance diagnosis but
       // do not turn a repairable, unfinished active task into a blocked task.
@@ -8029,6 +8773,12 @@ export async function runAgentMission({
           ...(setLooseCompoundEnabled && !setLooseDeliveryGate.complete
             ? [`set_loose_delivery_unpaid=${setLooseDeliveryGate.unpaid.join(",")}`]
             : []),
+          ...(reflectionWritebackFailure
+            ? ["reflection_writeback_failed"]
+            : []),
+          ...(projectLifecycleCompletionFailure
+            ? ["linear_project_progress_terminal_readback"]
+            : []),
         ].join(", ")}.`,
       );
       events.onTrace?.({
@@ -8041,6 +8791,8 @@ export async function runAgentMission({
           effectiveStopReason,
           acceptance,
           setLooseDeliveryGate,
+          reflectionWritebackFailure,
+          projectLifecycleCompletionFailure,
         },
       });
     }
@@ -8053,8 +8805,8 @@ export async function runAgentMission({
       );
       setLedgerNextAction(
         missionLedger,
-        nextAction ??
-          acceptance.nextAction ??
+        acceptance.nextAction ??
+          nextAction ??
           getStopReasonMessage(effectiveStopReason),
         runToolContext.now?.() ?? new Date(),
       );
@@ -8139,269 +8891,6 @@ export async function runAgentMission({
         });
       }
     }
-    // Agent B: thin completion-reflection hook before auto-continue decision.
-    const proofDebtSnapshot = runtimeSnapshot
-      ? proofDebtSnapshotFromRuntime(runtimeSnapshot, {
-          blockers: missionLedger?.blockers,
-          blockerCategory: missionLedger?.blockerCategory,
-          acceptance,
-        })
-      : missionLedger
-        ? proofDebtSnapshotFromLedger(missionLedger, { acceptance })
-        : {
-            acceptance,
-            missionPlan,
-            researchPlan,
-          };
-    const acceptanceForDebt = {
-      ...(proofDebtSnapshot.acceptance ?? acceptance),
-      missing: [
-        ...new Set([
-          ...((proofDebtSnapshot.acceptance?.missing ??
-            acceptance.missing) ??
-            []),
-          ...orchestratorHandoffMissing,
-        ]),
-      ],
-    };
-    const proofDebtForFinish = computeProofDebt({
-      ...proofDebtSnapshot,
-      acceptance: acceptanceForDebt,
-    });
-    const pendingGoalIds = Object.entries(operationGoals.goals)
-      .filter(([, state]) => state === "pending" || state === "failed")
-      .map(([goalId]) => goalId);
-    const reflectionMentioned = /\breflect(?:ion|ive)?\b/iu.test(
-      activeIntentPrompt,
-    );
-    const reflectionWriteReceipt = [...writeReceipts]
-      .reverse()
-      .find(
-        (receipt) =>
-          Boolean(receipt.path) &&
-          Boolean(receipt.payloadFingerprint) &&
-          (receipt.toolName === "append_research_memory" ||
-            receipt.toolName === "append_to_current_file" ||
-            receipt.toolName === "replace_current_file"),
-      );
-    const reflectionPersistence: PipelineLineageReflectionV1 =
-      !reflectionMentioned
-        ? { state: "not_requested" }
-        : missionIntent.explicitPersistence ||
-            missionIntent.requireWriteCompletion
-          ? reflectionWriteReceipt
-            ? {
-                state: "verified",
-                path: reflectionWriteReceipt.path!,
-                contentHash: reflectionWriteReceipt.payloadFingerprint!,
-              }
-            : { state: "missing" }
-          : { state: "chat_only_not_persisted" };
-    let pipelineLineage: PipelineLineageV1 | null = null;
-    try {
-      const acceptedRunIds = new Set(
-        [runToolContext.rootMissionId, runToolContext.runId, runId]
-          .filter((value): value is string => Boolean(value?.trim()))
-          .map((value) => value.trim()),
-      );
-      const projectLineage = (runToolContext.getProjectLineages?.() ?? [])
-        .filter((candidate) => acceptedRunIds.has(candidate.runId))
-        .sort((left, right) => right.commits.length - left.commits.length)[0];
-      if (projectLineage) {
-        pipelineLineage = buildPipelineLineageV1({
-          lineage: projectLineage,
-          reflection: reflectionPersistence,
-        });
-        events.onTrace?.({
-          id: `pipeline-lineage-${step}`,
-          kind: "verification",
-          step,
-          message: formatPipelineTimelineV1(pipelineLineage),
-          outputPreview: pipelineLineage,
-        });
-      }
-    } catch (error) {
-      events.onTrace?.({
-        id: `pipeline-lineage-${step}-unavailable`,
-        kind: "error",
-        step,
-        message:
-          "Pipeline lineage could not be projected from the host-owned ledger.",
-        error: {
-          code: "pipeline_lineage_projection_failed",
-          message: getUnknownErrorMessage(error),
-        },
-      });
-    }
-    const reflectionContext = buildReflectionContextV1({
-      runId,
-      ledger: missionLedger,
-      pipeline: pipelineLineage,
-      persistence: reflectionPersistence.state,
-    });
-    const activeNotePath =
-      runToolContext.app?.workspace?.getActiveFile?.()?.path?.trim() ||
-      writeReceipts
-        .map((receipt) => receipt.path?.trim())
-        .find((path): path is string => Boolean(path)) ||
-      null;
-    const reflectionRootMarkerId =
-      runtimeSnapshot?.lineage.rootRunId?.trim() ||
-      runToolContext.rootMissionId?.trim() ||
-      runId;
-    const successfulTerminalForInitiatingReflection =
-      effectiveStopReason === "final" ||
-      effectiveStopReason === "write_completed";
-    const compoundCompletionPlan =
-      compoundLifecycleDetected &&
-      pipelineLineage &&
-      successfulTerminalForInitiatingReflection &&
-      // Set-loose project delivery owns its reflection inside the exact
-      // publication/finalizer path. Running the generic hook as well can append
-      // a second completion section and, before the delivery gate pays, can
-      // manufacture apparent progress on every continuation segment.
-      !setLooseCompoundEnabled
-        ? planCompoundCompletionReflection({
-            prompt: activeIntentPrompt,
-            acceptance,
-            proofDebt: proofDebtForFinish,
-            writeReceiptCount: writeReceipts.length,
-            pendingGoalIds,
-            missionPlanStatus: missionPlan?.status,
-            reflectionContext,
-            runId,
-            markerId: reflectionRootMarkerId,
-            initiatingNotePath: activeNotePath,
-            workingMode: runToolContext.settings?.workingMode,
-            forceChatOnly: shouldForceCurrentPromptChatOnly(),
-            persistence: reflectionPersistence.state,
-          })
-        : null;
-    const completionReflection =
-      compoundCompletionPlan?.completion ??
-      reflectMissionCompletion({
-        prompt: activeIntentPrompt,
-        acceptance,
-        proofDebt: proofDebtForFinish,
-        writeReceiptCount: writeReceipts.length,
-        pendingGoalIds,
-        missionPlanStatus: missionPlan?.status,
-        reflectionContext,
-      });
-    // Agent 5: ledger-cited initiating-note reflection (no raw receipt dump).
-    if (compoundCompletionPlan) {
-      const notePlan = compoundCompletionPlan.initiatingNote;
-      if (notePlan.shouldWriteNote && notePlan.destination.kind === "initiating_note") {
-        try {
-          const notePath = notePlan.destination.notePath;
-          const file =
-            runToolContext.app?.vault?.getAbstractFileByPath?.(notePath) ?? null;
-          if (file && typeof runToolContext.app?.vault?.read === "function") {
-            const current = await runToolContext.app.vault.read(file as never);
-            const next = appendInitiatingNoteReflectionMarkdown(current, notePlan);
-            if (next !== current) {
-              await runToolContext.app.vault.modify(file as never, next);
-              events.onStatus?.(
-                `Initiating-note reflection appended to ${notePath}.`,
-              );
-            }
-          } else {
-            events.onStatus?.(
-              `Initiating-note reflection skipped; note not found: ${notePath}`,
-            );
-          }
-        } catch (error) {
-          events.onStatus?.(
-            `Initiating-note reflection failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
-      } else if (notePlan.chatSummary.trim()) {
-        events.onStatus?.(notePlan.chatSummary);
-      }
-    }
-    // Set-loose compound: unpaid delivery proofs must not Idle as success.
-    const completionReflectionForContinue =
-      setLooseCompoundEnabled && !setLooseDeliveryGate.complete
-        ? {
-            ...completionReflection,
-            done: false,
-            reason: setLooseDeliveryGate.reason,
-            remainingActions: [
-              ...new Set([
-                ...completionReflection.remainingActions,
-                ...setLooseDeliveryGate.unpaid,
-                ...setLooseUnpaidStages,
-              ]),
-            ],
-          }
-        : completionReflection;
-    if (
-      setLooseCompoundEnabled &&
-      !setLooseDeliveryGate.complete
-    ) {
-      events.onStatus?.(
-        `set_loose_delivery_unpaid=${setLooseDeliveryGate.unpaid.join(",")}`,
-      );
-      events.onTrace?.({
-        id: `set-loose-delivery-gate-${step}`,
-        kind: "status",
-        step,
-        message: `set_loose_delivery_unpaid=${setLooseDeliveryGate.unpaid.join(",")}`,
-        outputPreview: {
-          proofs: setLooseDeliveryProofs,
-          unpaid: setLooseDeliveryGate.unpaid,
-          unpaidStages: setLooseUnpaidStages,
-          reason: setLooseDeliveryGate.reason,
-        },
-      });
-    }
-    if (
-      !completionReflectionForContinue.done &&
-      effectiveStopReason === "budget"
-    ) {
-      events.onTrace?.({
-        id: `completion-reflection-${step}`,
-        kind: "status",
-        step,
-        message: `Completion reflection: ${completionReflectionForContinue.reason}`,
-        outputPreview: completionReflectionForContinue,
-      });
-    }
-    const setLooseDeliveryPendingTools = setLooseDeliveryUnpaid
-      ? pendingToolsForUnpaidSetLooseDelivery(setLooseDeliveryGate.unpaid)
-      : [];
-    const pendingToolNames = resolvePendingToolsForAutoContinuation({
-      debtPendingToolNames: [
-        ...(proofDebtForFinish.nextAction.toolName
-          ? [proofDebtForFinish.nextAction.toolName]
-          : []),
-        ...setLooseDeliveryPendingTools,
-      ],
-      pendingRequiredWrites: getPendingRequiredWriteToolNames(
-        operationGoals,
-        requiredWriteTools,
-      ),
-    });
-    const acceptanceForAutoContinue =
-      setLooseDeliveryUnpaid
-        ? {
-            ...acceptance,
-            status:
-              acceptance.status === "pass"
-                ? "needs_more_work"
-                : acceptance.status,
-            missing: [
-              ...new Set([
-                ...(acceptance.missing ?? []),
-                ...setLooseDeliveryGate.unpaid.map(
-                  (item) => `set_loose_delivery:${item}`,
-                ),
-              ]),
-            ],
-          }
-        : acceptance;
     const hasMatchingGrant = shouldInspectAutoContinuationGrant(
       effectiveStopReason,
       suppressAutoContinuation,
@@ -8493,6 +8982,12 @@ export async function runAgentMission({
         ? [
             setLooseCompoundEnabled && setLooseDeliveryUnpaid
               ? `set_loose_delivery_unpaid=${setLooseDeliveryGate.unpaid.join(",")}`
+              : null,
+            reflectionWritebackFailure
+              ? `required_tools_failed:reflection_writeback_failed:${reflectionWritebackFailure}`
+              : null,
+            projectLifecycleCompletionFailure
+              ? `required_tools_failed:project_lifecycle_completion_not_verified:${projectLifecycleCompletionFailure}`
               : null,
             autoContinuation.reason !== "not_budget"
               ? autoContinuation.reason
@@ -13140,6 +13635,37 @@ export async function runAgentMission({
         events.onReceipt?.(receipt);
         await recordLedgerReceipt(receipt, step);
         if (
+          result.receipt &&
+          toolCall.name !== WRITE_PROJECT_RESULTS_TOOL_NAME &&
+          toolCall.name !== APPEND_JUPYTER_REFLECTION_TOOL_NAME
+        ) {
+          try {
+            await runToolContext.persistProjectStageReceipt?.(
+              result.receipt,
+              runToolContext,
+            );
+          } catch (error) {
+            // The underlying tool receipt is already committed and must never
+            // be reclassified as a failed/replayable mutation merely because
+            // downstream Linear progress could not be projected. The durable
+            // stage callback is proof-driven and can resume from this receipt.
+            console.warn(
+              `Deferred project-stage projection for ${toolCall.name}.`,
+              error,
+            );
+          }
+        }
+        if (
+          result.receipt &&
+          (toolCall.name === WRITE_PROJECT_RESULTS_TOOL_NAME ||
+            toolCall.name === APPEND_JUPYTER_REFLECTION_TOOL_NAME)
+        ) {
+          await runToolContext.persistProjectReflectionReceipt?.(
+            result.receipt,
+            runToolContext,
+          );
+        }
+        if (
           toolCall.name === "append_to_current_file" ||
           toolCall.name === "replace_current_file" ||
           toolCall.name === "create_file"
@@ -13311,13 +13837,26 @@ export async function runAgentMission({
       }
 
       if (setLooseCompoundEnabled) {
-        const paidStage = lifecycleStagePaidBySuccessfulTool({
+        const paidBefore = new Set(setLoosePaidStages);
+        const legacyPaidStage = lifecycleStagePaidBySuccessfulTool({
           toolName: toolCall.name,
           ok: true,
         });
-        if (paidStage) {
-          setLoosePaidStages.add(paidStage);
+        if (legacyPaidStage) {
+          setLoosePaidStages.add(legacyPaidStage);
         }
+        const graphPaid = resolveCompletedCompoundLifecycleStagesV1(
+          missionGraphSession?.graph ?? missionGraph,
+          compoundLifecycleStages,
+          setLoosePaidStages,
+        );
+        if (graphPaid.authoritative) {
+          setLoosePaidStages.clear();
+          for (const stage of graphPaid.completed) setLoosePaidStages.add(stage);
+        }
+        const paidStage = compoundLifecycleStages.find(
+          (stage) => setLoosePaidStages.has(stage) && !paidBefore.has(stage),
+        ) ?? null;
 
         const argText =
           typeof toolCall.arguments.text === "string"
@@ -13357,37 +13896,22 @@ export async function runAgentMission({
           setLooseGateAfterTool.unpaid.length === 1 &&
           setLooseGateAfterTool.unpaid[0] === "note_reflection"
         ) {
-          const synthesized = buildSetLooseNoteReflectionMarkdown({
-            prompt: activeIntentPrompt,
-            receipts: writeReceipts,
-            assistantContent: lastFinalOutput,
+          const reflection = await runHostSetLooseReflection({
+            step,
+            toolIndex: "set-loose-reflection-after-tool",
+            status:
+              "Host-driving the mission-bound terminal reflection after delivery tools paid.",
           });
-          if (synthesized) {
-            events.onStatus?.(
-              "Host-synthesizing set-loose note reflection after delivery tools paid.",
+          if (reflection?.result.ok) {
+            Object.assign(
+              setLooseDeliveryProofs,
+              applySetLooseDeliveryProofFromSuccessfulTool({
+                toolName: reflection.result.toolName,
+                output: reflection.result.output,
+                argumentsText: reflection.renderedContent ?? "",
+                proofs: setLooseDeliveryProofs,
+              }),
             );
-            const appendResult = await runObservedModelToolCall({
-              origin: "runner",
-              toolCall: {
-                name: "append_to_current_file",
-                arguments: { text: synthesized },
-              },
-              step,
-              toolIndex: "set-loose-note-reflection-after-tool",
-              recordTranscript: false,
-            });
-            if (appendResult.ok) {
-              lastFinalOutput = synthesized;
-              Object.assign(
-                setLooseDeliveryProofs,
-                applySetLooseDeliveryProofFromSuccessfulTool({
-                  toolName: "append_to_current_file",
-                  output: appendResult.output,
-                  argumentsText: synthesized,
-                  proofs: setLooseDeliveryProofs,
-                }),
-              );
-            }
           }
         }
         if (
@@ -14001,6 +14525,32 @@ export async function runAgentMission({
       });
       throw error;
     }
+  };
+  const runHostSetLooseReflection = async (input: {
+    step: number;
+    toolIndex: string;
+    status: string;
+    assistantContent?: string;
+  }): Promise<{ result: ToolExecutionResult; renderedContent: string | null } | null> => {
+    const call = buildSetLooseLifecycleReflectionToolCallV1({
+      prompt: activeIntentPrompt,
+      stages: compoundLifecycleStages,
+      receipts: writeReceipts,
+      assistantContent: input.assistantContent ?? lastFinalOutput,
+    });
+    if (!call) return null;
+    events.onStatus?.(input.status);
+    const result = await runObservedModelToolCall({
+      origin: "runner",
+      toolCall: { name: call.toolName, arguments: call.arguments },
+      step: input.step,
+      toolIndex: input.toolIndex,
+      recordTranscript: false,
+    });
+    if (result.ok && call.renderedContent) {
+      lastFinalOutput = call.renderedContent;
+    }
+    return { result, renderedContent: call.renderedContent };
   };
   const runRequiredWebToolFallback = async (
     missingToolNames: string[],
@@ -15193,34 +15743,33 @@ export async function runAgentMission({
         ok: true,
       });
       if (paid) setLoosePaidStages.add(paid);
+      const graphPaid = resolveCompletedCompoundLifecycleStagesV1(
+        missionGraphSession?.graph ?? missionGraph,
+        compoundLifecycleStages,
+        setLoosePaidStages,
+      );
+      if (graphPaid.authoritative) {
+        setLoosePaidStages.clear();
+        for (const stage of graphPaid.completed) setLoosePaidStages.add(stage);
+      }
       if (!successfulToolNames.includes(toolName)) {
         successfulToolNames.push(toolName);
       }
     };
 
     if (decision.kind === "host_note_reflection") {
-      const synthesized = buildSetLooseNoteReflectionMarkdown({
-        prompt: activeIntentPrompt,
-        receipts: writeReceipts,
-        assistantContent: lastFinalOutput,
-      });
-      if (!synthesized) return "none";
-      events.onStatus?.(
-        "Host-driving set-loose note reflection after GitHub/workspace stall.",
-      );
-      const appendResult = await runObservedModelToolCall({
-        origin: "runner",
-        toolCall: {
-          name: "append_to_current_file",
-          arguments: { text: synthesized },
-        },
+      const reflection = await runHostSetLooseReflection({
         step: input.step,
-        toolIndex: "set-loose-host-note-reflection",
-        recordTranscript: false,
+        toolIndex: "set-loose-host-reflection",
+        status:
+          "Host-driving the mission-bound terminal reflection after GitHub/workspace stall.",
       });
-      if (!appendResult.ok) return "none";
-      lastFinalOutput = synthesized;
-      applyHostProofs("append_to_current_file", appendResult.output, synthesized);
+      if (!reflection?.result.ok) return "none";
+      applyHostProofs(
+        reflection.result.toolName,
+        reflection.result.output,
+        reflection.renderedContent ?? "",
+      );
       setLooseGithubOfferedUnusedSteps = 0;
       return setLooseDeliveryComplete({
         stages: compoundLifecycleStages,
@@ -15343,33 +15892,18 @@ export async function runAgentMission({
       unpaidAfter.length === 1 &&
       unpaidAfter[0] === "note_reflection"
     ) {
-      const synthesized = buildSetLooseNoteReflectionMarkdown({
-        prompt: activeIntentPrompt,
-        receipts: writeReceipts,
-        assistantContent: lastFinalOutput,
+      const reflection = await runHostSetLooseReflection({
+        step: input.step,
+        toolIndex: "set-loose-host-reflection-after-github",
+        status:
+          "Host-driving the mission-bound terminal reflection after host GitHub progress.",
       });
-      if (synthesized) {
-        events.onStatus?.(
-          "Host-synthesizing set-loose note reflection after host GitHub progress.",
+      if (reflection?.result.ok) {
+        applyHostProofs(
+          reflection.result.toolName,
+          reflection.result.output,
+          reflection.renderedContent ?? "",
         );
-        const appendResult = await runObservedModelToolCall({
-          origin: "runner",
-          toolCall: {
-            name: "append_to_current_file",
-            arguments: { text: synthesized },
-          },
-          step: input.step,
-          toolIndex: "set-loose-host-note-reflection-after-github",
-          recordTranscript: false,
-        });
-        if (appendResult.ok) {
-          lastFinalOutput = synthesized;
-          applyHostProofs(
-            "append_to_current_file",
-            appendResult.output,
-            synthesized,
-          );
-        }
       }
     }
 
@@ -16950,7 +17484,9 @@ export async function runAgentMission({
       }
       if (
         setLooseNoteReflectionUnpaid &&
-        stepAllowedToolNames.has("append_to_current_file") &&
+        (stepAllowedToolNames.has("append_to_current_file") ||
+          stepAllowedToolNames.has(WRITE_PROJECT_RESULTS_TOOL_NAME) ||
+          stepAllowedToolNames.has(APPEND_JUPYTER_REFLECTION_TOOL_NAME)) &&
         unchangedNoToolResponseCount >= 1 &&
         // Prefer finishing Linear/code/GitHub before host note reflection so we
         // do not burn the no-tool breaker mid-ladder.
@@ -16959,38 +17495,25 @@ export async function runAgentMission({
           proofs: setLooseDeliveryProofs,
         }).unpaid.every((item) => item === "note_reflection")
       ) {
-        const synthesized = buildSetLooseNoteReflectionMarkdown({
-          prompt: activeIntentPrompt,
-          receipts: writeReceipts,
+        const reflection = await runHostSetLooseReflection({
+          step,
+          toolIndex: "set-loose-terminal-reflection",
+          status:
+            "Host-driving the mission-bound terminal reflection after the model stalled.",
           assistantContent: response.message.content ?? "",
         });
-        if (synthesized) {
-          events.onStatus?.(
-            "Host-synthesizing set-loose note reflection after the model stalled without append_to_current_file.",
-          );
-          const appendResult = await runObservedModelToolCall({
-            origin: "runner",
-            toolCall: {
-              name: "append_to_current_file",
-              arguments: { text: synthesized },
-            },
-            step,
-            toolIndex: "set-loose-note-reflection",
-            recordTranscript: false,
-          });
-          if (appendResult.ok) {
-            lastFinalOutput = synthesized;
+        if (reflection?.result.ok) {
             Object.assign(
               setLooseDeliveryProofs,
               applySetLooseDeliveryProofFromSuccessfulTool({
-                toolName: "append_to_current_file",
-                output: appendResult.output,
-                argumentsText: synthesized,
+                toolName: reflection.result.toolName,
+                output: reflection.result.output,
+                argumentsText: reflection.renderedContent ?? "",
                 proofs: setLooseDeliveryProofs,
               }),
             );
             events.onStatus?.(
-              "Set-loose note reflection append committed; re-evaluating delivery proofs...",
+              "Set-loose terminal reflection committed; re-evaluating delivery proofs...",
             );
             unchangedNoToolResponseCount = 0;
             lastNoToolFrontierFingerprint = "";
@@ -17001,15 +17524,21 @@ export async function runAgentMission({
               }).complete
             ) {
               events.onStatus?.(
-                "Set-loose delivery proofs complete after host note reflection; finishing write.",
+                "Set-loose delivery proofs complete after host reflection; finishing write.",
               );
-              await finishRun("write_completed", step, stepLimit, synthesized);
+              await finishRun(
+                "write_completed",
+                step,
+                stepLimit,
+                reflection.renderedContent ?? lastFinalOutput,
+              );
               return;
             }
             continue;
-          }
+        }
+        if (reflection && !reflection.result.ok) {
           events.onStatus?.(
-            `Host set-loose note reflection append failed: ${appendResult.error?.message ?? "unknown"}`,
+            `Host set-loose reflection failed: ${reflection.result.error?.message ?? "unknown"}`,
           );
         }
       }
@@ -21794,6 +22323,42 @@ export function resolveActiveCompoundLifecycleStageV1(
   return fallback;
 }
 
+/**
+ * Project completed lifecycle stages from the canonical graph. When composite
+ * lifecycle nodes exist, their verified terminal state replaces any ephemeral
+ * tool-name cache; callers may use the fallback only for legacy/non-composite
+ * graphs that have no lifecycle nodes at all.
+ */
+export function resolveCompletedCompoundLifecycleStagesV1(
+  graph: MissionGraphV3 | null | undefined,
+  stages: readonly ProjectLifecycleStageV1[],
+  fallback: ReadonlySet<ProjectLifecycleStageV1> | readonly ProjectLifecycleStageV1[],
+): { authoritative: boolean; completed: ProjectLifecycleStageV1[] } {
+  const fallbackSet =
+    fallback instanceof Set ? fallback : new Set<ProjectLifecycleStageV1>(fallback);
+  if (!graph) {
+    return {
+      authoritative: false,
+      completed: stages.filter((stage) => fallbackSet.has(stage)),
+    };
+  }
+  const authoritative = stages.some(
+    (stage) => graph.nodes[`lifecycle-${stage}`] !== undefined,
+  );
+  if (!authoritative) {
+    return {
+      authoritative: false,
+      completed: stages.filter((stage) => fallbackSet.has(stage)),
+    };
+  }
+  return {
+    authoritative: true,
+    completed: stages.filter(
+      (stage) => graph.nodes[`lifecycle-${stage}`]?.status === "complete",
+    ),
+  };
+}
+
 /** Pure stage gate used by the compound runner and focused regression tests. */
 export function evaluateCompoundResearchBudgetGateV1(
   plan: ResearchPlan | null | undefined,
@@ -22281,9 +22846,94 @@ function withoutThinking(message: ModelChatMessage): ModelChatMessage {
 }
 
 /**
- * Build a minimal set-loose reflection body from receipts / assistant text so
- * note_reflection can pay when the model stalls without calling
- * append_to_current_file.
+ * Select the host-owned terminal reflection action for a set-loose lifecycle.
+ * New six-stage missions never fall back to whichever Markdown editor happens
+ * to be active: Markdown uses the no-overwrite Results writer, while an exact
+ * user-named notebook receives deterministic prose and host-resolved code
+ * cells. The legacy current-note append remains only for persisted lifecycle
+ * intents that predate the first-class reflection stage.
+ */
+export function buildSetLooseLifecycleReflectionToolCallV1(input: {
+  prompt: string;
+  stages: readonly ProjectLifecycleStageV1[];
+  receipts: readonly {
+    toolName?: string | null;
+    message?: string | null;
+    path?: string | null;
+    output?: unknown;
+    resource?: {
+      url?: string | null;
+      id?: string | null;
+      system?: string | null;
+    } | null;
+  }[];
+  assistantContent?: string;
+}): {
+  toolName: string;
+  arguments: Record<string, unknown>;
+  renderedContent: string | null;
+} | null {
+  if (input.stages.includes("reflection")) {
+    if (hasJupyterReflectionIntentV1(input.prompt)) {
+      const paths = extractExplicitJupyterNotebookPathsV1(input.prompt);
+      // Zero paths delegates to the notebook tool's deterministic, safe
+      // Results destination. More than one remains ambiguous and must not be
+      // guessed; exactly one preserves the user's explicit destination.
+      if (paths.length > 1) return null;
+      const completedPhaseLabels = input.stages
+        .filter((stage) => stage !== "reflection" && stage !== "reconciliation_cleanup")
+        .map((stage) => ({
+          accepted_research: "research and high-level design",
+          linear_hierarchy: "Linear planning",
+          code_execution: "implementation",
+          code_validation: "testing and validation",
+          private_github_publication: "GitHub draft publication",
+        })[stage])
+        .filter((value): value is string => Boolean(value));
+      const markdown = [
+        "## Developer mission reflection",
+        "",
+        `Verified phases: ${completedPhaseLabels.join(", ")}.`,
+        "",
+        "This notebook is the durable lab record for the run. Its evidence and code cells are resolved by the host from verified receipts and the immutable commit, not supplied by the model.",
+        "",
+        "The result stops at a draft pull request. Human review, merge, deployment, production observation, and the next experiment remain separate decisions.",
+      ].join("\n");
+      return {
+        toolName: APPEND_JUPYTER_REFLECTION_TOOL_NAME,
+        arguments:
+          paths.length === 1
+            ? { path: paths[0], markdown }
+            : { markdown },
+        renderedContent: markdown,
+      };
+    }
+    return {
+      toolName: WRITE_PROJECT_RESULTS_TOOL_NAME,
+      arguments: {},
+      renderedContent: null,
+    };
+  }
+
+  const legacy = buildSetLooseNoteReflectionMarkdown({
+    prompt: input.prompt,
+    receipts: input.receipts,
+    assistantContent: input.assistantContent,
+  });
+  return legacy
+    ? {
+        toolName: "append_to_current_file",
+        arguments: { text: legacy },
+        renderedContent: legacy,
+      }
+    : null;
+}
+
+/**
+ * Build a set-loose reflection only from host-verified cross-system evidence.
+ * Prompt/assistant text may contribute a user marker, but never URLs, commit
+ * identity, validation claims, or code. Link dumps and E2E-shaped prose are
+ * therefore insufficient to manufacture completion.
  */
 export function buildSetLooseNoteReflectionMarkdown(input: {
   prompt: string;
@@ -22296,55 +22946,105 @@ export function buildSetLooseNoteReflectionMarkdown(input: {
   }[];
   assistantContent?: string;
 }): string | null {
-  const blobs: string[] = [input.prompt, input.assistantContent ?? ""];
+  const receiptBlobs: string[] = [];
   for (const receipt of input.receipts) {
-    blobs.push(String(receipt.message ?? ""));
-    blobs.push(String(receipt.path ?? ""));
-    blobs.push(String(receipt.resource?.url ?? ""));
-    blobs.push(String(receipt.resource?.id ?? ""));
-    if (typeof receipt.output === "string") blobs.push(receipt.output);
+    receiptBlobs.push(String(receipt.message ?? ""));
+    receiptBlobs.push(String(receipt.path ?? ""));
+    receiptBlobs.push(String(receipt.resource?.url ?? ""));
+    receiptBlobs.push(String(receipt.resource?.id ?? ""));
+    if (typeof receipt.output === "string") receiptBlobs.push(receipt.output);
     else if (receipt.output != null) {
       try {
-        blobs.push(JSON.stringify(receipt.output));
+        receiptBlobs.push(JSON.stringify(receipt.output));
       } catch {
         // ignore non-serializable outputs
       }
     }
   }
-  const haystack = blobs.join("\n");
+  const verifiedExamples = findVerifiedCodeReflectionExamplesV1(
+    input.receipts.map((receipt) => receipt.output),
+  );
+  if (!verifiedExamples || verifiedExamples.examples.length === 0) return null;
+  const receiptHaystack = receiptBlobs.join("\n");
+  const markerHaystack = `${input.prompt}\n${input.assistantContent ?? ""}`;
   const marker =
-    haystack.match(/\bFLOW_REAL_[A-Za-z0-9]+\b/u)?.[0] ??
-    haystack.match(/\bCOMPOUND_[A-Za-z0-9]+\b/u)?.[0] ??
-    haystack.match(/\bBYOK_AUTONOMOUS_[A-Za-z0-9_]+\b/u)?.[0] ??
+    markerHaystack.match(/\bFLOW_REAL_[A-Za-z0-9]+\b/u)?.[0] ??
+    markerHaystack.match(/\bCOMPOUND_[A-Za-z0-9]+\b/u)?.[0] ??
+    markerHaystack.match(/\bBYOK_AUTONOMOUS_[A-Za-z0-9_]+\b/u)?.[0] ??
     "";
   const linearUrl =
-    haystack.match(/https:\/\/linear\.app\/[^\s)\]"'<>]+/iu)?.[0] ?? "";
-  // Prefer draft PR URL over create-only repo URL for set-loose GitHub proof.
+    receiptHaystack.match(/https:\/\/linear\.app\/[^\s)\]"'<>]+/iu)?.[0] ?? "";
   const githubPrUrl =
-    haystack.match(/https:\/\/github\.com\/[^\s)\]"'<>]+\/pull\/\d+/iu)?.[0] ??
+    receiptHaystack.match(/https:\/\/github\.com\/[^\s)\]"'<>]+\/pull\/\d+/iu)?.[0] ??
     "";
-  const githubRepoUrl =
-    haystack.match(/https:\/\/github\.com\/[^\s)\]"'<>]+/iu)?.[0] ?? "";
-  const githubUrl = githubPrUrl || githubRepoUrl;
-  const workspaceId =
-    haystack.match(/\b(?:workspaceId|workspace)\s+([a-z0-9][a-z0-9._-]{2,80})/iu)?.[1] ??
-    haystack.match(/\b(flow-real-[a-z0-9-]+)\b/iu)?.[1] ??
-    "";
-  if (!marker && !linearUrl && !githubUrl) return null;
-  return [
+  if (!linearUrl || !githubPrUrl) return null;
+  const lines = [
     "",
-    "## Flow real reflection",
+    "## Mission completion reflection",
+    `<!-- agentic-set-loose-reflection:${verifiedExamples.fingerprint.slice(7, 39)} -->`,
     marker ? `Marker: ${marker}` : null,
-    linearUrl ? `Linear: ${linearUrl}` : null,
-    githubRepoUrl && githubPrUrl && githubRepoUrl !== githubPrUrl
-      ? `GitHub: ${githubRepoUrl}`
-      : null,
-    githubPrUrl ? `Draft PR: ${githubPrUrl}` : githubUrl ? `GitHub: ${githubUrl}` : null,
-    workspaceId ? `Workspace: ${workspaceId}` : null,
-    "",
-  ]
-    .filter((line) => line !== null)
-    .join("\n");
+    `The accepted research became a tracked [Linear issue](${linearUrl}) and a code change at commit \`${verifiedExamples.commitSha.slice(0, 12)}\`.`,
+    "Targeted and full validation passed before the exact changed artifacts were approved for publication.",
+    `The tested change is available for human review in [the draft pull request](${githubPrUrl}).`,
+    "This evidence stops at a draft pull request; review, merge, deployment, and later product learning remain open.",
+  ].filter((line): line is string => line !== null);
+  for (const example of verifiedExamples.examples) {
+    const fence = reflectionCodeFenceV1(example.code);
+    lines.push(
+      "",
+      "### Verified code example",
+      `\`${example.path.replace(/`/gu, "\\`")}\` lines ${example.startLine}-${example.endLine} at commit \`${example.commitSha.slice(0, 12)}\` (file hash \`${example.artifactSha256.slice(7, 19)}\`; excerpt hash \`${example.codeSha256}\`).`,
+      `${fence}${example.language === "text" ? "" : example.language}`,
+      example.code,
+      fence,
+    );
+  }
+  const markdown = `${lines.join("\n")}\n`;
+  assertMeaningfulReflectionContentV1(markdown, "Set-loose reflection");
+  return markdown;
+}
+
+function findVerifiedCodeReflectionExamplesV1(
+  roots: readonly unknown[],
+): VerifiedCodeReflectionExamplesV1 | null {
+  const queue = roots.map((value) => ({ value, depth: 0 }));
+  const seen = new Set<object>();
+  let inspected = 0;
+  while (queue.length > 0 && inspected < 300) {
+    const item = queue.shift()!;
+    inspected += 1;
+    if (!item.value || typeof item.value !== "object") continue;
+    if (seen.has(item.value)) continue;
+    seen.add(item.value);
+    if (!Array.isArray(item.value)) {
+      const record = item.value as Record<string, unknown>;
+      if (record.kind === "verified_code_reflection_examples") {
+        try {
+          return parseVerifiedCodeReflectionExamplesV1(record);
+        } catch {
+          return null;
+        }
+      }
+      if (item.depth < 5) {
+        for (const value of Object.values(record)) {
+          queue.push({ value, depth: item.depth + 1 });
+        }
+      }
+    } else if (item.depth < 5) {
+      for (const value of item.value) {
+        queue.push({ value, depth: item.depth + 1 });
+      }
+    }
+  }
+  return null;
+}
+
+function reflectionCodeFenceV1(code: string): string {
+  const longest = Math.max(
+    2,
+    ...Array.from(code.matchAll(/`+/gu), (match) => match[0].length),
+  );
+  return "`".repeat(longest + 1);
 }
 
 /**
@@ -23710,6 +24410,36 @@ function runnerBoundMayAutoWithoutChatGrant(
   return boundMayAutoWithoutChatGrant(input);
 }
 
+/**
+ * Retain the model-driven progress reporter only as an explicitly requested
+ * standalone capability. Compound developer journeys use the host projector,
+ * which derives Linear transitions from verified receipts and readbacks.
+ */
+export function shouldOfferStandaloneLinearProgressReportV1(
+  prompt: string,
+): boolean {
+  const normalized = prompt.trim().toLowerCase();
+  if (!normalized || detectProjectLifecycleStagesV1(prompt).length > 1) {
+    return false;
+  }
+  if (
+    /\b(?:do not|don't|never|without)\b[^.!?;\n]{0,100}\b(?:report|post|send|write|update)\b[^.!?;\n]{0,100}\blinear\b/u.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  return (
+    normalized.includes(REPORT_PROGRESS_TO_LINEAR_TOOL_NAME) ||
+    /\b(?:report|post|send|write)\b[^.!?;\n]{0,100}\b(?:progress|status|update)\b[^.!?;\n]{0,100}\blinear\b/u.test(
+      normalized,
+    ) ||
+    /\blinear\b[^.!?;\n]{0,100}\b(?:progress|status)\s+update\b/u.test(
+      normalized,
+    )
+  );
+}
+
 const READ_NAV_TOOL_NAMES = new Set([
   ...GITHUB_CATALOG_READ_TOOL_NAMES,
   "read_current_file",
@@ -23756,6 +24486,8 @@ const WRITE_TOOL_NAMES = new Set([
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
   CREATE_GITHUB_REPOSITORY_TOOL_NAME,
   PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+  APPEND_JUPYTER_REFLECTION_TOOL_NAME,
+  WRITE_PROJECT_RESULTS_TOOL_NAME,
   "open_web_source",
   "create_design_canvas",
   "update_design_canvas",
@@ -23943,6 +24675,9 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
     GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES.map((name) => [name, "delete" as const]),
   ),
   [ASK_USER_TOOL_NAME]: "read",
+  [CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME]: "read",
+  [APPEND_JUPYTER_REFLECTION_TOOL_NAME]: "write",
+  [WRITE_PROJECT_RESULTS_TOOL_NAME]: "write",
   read_current_file: "read",
   inspect_vault_context: "read",
   inspect_vault_index: "read",
@@ -24181,13 +24916,21 @@ function getAllowedToolDefinitions(
    */
   namesActiveNoteSection = false,
 ) {
+  const joinedDeveloperLifecycle =
+    hasAffirmativeJoinedDeveloperLifecycleIntent(prompt);
+  const affirmativeResearchPublication =
+    settings?.linearEnabled === true &&
+    (hasExplicitResearchPublicationIntent(prompt) || joinedDeveloperLifecycle);
   // A broad mutation with no file, folder, artifact, or current-note target is
   // a clarification turn, not a vault-discovery mission. Exposing read tools
   // here lets the model wander the vault even though no later write can be
   // authorized, and weakens the explicit-scope blocker into accidental work.
+  // The accepted-research publisher is the narrow exception: mode:create owns
+  // a deterministic safe note destination even when Chat has no active note.
   if (
     missionIntent.explicitMutation &&
-    isBroadUnscopedVaultMutation(missionIntent.autonomyScope)
+    isBroadUnscopedVaultMutation(missionIntent.autonomyScope) &&
+    !affirmativeResearchPublication
   ) {
     return [];
   }
@@ -24241,7 +24984,8 @@ function getAllowedToolDefinitions(
     hasGraphConnectionIntent(prompt) ||
     allowParallelVaultInspection ||
     hasReflexReadLabel(["graph_context"]);
-  const allowLinearIssueTemplate = hasLinearIssueTemplateIntent(prompt);
+  const allowLinearIssueTemplate =
+    hasLinearIssueTemplateIntent(prompt) || joinedDeveloperLifecycle;
   const allowGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
   const allowTemplateTools = hasTemplateIntent(prompt);
   const allowTemplateSeed = hasTemplateSeedIntent(prompt);
@@ -24342,21 +25086,51 @@ function getAllowedToolDefinitions(
   const filtered = toolRegistry.getDefinitions().filter((definition) => {
     const name = definition.function.name;
 
-    if (name === PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) {
+    if (name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME) {
+      return hasProjectIdeationIntent(prompt);
+    }
+
+    if (name === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
+      return (
+        hasJupyterReflectionIntentV1(prompt) &&
+        (missionIntent.explicitMutation || missionIntent.explicitPersistence)
+      );
+    }
+
+    if (name === WRITE_PROJECT_RESULTS_TOOL_NAME) {
+      return (
+        projectLifecycleStages.includes("reflection") &&
+        !hasJupyterReflectionIntentV1(prompt)
+      );
+    }
+
+    if (name === REPORT_PROGRESS_TO_LINEAR_TOOL_NAME) {
       return (
         settings?.linearEnabled === true &&
-        linearIntent.explicit &&
-        hasExplicitResearchPublicationIntent(prompt) &&
-        (hasActiveMarkdownNote || allowResume)
+        shouldOfferStandaloneLinearProgressReportV1(prompt)
+      );
+    }
+
+    if (name === PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) {
+      return (
+        affirmativeResearchPublication &&
+        // mode:create has a deterministic Agent Work path fallback when Chat
+        // has no active Markdown note. The publication composite remains the
+        // only authority that may mint that note and its accepted lineage.
+        (hasActiveMarkdownNote || allowResume || affirmativeResearchPublication)
       );
     }
 
     if (name === PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) {
       return (
         settings?.linearEnabled === true &&
-        linearIntent.explicit &&
-        hasExplicitResearchProjectHierarchyIntent(prompt) &&
-        (hasActiveMarkdownNote || allowResume)
+        ((linearIntent.explicit &&
+          hasExplicitResearchProjectHierarchyIntent(prompt)) ||
+          joinedDeveloperLifecycle) &&
+        // A joined pathless mission first pays accepted publication; the
+        // hierarchy composite consumes that durable lineage rather than an
+        // ambient active-note assumption.
+        (hasActiveMarkdownNote || allowResume || joinedDeveloperLifecycle)
       );
     }
 
@@ -24785,6 +25559,10 @@ function isAllowedForMission(
   }
 
   if (WRITE_TOOL_NAMES.has(name)) {
+    if (name === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
+      return hasJupyterReflectionIntentV1(prompt);
+    }
+
     if (name === "rebuild_semantic_index") {
       return hasSemanticIndexMaintenanceIntent(prompt);
     }
@@ -24907,6 +25685,17 @@ function isToolWithinAutonomyScope(
       hasCheckpointResumeIntent(prompt) ||
       hasMissionResumeIntent(prompt) ||
       hasSafeReflexLabel(reflex, ["web_research"])
+    );
+  }
+
+  if (name === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
+    return hasJupyterReflectionIntentV1(prompt);
+  }
+
+  if (name === WRITE_PROJECT_RESULTS_TOOL_NAME) {
+    return (
+      detectProjectLifecycleStagesV1(prompt).includes("reflection") &&
+      !hasJupyterReflectionIntentV1(prompt)
     );
   }
 
@@ -25285,19 +26074,54 @@ function getRequiredWriteToolNames(
 ): string[] {
   const lifecycleStages = detectProjectLifecycleStagesV1(prompt);
   const compoundLifecycle = lifecycleStages.length > 1;
+  const joinedDeveloperLifecycle =
+    hasAffirmativeJoinedDeveloperLifecycleIntent(prompt);
   const lifecycleRequiredToolNames: string[] = [];
+  const wantsProjectIdeation =
+    hasProjectIdeationIntent(prompt) &&
+    allowedToolNames.has(CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME);
+  const wantsJupyterReflection =
+    hasJupyterReflectionIntentV1(prompt) &&
+    allowedToolNames.has(APPEND_JUPYTER_REFLECTION_TOOL_NAME);
+  const wantsProjectResultsReflection =
+    lifecycleStages.includes("reflection") &&
+    !wantsJupyterReflection &&
+    allowedToolNames.has(WRITE_PROJECT_RESULTS_TOOL_NAME);
+  const wantsStandaloneLinearProgressReport =
+    allowedToolNames.has(REPORT_PROGRESS_TO_LINEAR_TOOL_NAME) &&
+    shouldOfferStandaloneLinearProgressReportV1(prompt);
+  const withRequestedReflection = (
+    names: readonly string[],
+  ): string[] => [
+    ...new Set([
+      ...names,
+      ...(wantsJupyterReflection
+        ? [APPEND_JUPYTER_REFLECTION_TOOL_NAME]
+        : []),
+      ...(wantsProjectResultsReflection
+        ? [WRITE_PROJECT_RESULTS_TOOL_NAME]
+        : []),
+    ]),
+  ];
   const explicitlyNamedLinearMutations = getExplicitLinearMutationToolNames(
     prompt,
     allowedToolNames,
   );
   const wantsResearchPublish =
-    hasExplicitResearchPublicationIntent(prompt) &&
+    (hasExplicitResearchPublicationIntent(prompt) ||
+      joinedDeveloperLifecycle) &&
     allowedToolNames.has(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME);
   const wantsResearchHierarchy =
-    hasExplicitResearchProjectHierarchyIntent(prompt) &&
+    (hasExplicitResearchProjectHierarchyIntent(prompt) ||
+      joinedDeveloperLifecycle) &&
     allowedToolNames.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME);
+  const explicitGitHubMutationToolNames =
+    getExplicitGitHubCatalogMutationToolNames(prompt).filter((name) =>
+      allowedToolNames.has(name),
+    );
   const wantsSimpleLinearIssue =
     lifecycleStages.includes("linear_hierarchy") &&
+    !joinedDeveloperLifecycle &&
     !wantsResearchPublish &&
     !wantsResearchHierarchy &&
     (allowedToolNames.has("linear_create_issue") ||
@@ -25305,6 +26129,12 @@ function getRequiredWriteToolNames(
       /\bturn\b[\s\S]{0,100}\binto\b[\s\S]{0,40}\blinear\s+issues?\b/iu.test(
         prompt,
       ));
+  if (wantsProjectIdeation) {
+    lifecycleRequiredToolNames.push(CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME);
+  }
+  if (wantsStandaloneLinearProgressReport) {
+    lifecycleRequiredToolNames.push(REPORT_PROGRESS_TO_LINEAR_TOOL_NAME);
+  }
   if (shouldRequireLinearIssueTemplateRead(prompt, allowedToolNames)) {
     lifecycleRequiredToolNames.push("read_template");
   }
@@ -25326,7 +26156,10 @@ function getRequiredWriteToolNames(
         lifecycleRequiredToolNames.push("linear_get_issue");
       }
     }
-    if (lifecycleStages.includes("code_execution")) {
+    if (
+      lifecycleStages.includes("code_execution") ||
+      lifecycleStages.includes("code_validation")
+    ) {
       lifecycleRequiredToolNames.push(...getRequiredCodeWorkflowToolNames(prompt));
     }
     if (lifecycleStages.includes("private_github_publication")) {
@@ -25336,6 +26169,18 @@ function getRequiredWriteToolNames(
       if (allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME)) {
         lifecycleRequiredToolNames.push(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME);
       }
+    }
+    // A compound mission may ask for a general GitHub catalog mutation (for
+    // example, update an issue) without asking to publish code. Preserve that
+    // exact requested action in the ordered graph instead of silently dropping
+    // it when research or reflection makes the mission compound. The normal
+    // prepared-action path still requires an interactive exact grant; set-loose
+    // never auto-authorizes general GitHub CRUD.
+    lifecycleRequiredToolNames.push(...explicitGitHubMutationToolNames);
+    if (wantsJupyterReflection) {
+      lifecycleRequiredToolNames.push(APPEND_JUPYTER_REFLECTION_TOOL_NAME);
+    } else if (wantsProjectResultsReflection) {
+      lifecycleRequiredToolNames.push(WRITE_PROJECT_RESULTS_TOOL_NAME);
     }
     // A compound project lifecycle is already represented by its ordered,
     // composite stage tools. Do not infer unrelated vault write tools from
@@ -25349,6 +26194,17 @@ function getRequiredWriteToolNames(
         name === "linear_create_issue" ||
         name === "linear_get_issue",
     );
+  }
+  if (!compoundLifecycle && wantsProjectIdeation) {
+    return withRequestedReflection([
+      ...lifecycleRequiredToolNames,
+      ...(wantsResearchPublish
+        ? [PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME]
+        : []),
+      ...(wantsResearchHierarchy
+        ? [PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME]
+        : []),
+    ]);
   }
   // Prefer tools the user spelled (linear_create_issue) over inferred research
   // publication composites. Ordinary "note … create … Linear issue" prose must
@@ -25365,10 +26221,12 @@ function getRequiredWriteToolNames(
     ) {
       namedLinearWorkflow.push("append_to_current_file");
     }
-    return [...new Set(namedLinearWorkflow)].filter(
-      (name) =>
-        allowedToolNames.has(name) ||
-        explicitlyNamedLinearMutations.includes(name),
+    return withRequestedReflection(
+      [...new Set(namedLinearWorkflow)].filter(
+        (name) =>
+          allowedToolNames.has(name) ||
+          explicitlyNamedLinearMutations.includes(name),
+      ),
     );
   }
   if (
@@ -25376,20 +26234,20 @@ function getRequiredWriteToolNames(
     allowedToolNames.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) &&
     hasExplicitResearchProjectHierarchyIntent(prompt)
   ) {
-    return [
+    return withRequestedReflection([
       ...lifecycleRequiredToolNames,
       PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
-    ];
+    ]);
   }
   if (
     !compoundLifecycle &&
     allowedToolNames.has(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) &&
     hasExplicitResearchPublicationIntent(prompt)
   ) {
-    return [
+    return withRequestedReflection([
       ...lifecycleRequiredToolNames,
       PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
-    ];
+    ]);
   }
   if (
     !compoundLifecycle &&
@@ -25422,11 +26280,13 @@ function getRequiredWriteToolNames(
     ) {
       noteThenLinear.push("linear_get_issue");
     }
-    return [...new Set(noteThenLinear)].filter(
-      (name) =>
-        allowedToolNames.has(name) ||
-        name === "linear_create_issue" ||
-        name === "linear_get_issue",
+    return withRequestedReflection(
+      [...new Set(noteThenLinear)].filter(
+        (name) =>
+          allowedToolNames.has(name) ||
+          name === "linear_create_issue" ||
+          name === "linear_get_issue",
+      ),
     );
   }
   if (
@@ -25435,54 +26295,57 @@ function getRequiredWriteToolNames(
     /\bcreate\b/iu.test(prompt) &&
     allowedToolNames.has("linear_create_issue")
   ) {
-    return [...lifecycleRequiredToolNames, "linear_create_issue"];
+    return withRequestedReflection([
+      ...lifecycleRequiredToolNames,
+      "linear_create_issue",
+    ]);
   }
   const preparedBackgroundGitHubTools =
     getRequestedPreparedBackgroundGitHubTools(prompt).filter((name) =>
       allowedToolNames.has(name),
     );
   if (!compoundLifecycle && preparedBackgroundGitHubTools.length > 0) {
-    return preparedBackgroundGitHubTools;
+    return withRequestedReflection(preparedBackgroundGitHubTools);
   }
   if (
     !compoundLifecycle &&
     allowedToolNames.has(CREATE_GITHUB_REPOSITORY_TOOL_NAME) &&
     hasGitHubRepositoryBootstrapIntent(prompt)
   ) {
-    return [
+    return withRequestedReflection([
       CREATE_GITHUB_REPOSITORY_TOOL_NAME,
       ...(allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME) &&
       hasExplicitGitHubPublicationIntent(prompt)
         ? [PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME]
         : []),
-    ];
+    ]);
   }
   if (
     !compoundLifecycle &&
     allowedToolNames.has(DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME) &&
     hasExplicitPrivateGitHubRepositoryCleanupIntent(prompt)
   ) {
-    return [DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME];
+    return withRequestedReflection([
+      DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    ]);
   }
   if (
     !compoundLifecycle &&
     allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME) &&
     hasExplicitGitHubPublicationIntent(prompt)
   ) {
-    return [PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME];
+    return withRequestedReflection([
+      PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+    ]);
   }
-  const explicitGitHubMutationToolNames =
-    getExplicitGitHubCatalogMutationToolNames(prompt).filter((name) =>
-      allowedToolNames.has(name),
-    );
   if (!compoundLifecycle && explicitGitHubMutationToolNames.length > 0) {
-    return explicitGitHubMutationToolNames;
+    return withRequestedReflection(explicitGitHubMutationToolNames);
   }
   const explicitCodeToolNames = getExplicitCodeToolNames(prompt).filter((name) =>
     allowedToolNames.has(name),
   );
   if (!compoundLifecycle && explicitCodeToolNames.length > 0) {
-    return explicitCodeToolNames;
+    return withRequestedReflection(explicitCodeToolNames);
   }
   const inferredCodeWorkflowToolNames = getRequiredCodeWorkflowToolNames(
     prompt,
@@ -25498,7 +26361,7 @@ function getRequiredWriteToolNames(
     // same prompt says create, write, or document. A separately named
     // Obsidian/vault/current-note destination still keeps the hybrid code +
     // note workflow below.
-    return inferredCodeWorkflowToolNames;
+    return withRequestedReflection(inferredCodeWorkflowToolNames);
   }
   const requiredToolNames: string[] = [...lifecycleRequiredToolNames];
   const wholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
@@ -25543,6 +26406,7 @@ function getRequiredWriteToolNames(
   if (
     (hasAppendIntent(prompt) || noteOutputIntent) &&
     missionIntent.autonomyScope.write.currentNote &&
+    !wantsJupyterReflection &&
     (!preferPathTarget || hasCurrentMutationTarget) &&
     !wholeNoteReplace &&
     !hasSectionAppendIntent(prompt) &&
@@ -25558,7 +26422,7 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("append_to_current_file");
   }
 
-  if (hasAppendIntent(prompt) && preferPathTarget) {
+  if (hasAppendIntent(prompt) && preferPathTarget && !wantsJupyterReflection) {
     requiredToolNames.push("append_file");
   }
 
@@ -25679,6 +26543,12 @@ function getRequiredWriteToolNames(
 
   if (hasGraphLinkWriteIntent(prompt)) {
     requiredToolNames.push("link_related_notes_in_current_file");
+  }
+
+  if (wantsJupyterReflection) {
+    requiredToolNames.push(APPEND_JUPYTER_REFLECTION_TOOL_NAME);
+  } else if (wantsProjectResultsReflection) {
+    requiredToolNames.push(WRITE_PROJECT_RESULTS_TOOL_NAME);
   }
 
   requiredToolNames.push(
@@ -25994,9 +26864,12 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
   const repositoryRead = hasCodeWorkspaceReadIntent(prompt);
   const repositoryMutation = hasRepositoryCodeMutationIntent(prompt);
   const codeDeliverable = hasCodeDeliverableIntent(prompt);
+  const joinedDeveloperLifecycle =
+    hasAffirmativeJoinedDeveloperLifecycleIntent(prompt);
   if (
     hasExplicitGitHubPublicationIntent(prompt) &&
-    !hasRepositoryCodeEditIntent(prompt)
+    !hasRepositoryCodeEditIntent(prompt) &&
+    !joinedDeveloperLifecycle
   ) {
     // Publishing an already verified commit is a GitHub delivery action. The
     // word "repository" and the existing commit do not authorize a fresh Code
@@ -26008,7 +26881,8 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
   // one-off run_code_block request must not be promoted into a durable Code
   // workspace mission merely because the stage detector sees a language or
   // the word "code".
-  const implementationIntent = repositoryMutation || codeDeliverable;
+  const implementationIntent =
+    repositoryMutation || codeDeliverable || joinedDeveloperLifecycle;
   const explicitToolNames = getExplicitCodeToolNames(prompt);
   if (explicitToolNames.length > 0) {
     return expandExplicitCodeWorkflowToolNames(explicitToolNames, prompt);
@@ -26036,7 +26910,11 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
     return tools;
   }
 
-  if (hasRepositoryCodeEditIntent(prompt) || codeDeliverable) {
+  if (
+    hasRepositoryCodeEditIntent(prompt) ||
+    codeDeliverable ||
+    joinedDeveloperLifecycle
+  ) {
     const editTool = selectCodeWorkspaceEditToolName(
       prompt,
       new Set<string>(CODE_EXECUTION_TOOL_ALLOW),
@@ -26051,7 +26929,7 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
     // it for a scratch delivery ("write a checkers game on my desktop") put an
     // unsatisfiable node in the ladder: the workspace and files were authored,
     // then the mission died at that node with nothing delivered.
-    if (repositoryMutation) {
+    if (repositoryMutation || joinedDeveloperLifecycle) {
       tools.push("code_repair_record_cycle");
     }
   }
@@ -26059,6 +26937,7 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
   if (
     hasRepositoryCodeEditIntent(prompt) ||
     codeDeliverable ||
+    joinedDeveloperLifecycle ||
     /\b(validate|test|build|compile|commit)\b/i.test(prompt)
   ) {
     tools.push("code_validate_targeted", "code_validate_full");
@@ -26069,7 +26948,11 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
   ) {
     tools.push("code_workspace_export_directory");
   }
-  if (hasRepositoryCodeEditIntent(prompt) || /\bcommit\b/i.test(prompt)) {
+  if (
+    hasRepositoryCodeEditIntent(prompt) ||
+    /\bcommit\b/i.test(prompt) ||
+    joinedDeveloperLifecycle
+  ) {
     tools.push("code_commit_verified");
   }
   return [...new Set(tools)];
@@ -28427,6 +29310,10 @@ function getToolPreparationStatus(toolName: string): string | null {
     return "Creating Obsidian canvas design...";
   }
 
+  if (toolName === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
+    return "Preparing an exact, non-executing notebook reflection...";
+  }
+
   if (toolName === "read_design_canvas") {
     return "Reading the current Obsidian canvas structure...";
   }
@@ -28994,6 +29881,163 @@ function hasRequiredActionReceipt(
   return hasConcreteWriteReceipt(receipts) || hasExternalActionReceipt(receipts);
 }
 
+export function collectProjectStageEventsV1(input: {
+  runId: string;
+  receiptEvents: readonly AgentRunReceipt[];
+  lineages: readonly ProjectLineageV1[];
+  hostEvents?: readonly ProjectStageEventV1[];
+}): ProjectStageEventV1[] {
+  const acceptedRunIds = new Set(
+    [input.runId, ...input.receiptEvents.map((receipt) => receipt.runId)]
+      .filter((value): value is string => Boolean(value?.trim()))
+      .map((value) => value.trim()),
+  );
+  const events: ProjectStageEventV1[] = [];
+  for (const lineage of input.lineages) {
+    if (!acceptedRunIds.has(lineage.runId)) continue;
+    try {
+      const lineageEvents = projectStageEventsFromProjectLineageV1({
+        lineage,
+        runId: input.runId,
+      });
+      events.push(
+        ...bindAggregateProjectEventsToOnlyWorkUnitV1({
+          events: lineageEvents,
+          bindings: projectLinearBindingsFromProjectLineageV1({
+            lineage,
+            runId: input.runId,
+          }),
+        }),
+      );
+    } catch {
+      // A malformed or stale lineage is not report evidence. The lineage
+      // parser remains fail-closed; other independently verified receipts may
+      // still produce a partial Results report.
+    }
+  }
+  for (const receipt of input.receiptEvents) {
+    const projected = projectStageEventFromAgentRunReceiptV1(
+      input.runId,
+      receipt,
+    );
+    if (projected) events.push(projected);
+  }
+  for (const rawEvent of input.hostEvents ?? []) {
+    try {
+      const event = parseProjectStageEventV1(rawEvent);
+      if (event.runId === input.runId) events.push(event);
+    } catch {
+      // Plugin-data evidence remains fail-closed. A malformed persisted event
+      // cannot become report or Linear completion proof.
+    }
+  }
+  const unique = new Map(events.map((event) => [event.eventId, event]));
+  return [...unique.values()].sort(
+    (left, right) =>
+      left.occurredAt.localeCompare(right.occurredAt) ||
+      left.eventId.localeCompare(right.eventId),
+  );
+}
+
+/**
+ * A canonical lifecycle reflection is paid only by a verified host receipt for
+ * the dedicated Results or Jupyter writer. Generic note writes must not silence
+ * the initiating-note fallback because they may be unrelated mission output.
+ */
+export function canonicalLifecycleReflectionReceiptPaysV1(
+  receipt: Pick<
+    AgentRunReceipt,
+    "toolName" | "path" | "payloadFingerprint" | "readback"
+  >,
+): boolean {
+  const toolName = receipt.toolName?.trim();
+  const path = receipt.path?.trim() ?? "";
+  const expectedPath =
+    toolName === WRITE_PROJECT_RESULTS_TOOL_NAME
+      ? path.toLowerCase().endsWith(".md")
+      : toolName === APPEND_JUPYTER_REFLECTION_TOOL_NAME
+        ? path.toLowerCase().endsWith(".ipynb")
+        : false;
+  return Boolean(
+    expectedPath &&
+      receipt.readback?.status === "verified" &&
+      (receipt.readback.observedFingerprint?.trim() ||
+        receipt.payloadFingerprint?.trim()),
+  );
+}
+
+/** The legacy initiating-note reflection is a fallback, never a second write. */
+export function shouldPlanGenericInitiatingNoteReflectionV1(input: {
+  compoundLifecycleDetected: boolean;
+  pipelineLineagePresent: boolean;
+  successfulTerminal: boolean;
+  reflectionWritebackPreconditionFailed: boolean;
+  explicitJupyterReflection: boolean;
+  canonicalLifecycleReflectionPaid: boolean;
+  setLooseCompoundEnabled: boolean;
+}): boolean {
+  return (
+    input.compoundLifecycleDetected &&
+    input.pipelineLineagePresent &&
+    input.successfulTerminal &&
+    !input.reflectionWritebackPreconditionFailed &&
+    !input.explicitJupyterReflection &&
+    !input.canonicalLifecycleReflectionPaid &&
+    // Set-loose delivery owns its reflection inside the exact finalizer path.
+    !input.setLooseCompoundEnabled
+  );
+}
+
+function projectStageEventFromAgentRunReceiptV1(
+  runId: string,
+  receipt: AgentRunReceipt,
+): ProjectStageEventV1 | null {
+  if (
+    receipt.version !== 1 ||
+    !receipt.id ||
+    !receipt.committedAt ||
+    !/^sha256:[a-f0-9]{64}$/u.test(receipt.payloadFingerprint ?? "") ||
+    receipt.readback?.status !== "verified" ||
+    !receipt.resource ||
+    !["vault", "linear", "workspace", "git", "github"].includes(
+      receipt.resource.system,
+    )
+  ) {
+    return null;
+  }
+  const observedFingerprint = receipt.readback.observedFingerprint;
+  const observation: ProjectReceiptObservationV1 = {
+    schemaVersion: 1,
+    runId,
+    receiptId: receipt.id,
+    toolName: receipt.toolName,
+    committedAt: receipt.committedAt,
+    payloadFingerprint: receipt.payloadFingerprint!,
+    readbackStatus: "verified",
+    observedFingerprint:
+      typeof observedFingerprint === "string" &&
+      /^sha256:[a-f0-9]{64}$/u.test(observedFingerprint)
+        ? observedFingerprint
+        : null,
+    outcome: "committed",
+    resource: {
+      system: receipt.resource.system as ProjectReceiptObservationV1["resource"]["system"],
+      resourceType: receipt.resource.resourceType,
+      id: receipt.resource.id,
+      url: receipt.resource.url ?? null,
+      path: receipt.resource.path ?? null,
+      revision:
+        receipt.readback.observedRevision ?? receipt.resource.revision ?? null,
+    },
+    workUnits: [],
+  };
+  try {
+    return projectStageEventFromReceiptObservationV1(observation);
+  } catch {
+    return null;
+  }
+}
+
 function canonicalActionReceiptToAgentRunReceipt(
   receipt: ActionReceipt,
   output?: unknown,
@@ -29523,6 +30567,14 @@ function parseLegacyReceiptReadback(
 }
 
 function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
+  if (toolName === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
+    return "append";
+  }
+
+  if (toolName === WRITE_PROJECT_RESULTS_TOOL_NAME) {
+    return "create";
+  }
+
   if (
     toolName === "open_web_source" ||
     toolName === "create_design_canvas" ||
@@ -29632,6 +30684,8 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
 
 function isWriteToolName(toolName: string): boolean {
   return (
+    toolName === APPEND_JUPYTER_REFLECTION_TOOL_NAME ||
+    toolName === WRITE_PROJECT_RESULTS_TOOL_NAME ||
     toolName === "create_folder" ||
     toolName === "open_web_source" ||
     toolName === "create_design_canvas" ||
@@ -29674,6 +30728,7 @@ function redactToolArguments(
   const textFields = new Set([
     "text",
     "content",
+    "markdown",
     "summary",
     "templateText",
     "code",
@@ -32081,6 +33136,7 @@ function isBlockingPreWriteProof(item: string): boolean {
 
 function isContentWriteToolThatNeedsEvidence(toolName: string): boolean {
   return [
+    APPEND_JUPYTER_REFLECTION_TOOL_NAME,
     "create_file",
     "append_file",
     "replace_file",

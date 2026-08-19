@@ -28,7 +28,9 @@ const STAGE_CAPABILITY: Partial<
   accepted_research: "notes",
   linear_hierarchy: "linear",
   code_execution: "code",
+  code_validation: "code",
   private_github_publication: "github",
+  reflection: "notes",
   // Cleanup still needs a connected GitHub capability; delete_repo authority
   // is enforced separately by missionReadinessPreflight.
   reconciliation_cleanup: "github",
@@ -153,9 +155,13 @@ export function compoundLifecycleStageLabel(
     case "linear_hierarchy":
       return "Linear";
     case "code_execution":
-      return "Code";
+      return "Implement";
+    case "code_validation":
+      return "Test";
     case "private_github_publication":
       return "GitHub";
+    case "reflection":
+      return "Reflect";
     case "reconciliation_cleanup":
       return "Cleanup";
   }

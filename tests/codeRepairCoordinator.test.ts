@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { sha256Fingerprint } from "../packages/headless-runtime/src/canonicalize";
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 
 import {
   CodeRepairCoordinatorV1,
@@ -30,6 +34,12 @@ const BEFORE_HASH = `sha256:${"1".repeat(64)}`;
 const AFTER_HASH = `sha256:${"2".repeat(64)}`;
 const SHA_DRIFT = `sha256:${"9".repeat(64)}`;
 const NOW = "2026-07-12T12:00:00.000Z";
+const COMMIT_IDENTITY = {
+  authorName: AGENT_GIT_COMMIT_NAME_V1,
+  authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+  committerName: AGENT_GIT_COMMIT_NAME_V1,
+  committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+};
 
 test("exports the fixed AgentRunner tool catalog with fail-closed commit preparation", () => {
   const unavailable = async () => {
@@ -198,6 +208,7 @@ test("repairs a later cycle, validates fresh, and emits only a readback-verified
   assert.equal(result.verifiedCommitReceipt?.baseSha, BASE_SHA);
   assert.equal(result.verifiedCommitReceipt?.commitSha, COMMIT_SHA);
   assert.equal(result.verifiedCommitReceipt?.treeSha, TREE_SHA);
+  assert.deepEqual(result.verifiedCommitReceipt?.identity, COMMIT_IDENTITY);
   assert.deepEqual(result.verifiedCommitReceipt?.changedArtifacts, [
     { path: "src/index.ts", sha256: AFTER_HASH },
   ]);
@@ -563,6 +574,7 @@ function createHarness(options: HarnessOptions) {
             committedDiff.fingerprint,
           changedPaths: [...committedDiff.changedPaths],
           artifactHashes: structuredClone(committedArtifacts),
+          identity: { ...COMMIT_IDENTITY },
           readAt: NOW,
         };
       },
@@ -585,6 +597,7 @@ function createHarness(options: HarnessOptions) {
             diffFingerprint: committedDiff.fingerprint,
             changedPaths: [...committedDiff.changedPaths],
             artifactHashes: structuredClone(committedArtifacts),
+            identity: { ...COMMIT_IDENTITY },
             readAt: NOW,
           },
         };

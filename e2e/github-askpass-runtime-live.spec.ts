@@ -7,9 +7,14 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { createVerifiedCodePublicationHandoffV1 } from "../packages/core-api/src/verifiedCodePublicationHandoffV1";
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
 import type { VerifiedLocalCommitReceiptV1 } from "../extensions/code/repair/types";
 import { createTrustedGitHubRepositoryBindingV1 } from "../src/integrations/github/TrustedGitHubRepositoryBindingV1";
+import { createTrustedGitHubRepositoryBindingV2 } from "../src/integrations/github/TrustedGitHubRepositoryBindingV2";
 import {
   DisposableExternalCleanupManifest,
   preflightGhRepositoryDeleteAuthority,
@@ -127,15 +132,32 @@ test("production verified git push gateway pushes and reads back a disposable pr
       windowsHide: true,
       timeout: 60_000,
     });
-    const repositoryId = Number(
+    const repositoryReadback = JSON.parse(
       (
-        await execFileAsync("gh", ["api", `repos/${fullName}`, "--jq", ".id"], {
-          windowsHide: true,
-          timeout: 30_000,
-        })
+        await execFileAsync(
+          "gh",
+          [
+            "api",
+            `repos/${fullName}`,
+            "--jq",
+            "{id: .id, fullName: .full_name, htmlUrl: .html_url, defaultBranch: .default_branch, private: .private, visibility: .visibility, archived: .archived}",
+          ],
+          { windowsHide: true, timeout: 30_000 },
+        )
       ).stdout.trim(),
-    );
+    ) as {
+      id: number;
+      fullName: string;
+      htmlUrl: string;
+      defaultBranch: string;
+      private: boolean;
+      visibility: "private" | "public" | "internal";
+      archived: boolean;
+    };
+    const repositoryId = repositoryReadback.id;
     expect(Number.isSafeInteger(repositoryId) && repositoryId > 0).toBe(true);
+    expect(repositoryReadback.private).toBe(true);
+    expect(repositoryReadback.visibility).toBe("private");
 
     // Production-shaped trust objects with the real SHAs. Validation receipt
     // fingerprints are synthetic (this lane proves the push runtime, not the
@@ -176,6 +198,12 @@ test("production verified git push gateway pushes and reads back a disposable pr
         { path: "PROOF.md", sha256: proofSha256, bytes: Buffer.byteLength(proofBody) },
       ],
       changedArtifacts: [{ path: "PROOF.md", sha256: proofSha256 }],
+      identity: {
+        authorName: AGENT_GIT_COMMIT_NAME_V1,
+        authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+        committerName: AGENT_GIT_COMMIT_NAME_V1,
+        committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+      },
       targetedValidationReceiptId: `targeted-${suffix}`,
       fullValidationReceiptId: `full-${suffix}`,
       targetedValidationFingerprint: proofSha256,
@@ -220,11 +248,44 @@ test("production verified git push gateway pushes and reads back a disposable pr
       true,
     );
 
+    // Refresh the exact visibility evidence immediately before gateway.push;
+    // the V2 attestation binds this observation time and provider readback.
+    const freshRepositoryReadback = JSON.parse(
+      (
+        await execFileAsync(
+          "gh",
+          [
+            "api",
+            `repos/${fullName}`,
+            "--jq",
+            "{id: .id, fullName: .full_name, htmlUrl: .html_url, defaultBranch: .default_branch, private: .private, visibility: .visibility, archived: .archived}",
+          ],
+          { windowsHide: true, timeout: 30_000 },
+        )
+      ).stdout.trim(),
+    ) as typeof repositoryReadback;
+    const repositoryObservedAt = new Date().toISOString();
+    expect(freshRepositoryReadback.id).toBe(repositoryId);
+    expect(freshRepositoryReadback.private).toBe(true);
+    expect(freshRepositoryReadback.visibility).toBe("private");
+    const privateRepositoryBinding = createTrustedGitHubRepositoryBindingV2({
+      key: binding.key,
+      profile,
+      owner,
+      repository,
+      repositoryReadback: freshRepositoryReadback,
+      expectedVisibility: "private",
+      observedAt: repositoryObservedAt,
+      verifiedAccountId: account.id,
+      verifiedAccountLogin: account.login,
+      trustedAt: committedAt,
+    });
+
     // Drive the PRODUCTION gateway end to end, twice: the first call must
     // dispatch, readback-verify, and mint a receipt; the second identical call
     // must short-circuit on the durable attempt record without redispatching.
     const observed = await harness.page.evaluate(
-      async ({ pluginId, handoff, binding, profile }) => {
+      async ({ pluginId, handoff, binding, privateRepositoryBinding, profile }) => {
         const plugin = (window as typeof window & { app?: any }).app?.plugins
           ?.plugins?.[pluginId];
         if (!plugin?.createVerifiedGitPushGateway || !plugin.githubCredential) {
@@ -234,6 +295,8 @@ test("production verified git push gateway pushes and reads back a disposable pr
         const input = {
           handoff,
           binding,
+          privateRepositoryBinding,
+          expectedVisibility: "private",
           profile,
           credentialReferenceId: plugin.githubCredential.tokenReferenceId,
         };
@@ -245,6 +308,9 @@ test("production verified git push gateway pushes and reads back a disposable pr
         pluginId: NATIVE_CORE_PLUGIN_ID,
         handoff: JSON.parse(JSON.stringify(handoff)),
         binding: JSON.parse(JSON.stringify(binding)),
+        privateRepositoryBinding: JSON.parse(
+          JSON.stringify(privateRepositoryBinding),
+        ),
         profile: JSON.parse(JSON.stringify(profile)),
       },
     );

@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const viewSource = readFileSync(new URL("../src/AgentView.ts", import.meta.url), "utf8");
+const developerMissionProgressSource = readFileSync(
+  new URL("../src/ui/developerMissionProgress.ts", import.meta.url),
+  "utf8",
+);
 const settingsSource = readFileSync(new URL("../src/settings.ts", import.meta.url), "utf8");
 const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
 const chatCleanupSource = readFileSync(
@@ -19,12 +23,17 @@ test("native UI remains prompt-first with one Run Details destination", () => {
   assert.doesNotMatch(settingsSource, /runDetailsDiagnosticsExpanded/u);
 });
 
-test("Chat exposes one live-run surface and keeps process controls out of conversation", () => {
+test("Chat exposes one live-run surface with compact developer progress", () => {
   assert.equal(
     [...viewSource.matchAll(/data-testid": "live-run-card"/gu)].length,
     1,
   );
-  assert.doesNotMatch(viewSource, /data-testid": "lifecycle-stage-strip"/u);
+  assert.match(viewSource, /data-testid": "developer-mission-stage-strip"/u);
+  assert.match(viewSource, /data-testid": "developer-mission-completion"/u);
+  assert.match(
+    developerMissionProgressSource,
+    /Research[\s\S]{0,180}Linear plan[\s\S]{0,180}Implement[\s\S]{0,180}Test[\s\S]{0,180}GitHub[\s\S]{0,180}Reflect/u,
+  );
   assert.doesNotMatch(viewSource, /data-testid": "chat-team-strip"/u);
   assert.doesNotMatch(viewSource, /data-testid": "live-workstream"/u);
   assert.match(viewSource, /text: "Open Run Details"/u);

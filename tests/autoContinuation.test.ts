@@ -2,10 +2,76 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   decideAutoContinuation,
+  resolveAdaptiveLeadSegmentLimitV1,
+  resolveForegroundSegmentLimit,
   resolvePendingToolsForAutoContinuation,
 } from "../src/agent/autoContinuation";
 import { computeProofDebt } from "../src/agent/proofDebt";
 import { reflectMissionCompletion } from "../src/agent/completionReflection";
+
+test("foreground completion uses the configured proof-driven segment ceiling", () => {
+  assert.equal(
+    resolveForegroundSegmentLimit({
+      autoContinue: true,
+      completionDriven: true,
+      configuredCompletionSegments: 24,
+      configuredLongRunSegments: 2,
+      explicitLongRunningResearch: false,
+    }),
+    24,
+  );
+  assert.equal(
+    resolveForegroundSegmentLimit({
+      autoContinue: true,
+      completionDriven: true,
+      configuredCompletionSegments: 99,
+      explicitLongRunningResearch: true,
+    }),
+    48,
+  );
+  assert.equal(
+    resolveForegroundSegmentLimit({
+      autoContinue: true,
+      completionDriven: false,
+      configuredLongRunSegments: 8,
+      explicitLongRunningResearch: true,
+    }),
+    3,
+  );
+  assert.equal(
+    resolveForegroundSegmentLimit({
+      autoContinue: false,
+      completionDriven: true,
+      configuredCompletionSegments: 24,
+      explicitLongRunningResearch: true,
+    }),
+    1,
+  );
+});
+
+test("adaptive Lead can spend its full model budget across bounded slices", () => {
+  assert.equal(
+    resolveAdaptiveLeadSegmentLimitV1({
+      leadModelSteps: 60,
+      configuredCompletionSegments: 24,
+    }),
+    6,
+  );
+  assert.equal(
+    resolveAdaptiveLeadSegmentLimitV1({
+      leadModelSteps: 60,
+      configuredCompletionSegments: 4,
+    }),
+    4,
+  );
+  assert.equal(
+    resolveAdaptiveLeadSegmentLimitV1({
+      leadModelSteps: 9,
+      configuredCompletionSegments: 24,
+    }),
+    1,
+  );
+});
 
 test("auto continuation recommends only an unfinished productive budget outcome", () => {
   assert.deepEqual(

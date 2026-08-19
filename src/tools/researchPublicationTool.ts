@@ -32,6 +32,12 @@ import {
 import { AcceptedResearchNoteWriter } from "../integrations/linear";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
+import {
+  deriveAcceptedResearchSeedFromProjectIdeaBriefV1,
+  parseProjectIdeaAcceptedResearchSeedV1,
+  parseProjectIdeaBriefV1,
+  type ProjectIdeaAcceptedResearchSeedV1,
+} from "@agentic-researcher/core-api";
 
 export const PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME = "publish_research_to_linear";
 
@@ -478,7 +484,9 @@ export interface CreateResearchPublicationToolOptionsV1 {
    * Host-owned view of the trusted repository catalog, used to make package
    * negotiation self-describing: with exactly one trusted profile the
    * repositoryKey defaults to it instead of requiring the model to echo it,
-   * and rejection errors enumerate the valid keys so a retry can succeed.
+   * while multiple profiles and validation choices require exact affirmative
+   * names in the original mission. Model-supplied keys never select authority.
+   * Rejection errors enumerate valid keys so a user-directed retry can succeed.
    * Absent, the legacy strict behavior applies unchanged.
    */
   describeTrustedRepositoryCatalog?(): TrustedRepositoryCatalogV1;
@@ -487,6 +495,148 @@ export interface CreateResearchPublicationToolOptionsV1 {
 export interface TrustedRepositoryCatalogV1 {
   repositoryKeys: readonly string[];
   validationKeysByRepository: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * A native ideation brief that exists in this run is an exact publication
+ * input, never advisory prose. Unverified/unselected briefs cannot promote,
+ * and every field shared with AcceptedResearchNotePackageV1 must remain byte-
+ * for-byte equivalent before any note or Linear mutation is attempted.
+ *
+ * The exact seed is persisted inside the accepted package/artifact so resume
+ * does not depend on process-local cache state. Absence of both cache entries
+ * is valid only for an independent publication or for a package that already
+ * carries a self-verifying durable seed.
+ */
+export function assertProjectIdeaSeedPublicationBindingV1(
+  package_: AcceptedResearchNotePackageV1,
+  cache: Pick<
+    NonNullable<ToolExecutionContext["runtimeCache"]>,
+    "projectIdeaBrief" | "projectIdeaAcceptedResearchSeed"
+  > | undefined,
+  originalPrompt = "",
+): void {
+  const cachedBrief = cache?.projectIdeaBrief;
+  const cachedSeed = cache?.projectIdeaAcceptedResearchSeed;
+  if (!cachedBrief && !cachedSeed) {
+    if (package_.projectIdeaSeed) {
+      // Validate both the self-verifying source brief and the exact projection
+      // into accepted research. A signed seed attached to drifted publication
+      // fields is not a durable ideation binding.
+      parseAcceptedResearchNotePackageV1(package_);
+      return;
+    }
+    if (hasAffirmativeProjectIdeationIntentV1(originalPrompt)) {
+      throw new ToolExecutionError(
+        "research_publication_project_idea_seed_required",
+        "This mission completed or explicitly requires native project ideation, but its exact signed promotion seed is missing. Recreate the grounded selected brief before publishing; independent research publication remains available when ideation was not requested.",
+        { mutationState: "not_applied" },
+      );
+    }
+    return;
+  }
+  if (!cachedBrief || !cachedSeed) {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_not_promotable",
+      "The run-local project idea is unverified or has no selected option, so it cannot seed accepted research publication.",
+      { mutationState: "not_applied" },
+    );
+  }
+  let exactSeed: ProjectIdeaAcceptedResearchSeedV1;
+  try {
+    exactSeed = deriveAcceptedResearchSeedFromProjectIdeaBriefV1(
+      parseProjectIdeaBriefV1(cachedBrief),
+    );
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_cache_invalid",
+      cause instanceof Error
+        ? `The run-local project idea cache is invalid: ${cause.message}`
+        : "The run-local project idea cache is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+  if (canonicalJson(exactSeed) !== canonicalJson(cachedSeed)) {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_cache_invalid",
+      "The cached project idea promotion seed drifted from its fingerprinted brief.",
+      { mutationState: "not_applied" },
+    );
+  }
+  if (
+    !package_.projectIdeaSeed ||
+    canonicalJson(package_.projectIdeaSeed) !== canonicalJson(exactSeed)
+  ) {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_drift",
+      "Accepted research publication drifted from the exact durable project idea seed.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const acceptedProjection = {
+    title: package_.title,
+    problemImpact: package_.problemImpact,
+    objective: package_.objective,
+    proposedWork: package_.proposedWork,
+    nonGoals: package_.nonGoals,
+    acceptanceCriteria: package_.acceptanceCriteria,
+    evidence: package_.evidence.map(
+      ({ id, kind, reference, contentSha256 }) => ({
+        id,
+        kind,
+        reference,
+        contentSha256,
+      }),
+    ),
+    riskClass: package_.riskClass,
+  };
+  const seedProjection = {
+    title: exactSeed.title,
+    problemImpact: exactSeed.problemImpact,
+    objective: exactSeed.selectedDirection.summary,
+    proposedWork: exactSeed.proposedWork,
+    nonGoals: exactSeed.nonGoals,
+    acceptanceCriteria: exactSeed.acceptanceCriteria,
+    evidence: exactSeed.evidence,
+    riskClass: exactSeed.riskClass,
+  };
+  if (canonicalJson(acceptedProjection) !== canonicalJson(seedProjection)) {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_drift",
+      "Accepted research publication fields drifted from the exact durable project idea seed.",
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
+/**
+ * Publication-side guard kept local to avoid a routing-module cycle. It is
+ * deliberately narrower than general idea language: only an affirmative
+ * request to brainstorm/evaluate/select project directions makes the durable
+ * promotion seed mandatory after restart.
+ */
+export function hasAffirmativeProjectIdeationIntentV1(prompt: string): boolean {
+  const normalized = typeof prompt === "string"
+    ? prompt.replace(/\r\n?/gu, "\n")
+    : "";
+  if (/\bcreate_project_idea_brief\b/iu.test(normalized)) return true;
+  return normalized
+    .split(/(?:[!?;\n]+|\.(?=\s|$)|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some(
+      (clause) =>
+        !/\b(?:do\s+not|don't|never|skip|without)\b[^.\n]{0,100}\b(?:ideat|brainstorm|project\s+(?:idea|concept|direction))\w*/iu.test(
+          clause,
+        ) &&
+        (/\bproject\s+ideation\b/iu.test(clause) ||
+          /\b(?:ideat\w*|brainstorm|generate|develop|evaluate|compare|select|choose)\b[^.\n]{0,140}\b(?:project\s+)?(?:ideas?|concepts?|directions?)\b/iu.test(
+            clause,
+          ) ||
+          /\b(?:project\s+)?(?:ideas?|concepts?|directions?)\b[^.\n]{0,140}\b(?:ideat\w*|brainstorm|generate|develop|evaluate|compare|select|choose)\b/iu.test(
+            clause,
+          )),
+    );
 }
 
 /**
@@ -548,6 +698,19 @@ export function createResearchPublicationTool(
       const publicationId = `publication-${artifactId}`;
       const priorCheckpoint = await options.lineage.get?.(publicationId) ?? null;
       if (priorCheckpoint?.status === "complete") {
+        if (priorCheckpoint.acceptedPackage) {
+          assertProjectIdeaSeedPublicationBindingV1(
+            priorCheckpoint.acceptedPackage,
+            context.runtimeCache,
+            context.originalPrompt,
+          );
+        } else if (hasAffirmativeProjectIdeationIntentV1(context.originalPrompt)) {
+          throw new ToolExecutionError(
+            "research_publication_project_idea_seed_required",
+            "This completed publication belongs to a mission that explicitly requires native project ideation, but its durable accepted package and exact signed promotion seed are missing. Recreate the grounded selected brief before replaying publication.",
+            { mutationState: "not_applied" },
+          );
+        }
         return replayCompletedResearchPublication({
           checkpoint: priorCheckpoint,
           publicationId,
@@ -567,7 +730,8 @@ export function createResearchPublicationTool(
             vaultBindingKey,
           })
         : await captureInitiatingNoteBinding(context);
-      const proofCache = context.runtimeCache ?? { toolResults: new Map() };
+      const proofCache: NonNullable<ToolExecutionContext["runtimeCache"]> =
+        context.runtimeCache ?? { toolResults: new Map() };
       if (options.loadDurableWebEvidence) {
         seedDurableWebEvidence(
           proofCache,
@@ -599,6 +763,16 @@ export function createResearchPublicationTool(
         proofCache,
         rootRunId,
         priorCheckpoint?.acceptedPackage ?? null,
+      );
+      // This check intentionally runs after checkpoint stabilization, not only
+      // during fresh argument parsing. A restarted mission must reconstruct
+      // ideation lineage from the exact checkpoint-bound signed seed; losing
+      // the run-local cache can never silently downgrade a joined workflow to
+      // independent research publication.
+      assertProjectIdeaSeedPublicationBindingV1(
+        note.package,
+        proofCache,
+        context.originalPrompt,
       );
       if (!context.requestNestedApproval) {
         throw new ToolExecutionError(
@@ -740,10 +914,22 @@ export function createResearchPublicationTool(
 
 export function hasExplicitResearchPublicationIntent(prompt: string): boolean {
   const normalized = typeof prompt === "string" ? prompt : "";
+  const linearWorkNegated =
+    /\b(?:do\s+not|don't|never)\b[^.!?;\n]{0,80}\b(?:create|turn|convert|shape|break|translate|organize|plan)\b[^.!?;\n]{0,120}\blinear\s+(?:work|tasks?|issues?|tickets?)\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:without|skip|exclude|no)\b[^.!?;\n]{0,100}\blinear\s+(?:work|tasks?|issues?|tickets?)\b/iu.test(
+      normalized,
+    );
+  if (linearWorkNegated) return false;
   // "Obsidian note … create … Linear issue" is ordinary ticket writeback, not
   // publish_research_to_linear. Require research/findings/report language or an
   // explicit publish/send/sync verb before Linear.
-  return normalized
+  const naturalDeveloperPublication =
+    /\b(?:research|investigate|study|analy[sz]e)\b[\s\S]{0,280}\b(?:create|turn|convert|shape|break|translate|organize|plan)\b[\s\S]{0,160}\b(?:findings|research|design|results?|measurable|actionable|scoped|delivery)?\b[\s\S]{0,80}\blinear\s+(?:work|tasks?|issues?|project|plan)\b/iu.test(
+      normalized,
+    );
+  return naturalDeveloperPublication || normalized
     .split(/(?:[!?;\r\n]+|\.(?=\s|$)|\bbut\b)/iu)
     .map((clause) => clause.trim())
     .filter(Boolean)
@@ -784,7 +970,8 @@ async function parseToolArguments(input: {
   const { value, runId } = input;
   assertExactKeys(value, ["mode", "package"], ["notePath", "baseHash"]);
   const packageRecord = expectRecord(value.package, "accepted research package");
-  hydratePackageObjective(packageRecord);
+  const projectIdeaSeed = resolveCachedProjectIdeaSeedV1(input.runtimeCache);
+  hydratePackageObjective(packageRecord, projectIdeaSeed);
   assertExactKeys(
     packageRecord,
     [
@@ -818,6 +1005,8 @@ async function parseToolArguments(input: {
   packageRecord.executionClass = canonicalizeExecutionClass(
     packageRecord.executionClass,
   );
+  const trustedRepositoryCatalog =
+    input.describeTrustedRepositoryCatalog?.();
   if (packageRecord.schemaVersion !== 1) {
     throw new ToolExecutionError(
       "research_publication_invalid_arguments",
@@ -837,31 +1026,19 @@ async function parseToolArguments(input: {
   }
   if (
     packageRecord.executionClass === "code" &&
-    packageRecord.repositoryKey === undefined
+    packageRecord.repositoryKey === undefined &&
+    !trustedRepositoryCatalog
   ) {
-    // A model cannot invent a trusted key, and with exactly one registered
-    // profile there is nothing to disambiguate — requiring an echo of the key
-    // only converts good packages into repeated failures. With several
-    // profiles the choice is genuinely the mission's, so still fail closed,
-    // but name the candidates so a retry can succeed.
-    const catalog = input.describeTrustedRepositoryCatalog?.();
-    if (catalog && catalog.repositoryKeys.length === 1) {
-      packageRecord.repositoryKey = catalog.repositoryKeys[0];
-    } else {
-      const known = catalog?.repositoryKeys.length
-        ? ` Trusted repository keys: ${[...catalog.repositoryKeys].join(", ")}.`
-        : "";
-      throw new ToolExecutionError(
-        "research_publication_invalid_arguments",
-        `A package with executionClass code must include the trusted repositoryKey named by the mission.${known}`,
-        { mutationState: "not_applied" },
-      );
-    }
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      "A package with executionClass code must include the trusted repositoryKey named by the mission.",
+      { mutationState: "not_applied" },
+    );
   }
   bindExplicitTrustedRepositoryContract({
     packageRecord,
     originalPrompt: input.originalPrompt,
-    catalog: input.describeTrustedRepositoryCatalog?.(),
+    catalog: trustedRepositoryCatalog,
   });
   const trustedWebReferences = hydrateTrustedWebEvidence(
     packageRecord,
@@ -899,11 +1076,17 @@ async function parseToolArguments(input: {
   }
   const providerPackage = {
     ...packageRecord,
+    ...(projectIdeaSeed ? { projectIdeaSeed } : {}),
     vaultBindingKey: requireLogicalKey(input.vaultBindingKey, "host vault binding key"),
     originRunId: runId,
   } as unknown as AcceptedResearchNotePackageV1;
   const package_ = assertAcceptedResearchPackageShape(providerPackage);
   input.validateTrustedBindings(package_);
+  assertProjectIdeaSeedPublicationBindingV1(
+    package_,
+    input.runtimeCache,
+    input.originalPrompt,
+  );
   const path = input.initiatingNote?.source === "checkpoint"
     ? input.initiatingNote.path
     : requireSafeVaultMarkdownPath(
@@ -965,34 +1148,104 @@ function bindExplicitTrustedRepositoryContract(input: {
   catalog: TrustedRepositoryCatalogV1 | undefined;
 }): void {
   const { packageRecord, catalog } = input;
-  if (!catalog) return;
-  const promptRepositoryKeys = catalog.repositoryKeys.filter((key) =>
-    promptContainsLogicalKey(input.originalPrompt, key)
+  if (!catalog || packageRecord.executionClass !== "code") return;
+  const repositoryKeys = [...new Set(
+    catalog.repositoryKeys.map((key) => key.trim()).filter(Boolean),
+  )];
+  if (repositoryKeys.length === 0) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      "No trusted repository profile is available for this code publication.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const promptRepositoryKeys = repositoryKeys.filter((key) =>
+    promptAffirmativelyNamesLogicalKey(input.originalPrompt, key)
   );
-  if (promptRepositoryKeys.length === 1) {
+  if (repositoryKeys.length === 1) {
+    // One host profile is an authority-preserving default. Always replace the
+    // model echo with the sole trusted key.
+    packageRecord.repositoryKey = repositoryKeys[0];
+  } else if (promptRepositoryKeys.length === 1) {
+    // With a real choice, only the original mission can select the profile.
     packageRecord.repositoryKey = promptRepositoryKeys[0];
+  } else {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `A package with executionClass code must include the trusted repositoryKey named by the mission; exactly one must be affirmatively named when multiple profiles are trusted. Trusted repository keys: ${repositoryKeys.join(", ")}.`,
+      { mutationState: "not_applied" },
+    );
   }
   const repositoryKey =
     typeof packageRecord.repositoryKey === "string"
       ? packageRecord.repositoryKey
       : "";
-  const trustedValidationKeys =
-    catalog.validationKeysByRepository[repositoryKey] ?? [];
+  const trustedValidationKeys = [...new Set(
+    (catalog.validationKeysByRepository[repositoryKey] ?? [])
+      .map((key) => key.trim())
+      .filter(Boolean),
+  )];
   const promptValidationKeys = trustedValidationKeys.filter((key) =>
-    promptContainsLogicalKey(input.originalPrompt, key)
+    promptAffirmativelyNamesLogicalKey(input.originalPrompt, key)
   );
-  if (promptValidationKeys.length > 0) {
+  if (trustedValidationKeys.length === 0) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `No trusted validation requirement is available for repository ${repositoryKey}.`,
+      { mutationState: "not_applied" },
+    );
+  } else if (trustedValidationKeys.length === 1) {
+    packageRecord.validationRequirementKeys = [trustedValidationKeys[0]];
+  } else if (promptValidationKeys.length > 0) {
     // Logical repository/validation keys are host controls named by the user,
     // not creative model output. Bind the package to every exact trusted key
     // present in the original mission and discard a mistranscribed echo.
     packageRecord.validationRequirementKeys = [...promptValidationKeys];
+  } else {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `The mission must affirmatively name at least one exact trusted validation requirement when the selected repository has multiple validation choices. Trusted validation keys for ${repositoryKey}: ${trustedValidationKeys.join(", ")}.`,
+      { mutationState: "not_applied" },
+    );
   }
 }
 
-function promptContainsLogicalKey(prompt: string, key: string): boolean {
-  const normalizedPrompt = prompt.toLowerCase();
-  const normalizedKey = key.trim().toLowerCase();
-  if (!normalizedKey) return false;
+function promptAffirmativelyNamesLogicalKey(
+  prompt: string,
+  key: string,
+): boolean {
+  return prompt
+    .split(/(?:[!?;\n]+|\.(?=\s|$)|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some((clause) => {
+      const normalizedClause = clause.toLowerCase();
+      const normalizedKey = key.trim().toLowerCase();
+      return logicalKeyOccurrenceOffsets(normalizedClause, normalizedKey)
+        .some((keyOffset) => {
+          const before = normalizedClause.slice(
+            Math.max(0, keyOffset - 100),
+            keyOffset,
+          );
+          const after = normalizedClause.slice(
+            keyOffset + normalizedKey.length,
+            keyOffset + normalizedKey.length + 60,
+          );
+          return !/\b(?:do\s+not|don't|never|avoid|exclude|skip|without|not)\b[^,]*$/iu.test(
+            before,
+          ) && !/^\s*(?:(?:must|should|is|are|was|were)\s+)?not\b/iu.test(
+            after,
+          );
+        });
+    });
+}
+
+function logicalKeyOccurrenceOffsets(
+  normalizedPrompt: string,
+  normalizedKey: string,
+): number[] {
+  if (!normalizedKey) return [];
+  const offsets: number[] = [];
   let offset = normalizedPrompt.indexOf(normalizedKey);
   while (offset >= 0) {
     const before = offset === 0 ? "" : normalizedPrompt[offset - 1] ?? "";
@@ -1012,11 +1265,11 @@ function promptContainsLogicalKey(prompt: string, key: string): boolean {
       !/[a-z0-9._-]/u.test(before) &&
       !afterContinuesLogicalKey
     ) {
-      return true;
+      offsets.push(offset);
     }
     offset = normalizedPrompt.indexOf(normalizedKey, offset + 1);
   }
-  return false;
+  return offsets;
 }
 
 function canonicalizeRiskClass(value: unknown): unknown {
@@ -1402,7 +1655,27 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
   required: ["mode", "package"],
 };
 
-function hydratePackageObjective(packageRecord: Record<string, unknown>): void {
+function hydratePackageObjective(
+  packageRecord: Record<string, unknown>,
+  projectIdeaSeed: ProjectIdeaAcceptedResearchSeedV1 | null,
+): void {
+  if (projectIdeaSeed) {
+    if (
+      packageRecord.objective === undefined ||
+      packageRecord.objective === null ||
+      (typeof packageRecord.objective === "string" &&
+        !packageRecord.objective.trim())
+    ) {
+      packageRecord.objective = projectIdeaSeed.selectedDirection.summary;
+      return;
+    }
+    if (typeof packageRecord.objective === "string") {
+      packageRecord.objective = packageRecord.objective.trim();
+    }
+    // The durable package parser performs the exact equality check. Do not
+    // overwrite a divergent supplied objective and silently widen authority.
+    return;
+  }
   if (
     typeof packageRecord.objective === "string" &&
     packageRecord.objective.trim()
@@ -1826,6 +2099,62 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function resolveCachedProjectIdeaSeedV1(
+  cache: Pick<
+    NonNullable<ToolExecutionContext["runtimeCache"]>,
+    "projectIdeaBrief" | "projectIdeaAcceptedResearchSeed"
+  > | undefined,
+): ProjectIdeaAcceptedResearchSeedV1 | null {
+  const cachedBrief = cache?.projectIdeaBrief;
+  const cachedSeed = cache?.projectIdeaAcceptedResearchSeed;
+  if (!cachedBrief && !cachedSeed) return null;
+  if (!cachedBrief || !cachedSeed) {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_not_promotable",
+      "The run-local project idea is unverified or has no selected option, so it cannot seed accepted research publication.",
+      { mutationState: "not_applied" },
+    );
+  }
+  try {
+    const exact = deriveAcceptedResearchSeedFromProjectIdeaBriefV1(
+      parseProjectIdeaBriefV1(cachedBrief),
+    );
+    const observed = parseProjectIdeaAcceptedResearchSeedV1(cachedSeed);
+    if (canonicalJson(exact) !== canonicalJson(observed)) {
+      throw new Error(
+        "The cached project idea promotion seed drifted from its fingerprinted brief.",
+      );
+    }
+    return exact;
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_cache_invalid",
+      cause instanceof Error
+        ? `The run-local project idea cache is invalid: ${cause.message}`
+        : "The run-local project idea cache is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (!value || typeof value !== "object") return JSON.stringify(null);
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJson(
+          (value as Record<string, unknown>)[key],
+        )}`,
+    )
+    .join(",")}}`;
 }
 
 function isValidEvidenceIdentifier(value: unknown): boolean {

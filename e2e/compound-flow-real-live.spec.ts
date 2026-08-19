@@ -27,18 +27,38 @@ import {
   assertProductionAdoptedSandboxV1,
   hostProvisionedSandboxRuntimeDigestV1,
   startRealAiHarness,
+  type E2EPreparedApprovalObservationV1,
   type RealAiHarness,
 } from "./fixtures/realAiHarness";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
+import { assertVerifiedCommitBoundCodeExamplesV1 } from "./fixtures/reflectionAssertions";
 
 const LANE = "compound-flow-real-live";
 const PROFILE_KEY = "compound-flow-real-ts";
 const VALIDATION_PROFILE_KEY = "compound-flow-real-ts-validation";
+const FLOW_REAL_ALLOWED_PREPARED_APPROVAL_TOOLS = Object.freeze([
+  "publish_research_to_linear",
+  "linear_create_issue",
+  "code_workspace_create",
+  "code_workspace_write_expected",
+  "code_validate_fast",
+  "code_repair_record_cycle",
+  "code_validate_targeted",
+  "code_validate_full",
+  "code_commit_verified",
+  "github_create_repository",
+  "publish_verified_code_to_github",
+  "finalize_github_links_in_obsidian",
+  "finalize_github_link_in_linear",
+  "finalize_linear_issue_completion",
+  "append_to_current_file",
+] as const);
 
 /**
  * Agentic compound proof: live Chat set-loose Soft+Bound for Research →
  * Linear publication → Code → GitHub → note reflection → Linear completion in
- * ONE continuous mission (no mid-run Bound approvals). No host
+ * ONE continuous mission with exact, fingerprint-bound approvals for external
+ * mutations. No host
  * prepare/execute and no Node GitHub create as the pass path. Activation is
  * prompt + Run Mission only (no starter chip).
  *
@@ -298,7 +318,8 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       `LINEAR_LIVE_TEST_TEAM_ID ${teamId} is not a team in the connected Linear workspace (${connectedTeamIds.join(", ") || "none discovered"}).`,
     ).toContain(teamId);
 
-    // Continuous set-loose compound mission (one Run Mission; no Bound approvals).
+    // Continuous set-loose compound mission (one Run Mission). External
+    // mutation approvals remain exact prepared-action boundaries.
     // Prompt must hit full-pipeline / compound lifecycle detection: "full pipeline"
     // plus Linear + repository/workspace + GitHub + reflection (Flow real).
     await focusNote(harness.page, notePath);
@@ -309,6 +330,7 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       // keeps the proof-gated acceptance path that publish_research_to_linear
       // requires.
       `First research the Flow real ${marker} topic using exactly two public web sources and fetch both sources before accepting findings. Write the accepted findings into the current note ${notePath} using the canonical headings ## Problem and impact, ## Evidence and source links, and ## Proposed work, citing both fetched source URLs and passages.`,
+      `After both fetches, call create_project_idea_brief exactly once. Evaluate at least two project directions, select one option, and set groundingReferences to the exact two fetched web URLs. Treat the returned grounded promotion seed as authoritative: copy every shared title, problem, evidence, proposed-work, non-goal, acceptance-criterion, and risk field exactly into accepted research publication without rewriting it.`,
       // Stage 2 — research → Linear. publish_research_to_linear creates the
       // lineage that finalizeLinearLink/finalizeLinearCompletion resolve; a
       // bare linear_create_issue would leave the publication parked at
@@ -331,15 +353,40 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       // Never mention completing/closing the Linear issue: completion is host
       // finalization inside publish, and completion vocabulary flips stage
       // detection into reconciliation_cleanup which may pause for approval.
-      `Decide tool order yourself from the set-loose allowed tools. Do not ask for approval. Do not trash or delete. Do not merge. Stay in the tool loop until research, the published Linear issue, verified commit, draft PR, and reflection proofs exist.`,
+      `Decide tool order yourself from the set-loose allowed tools. Pause only for the exact prepared approval required by an external mutation. Do not trash or delete. Do not merge. Stay in the tool loop until research, the published Linear issue, verified commit, draft PR, and reflection proofs exist.`,
     ].join(" ");
+    const preparedApprovalObservations: E2EPreparedApprovalObservationV1[] = [];
     await harness.submitMission(compoundMission, {
       waitForCompletion: false,
       timeoutMs: 50 * 60_000,
     });
-    await harness.waitUntilIdleOrComplete(50 * 60_000);
+    const preparedApprovalCount = await harness.approveUntilMissionComplete(
+      50 * 60_000,
+      {
+        maxContinuations: 18,
+        allowedApprovalToolNames: FLOW_REAL_ALLOWED_PREPARED_APPROVAL_TOOLS,
+        requirePrivateRepositoryApproval: true,
+        requireExactPreparedActionApproval: true,
+        onApproval: (approval) => preparedApprovalObservations.push(approval),
+      },
+    );
+    expect(preparedApprovalCount).toBe(preparedApprovalObservations.length);
+    const linearPreparedApprovals = preparedApprovalObservations.filter(
+      (approval) =>
+        approval.toolName === "publish_research_to_linear" ||
+        approval.toolName === "linear_create_issue",
+    );
+    expect(
+      linearPreparedApprovals,
+      "the single-issue lane requires exactly one prepared Linear mutation approval",
+    ).toHaveLength(1);
+    const linearPreparedApproval = linearPreparedApprovals[0];
+    expect(linearPreparedApproval?.preparedActionId).toBeTruthy();
+    expect(linearPreparedApproval?.payloadFingerprint).toMatch(
+      /^sha256:[a-f0-9]{64}$/u,
+    );
 
-    // Harness already fails mid-run on Bound Approve; re-check at Idle.
+    // Every observed approval was guarded above; no stale control may survive.
     const boundApproveStillVisible = await harness.page.evaluate(() =>
       Array.from(
         document.querySelectorAll<HTMLButtonElement>(
@@ -349,7 +396,7 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     );
     expect(
       boundApproveStillVisible,
-      "set-loose COMPOUND-REAL must not leave a Bound Approve control after Idle",
+      "COMPOUND-REAL must not leave a Bound Approve control after Idle",
     ).toBe(false);
 
     const finalNote = await readNote(harness.page, notePath);
@@ -467,21 +514,15 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       finalNote,
       "reflection note must include the private GitHub repository URL",
     ).toContain(githubHtmlUrl!);
-    // Accept any canonical reflection heading, matching the byok-autonomous
-    // journey and e2eProjectRouting. The host's own finalizer writes
+    // Require a host-owned canonical reflection heading. The finalizer writes
     // "## Agent project reflection" (AcceptedResearchNoteWriter) or
-    // "## Mission completion reflection" (initiatingNoteReflection), and that
-    // reflection satisfies the noteReflectionWithMarkers delivery proof — which
-    // completes delivery and withdraws the write tools before the model can add
-    // its own "Flow real reflection". Requiring the model-authored heading made
-    // this lane depend on the model appending before GitHub publish. The proofs
-    // that matter (marker, Linear URL, repo URL, draft PR URL) are asserted
-    // individually above and below.
+    // "## Mission completion reflection" (initiatingNoteReflection). A
+    // model-authored "Flow real reflection" is not closure proof.
     expect(
       finalNote,
       "reflection section heading must be present",
     ).toMatch(
-      /##\s*(?:Flow real(?:\s+reflection)?|Agent project reflection|Mission completion reflection)/i,
+      /##\s*(?:Agent project reflection|Mission completion reflection)/i,
     );
 
     const codeProbe = await softProbeCodeDepth(
@@ -495,6 +536,35 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       codeProbe.depth,
       `continuous set-loose must reach verified commit; detail=${codeProbe.detail ?? ""}`,
     ).toBe("committed");
+    expect(codeProbe.commitSha).toMatch(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u);
+    const exactWorkspace = await resolveWorkspaceCleanupBinding(
+      harness.page,
+      workspaceId,
+    );
+    expect(
+      exactWorkspace,
+      "verified reflection proof requires the exact committed workspace",
+    ).not.toBeNull();
+    if (!exactWorkspace || !codeProbe.commitSha) {
+      throw new Error("Exact committed workspace reflection proof is unavailable.");
+    }
+    workspaceRoot = exactWorkspace.workspaceRoot;
+    workspaceBranch = exactWorkspace.workspaceBranch;
+    const reflectionCodeExamples =
+      await assertVerifiedCommitBoundCodeExamplesV1({
+        note: finalNote,
+        repositoryRoot: exactWorkspace.workspaceRoot,
+        expectedCommitSha: codeProbe.commitSha,
+      });
+    expect(reflectionCodeExamples.length).toBeGreaterThanOrEqual(1);
+    expect(reflectionCodeExamples.length).toBeLessThanOrEqual(2);
+    expect(
+      reflectionCodeExamples.some(
+        (example) =>
+          example.path === relativeCodePath && example.code.includes(marker),
+      ),
+      "reflection must show concise code from the marker-bearing file at the published commit",
+    ).toBe(true);
 
     const draftPrMatch = finalNote.match(
       /https:\/\/github\.com\/[^\s)\]"']+\/pull\/\d+/iu,
@@ -598,8 +668,23 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     // mandates a Linear initiative and project that this single-issue chain
     // never creates.
     const acceptanceSnapshot = await harness.attestProductionRun();
+    const projectIdeaAttestation = acceptanceSnapshot.missionEvidence.find(
+      (item: any) =>
+        /^project_idea:sha256:[a-f0-9]{64}:grounded:selected:promoted$/u.test(
+          String(item?.id ?? ""),
+        ),
+    );
+    expect(
+      projectIdeaAttestation,
+      "actual create_project_idea_brief tool-result evidence must retain one exact fingerprint and grounded+selected promotion proof",
+    ).toBeTruthy();
+    const projectIdeaFingerprint = /^project_idea:(sha256:[a-f0-9]{64}):/u.exec(
+      String(projectIdeaAttestation?.id ?? ""),
+    )?.[1];
+    expect(projectIdeaFingerprint).toMatch(/^sha256:[a-f0-9]{64}$/u);
     const observedArtifacts: string[] = [];
     const observedProofs: string[] = [];
+    const observedApprovals: string[] = [];
     const observedBindings: string[] = [];
     const attest = (bucket: string[], token: string, observed: boolean) => {
       if (observed) bucket.push(token);
@@ -628,6 +713,11 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     attest(observedProofs, "research:accepted", researchPublication!.acceptedProofExact);
     attest(
       observedProofs,
+      "research:grounded_selected_project_idea",
+      Boolean(projectIdeaFingerprint),
+    );
+    attest(
+      observedProofs,
       "research:two_distinct_sources",
       researchPublication!.webEvidenceReferences.length >= 2 &&
         researchPublication!.webEvidenceReferences.every((reference) =>
@@ -650,6 +740,11 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     attest(observedProofs, "git:verified_commit", codeProbe.commitProofExact);
     attest(
       observedProofs,
+      "reflection:verified_commit_bound_code_example",
+      reflectionCodeExamples.length >= 1 && reflectionCodeExamples.length <= 2,
+    );
+    attest(
+      observedProofs,
       "github:private_visibility_readback",
       remote.private === true,
     );
@@ -670,6 +765,14 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       "reconciliation:backlinks_and_status",
       summaryComment.issueId === completedIssueId &&
         summaryComment.body.includes(publication.pullRequestHtmlUrl),
+    );
+    attest(
+      observedApprovals,
+      "approval:linear_issue_create",
+      Boolean(linearPreparedApproval?.preparedActionId) &&
+        /^sha256:[a-f0-9]{64}$/u.test(
+          linearPreparedApproval?.payloadFingerprint ?? "",
+        ),
     );
 
     attest(
@@ -696,9 +799,8 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       {
         artifacts: observedArtifacts,
         proofs: observedProofs,
-        // Unattended set-loose: no approval boundaries, and cleanup runs after
-        // this record, so both stay empty by contract.
-        approvals: [],
+        approvals: observedApprovals,
+        // Cleanup runs after this record, so it remains empty by contract.
         bindings: observedBindings,
         cleanup: [],
       },

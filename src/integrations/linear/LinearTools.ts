@@ -1270,9 +1270,10 @@ function issueInputMismatchFields(
 }
 
 /**
- * Linear markdown round-trips rewrite task lists, spacing, and light markup.
- * Keep create/update readback fail-closed for total prose replacement while
- * accepting provider-stable reformatting of the same human content.
+ * Linear may rewrite a small, observed subset of Markdown presentation while
+ * retaining the exact description content. Compare only after applying those
+ * rewrites symmetrically; token overlap is not sufficient evidence that the
+ * approved payload was persisted intact.
  */
 function descriptionsCompatiblyMatch(
   actual: unknown,
@@ -1281,28 +1282,40 @@ function descriptionsCompatiblyMatch(
   if (expected === null || expected === undefined) {
     return actual === undefined || actual === null || actual === "";
   }
-  const expectedProse = canonicalizeLinearProse(expected);
-  const actualProse = canonicalizeLinearProse(actual);
-  if (expectedProse === actualProse) return true;
-  if (!expectedProse) return true;
-  if (!actualProse) return false;
-  const expectedTokens = expectedProse.split(" ").filter((token) => token.length > 2);
-  if (expectedTokens.length === 0) return true;
-  const actualTokens = new Set(
-    actualProse.split(" ").filter((token) => token.length > 2),
-  );
-  const hits = expectedTokens.filter((token) => actualTokens.has(token)).length;
-  return hits / expectedTokens.length >= 0.8;
+  return canonicalizeLinearDescription(actual) ===
+    canonicalizeLinearDescription(expected);
 }
 
-function canonicalizeLinearProse(value: unknown): string {
+/** Canonicalize only provider-observed Markdown presentation rewrites. */
+function canonicalizeLinearDescription(value: unknown): string {
   return String(value ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/^\s*[-*]\s+\[[ xX]\]\s+/gmu, "- ")
-    .replace(/[#*_`>[\]()!-]+/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim()
-    .toLowerCase();
+    .replace(/\r\n?/gu, "\n")
+    .split("\n")
+    .map((line) => {
+      let normalized = line.replace(/[ \t]+$/u, "");
+      normalized = normalized.replace(
+        /^([ \t]*)#{1,6}[ \t]+/u,
+        "$1",
+      );
+      normalized = normalized.replace(
+        /^([ \t]*)[-*+][ \t]+\[[xX]\][ \t]+/u,
+        "$1- [x] ",
+      );
+      normalized = normalized.replace(
+        /^([ \t]*)[-*+][ \t]+\[ \][ \t]+/u,
+        "$1- [ ] ",
+      );
+      normalized = normalized.replace(
+        /^([ \t]*)[-*+][ \t]+/u,
+        "$1- ",
+      );
+      if (!/^[ \t]*- /u.test(normalized)) {
+        normalized = normalized.replace(/:[ \t]*$/u, "");
+      }
+      return normalized;
+    })
+    .join("\n")
+    .trimEnd();
 }
 
 function describePostconditionMismatch(

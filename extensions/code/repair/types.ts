@@ -1,3 +1,5 @@
+import type { AgentGitCommitIdentityV1 } from "../../../packages/core-api/src/agentGitCommitIdentityV1";
+
 export const CODE_REPAIR_CHECKPOINT_VERSION = 1 as const;
 export const CODE_REPAIR_RECEIPT_VERSION = 1 as const;
 
@@ -190,6 +192,8 @@ export interface CodeCommitReadbackV1 {
   diffFingerprint: string;
   changedPaths: string[];
   artifactHashes: ArtifactHashReadbackV1[];
+  /** Exact raw identity read from the commit object, not process config. */
+  identity: AgentGitCommitIdentityV1;
   readAt: string;
 }
 
@@ -216,6 +220,8 @@ export interface VerifiedLocalCommitReceiptV1 {
   changedPaths: string[];
   artifactHashes: ArtifactHashReadbackV1[];
   changedArtifacts: ChangedArtifactHashV1[];
+  /** Exact raw identity verified from the committed Git object. */
+  identity: AgentGitCommitIdentityV1;
   targetedValidationReceiptId: string;
   fullValidationReceiptId: string;
   targetedValidationFingerprint: string;

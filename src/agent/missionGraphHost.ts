@@ -31,7 +31,11 @@ import {
 import {
   hasExplicitNoHostDirectoryExportIntent,
 } from "./promptIntentClassifiers";
+import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTool";
+import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
+import { extractExplicitJupyterNotebookPathsV1 } from "./jupyterReflectionIntent";
 import {
+  PROJECT_LIFECYCLE_STAGES,
   buildProjectLifecycleStageNodesV1,
   createProjectLifecycleIntentV1,
   detectProjectLifecycleStagesV1,
@@ -738,18 +742,41 @@ function buildCompositeLifecyclePlanV1(input: {
   steps: readonly PlannedToolStepV1[];
   descriptorByName: ReadonlyMap<string, ToolDescriptor>;
 }): CompositeLifecyclePlanV1 | null {
-  const stages = detectProjectLifecycleStagesV1(input.exactUserCommand);
-  // Scratch delivery plans intentionally omit code_repair_record_cycle, which
-  // is repository-only. Requiring it here would have dropped standalone
-  // Desktop deliveries out of the lifecycle plan entirely.
-  const conditionalStandaloneCodeDelivery =
-    stages.length === 1 &&
-    stages[0] === "code_execution" &&
-    input.steps.some((step) => step.name === "code_validate_fast");
-  if (
-    (stages.length < 2 && !conditionalStandaloneCodeDelivery) ||
-    input.steps.length === 0
-  ) {
+  const detectedStages = detectProjectLifecycleStagesV1(input.exactUserCommand);
+  const plannedStages = new Set(
+    input.steps.flatMap((step) => {
+      const descriptor = input.descriptorByName.get(step.name);
+      const stage = descriptor
+        ? projectLifecycleStageForToolV1(step.name, descriptor)
+        : null;
+      return stage ? [stage] : [];
+    }),
+  );
+  // Validation is a mandatory proof phase of implementation when validation
+  // tools are in the host-approved plan, even if the user's concise command
+  // merely says "implement". Reflection is added only by explicit reflection
+  // intent/tooling; generic note writes never widen into it.
+  const stages = PROJECT_LIFECYCLE_STAGES.filter(
+    (stage) =>
+      detectedStages.includes(stage) ||
+      (stage === "code_validation" &&
+        detectedStages.includes("code_execution") &&
+        plannedStages.has(stage)) ||
+      (stage === "reflection" && plannedStages.has(stage)),
+  );
+  // Preserve conventional per-tool graphs for unrelated singleton stages
+  // (notably exact prepared GitHub background actions). Validation and
+  // reflection are independently first-class composite stages; standalone
+  // code delivery keeps its established composite behavior when validation is
+  // present.
+  const independentlyComposite =
+    stages.length >= 2 ||
+    (stages.length === 1 &&
+      (stages[0] === "code_validation" ||
+        stages[0] === "reflection" ||
+        (stages[0] === "code_execution" &&
+          input.steps.some((step) => step.name === "code_validate_fast"))));
+  if (!independentlyComposite || input.steps.length === 0) {
     return null;
   }
   const stepsByStage = new Map<ProjectLifecycleStageV1, PlannedToolStepV1[]>(
@@ -778,7 +805,7 @@ function buildCompositeLifecyclePlanV1(input: {
   };
 }
 
-function projectLifecycleStageForToolV1(
+export function projectLifecycleStageForToolV1(
   toolName: string,
   descriptor: ToolDescriptor,
 ): ProjectLifecycleStageV1 | null {
@@ -788,8 +815,20 @@ function projectLifecycleStageForToolV1(
   ) {
     return "reconciliation_cleanup";
   }
+  if (name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME) {
+    return "accepted_research";
+  }
   if (name === "publish_research_to_linear") {
     return "accepted_research";
+  }
+  if (name === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
+    return "reflection";
+  }
+  if (
+    /(?:^|_)(?:write|append|create)?_?(?:project_)?(?:results?|reflection)(?:_|$)/u.test(name) &&
+    descriptor.capability.system === "vault"
+  ) {
+    return "reflection";
   }
   if (
     name === "publish_research_project_to_linear" ||
@@ -803,6 +842,14 @@ function projectLifecycleStageForToolV1(
     descriptor.capability.system === "github"
   ) {
     return "private_github_publication";
+  }
+  if (
+    name === "code_commit_verified" ||
+    name.startsWith("code_validate") ||
+    name.startsWith("code_repair") ||
+    /(?:^|_)(?:test|tests|testing|validate|validation|verify|verification)(?:_|$)/u.test(name)
+  ) {
+    return "code_validation";
   }
   if (
     name.startsWith("code_") ||
@@ -1107,6 +1154,8 @@ function plannedReadPrerequisiteIds(
       ? new Set(["semantic_search_notes"])
       : toolName === "web_fetch"
         ? new Set(["web_search"])
+        : toolName === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME
+          ? new Set(["web_fetch"])
       : new Set<string>();
   // Repeated exact workspace reads must be serialized so a same-name frontier
   // always resolves to one graph selector. Other read lifecycles retain their
@@ -1282,6 +1331,9 @@ function explicitVaultSelector(input: {
   objective: string;
   currentNotePath: string | null;
 }): string | null {
+  if (input.toolName === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
+    return extractExplicitJupyterNotebookPathsV1(input.objective)[0] ?? null;
+  }
   if (input.toolName === "read_file") {
     return analyzeExplicitVaultReadFilePaths(input.objective).paths[0] ?? null;
   }

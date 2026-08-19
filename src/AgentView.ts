@@ -136,6 +136,19 @@ import {
   KeyedFrameBatcher,
 } from "./ui/frameBatcher";
 import { LatestRenderGate } from "./ui/latestRenderGate";
+import {
+  applyDeveloperMissionGraphV1,
+  applyDeveloperMissionReceiptV1,
+  applyDeveloperMissionToolStartV1,
+  developerMissionCompletionFromProjectRunReportV1,
+  mergeDeveloperMissionLifecycleV1,
+  normalizeDeveloperMissionCompletionV1,
+  phaseStatusLabelV1,
+  type DeveloperMissionCompletionArtifactV1,
+  type DeveloperMissionCompletionViewV1,
+  type DeveloperMissionProgressViewV1,
+} from "./ui/developerMissionProgress";
+import { parseProjectRunReportV1 } from "./agent/projectRunReport";
 
 export const AGENT_VIEW_TYPE = "agentic-researcher-view";
 
@@ -200,6 +213,7 @@ export class AgentView extends ItemView {
   private chatEmptyStateEl: HTMLElement | null = null;
   private liveWorkstreamEl: HTMLElement | null = null;
   private lifecycleStageStripEl: HTMLElement | null = null;
+  private developerMissionCompletionEl: HTMLElement | null = null;
   private chatTeamStripEl: HTMLElement | null = null;
   private thinkingStreamEl: HTMLElement | null = null;
   private liveThinkingMessageEl: HTMLElement | null = null;
@@ -267,6 +281,9 @@ export class AgentView extends ItemView {
   private readonly runValidationShas: string[] = [];
   private runCommitSha: string | null = null;
   private runResearchNotePath: string | null = null;
+  private runResultsPath: string | null = null;
+  private developerMissionProgress: DeveloperMissionProgressViewV1 | null = null;
+  private developerMissionCompletion: DeveloperMissionCompletionViewV1 | null = null;
   private noteStreamingAnnounced = false;
   private activeTab: AgentViewTab = "chat";
   private isRunning = false;
@@ -418,6 +435,37 @@ export class AgentView extends ItemView {
     this.updateRunButtonState();
   }
 
+  /**
+   * Host integration point for the durable project-run reporter. The view does
+   * not infer provider authority from this payload: it only renders the safe,
+   * redacted artifact links the host has already verified.
+   */
+  presentDeveloperMissionCompletionV1(
+    completion: DeveloperMissionCompletionViewV1,
+  ): void {
+    const normalized = normalizeDeveloperMissionCompletionV1(completion);
+    this.developerMissionCompletion = normalized;
+    if (normalized.progress) {
+      this.developerMissionProgress = normalized.progress;
+      this.renderDeveloperMissionProgress();
+    }
+    const results = normalized.artifacts.find(
+      (artifact) => artifact.kind === "results" && artifact.vaultPath,
+    );
+    if (results?.vaultPath) {
+      this.runResultsPath = results.vaultPath;
+      this.developerMissionProgress = applyDeveloperMissionReceiptV1(
+        this.developerMissionProgress,
+        "project_run_report",
+        results.vaultPath,
+      );
+    }
+    this.renderDeveloperMissionCompletion({
+      ...normalized,
+      progress: this.developerMissionProgress,
+    });
+  }
+
   /** Refreshes the restart-safe Run Details projection from coordinator state. */
   refreshDurableMissionProjection(): void {
     const snapshot = this.plugin.getMissionRunSnapshot();
@@ -442,12 +490,47 @@ export class AgentView extends ItemView {
     this.missionGraphProjection = snapshot.lastMissionGraph
       ? projectMissionGraphRunDetails(snapshot.lastMissionGraph)
       : null;
+    const lifecycleStages = snapshot.lastConfig?.projectLifecycleEstimate?.stages.map(
+      (item) => item.stage,
+    );
+    if (lifecycleStages && lifecycleStages.length > 1) {
+      this.showLifecycleStageStrip(lifecycleStages);
+    }
+    if (snapshot.lastMissionGraph) {
+      this.developerMissionProgress = applyDeveloperMissionGraphV1(
+        this.developerMissionProgress,
+        Object.values(snapshot.lastMissionGraph.nodes).map((node) => ({
+          id: node.id,
+          objective: node.objective,
+          status: node.status,
+        })),
+      );
+      this.renderDeveloperMissionProgress();
+    }
     this.renderMissionGraph();
     this.renderModelConfig();
     this.renderMissionAcceptance(
       snapshot.lastMissionLedger?.acceptance ?? null,
       "ledger",
     );
+    const graphNodes = Object.values(snapshot.lastMissionGraph?.nodes ?? {});
+    const graphVerified =
+      graphNodes.length > 0 && graphNodes.every((node) => node.status === "complete");
+    const graphBlocked = graphNodes.some((node) => node.status === "blocked");
+    if (
+      !snapshot.isRunning &&
+      this.developerMissionProgress &&
+      (graphVerified || graphBlocked)
+    ) {
+      this.presentDeveloperMissionCompletionV1(
+        this.buildTrackedDeveloperMissionCompletion(
+          graphVerified ? "complete" : "blocked",
+          graphVerified
+            ? "All durable mission graph stages are verified."
+            : this.missionGraphProjection?.nextAction ?? "The project run needs attention.",
+        ),
+      );
+    }
   }
 
   /**
@@ -567,6 +650,8 @@ export class AgentView extends ItemView {
     this.chatLoaderEl = null;
     this.chatLoaderTextEl = null;
     this.liveWorkstreamEl = null;
+    this.lifecycleStageStripEl = null;
+    this.developerMissionCompletionEl = null;
     this.runStatusEl = null;
     this.runStatusTextEl = null;
     this.liveRunPhaseEl = null;
@@ -729,6 +814,14 @@ export class AgentView extends ItemView {
       text: "Preparing mission",
       cls: "agentic-researcher-run-status-text",
     });
+    this.lifecycleStageStripEl = this.runStatusEl.createDiv({
+      cls: "agentic-researcher-lifecycle-strip is-hidden",
+      attr: {
+        "data-testid": "developer-mission-stage-strip",
+        "aria-label": "Developer mission progress",
+      },
+    });
+    this.lifecycleStageStripEl.hidden = true;
     const liveRunMetricsEl = this.runStatusEl.createDiv({
       cls: "agentic-researcher-live-run-metrics",
     });
@@ -764,6 +857,15 @@ export class AgentView extends ItemView {
       event.stopPropagation();
       this.openRunDetails();
     });
+
+    this.developerMissionCompletionEl = container.createDiv({
+      cls: "agentic-researcher-developer-mission-completion is-hidden",
+      attr: {
+        "data-testid": "developer-mission-completion",
+        "aria-live": "polite",
+      },
+    });
+    this.developerMissionCompletionEl.hidden = true;
 
     this.chatAttentionEl = container.createDiv({
       cls: "agentic-researcher-chat-attention is-hidden",
@@ -1780,6 +1882,15 @@ export class AgentView extends ItemView {
       onTrace: (event) => this.appendTraceEvent(event),
       onMissionGraphUpdate: (graph) => {
         this.missionGraphProjection = projectMissionGraphRunDetails(graph);
+        this.developerMissionProgress = applyDeveloperMissionGraphV1(
+          this.developerMissionProgress,
+          Object.values(graph.nodes).map((node) => ({
+            id: node.id,
+            objective: node.objective,
+            status: node.status,
+          })),
+        );
+        this.renderDeveloperMissionProgress();
         this.renderMissionGraph();
         this.syncLifecycleStageStripFromGraph();
       },
@@ -2042,6 +2153,9 @@ export class AgentView extends ItemView {
     this.runValidationShas.length = 0;
     this.runCommitSha = null;
     this.runResearchNotePath = null;
+    this.runResultsPath = null;
+    this.developerMissionProgress = null;
+    this.developerMissionCompletion = null;
     this.noteStreamingAnnounced = false;
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
@@ -2104,6 +2218,7 @@ export class AgentView extends ItemView {
     this.renderChatTeamStrip();
     this.renderChatStatsStrip();
     this.hideLifecycleStageStrip();
+    this.hideDeveloperMissionCompletion();
     if (!options.preserveOrchestrator) {
       this.resetOrchestratorPanelForNewRun();
     }
@@ -2234,6 +2349,11 @@ export class AgentView extends ItemView {
   }
 
   private handleToolStart(event: AgentToolRunEvent) {
+    this.developerMissionProgress = applyDeveloperMissionToolStartV1(
+      this.developerMissionProgress,
+      event.name,
+    );
+    this.renderDeveloperMissionProgress();
     this.setMetric(
       this.stepValueEl,
       formatStepMetric(
@@ -2563,10 +2683,28 @@ export class AgentView extends ItemView {
       );
       this.setRunDetailsNeedsAttention(true);
       await this.maybeWriteMissionReceiptNote(event);
+      if (this.developerMissionProgress) {
+        this.presentDeveloperMissionCompletionV1(
+          this.buildTrackedDeveloperMissionCompletion(
+            "blocked",
+            event.stopDetail?.trim() || stopLine,
+          ),
+        );
+      }
       this.renderModelConfig();
       return;
     }
     await this.maybeWriteMissionReceiptNote(event);
+    if (this.developerMissionProgress) {
+      this.presentDeveloperMissionCompletionV1(
+        this.buildTrackedDeveloperMissionCompletion(
+          missionStop === "verified_complete" || missionStop === "write_completed"
+            ? "complete"
+            : "paused",
+          event.stopDetail?.trim() || stopLine,
+        ),
+      );
+    }
     this.renderModelConfig();
     this.stopRequested = false;
     this.setRunning(false);
@@ -2585,6 +2723,9 @@ export class AgentView extends ItemView {
   private async maybeWriteMissionReceiptNote(
     event: AgentRunCompleteEvent,
   ): Promise<void> {
+    // The host-owned Results artifact is the canonical scientific report.
+    // Do not create a second terse Mission Receipts note after the same run.
+    if (this.runResultsPath) return;
     const stages = this.runConfig?.projectLifecycleEstimate?.stages.map(
       (stage) => compoundLifecycleStageLabel(stage.stage),
     );
@@ -2935,6 +3076,12 @@ export class AgentView extends ItemView {
   }
 
   private appendReceipt(receipt: AgentRunReceipt) {
+    this.developerMissionProgress = applyDeveloperMissionReceiptV1(
+      this.developerMissionProgress,
+      receipt.toolName,
+      `${receipt.operation} ${receipt.message}`,
+    );
+    this.renderDeveloperMissionProgress();
     if (!this.receiptsEl) {
       return;
     }
@@ -3059,8 +3206,24 @@ export class AgentView extends ItemView {
   }
 
   private trackReceiptMetadata(receipt: AgentRunReceipt): void {
+    const receiptTool = (receipt.toolName ?? "").toLowerCase();
+    const receiptPath = receipt.path?.trim() ?? "";
+    if (
+      receiptPath &&
+      isSafeVaultResultPath(receiptPath) &&
+      (/^(?:Agent Work\/)?Results\//iu.test(receiptPath) ||
+        /reflection|jupyter|project_run_report|project_results|results_report/iu.test(receiptTool))
+    ) {
+      this.runResultsPath = receiptPath;
+      this.developerMissionProgress = applyDeveloperMissionReceiptV1(
+        this.developerMissionProgress,
+        "project_run_report",
+        receiptPath,
+      );
+      this.renderDeveloperMissionProgress();
+    }
     if (receipt.path?.trim() && !this.runResearchNotePath) {
-      const tool = (receipt.toolName ?? "").toLowerCase();
+      const tool = receiptTool;
       const path = receipt.path.trim();
       const looksLikeVaultMarkdown =
         /\.md$/iu.test(path) &&
@@ -3088,6 +3251,44 @@ export class AgentView extends ItemView {
       this.runLinearIssueIds.push(resourceId);
     }
     const output = isPlainRecord(receipt.output) ? receipt.output : null;
+    if (
+      receiptTool === "write_project_results" &&
+      receipt.readback?.status === "verified" &&
+      output?.report
+    ) {
+      try {
+        const report = parseProjectRunReportV1(output.report);
+        const observedPath = receiptPath || report.destination.path;
+        if (report.destination.path === observedPath) {
+          this.presentDeveloperMissionCompletionV1(
+            developerMissionCompletionFromProjectRunReportV1(report),
+          );
+        }
+      } catch {
+        // An invalid report payload is never promoted into the completion UI;
+        // the raw receipt remains available in Run Details for diagnosis.
+      }
+    }
+    const outputResultPath = firstStringValue(output, [
+      "resultsPath",
+      "resultPath",
+      "reportPath",
+      "notebookPath",
+    ]);
+    if (
+      outputResultPath &&
+      isSafeVaultResultPath(outputResultPath) &&
+      (/^(?:Agent Work\/)?Results\//iu.test(outputResultPath) ||
+        /reflection|jupyter|project_run_report|project_results|results_report/iu.test(receiptTool))
+    ) {
+      this.runResultsPath = outputResultPath;
+      this.developerMissionProgress = applyDeveloperMissionReceiptV1(
+        this.developerMissionProgress,
+        "project_run_report",
+        outputResultPath,
+      );
+      this.renderDeveloperMissionProgress();
+    }
     const commitSha =
       (typeof output?.commitSha === "string" && output.commitSha) ||
       (typeof output?.sha === "string" && output.sha) ||
@@ -5026,25 +5227,98 @@ export class AgentView extends ItemView {
     stages: readonly ProjectLifecycleStageV1[],
     activeStage?: ProjectLifecycleStageV1 | null,
   ): void {
-    const strip = this.lifecycleStageStripEl;
-    if (!strip || stages.length === 0) return;
-    this.lifecycleStripActive = stages.length > 1;
-    strip.empty();
-    strip.removeClass("is-hidden");
-    strip.show();
+    this.developerMissionProgress = mergeDeveloperMissionLifecycleV1(
+      this.developerMissionProgress,
+      stages,
+    );
+    if (activeStage) {
+      this.developerMissionProgress = applyDeveloperMissionGraphV1(
+        this.developerMissionProgress,
+        [{ id: `lifecycle-${activeStage}`, status: "running" }],
+      );
+    }
+    this.lifecycleStripActive = Boolean(this.developerMissionProgress);
+    this.renderDeveloperMissionProgress();
     if (this.lifecycleStripActive && !this.orchestratorTabButtonEl) {
       this.refreshOrchestratorAvailability();
     }
-    strip.createSpan({
-      text: formatCompoundLifecycleStageStrip(stages, activeStage),
-      cls: "agentic-researcher-lifecycle-strip-text",
-    });
+  }
+
+  private buildTrackedDeveloperMissionCompletion(
+    status: DeveloperMissionCompletionViewV1["status"],
+    summary: string,
+  ): DeveloperMissionCompletionViewV1 {
+    const artifacts: DeveloperMissionCompletionArtifactV1[] = [];
+    if (this.runResultsPath) {
+      artifacts.push({
+        kind: "results",
+        label: "Results",
+        vaultPath: this.runResultsPath,
+      });
+    }
+
+    const linearLinks = this.runArtifactLinks.filter(
+      (artifact) => artifact.system === "linear",
+    );
+    if (linearLinks.length > 0) {
+      for (const artifact of linearLinks) {
+        artifacts.push({
+          kind: "linear",
+          label: artifact.label || "Linear work",
+          url: artifact.url,
+        });
+      }
+    } else if (this.runLinearIssueIds.length > 0) {
+      artifacts.push({
+        kind: "linear",
+        label: `Linear work (${this.runLinearIssueIds.length} issue${this.runLinearIssueIds.length === 1 ? "" : "s"})`,
+      });
+    }
+
+    if (this.runValidationShas.length > 0) {
+      artifacts.push({
+        kind: "validation",
+        label: `Validation evidence (${this.runValidationShas.length})`,
+      });
+    }
+
+    const githubLinks = this.runArtifactLinks.filter(
+      (artifact) => artifact.system === "github",
+    );
+    const pullRequest = githubLinks.find((artifact) => /\/pull\/\d+(?:\b|\/)/iu.test(artifact.url));
+    if (this.runCommitSha) {
+      artifacts.push({
+        kind: "commit",
+        label: `Commit ${this.runCommitSha.slice(0, 8)}`,
+        url: githubLinks.find((artifact) =>
+          artifact.url.toLowerCase().includes(`/commit/${this.runCommitSha!.toLowerCase()}`),
+        )?.url,
+      });
+    }
+    if (pullRequest) {
+      artifacts.push({
+        kind: "pull_request",
+        label: pullRequest.label || "Draft pull request",
+        url: pullRequest.url,
+      });
+    }
+
+    return {
+      version: 1,
+      kind: "developer_mission_completion",
+      status,
+      summary,
+      artifacts,
+      progress: this.developerMissionProgress,
+    };
   }
 
   private hideLifecycleStageStrip(): void {
     this.lifecycleStripActive = false;
+    this.developerMissionProgress = null;
     this.lifecycleStageStripEl?.empty();
     this.lifecycleStageStripEl?.addClass("is-hidden");
+    if (this.lifecycleStageStripEl) this.lifecycleStageStripEl.hidden = true;
     this.lifecycleStageStripEl?.hide();
   }
 
@@ -5057,6 +5331,193 @@ export class AgentView extends ItemView {
     const activeStage =
       stages.find((stage) => activeId.includes(stage)) ?? null;
     this.showLifecycleStageStrip(stages, activeStage);
+  }
+
+  private renderDeveloperMissionProgress(): void {
+    const strip = this.lifecycleStageStripEl;
+    const progress = this.developerMissionProgress;
+    if (!strip || !progress || progress.phases.length <= 1) {
+      strip?.empty();
+      strip?.addClass("is-hidden");
+      if (strip) strip.hidden = true;
+      return;
+    }
+    strip.empty();
+    strip.removeClass("is-hidden");
+    strip.hidden = false;
+    strip.show();
+    this.renderDeveloperMissionPhaseList(strip, progress, "live");
+  }
+
+  private renderDeveloperMissionPhaseList(
+    container: HTMLElement,
+    progress: DeveloperMissionProgressViewV1,
+    surface: "live" | "completion",
+  ): void {
+    const list = container.createEl("ol", {
+      cls: "agentic-researcher-developer-mission-phases",
+      attr: {
+        "data-testid": `developer-mission-phases-${surface}`,
+        "aria-label": "Developer mission phases",
+      },
+    });
+    for (const phase of progress.phases) {
+      const item = list.createEl("li", {
+        cls: `agentic-researcher-developer-mission-phase is-${phase.status}`,
+        attr: {
+          "data-phase": phase.id,
+          "data-status": phase.status,
+          "aria-label": `${phase.label}: ${phaseStatusLabelV1(phase.status)}`,
+          ...(phase.status === "active" ? { "aria-current": "step" } : {}),
+        },
+      });
+      item.createSpan({
+        text: phase.status === "complete" ? "✓" : phase.status === "blocked" ? "!" : "•",
+        cls: "agentic-researcher-developer-mission-phase-mark",
+        attr: { "aria-hidden": "true" },
+      });
+      item.createSpan({
+        text: phase.label,
+        cls: "agentic-researcher-developer-mission-phase-label",
+      });
+    }
+  }
+
+  private hideDeveloperMissionCompletion(): void {
+    this.developerMissionCompletionEl?.empty();
+    this.developerMissionCompletionEl?.addClass("is-hidden");
+    if (this.developerMissionCompletionEl) {
+      this.developerMissionCompletionEl.hidden = true;
+    }
+    this.developerMissionCompletionEl?.hide();
+  }
+
+  private renderDeveloperMissionCompletion(
+    completion: DeveloperMissionCompletionViewV1,
+  ): void {
+    const container = this.developerMissionCompletionEl;
+    if (!container) return;
+    const merged = normalizeDeveloperMissionCompletionV1({
+      ...completion,
+      artifacts: [
+        ...(this.developerMissionCompletion?.artifacts ?? []),
+        ...completion.artifacts,
+      ],
+      progress: completion.progress ?? this.developerMissionProgress,
+    });
+    this.developerMissionCompletion = merged;
+    container.empty();
+    container.removeClass("is-hidden");
+    container.hidden = false;
+    container.show();
+    container.dataset.status = merged.status;
+
+    const header = container.createDiv({
+      cls: "agentic-researcher-developer-mission-completion-header",
+    });
+    const allPhasesVerified = Boolean(
+      merged.progress?.phases.length &&
+        merged.progress.phases.every((phase) => phase.status === "complete"),
+    );
+    header.createEl("h3", {
+      text:
+        merged.status === "complete"
+          ? allPhasesVerified
+            ? "Project run complete"
+            : "Project run finished"
+          : merged.status === "blocked"
+            ? "Project run needs attention"
+            : "Project run paused",
+    });
+    const detailsButton = header.createEl("button", {
+      text: "Open Run Details",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button" },
+    });
+    detailsButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      this.openRunDetails();
+    });
+    container.createEl("p", {
+      text: merged.summary,
+      cls: "agentic-researcher-developer-mission-completion-summary",
+    });
+    if (merged.progress) {
+      this.renderDeveloperMissionPhaseList(container, merged.progress, "completion");
+    }
+    if (merged.artifacts.length === 0) return;
+
+    const artifacts = container.createDiv({
+      cls: "agentic-researcher-developer-mission-artifacts",
+      attr: { "aria-label": "Project run artifacts" },
+    });
+    for (const artifact of merged.artifacts) {
+      this.renderDeveloperMissionArtifact(artifacts, artifact);
+    }
+  }
+
+  private renderDeveloperMissionArtifact(
+    container: HTMLElement,
+    artifact: DeveloperMissionCompletionArtifactV1,
+  ): void {
+    const common = {
+      cls: "agentic-researcher-developer-mission-artifact",
+      attr: {
+        "data-artifact-kind": artifact.kind,
+        "data-testid": `developer-mission-artifact-${artifact.kind}`,
+      },
+    };
+    if (artifact.url) {
+      const link = container.createEl("a", {
+        ...common,
+        text: artifact.label,
+        attr: {
+          ...common.attr,
+          href: artifact.url,
+          target: "_blank",
+          rel: "noopener noreferrer",
+        },
+      });
+      link.addEventListener("click", (event) => event.stopPropagation());
+      return;
+    }
+    if (artifact.vaultPath) {
+      const link = container.createEl("a", {
+        ...common,
+        text: artifact.label,
+        cls: `${common.cls} internal-link`,
+        attr: {
+          ...common.attr,
+          href: artifact.vaultPath,
+          "data-href": artifact.vaultPath,
+        },
+      });
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void this.app.workspace.openLinkText(artifact.vaultPath!, "", false);
+      });
+      return;
+    }
+    const button = container.createEl("button", {
+      ...common,
+      text: artifact.label,
+      attr: { ...common.attr, type: "button" },
+    });
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      this.openDeveloperMissionArtifactDetails(artifact.kind);
+    });
+  }
+
+  private openDeveloperMissionArtifactDetails(
+    kind: DeveloperMissionCompletionArtifactV1["kind"],
+  ): void {
+    this.openRunDetails();
+    const target = kind === "validation" ? this.verificationEl : this.receiptsEl;
+    const details = target?.closest("details");
+    if (details instanceof HTMLDetailsElement) details.open = true;
+    target?.scrollIntoView({ block: "nearest" });
   }
 
   private renderMissionReadinessBlocker(
@@ -5406,6 +5867,30 @@ export class AgentView extends ItemView {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstStringValue(
+  record: Record<string, unknown> | null,
+  keys: readonly string[],
+): string | null {
+  if (!record) return null;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function isSafeVaultResultPath(path: string): boolean {
+  return Boolean(
+    path &&
+      !path.startsWith("/") &&
+      !path.includes("\\") &&
+      !/[\u0000-\u001f\u007f]/u.test(path) &&
+      !/(^|\/)\.\.(\/|$)/u.test(path) &&
+      !/^[a-z]:/iu.test(path) &&
+      /\.(?:md|ipynb)$/iu.test(path),
+  );
 }
 
 function formatEffortProfile(profile: string): string {

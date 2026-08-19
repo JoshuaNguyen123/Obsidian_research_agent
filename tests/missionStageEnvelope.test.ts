@@ -12,7 +12,7 @@ import {
   MISSION_STAGE_ENVELOPE_BLOCKER_CODES,
   toolsAllowedForEnvelopeStage,
 } from "../src/agent/missionStageEnvelope";
-import { CODE_EXECUTION_TOOL_ALLOW } from "../src/agent/lifecycleStagePolicy";
+import { CODE_VALIDATION_TOOL_ALLOW } from "../src/agent/lifecycleStagePolicy";
 
 test("mission stage envelope create match consume and tool allow", () => {
   const envelope = createMissionStageEnvelope({
@@ -44,7 +44,7 @@ test("mission stage envelope create match consume and tool allow", () => {
 test("ensureMissionStageEnvelope refreshes on stage or fingerprint change and keeps counters otherwise", () => {
   const first = createMissionStageEnvelope({
     runId: "run-2",
-    stage: "code_execution",
+    stage: "code_validation",
     authorityFingerprint: "sha256:" + "b".repeat(64),
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     maxMutations: 4,
@@ -57,7 +57,7 @@ test("ensureMissionStageEnvelope refreshes on stage or fingerprint change and ke
   const same = ensureMissionStageEnvelope({
     existing: afterUse,
     runId: "run-2",
-    stage: "code_execution",
+    stage: "code_validation",
     authorityFingerprint: afterUse.authorityFingerprint,
     expiresAt: afterUse.budget.expiresAt,
     grantId: "grant-a",
@@ -92,7 +92,7 @@ test("assertEnvelopeAllowsBoundExecute fails closed on mismatch expiry and budge
   const fingerprint = "sha256:" + "d".repeat(64);
   const envelope = createMissionStageEnvelope({
     runId: "run-3",
-    stage: "code_execution",
+    stage: "code_validation",
     authorityFingerprint: fingerprint,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     maxMutations: 1,
@@ -124,7 +124,7 @@ test("assertEnvelopeAllowsBoundExecute fails closed on mismatch expiry and budge
 
   const expired = createMissionStageEnvelope({
     runId: "run-3",
-    stage: "code_execution",
+    stage: "code_validation",
     authorityFingerprint: fingerprint,
     expiresAt: new Date(Date.now() - 1_000).toISOString(),
   });
@@ -166,29 +166,27 @@ test("assertEnvelopeAllowsBoundExecute fails closed on mismatch expiry and budge
   assert.equal(denied.code, MISSION_STAGE_ENVELOPE_BLOCKER_CODES.toolDenied);
 });
 
-test("code_execution envelope allows repair patch and inspect tools from shared allowlist", () => {
+test("code_validation envelope allows repair, validation, commit, and note companions", () => {
   const envelope = createMissionStageEnvelope({
     runId: "run-code-allow",
-    stage: "code_execution",
+    stage: "code_validation",
     authorityFingerprint: "sha256:" + "f".repeat(64),
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
-  const allowed = toolsAllowedForEnvelopeStage("code_execution");
+  const allowed = toolsAllowedForEnvelopeStage("code_validation");
   for (const tool of [
-    "code_workspace_patch",
-    "code_workspace_append",
-    "code_workspace_mkdir",
-    "code_workspace_list",
-    "code_workspace_stat",
-    "code_workspace_search",
+    "code_validate_fast",
+    "code_validate_targeted",
+    "code_validate_full",
     "code_repair_record_cycle",
     "code_repair_status",
+    "code_commit_verified",
   ] as const) {
     assert.ok(allowed.includes(tool), `envelope allow missing ${tool}`);
     assert.equal(envelopeAllowsTool(envelope, tool), true);
   }
-  for (const tool of CODE_EXECUTION_TOOL_ALLOW) {
-    assert.ok(allowed.includes(tool), `envelope diverged from CODE_EXECUTION_TOOL_ALLOW at ${tool}`);
+  for (const tool of CODE_VALIDATION_TOOL_ALLOW) {
+    assert.ok(allowed.includes(tool), `envelope diverged from CODE_VALIDATION_TOOL_ALLOW at ${tool}`);
   }
 });
 

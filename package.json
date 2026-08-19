@@ -47,6 +47,7 @@
     "test:e2e:safe-assistant-renderer": "node scripts/run-e2e-exclusive.mjs --project=safe-assistant-renderer",
     "test:e2e:flow-real-cleanup": "node scripts/run-e2e-exclusive.mjs --project=linear-flow-real-cleanup",
     "test:e2e:github-askpass": "node scripts/run-e2e-exclusive.mjs --project=github-askpass-runtime-live",
+    "test:e2e:workflow-audit": "node scripts/run-workflow-audit-e2e.mjs",
     "test:e2e:live": "node scripts/run-e2e-exclusive.mjs --live-external --project=disposable-live-external",
     "record:demo:researcher": "node scripts/record-e2e-demo.mjs --label=researcher-demo --model=glm-5.2 --showcase-vault -- --real-ai --project=demo-journey-recording",
     "record:demo:builder": "node scripts/record-e2e-demo.mjs --label=builder-demo --model=glm-5.2 --showcase-vault -- --real-ai --project=demo-recording",

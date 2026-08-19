@@ -1,4 +1,10 @@
 import { detectChatOnlyIntent } from "./noteOutputPolicy";
+import { assertMeaningfulReflectionContentV1 } from "../../packages/core-api/src/reflectionContentV1";
+import {
+  parseVerifiedCodeReflectionExamplesV1,
+  type VerifiedCodeReflectionExampleV1,
+  type VerifiedCodeReflectionExamplesV1,
+} from "../../packages/core-api/src/verifiedCodePublicationHandoffV1";
 import type {
   PipelineLineageV1,
   PipelineStageStateV1,
@@ -76,6 +82,8 @@ export interface InitiatingNoteReflectionCitesV1 {
     state: PipelineStageStateV1;
   };
   gaps: string[];
+  /** Exact excerpts bound to the verified commit and artifact hashes. */
+  codeExamples: VerifiedCodeReflectionExampleV1[];
   /** True when lineage/pipeline verification is complete. */
   pipelineVerified: boolean;
 }
@@ -115,6 +123,8 @@ export interface InitiatingNoteReflectionInputV1 {
    * the mission otherwise looks note-bound.
    */
   persistence?: ReflectionContextV1["persistence"];
+  /** Host-verified examples; never accept model-authored snippets directly. */
+  codeExamples?: VerifiedCodeReflectionExamplesV1 | null;
 }
 
 export interface InitiatingNoteReflectionSuppressionV1 {
@@ -197,8 +207,9 @@ export function appendInitiatingNoteReflectionMarkdown(
   currentContent: string,
   plan: Pick<InitiatingNoteReflectionPlanV1, "marker" | "markdown">,
 ): string {
-  if (!plan.markdown.trim()) {
-    return currentContent;
+  assertMeaningfulReflectionContentV1(plan.markdown, "Initiating-note reflection");
+  if (!plan.marker.trim() || !plan.markdown.includes(plan.marker.trim())) {
+    throw new Error("Initiating-note reflection markdown must contain its idempotency marker.");
   }
   if (initiatingNoteAlreadyHasReflection(currentContent, plan.marker)) {
     return currentContent;
@@ -229,10 +240,12 @@ export function buildInitiatingNoteReflectionV1(
     citeFacts,
     linearIssueUrls,
     pipeline,
+    codeExamples: input.codeExamples,
   });
   const markerId = input.markerId?.trim() || runId;
   const marker = buildInitiatingNoteReflectionMarker(markerId);
   const markdown = formatReflectionMarkdown({ cites, marker });
+  assertMeaningfulReflectionContentV1(markdown, "Initiating-note reflection");
   const chatSummary = formatChatSummary(cites);
 
   const suppression = resolveInitiatingNoteReflectionSuppression({
@@ -312,6 +325,7 @@ function buildCites(input: {
   citeFacts: PipelineCiteFactsV1;
   linearIssueUrls: string[];
   pipeline: PipelineLineageV1 | null;
+  codeExamples?: VerifiedCodeReflectionExamplesV1 | null;
 }): InitiatingNoteReflectionCitesV1 {
   const owner = input.citeFacts.owner;
   const repository = input.citeFacts.repository;
@@ -324,6 +338,17 @@ function buildCites(input: {
     owner && repository && typeof pullRequestNumber === "number"
       ? buildGitHubPullRequestUrlV1(owner, repository, pullRequestNumber)
       : undefined;
+  const codeExamples = input.codeExamples
+    ? parseVerifiedCodeReflectionExamplesV1(input.codeExamples)
+    : null;
+  if (
+    codeExamples &&
+    (!input.citeFacts.commitSha || codeExamples.commitSha !== input.citeFacts.commitSha)
+  ) {
+    throw new Error(
+      "Verified reflection examples must match the pipeline commit SHA.",
+    );
+  }
 
   return {
     runId: input.runId,
@@ -339,6 +364,7 @@ function buildCites(input: {
     ...(input.citeFacts.branch ? { branch: input.citeFacts.branch } : {}),
     validation: { ...input.citeFacts.validation },
     gaps: [...input.citeFacts.gaps],
+    codeExamples: codeExamples ? [...codeExamples.examples] : [],
     pipelineVerified: input.pipeline?.verified === true,
   };
 }
@@ -358,7 +384,28 @@ function formatReflectionMarkdown(input: {
   const publication = formatReflectionPublicationSentence(cites);
   if (publication) lines.push(publication);
   lines.push(formatReflectionClosureSentence(cites));
+  for (const example of cites.codeExamples) {
+    lines.push("", ...formatVerifiedCodeExample(example));
+  }
   return lines.join("\n");
+}
+
+function formatVerifiedCodeExample(
+  example: VerifiedCodeReflectionExampleV1,
+): string[] {
+  const lineLabel =
+    example.startLine === example.endLine
+      ? `line ${example.startLine}`
+      : `lines ${example.startLine}-${example.endLine}`;
+  const artifactHash = shortFingerprint(example.artifactSha256);
+  const fence = codeFenceFor(example.code);
+  return [
+    "### Verified code example",
+    `\`${escapeInline(example.path)}\` ${lineLabel} at commit \`${shortSha(example.commitSha)}\` (file hash \`${artifactHash}\`; excerpt hash \`${example.codeSha256}\`).`,
+    `${fence}${example.language === "text" ? "" : example.language}`,
+    example.code,
+    fence,
+  ];
 }
 
 function formatReflectionJourneySentence(
@@ -479,6 +526,9 @@ function formatChatSummary(cites: InitiatingNoteReflectionCitesV1): string {
     parts.push(`PR #${cites.pullRequestNumber}`);
   }
   if (cites.repositoryUrl) parts.push(cites.repositoryUrl);
+  if (cites.codeExamples.length > 0) {
+    parts.push(`${cites.codeExamples.length} verified code example${cites.codeExamples.length === 1 ? "" : "s"}`);
+  }
   if (cites.gaps.length > 0) {
     parts.push(`gaps: ${cites.gaps.join(", ")}`);
   }
@@ -556,6 +606,18 @@ function sanitizeMarkerId(value: string): string {
 
 function shortSha(sha: string): string {
   return sha.length > 12 ? sha.slice(0, 12) : sha;
+}
+
+function shortFingerprint(value: string): string {
+  return value.startsWith("sha256:") ? value.slice(7, 19) : value.slice(0, 12);
+}
+
+function codeFenceFor(code: string): string {
+  const longest = Math.max(
+    0,
+    ...Array.from(code.matchAll(/`+/gu), (match) => match[0].length),
+  );
+  return "`".repeat(Math.max(3, longest + 1));
 }
 
 function escapeInline(value: string): string {

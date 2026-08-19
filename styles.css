@@ -855,15 +855,154 @@
 }
 
 .agentic-researcher-lifecycle-strip {
-  border: var(--agent-hairline);
+  border-bottom: var(--agent-hairline);
+  border-top: var(--agent-hairline);
   color: var(--agent-text);
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-small);
-  padding: var(--agent-space-3) var(--agent-space-4);
+  font-family: inherit;
+  font-size: var(--agent-type-label);
+  max-width: 100%;
+  overflow-x: auto;
+  padding: var(--agent-space-3) 0;
 }
 
+.agentic-researcher-lifecycle-strip[hidden],
 .agentic-researcher-lifecycle-strip.is-hidden {
   display: none;
+}
+
+.agentic-researcher-developer-mission-phases {
+  align-items: center;
+  display: flex;
+  gap: var(--agent-space-2);
+  list-style: none;
+  margin: 0;
+  min-width: max-content;
+  padding: 0;
+}
+
+.agentic-researcher-developer-mission-phase {
+  align-items: center;
+  color: var(--agent-text-muted);
+  display: flex;
+  gap: var(--agent-space-2);
+  white-space: nowrap;
+}
+
+.agentic-researcher-developer-mission-phase +
+  .agentic-researcher-developer-mission-phase::before {
+  color: var(--agent-rule-strong);
+  content: "→";
+  margin-right: var(--agent-space-1);
+}
+
+.agentic-researcher-developer-mission-phase.is-active {
+  color: var(--agent-text-accent);
+  font-weight: var(--agent-weight-strong);
+}
+
+.agentic-researcher-developer-mission-phase.is-complete {
+  color: var(--agent-text);
+}
+
+.agentic-researcher-developer-mission-phase.is-blocked {
+  color: var(--agent-warning);
+  font-weight: var(--agent-weight-strong);
+}
+
+.agentic-researcher-developer-mission-phase-mark {
+  align-items: center;
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-full);
+  display: inline-flex;
+  height: var(--agent-space-4);
+  justify-content: center;
+  width: var(--agent-space-4);
+}
+
+.agentic-researcher-developer-mission-phase.is-active
+  .agentic-researcher-developer-mission-phase-mark {
+  background: var(--agent-tint);
+  border-color: var(--agent-text-accent);
+}
+
+.agentic-researcher-developer-mission-phase.is-complete
+  .agentic-researcher-developer-mission-phase-mark {
+  background: var(--agent-tint-soft);
+  border-color: var(--agent-text);
+}
+
+.agentic-researcher-developer-mission-phase.is-blocked
+  .agentic-researcher-developer-mission-phase-mark {
+  background: var(--agent-warning-tint);
+  border-color: var(--agent-warning);
+}
+
+.agentic-researcher-developer-mission-completion {
+  background: var(--agent-surface);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
+  display: grid;
+  gap: var(--agent-space-4);
+  padding: var(--agent-space-4);
+}
+
+.agentic-researcher-developer-mission-completion[hidden],
+.agentic-researcher-developer-mission-completion.is-hidden {
+  display: none;
+}
+
+.agentic-researcher-developer-mission-completion[data-status="blocked"] {
+  border-color: var(--agent-warning);
+}
+
+.agentic-researcher-developer-mission-completion-header {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-3);
+  justify-content: space-between;
+}
+
+.agentic-researcher-developer-mission-completion-header h3,
+.agentic-researcher-developer-mission-completion-summary {
+  margin: 0;
+}
+
+.agentic-researcher-developer-mission-completion-header h3 {
+  font-size: var(--agent-type-title);
+}
+
+.agentic-researcher-developer-mission-completion-summary {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-body);
+  line-height: 1.5;
+}
+
+.agentic-researcher-developer-mission-artifacts {
+  border-top: var(--agent-hairline);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-2) var(--agent-space-4);
+  padding-top: var(--agent-space-3);
+}
+
+.agentic-researcher-view .agentic-researcher-developer-mission-artifact {
+  background: transparent;
+  border: 0;
+  color: var(--agent-text-accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--agent-type-label);
+  margin: 0;
+  padding: 0;
+  text-decoration: none;
+}
+
+.agentic-researcher-view .agentic-researcher-developer-mission-artifact:hover,
+.agentic-researcher-view .agentic-researcher-developer-mission-artifact:focus-visible {
+  color: var(--agent-text);
+  outline: 0;
+  text-decoration: underline;
 }
 
 .agentic-researcher-live-workstream {

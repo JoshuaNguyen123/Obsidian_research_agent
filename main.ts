@@ -200,6 +200,10 @@ import {
 import { createObsidianDurableMissionRepository } from "./src/agent/obsidianDurableMissionRepository";
 import { classifyOvernightMissionIntent } from "./src/agent/overnightIntent";
 import { detectChatOnlyIntent } from "./src/agent/noteOutputPolicy";
+import {
+  resolveAdaptiveLeadSegmentLimitV1,
+  resolveForegroundSegmentLimit,
+} from "./src/agent/autoContinuation";
 import { buildDurableOutcomeFromAgentRunner } from "./src/agent/agentRunnerDurableAdapter";
 import { seedDurableChildRun } from "./src/agent/durableChildSeed";
 import { planDurableResumeScan } from "./src/agent/durableResumeSelection";
@@ -332,11 +336,6 @@ import {
 import { resolveResearchTeamBudget } from "./src/orchestrator/researchTeamBudget";
 import { summarizeSourceLedger } from "./src/orchestrator/sourceLedgerSummary";
 import { buildResearcherAssignment } from "./src/orchestrator/researcherSoftCatalog";
-import {
-  buildAcceptedResearchArtifactFromWorkerHandoff,
-  buildResearcherHandoffV1FromWorker,
-  formatBridgedHandoffAttachContext,
-} from "./src/orchestrator/researchTeamHandoffBridge";
 import {
   createAutonomyRunStats,
   finalizeAutonomyRunStats,
@@ -499,6 +498,7 @@ import {
   type GitHubPublicationCheckpointNamespaceV1,
 } from "./src/integrations/github/GitHubPublicationCheckpointStore";
 import {
+  commitGitPushAttemptNamespaceAfterVerifiedWriteV1,
   DurableGitPushAttemptStoreV1,
   parseGitPushAttemptNamespaceV1,
   type GitPushAttemptNamespaceV1,
@@ -549,19 +549,35 @@ import {
 import {
   createPendingExternalActionStateV2,
 } from "./src/integrations/PendingExternalActionStateV2";
-import type { VerifiedCodePublicationHandoffV1 } from "./packages/core-api/src";
+import type {
+  VerifiedCodePublicationHandoffV1,
+  VerifiedCodeReflectionExamplesV1,
+} from "./packages/core-api/src";
 import {
   advanceProjectLineageV1,
   createProjectLineageV1,
   createResearcherHandoffV1,
   parseGitHubPublicationLineageProofV2,
   parseProjectLineageNamespaceV1,
+  projectGitHubPublicationLineageProofV2ToCompatibleV1,
   projectGitHubPublicationLineageProofV2ToV1,
   ProjectLineageStoreV1,
   type ProjectLineageNamespaceV1,
   type ProjectLineageV1,
   type ResearchProjectPlanV1,
 } from "./src/agent/projectLifecycle";
+import {
+  bindAggregateProjectEventsToOnlyWorkUnitV1,
+  projectLinearBindingsFromProjectLineageV1,
+  projectStageEventsFromProjectLineageV1,
+} from "./src/agent/projectStageLineageMapper";
+import { projectStageEventFromActionReceiptV1 } from "./src/agent/projectStageReceiptMapper";
+import {
+  parseProjectLinearProgressNamespaceV1,
+  ProjectLinearProgressRuntimeV1,
+  type LinearProgressPhaseBoundaryCommandV1,
+  type ProjectLinearProgressNamespaceV1,
+} from "./src/agent/projectLinearProgressRuntime";
 import { hasExplicitGitHubReviewRepairIntentV1 } from "./src/agent/githubReviewRepairIntent";
 import type { RepositoryProfileV2 } from "./extensions/code/repositories";
 import {
@@ -585,6 +601,8 @@ import {
   resolveResearchPublicationNotePathV1,
   trustedValidationKeysForProfileV1,
 } from "./src/tools/researchPublicationTool";
+import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "./src/tools/jupyterReflectionTool";
+import { WRITE_PROJECT_RESULTS_TOOL_NAME } from "./src/tools/projectResultsTool";
 import {
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
   createResearchProjectHierarchyTool,
@@ -880,6 +898,36 @@ export default class AgenticResearcherPlugin extends Plugin {
       return true;
     },
   });
+  private projectLinearProgressNamespace: ProjectLinearProgressNamespaceV1 =
+    parseProjectLinearProgressNamespaceV1(null);
+  private readonly projectLinearProgressRuntime =
+    new ProjectLinearProgressRuntimeV1({
+      read: async () => this.projectLinearProgressNamespace,
+      write: async (next, expectedRevision) => {
+        if (this.projectLinearProgressNamespace.revision !== expectedRevision) {
+          return false;
+        }
+        const previous = this.projectLinearProgressNamespace;
+        this.projectLinearProgressNamespace = next;
+        try {
+          await this.savePluginData();
+          const persisted = await this.loadData();
+          const readback = parseProjectLinearProgressNamespaceV1(
+            isRecord(persisted) ? persisted.projectLinearProgress : null,
+          );
+          if (readback.namespaceFingerprint !== next.namespaceFingerprint) {
+            throw new Error(
+              "Project Linear progress persistence readback did not match the exact write.",
+            );
+          }
+          this.projectLinearProgressNamespace = readback;
+          return true;
+        } catch (error) {
+          this.projectLinearProgressNamespace = previous;
+          throw error;
+        }
+      },
+    });
   private githubPublicationCheckpointNamespace: GitHubPublicationCheckpointNamespaceV1 =
     parseGitHubPublicationCheckpointNamespaceV1(null);
   private readonly githubPublicationCheckpointStore =
@@ -912,15 +960,17 @@ export default class AgenticResearcherPlugin extends Plugin {
     parseGitPushAttemptNamespaceV1(null);
   private readonly gitPushAttemptStore =
     new DurableGitPushAttemptStoreV1({
-      read: async () => this.gitPushAttemptNamespace,
-      write: async (next, expectedRevision) => {
-        if (this.gitPushAttemptNamespace.revision !== expectedRevision) {
-          return false;
-        }
-        this.gitPushAttemptNamespace = next;
-        await this.savePluginData();
-        return true;
-      },
+      read: async () => withPluginDataLock(this, async () => {
+        const persisted = await this.loadData();
+        return isRecord(persisted)
+          ? persisted.githubGitPushAttempts
+          : null;
+      }),
+      write: async (next, expectedRevision) =>
+        (await this.savePluginData({
+          gitPushAttemptNamespace: next,
+          expectedRevision,
+        })) === true,
     });
   private extensionStateMigration: ExtensionStateMigrationPlanV1 | null = null;
   private pluginDataV3Migration: PluginDataV3MigrationRecord | null = null;
@@ -1874,6 +1924,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       researchPublicationCheckpoints: rawResearchPublicationCheckpoints,
       researchProjectHierarchyCheckpoints: rawResearchProjectHierarchyCheckpoints,
       projectLineages: rawProjectLineages,
+      projectLinearProgress: rawProjectLinearProgress,
       linearQueueState: rawLinearQueueState,
       queueResourceLockState: rawQueueResourceLockState,
       queueDailyStartBudgetState: rawQueueDailyStartBudgetState,
@@ -2449,6 +2500,13 @@ export default class AgenticResearcherPlugin extends Plugin {
     } catch (error) {
       console.warn("Ignoring invalid project lineage state.", error);
       this.projectLineageNamespace = parseProjectLineageNamespaceV1(null);
+    }
+    try {
+      this.projectLinearProgressNamespace =
+        parseProjectLinearProgressNamespaceV1(rawProjectLinearProgress);
+    } catch {
+      this.projectLinearProgressNamespace =
+        parseProjectLinearProgressNamespaceV1(null);
     }
     this.linearQueueState = normalizeLinearQueueStateOrNull(rawLinearQueueState);
     this.queueResourceLockState = normalizeResourceLockStateOrDefault(
@@ -7763,7 +7821,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     await this.saveProjectMemoryData();
   }
 
-  private async savePluginData() {
+  private async savePluginData(gitPushAttemptWrite?: {
+    gitPushAttemptNamespace: GitPushAttemptNamespaceV1;
+    expectedRevision: number;
+  }): Promise<void | boolean> {
+    let gitPushAttemptCommitted: boolean | undefined;
     const write = this.pluginDataSaveTail
       .catch(() => undefined)
       .then(async () => {
@@ -7785,52 +7847,85 @@ export default class AgenticResearcherPlugin extends Plugin {
         void _utilityModelProvider;
         void _utilityBaseUrl;
         await withPluginDataLock(this, async () => {
-          const extensionOwnedData = selectExtensionOwnedPluginData(
-            await this.loadData(),
-          );
-          await this.saveData({
-            ...extensionOwnedData,
-            ...persistableSettings,
-            modelCredentialReferences:
-              this.modelCredentialStore?.snapshot() ??
-              emptyModelCredentialReferencesV1(),
-            linearCredentialReference: this.linearCredentialReference,
-            linearOAuthRuntimeState: this.linearOAuthRuntimeState,
-            githubCredential: this.githubCredential,
-            trustedGitHubRepositoryBindingsV2:
-              this.trustedGitHubRepositoryBindingsV2,
-            githubPrivateRepositoryCheckpoints:
-              this.githubPrivateRepositoryCheckpoints,
-            githubPrivateRepositoryCleanupCheckpoints:
-              this.githubPrivateRepositoryCleanupCheckpoints,
-            githubPublicationCheckpoints:
-              this.githubPublicationCheckpointNamespace,
-            githubReviewRepairCheckpoints:
-              this.githubReviewRepairCheckpointNamespace,
-            githubGitPushAttempts: this.gitPushAttemptNamespace,
-            linearCapabilitySnapshot: this.linearCapabilitySnapshot,
-            conversationHistory: this.conversationHistory,
-            researchMemoryIndex: this.researchMemoryIndex,
-            latestOrchestratorSnapshot: this.latestOrchestratorSnapshot,
-            topLevelChildTerminalCheckpoint:
-              this.topLevelChildTerminalCheckpoint,
-            linearIntegrationState: this.linearIntegrationState,
-            pendingLinearReconciliationState: this.pendingLinearReconciliationState,
-            externalActionReceiptLedger: this.externalActionReceiptLedger,
-            researchPublicationCheckpoints:
-              this.researchPublicationCheckpointNamespace,
-            researchProjectHierarchyCheckpoints:
-              this.researchProjectHierarchyCheckpointNamespace,
-            projectLineages: this.projectLineageNamespace,
-            linearQueueState: this.linearQueueState,
-            queueResourceLockState: this.queueResourceLockState,
-            queueDailyStartBudgetState: this.queueDailyStartBudgetState,
-            repositoryProfileRegistry: this.repositoryProfileRegistry,
-            authorityGrantStoreState: this.authorityGrantStoreState,
-            bundledCapabilityData: this.bundledCapabilityData,
-            extensionStateMigration: this.extensionStateMigration,
-            pluginDataV3Migration: this.pluginDataV3Migration,
-          });
+          const persistedBefore = await this.loadData();
+          const extensionOwnedData =
+            selectExtensionOwnedPluginData(persistedBefore);
+          const save = async (
+            gitPushAttemptNamespace: GitPushAttemptNamespaceV1,
+          ) => this.saveData({
+              ...extensionOwnedData,
+              ...persistableSettings,
+              modelCredentialReferences:
+                this.modelCredentialStore?.snapshot() ??
+                emptyModelCredentialReferencesV1(),
+              linearCredentialReference: this.linearCredentialReference,
+              linearOAuthRuntimeState: this.linearOAuthRuntimeState,
+              githubCredential: this.githubCredential,
+              trustedGitHubRepositoryBindingsV2:
+                this.trustedGitHubRepositoryBindingsV2,
+              githubPrivateRepositoryCheckpoints:
+                this.githubPrivateRepositoryCheckpoints,
+              githubPrivateRepositoryCleanupCheckpoints:
+                this.githubPrivateRepositoryCleanupCheckpoints,
+              githubPublicationCheckpoints:
+                this.githubPublicationCheckpointNamespace,
+              githubReviewRepairCheckpoints:
+                this.githubReviewRepairCheckpointNamespace,
+              githubGitPushAttempts: gitPushAttemptNamespace,
+              linearCapabilitySnapshot: this.linearCapabilitySnapshot,
+              conversationHistory: this.conversationHistory,
+              researchMemoryIndex: this.researchMemoryIndex,
+              latestOrchestratorSnapshot: this.latestOrchestratorSnapshot,
+              topLevelChildTerminalCheckpoint:
+                this.topLevelChildTerminalCheckpoint,
+              linearIntegrationState: this.linearIntegrationState,
+              pendingLinearReconciliationState: this.pendingLinearReconciliationState,
+              externalActionReceiptLedger: this.externalActionReceiptLedger,
+              researchPublicationCheckpoints:
+                this.researchPublicationCheckpointNamespace,
+              researchProjectHierarchyCheckpoints:
+                this.researchProjectHierarchyCheckpointNamespace,
+              projectLineages: this.projectLineageNamespace,
+              projectLinearProgress: this.projectLinearProgressNamespace,
+              linearQueueState: this.linearQueueState,
+              queueResourceLockState: this.queueResourceLockState,
+              queueDailyStartBudgetState: this.queueDailyStartBudgetState,
+              repositoryProfileRegistry: this.repositoryProfileRegistry,
+              authorityGrantStoreState: this.authorityGrantStoreState,
+              bundledCapabilityData: this.bundledCapabilityData,
+              extensionStateMigration: this.extensionStateMigration,
+              pluginDataV3Migration: this.pluginDataV3Migration,
+            });
+          if (!gitPushAttemptWrite) {
+            await save(this.gitPushAttemptNamespace);
+            return;
+          }
+          gitPushAttemptCommitted =
+            await commitGitPushAttemptNamespaceAfterVerifiedWriteV1(
+              {
+                readCached: () => this.gitPushAttemptNamespace,
+                writeAndReadback: async (candidate, expectedRevision) => {
+                  const persistedNamespace = parseGitPushAttemptNamespaceV1(
+                    isRecord(persistedBefore)
+                      ? persistedBefore.githubGitPushAttempts
+                      : null,
+                  );
+                  if (persistedNamespace.revision !== expectedRevision) {
+                    return false;
+                  }
+                  await save(candidate);
+                  const persistedAfter = await this.loadData();
+                  return isRecord(persistedAfter)
+                    ? persistedAfter.githubGitPushAttempts
+                    : null;
+                },
+                commitCached: (committed) => {
+                  this.gitPushAttemptNamespace = committed;
+                },
+              },
+              gitPushAttemptWrite.gitPushAttemptNamespace,
+              gitPushAttemptWrite.expectedRevision,
+            );
         });
       });
     this.pluginDataSaveTail = write.then(
@@ -7838,6 +7933,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       () => undefined,
     );
     await write;
+    return gitPushAttemptCommitted;
   }
 
   private reduceLinearQueueStateDurably(
@@ -8389,17 +8485,13 @@ export default class AgenticResearcherPlugin extends Plugin {
       (completionDrivenLoops ||
         (this.settings.autoContinueLongRuns !== false &&
           isExplicitLongRunningResearchPrompt(prompt)));
-    const maxSegments = autoContinueLongRun
-      ? Math.min(
-          isExplicitLongRunningResearchPrompt(prompt) ? 3 : 2,
-          Math.max(
-            1,
-            completionDrivenLoops
-              ? this.settings.maxCompletionSegments ?? 2
-              : this.settings.maxLongRunSegments ?? 2,
-          ),
-        )
-      : 1;
+    const maxSegments = resolveForegroundSegmentLimit({
+      autoContinue: autoContinueLongRun,
+      completionDriven: completionDrivenLoops,
+      configuredCompletionSegments: this.settings.maxCompletionSegments,
+      configuredLongRunSegments: this.settings.maxLongRunSegments,
+      explicitLongRunningResearch: isExplicitLongRunningResearchPrompt(prompt),
+    });
     const assistantCapture: AgentRunEvents = {
       onAssistantMessageStart: () => {
         assistantContent = "";
@@ -9068,10 +9160,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     const leadInitialSegmentToolCalls = leadContinuationToolCalls > 0
       ? leadMaxToolCalls - leadContinuationToolCalls
       : leadMaxToolCalls;
-    const leadMaxSegments = Math.min(
-      3,
-      Math.max(1, this.settings.maxCompletionSegments ?? 3),
-    );
+    const leadMaxSegments = resolveAdaptiveLeadSegmentLimitV1({
+      leadModelSteps: leadMaxSteps,
+      configuredCompletionSegments: this.settings.maxCompletionSegments,
+    });
     let operationalSnapshot: OrchestratorSnapshotV1 | null = null;
     const runtime = new OrchestratorRuntime({
       runId,
@@ -9307,60 +9399,11 @@ export default class AgenticResearcherPlugin extends Plugin {
       seedEvidence = merged.evidence;
       seedClaimPassages = merged.claimPassages;
       handoffContext = merged.promptContext;
-      const activeNotePath =
-        this.app.workspace.getActiveFile()?.path?.trim() ||
-        "Research/Team handoff.md";
-      const bridgedArtifact = buildAcceptedResearchArtifactFromWorkerHandoff({
-        handoff: merged.handoff,
-        notePath: activeNotePath.endsWith(".md")
-          ? activeNotePath
-          : `${activeNotePath}.md`,
-        runId,
-        evidence: merged.evidence,
-      });
-      if (!("ok" in bridgedArtifact)) {
-        const durableHandoff = buildResearcherHandoffV1FromWorker({
-          handoff: merged.handoff,
-          runId,
-          taskId: researchNodeId,
-          notePath: bridgedArtifact.notePath,
-          noteSha256: bridgedArtifact.noteSha256,
-          acceptedArtifactFingerprint: bridgedArtifact.artifactFingerprint,
-          artifact: bridgedArtifact,
-          evidence: merged.evidence,
-        });
-        if (!("ok" in durableHandoff)) {
-          // Keep merged MissionEvidence as Lead seedMissionEvidence; also
-          // attach durable AcceptedResearch lineage for publish_research_*.
-          try {
-            await this.projectLineageStore.upsert(
-              createProjectLineageV1({
-                lineageId: `project-${bridgedArtifact.artifactFingerprint.slice(7, 31)}`,
-                runId,
-                vaultBindingKey: bridgedArtifact.vaultBindingKey,
-                handoff: durableHandoff,
-                updatedAt: bridgedArtifact.acceptedAt,
-              }),
-            );
-          } catch (attachError) {
-            input.events.onStatus?.(
-              `ORCH> Could not attach accepted research lineage (${
-                attachError instanceof Error
-                  ? attachError.message
-                  : "attach_failed"
-              }).`,
-            );
-          }
-          handoffContext = [
-            handoffContext,
-            "",
-            formatBridgedHandoffAttachContext({
-              artifact: bridgedArtifact,
-              durableHandoff,
-            }),
-          ].join("\n");
-        }
-      }
+      // The Specialist handoff is evidence for the Lead, not accepted research.
+      // Accepted lifecycle lineage is created only by the publication workflow
+      // after the Lead-authored note has been written, read back, and hashed.
+      // Creating lineage here previously allowed a merely `ready` handoff and a
+      // synthetic note hash to unlock downstream Linear/code work.
       const handoffAccepted = merged.handoff.status === "accepted";
       recordHandoffAccepted(teamAutonomyStats, handoffAccepted);
       recordUsableSources(
@@ -11929,10 +11972,15 @@ export default class AgenticResearcherPlugin extends Plugin {
       const publication = candidate.commits.find(
         (commit) => commit.stage === "private_github_publication",
       );
+      const publicationProof =
+        publication?.proof.stage === "private_github_publication"
+          ? parseGitHubPublicationLineageProofV2(publication.proof)
+          : null;
       return (
-        publication?.proof.stage === "private_github_publication" &&
-        publication.proof.owner.toLowerCase() === binding.owner.toLowerCase() &&
-        publication.proof.repository.toLowerCase() ===
+        publicationProof?.visibility === "private" &&
+        publicationProof.trustedBindingFingerprint === binding.fingerprint &&
+        publicationProof.owner.toLowerCase() === binding.owner.toLowerCase() &&
+        publicationProof.repository.toLowerCase() ===
           binding.repository.toLowerCase()
       );
     });
@@ -11982,9 +12030,22 @@ export default class AgenticResearcherPlugin extends Plugin {
         "Project cleanup cannot finalize before durable Obsidian and provider backlinks exist.",
       );
     }
-    const publicationProof = lineage.commits[3]?.proof;
-    if (publicationProof?.stage !== "private_github_publication") {
+    const publicationCommit = lineage.commits.find(
+      (commit) => commit.stage === "private_github_publication",
+    );
+    if (publicationCommit?.proof.stage !== "private_github_publication") {
       throw new Error("Project cleanup lost its private GitHub publication proof.");
+    }
+    const publicationProof = parseGitHubPublicationLineageProofV2(
+      publicationCommit.proof,
+    );
+    if (
+      publicationProof.visibility !== "private" ||
+      publicationProof.trustedBindingFingerprint !== binding.fingerprint
+    ) {
+      throw new Error(
+        "Project cleanup lost its exact private GitHub visibility binding.",
+      );
     }
     await this.projectLineageStore.upsert(
       advanceProjectLineageV1({
@@ -12122,14 +12183,24 @@ export default class AgenticResearcherPlugin extends Plugin {
           runId: string;
           artifactFingerprint: string;
           notePath: string;
+          noteSha256: string;
+          noteContent: string;
         }> = [];
         for (const lineage of await this.projectLineageStore.list()) {
           const proof = lineage.commits[0]?.proof;
           if (proof?.stage === "accepted_research") {
+            const noteFile = this.app.vault.getAbstractFileByPath(proof.notePath);
+            const noteContent =
+              noteFile instanceof TFile &&
+              noteFile.extension.toLowerCase() === "md"
+                ? await this.app.vault.read(noteFile)
+                : "";
             candidates.push({
               runId: lineage.runId,
               artifactFingerprint: proof.artifactFingerprint,
               notePath: proof.notePath,
+              noteSha256: proof.noteSha256,
+              noteContent,
             });
           }
         }
@@ -12273,7 +12344,48 @@ export default class AgenticResearcherPlugin extends Plugin {
         };
       },
       persistProjectLineage: async (input) => {
-        await this.persistLinearHierarchyProjectLineage(input);
+        const issueReadbacks = await Promise.all(
+          input.issueIds.map(async (issueId) => {
+            const raw = await client.execute("issues.get", { id: issueId });
+            if (
+              !isRecord(raw) ||
+              raw.resourceType !== "issue" ||
+              raw.id !== issueId ||
+              typeof raw.identifier !== "string" ||
+              typeof raw.url !== "string" ||
+              typeof raw.snapshotHash !== "string"
+            ) {
+              throw new Error(
+                `Linear issue ${issueId} did not return its exact provider-read binding.`,
+              );
+            }
+            return {
+              id: issueId,
+              identifier: raw.identifier,
+              url: raw.url,
+              snapshotHash: raw.snapshotHash,
+            };
+          }),
+        );
+        const lineage = await this.persistLinearHierarchyProjectLineage({
+          ...input,
+          issueReadbacks,
+        });
+        try {
+          await this.projectAndDispatchLinearProgress(
+            lineage,
+            input.context,
+            false,
+          );
+        } catch (error) {
+          // The hierarchy and its provider readbacks are already durable. Keep
+          // the receipt-driven Ready transition pending so the terminal
+          // reflection pass can resume it without replaying Linear creation.
+          console.warn(
+            "Deferred the initial Linear project-progress projection.",
+            error,
+          );
+        }
       },
       isAvailable: () =>
         this.getOptionalExtensionCapabilities().integrations &&
@@ -12289,6 +12401,12 @@ export default class AgenticResearcherPlugin extends Plugin {
     initiativeId: string;
     projectId: string;
     issueIds: string[];
+    issueReadbacks: Array<{
+      id: string;
+      identifier: string;
+      url: string;
+      snapshotHash: string;
+    }>;
   }): Promise<ProjectLineageV1> {
     const lineage = (await this.projectLineageStore.list()).find(
       (candidate) =>
@@ -12318,6 +12436,16 @@ export default class AgenticResearcherPlugin extends Plugin {
     const providerReadbackFingerprints = input.checkpoint.items
       .map((item) => item.readbackFingerprint)
       .filter((value): value is string => typeof value === "string");
+    if (
+      input.issueReadbacks.length !== input.plan.issues.length ||
+      input.issueReadbacks.some(
+        (readback, index) => readback.id !== input.issueIds[index],
+      )
+    ) {
+      throw new Error(
+        "Linear issue readbacks must align exactly with the approved work-unit order.",
+      );
+    }
     return this.projectLineageStore.upsert(
       advanceProjectLineageV1({
         lineage,
@@ -12334,6 +12462,19 @@ export default class AgenticResearcherPlugin extends Plugin {
             (issue) => issue.workItemFingerprint,
           ),
           providerReadbackFingerprints,
+          workUnits: input.plan.issues.map((issue, issueIndex) => ({
+            workUnitId: issue.key,
+            linearIssueId: input.issueReadbacks[issueIndex]!.id,
+            linearIssueIdentifier:
+              input.issueReadbacks[issueIndex]!.identifier,
+            linearIssueUrl: input.issueReadbacks[issueIndex]!.url,
+            acceptanceCriterionIds: issue.acceptanceCriteria.map(
+              (_criterion, criterionIndex) =>
+                `${issue.key}:AC-${criterionIndex + 1}`,
+            ),
+            providerReadbackFingerprint:
+              input.issueReadbacks[issueIndex]!.snapshotHash,
+          })),
         },
       }),
     );
@@ -12343,6 +12484,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     resolveVerifiedCodePublicationHandoff(
       profileKey: string,
     ): Promise<VerifiedCodePublicationHandoffV1 | null>;
+    resolveVerifiedCodeReflectionExamples(
+      profileKey: string,
+      handoff: unknown,
+    ): Promise<VerifiedCodeReflectionExamplesV1 | null>;
     resolveTrustedRepositoryProfile(
       profileKey: string,
     ): Promise<RepositoryProfileV2 | null>;
@@ -12364,6 +12509,10 @@ export default class AgenticResearcherPlugin extends Plugin {
       resolveVerifiedCodePublicationHandoff?: (
         profileKey: string,
       ) => Promise<VerifiedCodePublicationHandoffV1 | null>;
+      resolveVerifiedCodeReflectionExamples?: (
+        profileKey: string,
+        handoff: unknown,
+      ) => Promise<VerifiedCodeReflectionExamplesV1 | null>;
       resolveTrustedRepositoryProfile?: (
         profileKey: string,
       ) => Promise<RepositoryProfileV2 | null>;
@@ -12386,6 +12535,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     }>("agentic-researcher-code");
     if (
       typeof code?.resolveVerifiedCodePublicationHandoff !== "function" ||
+      typeof code.resolveVerifiedCodeReflectionExamples !== "function" ||
       typeof code.resolveTrustedRepositoryProfile !== "function" ||
       typeof code.createTrustedQueueCodeMissionPrompt !== "function" ||
       typeof code.resolveVerifiedQueueCodeHandoff !== "function" ||
@@ -12398,6 +12548,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     return {
       resolveVerifiedCodePublicationHandoff: (profileKey) =>
         code.resolveVerifiedCodePublicationHandoff!(profileKey),
+      resolveVerifiedCodeReflectionExamples: (profileKey, handoff) =>
+        code.resolveVerifiedCodeReflectionExamples!(profileKey, handoff),
       resolveTrustedRepositoryProfile: (profileKey) =>
         code.resolveTrustedRepositoryProfile!(profileKey),
       createTrustedQueueCodeMissionPrompt: (input) =>
@@ -13152,7 +13304,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       publish: async (request) => {
         const credential = this.githubCredential;
         if (!credential) throw new Error("GitHub is not connected.");
-        await this.refreshPrivateGitHubPublicationBinding(
+        const privateRepositoryBinding =
+          await this.refreshPrivateGitHubPublicationBinding(
           input.binding,
           request.signal,
         );
@@ -13160,6 +13313,8 @@ export default class AgenticResearcherPlugin extends Plugin {
         const result = await gateway.push({
           handoff: input.handoff,
           binding: input.binding.publicationBinding,
+          privateRepositoryBinding,
+          expectedVisibility: input.binding.privateRepositoryBinding.visibility,
           profile: input.binding.profile,
           credentialReferenceId: credential.tokenReferenceId,
           signal: request.signal,
@@ -13206,7 +13361,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       reconcile: async (request) => {
         const credential = this.githubCredential;
         if (!credential) throw new Error("GitHub is not connected.");
-        await this.refreshPrivateGitHubPublicationBinding(
+        const privateRepositoryBinding =
+          await this.refreshPrivateGitHubPublicationBinding(
           input.binding,
           request.signal,
         );
@@ -13214,6 +13370,8 @@ export default class AgenticResearcherPlugin extends Plugin {
         const result = await gateway.reconcile({
           handoff: input.handoff,
           binding: input.binding.publicationBinding,
+          privateRepositoryBinding,
+          expectedVisibility: input.binding.privateRepositoryBinding.visibility,
           profile: input.binding.profile,
           credentialReferenceId: credential.tokenReferenceId,
           signal: request.signal,
@@ -13278,6 +13436,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           input.profileKey,
           input.handoff,
           input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
+          input.context,
         );
         return binding;
       },
@@ -13308,7 +13467,8 @@ export default class AgenticResearcherPlugin extends Plugin {
           publish: async (input) => {
             const credential = this.githubCredential;
             if (!credential) throw new Error("GitHub is not connected.");
-            await this.refreshPrivateGitHubPublicationBinding(
+            const privateRepositoryBinding =
+              await this.refreshPrivateGitHubPublicationBinding(
               binding,
               input.signal,
             );
@@ -13316,6 +13476,8 @@ export default class AgenticResearcherPlugin extends Plugin {
             const result = await gateway.push({
               handoff,
               binding: binding.publicationBinding,
+              privateRepositoryBinding,
+              expectedVisibility: binding.privateRepositoryBinding.visibility,
               profile: binding.profile,
               credentialReferenceId: credential.tokenReferenceId,
               signal: input.signal,
@@ -13366,7 +13528,8 @@ export default class AgenticResearcherPlugin extends Plugin {
           reconcile: async (input) => {
             const credential = this.githubCredential;
             if (!credential) throw new Error("GitHub is not connected.");
-            await this.refreshPrivateGitHubPublicationBinding(
+            const privateRepositoryBinding =
+              await this.refreshPrivateGitHubPublicationBinding(
               binding,
               input.signal,
             );
@@ -13374,6 +13537,8 @@ export default class AgenticResearcherPlugin extends Plugin {
             const result = await gateway.reconcile({
               handoff,
               binding: binding.publicationBinding,
+              privateRepositoryBinding,
+              expectedVisibility: binding.privateRepositoryBinding.visibility,
               profile: binding.profile,
               credentialReferenceId: credential.tokenReferenceId,
               signal: input.signal,
@@ -13499,6 +13664,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           input.profileKey,
           input.handoff,
           input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
+          input.context,
         );
         if (!origin.issue) {
           throw new Error("No exact Linear issue lineage matches this verified code handoff.");
@@ -13512,6 +13678,19 @@ export default class AgenticResearcherPlugin extends Plugin {
           completionProof: proof.completionProof,
           mergeSha: proof.mergeSha,
         });
+        const projectLineage = (await this.projectLineageStore.list()).find(
+          (candidate) =>
+            candidate.commits[0]?.proof.stage === "accepted_research" &&
+            candidate.commits[0].proof.artifactFingerprint ===
+              origin.artifact.artifactFingerprint,
+        );
+        if (projectLineage) {
+          await this.projectAndDispatchLinearProgress(
+            projectLineage,
+            input.context,
+            false,
+          );
+        }
         const comment = await this.executeApprovedLinearFinalizationAction({
           context: input.context,
           durableRunId: input.handoff.runId,
@@ -13535,6 +13714,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           input.profileKey,
           input.handoff,
           input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
+          input.context,
         );
         if (!origin.issue) {
           throw new Error("No exact Linear issue lineage matches this verified code handoff.");
@@ -13566,10 +13746,20 @@ export default class AgenticResearcherPlugin extends Plugin {
           input.profileKey,
           input.handoff,
           input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
+          input.context,
         );
         if (!origin.issue) {
           throw new Error("No exact Linear issue lineage matches this verified code handoff.");
         }
+        const projectLineage = (await this.projectLineageStore.list()).find(
+          (candidate) =>
+            candidate.commits[0]?.proof.stage === "accepted_research" &&
+            candidate.commits[0].proof.artifactFingerprint ===
+              origin.artifact.artifactFingerprint &&
+            candidate.commits.some((commit) => commit.stage === "linear_hierarchy"),
+        );
+        const notePresentation: "full_reflection" | "delivery_status" =
+          projectLineage ? "delivery_status" : "full_reflection";
         const file = this.app.vault.getFileByPath(origin.artifact.notePath);
         if (!file || file.extension !== "md") {
           throw new Error("The originating Obsidian research note is unavailable.");
@@ -13587,89 +13777,18 @@ export default class AgenticResearcherPlugin extends Plugin {
         const mergeCommitUrl = proof.mergeSha
           ? `https://github.com${repositoryPath}/commit/${proof.mergeSha}`
           : null;
-        const now = new Date();
-        const preparedAction = await withPreparedActionFingerprint({
-          version: 1,
-          id: `github-obsidian-reflection-${proof.publicationId}`,
-          runId: input.handoff.runId,
-          toolCallId: `github-obsidian-reflection-${proof.publicationId}`,
-          toolName: FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
-          target: {
-            system: "vault",
-            resourceType: "markdown_file",
-            id: origin.artifact.notePath,
-            path: origin.artifact.notePath,
-            revision: beforeSha256,
-          },
-          relatedResources: [{
-            system: "github",
-            resourceType: "pull_request",
-            id: String(proof.pullRequest.number),
-            url: proof.pullRequest.htmlUrl,
-            revision: proof.proofRevision,
-          }],
-          normalizedArgs: {
-            expectedNoteSha256: beforeSha256,
-            pullRequestNumber: proof.pullRequest.number,
-            pullRequestUrl: proof.pullRequest.htmlUrl,
-            completionProof: proof.completionProof,
-            proofRevision: proof.proofRevision,
-            publicationId: proof.publicationId,
-            issueIdentifier: origin.issue.identifier,
-            issueUrl: origin.issue.url,
-            changedPaths: input.handoff.changedPaths,
-            targetedValidationReceiptId: input.handoff.targetedValidationReceiptId,
-            fullValidationReceiptId: input.handoff.fullValidationReceiptId,
-            localCommitReceiptId: input.handoff.localCommitReceiptId,
-            ...(mergeCommitUrl ? { mergeCommitUrl } : {}),
-            ...(proof.mergeSha ? { mergeSha: proof.mergeSha } : {}),
-          },
-          preview: {
-            summary: `Append the verified project completion reflection to ${origin.artifact.notePath}.`,
-            destination: origin.artifact.notePath,
-            outboundPayload: {
-              pullRequestUrl: proof.pullRequest.htmlUrl,
-              completionProof: proof.completionProof,
-              proofRevision: proof.proofRevision,
-              linearIssueUrl: origin.issue.url,
-              changedPaths: input.handoff.changedPaths,
-              ...(mergeCommitUrl ? { mergeCommitUrl } : {}),
-              ...(proof.mergeSha ? { mergeSha: proof.mergeSha } : {}),
-            },
-            warnings: [],
-            outboundBytes: new TextEncoder().encode(
-              `${origin.issue.url}\n${proof.pullRequest.htmlUrl}\n${mergeCommitUrl ?? ""}\n${proof.proofRevision}\n${input.handoff.changedPaths.join("\n")}`,
-            ).length,
-          },
-          expectedTargetRevision: beforeSha256,
-          idempotencyKey: `github-note-reflection:${proof.publicationId}:${proof.proofRevision}`,
-          preparedAt: now.toISOString(),
-          expiresAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
-        } satisfies PreparedActionInput);
-        const requestApproval = input.context.requestNestedApproval;
-        if (!requestApproval) {
-          throw new Error("Obsidian GitHub backlink approval is unavailable.");
+        const codeExamples =
+          await this.getCodePublicationBridge()?.resolveVerifiedCodeReflectionExamples(
+            input.profileKey,
+            input.handoff,
+          ) ?? null;
+        if (!codeExamples) {
+          throw new Error(
+            "Exact-commit code examples are unavailable; project reflection cannot be finalized from mutable or unverified source text.",
+          );
         }
-        const approval = await requestApproval({
-          toolName: preparedAction.toolName,
-          action: preparedAction.preview.summary,
-          reason:
-            "Approve the exact note hash and evidence-backed project reflection. Note drift invalidates this approval.",
-          policyTags: ["github_publication", "obsidian_reflection", "exact"],
-          preparedAction,
-          timeoutMs: 120_000,
-          confirmationIndex: 1,
-          requiredConfirmations: 1,
-        });
-        if (
-          !approval.approved ||
-          approval.approvalFingerprint !== preparedAction.payloadFingerprint
-        ) {
-          throw new Error("Obsidian GitHub backlink approval was denied or stale.");
-        }
-        const result = await new AcceptedResearchNoteWriter(
-          this.app.vault,
-        ).appendProjectCompletionReflection({
+        const noteWriter = new AcceptedResearchNoteWriter(this.app.vault);
+        const reflectionRequest = {
           artifact: origin.artifact,
           expectedNoteSha256: beforeSha256,
           publicationId: proof.publicationId,
@@ -13683,19 +13802,212 @@ export default class AgenticResearcherPlugin extends Plugin {
           targetedValidationReceiptId: input.handoff.targetedValidationReceiptId,
           fullValidationReceiptId: input.handoff.fullValidationReceiptId,
           localCommitReceiptId: input.handoff.localCommitReceiptId,
+          codeHandoffFingerprint: input.handoff.fingerprint,
+          codeExamples,
+          presentation: notePresentation,
           ...(mergeCommitUrl && proof.mergeSha
             ? { mergeCommitUrl, mergeSha: proof.mergeSha }
             : {}),
+        } as const;
+        const reflectionPlan = await noteWriter.planProjectCompletionReflection(
+          reflectionRequest,
+        );
+        const now = new Date();
+        const preparedAction = await withPreparedActionFingerprint({
+          version: 1,
+          id: `github-obsidian-reflection-${proof.publicationId}`,
+          runId: input.handoff.runId,
+          toolCallId: `github-obsidian-reflection-${proof.publicationId}`,
+          toolName: FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
+          target: {
+            system: "vault",
+            resourceType: "markdown_file",
+            id: origin.artifact.notePath,
+            path: origin.artifact.notePath,
+            revision: reflectionPlan.beforeSha256,
+          },
+          relatedResources: [{
+            system: "github",
+            resourceType: "pull_request",
+            id: String(proof.pullRequest.number),
+            url: proof.pullRequest.htmlUrl,
+            revision: proof.proofRevision,
+          }],
+          normalizedArgs: {
+            expectedNoteSha256: reflectionPlan.beforeSha256,
+            expectedAfterSha256: reflectionPlan.expectedAfterSha256,
+            proposedAppendMarkdown: reflectionPlan.proposedAppendMarkdown,
+            proposedAppendSha256: reflectionPlan.proposedAppendSha256,
+            proposedAppendBytes: reflectionPlan.proposedAppendBytes,
+            reflectionMarkdownSha256: reflectionPlan.reflectionMarkdownSha256,
+            reflectionOperation: reflectionPlan.operation,
+            presentation: reflectionPlan.presentation,
+            pullRequestNumber: proof.pullRequest.number,
+            pullRequestUrl: proof.pullRequest.htmlUrl,
+            completionProof: proof.completionProof,
+            proofRevision: proof.proofRevision,
+            publicationId: proof.publicationId,
+            issueIdentifier: origin.issue.identifier,
+            issueUrl: origin.issue.url,
+            changedPaths: input.handoff.changedPaths,
+            targetedValidationReceiptId: input.handoff.targetedValidationReceiptId,
+            fullValidationReceiptId: input.handoff.fullValidationReceiptId,
+            localCommitReceiptId: input.handoff.localCommitReceiptId,
+            codeHandoffFingerprint: input.handoff.fingerprint,
+            codeExamplesFingerprint: codeExamples.fingerprint,
+            codeExamplePaths: codeExamples.examples.map((example) =>
+              example.path,
+            ),
+            ...(mergeCommitUrl ? { mergeCommitUrl } : {}),
+            ...(proof.mergeSha ? { mergeSha: proof.mergeSha } : {}),
+          },
+          preview: {
+            summary: reflectionPlan.operation === "append"
+              ? reflectionPlan.presentation === "delivery_status"
+                ? `Append the verified delivery checkpoint to ${origin.artifact.notePath}.`
+                : `Append the verified project completion reflection to ${origin.artifact.notePath}.`
+              : reflectionPlan.presentation === "delivery_status"
+                ? `Reconcile the already-persisted delivery checkpoint in ${origin.artifact.notePath}.`
+                : `Reconcile the already-persisted project completion reflection in ${origin.artifact.notePath}.`,
+            destination: origin.artifact.notePath,
+            outboundPayload: {
+              pullRequestUrl: proof.pullRequest.htmlUrl,
+              completionProof: proof.completionProof,
+              proofRevision: proof.proofRevision,
+              linearIssueUrl: origin.issue.url,
+              changedPaths: input.handoff.changedPaths,
+              codeExamplesFingerprint: codeExamples.fingerprint,
+              proposedAppendSha256: reflectionPlan.proposedAppendSha256,
+              expectedAfterSha256: reflectionPlan.expectedAfterSha256,
+              proposedAppendBytes: reflectionPlan.proposedAppendBytes,
+              reflectionMarkdownSha256: reflectionPlan.reflectionMarkdownSha256,
+              markdownExcerpt: reflectionPlan.markdownExcerpt,
+              markdownExcerptTruncated: reflectionPlan.markdownExcerptTruncated,
+              codeExcerpt: reflectionPlan.codeExcerpt,
+              codeExcerptSha256: reflectionPlan.codeExcerptSha256,
+              codeExcerptTruncated: reflectionPlan.codeExcerptTruncated,
+              codeExamplePaths: codeExamples.examples.map((example) =>
+                example.path,
+              ),
+              ...(mergeCommitUrl ? { mergeCommitUrl } : {}),
+              ...(proof.mergeSha ? { mergeSha: proof.mergeSha } : {}),
+            },
+            warnings: [
+              ...(reflectionPlan.markdownExcerptTruncated
+                ? ["Markdown approval excerpt is truncated; the full append remains hash-bound."]
+                : []),
+              ...(reflectionPlan.codeExcerptTruncated
+                ? ["Code approval excerpt is truncated; the full verified example remains hash-bound."]
+                : []),
+            ],
+            outboundBytes: reflectionPlan.proposedAppendBytes,
+          },
+          expectedTargetRevision: reflectionPlan.beforeSha256,
+          idempotencyKey: `github-note-reflection:${proof.publicationId}:${proof.proofRevision}`,
+          preparedAt: now.toISOString(),
+          expiresAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
+        } satisfies PreparedActionInput);
+        const requestApproval = input.context.requestNestedApproval;
+        if (!requestApproval) {
+          throw new Error("Obsidian GitHub backlink approval is unavailable.");
+        }
+        const approval = await requestApproval({
+          toolName: preparedAction.toolName,
+          action: preparedAction.preview.summary,
+          reason:
+            reflectionPlan.presentation === "delivery_status"
+              ? "Approve the exact note hash and evidence-backed delivery checkpoint. Note drift invalidates this approval."
+              : "Approve the exact note hash and evidence-backed project reflection. Note drift invalidates this approval.",
+          policyTags: ["github_publication", "obsidian_reflection", "exact"],
+          preparedAction,
+          timeoutMs: 120_000,
+          confirmationIndex: 1,
+          requiredConfirmations: 1,
+        });
+        if (
+          !approval.approved ||
+          approval.approvalFingerprint !== preparedAction.payloadFingerprint
+        ) {
+          throw new Error("Obsidian GitHub backlink approval was denied or stale.");
+        }
+        const approvedAppendMarkdown =
+          preparedAction.normalizedArgs.proposedAppendMarkdown;
+        const approvedAppendSha256 =
+          preparedAction.normalizedArgs.proposedAppendSha256;
+        const approvedAppendBytes =
+          preparedAction.normalizedArgs.proposedAppendBytes;
+        const approvedBeforeSha256 =
+          preparedAction.normalizedArgs.expectedNoteSha256;
+        const approvedAfterSha256 =
+          preparedAction.normalizedArgs.expectedAfterSha256;
+        const approvedReflectionSha256 =
+          preparedAction.normalizedArgs.reflectionMarkdownSha256;
+        if (
+          approvedAppendMarkdown !== reflectionPlan.proposedAppendMarkdown ||
+          approvedAppendSha256 !== reflectionPlan.proposedAppendSha256 ||
+          approvedAppendBytes !== reflectionPlan.proposedAppendBytes ||
+          approvedBeforeSha256 !== reflectionPlan.beforeSha256 ||
+          approvedAfterSha256 !== reflectionPlan.expectedAfterSha256 ||
+          approvedReflectionSha256 !== reflectionPlan.reflectionMarkdownSha256
+        ) {
+          throw new Error(
+            "Approved Obsidian reflection payload no longer matches its deterministic plan.",
+          );
+        }
+        const reflectionStartedAt = new Date().toISOString();
+        const result = await noteWriter.appendPreparedProjectCompletionReflection({
+          ...reflectionPlan,
+          proposedAppendMarkdown: approvedAppendMarkdown,
+          proposedAppendSha256: approvedAppendSha256,
+          proposedAppendBytes: approvedAppendBytes,
+          beforeSha256: approvedBeforeSha256,
+          expectedAfterSha256: approvedAfterSha256,
+          reflectionMarkdownSha256: approvedReflectionSha256,
         });
         const finalizedReceiptId =
           `github-note-reflection-${result.afterSha256.slice(7, 39)}`;
+        const reflectionCommittedAt = new Date().toISOString();
+        const reflectionReceipt: ActionReceipt = {
+          version: 1,
+          id: finalizedReceiptId,
+          runId: preparedAction.runId,
+          actionId: preparedAction.id,
+          toolName: preparedAction.toolName,
+          operation: "append",
+          resource: {
+            ...preparedAction.target,
+            revision: result.afterSha256,
+          },
+          relatedResources: preparedAction.relatedResources,
+          message: reflectionPlan.presentation === "delivery_status"
+            ? `Verified delivery checkpoint at ${result.path}.`
+            : `Verified project completion reflection at ${result.path}.`,
+          payloadFingerprint: preparedAction.payloadFingerprint,
+          grantId: approval.approvalId,
+          idempotencyKey: preparedAction.idempotencyKey,
+          startedAt: reflectionStartedAt,
+          committedAt: reflectionCommittedAt,
+          commitKind:
+            result.operation === "no_op" ? "reconciled" : "committed",
+          readback: {
+            status: "verified",
+            checkedAt: reflectionCommittedAt,
+            observedRevision: result.afterSha256,
+            observedFingerprint: result.afterSha256,
+          },
+          effects: {
+            bytesWritten: result.transaction?.bytesWritten ?? 0,
+            affectedCount: result.operation === "no_op" ? 0 : 1,
+          },
+        };
+        await this.appendExternalActionReceipt(reflectionReceipt);
         await this.persistFinalizedGitHubPublicationLineage({
           origin,
-          receiptId: finalizedReceiptId,
+          receiptId: reflectionReceipt.id,
           noteSha256: result.afterSha256,
         });
         return {
-          receiptId: finalizedReceiptId,
+          receiptId: reflectionReceipt.id,
         };
       },
     };
@@ -13705,6 +14017,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     profileKey: string,
     handoff: VerifiedCodePublicationHandoffV1,
     verifiedLinearBinding: VerifiedLinearCodeRepositoryBindingV1 | null = null,
+    context: ToolExecutionContext | null = null,
   ): Promise<ResearchPublicationCheckpointV1> {
     const checkpoints = await this.researchPublicationCheckpointStore.list();
     let origin = verifiedLinearBinding
@@ -13766,15 +14079,32 @@ export default class AgenticResearcherPlugin extends Plugin {
         "The verified local commit resolved to a different accepted-research publication.",
       );
     }
-    await this.persistCodeExecutionProjectLineage(resolved, handoff);
+    const projectLineage = await this.persistCodeExecutionProjectLineage(
+      resolved,
+      handoff,
+    );
+    if (projectLineage && context) {
+      try {
+        await this.projectAndDispatchLinearProgress(
+          projectLineage,
+          context,
+          false,
+        );
+      } catch (error) {
+        console.warn(
+          "Deferred implementation/test Linear project progress.",
+          error,
+        );
+      }
+    }
     return resolved;
   }
 
   private async persistCodeExecutionProjectLineage(
     origin: ResearchPublicationCheckpointV1,
     handoff: VerifiedCodePublicationHandoffV1,
-  ): Promise<void> {
-    const lineage = (await this.projectLineageStore.list()).find(
+  ): Promise<ProjectLineageV1 | null> {
+    let lineage = (await this.projectLineageStore.list()).find(
       (candidate) =>
         candidate.commits[0]?.proof.stage === "accepted_research" &&
         candidate.commits[0].proof.artifactFingerprint ===
@@ -13783,27 +14113,76 @@ export default class AgenticResearcherPlugin extends Plugin {
     // Standalone verified publication remains supported without manufacturing
     // an end-to-end project lineage. Compound lifecycle lineage begins only
     // after the exact Linear hierarchy has been committed.
-    if (!lineage || lineage.commits.length < 2) return;
-    const existing = lineage.commits.find(
+    if (!lineage || lineage.commits.length < 2) return null;
+    const existingExecution = lineage.commits.find(
       (commit) => commit.stage === "code_execution",
     );
-    if (existing) {
+    if (existingExecution) {
       if (
-        existing.proof.stage !== "code_execution" ||
-        existing.proof.commitSha !== handoff.commitSha
+        existingExecution.proof.stage !== "code_execution" ||
+        existingExecution.proof.commitSha !== handoff.commitSha
       ) {
         throw new Error(
           "A different verified commit is already committed to this project lineage.",
         );
       }
-      return;
+    } else {
+      lineage = await this.projectLineageStore.upsert(
+        advanceProjectLineageV1({
+          lineage,
+          committedAt: nextMonotonicIso(lineage.updatedAt, handoff.committedAt),
+          proof: {
+            stage: "code_execution",
+            repositoryProfileKey: handoff.repositoryProfileKey,
+            repositoryProfileFingerprint: handoff.repositoryProfileFingerprint,
+            workspaceId: handoff.workspaceId,
+            validationReceiptFingerprints: [
+              handoff.targetedValidationFingerprint,
+              handoff.fullValidationFingerprint,
+            ],
+            diffFingerprint: handoff.diffFingerprint,
+            targetedValidationPassed: true,
+            freshFullValidationPassed: true,
+            commitSha: handoff.commitSha,
+            commitReadbackFingerprint: handoff.localCommitReceiptFingerprint,
+          },
+        }),
+      );
     }
-    await this.projectLineageStore.upsert(
+
+    const existingValidation = lineage.commits.find(
+      (commit) => commit.stage === "code_validation",
+    );
+    if (existingValidation) {
+      if (
+        existingValidation.proof.stage !== "code_validation" ||
+        existingValidation.proof.commitSha !== handoff.commitSha ||
+        existingValidation.proof.commitReadbackFingerprint !==
+          handoff.localCommitReceiptFingerprint
+      ) {
+        throw new Error(
+          "A different validation result is already committed to this project lineage.",
+        );
+      }
+      return lineage;
+    }
+    // Older in-flight lineages may already have selected the legacy branch by
+    // committing GitHub publication directly after code_execution. Preserve
+    // their immutable history; only new lineages receive the explicit Test
+    // stage before publication.
+    if (
+      lineage.commits.some(
+        (commit) => commit.stage === "private_github_publication",
+      )
+    ) {
+      return lineage;
+    }
+    return this.projectLineageStore.upsert(
       advanceProjectLineageV1({
         lineage,
         committedAt: nextMonotonicIso(lineage.updatedAt, handoff.committedAt),
         proof: {
-          stage: "code_execution",
+          stage: "code_validation",
           repositoryProfileKey: handoff.repositoryProfileKey,
           repositoryProfileFingerprint: handoff.repositoryProfileFingerprint,
           workspaceId: handoff.workspaceId,
@@ -13816,6 +14195,78 @@ export default class AgenticResearcherPlugin extends Plugin {
           freshFullValidationPassed: true,
           commitSha: handoff.commitSha,
           commitReadbackFingerprint: handoff.localCommitReceiptFingerprint,
+        },
+      }),
+    );
+  }
+
+  private async persistReflectionProjectLineage(
+    receipt: ActionReceipt,
+  ): Promise<ProjectLineageV1 | null> {
+    if (
+      receipt.toolName !== WRITE_PROJECT_RESULTS_TOOL_NAME &&
+      receipt.toolName !== APPEND_JUPYTER_REFLECTION_TOOL_NAME
+    ) {
+      throw new Error(
+        "Only canonical Results or Jupyter receipts can commit project reflection lineage.",
+      );
+    }
+    const path = receipt.resource.path;
+    const resultsSha256 =
+      receipt.readback.observedFingerprint ??
+      receipt.readback.observedRevision;
+    if (
+      receipt.readback.status !== "verified" ||
+      typeof path !== "string" ||
+      !isSafeProjectReflectionPath(path) ||
+      typeof resultsSha256 !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(resultsSha256) ||
+      !/^sha256:[a-f0-9]{64}$/u.test(receipt.payloadFingerprint)
+    ) {
+      throw new Error(
+        "Project reflection lineage requires a safe exact-path receipt with verified SHA-256 readback.",
+      );
+    }
+    const lineage = (await this.projectLineageStore.list()).find(
+      (candidate) => candidate.runId === receipt.runId,
+    );
+    // Results and Jupyter remain independently callable. A standalone report
+    // has no project lineage to advance and is still preserved by its receipt.
+    if (!lineage) return null;
+    const existing = lineage.commits.find(
+      (commit) => commit.stage === "reflection",
+    );
+    const writeReceiptFingerprint = await sha256LinearValue(receipt);
+    if (existing) {
+      if (
+        existing.proof.stage !== "reflection" ||
+        existing.proof.resultsPath !== path ||
+        existing.proof.resultsSha256 !== resultsSha256 ||
+        existing.proof.writeReceiptFingerprint !== writeReceiptFingerprint
+      ) {
+        throw new Error(
+          "A different Results reflection is already committed to this project lineage.",
+        );
+      }
+      return lineage;
+    }
+    const latestStage = lineage.commits.at(-1)?.stage;
+    if (latestStage !== "private_github_publication") {
+      // The compatibility stage label is shared by legacy-private and
+      // visibility-bound V2 publication proof. Do not advance a partial
+      // independent workflow that has no verified publication commit.
+      return null;
+    }
+    return this.projectLineageStore.upsert(
+      advanceProjectLineageV1({
+        lineage,
+        committedAt: nextMonotonicIso(lineage.updatedAt, receipt.committedAt),
+        proof: {
+          stage: "reflection",
+          resultsPath: path,
+          resultsSha256,
+          writeReceiptFingerprint,
+          summaryFingerprint: receipt.payloadFingerprint,
         },
       }),
     );
@@ -13953,25 +14404,13 @@ export default class AgenticResearcherPlugin extends Plugin {
     const existing = lineage.commits.find(
       (commit) => commit.stage === "private_github_publication",
     );
-    if (existing) {
-      if (
-        binding.visibility !== "private" ||
-        existing.proof.stage !== "private_github_publication" ||
-        existing.proof.remoteSha !== input.handoff.commitSha
-      ) {
-        throw new Error(
-          "A different private GitHub publication is already committed to this project lineage.",
-        );
-      }
-      return;
-    }
     if (
       input.pullRequest.draft !== true ||
       input.pullRequest.head.sha !== input.handoff.commitSha ||
       input.checkpoint.remoteSha !== input.handoff.commitSha
     ) {
       throw new Error(
-        "Project lineage requires a fresh private binding and exact draft pull-request readback.",
+        "Project lineage requires a fresh visibility-bound repository binding and exact draft pull-request readback.",
       );
     }
     const pullRequestReadbackFingerprint = await sha256LinearValue({
@@ -13998,10 +14437,22 @@ export default class AgenticResearcherPlugin extends Plugin {
         binding.repositoryReadbackFingerprint,
       pullRequestReadbackFingerprint,
     });
-    // ProjectLineageV1 is a private-only compatibility record. The canonical
-    // V2 binding + publication checkpoint already persist public truth; never
-    // forge verifiedPrivate merely to fit the legacy projection.
-    if (canonicalProof.visibility === "public") return;
+    if (existing) {
+      if (existing.proof.stage !== "private_github_publication") {
+        throw new Error(
+          "A different GitHub publication is already committed to this project lineage.",
+        );
+      }
+      const existingCanonical = parseGitHubPublicationLineageProofV2(
+        existing.proof,
+      );
+      if (JSON.stringify(existingCanonical) !== JSON.stringify(canonicalProof)) {
+        throw new Error(
+          "A different visibility-bound GitHub publication is already committed to this project lineage.",
+        );
+      }
+      return;
+    }
     await this.projectLineageStore.upsert(
       advanceProjectLineageV1({
         lineage,
@@ -14009,7 +14460,12 @@ export default class AgenticResearcherPlugin extends Plugin {
           lineage.updatedAt,
           input.checkpoint.updatedAt,
         ),
-        proof: projectGitHubPublicationLineageProofV2ToV1(canonicalProof),
+        proof:
+          canonicalProof.visibility === "private"
+            ? projectGitHubPublicationLineageProofV2ToV1(canonicalProof)
+            : projectGitHubPublicationLineageProofV2ToCompatibleV1(
+                canonicalProof,
+              ),
       }),
     );
   }
@@ -14052,6 +14508,322 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
   }
 
+  /**
+   * Persist a receipt-derived phase event as soon as the underlying code tool
+   * commits. Only a single exact Linear work unit can inherit aggregate
+   * foreground code evidence; multi-child projects wait for their own explicit
+   * execution bindings instead of broadcasting one mutation to every ticket.
+   */
+  private async persistProjectStageReceipt(
+    receipt: ActionReceipt,
+    context: ToolExecutionContext,
+  ): Promise<void> {
+    const rootRunId =
+      context.rootMissionId?.trim() || context.runId?.trim() || receipt.runId;
+    const lineage = (await this.projectLineageStore.list()).find(
+      (candidate) => candidate.runId === rootRunId,
+    );
+    if (!lineage) return;
+    if (
+      receipt.runId !== lineage.runId &&
+      context.rootMissionId?.trim() !== lineage.runId
+    ) {
+      return;
+    }
+    const bindings = projectLinearBindingsFromProjectLineageV1({ lineage });
+    if (bindings.length !== 1) return;
+    const binding = bindings[0]!;
+    const event = projectStageEventFromActionReceiptV1({
+      receipt,
+      runId: lineage.runId,
+      workUnits: [{
+        workUnitId: binding.workUnitId,
+        acceptanceCriterionIds: [],
+      }],
+    });
+    if (!event || !["implement", "test"].includes(event.phase)) return;
+
+    const previous = await this.projectLinearProgressRuntime.load(lineage.runId);
+    await this.projectLinearProgressRuntime.recordEvents({
+      runId: lineage.runId,
+      events: [event],
+      bindings,
+      processedAt: nextMonotonicIso(
+        lineage.updatedAt,
+        receipt.committedAt,
+        ...(previous ? [previous.updatedAt] : []),
+      ),
+    });
+    await this.projectAndDispatchLinearProgress(lineage, context, false);
+  }
+
+  /**
+   * Project durable lifecycle evidence onto the exact Linear child issues that
+   * were created for this run. The runtime owns the cursor/outbox; this host
+   * adapter owns credentials, exact approvals, provider reads, and receipts.
+   */
+  private async projectAndDispatchLinearProgress(
+    lineage: ProjectLineageV1,
+    context: ToolExecutionContext,
+    requireDrained: boolean,
+  ): Promise<void> {
+    const bindings = projectLinearBindingsFromProjectLineageV1({ lineage });
+    if (bindings.length === 0) {
+      // Legacy lineages predate exact issue/work-unit bindings. They remain
+      // readable, but cannot safely drive provider mutations.
+      if (requireDrained) {
+        throw new Error(
+          "Linear project progress cannot complete without an exact issue/work-unit binding.",
+        );
+      }
+      return;
+    }
+    const events = bindAggregateProjectEventsToOnlyWorkUnitV1({
+      events: projectStageEventsFromProjectLineageV1({ lineage }),
+      bindings,
+    });
+    const previousRun = await this.projectLinearProgressRuntime.load(lineage.runId);
+    await this.projectLinearProgressRuntime.recordEvents({
+      runId: lineage.runId,
+      events,
+      bindings,
+      processedAt: nextMonotonicIso(
+        lineage.updatedAt,
+        ...(previousRun ? [previousRun.updatedAt] : []),
+      ),
+    });
+
+    for (;;) {
+      const command = await this.projectLinearProgressRuntime.nextPending(
+        lineage.runId,
+      );
+      if (!command) break;
+      const configuredStateId = this.linearStateIdForProjectProgress(command);
+      if (!configuredStateId) {
+        const error =
+          `Linear project progress cannot map ${command.target} because its ` +
+          "workflow state is not configured.";
+        if (requireDrained) throw new Error(error);
+        // Configuration can be repaired without changing the immutable
+        // phase-boundary command. Keep it pending so a later receipt pass can
+        // dispatch the same command after the state mapping is configured.
+        console.warn(error);
+        return;
+      }
+
+      try {
+        await this.dispatchLinearProgressCommand({
+          command,
+          configuredStateId,
+          context,
+        });
+      } catch (error) {
+        // A partial/ambiguous provider outcome stays pending. Stable action
+        // identities let the next pass recover the comment/state by readback
+        // without replaying either mutation.
+        if (requireDrained) throw error;
+        console.warn(
+          `Deferred Linear project progress for ${command.workUnitId}.`,
+          error,
+        );
+        return;
+      }
+    }
+
+    if (requireDrained) {
+      const run = await this.projectLinearProgressRuntime.load(lineage.runId);
+      const blocked = run?.outbox.filter((item) => item.status === "blocked") ?? [];
+      if (blocked.length > 0) {
+        throw new Error(
+          `Linear project progress is blocked for ${blocked.length} work unit ` +
+          `${blocked.length === 1 ? "boundary" : "boundaries"}.`,
+        );
+      }
+      const pending = run?.outbox.filter((item) => item.status === "pending") ?? [];
+      const incomplete = run?.cursor.workUnits.filter(
+        (unit) =>
+          unit.target !== "completed" ||
+          unit.unpaidAcceptanceCriterionIds.length > 0,
+      ) ?? [];
+      const completedApplied = new Set(
+        run?.outbox
+          .filter((item) => item.status === "applied" && item.target === "completed")
+          .map((item) => item.workUnitId) ?? [],
+      );
+      const missingCompletionReadback =
+        run?.bindings.filter(
+          (binding) => !completedApplied.has(binding.workUnitId),
+        ) ?? [];
+      if (
+        !run ||
+        pending.length > 0 ||
+        incomplete.length > 0 ||
+        missingCompletionReadback.length > 0
+      ) {
+        throw new Error(
+          "Linear project progress is not terminal: every exact work unit requires paid acceptance criteria, a completed cursor, and an applied provider completion readback.",
+        );
+      }
+    }
+  }
+
+  private linearStateIdForProjectProgress(
+    command: LinearProgressPhaseBoundaryCommandV1,
+  ): string {
+    const value = (() => {
+      switch (command.target) {
+        case "ready":
+          return this.settings.linearReadyStateId;
+        case "in_progress":
+        case "ready_for_review":
+        case "in_review":
+          return this.settings.linearStartedStateId;
+        case "blocked":
+          return this.settings.linearBlockedStateId;
+        case "completed":
+          return this.settings.linearCompletedStateId;
+      }
+    })();
+    return typeof value === "string" ? value.trim() : "";
+  }
+
+  private async dispatchLinearProgressCommand(input: {
+    command: LinearProgressPhaseBoundaryCommandV1;
+    configuredStateId: string;
+    context: ToolExecutionContext;
+  }): Promise<void> {
+    const { command, configuredStateId, context } = input;
+    const commandSuffix = command.commandId
+      .slice("sha256:".length)
+      .slice(0, 40);
+    // Fail before the provider-visible comment if the bound issue can no
+    // longer be read exactly.
+    let issue = await this.readLinearProgressIssue(command.linearIssueId);
+
+    const commentReceipt = await this.executeApprovedLinearFinalizationAction({
+      context,
+      durableRunId: command.runId,
+      toolCallId: `project-progress-comment-${commandSuffix}`,
+      toolName: "linear_create_comment",
+      arguments: {
+        issueId: command.linearIssueId,
+        body: command.comment,
+      },
+      approvalReason:
+        "Post this receipt-derived developer phase boundary to the exact Linear issue.",
+      policyTags: ["developer_mission", "linear_progress", "exact"],
+    });
+    if (
+      commentReceipt.readback.status !== "verified" ||
+      !commentReceipt.readback.observedFingerprint
+    ) {
+      throw new Error(
+        "Linear project progress requires an independently verified comment readback.",
+      );
+    }
+
+    let stateMutationReceipt: ActionReceipt | null = null;
+    if (issue.stateId !== configuredStateId) {
+      try {
+        stateMutationReceipt = await this.executeApprovedLinearFinalizationAction({
+          context,
+          durableRunId: command.runId,
+          toolCallId: `project-progress-state-${commandSuffix}`,
+          toolName: "linear_update_issue",
+          arguments: {
+            id: command.linearIssueId,
+            stateId: configuredStateId,
+          },
+          approvalReason:
+            "Move the exact Linear issue to the workflow state proven by this developer phase boundary.",
+          policyTags: ["developer_mission", "linear_progress", "exact"],
+        });
+      } catch (error) {
+        // A concurrent/recovered update may now make prepare report no-change.
+        // Only exact provider state readback can convert that race into proof.
+        issue = await this.readLinearProgressIssue(command.linearIssueId);
+        if (issue.stateId !== configuredStateId) throw error;
+      }
+    }
+
+    const finalIssue = await this.readLinearProgressIssue(command.linearIssueId);
+    if (finalIssue.stateId !== configuredStateId) {
+      throw new Error(
+        "Linear project progress state readback did not match the configured target.",
+      );
+    }
+    const stateReadbackFingerprint = await sha256LinearValue({
+      version: 1,
+      kind: "linear_issue_state_readback",
+      commandId: command.commandId,
+      commandFingerprint: command.commandFingerprint,
+      issueId: command.linearIssueId,
+      target: command.target,
+      configuredStateId,
+      observedStateId: finalIssue.stateId,
+      observedIssueFingerprint: finalIssue.snapshotHash,
+    });
+    const commentReceiptFingerprint = await sha256LinearValue(commentReceipt);
+    const stateMutationReceiptFingerprint = stateMutationReceipt
+      ? await sha256LinearValue(stateMutationReceipt)
+      : null;
+    const providerReceiptFingerprint = await sha256LinearValue({
+      version: 1,
+      kind: "linear_project_progress_provider_receipt",
+      commandId: command.commandId,
+      commandFingerprint: command.commandFingerprint,
+      commentReceiptId: commentReceipt.id,
+      commentReceiptFingerprint,
+      stateMutationReceiptId: stateMutationReceipt?.id ?? null,
+      stateMutationReceiptFingerprint,
+      stateReadbackFingerprint,
+    });
+    const run = await this.projectLinearProgressRuntime.load(command.runId);
+    await this.projectLinearProgressRuntime.acknowledgeVerified({
+      runId: command.runId,
+      commandId: command.commandId,
+      commandFingerprint: command.commandFingerprint,
+      providerReceiptId: `project-linear-progress-${commandSuffix}`,
+      providerReceiptFingerprint,
+      verifiedAt: nextMonotonicIso(
+        commentReceipt.committedAt,
+        ...(stateMutationReceipt ? [stateMutationReceipt.committedAt] : []),
+        ...(run ? [run.updatedAt] : []),
+      ),
+    });
+  }
+
+  private async readLinearProgressIssue(issueId: string): Promise<{
+    id: string;
+    stateId: string;
+    snapshotHash: string;
+  }> {
+    const raw = await this.createSecretBackedLinearClient().execute(
+      "issues.get",
+      { id: issueId },
+    );
+    const state = isRecord(raw) && isRecord(raw.state) ? raw.state : null;
+    if (
+      !isRecord(raw) ||
+      raw.resourceType !== "issue" ||
+      raw.id !== issueId ||
+      !state ||
+      typeof state.id !== "string" ||
+      !state.id.trim() ||
+      typeof raw.snapshotHash !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(raw.snapshotHash)
+    ) {
+      throw new Error(
+        `Linear issue ${issueId} did not return an exact workflow-state readback.`,
+      );
+    }
+    return {
+      id: issueId,
+      stateId: state.id,
+      snapshotHash: raw.snapshotHash,
+    };
+  }
+
   private async executeApprovedLinearFinalizationAction(input: {
     context: ToolExecutionContext;
     durableRunId: string;
@@ -14059,6 +14831,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     toolName: "linear_create_comment" | "linear_update_issue";
     arguments: Record<string, unknown>;
     approvalReason: string;
+    policyTags?: string[];
   }): Promise<ActionReceipt> {
     const grantStore = this.authorityGrantStore;
     const requestApproval = input.context.requestNestedApproval;
@@ -14155,7 +14928,11 @@ export default class AgenticResearcherPlugin extends Plugin {
       toolName: input.toolName,
       action: prepared.preview.summary,
       reason: input.approvalReason,
-      policyTags: ["github_publication", "linear_finalization", "exact"],
+      policyTags: input.policyTags ?? [
+        "github_publication",
+        "linear_finalization",
+        "exact",
+      ],
       preparedAction: prepared.action,
       timeoutMs: 120_000,
       confirmationIndex: 1,
@@ -14339,6 +15116,96 @@ export default class AgenticResearcherPlugin extends Plugin {
       getToolOutcomeMemory: () => this.toolOutcomeMemory,
       setToolOutcomeMemory: (memory) => this.setToolOutcomeMemory(memory),
       getProjectLineages: () => this.getProjectLineages(),
+      getProjectStageEvents: (runId) => {
+        const requested = runId?.trim();
+        if (!requested) return [];
+        return this.projectLinearProgressNamespace.runs[requested]?.events ?? [];
+      },
+      persistProjectStageReceipt: (receipt, executionContext) =>
+        this.persistProjectStageReceipt(receipt, executionContext),
+      persistProjectReflectionReceipt: async (receipt, executionContext) => {
+        await this.appendExternalActionReceipt(receipt);
+        const lineage = await this.persistReflectionProjectLineage(receipt);
+        if (lineage) {
+          try {
+            await this.projectAndDispatchLinearProgress(
+              lineage,
+              executionContext,
+              false,
+            );
+          } catch (error) {
+            // The exact Results/notebook receipt and reflection lineage are
+            // already durable. Provider progress is a separate resumable
+            // projection and must never make the no-overwrite artifact look
+            // replayable after it committed.
+            console.warn(
+              "Deferred terminal Linear project progress after reflection persistence.",
+              error,
+            );
+          }
+        }
+      },
+      verifyProjectLifecycleCompletion: async (executionContext) => {
+        const rootRunId =
+          executionContext.rootMissionId?.trim() ||
+          executionContext.runId?.trim();
+        if (!rootRunId) {
+          throw new Error(
+            "Developer mission completion requires a durable root run id.",
+          );
+        }
+        const lineage = this.getProjectLineages().find(
+          (candidate) => candidate.runId === rootRunId,
+        );
+        if (!lineage) {
+          throw new Error(
+            "Developer mission completion cannot resolve its durable project lineage.",
+          );
+        }
+        if (
+          !lineage.commits.some(
+            (commit) => commit.stage === "reflection",
+          )
+        ) {
+          throw new Error(
+            "Developer mission completion requires a verified Results or Jupyter reflection lineage.",
+          );
+        }
+        await this.projectAndDispatchLinearProgress(
+          lineage,
+          executionContext,
+          true,
+        );
+      },
+      resolveVerifiedCodeReflectionExamples: async ({
+        repositoryProfileKey,
+        commitSha,
+      }) => {
+        const bridge = this.getCodePublicationBridge();
+        if (!bridge) return null;
+        const handoff = await bridge.resolveVerifiedCodePublicationHandoff(
+          repositoryProfileKey,
+        );
+        if (!handoff || handoff.commitSha !== commitSha) return null;
+        return bridge.resolveVerifiedCodeReflectionExamples(
+          repositoryProfileKey,
+          handoff,
+        );
+      },
+      resolveLatestVerifiedCodeReflectionExamples: async ({
+        repositoryProfileKey,
+      }) => {
+        const bridge = this.getCodePublicationBridge();
+        if (!bridge) return null;
+        const handoff = await bridge.resolveVerifiedCodePublicationHandoff(
+          repositoryProfileKey,
+        );
+        if (!handoff) return null;
+        return bridge.resolveVerifiedCodeReflectionExamples(
+          repositoryProfileKey,
+          handoff,
+        );
+      },
       getRepositoryProfileKeys: () =>
         Object.keys(this.repositoryProfileRegistry.profiles),
       resolveVerifiedLinearCodeRepositoryBinding: async (issueRecord) =>
@@ -15099,6 +15966,20 @@ function isQueuedCodePreparedActionAllowed(input: {
 function nextMonotonicIso(...previous: string[]): string {
   const minimum = Math.max(...previous.map((value) => Date.parse(value) + 1));
   return new Date(Math.max(Date.now(), minimum)).toISOString();
+}
+
+function isSafeProjectReflectionPath(path: string): boolean {
+  return (
+    path === path.trim() &&
+    path.length > 0 &&
+    path.length <= 500 &&
+    !path.startsWith("/") &&
+    !path.includes("\\") &&
+    !/^[A-Za-z]:/u.test(path) &&
+    !/(^|\/)\.\.?(\/|$)/u.test(path) &&
+    !/^(?:\.obsidian|\.agent-backups)(?:\/|$)/iu.test(path) &&
+    /\.(?:md|ipynb)$/iu.test(path)
+  );
 }
 
 function assertReducerRevision<T extends { revision: number }>(

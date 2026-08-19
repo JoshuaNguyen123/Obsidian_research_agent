@@ -14,7 +14,7 @@ import {
 
 const OBSERVED_AT = "2026-07-16T15:00:00.000Z";
 
-test("TrustedGitHubRepositoryBindingV2 binds exact private readback and excludes volatile observation time from identity", () => {
+test("TrustedGitHubRepositoryBindingV2 keeps stable identity and seals volatile observation time", () => {
   const profile = profileFixture();
   const first = createTrustedGitHubRepositoryBindingV2({
     key: "github-fixture",
@@ -40,7 +40,18 @@ test("TrustedGitHubRepositoryBindingV2 binds exact private readback and excludes
   });
   assert.equal(first.visibility, "private");
   assert.equal(first.fingerprint, later.fingerprint);
+  assert.notEqual(
+    first.visibilityAttestationFingerprint,
+    later.visibilityAttestationFingerprint,
+  );
   assert.deepEqual(parseTrustedGitHubRepositoryBindingV2(first), first);
+  assert.throws(
+    () => parseTrustedGitHubRepositoryBindingV2({
+      ...first,
+      observedAt: later.observedAt,
+    }),
+    /visibility attestation/iu,
+  );
   assert.throws(() => createTrustedGitHubRepositoryBindingV2({
     key: "github-fixture",
     profile,

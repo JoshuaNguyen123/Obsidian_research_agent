@@ -44,6 +44,10 @@ import {
   type EphemeralGitAskpassBrokerV1,
   type VerifiedGitCommandRunnerV1,
 } from "../../../src/integrations/github/VerifiedGitPushGateway";
+import {
+  upgradeTrustedGitHubRepositoryBindingV1ToV2,
+} from "../../../src/integrations/github/TrustedGitHubRepositoryBindingV2";
+import type { TrustedGitHubRepositoryBindingV1 } from "../../../src/integrations/github/TrustedGitHubRepositoryBindingV1";
 import { createPendingExternalActionStateV2 } from "../../../src/integrations/PendingExternalActionStateV2";
 import type { HttpTransport } from "../../../src/model/types";
 import type {
@@ -154,12 +158,22 @@ export async function prepareBackgroundGitHubProviderDependencyFactoryV1(
       remoteHeads: {
         read: (input) => scoped.readRemoteHead(input, input.signal),
       },
+      privateRepositoryBindings: {
+        verify: (binding, signal) =>
+          scoped.readPrivateRepositoryBinding(binding, signal),
+      },
       workflows: {
         create: async (input) => {
           assertSameAction(action, input.package.action);
           let checkpoint = await checkpoints.get(action.payload.publicationId);
           if (!checkpoint) checkpoint = await checkpoints.upsert(input.package.localPlan.checkpoint);
-          const push = createWorkflowPushPort(action, input.package, pushGateway, now);
+          const push = createWorkflowPushPort(
+            action,
+            input.package,
+            pushGateway,
+            scoped,
+            now,
+          );
           return {
             workflow: new GitHubPublicationWorkflowV1({
               push,
@@ -201,6 +215,34 @@ class ActionScopedGitHubProviderV1 implements GitHubPublicationProviderPortV1 {
 
   verifyAccount(signal?: AbortSignal) {
     return this.withPinnedClient(signal, async (_client, _secret, account) => account);
+  }
+
+  readPrivateRepositoryBinding(
+    binding: TrustedGitHubRepositoryBindingV1,
+    signal?: AbortSignal,
+  ) {
+    if (
+      binding.fingerprint !==
+        this.options.action.binding.repositoryBindingFingerprint ||
+      binding.verifiedAccountId !==
+        this.options.action.binding.verifiedAccountId ||
+      binding.verifiedAccountLogin !==
+        this.options.action.binding.verifiedAccountLogin
+    ) {
+      throw boundary(
+        "repository_drift",
+        "Private repository evidence was requested for a different trusted binding.",
+      );
+    }
+    return this.withPinnedClient(
+      signal,
+      async (_client, _secret, _account, repositoryReadback) =>
+        upgradeTrustedGitHubRepositoryBindingV1ToV2({
+          binding,
+          repositoryReadback,
+          observedAt: this.options.now().toISOString(),
+        }),
+    );
   }
 
   readRemoteHead(
@@ -697,6 +739,7 @@ function createWorkflowPushPort(
   action: PreparedBackgroundGitHubActionV1,
   preparedPackage: PreparedBackgroundGitHubPackageV1,
   gateway: VerifiedGitPushGatewayV1,
+  scoped: ActionScopedGitHubProviderV1,
   now: () => Date,
 ): GitHubPublicationPushPortV1 {
   const execute = async (reconcile: boolean, input: Parameters<GitHubPublicationPushPortV1["publish"]>[0]) => {
@@ -704,9 +747,16 @@ function createWorkflowPushPort(
     if (!handoff || input.handoff.handoffFingerprint !== handoff.fingerprint || input.approvalFingerprint !== action.preparedActionFingerprint) {
       throw boundary("provider_contract_rejected", "Workflow push drifted from the verified package handoff.");
     }
+    const privateRepositoryBinding =
+      await scoped.readPrivateRepositoryBinding(
+        preparedPackage.localPlan.repositoryBinding,
+        input.signal,
+      );
     const request = {
       handoff,
       binding: preparedPackage.localPlan.repositoryBinding,
+      privateRepositoryBinding,
+      expectedVisibility: "private" as const,
       profile: {
         repositoryProfileKey: preparedPackage.localPlan.repositoryProof.repositoryProfileKey,
         repositoryProfileFingerprint: preparedPackage.localPlan.repositoryProof.repositoryProfileFingerprint,

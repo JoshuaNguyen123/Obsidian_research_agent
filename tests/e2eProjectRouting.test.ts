@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { extractVerifiedCommitBoundCodeExamplesV1 } from "../e2e/fixtures/reflectionAssertions";
 
 // @ts-ignore The production runner is an intentionally unbundled Node ESM script.
 import { applyE2eAiMode, applyE2eLane, applyE2eProviderDefaults, applyPersistedWindowsSandboxEnvironment, assertExternalCredentialProjectPreconditions, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
+// @ts-ignore The production workflow-audit runner is an intentionally unbundled Node ESM script.
+import { runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
 
 test("no Playwright lane runs against a mocked model", () => {
   const config = readFileSync(
@@ -119,6 +122,201 @@ test("exclusive E2E runner routes the BYOK autonomous journey as real AI", () =>
   });
 });
 
+test("full workflow audit routes independent functions and the joined journey sequentially", async () => {
+  const auditStages = WORKFLOW_AUDIT_STAGES as ReadonlyArray<{
+    id: string;
+    project?: string;
+    realAi: boolean;
+    verifier?: string;
+    testFile?: string;
+  }>;
+  assert.deepEqual(
+    auditStages.map((stage) => ({
+      id: stage.id,
+      project: stage.project,
+      realAi: stage.realAi,
+      verified: Boolean(stage.verifier),
+      testFile: stage.testFile ?? null,
+    })),
+    [
+      {
+        id: "project_ideation_contract",
+        project: undefined,
+        realAi: false,
+        verified: false,
+        testFile: "tests/projectIdeaBriefTool.test.ts",
+      },
+      {
+        id: "natural_developer_mission_routing_contract",
+        project: undefined,
+        realAi: false,
+        verified: false,
+        testFile: "tests/projectLinearProgressHostIntegration.test.ts",
+      },
+      {
+        id: "research",
+        project: "daily-use-research",
+        realAi: true,
+        verified: false,
+        testFile: null,
+      },
+      {
+        id: "linear_ticket_creation",
+        project: "configured-linear-live",
+        realAi: false,
+        verified: false,
+        testFile: null,
+      },
+      {
+        id: "desktop_code_test_execution",
+        project: "desktop-code-delivery-real-live",
+        realAi: true,
+        verified: false,
+        testFile: null,
+      },
+      {
+        id: "private_github_push",
+        project: "github-askpass-runtime-live",
+        realAi: false,
+        verified: false,
+        testFile: null,
+      },
+      {
+        id: "jupyter_reflection_contract",
+        project: undefined,
+        realAi: false,
+        verified: false,
+        testFile: "tests/jupyterReflectionTool.test.ts",
+      },
+      {
+        id: "linked_phase_research_to_note_and_jupyter_reflection",
+        project: "byok-autonomous-journey",
+        realAi: true,
+        verified: true,
+        testFile: null,
+      },
+    ],
+  );
+
+  const headSha = "a".repeat(40);
+  const calls: Array<{ args: string[]; visibility: string | undefined }> = [];
+  const manifests: any[] = [];
+  const result = await runWorkflowAuditE2eV1({
+    platform: "win32",
+    env: {
+      WORKFLOW_AUDIT_LIVE_CONFIRMATION: WORKFLOW_AUDIT_CONFIRMATION,
+      WORKFLOW_AUDIT_EXPECTED_HEAD: headSha,
+      LINEAR_LIVE_TEST_TEAM_ID: "team-disposable",
+      E2E_GITHUB_TOKEN: `ghp_${"x".repeat(24)}`,
+    },
+    gitState: async () => ({ headSha, status: "" }),
+    runChild: async (_command: string, args: string[], options: any) => {
+      calls.push({
+        args: args.map((value) => String(value)),
+        visibility: options?.env?.E2E_GITHUB_VISIBILITY,
+      });
+      return 0;
+    },
+    persistManifest: async (_path: string, manifest: unknown) => {
+      manifests.push(JSON.parse(JSON.stringify(manifest)));
+    },
+    now: () => new Date("2026-08-19T12:00:00.000Z"),
+  });
+  assert.equal(result.status, "passed");
+  assert.equal(result.headSha, headSha);
+  assert.deepEqual(
+    calls.flatMap((call) => {
+      const project = call.args.find((argument) =>
+        argument.startsWith("--project="),
+      );
+      return project ? [project] : [];
+    }),
+    auditStages
+      .filter((stage) => stage.project)
+      .map((stage) => `--project=${stage.project}`),
+  );
+  assert.deepEqual(calls[0]?.args.slice(0, 3), ["--import", "tsx", "--test"]);
+  assert.equal(calls[0]?.args[3], "tests/projectIdeaBriefTool.test.ts");
+  assert.deepEqual(calls[1]?.args.slice(0, 3), ["--import", "tsx", "--test"]);
+  assert.equal(
+    calls[1]?.args[3],
+    "tests/projectLinearProgressHostIntegration.test.ts",
+  );
+  assert.deepEqual(calls[6]?.args.slice(0, 3), ["--import", "tsx", "--test"]);
+  assert.equal(calls[6]?.args[3], "tests/jupyterReflectionTool.test.ts");
+  assert.equal(calls.length, 9, "the linked phase lane must run its verifier last");
+  assert.equal(calls[8]?.args.some((arg) =>
+    arg.endsWith("verify-byok-autonomous-journey.mjs")
+  ), true);
+  assert.equal(calls.every((call) => call.visibility === "private"), true);
+  assert.equal(manifests.at(-1)?.status, "passed");
+  assert.equal(manifests.at(-1)?.stages?.length, 8);
+});
+
+test("full workflow audit fails before mutation without exact clean-head authority", () => {
+  assert.throws(
+    () => validateWorkflowAuditEnvironmentV1({}, "win32"),
+    /WORKFLOW_AUDIT_LIVE_CONFIRMATION/u,
+  );
+  assert.throws(
+    () =>
+      validateWorkflowAuditEnvironmentV1(
+        {
+          WORKFLOW_AUDIT_LIVE_CONFIRMATION: WORKFLOW_AUDIT_CONFIRMATION,
+          WORKFLOW_AUDIT_EXPECTED_HEAD: "a".repeat(40),
+          LINEAR_LIVE_TEST_TEAM_ID: "team-disposable",
+          E2E_GITHUB_TOKEN: `ghp_${"x".repeat(24)}`,
+          E2E_GITHUB_VISIBILITY: "public",
+        },
+        "win32",
+      ),
+    /private-GitHub-only/u,
+  );
+});
+
+test("reflection proof parser rejects links or markers without bounded commit code", () => {
+  assert.deepEqual(
+    extractVerifiedCommitBoundCodeExamplesV1(
+      "## Agent project reflection\n\nhttps://linear.app/x https://github.com/x/y/pull/1\n",
+    ),
+    [],
+  );
+  const note = [
+    "## Agent project reflection",
+    "",
+    "Research became tested code.",
+    "",
+    "### Verified code example",
+    `\`src/add.ts\` lines 1-2 at commit \`aaaaaaaaaaaa\` (file hash \`bbbbbbbbbbbb\`; excerpt hash \`sha256:${"c".repeat(64)}\`).`,
+    "```typescript",
+    "export function add(left: number, right: number) {",
+    "  return left + right;",
+    "```",
+  ].join("\n");
+  assert.deepEqual(extractVerifiedCommitBoundCodeExamplesV1(note), [
+    {
+      path: "src/add.ts",
+      startLine: 1,
+      endLine: 2,
+      commitPrefix: "aaaaaaaaaaaa",
+      artifactSha256Prefix: "bbbbbbbbbbbb",
+      codeSha256: `sha256:${"c".repeat(64)}`,
+      language: "typescript",
+      code: [
+        "export function add(left: number, right: number) {",
+        "  return left + right;",
+      ].join("\n"),
+    },
+  ]);
+  assert.throws(
+    () =>
+      extractVerifiedCommitBoundCodeExamplesV1(
+        note.replace("lines 1-2", "lines 1-21"),
+      ),
+    /1-20 lines/u,
+  );
+});
+
 test("BYOK autonomous journey requires its Linear cleanup scope before boot", () => {
   assert.throws(
     () =>
@@ -175,6 +373,12 @@ test("BYOK autonomous journey proves one root publication and cleans every owned
   assert.match(spec, /publicationReceipts\[0\]\?\.runId/u);
   assert.match(spec, /maxContinuations: 4/u);
   assert.match(spec, /buildByokPhaseAResearchPrompt/u);
+  assert.match(spec, /append_jupyter_reflection/u);
+  assert.match(spec, /verified_code_example/u);
+  assert.match(spec, /execution_count\)\.toBeNull\(\)/u);
+  assert.match(spec, /cell\.outputs\)\.toEqual\(\[\]\)/u);
+  assert.match(spec, /reconcileJupyterAfterRestart/u);
+  assert.match(spec, /notebookAfterReconciliation\)\.toBe\(finalNotebookViaFilesystem\)/u);
   assert.match(spec, /hasExplicitResearchPublicationIntent\(phaseAPrompt\)/u);
   assert.match(
     spec,
@@ -570,6 +774,10 @@ test("package commands route only to real lanes and live projects disable reruns
     packageJson.scripts["test:e2e:hello-github"],
     /--real-ai --project=obsidian-hello-github-live/u,
   );
+  assert.equal(
+    packageJson.scripts["test:e2e:workflow-audit"],
+    "node scripts/run-workflow-audit-e2e.mjs",
+  );
   // test:e2e:journeys was removed: passing six --project flags made
   // E2E_PLAYWRIGHT_LANE a comma-joined string, so exact-equality lane guards
   // skipped themselves and the pack reported success having run almost
@@ -804,7 +1012,7 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   );
   assert.match(realHarness, /durablyCompletedLifecycleTools\.includes/u);
   const approvalPoll = realHarness.indexOf(
-    "approveFirstVisiblePreparedAction(page)",
+    "approveFirstVisiblePreparedAction(page",
   );
   const durableRestartRead = realHarness.indexOf(
     "plugin?.getDurableMissionRestartReadiness?.()",

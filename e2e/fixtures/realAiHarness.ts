@@ -83,6 +83,13 @@ export type ProjectLifecycleStageName =
 
 export interface CompoundMissionApprovalOptions {
   maxContinuations?: number;
+  /** Fail closed instead of clicking an unexpected prepared mutation. */
+  allowedApprovalToolNames?: readonly string[];
+  /** GitHub repository creation must visibly name private visibility. */
+  requirePrivateRepositoryApproval?: boolean;
+  /** Every clicked request must carry a matching prepared-action fingerprint. */
+  requireExactPreparedActionApproval?: boolean;
+  onApproval?: (approval: E2EPreparedApprovalObservationV1) => void;
   /** Redacted harness counters retained even when the mission fails mid-loop. */
   onProgress?: (counters: {
     approvals: number;
@@ -92,6 +99,14 @@ export interface CompoundMissionApprovalOptions {
   /** Restart the production plugin immediately after selected durable stage commits. */
   restartAfterProjectStages?: readonly ProjectLifecycleStageName[];
   onStageRestarted?: (stage: ProjectLifecycleStageName) => Promise<void>;
+}
+
+export interface E2EPreparedApprovalObservationV1 {
+  toolName: string;
+  requestId: string;
+  preparedActionId: string | null;
+  payloadFingerprint: string | null;
+  visibility: string | null;
 }
 
 export interface RealAiHarnessNativeOptions {
@@ -1081,13 +1096,13 @@ async function approveUntilMissionComplete(
         `Obsidian page closed while waiting for mission completion; approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
       );
     }
-    if (
-      await raceRendererResponsive(
-        approveFirstVisiblePreparedAction(page),
-        "prepared-approval",
-      )
-    ) {
+    const preparedApproval = await raceRendererResponsive(
+      approveFirstVisiblePreparedAction(page, options),
+      "prepared-approval",
+    );
+    if (preparedApproval) {
       approvals += 1;
+      options.onApproval?.(preparedApproval);
       options.onProgress?.(progress());
       await safePageWait(page, 100, "post-approval settle");
       continue;
@@ -1304,9 +1319,10 @@ async function approveUntilMissionComplete(
       continue;
     }
     if (ui.hasEnabledApproval) {
-      const clicked = await approveFirstVisiblePreparedAction(page);
+      const clicked = await approveFirstVisiblePreparedAction(page, options);
       if (clicked) {
         approvals += 1;
+        options.onApproval?.(clicked);
         options.onProgress?.(progress());
       }
       await safePageWait(page, 100, "post-approval settle");
@@ -1654,7 +1670,15 @@ async function approveUntilMissionComplete(
   }
 }
 
-async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
+async function approveFirstVisiblePreparedAction(
+  page: Page,
+  policy: Pick<
+    CompoundMissionApprovalOptions,
+    | "allowedApprovalToolNames"
+    | "requirePrivateRepositoryApproval"
+    | "requireExactPreparedActionApproval"
+  > = {},
+): Promise<E2EPreparedApprovalObservationV1 | null> {
   // Click Approve in-place via DOM — no tab switching. Prefer Chat Soft→Bound
   // Approve, then any Run Details approve card (including when Details is hidden).
   if (page.isClosed()) {
@@ -1663,7 +1687,7 @@ async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
     );
   }
   try {
-    return await page.evaluate(() => {
+    return await page.evaluate(({ pluginId, allowedToolNames, requirePrivateRepository, requireExactPreparedAction }) => {
       const buttons = Array.from(
         document.querySelectorAll<HTMLButtonElement>(
           "button[data-testid='chat-approval-approve']:not(:disabled):not([data-e2e-approval-scheduled]), button.agentic-researcher-approval-approve:not(:disabled):not([data-e2e-approval-scheduled])",
@@ -1676,7 +1700,71 @@ async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
         chat ??
         buttons.find((candidate) => candidate.getClientRects().length > 0) ??
         buttons.at(-1);
-      if (!button) return false;
+      if (!button) return null;
+      const chatAttention = button.closest(
+        ".agentic-researcher-chat-attention",
+      );
+      const detailCard = button.closest(
+        ".agentic-researcher-approval-card",
+      );
+      const renderedTitle = String(
+        chatAttention
+          ?.querySelector(".agentic-researcher-chat-attention-title")
+          ?.textContent ??
+          detailCard
+            ?.querySelector(".agentic-researcher-approval-title")
+            ?.textContent ??
+          "",
+      ).trim();
+      const chatTool = renderedTitle.match(/^Approval needed:\s*(\S+)$/u)?.[1];
+      const detailTool = renderedTitle.match(/^([^:\s]+):/u)?.[1];
+      const toolName = chatTool ?? detailTool ?? "";
+      if (allowedToolNames.length > 0 && !allowedToolNames.includes(toolName)) {
+        throw new Error(
+          `E2E refused unexpected prepared approval tool ${toolName || "unknown"}; title=${JSON.stringify(renderedTitle)}.`,
+        );
+      }
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      const pending = plugin?.approvalBroker?.getPending?.() ?? [];
+      const matching = pending.filter(
+        (request: any) => String(request?.toolName ?? "") === toolName,
+      );
+      if (allowedToolNames.length > 0 && matching.length !== 1) {
+        throw new Error(
+          `E2E requires one exact pending approval for ${toolName}; observed ${matching.length}.`,
+        );
+      }
+      const request = matching[0] ?? null;
+      const prepared = request?.preparedAction ?? null;
+      const payloadFingerprint = String(
+        request?.payloadFingerprint ?? prepared?.payloadFingerprint ?? "",
+      );
+      if (
+        requireExactPreparedAction &&
+        (!prepared ||
+          prepared.toolName !== toolName ||
+          prepared.runId !== request?.runId ||
+          !/^sha256:[a-f0-9]{64}$/u.test(payloadFingerprint) ||
+          prepared.payloadFingerprint !== payloadFingerprint)
+      ) {
+        throw new Error(
+          `E2E refused ${toolName || "unknown"} without an exact prepared-action fingerprint.`,
+        );
+      }
+      const visibility = String(
+        prepared?.normalizedArgs?.visibility ??
+          (prepared?.normalizedArgs?.private === true ? "private" : ""),
+      ).toLowerCase();
+      if (
+        requirePrivateRepository &&
+        toolName === "github_create_repository" &&
+        visibility !== "private"
+      ) {
+        throw new Error(
+          `E2E refused GitHub repository approval without exact private visibility: ${JSON.stringify(visibility)}.`,
+        );
+      }
       // Dispatch on the next renderer turn so Runtime.evaluate can return
       // before the host approval handler starts a long code/tool action. A
       // synchronous button.click() can keep the CDP request outstanding for
@@ -1696,7 +1784,20 @@ async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
           action.disabled = true;
         }
       }, 0);
-      return true;
+      return {
+        toolName,
+        requestId: String(request?.id ?? ""),
+        preparedActionId: prepared ? String(prepared.id ?? "") : null,
+        payloadFingerprint: payloadFingerprint || null,
+        visibility: visibility || null,
+      };
+    }, {
+      pluginId: NATIVE_CORE_PLUGIN_ID,
+      allowedToolNames: [...(policy.allowedApprovalToolNames ?? [])],
+      requirePrivateRepository:
+        policy.requirePrivateRepositoryApproval === true,
+      requireExactPreparedAction:
+        policy.requireExactPreparedActionApproval === true,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

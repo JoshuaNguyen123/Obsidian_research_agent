@@ -59,8 +59,9 @@ export default defineConfig({
   },
   projects: [
     {
-      // Default product-health proof: exact reported prompt, production model,
-      // native Obsidian writes, semantic artifact QA, and atomic acceptance.
+      // Default product-health proof: reported mission plus a run-owned artifact
+      // destination, production model, native Obsidian writes, semantic
+      // artifact QA, and atomic acceptance.
       name: "core-native",
       testMatch: /core-native\.spec\.ts/u,
       retries: 0,

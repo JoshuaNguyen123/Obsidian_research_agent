@@ -562,15 +562,11 @@ test("green fast validation skips the conditional repair checkpoint", async () =
   assert.deepEqual(
     getMissionCompositeLifecycleStateV1(afterFast.nodes[fast.nodeId]),
     {
-      actionCursor: 3,
-      completedActionIds: [
-        "action-001-code_workspace_create",
-        "action-002-code_validate_fast",
-      ],
-      skippedActionIds: ["action-003-code_repair_record_cycle"],
+      actionCursor: 2,
+      completedActionIds: ["action-001-code_validate_fast"],
+      skippedActionIds: ["action-002-code_repair_record_cycle"],
       actionAttemptCounts: {
-        "action-001-code_workspace_create": 1,
-        "action-002-code_validate_fast": 1,
+        "action-001-code_validate_fast": 1,
       },
     },
   );
@@ -1178,27 +1174,23 @@ test("red full validation recovery repeats targeted validation after a correctio
     },
   );
   assert.equal(recovery.scheduled, true);
-  const recoveryFast = Object.values(recovery.graph.nodes).find((candidate) =>
-    candidate.id.startsWith("validation-recovery-fast-"),
+  const recoveryStage = Object.values(recovery.graph.nodes).find(
+    (candidate) => candidate.id.startsWith("validation-recovery-stage-"),
   );
-  const recoveryRepair = Object.values(recovery.graph.nodes).find((candidate) =>
-    candidate.id.startsWith("validation-recovery-record-"),
+  assert.ok(recoveryStage);
+  assert.equal(recoveryStage.status, "queued");
+  assert.equal(
+    getCurrentMissionCompositeLifecycleActionV1(recoveryStage)?.toolName,
+    "code_validate_fast",
   );
-  const recoveryTargeted = Object.values(recovery.graph.nodes).find(
-    (candidate) =>
-      candidate.id.startsWith("validation-recovery-targeted-"),
+  assert.equal(
+    recovery.graph.nodes[fullExecution.nodeId]?.status,
+    "blocked",
   );
-  assert.ok(recoveryFast);
-  assert.ok(recoveryRepair);
-  assert.ok(recoveryTargeted);
-  assert.equal(recoveryFast.status, "queued");
-  assert.equal(recoveryRepair.status, "queued");
-  assert.equal(recoveryTargeted.status, "queued");
-  assert.ok(recoveryTargeted.dependencyIds.includes(recoveryRepair.id));
-  assert.ok(
-    recovery.graph.nodes[fullExecution.nodeId]?.dependencyIds.includes(
-      recoveryTargeted.id,
-    ),
+  assert.equal(
+    (await session.beginToolExecution("code_validate_fast")).ok,
+    false,
+    "the repeated closed validation stage stays gated on a correction receipt",
   );
   const correction = await session.recordValidationRecoveryCorrection({
     toolName: "code_workspace_patch",
@@ -1209,12 +1201,35 @@ test("red full validation recovery repeats targeted validation after a correctio
     observedAt: harness.nextTimestamp(),
   });
   assert.equal(correction.recorded, true);
-  assert.equal(correction.graph.nodes[recoveryFast.id]?.status, "ready");
+  assert.equal(correction.graph.nodes[recoveryStage.id]?.status, "ready");
   assert.equal(
     correction.graph.capabilityEnvelope.fingerprint,
     envelopeFingerprint,
   );
   assert.doesNotThrow(() => validateMissionGraphV3(correction.graph));
+
+  for (const [toolName, character] of [
+    ["code_validate_fast", "a"],
+    ["code_repair_record_cycle", "b"],
+    ["code_validate_targeted", "c"],
+    ["code_validate_full", "d"],
+  ] as const) {
+    await complete(toolName, character);
+  }
+  assert.equal(session.graph.nodes[recoveryStage.id]?.status, "complete");
+  assert.equal(session.graph.nodes[fullExecution.nodeId]?.status, "complete");
+  assert.equal(session.graph.nodes.final?.status, "ready");
+  assert.equal(
+    getMissionCompositeLifecycleStateV1(
+      session.graph.nodes[fullExecution.nodeId]!,
+    )?.actionCursor,
+    4,
+  );
+  assert.equal(
+    session.graph.capabilityEnvelope.fingerprint,
+    envelopeFingerprint,
+  );
+  assert.doesNotThrow(() => validateMissionGraphV3(session.graph));
 });
 
 test("concurrent mutation starts serialize through the graph frontier and one exclusive lock", async () => {
@@ -1669,7 +1684,7 @@ test("a composite code lifecycle resumes after bounded create collision repair",
   );
   assert.equal(
     getCurrentMissionCompositeLifecycleActionV1(lifecycleNode)?.toolName,
-    "code_validate_fast",
+    "code_workspace_export_directory",
   );
   assert.doesNotThrow(() => validateMissionGraphV3(repaired));
 });

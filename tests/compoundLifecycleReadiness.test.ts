@@ -107,6 +107,6 @@ test("stage strip marks the active stage", () => {
       ["accepted_research", "linear_hierarchy", "code_execution"],
       "linear_hierarchy",
     ),
-    "Research → [Linear] → Code",
+    "Research → [Linear] → Implement",
   );
 });

@@ -30,9 +30,13 @@ const STAGE_OBJECTIVES: Readonly<Record<ProjectLifecycleStageV1, string>> = {
   linear_hierarchy:
     "Establish or verify the Linear hierarchy needed for unpaid delivery proof.",
   code_execution:
-    "Advance unpaid code proof: sandbox ready → workspace edit → validate/repair → verified commit.",
+    "Implement the accepted Linear work in the bound workspace and preserve exact changed-file receipts.",
+  code_validation:
+    "Run fast, targeted, and full validation; repair only from verified diagnostics, then create the verified commit.",
   private_github_publication:
     "Ask whether the exact GitHub repository is public or private, then publish the verified workspace as a draft PR.",
+  reflection:
+    "Write the host-grounded project Results report with phase outcomes, validation, commit/PR links, limitations, and verified code examples.",
   reconciliation_cleanup:
     "Trash only exact disposable Linear/GitHub targets and prove provider absence.",
 };

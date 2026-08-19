@@ -1,4 +1,9 @@
-import type { ActionReceipt, PreparedAction, ResourceRef } from "../../agent/actions";
+import {
+  verifyPreparedActionFingerprint,
+  type ActionReceipt,
+  type PreparedAction,
+  type ResourceRef,
+} from "../../agent/actions";
 import type { AuthorityGrantV1 } from "../../agent/authority";
 import type { ToolExecutionContext } from "../../tools/types";
 import {
@@ -17,9 +22,12 @@ import {
 import type { LinearToolClient } from "./LinearTools";
 import { listAllLinearPages } from "./linearPagination";
 import {
+  assertExactKeys,
   DurableLinearContractError,
   expectIsoTimestamp,
+  expectPlainRecord,
   expectSha256,
+  expectString,
   fingerprintContract,
 } from "./LinearContractSupport";
 import { matchAssociatedLinearProject } from "./linearProjectAssociation";
@@ -114,6 +122,7 @@ export class ResearchProjectHierarchyCheckpointStoreV1
   async persist(checkpoint: ResearchProjectHierarchyCheckpointV1): Promise<void> {
     const operation = this.mutationTail.then(async () => {
       const normalized = parseResearchProjectHierarchyCheckpointV1(checkpoint);
+      await assertHierarchyPreparedActionsSelfVerify(normalized);
       const current = parseResearchProjectHierarchyCheckpointNamespaceV1(
         await this.persistence.read(),
       );
@@ -183,10 +192,20 @@ export function parseResearchProjectHierarchyCheckpointNamespaceV1(
 export function parseResearchProjectHierarchyCheckpointV1(
   value: unknown,
 ): ResearchProjectHierarchyCheckpointV1 {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new DurableLinearContractError("Research project hierarchy checkpoint must be an object.");
-  }
-  const record = value as ResearchProjectHierarchyCheckpointV1;
+  const rawRecord = expectPlainRecord(
+    value,
+    "research project hierarchy checkpoint",
+  );
+  assertExactKeys(
+    rawRecord,
+    [
+      "version", "planFingerprint", "status", "approvalFingerprint",
+      "approvalId", "grantId", "items", "updatedAt",
+    ],
+    [],
+    "research project hierarchy checkpoint",
+  );
+  const record = rawRecord as unknown as ResearchProjectHierarchyCheckpointV1;
   if (
     record.version !== 1 ||
     !["prepared", "approval_denied", "approved", "partial", "reconcile_required", "complete"].includes(record.status) ||
@@ -199,8 +218,32 @@ export function parseResearchProjectHierarchyCheckpointV1(
   expectSha256(record.planFingerprint, "research project hierarchy plan fingerprint");
   expectSha256(record.approvalFingerprint, "research project hierarchy approval fingerprint");
   expectIsoTimestamp(record.updatedAt, "research project hierarchy checkpoint time");
+  if (
+    (record.approvalId !== null &&
+      (typeof record.approvalId !== "string" || !record.approvalId.trim())) ||
+    (record.grantId !== null &&
+      (typeof record.grantId !== "string" || !record.grantId.trim()))
+  ) {
+    throw new DurableLinearContractError(
+      "Research project hierarchy approval and grant IDs must be non-empty strings or null.",
+    );
+  }
   const keys = new Set<string>();
-  for (const item of record.items) {
+  for (const rawItem of record.items) {
+    const itemRecord = expectPlainRecord(
+      rawItem,
+      "research project hierarchy checkpoint item",
+    );
+    assertExactKeys(
+      itemRecord,
+      [
+        "key", "kind", "status", "toolCallId", "action", "resourceId",
+        "readbackFingerprint", "receipt",
+      ],
+      [],
+      "research project hierarchy checkpoint item",
+    );
+    const item = itemRecord as unknown as ResearchProjectHierarchyCheckpointItemV1;
     if (
       !item ||
       typeof item.key !== "string" ||
@@ -223,8 +266,214 @@ export function parseResearchProjectHierarchyCheckpointV1(
     if (item.status !== "deduplicated" && !item.action) {
       throw new DurableLinearContractError("Non-deduplicated hierarchy items require a prepared action.");
     }
+    if (item.action) {
+      const action = parseHierarchyPreparedActionV1(item.action, item.key);
+      const expectedAction = HIERARCHY_ACTION_CONTRACT[item.kind];
+      if (
+        action.toolCallId !== item.toolCallId ||
+        action.target.id !== item.resourceId ||
+        action.toolName !== expectedAction.toolName ||
+        action.target.system !== "linear" ||
+        action.target.resourceType !== expectedAction.resourceType
+      ) {
+        throw new DurableLinearContractError(
+          `Prepared hierarchy action ${item.key} does not match its checkpoint item identity.`,
+        );
+      }
+    }
   }
   return clone(record)!;
+}
+
+const HIERARCHY_ACTION_CONTRACT: Record<
+  ResearchProjectHierarchyItemKindV1,
+  { toolName: string; resourceType: string }
+> = {
+  initiative: {
+    toolName: "linear_create_initiative",
+    resourceType: "initiative",
+  },
+  project: {
+    toolName: "linear_create_project",
+    resourceType: "project",
+  },
+  initiative_project_link: {
+    toolName: "linear_create_initiative_project_link",
+    resourceType: "initiative_project_link",
+  },
+  issue: {
+    toolName: "linear_create_issue",
+    resourceType: "issue",
+  },
+  issue_relation: {
+    toolName: "linear_create_issue_relation",
+    resourceType: "issue_relation",
+  },
+};
+
+function parseHierarchyPreparedActionV1(
+  value: unknown,
+  itemKey: string,
+): PreparedAction {
+  const label = `prepared hierarchy action ${itemKey}`;
+  const record = expectPlainRecord(value, label);
+  assertExactKeys(
+    record,
+    [
+      "version", "id", "runId", "toolCallId", "toolName", "target",
+      "relatedResources", "normalizedArgs", "preview", "payloadFingerprint",
+      "preparedAt", "expiresAt",
+    ],
+    [
+      "expectedTargetRevision", "idempotencyKey", "reconciliationKey",
+      "requiredConfirmations",
+    ],
+    label,
+  );
+  if (record.version !== 1) {
+    throw new DurableLinearContractError(`${label} version is invalid.`);
+  }
+  for (const key of ["id", "runId", "toolCallId", "toolName"] as const) {
+    expectCanonicalActionString(record[key], `${label} ${key}`, 500);
+  }
+  for (const key of [
+    "expectedTargetRevision",
+    "idempotencyKey",
+    "reconciliationKey",
+  ] as const) {
+    if (record[key] !== undefined) {
+      expectCanonicalActionString(record[key], `${label} ${key}`, 1_000);
+    }
+  }
+  if (
+    record.requiredConfirmations !== undefined &&
+    record.requiredConfirmations !== 1 &&
+    record.requiredConfirmations !== 2
+  ) {
+    throw new DurableLinearContractError(
+      `${label} required confirmations must be 1 or 2.`,
+    );
+  }
+  parseHierarchyActionResourceV1(record.target, `${label} target`);
+  if (!Array.isArray(record.relatedResources)) {
+    throw new DurableLinearContractError(
+      `${label} related resources must be an array.`,
+    );
+  }
+  record.relatedResources.forEach((resource, index) =>
+    parseHierarchyActionResourceV1(
+      resource,
+      `${label} related resource ${index + 1}`,
+    )
+  );
+  expectPlainRecord(record.normalizedArgs, `${label} normalized arguments`);
+  parseHierarchyActionPreviewV1(record.preview, `${label} preview`);
+  expectSha256(record.payloadFingerprint, `${label} payload fingerprint`);
+  expectIsoTimestamp(record.preparedAt, `${label} prepared at`);
+  expectIsoTimestamp(record.expiresAt, `${label} expires at`);
+  try {
+    // Reject undefined, functions, cycles, and all other values that cannot be
+    // represented by the canonical payload fingerprint contract.
+    fingerprintContract(record);
+  } catch (error) {
+    throw new DurableLinearContractError(
+      `${label} is not canonical JSON: ${safeMessage(error)}`,
+    );
+  }
+  return record as unknown as PreparedAction;
+}
+
+function parseHierarchyActionPreviewV1(value: unknown, label: string): void {
+  const record = expectPlainRecord(value, label);
+  assertExactKeys(
+    record,
+    ["summary", "destination", "warnings", "outboundBytes"],
+    ["before", "after", "outboundPayload", "duplicateCandidates"],
+    label,
+  );
+  expectCanonicalActionString(record.summary, `${label} summary`, 20_000);
+  expectCanonicalActionString(
+    record.destination,
+    `${label} destination`,
+    2_000,
+  );
+  if (
+    !Array.isArray(record.warnings) ||
+    record.warnings.some((warning) => typeof warning !== "string")
+  ) {
+    throw new DurableLinearContractError(`${label} warnings are invalid.`);
+  }
+  if (
+    !Number.isInteger(record.outboundBytes) ||
+    (record.outboundBytes as number) < 0
+  ) {
+    throw new DurableLinearContractError(
+      `${label} outbound bytes must be a non-negative integer.`,
+    );
+  }
+  for (const key of ["before", "after", "outboundPayload"] as const) {
+    if (record[key] !== undefined) {
+      expectPlainRecord(record[key], `${label} ${key}`);
+    }
+  }
+  if (record.duplicateCandidates !== undefined) {
+    if (!Array.isArray(record.duplicateCandidates)) {
+      throw new DurableLinearContractError(
+        `${label} duplicate candidates must be an array.`,
+      );
+    }
+    record.duplicateCandidates.forEach((resource, index) =>
+      parseHierarchyActionResourceV1(
+        resource,
+        `${label} duplicate candidate ${index + 1}`,
+      )
+    );
+  }
+}
+
+function parseHierarchyActionResourceV1(value: unknown, label: string): void {
+  const record = expectPlainRecord(value, label);
+  assertExactKeys(
+    record,
+    ["system", "resourceType", "id"],
+    [
+      "identifier", "url", "path", "accountId", "containerId",
+      "workspaceId", "teamId", "projectId", "repositoryId",
+      "repositoryProfileId", "revision",
+    ],
+    label,
+  );
+  expectCanonicalActionString(record.system, `${label} system`, 50);
+  expectCanonicalActionString(
+    record.resourceType,
+    `${label} resource type`,
+    200,
+  );
+  expectCanonicalActionString(record.id, `${label} id`, 1_000);
+  for (const key of [
+    "identifier", "url", "path", "accountId", "containerId",
+    "workspaceId", "teamId", "projectId", "repositoryId",
+    "repositoryProfileId", "revision",
+  ] as const) {
+    if (record[key] !== undefined) {
+      expectCanonicalActionString(record[key], `${label} ${key}`, 4_000);
+    }
+  }
+}
+
+function expectCanonicalActionString(
+  value: unknown,
+  label: string,
+  maximum: number,
+): void {
+  const normalized = expectString(value, label, 1, maximum, {
+    secretFree: false,
+  });
+  if (normalized !== value) {
+    throw new DurableLinearContractError(
+      `${label} must already be in canonical trimmed form.`,
+    );
+  }
 }
 
 export interface ResearchProjectHierarchyApprovalRequestV1 {
@@ -241,7 +490,19 @@ export interface ResearchProjectHierarchyApprovalRequestV1 {
     kind: ResearchProjectHierarchyItemKindV1;
     resourceId: string;
     readbackFingerprint: string;
+    snapshot: ResearchProjectHierarchyApprovalSnapshotV1;
   }>;
+}
+
+export interface ResearchProjectHierarchyApprovalSnapshotV1 {
+  resourceType: string;
+  name: string | null;
+  title: string | null;
+  description: string | null;
+  relationType: string | null;
+  teamIds: string[];
+  projectIds: string[];
+  relationEndpoints: Record<string, string>;
 }
 
 export type ResearchProjectHierarchyApprovalDecisionV1 =
@@ -349,6 +610,20 @@ export class ResearchProjectHierarchyWorkflowV1 {
     }
 
     let checkpoint = await this.options.checkpoints.get(plan.fingerprint);
+    if (checkpoint) {
+      try {
+        checkpoint = parseResearchProjectHierarchyCheckpointV1(checkpoint);
+        await assertHierarchyCheckpointApprovalIntegrity(plan, checkpoint);
+      } catch (error) {
+        return rejected(
+          plan,
+          checkpoint,
+          "linear_hierarchy_checkpoint_invalid",
+          safeMessage(error),
+          "reconcile_required",
+        );
+      }
+    }
     if (checkpoint?.status === "complete") {
       try {
         checkpoint = await this.reverifyCommittedCheckpoint(plan, checkpoint, request.context);
@@ -357,7 +632,16 @@ export class ResearchProjectHierarchyWorkflowV1 {
         await this.persistCheckpointReceipts(checkpoint, receipt);
         return completeResult(plan, checkpoint, receipt);
       } catch (error) {
-        return rejected(plan, checkpoint, "linear_hierarchy_resume_readback_failed", safeMessage(error));
+        const drifted = error instanceof ResearchProjectHierarchyDriftError;
+        return rejected(
+          plan,
+          checkpoint,
+          drifted
+            ? "linear_hierarchy_resume_drift"
+            : "linear_hierarchy_resume_readback_failed",
+          safeMessage(error),
+          drifted ? "reconcile_required" : "rejected",
+        );
       }
     }
 
@@ -421,6 +705,33 @@ export class ResearchProjectHierarchyWorkflowV1 {
       };
       // Required crash boundary: no mutation occurs before this resolves.
       await this.options.checkpoints.persist(checkpoint);
+      try {
+        await assertHierarchyCheckpointApprovalIntegrity(plan, checkpoint);
+      } catch (error) {
+        return rejected(
+          plan,
+          checkpoint,
+          "linear_hierarchy_checkpoint_invalid",
+          safeMessage(error),
+          "reconcile_required",
+        );
+      }
+    }
+
+    // A checkpoint can already contain provider-owned dependencies: exact
+    // duplicates discovered during preparation and committed children from a
+    // partial attempt. Verify every one before approval is requested or any
+    // later child can mutate Linear. This is intentionally also run again
+    // after approval, because a human approval wait is an unbounded race
+    // window with provider state.
+    try {
+      checkpoint = await this.reverifyStableCheckpointDependencies(
+        checkpoint,
+        request.context,
+      );
+      await this.options.checkpoints.persist(checkpoint);
+    } catch (error) {
+      return hierarchyDependencyDriftResult(plan, checkpoint, error);
     }
 
     // A prior attempt may have committed a provider mutation and its readback
@@ -428,11 +739,35 @@ export class ResearchProjectHierarchyWorkflowV1 {
     // idempotent ledger from the authoritative checkpoint before proceeding.
     await this.persistCheckpointReceipts(checkpoint);
 
+    // This is the last boundary before a persisted grouped grant can be
+    // resolved or a new approval can be requested. Rebind the full immutable
+    // action set to its original plan+items fingerprint.
+    try {
+      await assertHierarchyCheckpointApprovalIntegrity(plan, checkpoint);
+    } catch (error) {
+      return rejected(
+        plan,
+        checkpoint,
+        "linear_hierarchy_checkpoint_invalid",
+        safeMessage(error),
+        "reconcile_required",
+      );
+    }
+
     let grant: AuthorityGrantV1 | null = null;
     if (checkpoint.grantId && this.options.approval.resolvePersistedGrant) {
       grant = await this.options.approval.resolvePersistedGrant(checkpoint.grantId);
     }
     if (!grant) {
+      let deduplicatedResources: ResearchProjectHierarchyApprovalRequestV1["deduplicatedResources"];
+      try {
+        deduplicatedResources = await this.readDeduplicatedApprovalResources(
+          checkpoint,
+          request.context,
+        );
+      } catch (error) {
+        return hierarchyDependencyDriftResult(plan, checkpoint, error);
+      }
       const decision = await this.options.approval.requestExactGroupedApproval({
         kind: "linear_research_project_hierarchy",
         runId: request.runId,
@@ -442,16 +777,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
         workspaceId: plan.destination.workspaceId,
         teamId: plan.destination.teamId,
         preparedActions: checkpoint.items.flatMap((item) => item.action ? [item.action] : []),
-        deduplicatedResources: checkpoint.items.flatMap((item) =>
-          item.status === "deduplicated" && item.readbackFingerprint
-            ? [{
-                key: item.key,
-                kind: item.kind,
-                resourceId: item.resourceId,
-                readbackFingerprint: item.readbackFingerprint,
-              }]
-            : [],
-        ),
+        deduplicatedResources,
       });
       if (!decision.approved) {
         checkpoint = { ...checkpoint, status: "approval_denied", updatedAt: this.now().toISOString() };
@@ -472,9 +798,46 @@ export class ResearchProjectHierarchyWorkflowV1 {
       await this.options.checkpoints.persist(checkpoint);
     }
 
+    try {
+      checkpoint = await this.reverifyStableCheckpointDependencies(
+        checkpoint,
+        request.context,
+      );
+      await this.options.checkpoints.persist(checkpoint);
+    } catch (error) {
+      return hierarchyDependencyDriftResult(plan, checkpoint, error);
+    }
+
     for (let index = 0; index < checkpoint.items.length; index += 1) {
-      const item: ResearchProjectHierarchyCheckpointItemV1 = checkpoint.items[index]!;
-      if (item.status === "committed" || item.status === "deduplicated") continue;
+      const currentItem = checkpoint.items[index]!;
+      if (
+        currentItem.status === "committed" ||
+        currentItem.status === "deduplicated"
+      ) continue;
+      // Recheck the exact stable prefix immediately before every new child
+      // dispatch. A sibling mutation must never proceed after an earlier
+      // committed/deduplicated provider dependency has drifted.
+      try {
+        checkpoint = await this.reverifyStableCheckpointDependencies(
+          checkpoint,
+          request.context,
+        );
+      } catch (error) {
+        return hierarchyDependencyDriftResult(plan, checkpoint, error);
+      }
+      try {
+        await assertHierarchyCheckpointApprovalIntegrity(plan, checkpoint);
+      } catch (error) {
+        return rejected(
+          plan,
+          checkpoint,
+          "linear_hierarchy_checkpoint_invalid",
+          safeMessage(error),
+          "reconcile_required",
+        );
+      }
+      const item: ResearchProjectHierarchyCheckpointItemV1 =
+        checkpoint.items[index]!;
       if (!item.action) {
         return rejected(plan, checkpoint, "linear_hierarchy_checkpoint_invalid", `Prepared hierarchy item ${item.key} lost its action.`);
       }
@@ -750,11 +1113,40 @@ export class ResearchProjectHierarchyWorkflowV1 {
     context: ToolExecutionContext,
   ): Promise<Map<string, LinearBaseRecord>> {
     const result = new Map<string, LinearBaseRecord>();
-    const catalogs = await Promise.all([
+    const [initiatives, projects, issues] = await Promise.all([
       this.list("initiatives.list", context),
       this.list("projects.list", context),
       this.list("issues.list", context),
     ]);
+    const projectMatches = projects.filter((record) => {
+      if (record.resourceType !== "project") return false;
+      // A provider-global project catalog can contain identical names and
+      // descriptions in another team. Positive destination-team evidence is
+      // mandatory for every reuse path, including exact content.
+      if (!recordTeamIds(record).includes(plan.destination.teamId)) return false;
+      const exactContent =
+        record.name === plan.project.title &&
+        record.content === plan.project.description;
+      if (exactContent) return true;
+      // Title-only association is weaker than exact content and is accepted
+      // only with positive provider evidence that the project belongs to the
+      // approved destination team. Missing team metadata is not evidence.
+      const associated = matchAssociatedLinearProject(
+        [{
+          id: record.id,
+          name: String(record.name ?? record.title ?? "").trim() || record.id,
+        }],
+        plan.project.title,
+      );
+      return associated?.id === record.id;
+    });
+    if (projectMatches.length > 1) {
+      throw new Error(`Linear project ${plan.project.title} matches multiple resources.`);
+    }
+    const selectedProject = projectMatches[0];
+    if (selectedProject) {
+      result.set(plan.project.idempotencyKey, selectedProject);
+    }
     const expected: Array<{
       key: string;
       label: string;
@@ -768,41 +1160,19 @@ export class ResearchProjectHierarchyWorkflowV1 {
           record.name === plan.initiative.title &&
           record.content === plan.initiative.description,
       },
-      {
-        key: plan.project.idempotencyKey,
-        label: `project ${plan.project.title}`,
-        matches: (record) => {
-          if (record.resourceType !== "project") return false;
-          if (
-            record.name === plan.project.title &&
-            record.content === plan.project.description
-          ) {
-            return true;
-          }
-          // Reuse an already-associated project by title when the clean
-          // description fingerprint differs (for example after a resume).
-          const associated = matchAssociatedLinearProject(
-            [
-              {
-                id: record.id,
-                name: String(record.name ?? record.title ?? "").trim() || record.id,
-              },
-            ],
-            plan.project.title,
-          );
-          return associated !== null && associated.id === record.id;
-        },
-      },
       ...plan.issues.map((issue) => ({
         key: issue.idempotencyKey,
         label: `issue ${issue.title}`,
         matches: (record: LinearBaseRecord) =>
           record.resourceType === "issue" &&
           record.title === issue.title &&
-          record.description === renderHierarchyIssueDescriptionV1(issue, plan),
+          record.description === renderHierarchyIssueDescriptionV1(issue, plan) &&
+          recordTeamIds(record).includes(plan.destination.teamId) &&
+          selectedProject !== undefined &&
+          recordProjectIds(record).includes(selectedProject.id),
       })),
     ];
-    for (const record of catalogs.flat()) {
+    for (const record of [...initiatives, ...issues]) {
       const matches = expected.filter((candidate) => candidate.matches(record));
       if (matches.length > 1) {
         throw new Error("One Linear resource matches multiple clean hierarchy items.");
@@ -823,8 +1193,8 @@ export class ResearchProjectHierarchyWorkflowV1 {
     // checks, and a single 50-row page silently missed existing records in any
     // workspace past that size — the same class of bug that made project
     // association create duplicates. Five pages bounds the sweep at 250 rows
-    // per collection; beyond that the pre-existing behaviour (treat as absent)
-    // resumes rather than a new failure mode appearing.
+    // per collection. A capped sweep is not proof of absence, so mutation
+    // planning must fail closed instead of creating possible duplicates.
     const sweep = await listAllLinearPages(
       this.options.readClient,
       operationKey,
@@ -832,6 +1202,11 @@ export class ResearchProjectHierarchyWorkflowV1 {
       requestOptions(context),
       { maxPages: 5 },
     );
+    if (sweep.truncated) {
+      throw new Error(
+        `Linear ${operationKey} lookup exceeded the bounded 250-record sweep; absence cannot be verified safely.`,
+      );
+    }
     return sweep.items;
   }
 
@@ -895,21 +1270,175 @@ export class ResearchProjectHierarchyWorkflowV1 {
     checkpoint: ResearchProjectHierarchyCheckpointV1,
     context: ToolExecutionContext,
   ): Promise<ResearchProjectHierarchyCheckpointV1> {
-    const items: ResearchProjectHierarchyCheckpointItemV1[] = [];
-    for (const item of checkpoint.items) {
-      const readback = await this.readItem(item.kind, item.resourceId, context);
-      if (!readback) throw new Error(`Linear hierarchy resource ${item.key} is missing during resume readback.`);
-      items.push({ ...item, readbackFingerprint: readback.snapshotHash });
-    }
+    const verified = await this.reverifyStableCheckpointDependencies(
+      checkpoint,
+      context,
+    );
     const next = {
-      ...checkpoint,
+      ...verified,
       status: "complete" as const,
-      items,
       updatedAt: this.now().toISOString(),
     };
     validateCheckpoint(next, plan);
     return next;
   }
+
+  private async reverifyStableCheckpointDependencies(
+    checkpoint: ResearchProjectHierarchyCheckpointV1,
+    context: ToolExecutionContext,
+  ): Promise<ResearchProjectHierarchyCheckpointV1> {
+    const items: ResearchProjectHierarchyCheckpointItemV1[] = [];
+    for (const item of checkpoint.items) {
+      if (item.status !== "committed" && item.status !== "deduplicated") {
+        items.push({ ...item });
+        continue;
+      }
+      const readback = await this.readItem(item.kind, item.resourceId, context);
+      if (!readback) {
+        throw new Error(
+          `Linear hierarchy resource ${item.key} is missing during dependency readback.`,
+        );
+      }
+      if (
+        !item.readbackFingerprint ||
+        readback.snapshotHash !== item.readbackFingerprint
+      ) {
+        throw new ResearchProjectHierarchyDriftError(
+          `Linear hierarchy resource ${item.key} changed after its approved provider snapshot.`,
+        );
+      }
+      items.push({ ...item });
+    }
+    return { ...checkpoint, items, updatedAt: this.now().toISOString() };
+  }
+
+  private async readDeduplicatedApprovalResources(
+    checkpoint: ResearchProjectHierarchyCheckpointV1,
+    context: ToolExecutionContext,
+  ): Promise<ResearchProjectHierarchyApprovalRequestV1["deduplicatedResources"]> {
+    const resources: ResearchProjectHierarchyApprovalRequestV1["deduplicatedResources"] = [];
+    for (const item of checkpoint.items) {
+      if (item.status !== "deduplicated") continue;
+      const readback = await this.readItem(item.kind, item.resourceId, context);
+      if (!readback) {
+        throw new Error(
+          `Linear hierarchy resource ${item.key} is missing before grouped approval.`,
+        );
+      }
+      if (
+        !item.readbackFingerprint ||
+        readback.snapshotHash !== item.readbackFingerprint
+      ) {
+        throw new ResearchProjectHierarchyDriftError(
+          `Linear hierarchy resource ${item.key} changed before grouped approval.`,
+        );
+      }
+      resources.push({
+        key: item.key,
+        kind: item.kind,
+        resourceId: item.resourceId,
+        readbackFingerprint: item.readbackFingerprint,
+        snapshot: approvalSnapshot(readback),
+      });
+    }
+    return resources;
+  }
+}
+
+class ResearchProjectHierarchyDriftError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResearchProjectHierarchyDriftError";
+  }
+}
+
+function hierarchyDependencyDriftResult(
+  plan: ResearchProjectPlanV1,
+  checkpoint: ResearchProjectHierarchyCheckpointV1,
+  error: unknown,
+): Extract<ResearchProjectHierarchyResultV1, { ok: false }> {
+  const drifted = error instanceof ResearchProjectHierarchyDriftError;
+  return rejected(
+    plan,
+    checkpoint,
+    drifted
+      ? "linear_hierarchy_resume_drift"
+      : "linear_hierarchy_resume_readback_failed",
+    safeMessage(error),
+    "reconcile_required",
+  );
+}
+
+function recordTeamIds(record: LinearBaseRecord): string[] {
+  const values: unknown[] = [
+    record.attributes?.team,
+    record.attributes?.teamId,
+    record.attributes?.teams,
+    record.attributes?.teamIds,
+    (record as LinearBaseRecord & { team?: { id?: unknown } }).team?.id,
+  ];
+  return normalizedReferenceIds(values);
+}
+
+function recordProjectIds(record: LinearBaseRecord): string[] {
+  const values: unknown[] = [
+    record.attributes?.project,
+    record.attributes?.projectId,
+    record.attributes?.projects,
+    record.attributes?.projectIds,
+    (record as LinearBaseRecord & { project?: { id?: unknown } }).project?.id,
+  ];
+  return normalizedReferenceIds(values);
+}
+
+function normalizedReferenceIds(values: readonly unknown[]): string[] {
+  const ids = values.flatMap((value) =>
+    Array.isArray(value) ? value : [value],
+  ).map((value) => typeof value === "string" ? value.trim() : "")
+    .filter(Boolean);
+  return [...new Set(ids)];
+}
+
+function approvalSnapshot(
+  record: LinearBaseRecord,
+): ResearchProjectHierarchyApprovalSnapshotV1 {
+  const endpoints: Record<string, string> = {};
+  for (const key of ["initiative", "project", "issue", "relatedIssue"] as const) {
+    const value = record.attributes?.[key];
+    if (typeof value === "string" && value.trim()) {
+      endpoints[key] = boundedApprovalText(value, `Linear ${key} endpoint`, 256)!;
+    }
+  }
+  return {
+    resourceType: record.resourceType,
+    name: boundedApprovalText(record.name, "Linear resource name", 1_000),
+    title: boundedApprovalText(record.title, "Linear resource title", 1_000),
+    description: boundedApprovalText(
+      record.description ?? record.content ?? record.body,
+      "Linear resource description",
+      20_000,
+    ),
+    relationType: boundedApprovalText(record.type, "Linear relation type", 256),
+    teamIds: recordTeamIds(record),
+    projectIds: recordProjectIds(record),
+    relationEndpoints: endpoints,
+  };
+}
+
+function boundedApprovalText(
+  value: unknown,
+  label: string,
+  maximum: number,
+): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (
+    typeof value !== "string" ||
+    value.length > maximum ||
+    /[\0\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+  ) {
+    throw new Error(`${label} cannot be represented exactly in grouped approval.`);
+  }
+  return value;
 }
 
 function operation(input: {
@@ -1017,12 +1546,57 @@ function fingerprintHierarchyApproval(
     actions: items.map((item) => ({
       key: item.key,
       kind: item.kind,
-      status: item.status,
+      disposition: item.action ? "prepared_action" : "deduplicated",
       resourceId: item.resourceId,
       payloadFingerprint: item.action?.payloadFingerprint ?? null,
-      readbackFingerprint: item.readbackFingerprint,
+      // A created child's provider readback and checkpoint status evolve after
+      // approval. Only a no-action deduplication snapshot is part of the
+      // immutable grouped approval payload.
+      readbackFingerprint: item.action ? null : item.readbackFingerprint,
     })),
   });
+}
+
+async function assertHierarchyPreparedActionsSelfVerify(
+  checkpoint: ResearchProjectHierarchyCheckpointV1,
+): Promise<void> {
+  for (const item of checkpoint.items) {
+    if (!item.action) continue;
+    let verified = false;
+    try {
+      verified = await verifyPreparedActionFingerprint(item.action);
+    } catch (error) {
+      throw new DurableLinearContractError(
+        `Prepared hierarchy action ${item.key} cannot be fingerprinted: ${safeMessage(error)}`,
+      );
+    }
+    if (!verified) {
+      throw new DurableLinearContractError(
+        `Prepared hierarchy action ${item.key} does not match its payload fingerprint.`,
+      );
+    }
+  }
+}
+
+async function assertHierarchyCheckpointApprovalIntegrity(
+  plan: ResearchProjectPlanV1,
+  checkpoint: ResearchProjectHierarchyCheckpointV1,
+): Promise<void> {
+  validateCheckpoint(checkpoint, plan);
+  await assertHierarchyPreparedActionsSelfVerify(checkpoint);
+  for (const item of checkpoint.items) {
+    if (item.action && item.action.runId !== plan.runId) {
+      throw new DurableLinearContractError(
+        `Prepared hierarchy action ${item.key} belongs to a different run.`,
+      );
+    }
+  }
+  const recomputed = fingerprintHierarchyApproval(plan, checkpoint.items);
+  if (checkpoint.approvalFingerprint !== recomputed) {
+    throw new DurableLinearContractError(
+      "Research project hierarchy checkpoint items do not match the exact grouped approval fingerprint.",
+    );
+  }
 }
 
 function validateCheckpoint(

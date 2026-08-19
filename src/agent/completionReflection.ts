@@ -160,6 +160,7 @@ export function planCompoundCompletionReflection(
     workingMode: input.workingMode,
     explicitChatOnly: input.explicitChatOnly,
     persistence: input.persistence ?? context?.persistence,
+    codeExamples: input.codeExamples,
   });
   const initiatingNote: InitiatingNoteReflectionPlanV1 = completion.done
     ? preparedInitiatingNote

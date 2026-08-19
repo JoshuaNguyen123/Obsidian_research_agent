@@ -13,9 +13,11 @@ import {
   type ProjectLifecycleStageV1,
 } from "./projectLifecycle";
 import { effectClassForTool } from "./autonomyEffectClass";
+import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
 import {
   CODE_EXECUTION_ENVELOPE_NOTE_COMPANIONS,
-  CODE_EXECUTION_TOOL_ALLOW,
+  CODE_IMPLEMENTATION_TOOL_ALLOW,
+  CODE_VALIDATION_TOOL_ALLOW,
   GITHUB_CLEANUP_DESTRUCTIVE_TOOL_ALLOW,
   GITHUB_STAGE_READ_TOOL_ALLOW,
   GITHUB_STAGE_SAFE_MUTATION_TOOL_ALLOW,
@@ -45,6 +47,7 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
   accepted_research: [
     "web_search",
     "web_fetch",
+    "create_project_idea_brief",
     "read_current_file",
     "read_file",
     "read_markdown_files",
@@ -57,10 +60,6 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
     "replace_current_file",
     "count_words",
     "publish_research_to_linear",
-    // Reflection reports back to the issue this run created. The composite is
-    // allowlisted; the raw linear_update_issue deliberately stays out so a
-    // state change cannot be aimed at an arbitrary state id.
-    "report_progress_to_linear",
   ],
   linear_hierarchy: [
     "publish_research_to_linear",
@@ -68,12 +67,15 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
     "linear_create_issue",
     "linear_get_issue",
     "linear_search_issues",
-    "report_progress_to_linear",
     "append_to_current_file",
     "read_current_file",
   ],
   code_execution: [
-    ...CODE_EXECUTION_TOOL_ALLOW,
+    ...CODE_IMPLEMENTATION_TOOL_ALLOW,
+    ...CODE_EXECUTION_ENVELOPE_NOTE_COMPANIONS,
+  ],
+  code_validation: [
+    ...CODE_VALIDATION_TOOL_ALLOW,
     ...CODE_EXECUTION_ENVELOPE_NOTE_COMPANIONS,
   ],
   private_github_publication: [
@@ -82,7 +84,11 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
     "github_create_repository",
     ...GITHUB_STAGE_READ_TOOL_ALLOW,
     ...GITHUB_STAGE_SAFE_MUTATION_TOOL_ALLOW,
-    "report_progress_to_linear",
+    "read_current_file",
+  ],
+  reflection: [
+    APPEND_JUPYTER_REFLECTION_TOOL_NAME,
+    "write_project_results",
     "append_to_current_file",
     "read_current_file",
   ],

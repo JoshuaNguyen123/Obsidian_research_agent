@@ -1,3 +1,4 @@
+import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
 import {
   withPreparedActionFingerprint,
   type ActionReceipt,
@@ -8,6 +9,7 @@ import {
 import type { AuthorityGrantV1 } from "../agent/authority";
 import {
   createResearchProjectPlanV1,
+  detectProjectLifecycleStagesV1,
   type ResearchProjectDestinationV1,
 } from "../agent/projectLifecycle";
 import {
@@ -24,7 +26,7 @@ import {
 } from "../integrations/linear/LinearContractSupport";
 import type { LinearToolClient } from "../integrations/linear/LinearTools";
 import type { JsonSchemaObject } from "../model/types";
-import type { AgentTool } from "./types";
+import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 
 export { PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME };
@@ -38,6 +40,17 @@ export interface ResearchProjectHierarchyGrantInputV1 {
   resourceTypes: string[];
 }
 
+/**
+ * Host-owned accepted-research bytes. The model may narrow the note path or
+ * artifact fingerprint, but it cannot supply or replace this binding.
+ */
+export interface AcceptedResearchHierarchyBindingV1 {
+  artifactFingerprint: string;
+  notePath: string;
+  noteSha256: string;
+  noteContent: string;
+}
+
 export interface CreateResearchProjectHierarchyToolOptionsV1 {
   readClient: LinearToolClient;
   actionExecutor: Pick<
@@ -49,7 +62,7 @@ export interface CreateResearchProjectHierarchyToolOptionsV1 {
   resolveAcceptedResearchBinding(input: {
     runId: string;
     notePath: string | null;
-  }): Promise<{ artifactFingerprint: string; notePath: string } | null>;
+  }): Promise<AcceptedResearchHierarchyBindingV1 | null>;
   mintHierarchyGrant(
     input: ResearchProjectHierarchyGrantInputV1,
   ): Promise<AuthorityGrantV1>;
@@ -68,6 +81,7 @@ export interface CreateResearchProjectHierarchyToolOptionsV1 {
     initiativeId: string;
     projectId: string;
     issueIds: string[];
+    context: ToolExecutionContext;
   }): Promise<void>;
   isAvailable?: () => boolean;
   now?: () => Date;
@@ -104,6 +118,10 @@ export function createResearchProjectHierarchyTool(
       const runId = requireIdentity(context.runId, "run id");
       const toolCallId = requireIdentity(context.operationId, "tool call id");
       const planInput = parsePlanArguments(args);
+      assertExecutableDeveloperMissionUsesOneDeliveryIssue(
+        context.originalPrompt,
+        planInput.issues.length,
+      );
       const acceptedResearchBinding =
         await options.resolveAcceptedResearchBinding({
           runId,
@@ -128,6 +146,7 @@ export function createResearchProjectHierarchyTool(
         planInput.suppliedSourceNotePath,
         acceptedResearchBinding.notePath,
       );
+      assertAcceptedResearchBindingMatchesBytes(acceptedResearchBinding);
       const {
         suppliedArtifactFingerprint: _suppliedArtifactFingerprint,
         suppliedSourceNotePath: _suppliedSourceNotePath,
@@ -158,6 +177,10 @@ export function createResearchProjectHierarchyTool(
           destination: options.destination,
           createdAt: (options.now ?? context.now ?? (() => new Date()))().toISOString(),
         });
+        assertResearchProjectPlanSemanticallyBoundToAcceptedNote(
+          plan,
+          acceptedResearchBinding.noteContent,
+        );
       } catch (error) {
         if (error instanceof DurableLinearContractError) {
           throw notApplied(
@@ -269,6 +292,7 @@ export function createResearchProjectHierarchyTool(
           initiativeId: result.initiativeId,
           projectId: result.projectId,
           issueIds: result.issueIds,
+          context,
         });
       }
       return { ...result, backlinkReceipt };
@@ -297,11 +321,41 @@ export function hasExplicitResearchProjectHierarchyIntent(prompt: string): boole
   }
   return (
     /\b(?:shape|turn|convert|create|build|publish|send)\b[\s\S]{0,180}\b(?:accepted\s+)?research\b[\s\S]{0,180}\blinear\b[\s\S]{0,160}\b(?:initiative|project|hierarchy)\b/iu.test(text) ||
-    /\bcreate\b[\s\S]{0,80}\bproject\b[\s\S]{0,80}\bend[- ]to[- ]end\b/iu.test(text)
+    /\bcreate\b[\s\S]{0,80}\bproject\b[\s\S]{0,80}\bend[- ]to[- ]end\b/iu.test(text) ||
+    /\b(?:research|investigate|study|analy[sz]e)\b[\s\S]{0,280}\b(?:create|turn|convert|shape|break|translate|organize|plan)\b[\s\S]{0,160}\b(?:findings|research|design|results?|measurable|actionable|scoped|delivery)?\b[\s\S]{0,80}\blinear\s+(?:work|tasks?|issues?|project|plan)\b/iu.test(text)
   );
 }
 
-async function buildGroupedApprovalAction(
+/**
+ * The current foreground code pipeline produces one verified commit/validation
+ * bundle. It can truthfully close one Linear delivery ticket with a measurable
+ * acceptance checklist, but it cannot attribute that aggregate bundle across
+ * several independently completable child tickets. Standalone hierarchy work
+ * remains capable of creating 1-20 issues; only a joined six-stage developer
+ * mission is narrowed here.
+ */
+export function assertExecutableDeveloperMissionUsesOneDeliveryIssue(
+  prompt: string,
+  issueCount: number,
+): void {
+  const stages = new Set(detectProjectLifecycleStagesV1(prompt));
+  const joinedStages = [
+    "linear_hierarchy",
+    "code_execution",
+    "code_validation",
+    "private_github_publication",
+    "reflection",
+  ] as const;
+  const joinedExecution = joinedStages.every((stage) => stages.has(stage));
+  if (joinedExecution && issueCount !== 1) {
+    throw notApplied(
+      "linear_hierarchy_autonomous_delivery_unit_required",
+      "A joined Research-to-Results developer mission currently requires exactly one Linear delivery issue. Put the measurable units into that issue's acceptanceCriteria; create a multi-issue hierarchy independently when each child will be implemented and verified in a separate run.",
+    );
+  }
+}
+
+export async function buildGroupedApprovalAction(
   request: ResearchProjectHierarchyApprovalRequestV1,
   nowProvider?: () => Date,
 ): Promise<PreparedAction> {
@@ -309,16 +363,46 @@ async function buildGroupedApprovalAction(
   const actionFingerprints = request.preparedActions.map(
     (action) => action.payloadFingerprint,
   );
-  const outboundPayload: Record<string, JsonValue> = {
-    planFingerprint: request.planFingerprint,
-    approvalFingerprint: request.approvalFingerprint,
-    actionFingerprints,
-    deduplicatedResources: request.deduplicatedResources.map((item) => ({
+  const inspectablePreparedActions: JsonValue[] = request.preparedActions.map(
+    (action): JsonValue => ({
+      toolName: action.toolName,
+      target: JSON.parse(JSON.stringify(action.target)) as JsonValue,
+      payloadFingerprint: action.payloadFingerprint,
+      preview: {
+        summary: action.preview.summary,
+        destination: action.preview.destination,
+        // Child previews are produced by the host adapter from its validated
+        // provider payload. Including the exact bounded payload lets the user
+        // inspect titles, descriptions, and relation endpoints instead of
+        // approving an opaque list of hashes.
+        outboundPayload:
+          action.preview.outboundPayload ?? action.normalizedArgs,
+      },
+    }),
+  );
+  const inspectableDeduplicatedResources: JsonValue[] =
+    request.deduplicatedResources.map((item): JsonValue => ({
       key: item.key,
       kind: item.kind,
       resourceId: item.resourceId,
       readbackFingerprint: item.readbackFingerprint,
-    })),
+      snapshot: {
+        resourceType: item.snapshot.resourceType,
+        name: item.snapshot.name,
+        title: item.snapshot.title,
+        description: item.snapshot.description,
+        relationType: item.snapshot.relationType,
+        teamIds: item.snapshot.teamIds,
+        projectIds: item.snapshot.projectIds,
+        relationEndpoints: item.snapshot.relationEndpoints,
+      },
+    }));
+  const outboundPayload: Record<string, JsonValue> = {
+    planFingerprint: request.planFingerprint,
+    approvalFingerprint: request.approvalFingerprint,
+    actionFingerprints,
+    preparedActions: inspectablePreparedActions,
+    deduplicatedResources: inspectableDeduplicatedResources,
   };
   return withPreparedActionFingerprint({
     version: 1,
@@ -350,10 +434,7 @@ async function buildGroupedApprovalAction(
         revision: item.readbackFingerprint,
       })),
       warnings: [],
-      outboundBytes: request.preparedActions.reduce(
-        (total, action) => total + action.preview.outboundBytes,
-        0,
-      ),
+      outboundBytes: new TextEncoder().encode(JSON.stringify(outboundPayload)).byteLength,
     },
     idempotencyKey: `linear-research-project:${request.planFingerprint}`,
     reconciliationKey: `linear-research-project:${request.planFingerprint}`,
@@ -425,16 +506,12 @@ export function resolveCanonicalAcceptedResearchNotePath(
 }
 
 export function selectAcceptedResearchBindingForCurrentMission(
-  candidates: Array<{
-    runId: string;
-    artifactFingerprint: string;
-    notePath: string;
-  }>,
+  candidates: AcceptedResearchHierarchyBindingCandidateV1[],
   input: {
     acceptedRunIds: ReadonlySet<string>;
     missionObjective: string;
   },
-): { artifactFingerprint: string; notePath: string } | null {
+): AcceptedResearchHierarchyBindingV1 | null {
   const exactRunMatches = candidates.filter((candidate) =>
     input.acceptedRunIds.has(candidate.runId),
   );
@@ -450,7 +527,132 @@ export function selectAcceptedResearchBindingForCurrentMission(
   return {
     artifactFingerprint: selected[0].artifactFingerprint,
     notePath: selected[0].notePath,
+    noteSha256: selected[0].noteSha256,
+    noteContent: selected[0].noteContent,
   };
+}
+
+export interface AcceptedResearchHierarchyBindingCandidateV1 {
+  runId: string;
+  artifactFingerprint: string;
+  notePath: string;
+  noteSha256: string;
+  noteContent: string;
+}
+
+const MAX_ACCEPTED_RESEARCH_NOTE_CHARS = 250_000;
+const SEMANTIC_STOP_WORDS = new Set([
+  "accepted", "acceptance", "against", "also", "because", "before", "build",
+  "completion", "create", "deliver", "description", "evidence", "from", "have",
+  "implementation", "initiative", "issue", "must", "note", "project", "proposed",
+  "research", "scope", "should", "that", "their", "these", "this", "through",
+  "validation", "verified", "with", "work",
+]);
+
+/** Verify that the selected note still contains the exact host-accepted bytes. */
+export function assertAcceptedResearchBindingMatchesBytes(
+  binding: AcceptedResearchHierarchyBindingV1,
+): void {
+  requireFingerprint(binding.artifactFingerprint, "accepted research artifact fingerprint");
+  requireText(binding.notePath, "accepted research note path", 500);
+  const expected = requireFingerprint(binding.noteSha256, "accepted research note hash");
+  if (
+    typeof binding.noteContent !== "string" ||
+    binding.noteContent.length < 1 ||
+    binding.noteContent.length > MAX_ACCEPTED_RESEARCH_NOTE_CHARS
+  ) {
+    throw notApplied(
+      "linear_hierarchy_accepted_research_bytes_required",
+      "The exact bounded bytes of the host-accepted research note are unavailable.",
+    );
+  }
+  const observed = `sha256:${portableSha256Text(binding.noteContent)}`;
+  if (observed !== expected) {
+    throw notApplied(
+      "linear_hierarchy_accepted_research_drift",
+      "The accepted research note changed after host acceptance; re-accept the current note before publishing to Linear.",
+    );
+  }
+}
+
+/**
+ * Local, deterministic relevance gate. Every issue must retain at least one
+ * distinctive term from the exact accepted note, and the hierarchy as a whole
+ * must retain multiple anchors. This is deliberately a fail-closed lexical
+ * gate, not an embedding or model judgment.
+ */
+export function assertResearchProjectPlanSemanticallyBoundToAcceptedNote(
+  plan: ReturnType<typeof createResearchProjectPlanV1>,
+  acceptedNoteContent: string,
+): void {
+  const noteTerms = semanticTerms(acceptedNoteContent);
+  if (noteTerms.size < 2) {
+    throw notApplied(
+      "linear_hierarchy_accepted_research_digest_insufficient",
+      "The accepted research note does not contain enough distinctive content to validate a Linear hierarchy.",
+    );
+  }
+  const overviewTerms = semanticTerms([
+    plan.initiative.title,
+    plan.initiative.description,
+    plan.project.title,
+    plan.project.description,
+  ].join("\n"));
+  if (sharedTerms(overviewTerms, noteTerms).size < 1) {
+    throwSemanticMismatch("The Linear initiative/project does not retain a distinctive anchor from the accepted research note.");
+  }
+
+  const allPlanTerms = new Set(overviewTerms);
+  for (const issue of plan.issues) {
+    const issueTerms = semanticTerms([
+      issue.title,
+      issue.description,
+      issue.problemImpact ?? "",
+      issue.confidenceLimitations ?? "",
+      ...(issue.proposedWork ?? []),
+      ...(issue.nonGoals ?? []),
+      ...(issue.scope ?? []),
+      ...issue.acceptanceCriteria,
+      ...(issue.validation ?? []),
+    ].join("\n"));
+    for (const term of issueTerms) allPlanTerms.add(term);
+    if (sharedTerms(issueTerms, noteTerms).size < 1) {
+      throwSemanticMismatch(
+        `Linear issue ${issue.key} is not semantically bound to the accepted research note.`,
+      );
+    }
+  }
+  const requiredOverallAnchors = Math.min(3, noteTerms.size);
+  if (sharedTerms(allPlanTerms, noteTerms).size < requiredOverallAnchors) {
+    throwSemanticMismatch(
+      `The Linear hierarchy must retain at least ${requiredOverallAnchors} distinctive accepted-research anchors.`,
+    );
+  }
+}
+
+function semanticTerms(value: string): Set<string> {
+  const withoutMachineNoise = value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/<!--[^]*?-->/gu, " ")
+    .replace(/https?:\/\/\S+/gu, " ")
+    .replace(/sha256:[a-f0-9]{64}/gu, " ");
+  const terms = withoutMachineNoise.match(/[\p{L}\p{N}][\p{L}\p{N}_-]{3,}/gu) ?? [];
+  return new Set(
+    terms.filter((term) =>
+      !SEMANTIC_STOP_WORDS.has(term) &&
+      !/^\d+$/u.test(term) &&
+      !/^[a-f0-9]{32,}$/u.test(term),
+    ),
+  );
+}
+
+function sharedTerms(left: ReadonlySet<string>, right: ReadonlySet<string>): Set<string> {
+  return new Set([...left].filter((term) => right.has(term)));
+}
+
+function throwSemanticMismatch(message: string): never {
+  throw notApplied("linear_hierarchy_research_semantic_mismatch", message);
 }
 
 function parseHierarchyItem(value: unknown, label: string) {

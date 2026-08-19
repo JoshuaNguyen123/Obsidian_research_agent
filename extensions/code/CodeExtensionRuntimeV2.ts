@@ -13,8 +13,11 @@ import type {
 import {
   createPreparedBackgroundCodeActionV1,
   createVerifiedCodePublicationHandoffV1,
+  createVerifiedCodeReflectionExamplesV1,
+  parseVerifiedCodePublicationHandoffV1,
   type ConsumedBackgroundCodeGrantV1,
   type VerifiedCodePublicationHandoffV1,
+  type VerifiedCodeReflectionExamplesV1,
 } from "@agentic-researcher/core-api";
 import {
   canonicalJson,
@@ -31,6 +34,7 @@ import { withPluginDataLock } from "../shared/softDependency";
 import {
   CODE_EXECUTION_TOOL_NAMES_V2,
   CodeSandboxContributionErrorV2,
+  DurableSandboxExecutionJournalV1,
   SandboxManagerV2,
   SpawnSandboxCommandRunnerV2,
   createCodeExecutionContributionsV2,
@@ -39,6 +43,8 @@ import {
   readHostProvisionedSandboxBindingV1,
   type HostProvisionedSandboxAdoptionReasonV1,
   type HostProvisionedSandboxPlatformV1,
+  type DurableSandboxExecutionJournalPersistenceV1,
+  type DurableSandboxExecutionNamespaceV1,
   type PreparedSandboxActionV2,
   type SandboxCapabilityStatusV2,
   type SandboxCommandRunnerV2,
@@ -120,6 +126,8 @@ const MAX_SANDBOX_STAGING_TOTAL_BYTES = 10_000_000;
 const MAX_SANDBOX_STAGING_DIRECTORIES = 256;
 const MAX_SANDBOX_STAGING_METADATA_ENTRIES = 2_000;
 const MAX_SANDBOX_STAGING_DEPTH = 32;
+const MAX_REFLECTION_SOURCE_BYTES = 1_000_000;
+const MAX_REFLECTION_EXAMPLE_LINES = 20;
 const SCRATCH_SANDBOX_PROJECT_ID = "scratch";
 const IGNORED_INVENTORY_DIRECTORIES = new Set([
   ".git",
@@ -148,6 +156,47 @@ const PIN_BASENAMES = new Set([
   "gradlew",
   "mvnw",
   "runtime.txt",
+]);
+
+const REFLECTION_SOURCE_EXTENSIONS = new Set([
+  ".c",
+  ".cc",
+  ".cpp",
+  ".cs",
+  ".css",
+  ".go",
+  ".h",
+  ".hpp",
+  ".html",
+  ".java",
+  ".js",
+  ".jsx",
+  ".kt",
+  ".kts",
+  ".mjs",
+  ".php",
+  ".ps1",
+  ".py",
+  ".rb",
+  ".rs",
+  ".scss",
+  ".sh",
+  ".sql",
+  ".svelte",
+  ".swift",
+  ".ts",
+  ".tsx",
+  ".vue",
+]);
+
+const REFLECTION_EXCLUDED_SEGMENTS = new Set([
+  ".git",
+  "build",
+  "coverage",
+  "dist",
+  "generated",
+  "node_modules",
+  "vendor",
 ]);
 
 export type CodeRepositoryProfileSourceV2 =
@@ -329,6 +378,7 @@ export class CodeExtensionRuntimeV2 {
   private readonly sandboxRunner: SandboxCommandRunnerV2;
   private repairContributions: ExtensionContributionV1[];
   private validationReceiptRegistry: DurableValidationReceiptRegistryV1 | null = null;
+  private sandboxExecutionJournal: DurableSandboxExecutionJournalV1 | null = null;
   private repairGit: SpawnFixedArgvGitRunnerV1 | null = null;
   private sandboxManager: SandboxManagerV2 | null = null;
   private state: CodeRuntimeStateV2 | null = null;
@@ -379,6 +429,10 @@ export class CodeExtensionRuntimeV2 {
     });
 
     this.sandboxManager = this.injectedSandboxManager ?? this.createConfiguredSandboxManager();
+    this.sandboxExecutionJournal = new DurableSandboxExecutionJournalV1(
+      this.sandboxExecutionJournalPersistence(),
+      this.now,
+    );
     this.repositoryProvisioner = new ProfileAwareRepositoryProvisionerV2(
       this,
       new LocalGitWorkspaceProvisionerV2(this.workspaceManager),
@@ -409,6 +463,7 @@ export class CodeExtensionRuntimeV2 {
       // registration. Resolve it per call so tools never retain the empty
       // startup manager after a verified provider is configured.
       sandboxManager: () => this.requireSandboxManager(),
+      executionJournal: this.requireSandboxExecutionJournal(),
       getProfile: (profileKey) => this.getRepositoryProfile(profileKey),
       resolvePreparationInput: ({ purpose, workspaceId, context }) =>
         this.resolveSandboxPreparationInput(purpose, workspaceId, context),
@@ -1526,6 +1581,136 @@ export class CodeExtensionRuntimeV2 {
     });
   }
 
+  /**
+   * Acquire concise reflection examples from the exact immutable commit named
+   * by a durable publication handoff. The caller cannot redirect this read to
+   * the mutable working tree: the supplied handoff must re-resolve from the
+   * extension-owned checkpoint store before Git object readback begins.
+   */
+  async resolveVerifiedCodeReflectionExamples(
+    profileKeyInput: string,
+    handoffInput: unknown,
+  ): Promise<VerifiedCodeReflectionExamplesV1 | null> {
+    this.assertInitialized();
+    const profileKey = boundedIdentifier(
+      profileKeyInput,
+      "repository profile key",
+    );
+    let supplied: VerifiedCodePublicationHandoffV1;
+    try {
+      supplied = parseVerifiedCodePublicationHandoffV1(handoffInput);
+    } catch {
+      return null;
+    }
+    if (supplied.repositoryProfileKey !== profileKey) return null;
+
+    const durable = await this.resolveLatestVerifiedPublicationHandoff(profileKey, {
+      runId: supplied.runId,
+      requestId: supplied.requestId,
+    });
+    if (!durable || durable.fingerprint !== supplied.fingerprint) return null;
+    const git = this.repairGit;
+    if (!git) return null;
+
+    let commit: Awaited<ReturnType<SpawnFixedArgvGitRunnerV1["run"]>>;
+    let tree: Awaited<ReturnType<SpawnFixedArgvGitRunnerV1["run"]>>;
+    try {
+      commit = await git.run({
+        cwd: durable.canonicalWorktreeRoot,
+        args: ["rev-parse", "--verify", `${durable.commitSha}^{commit}`],
+      });
+      tree = await git.run({
+        cwd: durable.canonicalWorktreeRoot,
+        args: ["rev-parse", "--verify", `${durable.commitSha}^{tree}`],
+      });
+    } catch {
+      return null;
+    }
+    if (commit.exitCode !== 0 || commit.stdout.trim() !== durable.commitSha) {
+      return null;
+    }
+    if (tree.exitCode !== 0 || tree.stdout.trim() !== durable.treeSha) {
+      return null;
+    }
+
+    const artifacts = new Map(
+      durable.artifactHashes.map((artifact) => [artifact.path, artifact]),
+    );
+    const candidates = durable.changedArtifacts
+      .flatMap((changed) => {
+        if (changed.sha256 === null || !isReflectionSourcePath(changed.path)) {
+          return [];
+        }
+        const artifact = artifacts.get(changed.path);
+        if (
+          !artifact ||
+          artifact.sha256 !== changed.sha256 ||
+          artifact.bytes < 1 ||
+          artifact.bytes > MAX_REFLECTION_SOURCE_BYTES
+        ) {
+          return [];
+        }
+        return [{ path: changed.path, artifact }];
+      })
+      .sort(compareReflectionSourceCandidates);
+
+    const sources: Array<{ path: string; content: string }> = [];
+    const selections: Array<{
+      path: string;
+      startLine: number;
+      endLine: number;
+    }> = [];
+    for (const candidate of candidates) {
+      if (sources.length >= 2) break;
+      let readback: Awaited<ReturnType<SpawnFixedArgvGitRunnerV1["runBytes"]>>;
+      try {
+        readback = await git.runBytes({
+          cwd: durable.canonicalWorktreeRoot,
+          args: ["cat-file", "blob", `${durable.commitSha}:${candidate.path}`],
+          maxStdoutBytes: MAX_REFLECTION_SOURCE_BYTES,
+        });
+      } catch {
+        return null;
+      }
+      if (readback.exitCode !== 0) return null;
+      if (
+        readback.stdout.byteLength !== candidate.artifact.bytes ||
+        sha256Bytes(readback.stdout) !== candidate.artifact.sha256
+      ) {
+        return null;
+      }
+      let content: string;
+      try {
+        content = new TextDecoder("utf-8", { fatal: true }).decode(readback.stdout);
+      } catch {
+        continue;
+      }
+      if (!content.trim() || content.includes("\0")) continue;
+      const selection = await selectVerifiedReflectionExcerpt({
+        git,
+        worktreeRoot: durable.canonicalWorktreeRoot,
+        parentSha: durable.parentSha,
+        commitSha: durable.commitSha,
+        path: candidate.path,
+        content,
+      });
+      if (!selection) continue;
+      sources.push({ path: candidate.path, content });
+      selections.push({ path: candidate.path, ...selection });
+    }
+    if (sources.length < 1) return null;
+
+    try {
+      return createVerifiedCodeReflectionExamplesV1({
+        handoff: durable,
+        sources,
+        selections,
+      });
+    } catch {
+      return null;
+    }
+  }
+
   async resolveVerifiedReviewRepairBase(
     input: CodeReviewRepairBaseResolutionInputV1,
   ): Promise<VerifiedCodePublicationHandoffV1 | null> {
@@ -1955,6 +2140,20 @@ export class CodeExtensionRuntimeV2 {
           "codeValidationReceiptsV1",
           namespace,
           expectedRevision,
+      ),
+    };
+  }
+
+  private sandboxExecutionJournalPersistence(): DurableSandboxExecutionJournalPersistenceV1 {
+    return {
+      readNamespace: () => this.readTopLevelNamespace<DurableSandboxExecutionNamespaceV1>(
+        "codeSandboxExecutionJournalV1",
+      ),
+      writeNamespace: (namespace, expectedRevision) =>
+        this.writeTopLevelNamespace(
+          "codeSandboxExecutionJournalV1",
+          namespace,
+          expectedRevision,
         ),
     };
   }
@@ -2272,6 +2471,13 @@ export class CodeExtensionRuntimeV2 {
   private requireSandboxManager(): SandboxManagerV2 {
     if (!this.sandboxManager) throw new Error("CodeExtensionRuntimeV2 sandbox is not initialized.");
     return this.sandboxManager;
+  }
+
+  private requireSandboxExecutionJournal(): DurableSandboxExecutionJournalV1 {
+    if (!this.sandboxExecutionJournal) {
+      throw new Error("CodeExtensionRuntimeV2 sandbox execution journal is not initialized.");
+    }
+    return this.sandboxExecutionJournal;
   }
 
   private createConfiguredSandboxManager(): SandboxManagerV2 {
@@ -3203,6 +3409,121 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase()
     : path.resolve(left) === path.resolve(right);
+}
+
+function isReflectionSourcePath(value: string): boolean {
+  let relative: string;
+  try {
+    relative = assertWorkspaceRelativePathV2(value, "reflection source path");
+  } catch {
+    return false;
+  }
+  const segments = relative.toLowerCase().split("/");
+  if (segments.some((segment) => REFLECTION_EXCLUDED_SEGMENTS.has(segment))) {
+    return false;
+  }
+  const basename = segments[segments.length - 1] ?? "";
+  if (
+    basename.includes(".min.") ||
+    basename.endsWith(".lock") ||
+    basename === "main.js"
+  ) {
+    return false;
+  }
+  return REFLECTION_SOURCE_EXTENSIONS.has(path.posix.extname(relative).toLowerCase());
+}
+
+function compareReflectionSourceCandidates(
+  left: { path: string },
+  right: { path: string },
+): number {
+  const priority = (candidate: string): number =>
+    /(?:^|\/)(?:__tests__|test|tests)(?:\/|$)|(?:\.|_)(?:spec|test)\.[^/]+$/iu.test(candidate)
+      ? 1
+      : 0;
+  return priority(left.path) - priority(right.path) ||
+    Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8"));
+}
+
+async function selectVerifiedReflectionExcerpt(input: {
+  git: SpawnFixedArgvGitRunnerV1;
+  worktreeRoot: string;
+  parentSha: string;
+  commitSha: string;
+  path: string;
+  content: string;
+}): Promise<{ startLine: number; endLine: number } | null> {
+  const lines = input.content.replace(/\r\n?/gu, "\n").split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length < 1) return null;
+
+  let changed: { line: number; count: number } | null = null;
+  try {
+    const diff = await input.git.run({
+      cwd: input.worktreeRoot,
+      args: [
+        "diff",
+        "--unified=0",
+        "--no-ext-diff",
+        "--no-color",
+        input.parentSha,
+        input.commitSha,
+        "--",
+        input.path,
+      ],
+    });
+    if (diff.exitCode === 0) changed = firstAddedDiffRange(diff.stdout);
+  } catch {
+    // Exact source readback remains authoritative; a bounded excerpt can fall
+    // back to the first meaningful source line when hunk metadata is absent.
+  }
+
+  const fallbackLine = firstMeaningfulSourceLine(lines);
+  const anchor = changed?.line ?? fallbackLine;
+  if (anchor === null || anchor < 1 || anchor > lines.length) return null;
+  const changedCount = Math.max(1, changed?.count ?? 1);
+  let startLine = Math.max(1, anchor - 2);
+  let endLine = Math.min(
+    lines.length,
+    anchor + changedCount + 2,
+    startLine + MAX_REFLECTION_EXAMPLE_LINES - 1,
+  );
+  while (startLine < anchor && !lines[startLine - 1]?.trim()) startLine += 1;
+  while (endLine > anchor && !lines[endLine - 1]?.trim()) endLine -= 1;
+  if (endLine < startLine) return null;
+  return { startLine, endLine };
+}
+
+function firstAddedDiffRange(value: string): { line: number; count: number } | null {
+  const matches = value.matchAll(
+    /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gmu,
+  );
+  for (const match of matches) {
+    const line = Number(match[1]);
+    const count = match[2] === undefined ? 1 : Number(match[2]);
+    if (Number.isSafeInteger(line) && line >= 1 && Number.isSafeInteger(count) && count > 0) {
+      return { line, count };
+    }
+  }
+  return null;
+}
+
+function firstMeaningfulSourceLine(lines: readonly string[]): number | null {
+  const declaration = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:class|const|def|enum|fn|func|function|interface|let|namespace|record|struct|type|var)\b|^(?:public|private|protected|static)\b|^<[a-z]|^[.#]?[a-z][^{]*\{/iu;
+  let fallback: number | null = null;
+  for (const [index, raw] of lines.entries()) {
+    const line = raw.trim();
+    if (
+      !line ||
+      /^(?:\/\/|\/\*|\*|<!--|#(?!!))/u.test(line) ||
+      /^(?:[{}]|\);?)$/u.test(line)
+    ) {
+      continue;
+    }
+    fallback ??= index + 1;
+    if (declaration.test(line)) return index + 1;
+  }
+  return fallback;
 }
 
 function sha256Canonical(value: unknown): string {

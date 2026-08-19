@@ -40,7 +40,7 @@ test("stage prompt projection keeps only objective evidence and callable tools",
   });
 
   assert.equal(projection.stage, "code_execution");
-  assert.match(projection.objective, /code proof/i);
+  assert.match(projection.objective, /Implement the accepted Linear work/i);
   assert.deepEqual(projection.callableTools, [
     "code_validate_fast",
     "code_commit_verified",
@@ -81,7 +81,9 @@ test("objectiveForLifecycleStage covers every durable stage", () => {
     "accepted_research",
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
+    "reflection",
     "reconciliation_cleanup",
   ] as const) {
     assert.ok(objectiveForLifecycleStage(stage).length > 10);

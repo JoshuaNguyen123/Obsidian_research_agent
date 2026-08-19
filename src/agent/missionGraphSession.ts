@@ -947,6 +947,11 @@ export class MissionGraphSession {
           result,
         );
       }
+      if (result.ok) {
+        graph = await this.reconcileValidationRecoveryOriginUnlocked(
+          this.record.graph.nodes[execution.nodeId]!,
+        );
+      }
       return graph;
     });
   }
@@ -1216,9 +1221,13 @@ export class MissionGraphSession {
           `Validation recovery requires a running targeted/full validator; ${validationNode.id} is ${validationNode.status}.`,
         );
       }
-      if (getMissionCompositeLifecycleSpecV1(validationNode)) {
-        throw new Error(
-          "Validation recovery cannot rewrite a composite lifecycle cursor.",
+      const lifecycle = getMissionCompositeLifecycleSpecV1(validationNode);
+      if (lifecycle) {
+        return this.finishFailedCompositeValidationWithRecoveryUnlocked(
+          execution,
+          validationNode,
+          lifecycle,
+          result,
         );
       }
 
@@ -1538,6 +1547,234 @@ export class MissionGraphSession {
   }
 
   /**
+   * Composite validation stages keep their closed action literal immutable.
+   * A red targeted/full action therefore cannot splice recovery actions into
+   * the cursor. Instead, clone the already-authorized validation stage as one
+   * bounded sibling, hold it behind a receipt-backed correction gate, and
+   * reconcile its complete proof back into the blocked origin. The clone has
+   * the exact authority signature and depth of the original stage, so this
+   * consumes only host-reserved budget and never widens tools, bindings, or
+   * graph depth.
+   */
+  private async finishFailedCompositeValidationWithRecoveryUnlocked(
+    execution: MissionGraphToolExecution,
+    validationNode: MissionNodeV3,
+    lifecycle: NonNullable<
+      ReturnType<typeof getMissionCompositeLifecycleSpecV1>
+    >,
+    result: {
+      evidence?: MissionEvidenceRefV1;
+      receipt?: MissionReceiptRefV1;
+      failureFingerprint: string;
+      failureMessage: string;
+    },
+  ): Promise<{ graph: MissionGraphV3; scheduled: boolean }> {
+    const lifecycleState = getMissionCompositeLifecycleStateV1(validationNode);
+    const lifecycleAction =
+      getCurrentMissionCompositeLifecycleActionV1(validationNode);
+    if (
+      !lifecycleState ||
+      !lifecycleAction ||
+      lifecycleAction.toolName !== execution.toolName ||
+      lifecycleAction.id !== execution.lifecycleActionId
+    ) {
+      throw new Error(
+        `Validation recovery no longer matches the durable composite lifecycle cursor for ${validationNode.id}.`,
+      );
+    }
+
+    const recoveryDepth = this.validationRecoveryDepthUnlocked(
+      validationNode.id,
+    );
+    const nextAttempts = recoveryDepth + 1;
+    const failedOutputs = {
+      ...validationNode.outputs,
+      lifecycleActionCursor: lifecycleState.actionCursor,
+      lifecycleCompletedActionIds: [...lifecycleState.completedActionIds],
+      lifecycleSkippedActionIds: [...lifecycleState.skippedActionIds],
+      lifecycleActionAttemptCounts: {
+        ...lifecycleState.actionAttemptCounts,
+        [lifecycleAction.id]:
+          (lifecycleState.actionAttemptCounts[lifecycleAction.id] ?? 0) + 1,
+      },
+    };
+    const operations: MissionGraphPatchOperationV1[] = [
+      {
+        op: "record_attempt",
+        nodeId: validationNode.id,
+        failureFingerprint: result.failureFingerprint,
+        observedAt: this.now(),
+      },
+    ];
+    if (result.evidence) {
+      operations.push({
+        op: "append_evidence",
+        nodeId: validationNode.id,
+        evidence: result.evidence,
+      });
+    }
+    if (result.receipt) {
+      operations.push({
+        op: "append_receipt",
+        nodeId: validationNode.id,
+        receipt: result.receipt,
+      });
+    }
+
+    if (nextAttempts >= validationNode.retries.maxAttempts) {
+      operations.push(
+        {
+          op: "set_outputs",
+          nodeId: validationNode.id,
+          outputs: failedOutputs,
+        },
+        {
+          op: "set_status",
+          nodeId: validationNode.id,
+          expectedStatus: "running",
+          status: "blocked",
+          blocker: {
+            code: "validation_repair_cycles_exhausted",
+            message:
+              "Validation remained red after the bounded correction cycles.",
+            requiredAction:
+              "Inspect the latest validation diagnostic before starting a new explicitly authorized repair run.",
+          },
+        },
+      );
+      let graph: MissionGraphV3;
+      try {
+        graph = await this.applyUnlocked(
+          `Block ${execution.toolName} after bounded composite validation recovery was exhausted.`,
+          operations,
+        );
+      } finally {
+        if (execution.lockLease) {
+          await this.releaseNodeLocksUnlocked(execution.lockLease);
+        }
+      }
+      return { graph, scheduled: false };
+    }
+
+    const reserveNode = findContinuationReserveNode(this.record.graph);
+    if (!reserveNode || reserveNode.id === validationNode.id) {
+      throw new Error(
+        "Composite validation recovery has no nonterminal continuation budget reserve.",
+      );
+    }
+    const allocation = transferReservedBudgetForContinuation(
+      this.record.graph,
+      reserveNode,
+      validationNode.budget,
+    );
+    const recoveryNodeId =
+      `validation-recovery-stage-${sanitizeMissionId(
+        `${this.record.graph.revision + 1}-${validationNode.id}`,
+      )}`.slice(0, 128);
+    if (this.record.graph.nodes[recoveryNodeId]) {
+      throw new Error(
+        `Composite validation recovery node ${recoveryNodeId} already exists without its durable origin marker.`,
+      );
+    }
+    const recoveryNode: MissionNodeV3 = {
+      ...clone(validationNode),
+      id: recoveryNodeId,
+      objective:
+        `Repeat the closed ${lifecycle.stage} proof stage after a receipt-backed correction for red ${execution.toolName} on ${validationNode.id}.`.slice(
+          0,
+          4_000,
+        ),
+      outputs: {},
+      retries: {
+        maxAttempts: validationNode.retries.maxAttempts,
+        attempts: 0,
+        failureFingerprints: [],
+        consecutiveFailureFingerprint: null,
+        consecutiveFailureCount: 0,
+      },
+      status: "queued",
+      evidence: [],
+      receipts: [],
+      verification: null,
+      blocker: null,
+    };
+    operations.push(
+      { op: "add_node", node: recoveryNode },
+      {
+        op: "set_outputs",
+        nodeId: validationNode.id,
+        outputs: failedOutputs,
+      },
+      {
+        op: "set_status",
+        nodeId: validationNode.id,
+        expectedStatus: "running",
+        status: "blocked",
+        blocker: {
+          code: "validation_recovery_pending",
+          message: `Validation action ${execution.toolName} is red and requires one receipt-backed workspace correction.`,
+          requiredAction: compositeValidationRecoveryRequiredActionV1(
+            recoveryNodeId,
+          ),
+        },
+      },
+    );
+    if (
+      JSON.stringify(allocation.reserveNodeBudget) !==
+      JSON.stringify(reserveNode.budget)
+    ) {
+      operations.push({
+        op: "update_node",
+        nodeId: reserveNode.id,
+        changes: { budget: allocation.reserveNodeBudget },
+      });
+    }
+
+    let graph: MissionGraphV3;
+    try {
+      graph = await this.applyUnlocked(
+        `Gate a closed composite validation retry on a workspace correction after red ${execution.toolName}.`,
+        operations,
+      );
+    } finally {
+      if (execution.lockLease) {
+        await this.releaseNodeLocksUnlocked(execution.lockLease);
+      }
+    }
+    return { graph, scheduled: true };
+  }
+
+  private validationRecoveryDepthUnlocked(nodeId: string): number {
+    const seen = new Set<string>();
+    let currentNodeId = nodeId;
+    let depth = 0;
+    while (!seen.has(currentNodeId)) {
+      seen.add(currentNodeId);
+      const parent = Object.values(this.record.graph.nodes).find(
+        (candidate) => {
+          const recovery = candidate.outputs.validationRecovery;
+          return (
+            recovery !== null &&
+            typeof recovery === "object" &&
+            !Array.isArray(recovery) &&
+            (recovery as Record<string, unknown>).recoveryNodeId ===
+              currentNodeId
+          );
+        },
+      );
+      const compositeParent = Object.values(this.record.graph.nodes).find(
+        (candidate) =>
+          compositeValidationRecoveryNodeIdV1(candidate) === currentNodeId,
+      );
+      const resolvedParent = parent ?? compositeParent;
+      if (!resolvedParent) break;
+      depth += 1;
+      currentNodeId = resolvedParent.id;
+    }
+    return depth;
+  }
+
+  /**
    * Pay the durable correction gate only from a successful, receipt-backed
    * adaptive workspace mutation. Reads, prose, and unchanged validator calls
    * cannot unlock the recovery fast node.
@@ -1578,24 +1815,49 @@ export class MissionGraphSession {
       }
       const recoveryNode = Object.values(this.record.graph.nodes).find(
         (candidate) => {
-          if (candidate.status !== "queued") return false;
+          if (
+            candidate.status !== "queued" &&
+            candidate.status !== "blocked"
+          ) {
+            return false;
+          }
           const recovery = candidate.outputs.validationRecovery;
-          return (
+          const conventionalRecovery =
             recovery !== null &&
             typeof recovery === "object" &&
             !Array.isArray(recovery) &&
             (recovery as Record<string, unknown>).status ===
-              "awaiting_correction"
+              "awaiting_correction";
+          const conventionalFastNodeId = conventionalRecovery
+            ? (recovery as Record<string, unknown>).fastNodeId
+            : null;
+          const compositeFastNodeId =
+            compositeValidationRecoveryNodeIdV1(candidate);
+          const fastNodeId =
+            typeof conventionalFastNodeId === "string"
+              ? conventionalFastNodeId
+              : compositeFastNodeId;
+          return Boolean(
+            fastNodeId &&
+              this.record.graph.nodes[fastNodeId]?.status === "queued",
           );
         },
       );
       if (!recoveryNode) {
         return { graph: this.record.graph, recorded: false };
       }
-      const recovery = recoveryNode.outputs
-        .validationRecovery as Record<string, unknown>;
-      const fastNodeId = recovery.fastNodeId;
-      if (typeof fastNodeId !== "string") {
+      const recovery = recoveryNode.outputs.validationRecovery;
+      const conventionalRecovery =
+        recovery !== null &&
+        typeof recovery === "object" &&
+        !Array.isArray(recovery)
+          ? (recovery as Record<string, unknown>)
+          : null;
+      const fastNodeId =
+        typeof conventionalRecovery?.fastNodeId === "string"
+          ? conventionalRecovery.fastNodeId
+          : compositeValidationRecoveryNodeIdV1(recoveryNode);
+      if (!fastNodeId) {
         throw new Error(
           `Validation recovery on ${recoveryNode.id} lost its exact fast-validation node binding.`,
         );
@@ -1609,25 +1871,29 @@ export class MissionGraphSession {
       const graph = await this.applyUnlocked(
         `Record receipt-backed workspace correction for ${recoveryNode.id}.`,
         [
-          {
-            op: "set_outputs",
-            nodeId: recoveryNode.id,
-            outputs: {
-              ...recoveryNode.outputs,
-              validationRecovery: {
-                ...recovery,
-                status: "correction_recorded",
-                correction: {
-                  toolName: input.toolName,
-                  path: normalizedPath,
-                  eligiblePaths,
-                  receiptId: input.receiptId,
-                  receiptFingerprint: input.receiptFingerprint,
-                  observedAt: input.observedAt,
+          ...(conventionalRecovery
+            ? ([
+                {
+                  op: "set_outputs" as const,
+                  nodeId: recoveryNode.id,
+                  outputs: {
+                    ...recoveryNode.outputs,
+                    validationRecovery: {
+                      ...conventionalRecovery,
+                      status: "correction_recorded",
+                      correction: {
+                        toolName: input.toolName,
+                        path: normalizedPath,
+                        eligiblePaths,
+                        receiptId: input.receiptId,
+                        receiptFingerprint: input.receiptFingerprint,
+                        observedAt: input.observedAt,
+                      },
+                    },
+                  },
                 },
-              },
-            },
-          },
+              ] as const)
+            : []),
           {
             op: "set_status",
             nodeId: fastNodeId,
@@ -1639,6 +1905,169 @@ export class MissionGraphSession {
       );
       return { graph, recorded: true };
     });
+  }
+
+  /**
+   * A successful composite recovery node pays the blocked origin without
+   * replaying the failed provider call. Recovery nodes carry the exact same
+   * closed lifecycle authority as their origin, so their terminal proof can
+   * be projected onto the origin with new graph-local evidence/receipt IDs.
+   * The loop also collapses a bounded chain when a recovery stage itself
+   * needed another correction cycle.
+   */
+  private async reconcileValidationRecoveryOriginUnlocked(
+    completedRecoveryNode: MissionNodeV3,
+  ): Promise<MissionGraphV3> {
+    let recoveredNode = completedRecoveryNode;
+    while (recoveredNode.status === "complete") {
+      const origin = Object.values(this.record.graph.nodes).find(
+        (candidate) => {
+          if (
+            candidate.status !== "blocked" ||
+            candidate.blocker?.code !== "validation_recovery_pending"
+          ) {
+            return false;
+          }
+          return (
+            compositeValidationRecoveryNodeIdV1(candidate) ===
+            recoveredNode.id
+          );
+        },
+      );
+      if (!origin) break;
+
+      const originLifecycle = getMissionCompositeLifecycleSpecV1(origin);
+      const originState = getMissionCompositeLifecycleStateV1(origin);
+      const recoveryLifecycle =
+        getMissionCompositeLifecycleSpecV1(recoveredNode);
+      const recoveryState =
+        getMissionCompositeLifecycleStateV1(recoveredNode);
+      if (
+        !originLifecycle ||
+        !originState ||
+        !recoveryLifecycle ||
+        !recoveryState ||
+        originLifecycle.intentFingerprint !==
+          recoveryLifecycle.intentFingerprint ||
+        originLifecycle.stage !== recoveryLifecycle.stage ||
+        JSON.stringify(originLifecycle.actions) !==
+          JSON.stringify(recoveryLifecycle.actions) ||
+        recoveryState.actionCursor !== recoveryLifecycle.actions.length
+      ) {
+        throw new Error(
+          `Completed validation recovery ${recoveredNode.id} does not match the closed lifecycle authority of ${origin.id}.`,
+        );
+      }
+
+      const actionAttemptCounts = Object.fromEntries(
+        originLifecycle.actions.flatMap((action) => {
+          const count = Math.min(
+            10,
+            (originState.actionAttemptCounts[action.id] ?? 0) +
+              (recoveryState.actionAttemptCounts[action.id] ?? 0),
+          );
+          return count > 0 ? [[action.id, count] as const] : [];
+        }),
+      );
+      const operations: MissionGraphPatchOperationV1[] = [
+        ...recoveredNode.evidence.map(
+          (evidence, index): MissionGraphPatchOperationV1 => ({
+            op: "append_evidence",
+            nodeId: origin.id,
+            evidence: {
+              ...evidence,
+              id: missionGraphLocalReferenceId(
+                `validation-recovery-evidence-${String(index + 1).padStart(3, "0")}`,
+                origin.id,
+                this.record.graph.revision + 1,
+              ),
+            },
+          }),
+        ),
+        ...recoveredNode.receipts.map(
+          (receipt, index): MissionGraphPatchOperationV1 => ({
+            op: "append_receipt",
+            nodeId: origin.id,
+            receipt: {
+              ...receipt,
+              id: missionGraphLocalReferenceId(
+                `validation-recovery-receipt-${String(index + 1).padStart(3, "0")}`,
+                origin.id,
+                this.record.graph.revision + 1,
+              ),
+            },
+          }),
+        ),
+        {
+          op: "set_outputs",
+          nodeId: origin.id,
+          outputs: {
+            lifecycleActionCursor: recoveryState.actionCursor,
+            lifecycleCompletedActionIds: [
+              ...recoveryState.completedActionIds,
+            ],
+            lifecycleSkippedActionIds: [...recoveryState.skippedActionIds],
+            lifecycleActionAttemptCounts: actionAttemptCounts,
+          },
+        },
+        {
+          op: "set_status",
+          nodeId: origin.id,
+          expectedStatus: "blocked",
+          status: "ready",
+          blocker: null,
+        },
+        {
+          op: "set_status",
+          nodeId: origin.id,
+          expectedStatus: "ready",
+          status: "running",
+          blocker: null,
+        },
+        {
+          op: "set_status",
+          nodeId: origin.id,
+          expectedStatus: "running",
+          status: "verifying",
+          blocker: null,
+        },
+        {
+          op: "set_status",
+          nodeId: origin.id,
+          expectedStatus: "verifying",
+          status: "complete",
+          blocker: null,
+        },
+      ];
+      for (const candidate of Object.values(this.record.graph.nodes)) {
+        if (
+          candidate.status === "queued" &&
+          !isFastValidationAwaitingCorrection(
+            this.record.graph,
+            candidate.id,
+          ) &&
+          candidate.dependencyIds.every(
+            (dependencyId) =>
+              dependencyId === origin.id ||
+              this.record.graph.nodes[dependencyId]?.status === "complete",
+          )
+        ) {
+          operations.push({
+            op: "set_status",
+            nodeId: candidate.id,
+            expectedStatus: "queued",
+            status: "ready",
+            blocker: null,
+          });
+        }
+      }
+      await this.applyUnlocked(
+        `Reconcile closed validation recovery ${recoveredNode.id} into ${origin.id}.`,
+        operations,
+      );
+      recoveredNode = this.record.graph.nodes[origin.id]!;
+    }
+    return this.record.graph;
   }
 
   /**
@@ -2777,19 +3206,50 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+const COMPOSITE_VALIDATION_RECOVERY_ACTION_PREFIX =
+  "Apply an eligible workspace correction, then complete validation recovery node ";
+
+function compositeValidationRecoveryRequiredActionV1(
+  recoveryNodeId: string,
+): string {
+  return `${COMPOSITE_VALIDATION_RECOVERY_ACTION_PREFIX}${recoveryNodeId}.`;
+}
+
+function compositeValidationRecoveryNodeIdV1(
+  node: Pick<MissionNodeV3, "blocker">,
+): string | null {
+  if (
+    node.blocker?.code !== "validation_recovery_pending" ||
+    !node.blocker.requiredAction?.startsWith(
+      COMPOSITE_VALIDATION_RECOVERY_ACTION_PREFIX,
+    ) ||
+    !node.blocker.requiredAction.endsWith(".")
+  ) {
+    return null;
+  }
+  const nodeId = node.blocker.requiredAction.slice(
+    COMPOSITE_VALIDATION_RECOVERY_ACTION_PREFIX.length,
+    -1,
+  );
+  return /^[A-Za-z0-9._-]{1,128}$/u.test(nodeId) ? nodeId : null;
+}
+
 function isFastValidationAwaitingCorrection(
   graph: MissionGraphV3,
   fastNodeId: string,
 ): boolean {
   return Object.values(graph.nodes).some((candidate) => {
     const recovery = candidate.outputs.validationRecovery;
-    return (
+    const conventionalRecovery =
       recovery !== null &&
       typeof recovery === "object" &&
       !Array.isArray(recovery) &&
       (recovery as Record<string, unknown>).status ===
         "awaiting_correction" &&
-      (recovery as Record<string, unknown>).fastNodeId === fastNodeId
+      (recovery as Record<string, unknown>).fastNodeId === fastNodeId;
+    return (
+      conventionalRecovery ||
+      compositeValidationRecoveryNodeIdV1(candidate) === fastNodeId
     );
   });
 }

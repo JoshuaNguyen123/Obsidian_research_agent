@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CODE_EXECUTION_TOOL_ALLOW,
+  CODE_IMPLEMENTATION_TOOL_ALLOW,
+  CODE_VALIDATION_TOOL_ALLOW,
   GITHUB_CLEANUP_DESTRUCTIVE_TOOL_ALLOW,
   GITHUB_STAGE_READ_TOOL_ALLOW,
   GITHUB_STAGE_SAFE_MUTATION_TOOL_ALLOW,
@@ -26,17 +28,32 @@ test("toolsAllowedForLifecycleStage returns stage-scoped tool names", () => {
   const research = toolsAllowedForLifecycleStage("accepted_research");
   assert.ok(research.includes("web_search"));
   assert.ok(research.includes("web_fetch"));
+  assert.ok(research.includes("create_project_idea_brief"));
+  assert.ok(
+    toolsAllowedForEnvelopeStage("accepted_research").includes(
+      "create_project_idea_brief",
+    ),
+  );
   assert.ok(research.includes("publish_research_to_linear"));
   assert.ok(research.includes("semantic_search_notes"));
   assert.ok(research.includes("find_related_notes"));
   assert.ok(research.includes("get_note_graph_context"));
 
-  const code = toolsAllowedForLifecycleStage("code_execution");
-  assert.ok(code.includes("code_commit_verified"));
-  assert.ok(code.includes("code_validate_full"));
-  assert.ok(code.includes("code_workspace_patch"));
-  assert.ok(code.includes("code_workspace_mkdir"));
-  assert.ok(code.includes("code_repair_record_cycle"));
+  const implementation = toolsAllowedForLifecycleStage("code_execution");
+  assert.ok(implementation.includes("code_workspace_patch"));
+  assert.ok(implementation.includes("code_workspace_mkdir"));
+  assert.equal(implementation.includes("code_validate_full"), false);
+  assert.equal(implementation.includes("code_commit_verified"), false);
+
+  const validation = toolsAllowedForLifecycleStage("code_validation");
+  assert.ok(validation.includes("code_validate_full"));
+  assert.ok(validation.includes("code_repair_record_cycle"));
+  assert.ok(validation.includes("code_commit_verified"));
+  assert.equal(validation.includes("code_workspace_patch"), false);
+
+  const reflection = toolsAllowedForLifecycleStage("reflection");
+  assert.ok(reflection.includes("write_project_results"));
+  assert.ok(reflection.includes("append_jupyter_reflection"));
 });
 
 test("GitHub lifecycle stage separates catalog reads and safe mutations from destructive cleanup", () => {
@@ -59,25 +76,46 @@ test("GitHub lifecycle stage separates catalog reads and safe mutations from des
   }
 });
 
-test("CODE_EXECUTION_TOOL_ALLOW stays shared across lifecycle Soft-union envelope and route base", () => {
-  const lifecycle = new Set(toolsAllowedForLifecycleStage("code_execution"));
-  const envelope = new Set(toolsAllowedForEnvelopeStage("code_execution"));
+test("code route union stays shared while lifecycle and envelope keep implementation and validation separate", () => {
+  const implementationLifecycle = new Set(
+    toolsAllowedForLifecycleStage("code_execution"),
+  );
+  const validationLifecycle = new Set(
+    toolsAllowedForLifecycleStage("code_validation"),
+  );
+  const implementationEnvelope = new Set(
+    toolsAllowedForEnvelopeStage("code_execution"),
+  );
+  const validationEnvelope = new Set(
+    toolsAllowedForEnvelopeStage("code_validation"),
+  );
   const routeBase = new Set(ROUTE_BASE_TOOLS.code);
   for (const tool of CODE_EXECUTION_TOOL_ALLOW) {
-    assert.ok(lifecycle.has(tool), `lifecycle missing ${tool}`);
-    assert.ok(envelope.has(tool), `envelope missing ${tool}`);
     assert.ok(routeBase.has(tool), `ROUTE_BASE_TOOLS.code missing ${tool}`);
     assert.ok(
       SET_LOOSE_BOUND_TOOL_NAMES.has(tool),
       `SET_LOOSE_BOUND_TOOL_NAMES missing ${tool}`,
     );
   }
-  assert.ok(envelope.has("append_to_current_file"));
-  assert.ok(envelope.has("read_current_file"));
-  assert.equal(lifecycle.has("append_to_current_file"), false);
+  for (const tool of CODE_IMPLEMENTATION_TOOL_ALLOW) {
+    assert.ok(implementationLifecycle.has(tool), `implementation missing ${tool}`);
+    assert.ok(implementationEnvelope.has(tool), `implementation envelope missing ${tool}`);
+    assert.equal(validationLifecycle.has(tool), false, `${tool} leaked into validation`);
+  }
+  for (const tool of CODE_VALIDATION_TOOL_ALLOW) {
+    assert.ok(validationLifecycle.has(tool), `validation missing ${tool}`);
+    assert.ok(validationEnvelope.has(tool), `validation envelope missing ${tool}`);
+    assert.equal(implementationLifecycle.has(tool), false, `${tool} leaked into implementation`);
+  }
+  assert.ok(implementationEnvelope.has("append_to_current_file"));
+  assert.ok(implementationEnvelope.has("read_current_file"));
+  assert.ok(validationEnvelope.has("append_to_current_file"));
+  assert.ok(validationEnvelope.has("read_current_file"));
+  assert.equal(implementationLifecycle.has("append_to_current_file"), false);
+  assert.equal(validationLifecycle.has("append_to_current_file"), false);
 
   const softUnion = toolsOfferedForSetLoosePipeline({
-    stages: ["code_execution"],
+    stages: ["code_execution", "code_validation"],
     currentStage: "code_execution",
     passedFastRepairCycle: false,
   });

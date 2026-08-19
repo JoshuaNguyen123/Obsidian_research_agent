@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
-import type { ScopedExtensionContextV1 } from "../packages/core-api/src";
+import type { JsonValueV1, ScopedExtensionContextV1 } from "../packages/core-api/src";
+import { sha256Fingerprint } from "../packages/headless-runtime/src/canonicalize";
 import { verifyPreparedActionFingerprint } from "../src/agent/actions";
 
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
@@ -13,6 +14,8 @@ import {
   buildSandboxProbeCommandV2,
   type SandboxCommandRunnerV2,
   type SandboxHostCommandSpecV2,
+  type PreparedSandboxActionV2,
+  type SandboxExecutionReceiptV2,
   type SandboxProviderConfigV2,
   type SandboxRunnerResultV2,
 } from "../extensions/code/sandbox/SandboxManager";
@@ -28,6 +31,11 @@ import {
   CodeSandboxContributionErrorV2,
   createCodeExecutionContributionsV2,
 } from "../extensions/code/sandbox/CodeExecutionContributionsV2";
+import {
+  DurableSandboxExecutionJournalV1,
+  type DurableSandboxExecutionJournalPersistenceV1,
+  type DurableSandboxExecutionNamespaceV1,
+} from "../extensions/code/sandbox/DurableSandboxExecutionJournalV1";
 
 const PROBE = JSON.stringify({
   version: 1,
@@ -434,6 +442,7 @@ test("code contribution factory replaces compatibility execution tools with prep
   let observedValidationReceipts = 0;
   const contributions = createCodeExecutionContributionsV2({
     sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
     async getProfile(key) {
       return key === fixture.profile.key ? fixture.profile : null;
     },
@@ -458,14 +467,7 @@ test("code contribution factory replaces compatibility execution tools with prep
       assert.equal(input.requestId, "request-1");
       assert.equal(input.action.repairRequestId, "request-1");
       assert.equal(input.receipt.actionId, input.action.id);
-      return {
-        version: 1,
-        kindName: "code_validation",
-        kind: "fast",
-        id: input.receipt.id,
-        fingerprint: `sha256:${"9".repeat(64)}`,
-        failureFingerprint: null,
-      };
+      return durableValidationReceipt(input);
     },
   });
   const tools = contributions
@@ -578,6 +580,7 @@ test("validation contribution withholds success when durable receipt persistence
   const source = new TextEncoder().encode("export const value = 1;\n");
   const contributions = createCodeExecutionContributionsV2({
     sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
     getProfile: async () => fixture.profile,
     resolveExecutionInput: async () => ({
       stagedFiles: [{ path: "src/index.ts", bytes: source }],
@@ -619,6 +622,283 @@ test("validation contribution withholds success when durable receipt persistence
   assert.equal(executions, 1, "sandbox ran once, but no green tool result was returned");
 });
 
+test("code contributions require a journal and never dispatch when its write-ahead marker fails", async () => {
+  let executions = 0;
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: {
+      async run(spec) {
+        if (spec.purpose === "boundary_probe") {
+          return { exitCode: 0, stdout: PROBE, stderr: "" };
+        }
+        executions += 1;
+        return { exitCode: 0, stdout: "must not run", stderr: "" };
+      },
+    },
+    now: () => new Date("2026-07-12T12:00:00.000Z"),
+  });
+  const fixture = prepareInput();
+  assert.throws(
+    () => createCodeExecutionContributionsV2({
+      sandboxManager: manager,
+      getProfile: async () => fixture.profile,
+    } as never),
+    (error: unknown) =>
+      error instanceof CodeSandboxContributionErrorV2 &&
+      error.code === "sandbox_execution_journal_required",
+  );
+
+  const source = new TextEncoder().encode("export const value = 1;\n");
+  const contributions = createCodeExecutionContributionsV2({
+    sandboxManager: manager,
+    executionJournal: testExecutionJournal({ failWriteAt: 2 }),
+    getProfile: async () => fixture.profile,
+    resolveExecutionInput: async () => ({
+      stagedFiles: [{ path: "src/index.ts", bytes: source }],
+    }),
+  });
+  await manager.probeProviders();
+  const validation = contributions
+    .filter((entry) => entry.descriptor.kind === "tool")
+    .map((entry) => entry as Extract<typeof entry, { tool: unknown }>)
+    .find((entry) => entry.tool.name === "code_validate_fast")!.tool;
+  const prepared = await validation.prepare!({
+    profileKey: fixture.profile.key,
+    projectId: fixture.projectId,
+    commandId: fixture.commandId,
+    workspaceId: fixture.workspaceId,
+    repairRequestId: fixture.repairRequestId,
+    workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
+    stagingManifest: fixture.stagingManifest,
+    environment: fixture.environment,
+  }, context());
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  await assert.rejects(
+    validation.executePrepared!(prepared.action, context({
+      authorizedAction: authorization(prepared.action),
+    })),
+    (error: unknown) =>
+      error instanceof CodeSandboxContributionErrorV2 &&
+      error.code === "sandbox_journal_dispatch_failed",
+  );
+  assert.equal(executions, 0);
+});
+
+test("sandbox reconciliation uses durable execution and validation receipts without replay", async () => {
+  let executions = 0;
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: {
+      async run(spec) {
+        if (spec.purpose === "boundary_probe") {
+          return { exitCode: 0, stdout: PROBE, stderr: "" };
+        }
+        executions += 1;
+        return { exitCode: 0, stdout: "green", stderr: "" };
+      },
+    },
+    now: () => new Date("2026-07-12T12:00:00.000Z"),
+  });
+  const fixture = prepareInput();
+  const source = new TextEncoder().encode("export const value = 1;\n");
+  let durableExecution: SandboxExecutionReceiptV2 | null = null;
+  let durableValidation: Record<string, unknown> | null = null;
+  const contributions = createCodeExecutionContributionsV2({
+    sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
+    getProfile: async () => fixture.profile,
+    resolveExecutionInput: async () => ({
+      stagedFiles: [{ path: "src/index.ts", bytes: source }],
+    }),
+    async observeValidationReceipt(input) {
+      durableExecution = structuredClone(input.receipt);
+      const evidence = {
+        operationId: input.receipt.actionId,
+        kind: "fast" as const,
+        sandboxId: "sandbox-durable-fast",
+        freshSandbox: true,
+        startedAt: input.receipt.startedAt,
+        completedAt: input.receipt.completedAt,
+        checks: [{ label: "root:test", exitCode: 0, stdout: "hash", stderr: "hash", durationMs: 0 }],
+        status: "passed" as const,
+        failureFingerprint: null,
+        binding: {
+          requestId: input.action.repairRequestId,
+          workspaceId: input.action.workspaceId,
+          profileKey: input.action.profileKey,
+          inputWorkspaceManifestFingerprint: input.action.workspaceManifestFingerprint,
+          validatedWorkspaceManifestFingerprint: input.action.workspaceManifestFingerprint,
+          workspaceChangedPaths: ["src/index.ts"],
+          stagingManifestFingerprint: await sha256Fingerprint(input.action.stagingManifest),
+          stagedFiles: input.action.stagingManifest,
+          importedArtifacts: [],
+        },
+      };
+      durableValidation = {
+        version: 1,
+        kindName: "code_validation",
+        id: input.receipt.id,
+        ...evidence,
+        fingerprint: await sha256Fingerprint(evidence),
+      };
+      return durableValidation as never;
+    },
+    async reconcileExecutionReceipt() {
+      if (!durableExecution || !durableValidation) {
+        return { outcome: "still_uncertain", message: "No durable receipt yet." };
+      }
+      return {
+        outcome: "committed",
+        receipt: structuredClone(durableExecution),
+        validationReceipt: structuredClone(durableValidation) as never,
+      };
+    },
+  });
+  await manager.probeProviders();
+  const validation = contributions
+    .filter((entry) => entry.descriptor.kind === "tool")
+    .map((entry) => entry as Extract<typeof entry, { tool: unknown }>)
+    .find((entry) => entry.tool.name === "code_validate_fast")!.tool;
+  const prepared = await validation.prepare!({
+    profileKey: fixture.profile.key,
+    projectId: fixture.projectId,
+    commandId: fixture.commandId,
+    workspaceId: fixture.workspaceId,
+    repairRequestId: "request-1",
+    workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
+    stagingManifest: fixture.stagingManifest,
+    environment: fixture.environment,
+  }, context());
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  await validation.executePrepared!(prepared.action, context({
+    authorizedAction: authorization(prepared.action),
+  }));
+  const reconciled = await validation.reconcile!(prepared.action, context());
+  assert.equal(reconciled.outcome, "committed");
+  assert.equal(reconciled.receipt?.commitKind, "reconciled");
+  assert.equal(reconciled.receipt?.grantId, "grant-1");
+  assert.equal(executions, 1, "reconciliation must not execute the sandbox again");
+});
+
+test("sandbox reconciliation accepts only explicit fingerprinted not-applied proof", async () => {
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: { async run() { return { exitCode: 0, stdout: PROBE, stderr: "" }; } },
+    now: () => new Date("2026-07-12T12:00:00.000Z"),
+  });
+  const fixture = prepareInput();
+  let actionId = "";
+  let actionFingerprint = "";
+  const checkedAt = "2026-07-12T12:01:00.000Z";
+  const contributions = createCodeExecutionContributionsV2({
+    sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
+    getProfile: async () => fixture.profile,
+    async reconcileExecutionReceipt() {
+      const evidence = { actionId, actionFingerprint, checkedAt };
+      return {
+        outcome: "not_applied",
+        proof: { ...evidence, fingerprint: await sha256Fingerprint(evidence) },
+        message: "Durable dispatch journal proves execution never started.",
+      };
+    },
+  });
+  await manager.probeProviders();
+  const validation = contributions
+    .filter((entry) => entry.descriptor.kind === "tool")
+    .map((entry) => entry as Extract<typeof entry, { tool: unknown }>)
+    .find((entry) => entry.tool.name === "code_validate_fast")!.tool;
+  const prepared = await validation.prepare!({
+    profileKey: fixture.profile.key,
+    projectId: fixture.projectId,
+    commandId: fixture.commandId,
+    workspaceId: fixture.workspaceId,
+    repairRequestId: "request-1",
+    workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
+    stagingManifest: fixture.stagingManifest,
+    environment: fixture.environment,
+  }, context());
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const sandboxAction = (prepared.action.normalizedArgs as {
+    sandboxAction: { id: string; payloadFingerprint: string };
+  }).sandboxAction;
+  actionId = sandboxAction.id;
+  actionFingerprint = sandboxAction.payloadFingerprint;
+  const reconciled = await validation.reconcile!(prepared.action, context());
+  assert.equal(reconciled.outcome, "not_applied");
+});
+
+test("supplemental not-applied evidence cannot downgrade a durable uncertain dispatch", async () => {
+  let executions = 0;
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: {
+      async run(spec) {
+        if (spec.purpose === "boundary_probe") {
+          return { exitCode: 0, stdout: PROBE, stderr: "" };
+        }
+        executions += 1;
+        return { exitCode: 0, stdout: "must not run", stderr: "" };
+      },
+    },
+    now: () => new Date("2026-07-12T12:00:00.000Z"),
+  });
+  const fixture = prepareInput();
+  const journal = testExecutionJournal();
+  const contributions = createCodeExecutionContributionsV2({
+    sandboxManager: manager,
+    executionJournal: journal,
+    getProfile: async () => fixture.profile,
+    async reconcileExecutionReceipt({ action }) {
+      const evidence = {
+        actionId: action.id,
+        actionFingerprint: action.payloadFingerprint,
+        checkedAt: "2026-07-12T12:01:00.000Z",
+      };
+      return {
+        outcome: "not_applied",
+        proof: {
+          ...evidence,
+          fingerprint: await sha256Fingerprint(evidence),
+        },
+        message: "Supplemental source claims the action was not applied.",
+      };
+    },
+  });
+  await manager.probeProviders();
+  const validation = contributions
+    .filter((entry) => entry.descriptor.kind === "tool")
+    .map((entry) => entry as Extract<typeof entry, { tool: unknown }>)
+    .find((entry) => entry.tool.name === "code_validate_fast")!.tool;
+  const prepared = await validation.prepare!({
+    profileKey: fixture.profile.key,
+    projectId: fixture.projectId,
+    commandId: fixture.commandId,
+    workspaceId: fixture.workspaceId,
+    repairRequestId: fixture.repairRequestId,
+    workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
+    stagingManifest: fixture.stagingManifest,
+    environment: fixture.environment,
+  }, context());
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const sandboxAction = (prepared.action.normalizedArgs as unknown as {
+    sandboxAction: PreparedSandboxActionV2;
+  }).sandboxAction;
+  await journal.markDispatching({
+    runId: prepared.action.runId,
+    action: sandboxAction,
+  });
+
+  const reconciled = await validation.reconcile!(prepared.action, context());
+  assert.equal(reconciled.outcome, "still_uncertain");
+  assert.match(reconciled.message ?? "", /cannot downgrade/iu);
+  assert.equal(executions, 0, "reconciliation must never replay sandbox execution");
+});
+
 test("failed validation exposes a redacted bounded foreground excerpt while durable observer sees hashes only", async () => {
   const durableSources: unknown[] = [];
   const bareCredential = `github_pat_${"z".repeat(40)}`;
@@ -647,21 +927,14 @@ test("failed validation exposes a redacted bounded foreground excerpt while dura
   const source = new TextEncoder().encode("export const value = 1;\n");
   const contributions = createCodeExecutionContributionsV2({
     sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
     getProfile: async () => fixture.profile,
     resolveExecutionInput: async () => ({
       stagedFiles: [{ path: "src/index.ts", bytes: source }],
     }),
     async observeValidationReceipt(input) {
       durableSources.push(structuredClone(input.diagnostics));
-      return {
-        version: 1,
-        kindName: "code_validation",
-        kind: "fast",
-        id: input.receipt.id,
-        status: "failed",
-        fingerprint: `sha256:${"8".repeat(64)}`,
-        failureFingerprint: `sha256:${"7".repeat(64)}`,
-      };
+      return durableValidationReceipt(input);
     },
   });
   await manager.probeProviders();
@@ -822,6 +1095,89 @@ test("SpawnSandboxCommandRunnerV2 launches only fixed provider argv with clean b
       error.code === "unsupported_staging",
   );
 });
+
+function testExecutionJournal(
+  options: { failWriteAt?: number } = {},
+): DurableSandboxExecutionJournalV1 {
+  let namespace: DurableSandboxExecutionNamespaceV1 | null = null;
+  let writes = 0;
+  const persistence: DurableSandboxExecutionJournalPersistenceV1 = {
+    async readNamespace() {
+      return namespace === null ? null : structuredClone(namespace);
+    },
+    async writeNamespace(next, expectedRevision) {
+      writes += 1;
+      if (
+        writes === options.failWriteAt ||
+        (namespace?.revision ?? 0) !== expectedRevision
+      ) {
+        return false;
+      }
+      namespace = structuredClone(next);
+      return true;
+    },
+  };
+  let tick = 0;
+  return new DurableSandboxExecutionJournalV1(
+    persistence,
+    () =>
+      new Date(
+        Date.parse("2026-07-12T12:00:00.000Z") + tick++ * 1_000,
+      ),
+  );
+}
+
+async function durableValidationReceipt(input: {
+  action: PreparedSandboxActionV2;
+  receipt: SandboxExecutionReceiptV2;
+}): Promise<JsonValueV1> {
+  const evidence = {
+    operationId: input.action.id,
+    kind: input.action.purpose === "validation_targeted"
+      ? "targeted" as const
+      : input.action.purpose === "validation_full"
+        ? "full" as const
+        : "fast" as const,
+    sandboxId: `sandbox-${input.receipt.id}`,
+    freshSandbox: true,
+    startedAt: input.receipt.startedAt,
+    completedAt: input.receipt.completedAt,
+    checks: [{
+      label: "fixture validation",
+      exitCode: input.receipt.exitCode,
+      stdout: input.receipt.stdoutSha256,
+      stderr: input.receipt.stderrSha256,
+      durationMs: 0,
+    }],
+    status: input.receipt.status === "verified" ? "passed" as const : "failed" as const,
+    failureFingerprint:
+      input.receipt.status === "verified" ? null : `sha256:${"7".repeat(64)}`,
+    binding: {
+      requestId: input.action.repairRequestId,
+      workspaceId: input.action.workspaceId,
+      profileKey: input.action.profileKey,
+      inputWorkspaceManifestFingerprint: input.action.workspaceManifestFingerprint,
+      validatedWorkspaceManifestFingerprint: input.action.workspaceManifestFingerprint,
+      workspaceChangedPaths: input.action.stagingManifest.map((file) => file.path),
+      stagingManifestFingerprint: await sha256Fingerprint(input.action.stagingManifest),
+      stagedFiles: input.action.stagingManifest,
+      importedArtifacts: input.receipt.importedArtifacts.map(
+        ({ path, sha256: artifactSha256, bytes }) => ({
+          path,
+          sha256: artifactSha256,
+          bytes,
+        }),
+      ),
+    },
+  };
+  return {
+    version: 1,
+    kindName: "code_validation",
+    id: input.receipt.id,
+    ...evidence,
+    fingerprint: await sha256Fingerprint(evidence),
+  } as unknown as JsonValueV1;
+}
 
 function prepareInput() {
   const source = new TextEncoder().encode("export const value = 1;\n");

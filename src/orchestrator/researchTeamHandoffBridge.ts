@@ -25,11 +25,8 @@ function sha256Hex(text: string): string {
   return `sha256:${portableSha256Text(text)}`;
 }
 
-function isReadyHandoff(handoff: WorkerHandoff): boolean {
-  return (
-    handoff.status === "ready" ||
-    handoff.status === "accepted"
-  );
+function isAcceptedHandoff(handoff: WorkerHandoff): boolean {
+  return handoff.status === "accepted";
 }
 
 function isHttpUrl(value: string): boolean {
@@ -139,13 +136,16 @@ export function resolveAcceptedResearchEvidenceFromWorker(input: {
 export function buildAcceptedResearchArtifactFromWorkerHandoff(input: {
   handoff: WorkerHandoff;
   notePath: string;
-  noteSha256?: string;
+  /** Exact SHA-256 returned by the host after writing and reading the note. */
+  noteSha256: string;
+  /** Durable receipt for the host-verified note mutation/readback. */
+  noteReceiptId: string;
   runId: string;
   /** Host-observed worker evidence; required for real URL/path provenance. */
   evidence?: MissionEvidence[];
 }): AcceptedResearchArtifactV1 | { ok: false; reason: string } {
   const { handoff, notePath, runId } = input;
-  if (!isReadyHandoff(handoff)) {
+  if (!isAcceptedHandoff(handoff)) {
     return { ok: false, reason: `handoff_status_${handoff.status}` };
   }
   if (handoff.evidenceIds.length === 0 && handoff.sourceIds.length === 0) {
@@ -158,6 +158,14 @@ export function buildAcceptedResearchArtifactFromWorkerHandoff(input: {
   if (!path || !path.endsWith(".md")) {
     return { ok: false, reason: "invalid_note_path" };
   }
+  const noteSha = input.noteSha256.trim();
+  if (!/^sha256:[0-9a-f]{64}$/u.test(noteSha)) {
+    return { ok: false, reason: "verified_note_hash_required" };
+  }
+  const noteReceiptId = input.noteReceiptId.trim();
+  if (!noteReceiptId) {
+    return { ok: false, reason: "verified_note_receipt_required" };
+  }
   const evidence = resolveAcceptedResearchEvidenceFromWorker({
     handoff,
     runId,
@@ -166,9 +174,6 @@ export function buildAcceptedResearchArtifactFromWorkerHandoff(input: {
   if (evidence.length === 0) {
     return { ok: false, reason: "no_resolvable_evidence_references" };
   }
-  const noteSha =
-    input.noteSha256?.trim() ||
-    sha256Hex(`note:${runId}:${path}:${handoff.id}`);
   try {
     return createAcceptedResearchArtifactV1({
       schemaVersion: 1,
@@ -177,7 +182,7 @@ export function buildAcceptedResearchArtifactFromWorkerHandoff(input: {
       vaultBindingKey: "current-vault",
       notePath: path,
       noteSha256: noteSha,
-      noteReceiptId: `note-receipt-${handoff.id}`.replace(/[^A-Za-z0-9._-]/g, "-"),
+      noteReceiptId,
       evidence,
       acceptanceCriteria: [
         {
@@ -204,12 +209,13 @@ export function buildResearcherHandoffV1FromWorker(input: {
   taskId: string;
   notePath: string;
   noteSha256: string;
+  noteReceiptId: string;
   acceptedArtifactFingerprint: string;
   artifact?: AcceptedResearchArtifactV1;
   evidence?: MissionEvidence[];
 }): ResearcherHandoffV1 | { ok: false; reason: string } {
   const { handoff } = input;
-  if (!isReadyHandoff(handoff)) {
+  if (!isAcceptedHandoff(handoff)) {
     return { ok: false, reason: `handoff_status_${handoff.status}` };
   }
   const artifact =
@@ -218,6 +224,7 @@ export function buildResearcherHandoffV1FromWorker(input: {
       handoff,
       notePath: input.notePath,
       noteSha256: input.noteSha256,
+      noteReceiptId: input.noteReceiptId,
       runId: input.runId,
       evidence: input.evidence,
     });

@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 
 import { sha256Fingerprint } from "../../../packages/headless-runtime/src/canonicalize";
+import {
+  isAgentGitCommitIdentityV1,
+  type AgentGitCommitIdentityV1,
+} from "../../../packages/core-api/src/agentGitCommitIdentityV1";
 
 import {
   classifyProtectedControlChanges,
@@ -1183,7 +1187,7 @@ export async function parseCodeRepairCheckpointV1(
   if (checkpoint.commitReadback) {
     assertExactKeys(checkpoint.commitReadback, [
       "operationId", "commitSha", "parentSha", "treeSha", "diffFingerprint",
-      "changedPaths", "artifactHashes", "readAt",
+      "changedPaths", "artifactHashes", "identity", "readAt",
     ], "commit readback");
     normalizeCommitReadback(checkpoint.commitReadback, checkpoint.commitReadback.operationId);
   }
@@ -1619,8 +1623,31 @@ function normalizeCommitReadback(
     diffFingerprint: assertSha256(input.diffFingerprint, "readback diff fingerprint"),
     changedPaths: normalizePathSet(input.changedPaths, "commit readback changed paths"),
     artifactHashes: normalizeArtifactReadback(input.artifactHashes),
+    identity: normalizeCommitIdentity(input.identity),
     readAt: assertBoundedString(input.readAt, "commit readback time", 1, 128),
   };
+}
+
+function normalizeCommitIdentity(input: AgentGitCommitIdentityV1): AgentGitCommitIdentityV1 {
+  assertPlainObject(input, "Git commit identity");
+  assertExactKeys(input, [
+    "authorName", "authorEmail", "committerName", "committerEmail",
+  ], "Git commit identity");
+  const identity = {
+    authorName: assertBoundedString(input.authorName, "Git author name", 1, 1_024),
+    authorEmail: assertBoundedString(input.authorEmail, "Git author email", 1, 1_024),
+    committerName: assertBoundedString(input.committerName, "Git committer name", 1, 1_024),
+    committerEmail: assertBoundedString(input.committerEmail, "Git committer email", 1, 1_024),
+  };
+  if (
+    Object.values(identity).some((value) => /[\0\r\n]/u.test(value)) ||
+    !isAgentGitCommitIdentityV1(identity)
+  ) {
+    throw new Error(
+      "Git commit readback does not contain the host-pinned Agentic Researcher author and committer identity.",
+    );
+  }
+  return identity;
 }
 
 function normalizeExpectedArtifacts(input: ExpectedArtifactV1[]): ExpectedArtifactV1[] {
@@ -1865,6 +1892,7 @@ async function createVerifiedCommitReceipt(input: {
       path: file.path,
       sha256: file.afterSha256,
     })),
+    identity: normalizeCommitIdentity(input.commitReadback.identity),
     targetedValidationReceiptId: input.targetedValidation.id,
     fullValidationReceiptId: input.fullValidation.id,
     targetedValidationFingerprint: input.targetedValidation.fingerprint,
@@ -2056,6 +2084,7 @@ function assertExactVerifiedCommitReceipt(receipt: VerifiedLocalCommitReceiptV1)
     "version", "kind", "id", "status", "requestId", "runId", "worktreeId",
     "workspaceId", "branch", "baseSha", "commitSha", "parentSha", "treeSha",
     "diffFingerprint", "changedPaths", "artifactHashes", "changedArtifacts",
+    "identity",
     "targetedValidationReceiptId", "fullValidationReceiptId",
     "targetedValidationFingerprint", "fullValidationFingerprint", "committedAt",
     "fingerprint",
@@ -2066,6 +2095,7 @@ function assertExactVerifiedCommitReceipt(receipt: VerifiedLocalCommitReceiptV1)
   for (const artifact of receipt.changedArtifacts) {
     assertExactKeys(artifact, ["path", "sha256"], "verified changed artifact");
   }
+  normalizeCommitIdentity(receipt.identity);
 }
 
 function sameStrings(left: string[], right: string[]): boolean {

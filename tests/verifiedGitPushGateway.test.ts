@@ -5,7 +5,6 @@ import test from "node:test";
 import {
   AGENT_GIT_COMMIT_EMAIL_V1,
   AGENT_GIT_COMMIT_NAME_V1,
-  LEGACY_AGENT_GIT_COMMIT_EMAIL_V1,
 } from "../packages/core-api/src/agentGitCommitIdentityV1";
 import { createVerifiedCodePublicationHandoffV1 } from "../packages/core-api/src/verifiedCodePublicationHandoffV1";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
@@ -15,6 +14,14 @@ import {
   createTrustedGitHubRepositoryBindingV1,
   parseTrustedGitHubRepositoryBindingV1,
 } from "../src/integrations/github/TrustedGitHubRepositoryBindingV1";
+import {
+  createTrustedGitHubRepositoryBindingV2,
+} from "../src/integrations/github/TrustedGitHubRepositoryBindingV2";
+import {
+  DurableGitPushAttemptStoreV1,
+  parseGitPushAttemptNamespaceV1,
+  type GitPushAttemptNamespaceV1,
+} from "../src/integrations/github/GitPushAttemptStore";
 import {
   VerifiedGitPushErrorV1,
   VerifiedGitPushGatewayV1,
@@ -34,6 +41,115 @@ const FP_A = `sha256:${"a".repeat(64)}`;
 const FP_B = `sha256:${"b".repeat(64)}`;
 const ROOT = "C:\\agent-worktrees\\repair-1";
 const TOKEN = "github-secret-that-must-never-cross-the-broker";
+
+test("gateway rejects public, stale, unknown, and mismatched targets before Git or credential access", async () => {
+  const cases = [
+    createFixture({ repositoryVisibility: "public" }),
+    createFixture({ visibilityObservedAt: "2026-07-12T11:57:00.000Z" }),
+    createFixture({ visibilityRepository: "different-repository" }),
+  ];
+  for (const fixture of cases) {
+    await assert.rejects(
+      fixture.gateway.push(fixture.input),
+      (error: unknown) =>
+        error instanceof VerifiedGitPushErrorV1 &&
+        error.code === "repository_visibility_unverified",
+    );
+    assert.equal(fixture.runner.calls.length, 0);
+    assert.equal(fixture.broker.calls, 0);
+    assert.equal(fixture.store.all().length, 0);
+  }
+
+  const unknown = createFixture();
+  await assert.rejects(
+    unknown.gateway.push({
+      ...unknown.input,
+      privateRepositoryBinding: undefined as never,
+    }),
+    (error: unknown) =>
+      error instanceof VerifiedGitPushErrorV1 &&
+      error.code === "repository_visibility_unverified",
+  );
+  assert.equal(unknown.runner.calls.length, 0);
+  assert.equal(unknown.broker.calls, 0);
+  assert.equal(unknown.store.all().length, 0);
+
+  const stale = createFixture({
+    visibilityObservedAt: "2026-07-12T11:57:00.000Z",
+  });
+  await assert.rejects(
+    stale.gateway.push({
+      ...stale.input,
+      privateRepositoryBinding: {
+        ...stale.privateRepositoryBinding,
+        observedAt: "2026-07-12T12:02:59.000Z",
+      },
+    }),
+    (error: unknown) =>
+      error instanceof VerifiedGitPushErrorV1 &&
+      error.code === "repository_visibility_unverified",
+  );
+  assert.equal(stale.runner.calls.length, 0);
+  assert.equal(stale.broker.calls, 0);
+  assert.equal(stale.store.all().length, 0);
+});
+
+test("gateway permits an explicitly approved fresh public target", async () => {
+  const fixture = createFixture({
+    repositoryVisibility: "public",
+    expectedVisibility: "public",
+  });
+  const result = await fixture.gateway.push(fixture.input);
+  assert.equal(result.status, "pushed_verified");
+  assert.equal(fixture.runner.pushes, 1);
+  assert.equal(fixture.broker.calls, 1);
+});
+
+test("private and public visibility evidence cannot reuse an attempt or receipt", async () => {
+  const fixture = createFixture();
+  const privateResult = await fixture.gateway.push(fixture.input);
+  assert.equal(privateResult.status, "pushed_verified");
+  if (privateResult.status !== "pushed_verified") return;
+
+  const publicRepositoryBinding = createTrustedGitHubRepositoryBindingV2({
+    key: fixture.binding.key,
+    profile: fixture.profile,
+    owner: fixture.binding.owner,
+    repository: fixture.binding.repository,
+    repositoryReadback: {
+      id: fixture.binding.repositoryId,
+      fullName: `${fixture.binding.owner}/${fixture.binding.repository}`,
+      htmlUrl: `https://github.com/${fixture.binding.owner}/${fixture.binding.repository}`,
+      defaultBranch: fixture.binding.defaultBranch,
+      private: false,
+      visibility: "public",
+      archived: false,
+    },
+    expectedVisibility: "public",
+    observedAt: "2026-07-12T12:02:31.000Z",
+    verifiedAccountId: fixture.binding.verifiedAccountId,
+    verifiedAccountLogin: fixture.binding.verifiedAccountLogin,
+    trustedAt: fixture.binding.trustedAt,
+  });
+  const publicResult = await fixture.gateway.push({
+    ...fixture.input,
+    privateRepositoryBinding: publicRepositoryBinding,
+    expectedVisibility: "public",
+  });
+  assert.equal(publicResult.status, "pushed_verified");
+  if (publicResult.status !== "pushed_verified") return;
+
+  assert.notEqual(publicResult.receipt.id, privateResult.receipt.id);
+  assert.notEqual(publicResult.receipt.fingerprint, privateResult.receipt.fingerprint);
+  assert.notEqual(
+    publicResult.receipt.repositoryVisibilityBindingFingerprint,
+    privateResult.receipt.repositoryVisibilityBindingFingerprint,
+  );
+  assert.equal(publicResult.receipt.repositoryVisibility, "public");
+  assert.equal(privateResult.receipt.repositoryVisibility, "private");
+  assert.equal(fixture.store.all().length, 2);
+  assert.equal(fixture.runner.pushes, 1, "the visibility transition must not redispatch an already-present commit");
+});
 
 test("VerifiedGitPushGateway pushes a new agent branch and verifies remote readback", async () => {
   const fixture = createFixture();
@@ -111,6 +227,50 @@ test("ambiguous push is persisted for reconciliation and is never retried", asyn
   assert.equal(fixture.runner.pushes, 1);
 });
 
+test("non-durable verified state is rejected and the durable dispatch marker suppresses replay", async () => {
+  const fixture = createFixture();
+  let durable: GitPushAttemptNamespaceV1 | null = null;
+  let volatile: GitPushAttemptNamespaceV1 | null = null;
+  let writes = 0;
+  const store = new DurableGitPushAttemptStoreV1({
+    async read() { return clone(durable); },
+    async write(next, expectedRevision) {
+      assert.equal(durable?.revision ?? 0, expectedRevision);
+      writes += 1;
+      volatile = clone(next);
+      if (writes === 1) durable = clone(next);
+      return true;
+    },
+  });
+  const gateway = new VerifiedGitPushGatewayV1({
+    runner: fixture.runner,
+    askpassBroker: fixture.broker,
+    attemptStore: store,
+    disabledHooksPath: "C:\\agent-runtime\\empty-hooks",
+    now: tickingClock(),
+  });
+
+  await assert.rejects(
+    gateway.push(fixture.input),
+    /exact written namespace/i,
+  );
+  assert.equal(fixture.runner.pushes, 1);
+  assert.equal(
+    Object.values(parseGitPushAttemptNamespaceV1(volatile).attempts)[0]?.status,
+    "verified",
+    "the simulated non-durable cache observed a verified replacement",
+  );
+  assert.equal(
+    Object.values(parseGitPushAttemptNamespaceV1(durable).attempts)[0]?.status,
+    "dispatching",
+    "only the exact durable dispatch marker may drive restart behavior",
+  );
+
+  const retried = await gateway.push(fixture.input);
+  assert.equal(retried.status, "reconcile_required");
+  assert.equal(fixture.runner.pushes, 1, "ambiguous durable dispatch must never replay");
+});
+
 test("failed remote readback remains reconcile-required without a second dispatch", async () => {
   const fixture = createFixture({ pushMode: "readback_mismatch" });
   const result = await fixture.gateway.push(fixture.input);
@@ -140,6 +300,75 @@ test("auth-failed push is not_applied and may retry after a Contents-capable cre
   const second = await fixture.gateway.push(fixture.input);
   assert.equal(second.status, "pushed_verified");
   assert.equal(fixture.runner.pushes, 2);
+});
+
+test("durable auth-heal retry archives prior evidence and accepts a refreshed V2 observation", async () => {
+  const fixture = createFixture({ pushMode: "auth_failure" });
+  let namespace: GitPushAttemptNamespaceV1 | null = null;
+  const store = new DurableGitPushAttemptStoreV1({
+    async read() {
+      return clone(namespace);
+    },
+    async write(next, expectedRevision) {
+      if ((namespace?.revision ?? 0) !== expectedRevision) return false;
+      namespace = clone(next);
+      return true;
+    },
+  });
+  const gateway = new VerifiedGitPushGatewayV1({
+    runner: fixture.runner,
+    askpassBroker: fixture.broker,
+    attemptStore: store,
+    disabledHooksPath: "C:\\agent-runtime\\empty-hooks",
+    now: tickingClock(),
+  });
+  const first = await gateway.push(fixture.input);
+  assert.equal(first.status, "not_applied");
+
+  const refreshed = createTrustedGitHubRepositoryBindingV2({
+    key: fixture.binding.key,
+    profile: fixture.profile,
+    owner: fixture.binding.owner,
+    repository: fixture.binding.repository,
+    repositoryReadback: {
+      id: fixture.binding.repositoryId,
+      fullName: `${fixture.binding.owner}/${fixture.binding.repository}`,
+      htmlUrl: `https://github.com/${fixture.binding.owner}/${fixture.binding.repository}`,
+      defaultBranch: fixture.binding.defaultBranch,
+      private: true,
+      visibility: "private",
+      archived: false,
+    },
+    expectedVisibility: "private",
+    observedAt: "2026-07-12T12:03:00.000Z",
+    verifiedAccountId: fixture.binding.verifiedAccountId,
+    verifiedAccountLogin: fixture.binding.verifiedAccountLogin,
+    trustedAt: fixture.binding.trustedAt,
+  });
+  assert.notEqual(
+    refreshed.visibilityAttestationFingerprint,
+    fixture.privateRepositoryBinding.visibilityAttestationFingerprint,
+  );
+  fixture.runner.pushMode = "success";
+  const healed = await gateway.push({
+    ...fixture.input,
+    privateRepositoryBinding: refreshed,
+  });
+  assert.equal(healed.status, "pushed_verified");
+  assert.equal(fixture.runner.pushes, 2);
+
+  const persisted = namespace as unknown as GitPushAttemptNamespaceV1;
+  const [attempt] = Object.values(persisted.attempts);
+  assert.equal(attempt?.status, "verified");
+  assert.equal(attempt?.retryHistory.length, 1);
+  assert.equal(
+    attempt?.retryHistory[0]?.visibilityAttestationFingerprint,
+    fixture.privateRepositoryBinding.visibilityAttestationFingerprint,
+  );
+  assert.equal(
+    attempt?.visibilityAttestationFingerprint,
+    refreshed.visibilityAttestationFingerprint,
+  );
 });
 
 test("verbose auth failure with the fatal line past 1000 bytes is still not_applied", async () => {
@@ -280,14 +509,20 @@ test("a GitHub-linked author or committer is blocked before credential or remote
   }
 });
 
-test("the earlier local-only agent identity remains publication compatible", async () => {
+test("the earlier localhost agent identity is blocked before publication", async () => {
   const fixture = createFixture({
-    authorEmail: LEGACY_AGENT_GIT_COMMIT_EMAIL_V1,
-    committerEmail: LEGACY_AGENT_GIT_COMMIT_EMAIL_V1,
+    authorEmail: "agentic-researcher@localhost",
+    committerEmail: "agentic-researcher@localhost",
   });
-  const result = await fixture.gateway.push(fixture.input);
-  assert.equal(result.status, "pushed_verified");
-  assert.equal(fixture.runner.pushes, 1);
+  await assert.rejects(
+    fixture.gateway.push(fixture.input),
+    (error: unknown) =>
+      error instanceof VerifiedGitPushErrorV1 &&
+      error.code === "commit_identity_mismatch",
+  );
+  assert.equal(fixture.runner.remoteReads, 0);
+  assert.equal(fixture.runner.pushes, 0);
+  assert.equal(fixture.broker.calls, 0);
 });
 
 test("an already-present exact remote commit is verified without push", async () => {
@@ -338,6 +573,10 @@ function createFixture(options: {
   authorEmail?: string;
   committerName?: string;
   committerEmail?: string;
+  repositoryVisibility?: "private" | "public";
+  expectedVisibility?: "private" | "public";
+  visibilityObservedAt?: string;
+  visibilityRepository?: string;
 } = {}) {
   const profile = detectRepositoryProfileV2({
     key: "fixture",
@@ -356,6 +595,30 @@ function createFixture(options: {
     verifiedAccountId: 202,
     verifiedAccountLogin: "agent-owner",
     trustedAt: "2026-07-12T12:02:00.000Z",
+  });
+  const repositoryVisibility = options.repositoryVisibility ?? "private";
+  const visibilityRepository =
+    options.visibilityRepository ?? binding.repository;
+  const privateRepositoryBinding = createTrustedGitHubRepositoryBindingV2({
+    key: binding.key,
+    profile,
+    owner: binding.owner,
+    repository: visibilityRepository,
+    repositoryReadback: {
+      id: visibilityRepository === binding.repository ? binding.repositoryId : 102,
+      fullName: `${binding.owner}/${visibilityRepository}`,
+      htmlUrl: `https://github.com/${binding.owner}/${visibilityRepository}`,
+      defaultBranch: binding.defaultBranch,
+      private: repositoryVisibility === "private",
+      visibility: repositoryVisibility,
+      archived: false,
+    },
+    expectedVisibility: repositoryVisibility,
+    observedAt:
+      options.visibilityObservedAt ?? "2026-07-12T12:02:30.000Z",
+    verifiedAccountId: binding.verifiedAccountId,
+    verifiedAccountLogin: binding.verifiedAccountLogin,
+    trustedAt: binding.trustedAt,
   });
   const handoff = createVerifiedCodePublicationHandoffV1({
     id: "handoff-1",
@@ -393,10 +656,13 @@ function createFixture(options: {
     store,
     profile,
     binding,
+    privateRepositoryBinding,
     handoff,
     input: {
       handoff,
       binding,
+      privateRepositoryBinding,
+      expectedVisibility: options.expectedVisibility ?? "private",
       profile,
       credentialReferenceId: "secret-ref-github-1",
     },
@@ -613,6 +879,12 @@ function localCommitReceipt(): VerifiedLocalCommitReceiptV1 {
     changedPaths: ["src/fix.ts"],
     artifactHashes: [{ path: "src/fix.ts", sha256: FP_A, bytes: 42 }],
     changedArtifacts: [{ path: "src/fix.ts", sha256: FP_A }],
+    identity: {
+      authorName: AGENT_GIT_COMMIT_NAME_V1,
+      authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+      committerName: AGENT_GIT_COMMIT_NAME_V1,
+      committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+    },
     targetedValidationReceiptId: "targeted-1",
     fullValidationReceiptId: "full-1",
     targetedValidationFingerprint: FP_A,

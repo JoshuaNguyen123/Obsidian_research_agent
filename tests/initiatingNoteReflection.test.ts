@@ -13,11 +13,12 @@ import {
 } from "../src/agent/pipelineLineage";
 import type { ProjectLineageV1 } from "../src/agent/projectLifecycle";
 import type { MissionLedger } from "../src/agent/missionLedger";
+import { verifiedCodeReflectionFixture } from "./fixtures/verifiedCodeReflection";
+import { extractVerifiedCommitBoundCodeExamplesV1 } from "../e2e/fixtures/reflectionAssertions";
 
 const fp = (char: string) => `sha256:${char.repeat(64)}`;
 
-function verifiedLineage(): ProjectLineageV1 {
-  const commitSha = "a".repeat(40);
+function verifiedLineage(commitSha = "a".repeat(40)): ProjectLineageV1 {
   return {
     schemaVersion: 1,
     kind: "project_lineage",
@@ -303,5 +304,57 @@ test("continuation segments sharing a root marker append one reflection", () => 
   assert.equal(
     (twice.match(/^## Mission completion reflection$/gmu) ?? []).length,
     1,
+  );
+});
+
+test("reflection renders concise examples only from a matching verified commit bundle", () => {
+  const { examples } = verifiedCodeReflectionFixture();
+  const pipeline = buildPipelineLineageV1({
+    lineage: verifiedLineage(examples.commitSha),
+  });
+  const plan = buildInitiatingNoteReflectionV1({
+    runId: "run-code-example",
+    pipeline,
+    initiatingNotePath: "Research/Source.md",
+    codeExamples: examples,
+  });
+  assert.match(plan.markdown, /### Verified code example/u);
+  assert.match(plan.markdown, /`src\/add\.ts` lines 1-3/u);
+  assert.match(plan.markdown, /```typescript/u);
+  assert.match(plan.markdown, /return left \+ right/u);
+  assert.equal(plan.cites.codeExamples[0]?.artifactSha256, examples.examples[0]?.artifactSha256);
+  assert.ok(
+    plan.markdown.includes(
+      `excerpt hash \`${examples.examples[0]!.codeSha256}\``,
+    ),
+  );
+  const parsedExamples = extractVerifiedCommitBoundCodeExamplesV1(plan.markdown);
+  assert.equal(parsedExamples.length, 1);
+  assert.equal(parsedExamples[0]?.codeSha256, examples.examples[0]?.codeSha256);
+  assert.equal(parsedExamples[0]?.code, examples.examples[0]?.code);
+
+  assert.throws(
+    () => buildInitiatingNoteReflectionV1({
+      runId: "run-wrong-commit",
+      pipeline: buildPipelineLineageV1({ lineage: verifiedLineage() }),
+      initiatingNotePath: "Research/Source.md",
+      codeExamples: examples,
+    }),
+    /must match the pipeline commit SHA/iu,
+  );
+});
+
+test("append helper rejects marker and URL only completion artifacts", () => {
+  assert.throws(
+    () => appendInitiatingNoteReflectionMarkdown("# Source\n", {
+      marker: "<!-- agentic-initiating-reflection:run-empty -->",
+      markdown: [
+        "## Mission completion reflection",
+        "<!-- agentic-initiating-reflection:run-empty -->",
+        "https://linear.app/acme/issue/ABC-1",
+        "https://github.com/acme/repo/pull/1",
+      ].join("\n"),
+    }),
+    /meaningful explanatory prose/iu,
   );
 });

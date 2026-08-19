@@ -42,7 +42,12 @@ test.describe("Core native product health", () => {
         { placeholderCurrentNote: true },
       );
 
-      await harness.submitMission(TRANSFORMER_BRIEF_PROMPT, {
+      const expectedCanvasPath =
+        `Designs/e2e-core-transformer-${harness.marker}.canvas`;
+      const missionPrompt =
+        `${TRANSFORMER_BRIEF_PROMPT} Save the diagram Canvas as ` +
+        `\`${expectedCanvasPath}\`.`;
+      await harness.submitMission(missionPrompt, {
         timeoutMs: 8 * 60_000,
       });
       const snapshot = await harness.attestProductionRun({
@@ -155,6 +160,7 @@ test.describe("Core native product health", () => {
       expect(canvasReceipt, JSON.stringify(safeState)).toBeTruthy();
       expect(typeof markdownPath, JSON.stringify(safeState)).toBe("string");
       expect(typeof canvasPath, JSON.stringify(safeState)).toBe("string");
+      expect(canvasPath, JSON.stringify(safeState)).toBe(expectedCanvasPath);
       expect(terminalGraph, JSON.stringify(safeState)).toBe(true);
       expect(noUnrequestedResearch, JSON.stringify(safeState)).toBe(true);
       expect(staleBlockerVisible, JSON.stringify(safeState)).toBe(false);
@@ -208,7 +214,7 @@ test.describe("Core native product health", () => {
       const proof: MissionE2EProofV1 = {
         version: 1,
         scenarioId: "CORE-01",
-        promptSha256: sha256Text(TRANSFORMER_BRIEF_PROMPT),
+        promptSha256: sha256Text(missionPrompt),
         runId: String(snapshot.runId),
         productionModelCalls,
         graphTerminal: terminalGraph,

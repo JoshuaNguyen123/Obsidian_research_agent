@@ -13,6 +13,7 @@ import {
   expectSha256,
   expectString,
   fingerprintContract,
+  parseHttpUrl,
   parseUniqueStrings,
   parseVaultMarkdownPath,
 } from "../integrations/linear/LinearContractSupport";
@@ -32,20 +33,67 @@ export const PROJECT_LIFECYCLE_STAGES = Object.freeze([
   "accepted_research",
   "linear_hierarchy",
   "code_execution",
+  "code_validation",
   "private_github_publication",
+  "reflection",
   "reconciliation_cleanup",
 ] as const);
 
 export type ProjectLifecycleStageV1 = (typeof PROJECT_LIFECYCLE_STAGES)[number];
+
+/** Quiet, user-facing labels shared by progress surfaces and reports. */
+export const PROJECT_LIFECYCLE_STAGE_LABELS_V1: Readonly<
+  Record<ProjectLifecycleStageV1, string>
+> = Object.freeze({
+  accepted_research: "Research & design",
+  linear_hierarchy: "Linear planning",
+  code_execution: "Implementation",
+  code_validation: "Validation",
+  private_github_publication: "GitHub publication",
+  reflection: "Reflection",
+  reconciliation_cleanup: "Reconciliation & cleanup",
+});
+
+export function projectLifecycleStageLabelV1(
+  stage: ProjectLifecycleStageV1,
+): string {
+  return PROJECT_LIFECYCLE_STAGE_LABELS_V1[stage];
+}
 
 /** Canonical lifecycle vocabulary for new durable state. */
 export const PROJECT_LIFECYCLE_STAGES_V2 = Object.freeze([
   "accepted_research",
   "linear_hierarchy",
   "code_execution",
+  "code_validation",
   "github_publication",
+  "reflection",
   "reconciliation_cleanup",
 ] as const);
+
+/**
+ * Persisted V1 lineages created before validation and reflection became
+ * first-class stages remain valid. New intents always use
+ * `PROJECT_LIFECYCLE_STAGES`; lineage parsing accepts this legacy sequence as
+ * an exact compatibility branch rather than silently rewriting durable proof.
+ */
+const LEGACY_PROJECT_LINEAGE_STAGES_V1 = Object.freeze([
+  "accepted_research",
+  "linear_hierarchy",
+  "code_execution",
+  "private_github_publication",
+  "reconciliation_cleanup",
+] as const satisfies readonly ProjectLifecycleStageV1[]);
+
+/** A legacy in-flight lineage may opt into the new reflection proof. */
+const REFLECTION_UPGRADED_LEGACY_PROJECT_LINEAGE_STAGES_V1 = Object.freeze([
+  "accepted_research",
+  "linear_hierarchy",
+  "code_execution",
+  "private_github_publication",
+  "reflection",
+  "reconciliation_cleanup",
+] as const satisfies readonly ProjectLifecycleStageV1[]);
 
 export type ProjectLifecycleStageV2 =
   (typeof PROJECT_LIFECYCLE_STAGES_V2)[number];
@@ -200,6 +248,20 @@ export interface LinearHierarchyLineageProofV1 {
   issueIds: string[];
   workItemFingerprints: string[];
   providerReadbackFingerprints: string[];
+  /**
+   * Exact provider-read child bindings for receipt-driven progress. Legacy
+   * lineage may omit these; omission disables automatic per-issue projection.
+   */
+  workUnits?: LinearHierarchyWorkUnitBindingV1[];
+}
+
+export interface LinearHierarchyWorkUnitBindingV1 {
+  workUnitId: string;
+  linearIssueId: string;
+  linearIssueIdentifier: string;
+  linearIssueUrl: string;
+  acceptanceCriterionIds: string[];
+  providerReadbackFingerprint: string;
 }
 
 export interface CodeExecutionLineageProofV1 {
@@ -209,6 +271,19 @@ export interface CodeExecutionLineageProofV1 {
   workspaceId: string;
   validationReceiptFingerprints: string[];
   /** Exact verified workspace diff bound into the commit handoff. */
+  diffFingerprint?: string;
+  targetedValidationPassed: true;
+  freshFullValidationPassed: true;
+  commitSha: string;
+  commitReadbackFingerprint: string;
+}
+
+export interface CodeValidationLineageProofV1 {
+  stage: "code_validation";
+  repositoryProfileKey: string;
+  repositoryProfileFingerprint: string;
+  workspaceId: string;
+  validationReceiptFingerprints: string[];
   diffFingerprint?: string;
   targetedValidationPassed: true;
   freshFullValidationPassed: true;
@@ -245,6 +320,36 @@ export interface GitHubPublicationLineageProofV2 {
   pullRequestReadbackFingerprint: string;
 }
 
+/**
+ * ProjectLineageV1 keeps its historical publication stage label for durable
+ * ordering compatibility. This explicitly versioned proof carries canonical
+ * V2 visibility truth without pretending a public repository was private.
+ * Legacy private proofs remain a separate, unchanged contract.
+ */
+export interface VisibilityBoundGitHubPublicationLineageProofV1 {
+  stage: "private_github_publication";
+  proofVersion: 2;
+  trustedBindingFingerprint: string;
+  owner: string;
+  repository: string;
+  visibility: RepositoryVisibility;
+  verifiedVisibility: true;
+  branch: string;
+  pullRequestNumber: number;
+  draft: true;
+  remoteSha: string;
+  repositoryReadbackFingerprint: string;
+  pullRequestReadbackFingerprint: string;
+}
+
+export interface ReflectionLineageProofV1 {
+  stage: "reflection";
+  resultsPath: string;
+  resultsSha256: string;
+  writeReceiptFingerprint: string;
+  summaryFingerprint: string;
+}
+
 export interface ReconciliationCleanupLineageProofV1 {
   stage: "reconciliation_cleanup";
   backlinkReceiptFingerprints: string[];
@@ -257,7 +362,10 @@ export type ProjectLifecycleStageProofV1 =
   | AcceptedResearchLineageProofV1
   | LinearHierarchyLineageProofV1
   | CodeExecutionLineageProofV1
+  | CodeValidationLineageProofV1
   | PrivateGitHubPublicationLineageProofV1
+  | VisibilityBoundGitHubPublicationLineageProofV1
+  | ReflectionLineageProofV1
   | ReconciliationCleanupLineageProofV1;
 
 export interface ProjectLifecycleStageCommitV1 {
@@ -582,9 +690,12 @@ export function migratePrivateGitHubPublicationLineageProofV1ToV2(
   value: unknown,
 ): GitHubPublicationLineageProofV2 {
   const proof = parseStageProof(value);
-  if (proof.stage !== "private_github_publication") {
+  if (
+    proof.stage !== "private_github_publication" ||
+    "proofVersion" in proof
+  ) {
     throw new DurableLinearContractError(
-      "Legacy GitHub publication proof must use private_github_publication.",
+      "Legacy GitHub publication proof must use the unversioned private-only contract.",
     );
   }
   return {
@@ -608,7 +719,29 @@ export function parseGitHubPublicationLineageProofV2(
 ): GitHubPublicationLineageProofV2 {
   const record = expectPlainRecord(value, "GitHub publication lineage proof v2");
   if (record.stage === "private_github_publication") {
-    return migratePrivateGitHubPublicationLineageProofV1ToV2(record);
+    const compatible = parseStageProof(record);
+    if (
+      compatible.stage === "private_github_publication" &&
+      "proofVersion" in compatible
+    ) {
+      return {
+        stage: "github_publication",
+        trustedBindingFingerprint: compatible.trustedBindingFingerprint,
+        owner: compatible.owner,
+        repository: compatible.repository,
+        visibility: compatible.visibility,
+        verifiedVisibility: true,
+        branch: compatible.branch,
+        pullRequestNumber: compatible.pullRequestNumber,
+        draft: true,
+        remoteSha: compatible.remoteSha,
+        repositoryReadbackFingerprint:
+          compatible.repositoryReadbackFingerprint,
+        pullRequestReadbackFingerprint:
+          compatible.pullRequestReadbackFingerprint,
+      };
+    }
+    return migratePrivateGitHubPublicationLineageProofV1ToV2(compatible);
   }
   assertExactKeys(
     record,
@@ -695,6 +828,32 @@ export function projectGitHubPublicationLineageProofV2ToV1(
 }
 
 /**
+ * Visibility-safe projection for the V1 lineage container. The stage label is
+ * retained solely for V1 ordering; proofVersion and verifiedVisibility make
+ * the repository's actual visibility explicit and non-forgeable.
+ */
+export function projectGitHubPublicationLineageProofV2ToCompatibleV1(
+  value: unknown,
+): VisibilityBoundGitHubPublicationLineageProofV1 {
+  const proof = parseGitHubPublicationLineageProofV2(value);
+  return {
+    stage: "private_github_publication",
+    proofVersion: 2,
+    trustedBindingFingerprint: proof.trustedBindingFingerprint,
+    owner: proof.owner,
+    repository: proof.repository,
+    visibility: proof.visibility,
+    verifiedVisibility: true,
+    branch: proof.branch,
+    pullRequestNumber: proof.pullRequestNumber,
+    draft: true,
+    remoteSha: proof.remoteSha,
+    repositoryReadbackFingerprint: proof.repositoryReadbackFingerprint,
+    pullRequestReadbackFingerprint: proof.pullRequestReadbackFingerprint,
+  };
+}
+
+/**
  * Deterministic stage classification. Action verbs are required so provider
  * names in source text cannot widen the mission. Explicit negation wins.
  */
@@ -710,7 +869,7 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   const isNegated = (targetPattern: string) => {
     if (
       new RegExp(
-        `\\b(?:without|skip|exclude)\\b[^.\\n]{0,100}\\b(?:${targetPattern})\\b`,
+        `\\b(?:without|skip|exclude)\\b[^.!?;\\n]{0,100}\\b(?:${targetPattern})\\b`,
         "u",
       ).test(normalized)
     ) {
@@ -721,7 +880,7 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
     }
     const target = new RegExp(`\\b(?:${targetPattern})\\b`, "u");
     for (const match of normalized.matchAll(
-      /\b(?:do not|don't|never)\b([^.\n]{0,120})/gu,
+      /\b(?:do not|don't|never)\b([^.!?;\n]{0,120})/gu,
     )) {
       const rest = match[1] ?? "";
       if (/^\s*(?:stop|ask|wait|continue|idle|halt|pause)\b/u.test(rest)) {
@@ -747,7 +906,28 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
     /\blinear\b[\s\S]{0,900}\b(?:repository|repo|workspace)\b[\s\S]{0,900}\bgithub\b[\s\S]{0,900}\breflection\b/u.test(
       normalized,
     );
-  if (isEndToEndUnlock || isCompoundPipelineUnlock) {
+  // An ordinary developer request should unlock the complete journey without
+  // requiring a workflow checkbox or the literal phrase "full pipeline".
+  // Requiring all four action families keeps mere architectural discussion
+  // from widening into execution authority. Linear planning and reflection
+  // are then host-inferred delivery stages unless explicitly negated.
+  const developerMissionResearchText = normalized.replace(
+    /\b(?:(?:signed\s+)?accepted[- ]research|(?:the|this|that)\s+research)(?:['’]s)?\b/gu,
+    "existing specification",
+  );
+  const isDeveloperMissionUnlock =
+    /\b(?:research|investigate|study|analy[sz]e)\b/u.test(
+      developerMissionResearchText,
+    ) &&
+    !isNegated("research|investigat(?:e|ion)") &&
+    /\b(?:implement|code|build|develop|create)\b[^.\n]{0,180}\b(?:code|implementation|repository|repo|workspace|app|library|module|service|feature|project|it)\b/u.test(normalized) &&
+    !isNegated("code|implement(?:ation)?|repository|repo|workspace") &&
+    /\b(?:test|validate|verify|check)\b/u.test(normalized) &&
+    !isNegated("test(?:ing|s)?|validat(?:e|ion)|verify|checks?") &&
+    (/(?:\b(?:publish|push|open|create|ship)\b[^.\n]{0,180}\b(?:github|draft\s+(?:pr|pull request)|pull request)\b)/u.test(normalized) ||
+      /\bgithub\b[^.\n]{0,120}\b(?:publish|push|draft\s+(?:pr|pull request)|pull request|ship)\b/u.test(normalized)) &&
+    !isNegated("github|publish(?:ing|ation)?|push|pull request|draft pr|private repository|ship");
+  if (isEndToEndUnlock || isCompoundPipelineUnlock || isDeveloperMissionUnlock) {
     const cleanupAsked =
       /\b(?:cleanup|clean\s*up|reconcil(?:e|iation)|backlinks?|close)\b/u.test(normalized);
     return PROJECT_LIFECYCLE_STAGES.filter((stage) => {
@@ -758,11 +938,19 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
           return !isNegated("linear|initiative|project|issues?|hierarchy");
         case "code_execution":
           return !isNegated("code|implement(?:ation)?|repository|repo|workspace");
+        case "code_validation":
+          return !isNegated("test(?:ing|s)?|validat(?:e|ion)|verify|checks?");
         case "private_github_publication":
           return !isNegated("github|publish(?:ing|ation)?|push|pull request|draft pr|private repository");
+        case "reflection":
+          // A destination-only opt-out (for example, "not in Jupyter")
+          // selects the default Results note; it does not cancel the mission's
+          // terminal reflection. Only an explicit reflection/report/results
+          // opt-out removes the stage.
+          return !isNegated("reflect(?:ion)?|report|results?(?: note| page| report)?|retrospective|postmortem");
         case "reconciliation_cleanup":
-          // End-to-end keeps cleanup unless negated; compound unlocks omit it
-          // unless cleanup was explicitly asked for.
+          // End-to-end keeps cleanup unless negated; compound and natural
+          // developer missions omit it unless cleanup was explicitly asked.
           if (isEndToEndUnlock) {
             return !isNegated("cleanup|clean\\s*up|reconcil(?:e|iation)|backlinks?|close");
           }
@@ -780,7 +968,7 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   // References to an already accepted research contract are inputs to later
   // lifecycle stages, not a new instruction to perform or republish research.
   const researchIntentText = normalized.replace(
-    /\b(?:signed\s+)?accepted[- ]research(?:['’]s)?\b/gu,
+    /\b(?:(?:signed\s+)?accepted[- ]research|(?:the|this|that)\s+research)(?:['’]s)?\b/gu,
     "existing specification",
   );
   const positiveResearch = (pattern: RegExp) =>
@@ -820,8 +1008,32 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   ) {
     stages.push("code_execution");
   }
+  if (
+    positive(
+      /\b(?:test|validate|verify|check|run)\b[^.\n]{0,140}\b(?:tests?|validation|checks?|suite|build|implementation|code|workspace|repository|repo|commit)\b/u,
+      "test(?:ing|s)?|validat(?:e|ion)|verify|checks?",
+    ) ||
+    positive(
+      /\b(?:targeted|focused|full|integration|unit|end[- ]to[- ]end)\b[^.\n]{0,80}\b(?:tests?|validation|checks?|suite)\b/u,
+      "test(?:ing|s)?|validat(?:e|ion)|verify|checks?",
+    )
+  ) {
+    stages.push("code_validation");
+  }
   if (positive(/\b(?:publish|push|open|create)\b[^.\n]{0,140}\b(?:github|draft\s+(?:pr|pull request)|pull request|private\s+repository)\b/u, "github|publish(?:ing|ation)?|push|pull request|draft pr|private repository")) {
     stages.push("private_github_publication");
+  }
+  if (
+    positive(
+      /\b(?:write|append|create|record|summari[sz]e|produce)\b[^.\n]{0,140}\b(?:reflection|results?(?: note| page| report)?|retrospective|postmortem|jupyter\s+notebook|notebook)\b/u,
+      "reflect(?:ion)?|report|results?(?: note| page| report)?|retrospective|postmortem|jupyter|notebook",
+    ) ||
+    positive(
+      /\b(?:reflect|reflection)\b[^.\n]{0,140}\b(?:mission|project|work|results?|note|notebook|jupyter|completion)\b/u,
+      "reflect(?:ion)?|report|results?(?: note| page| report)?|retrospective|postmortem|jupyter|notebook",
+    )
+  ) {
+    stages.push("reflection");
   }
   if (
     positive(
@@ -886,17 +1098,12 @@ export function projectLifecycleStageEstimateForSetLoose(
   if (
     stage === "linear_hierarchy" ||
     stage === "code_execution" ||
+    stage === "code_validation" ||
     stage === "private_github_publication"
   ) {
     return {
       ...base,
       approvalMayPause: false,
-      label:
-        stage === "linear_hierarchy"
-          ? "Linear prepare, create, and readback"
-          : stage === "code_execution"
-            ? "Code implementation, validation, and commit"
-            : "Private GitHub publication and readback",
     };
   }
   return base;
@@ -928,7 +1135,7 @@ function projectLifecycleStageEstimate(
     case "accepted_research":
       return {
         stage,
-        label: "Research and Obsidian note",
+        label: projectLifecycleStageLabelV1(stage),
         activeMinutesMin: 4,
         activeMinutesMax: 12,
         approvalMayPause: false,
@@ -936,7 +1143,7 @@ function projectLifecycleStageEstimate(
     case "linear_hierarchy":
       return {
         stage,
-        label: "Linear prepare, approval, create, and readback",
+        label: projectLifecycleStageLabelV1(stage),
         activeMinutesMin: 2,
         activeMinutesMax: 6,
         approvalMayPause: true,
@@ -944,23 +1151,39 @@ function projectLifecycleStageEstimate(
     case "code_execution":
       return {
         stage,
-        label: "Code implementation, validation, and commit",
+        label: projectLifecycleStageLabelV1(stage),
         activeMinutesMin: 5,
-        activeMinutesMax: 20,
+        activeMinutesMax: 18,
+        approvalMayPause: true,
+      };
+    case "code_validation":
+      return {
+        stage,
+        label: projectLifecycleStageLabelV1(stage),
+        activeMinutesMin: 3,
+        activeMinutesMax: 12,
         approvalMayPause: true,
       };
     case "private_github_publication":
       return {
         stage,
-        label: "Private GitHub publication and readback",
+        label: projectLifecycleStageLabelV1(stage),
         activeMinutesMin: 2,
         activeMinutesMax: 7,
         approvalMayPause: true,
       };
+    case "reflection":
+      return {
+        stage,
+        label: projectLifecycleStageLabelV1(stage),
+        activeMinutesMin: 2,
+        activeMinutesMax: 6,
+        approvalMayPause: false,
+      };
     case "reconciliation_cleanup":
       return {
         stage,
-        label: "Backlinks, status reconciliation, and cleanup proof",
+        label: projectLifecycleStageLabelV1(stage),
         activeMinutesMin: 2,
         activeMinutesMax: 6,
         approvalMayPause: true,
@@ -1015,13 +1238,13 @@ export function advanceProjectLineageV1(input: {
 }): ProjectLineageV1 {
   const lineage = parseProjectLineageV1(input.lineage);
   const proof = parseStageProof(input.proof);
-  const expected = PROJECT_LIFECYCLE_STAGES[lineage.commits.length];
-  if (!expected) {
+  const expected = nextProjectLineageStages(lineage.commits.map((commit) => commit.stage));
+  if (expected.length === 0) {
     throw new DurableLinearContractError("Project lineage is already complete.");
   }
-  if (proof.stage !== expected) {
+  if (!expected.includes(proof.stage)) {
     throw new DurableLinearContractError(
-      `Project lineage expected ${expected} before ${proof.stage}.`,
+      `Project lineage expected ${expected.join(" or ")} before ${proof.stage}.`,
     );
   }
   assertLineageContinuity(lineage, proof);
@@ -1530,12 +1753,20 @@ function buildProjectLineage(input: {
   updatedAt: unknown;
 }): ProjectLineageV1 {
   if (input.commits.length < 1 || input.commits.length > PROJECT_LIFECYCLE_STAGES.length) {
-    throw new DurableLinearContractError("Project lineage requires 1-5 committed stages.");
+    throw new DurableLinearContractError(
+      `Project lineage requires 1-${PROJECT_LIFECYCLE_STAGES.length} committed stages.`,
+    );
+  }
+  const suppliedStages = input.commits.map((commit) => commit.stage);
+  if (!isValidProjectLineagePrefix(suppliedStages)) {
+    throw new DurableLinearContractError(
+      "Project lineage stages must be complete, unique, and in a supported canonical order.",
+    );
   }
   const commits = input.commits.map((commit, index) => {
     const proof = parseStageProof(commit.proof);
-    const expected = PROJECT_LIFECYCLE_STAGES[index];
-    if (commit.stage !== expected || proof.stage !== expected) {
+    const expected = suppliedStages[index];
+    if (proof.stage !== expected) {
       throw new DurableLinearContractError("Project lineage stages must be complete, unique, and in canonical order.");
     }
     return {
@@ -1569,6 +1800,37 @@ function buildProjectLineage(input: {
     commits: commits.map(({ committedAt: _committedAt, ...commit }) => commit),
   };
   return { ...fixed, fingerprint: fingerprintContract(stable) };
+}
+
+const PROJECT_LINEAGE_STAGE_SEQUENCES: readonly (readonly ProjectLifecycleStageV1[])[] = [
+  PROJECT_LIFECYCLE_STAGES,
+  LEGACY_PROJECT_LINEAGE_STAGES_V1,
+  REFLECTION_UPGRADED_LEGACY_PROJECT_LINEAGE_STAGES_V1,
+];
+
+function isValidProjectLineagePrefix(
+  stages: readonly ProjectLifecycleStageV1[],
+): boolean {
+  return PROJECT_LINEAGE_STAGE_SEQUENCES.some(
+    (sequence) =>
+      stages.length <= sequence.length &&
+      stages.every((stage, index) => stage === sequence[index]),
+  );
+}
+
+function nextProjectLineageStages(
+  stages: readonly ProjectLifecycleStageV1[],
+): ProjectLifecycleStageV1[] {
+  return [
+    ...new Set(
+      PROJECT_LINEAGE_STAGE_SEQUENCES.flatMap((sequence) =>
+        stages.length < sequence.length &&
+        stages.every((stage, index) => stage === sequence[index])
+          ? [sequence[stages.length]]
+          : [],
+      ),
+    ),
+  ];
 }
 
 function clone<T>(value: T): T {
@@ -1614,7 +1876,26 @@ function parseStageProof(value: unknown): ProjectLifecycleStageProofV1 {
         researcherHandoffFingerprint: expectSha256(record.researcherHandoffFingerprint, "researcher handoff fingerprint"),
       };
     case "linear_hierarchy":
-      assertExactKeys(record, ["stage", "planFingerprint", "workspaceId", "teamId", "initiativeId", "projectId", "issueIds", "workItemFingerprints", "providerReadbackFingerprints"], [], "Linear hierarchy lineage proof");
+      assertExactKeys(record, ["stage", "planFingerprint", "workspaceId", "teamId", "initiativeId", "projectId", "issueIds", "workItemFingerprints", "providerReadbackFingerprints"], ["workUnits"], "Linear hierarchy lineage proof");
+      const issueIds = parseUniqueStrings(record.issueIds, "Linear issue id", 1, 20, 160, expectOpaqueId);
+      const workItemFingerprints = parseUniqueStrings(record.workItemFingerprints, "work item fingerprint", 1, 20, 72, expectSha256);
+      const workUnits = record.workUnits === undefined
+        ? undefined
+        : parseLinearHierarchyWorkUnits(record.workUnits);
+      if (issueIds.length !== workItemFingerprints.length) {
+        throw new DurableLinearContractError(
+          "Linear hierarchy issue ids and work-item fingerprints must align one-to-one.",
+        );
+      }
+      if (
+        workUnits &&
+        (workUnits.length !== issueIds.length ||
+          workUnits.some((unit, index) => unit.linearIssueId !== issueIds[index]))
+      ) {
+        throw new DurableLinearContractError(
+          "Linear hierarchy work-unit bindings must align exactly with the ordered issue readbacks.",
+        );
+      }
       return {
         stage,
         planFingerprint: expectSha256(record.planFingerprint, "research project plan fingerprint"),
@@ -1622,14 +1903,15 @@ function parseStageProof(value: unknown): ProjectLifecycleStageProofV1 {
         teamId: expectOpaqueId(record.teamId, "Linear team id"),
         initiativeId: expectOpaqueId(record.initiativeId, "Linear initiative id"),
         projectId: expectOpaqueId(record.projectId, "Linear project id"),
-        issueIds: parseUniqueStrings(record.issueIds, "Linear issue id", 1, 20, 160, expectOpaqueId),
-        workItemFingerprints: parseUniqueStrings(record.workItemFingerprints, "work item fingerprint", 1, 20, 72, expectSha256),
+        issueIds,
+        workItemFingerprints,
         providerReadbackFingerprints: parseUniqueStrings(record.providerReadbackFingerprints, "Linear readback fingerprint", 3, 22, 72, expectSha256),
+        ...(workUnits ? { workUnits } : {}),
       };
     case "code_execution":
-      assertExactKeys(record, ["stage", "repositoryProfileKey", "repositoryProfileFingerprint", "workspaceId", "validationReceiptFingerprints", "targetedValidationPassed", "freshFullValidationPassed", "commitSha", "commitReadbackFingerprint"], ["diffFingerprint"], "code execution lineage proof");
+      assertExactKeys(record, ["stage", "repositoryProfileKey", "repositoryProfileFingerprint", "workspaceId", "validationReceiptFingerprints", "targetedValidationPassed", "freshFullValidationPassed", "commitSha", "commitReadbackFingerprint"], ["diffFingerprint"], "legacy code execution lineage proof");
       if (record.targetedValidationPassed !== true || record.freshFullValidationPassed !== true) {
-        throw new DurableLinearContractError("Code lineage requires targeted and fresh-full validation proof.");
+        throw new DurableLinearContractError("Legacy code lineage requires targeted and fresh-full validation proof.");
       }
       return {
         stage,
@@ -1650,7 +1932,87 @@ function parseStageProof(value: unknown): ProjectLifecycleStageProofV1 {
         commitSha: gitSha(record.commitSha, "local commit SHA"),
         commitReadbackFingerprint: expectSha256(record.commitReadbackFingerprint, "commit readback fingerprint"),
       };
+    case "code_validation":
+      assertExactKeys(record, ["stage", "repositoryProfileKey", "repositoryProfileFingerprint", "workspaceId", "validationReceiptFingerprints", "targetedValidationPassed", "freshFullValidationPassed", "commitSha", "commitReadbackFingerprint"], ["diffFingerprint"], "code validation lineage proof");
+      if (record.targetedValidationPassed !== true || record.freshFullValidationPassed !== true) {
+        throw new DurableLinearContractError("Code validation lineage requires targeted and fresh-full validation proof.");
+      }
+      return {
+        stage,
+        repositoryProfileKey: expectLogicalKey(record.repositoryProfileKey, "repository profile key"),
+        repositoryProfileFingerprint: expectSha256(record.repositoryProfileFingerprint, "repository profile fingerprint"),
+        workspaceId: expectOpaqueId(record.workspaceId, "code workspace id"),
+        validationReceiptFingerprints: parseUniqueStrings(record.validationReceiptFingerprints, "validation receipt fingerprint", 2, 20, 72, expectSha256),
+        ...(record.diffFingerprint === undefined
+          ? {}
+          : { diffFingerprint: expectSha256(record.diffFingerprint, "code diff fingerprint") }),
+        targetedValidationPassed: true,
+        freshFullValidationPassed: true,
+        commitSha: gitSha(record.commitSha, "local commit SHA"),
+        commitReadbackFingerprint: expectSha256(record.commitReadbackFingerprint, "commit readback fingerprint"),
+      };
     case "private_github_publication":
+      if (record.proofVersion === 2) {
+        assertExactKeys(
+          record,
+          [
+            "stage",
+            "proofVersion",
+            "trustedBindingFingerprint",
+            "owner",
+            "repository",
+            "visibility",
+            "verifiedVisibility",
+            "branch",
+            "pullRequestNumber",
+            "draft",
+            "remoteSha",
+            "repositoryReadbackFingerprint",
+            "pullRequestReadbackFingerprint",
+          ],
+          [],
+          "visibility-bound GitHub publication lineage proof",
+        );
+        if (
+          (record.visibility !== "public" &&
+            record.visibility !== "private") ||
+          record.verifiedVisibility !== true ||
+          record.draft !== true
+        ) {
+          throw new DurableLinearContractError(
+            "Visibility-bound GitHub publication lineage requires explicit verified visibility and a draft pull request.",
+          );
+        }
+        return {
+          stage,
+          proofVersion: 2,
+          trustedBindingFingerprint: expectSha256(
+            record.trustedBindingFingerprint,
+            "trusted GitHub binding fingerprint",
+          ),
+          owner: githubName(record.owner, "GitHub owner"),
+          repository: githubName(record.repository, "GitHub repository"),
+          visibility: record.visibility,
+          verifiedVisibility: true,
+          branch: gitBranch(record.branch),
+          pullRequestNumber: expectInteger(
+            record.pullRequestNumber,
+            "GitHub pull request number",
+            1,
+            2_147_483_647,
+          ),
+          draft: true,
+          remoteSha: gitSha(record.remoteSha, "remote GitHub SHA"),
+          repositoryReadbackFingerprint: expectSha256(
+            record.repositoryReadbackFingerprint,
+            "GitHub repository readback fingerprint",
+          ),
+          pullRequestReadbackFingerprint: expectSha256(
+            record.pullRequestReadbackFingerprint,
+            "GitHub pull request readback fingerprint",
+          ),
+        };
+      }
       assertExactKeys(record, ["stage", "trustedBindingFingerprint", "owner", "repository", "verifiedPrivate", "branch", "pullRequestNumber", "draft", "remoteSha", "repositoryReadbackFingerprint", "pullRequestReadbackFingerprint"], [], "private GitHub publication lineage proof");
       if (record.verifiedPrivate !== true || record.draft !== true) {
         throw new DurableLinearContractError("GitHub publication lineage requires private visibility and a draft pull request.");
@@ -1668,6 +2030,15 @@ function parseStageProof(value: unknown): ProjectLifecycleStageProofV1 {
         repositoryReadbackFingerprint: expectSha256(record.repositoryReadbackFingerprint, "GitHub repository readback fingerprint"),
         pullRequestReadbackFingerprint: expectSha256(record.pullRequestReadbackFingerprint, "GitHub pull request readback fingerprint"),
       };
+    case "reflection":
+      assertExactKeys(record, ["stage", "resultsPath", "resultsSha256", "writeReceiptFingerprint", "summaryFingerprint"], [], "reflection lineage proof");
+      return {
+        stage,
+        resultsPath: parseVaultResultsPath(record.resultsPath),
+        resultsSha256: expectSha256(record.resultsSha256, "reflection results hash"),
+        writeReceiptFingerprint: expectSha256(record.writeReceiptFingerprint, "reflection write receipt fingerprint"),
+        summaryFingerprint: expectSha256(record.summaryFingerprint, "reflection summary fingerprint"),
+      };
     case "reconciliation_cleanup":
       assertExactKeys(record, ["stage", "backlinkReceiptFingerprints", "providerStatusReadbackFingerprints", "cleanupReceiptFingerprints", "noUnapprovedMutations"], [], "reconciliation cleanup lineage proof");
       if (record.noUnapprovedMutations !== true) {
@@ -1683,6 +2054,100 @@ function parseStageProof(value: unknown): ProjectLifecycleStageProofV1 {
   }
 }
 
+function parseVaultResultsPath(value: unknown): string {
+  const path = expectString(value, "reflection results path", 1, 500, {
+    secretFree: true,
+  });
+  if (
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    /(^|\/)\.\.?(\/|$)/u.test(path) ||
+    /^[A-Za-z]:/u.test(path) ||
+    !/\.(?:md|ipynb)$/iu.test(path) ||
+    /^(?:\.obsidian|\.agent-backups)(?:\/|$)/iu.test(path)
+  ) {
+    throw new DurableLinearContractError(
+      "reflection results path must be a safe vault-relative Markdown or Jupyter path.",
+    );
+  }
+  return path;
+}
+
+function parseLinearHierarchyWorkUnits(
+  value: unknown,
+): LinearHierarchyWorkUnitBindingV1[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 20) {
+    throw new DurableLinearContractError(
+      "Linear hierarchy work-unit bindings require 1-20 entries.",
+    );
+  }
+  const parsed = value.map((candidate, index) => {
+    const label = `Linear hierarchy work-unit binding ${index + 1}`;
+    const record = expectPlainRecord(candidate, label);
+    assertExactKeys(
+      record,
+      [
+        "workUnitId",
+        "linearIssueId",
+        "linearIssueIdentifier",
+        "linearIssueUrl",
+        "acceptanceCriterionIds",
+        "providerReadbackFingerprint",
+      ],
+      [],
+      label,
+    );
+    const identifier = expectString(
+      record.linearIssueIdentifier,
+      `${label} issue identifier`,
+      3,
+      80,
+      { secretFree: true },
+    );
+    if (!/^[A-Z][A-Z0-9]{0,19}-[1-9][0-9]{0,9}$/u.test(identifier)) {
+      throw new DurableLinearContractError(
+        `${label} issue identifier must use the canonical TEAM-123 form.`,
+      );
+    }
+    const linearIssueUrl = parseHttpUrl(
+      record.linearIssueUrl,
+      `${label} issue URL`,
+    );
+    const hostname = new URL(linearIssueUrl).hostname.toLowerCase();
+    if (hostname !== "linear.app" && !hostname.endsWith(".linear.app")) {
+      throw new DurableLinearContractError(
+        `${label} issue URL must use the Linear HTTPS host.`,
+      );
+    }
+    return {
+      workUnitId: expectOpaqueId(record.workUnitId, `${label} work-unit id`),
+      linearIssueId: expectOpaqueId(record.linearIssueId, `${label} issue id`),
+      linearIssueIdentifier: identifier,
+      linearIssueUrl,
+      acceptanceCriterionIds: parseUniqueStrings(
+        record.acceptanceCriterionIds,
+        `${label} acceptance criterion id`,
+        1,
+        20,
+        160,
+        expectOpaqueId,
+      ),
+      providerReadbackFingerprint: expectSha256(
+        record.providerReadbackFingerprint,
+        `${label} provider readback fingerprint`,
+      ),
+    } satisfies LinearHierarchyWorkUnitBindingV1;
+  });
+  for (const key of ["workUnitId", "linearIssueId", "linearIssueIdentifier"] as const) {
+    if (new Set(parsed.map((unit) => unit[key])).size !== parsed.length) {
+      throw new DurableLinearContractError(
+        `Linear hierarchy work-unit ${key} values must be unique.`,
+      );
+    }
+  }
+  return parsed;
+}
+
 function assertLineageContinuity(
   lineage: ProjectLineageV1,
   proof: ProjectLifecycleStageProofV1,
@@ -1696,9 +2161,12 @@ function assertLineageContinuity(
     }
   }
   if (proof.stage === "private_github_publication") {
-    const code = lineage.commits.find((commit) => commit.stage === "code_execution")
+    const validation = lineage.commits.find((commit) => commit.stage === "code_validation")
+      ?.proof as CodeValidationLineageProofV1 | undefined;
+    const legacyCode = lineage.commits.find((commit) => commit.stage === "code_execution")
       ?.proof as CodeExecutionLineageProofV1 | undefined;
-    if (!code || proof.remoteSha !== code.commitSha) {
+    const verifiedCommitSha = validation?.commitSha ?? legacyCode?.commitSha ?? null;
+    if (!verifiedCommitSha || proof.remoteSha !== verifiedCommitSha) {
       throw new DurableLinearContractError("GitHub publication remote SHA must equal the verified local commit SHA.");
     }
   }
@@ -1795,9 +2263,13 @@ function stageObjective(stage: ProjectLifecycleStageV1): string {
     case "linear_hierarchy":
       return "Prepare, approve once, create or deduplicate, and independently read back one Linear initiative/project/issues hierarchy.";
     case "code_execution":
-      return "Resume one trusted workspace, implement the approved work, validate targeted and fresh-full, commit, and read the commit back.";
+      return "Resume one trusted workspace and implement the approved measurable work with exact mutation receipts.";
+    case "code_validation":
+      return "Run targeted and fresh-full validation, repair only from observed failures, then create and read back one verified local commit.";
     case "private_github_publication":
-      return "Verify private repository visibility, publish the exact verified commit, and independently read back the draft pull request.";
+      return "Verify the explicitly approved repository visibility, publish the exact verified commit, and independently read back the draft pull request.";
+    case "reflection":
+      return "Write one concise evidence-bound Results reflection and independently read back its exact destination.";
     case "reconciliation_cleanup":
       return "Reconcile backlinks and provider state, then independently verify approved cleanup without replay.";
   }

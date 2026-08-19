@@ -82,9 +82,8 @@ test("a blocked run states the blocker in chat instead of pointing at a panel", 
     stopReasonChatLine("required_tools_failed", "code_commit_verified failed."),
     /code_commit_verified failed/u,
   );
-  // Without a detail there is nothing to lead with, so the pointer remains.
-  assert.match(
-    stopReasonChatLine("graph_blocked"),
-    /open Run Details for the blocker/u,
-  );
+  // Persisted Chat history must remain useful after ephemeral Run Details have
+  // been cleared or replaced by another run.
+  assert.match(stopReasonChatLine("graph_blocked"), /Retry the mission/u);
+  assert.doesNotMatch(stopReasonChatLine("graph_blocked"), /open Run Details/u);
 });

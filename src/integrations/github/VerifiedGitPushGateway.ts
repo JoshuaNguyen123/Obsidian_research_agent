@@ -14,6 +14,14 @@ import {
   type TrustedGitHubRepositoryBindingV1,
   type TrustedGitHubPublicationProfileProofV1,
 } from "./TrustedGitHubRepositoryBindingV1";
+import {
+  assertFreshGitHubRepositoryBindingV2,
+  type TrustedGitHubRepositoryBindingV2,
+} from "./TrustedGitHubRepositoryBindingV2";
+import {
+  isRepositoryVisibility,
+  type RepositoryVisibility,
+} from "./RepositoryVisibility";
 import { portableSha256Text } from "../../../packages/core-api/src/portableSha256";
 import { requireNodeModule } from "../../platform/nodeRequire";
 
@@ -60,12 +68,29 @@ export type GitPushAttemptStatusV1 =
   | "verified"
   | "not_applied";
 
+export interface GitPushNotAppliedAttemptAuditV1 {
+  outcome: "not_applied";
+  revision: number;
+  visibilityAttestationFingerprint: string;
+  beforeRemoteSha: string | null;
+  dispatchCount: 0 | 1;
+  startedAt: string;
+  notAppliedAt: string;
+  diagnostic: string;
+  fingerprint: string;
+}
+
 export interface GitPushAttemptRecordV1 {
   version: 1;
   id: string;
   revision: number;
   handoffFingerprint: string;
   bindingFingerprint: string;
+  visibilityBindingFingerprint: string;
+  visibilityAttestationFingerprint: string;
+  repositoryReadbackFingerprint: string;
+  expectedVisibility: RepositoryVisibility;
+  retryHistory: GitPushNotAppliedAttemptAuditV1[];
   branch: string;
   remoteUrl: string;
   beforeRemoteSha: string | null;
@@ -103,6 +128,10 @@ export interface VerifiedGitPushReceiptV1 {
   handoffFingerprint: string;
   repositoryBindingKey: string;
   repositoryBindingFingerprint: string;
+  repositoryVisibility: RepositoryVisibility;
+  repositoryVisibilityBindingFingerprint: string;
+  repositoryVisibilityAttestationFingerprint: string;
+  repositoryReadbackFingerprint: string;
   repositoryProfileKey: string;
   repositoryProfileFingerprint: string;
   canonicalWorktreeRoot: string;
@@ -155,6 +184,10 @@ export interface VerifiedGitPushGatewayOptionsV1 {
 export interface VerifiedGitPushInputV1 {
   handoff: VerifiedCodePublicationHandoffV1;
   binding: TrustedGitHubRepositoryBindingV1;
+  /** Fresh provider readback authority for the exact V1 target. */
+  privateRepositoryBinding: TrustedGitHubRepositoryBindingV2;
+  /** Must come from the user's explicit repository-visibility approval. */
+  expectedVisibility: RepositoryVisibility;
   profile: RepositoryProfileV2 | TrustedGitHubPublicationProfileProofV1;
   credentialReferenceId: string;
   signal?: AbortSignal;
@@ -164,6 +197,7 @@ export class VerifiedGitPushErrorV1 extends Error {
   constructor(
     readonly code:
       | "invalid_publication_handoff"
+      | "repository_visibility_unverified"
       | "local_commit_drift"
       | "commit_identity_mismatch"
       | "remote_non_fast_forward"
@@ -187,17 +221,28 @@ export class VerifiedGitPushGatewayV1 {
 
   async push(input: VerifiedGitPushInputV1): Promise<VerifiedGitPushResultV1> {
     const prepared = this.prepare(input);
-    const attemptId = attemptIdFor(prepared.handoff, prepared.binding);
+    const attemptId = attemptIdFor(
+      prepared.handoff,
+      prepared.binding,
+      prepared.visibilityBinding,
+      prepared.expectedVisibility,
+    );
     const prior = await this.options.attemptStore.load(attemptId);
     // Definitive not_applied (auth/permission) may be retried after the host
     // installs a Contents-capable credential. Ambiguous reconcile_required must
     // never redispatch.
     if (prior && prior.status !== "not_applied") return resultFromPrior(prior);
+    if (prior && prior.retryHistory.length >= 8) {
+      throw new VerifiedGitPushErrorV1(
+        "attempt_store_conflict",
+        "Git push authentication retry history reached its fixed safety limit; prepare a new verified publication handoff.",
+      );
+    }
 
     await this.verifyLocalIdentity(prepared.handoff, input.signal);
     return this.options.askpassBroker.withHandle({
       credentialReferenceId: bounded(input.credentialReferenceId, "credential reference id", 1, 512),
-      repositoryBindingFingerprint: prepared.binding.fingerprint,
+      repositoryBindingFingerprint: prepared.visibilityBinding.fingerprint,
       signal: input.signal,
       use: async (handle) => {
         const environment = askpassEnvironment(handle);
@@ -251,6 +296,15 @@ export class VerifiedGitPushGatewayV1 {
           revision: prior ? prior.revision + 1 : 0,
           handoffFingerprint: prepared.handoff.fingerprint,
           bindingFingerprint: prepared.binding.fingerprint,
+          visibilityBindingFingerprint: prepared.visibilityBinding.fingerprint,
+          visibilityAttestationFingerprint:
+            prepared.visibilityBinding.visibilityAttestationFingerprint,
+          repositoryReadbackFingerprint:
+            prepared.visibilityBinding.repositoryReadbackFingerprint,
+          expectedVisibility: prepared.expectedVisibility,
+          retryHistory: prior
+            ? [...prior.retryHistory, notAppliedRetryAudit(prior)]
+            : [],
           branch: prepared.handoff.branch,
           remoteUrl: prepared.remoteUrl,
           beforeRemoteSha,
@@ -387,7 +441,12 @@ export class VerifiedGitPushGatewayV1 {
   /** Readback-only reconciliation. It never dispatches another push. */
   async reconcile(input: VerifiedGitPushInputV1): Promise<VerifiedGitPushResultV1> {
     const prepared = this.prepare(input);
-    const attemptId = attemptIdFor(prepared.handoff, prepared.binding);
+    const attemptId = attemptIdFor(
+      prepared.handoff,
+      prepared.binding,
+      prepared.visibilityBinding,
+      prepared.expectedVisibility,
+    );
     const attempt = await this.options.attemptStore.load(attemptId);
     if (!attempt) {
       throw new VerifiedGitPushErrorV1("attempt_store_conflict", "No durable Git push attempt exists to reconcile.");
@@ -398,7 +457,7 @@ export class VerifiedGitPushGatewayV1 {
     await this.verifyLocalIdentity(prepared.handoff, input.signal);
     return this.options.askpassBroker.withHandle({
       credentialReferenceId: bounded(input.credentialReferenceId, "credential reference id", 1, 512),
-      repositoryBindingFingerprint: prepared.binding.fingerprint,
+      repositoryBindingFingerprint: prepared.visibilityBinding.fingerprint,
       signal: input.signal,
       use: async (handle) => {
         let observed: string | null;
@@ -455,10 +514,32 @@ export class VerifiedGitPushGatewayV1 {
   private prepare(input: VerifiedGitPushInputV1): {
     handoff: VerifiedCodePublicationHandoffV1;
     binding: TrustedGitHubRepositoryBindingV1;
+    visibilityBinding: TrustedGitHubRepositoryBindingV2;
+    expectedVisibility: RepositoryVisibility;
     remoteUrl: string;
   } {
     let handoff: VerifiedCodePublicationHandoffV1;
     let binding: TrustedGitHubRepositoryBindingV1;
+    let privateRepositoryBinding: TrustedGitHubRepositoryBindingV2;
+    try {
+      privateRepositoryBinding = assertFreshGitHubRepositoryBindingV2(
+        input.privateRepositoryBinding,
+        { now: this.now() },
+      );
+      if (
+        !isRepositoryVisibility(input.expectedVisibility) ||
+        privateRepositoryBinding.visibility !== input.expectedVisibility
+      ) {
+        throw new Error(
+          "Fresh GitHub repository visibility does not match the explicitly approved target visibility.",
+        );
+      }
+    } catch (error) {
+      throw new VerifiedGitPushErrorV1(
+        "repository_visibility_unverified",
+        safeDiagnostic(error),
+      );
+    }
     try {
       handoff = parseVerifiedCodePublicationHandoffV1(input.handoff);
       ({ binding } = isRepositoryProfileV2(input.profile)
@@ -478,7 +559,19 @@ export class VerifiedGitPushGatewayV1 {
         "Verified code handoff does not match the trusted GitHub repository binding.",
       );
     }
-    return { handoff, binding, remoteUrl: buildTrustedGitHubHttpsRemoteUrlV1(binding) };
+    if (!privateBindingMatchesLegacyBinding(binding, privateRepositoryBinding)) {
+      throw new VerifiedGitPushErrorV1(
+        "repository_visibility_unverified",
+        "Fresh private GitHub repository evidence does not match the exact trusted publication target.",
+      );
+    }
+    return {
+      handoff,
+      binding,
+      visibilityBinding: privateRepositoryBinding,
+      expectedVisibility: input.expectedVisibility,
+      remoteUrl: buildTrustedGitHubHttpsRemoteUrlV1(binding),
+    };
   }
 
   private async verifyLocalIdentity(
@@ -511,11 +604,7 @@ export class VerifiedGitPushGatewayV1 {
       environment,
       signal,
     );
-    if (
-      !isAgentGitCommitIdentityV1(identity, {
-        allowLegacyLocalhost: true,
-      })
-    ) {
+    if (!isAgentGitCommitIdentityV1(identity)) {
       throw new VerifiedGitPushErrorV1(
         "commit_identity_mismatch",
         "Verified commit author or committer is not the host-pinned Agentic Researcher identity; publication is blocked to prevent GitHub account misattribution.",
@@ -689,13 +778,24 @@ export class VerifiedGitPushGatewayV1 {
     const evidence: Omit<VerifiedGitPushReceiptV1, "fingerprint"> = {
       version: 1,
       kind: "verified_git_push",
-      id: `github-push-${prepared.handoff.fingerprint.slice("sha256:".length, "sha256:".length + 32)}`,
+      id: `github-push-${sha256({
+        handoff: prepared.handoff.fingerprint,
+        visibilityBinding: prepared.visibilityBinding.fingerprint,
+        expectedVisibility: prepared.expectedVisibility,
+      }).slice("sha256:".length, "sha256:".length + 32)}`,
       status: "verified",
       commitKind,
       handoffId: prepared.handoff.id,
       handoffFingerprint: prepared.handoff.fingerprint,
       repositoryBindingKey: prepared.binding.key,
       repositoryBindingFingerprint: prepared.binding.fingerprint,
+      repositoryVisibility: prepared.expectedVisibility,
+      repositoryVisibilityBindingFingerprint:
+        prepared.visibilityBinding.fingerprint,
+      repositoryVisibilityAttestationFingerprint:
+        prepared.visibilityBinding.visibilityAttestationFingerprint,
+      repositoryReadbackFingerprint:
+        prepared.visibilityBinding.repositoryReadbackFingerprint,
       repositoryProfileKey: prepared.handoff.repositoryProfileKey,
       repositoryProfileFingerprint: prepared.handoff.repositoryProfileFingerprint,
       canonicalWorktreeRoot: prepared.handoff.canonicalWorktreeRoot,
@@ -773,6 +873,29 @@ export class VerifiedGitPushGatewayV1 {
   }
 }
 
+function privateBindingMatchesLegacyBinding(
+  legacy: TrustedGitHubRepositoryBindingV1,
+  privateBinding: TrustedGitHubRepositoryBindingV2,
+): boolean {
+  return (
+    privateBinding.key === legacy.key &&
+    privateBinding.repositoryProfileKey === legacy.repositoryProfileKey &&
+    privateBinding.repositoryProfileFingerprint ===
+      legacy.repositoryProfileFingerprint &&
+    privateBinding.canonicalRepositoryRoot === legacy.canonicalRepositoryRoot &&
+    privateBinding.githubHost === legacy.githubHost &&
+    privateBinding.owner === legacy.owner &&
+    privateBinding.repository === legacy.repository &&
+    privateBinding.repositoryId === legacy.repositoryId &&
+    privateBinding.defaultBranch === legacy.defaultBranch &&
+    privateBinding.remoteName === legacy.remoteName &&
+    privateBinding.agentBranchPrefix === legacy.agentBranchPrefix &&
+    privateBinding.verifiedAccountId === legacy.verifiedAccountId &&
+    privateBinding.verifiedAccountLogin === legacy.verifiedAccountLogin &&
+    privateBinding.trustedAt === legacy.trustedAt
+  );
+}
+
 function isRepositoryProfileV2(
   value: RepositoryProfileV2 | TrustedGitHubPublicationProfileProofV1,
 ): value is RepositoryProfileV2 {
@@ -801,11 +924,42 @@ function resultFromPrior(attempt: GitPushAttemptRecordV1): VerifiedGitPushResult
   };
 }
 
+function notAppliedRetryAudit(
+  attempt: GitPushAttemptRecordV1,
+): GitPushNotAppliedAttemptAuditV1 {
+  if (attempt.status !== "not_applied" || !attempt.diagnostic) {
+    throw new VerifiedGitPushErrorV1(
+      "attempt_store_conflict",
+      "Only an exact durable not-applied attempt may authorize another Git push dispatch.",
+    );
+  }
+  const evidence: Omit<GitPushNotAppliedAttemptAuditV1, "fingerprint"> = {
+    outcome: "not_applied",
+    revision: attempt.revision,
+    visibilityAttestationFingerprint:
+      attempt.visibilityAttestationFingerprint,
+    beforeRemoteSha: attempt.beforeRemoteSha,
+    dispatchCount: attempt.dispatchCount,
+    startedAt: attempt.startedAt,
+    notAppliedAt: attempt.updatedAt,
+    diagnostic: attempt.diagnostic,
+  };
+  return { ...evidence, fingerprint: sha256(evidence) };
+}
+
 function attemptIdFor(
   handoff: VerifiedCodePublicationHandoffV1,
   binding: TrustedGitHubRepositoryBindingV1,
+  visibilityBinding: TrustedGitHubRepositoryBindingV2,
+  expectedVisibility: RepositoryVisibility,
 ): string {
-  return `git-push-${sha256({ handoff: handoff.fingerprint, binding: binding.fingerprint }).slice("sha256:".length, "sha256:".length + 40)}`;
+  return `git-push-${sha256({
+    handoff: handoff.fingerprint,
+    binding: binding.fingerprint,
+    visibilityBinding: visibilityBinding.fingerprint,
+    repositoryReadback: visibilityBinding.repositoryReadbackFingerprint,
+    expectedVisibility,
+  }).slice("sha256:".length, "sha256:".length + 40)}`;
 }
 
 function askpassEnvironment(handle: EphemeralGitAskpassHandleV1): Readonly<Record<string, string>> {

@@ -112,8 +112,9 @@ async function listTeamProjects(
   // used to spend its whole budget on unrelated rows, miss the existing
   // project, and create a duplicate — which the host then persisted as the
   // sticky queue default. Five pages covers 250 projects; beyond that the
-  // sweep reports truncation and the policy layer may still choose to create,
-  // which is the pre-existing behaviour rather than a new failure mode.
+  // sweep reports truncation. A capped search cannot prove that an associated
+  // project is absent, so fail closed before the create policy can mutate the
+  // provider or create a duplicate.
   const sweep = await listAllLinearPages(
     client,
     "projects.list",
@@ -121,6 +122,11 @@ async function listTeamProjects(
     options,
     { maxPages: 5 },
   );
+  if (sweep.truncated) {
+    throw new Error(
+      "Linear project association search exceeded the bounded 250-project sweep; project absence cannot be verified safely.",
+    );
+  }
   return sweep.items
     .filter((item) => item.resourceType === "project")
     .map((item) => ({
@@ -129,8 +135,7 @@ async function listTeamProjects(
       teamIds: teamIdsFromRecord(item),
     }))
     .filter(
-      (item) =>
-        item.teamIds.length === 0 || item.teamIds.includes(teamId),
+      (item) => item.teamIds.includes(teamId),
     );
 }
 
@@ -170,14 +175,28 @@ async function createTeamProject(
 }
 
 function teamIdsFromRecord(record: LinearBaseRecord): string[] {
-  const raw = record.attributes?.teams;
-  if (Array.isArray(raw)) {
-    return raw.map((value) => String(value).trim()).filter(Boolean);
-  }
-  if (typeof raw === "string" && raw.trim()) {
-    return [raw.trim()];
-  }
-  return [];
+  const extended = record as LinearBaseRecord & {
+    team?: { id?: unknown };
+    teams?: Array<{ id?: unknown } | string>;
+  };
+  const values: unknown[] = [
+    record.attributes?.teamId,
+    record.attributes?.teamIds,
+    record.attributes?.team,
+    record.attributes?.teams,
+    extended.team?.id,
+    extended.teams,
+  ];
+  return [...new Set(values.flatMap((value) =>
+    Array.isArray(value) ? value : [value],
+  ).map((value) => {
+    if (typeof value === "string") return value.trim();
+    if (value && typeof value === "object") {
+      const id = (value as { id?: unknown }).id;
+      return typeof id === "string" ? id.trim() : "";
+    }
+    return "";
+  }).filter(Boolean))];
 }
 
 function extractId(value: unknown): string | null {

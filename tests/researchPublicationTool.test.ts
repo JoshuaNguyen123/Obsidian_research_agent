@@ -35,6 +35,10 @@ import {
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
 import type { ToolExecutionContext } from "../src/tools/types";
 import { isCompletedAcceptedResearchPublicationReceipt } from "../src/agent/setLooseCompoundAutonomy";
+import {
+  createProjectIdeaBriefV1,
+  deriveAcceptedResearchSeedFromProjectIdeaBriefV1,
+} from "../packages/core-api/src";
 
 const NOW = "2026-07-12T20:00:00.000Z";
 const HASH = `sha256:${"a".repeat(64)}`;
@@ -52,6 +56,36 @@ test("research publication intent is clause-local across later GitHub prohibitio
     "Do not implement code or publish to GitHub in this phase. Finish only after accepted-research lineage, Linear provider readback, and the note backlink are durable.",
   ].join(" ");
   assert.equal(hasExplicitResearchPublicationIntent(phaseA), true);
+  assert.equal(
+    hasExplicitResearchPublicationIntent(
+      "Investigate conflict-free counters and turn the findings into Linear work.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasExplicitResearchPublicationIntent(
+      "Investigate conflict-free counters, but do not turn the findings into Linear work.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasExplicitResearchPublicationIntent(
+      "Research a conflict-free counter and create measurable Linear work.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasExplicitResearchPublicationIntent(
+      "Research a conflict-free counter, but do not create Linear work.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasExplicitResearchPublicationIntent(
+      "Research the counter and publish accepted research to one Linear issue. Keep the issue standalone; do not create a Linear project or initiative.",
+    ),
+    true,
+  );
   assert.equal(
     hasExplicitResearchPublicationIntent(
       "Do not publish the accepted research report to Linear.",
@@ -265,6 +299,91 @@ test("checkpoint resume ignores newly active note and keeps the original note bi
     fixture.noteWrites.some((request) => request.path === noteB.path),
     false,
   );
+});
+
+test("restart resumes ideation-bound publication only from the exact durable signed seed", async () => {
+  const prompt =
+    "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.";
+  const fixture = createFixture("reconcile_required", { resumeCheckpoints: true });
+  const firstContext = contextFixture(
+    prompt,
+    "run-ideation-restart",
+    "call-ideation-first",
+  );
+  firstContext.runtimeCache = ideationRuntimeCacheFixture();
+  firstContext.requestNestedApproval = approveNested;
+
+  await assert.rejects(
+    fixture.tool.execute(argsFixture(), firstContext),
+    (error: unknown) =>
+      error instanceof Error &&
+      (error as Error & { code?: string }).code === "linear_mutation_uncertain",
+  );
+  assert.match(
+    fixture.checkpoints.at(-1)?.acceptedPackage?.projectIdeaSeed
+      ?.projectIdeaFingerprint ?? "",
+    /^sha256:[a-f0-9]{64}$/u,
+  );
+
+  fixture.publisher.mode = "deduplicated";
+  const restartedContext = contextFixture(
+    prompt,
+    "run-ideation-restart",
+    "call-ideation-restarted",
+  );
+  restartedContext.runtimeCache = { toolResults: new Map() };
+  restartedContext.requestNestedApproval = approveNested;
+  const resumed = await fixture.tool.execute(
+    { ignoredProviderRetryShape: true },
+    restartedContext,
+  ) as { ok: boolean };
+  assert.equal(resumed.ok, true);
+  assert.equal(fixture.noteWrites.length, 1);
+
+  const missing = createFixture("created", { resumeCheckpoints: true });
+  const missingContext = contextFixture(
+    prompt,
+    "run-ideation-missing-seed",
+    "call-ideation-missing-seed",
+  );
+  missingContext.runtimeCache = { toolResults: new Map() };
+  missingContext.requestNestedApproval = approveNested;
+  await assert.rejects(
+    missing.tool.execute(argsFixture(), missingContext),
+    (error: unknown) =>
+      error instanceof Error &&
+      (error as Error & { code?: string }).code ===
+        "research_publication_project_idea_seed_required",
+  );
+  assert.equal(missing.noteWrites.length, 0);
+  assert.equal(missing.grants.length, 0);
+});
+
+test("ideation-origin publication rejects an objective divergent from the signed selected direction before mutation", async () => {
+  const fixture = createFixture("created", { resumeCheckpoints: true });
+  const args = argsFixture();
+  (args.package as Record<string, unknown>).objective =
+    "Perform unauthorized work outside the selected project direction.";
+  const context = contextFixture(
+    "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.",
+    "run-ideation-objective-drift",
+    "call-ideation-objective-drift",
+  );
+  context.runtimeCache = ideationRuntimeCacheFixture();
+  context.requestNestedApproval = approveNested;
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "research_publication_invalid_arguments");
+  assert.match(result.error?.message ?? "", /project idea seed|objective|drift/iu);
+  assert.equal(result.mutationState, "not_applied");
+  assert.equal(fixture.noteWrites.length, 0);
+  assert.equal(fixture.publisher.publishCount, 0);
+  assert.equal(fixture.grants.length, 0);
 });
 
 test("continuation segments replay one root-bound completed publication without another Linear mutation", async () => {
@@ -737,6 +856,31 @@ test("host derives a missing package objective from the title", async () => {
     fixture.noteWrites[0]?.package.objective,
     "Deliver the accepted research for: Accepted research",
   );
+});
+
+test("host derives a missing ideation-origin objective from the signed selected direction", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  delete (args.package as Record<string, unknown>).objective;
+  const context = contextFixture(
+    "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.",
+    "run-ideation-derived-objective",
+    "call-ideation-derived-objective",
+  );
+  context.runtimeCache = ideationRuntimeCacheFixture();
+  context.requestNestedApproval = approveNested;
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    fixture.noteWrites[0]?.package.objective,
+    "Implement the accepted work item.",
+  );
+  assert.equal(fixture.publisher.publishCount, 1);
 });
 
 test("an empty proposed-work array fails at the pre-mutation tool boundary", async () => {
@@ -1448,6 +1592,9 @@ function createFixture(
         riskClass: request.package.riskClass,
         acceptedAt: request.acceptedAt,
         acceptedBy: "host",
+        ...(request.package.projectIdeaSeed
+          ? { projectIdeaSeed: request.package.projectIdeaSeed }
+          : {}),
       });
       return {
         path: request.path,
@@ -1573,6 +1720,7 @@ function createFixture(
 
 class FakePublisher implements ResearchPublicationPublisherPortV1 {
   lastActiveGrantCount = 0;
+  publishCount = 0;
   readCount = 0;
   readbackDescriptionOverride: string | null = null;
   private ticket: ReturnType<typeof ticket> | null = null;
@@ -1588,6 +1736,7 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
     };
   }
   async publish(request: ResearchTicketPublishRequest) {
+    this.publishCount += 1;
     const built = ticket(request);
     this.lastActiveGrantCount = request.activeGrants?.length ?? 0;
     const issue_ = issue(built.description);
@@ -1664,6 +1813,58 @@ function contextFixture(
     now: () => new Date(NOW),
     httpTransport: async () => ({ status: 500, headers: {} }),
   } as unknown as ToolExecutionContext;
+}
+
+function ideationRuntimeCacheFixture(): NonNullable<
+  ToolExecutionContext["runtimeCache"]
+> {
+  const evidenceId = `evidence-${"a".repeat(64)}`;
+  const brief = createProjectIdeaBriefV1({
+    ideaId: "idea-accepted-research",
+    title: "Accepted research",
+    problem: "The durable handoff is required.",
+    hypothesis: "An exact signed handoff will make restart-safe publication auditable.",
+    options: [{
+      id: "option-a",
+      title: "Persist the exact handoff",
+      summary: "Implement the accepted work item.",
+    }],
+    selectedOptionId: "option-a",
+    proposedWork: ["Implement the accepted work."],
+    nonGoals: ["Automatic merge."],
+    constraints: [],
+    risks: [],
+    acceptanceCriteria: [{ id: "AC-1", text: "The handoff is verified." }],
+    evidenceStatus: "grounded",
+    evidence: [{
+      id: evidenceId,
+      kind: "web",
+      reference: "https://example.test/evidence",
+      contentSha256: HASH,
+    }],
+    riskClass: "medium",
+    limitations: ["Provider smoke testing remains separate."],
+    createdAt: NOW,
+  });
+  const seed = deriveAcceptedResearchSeedFromProjectIdeaBriefV1(brief);
+  return {
+    toolResults: new Map(),
+    projectIdeaBrief: brief,
+    projectIdeaAcceptedResearchSeed: seed,
+    trustedWebFetchResults: new Map([[
+      "ideation-source",
+      {
+        ok: true,
+        toolName: "web_fetch",
+        output: {
+          normalizedUrl: "https://example.test/evidence",
+          contentHash: HASH,
+          title: "Evidence",
+          content: "Supports the work.",
+        },
+      },
+    ]]),
+  };
 }
 
 async function approveNested(
@@ -1811,6 +2012,129 @@ test("host binds an explicitly named trusted validation key over a mistranscribe
     fixture.noteWrites[0]?.package.validationRequirementKeys,
     ["trusted.validation"],
   );
+});
+
+test("multi-profile catalog binds the one mission-named repository over the model echo", async () => {
+  const fixture = createFixture("created", {
+    describeTrustedRepositoryCatalog: () => ({
+      repositoryKeys: ["trusted-repo", "other-repo"],
+      validationKeysByRepository: {
+        "trusted-repo": ["trusted.validation"],
+        "other-repo": ["other.validation"],
+      },
+    }),
+  });
+  const args = argsFixture({ notePath: undefined });
+  (args.package as Record<string, unknown>).repositoryKey = "other-repo";
+  (args.package as Record<string, unknown>).validationRequirementKeys = [
+    "other.validation",
+  ];
+  const context = initiatingNoteContext(
+    "run-catalog-multi-explicit",
+    "call-catalog-multi-explicit",
+  );
+  context.originalPrompt = [
+    "Publish the accepted research from this note to Linear.",
+    "Use trusted repository key trusted-repo and validation requirement key trusted.validation.",
+  ].join(" ");
+
+  const result = await fixture.tool.execute(args, context) as { ok: boolean };
+
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites[0]?.package.repositoryKey, "trusted-repo");
+  assert.deepEqual(
+    fixture.noteWrites[0]?.package.validationRequirementKeys,
+    ["trusted.validation"],
+  );
+});
+
+test("multi-profile catalog rejects a model-supplied repository when the mission names none", async () => {
+  const fixture = createFixture("created", {
+    describeTrustedRepositoryCatalog: () => ({
+      repositoryKeys: ["trusted-repo", "other-repo"],
+      validationKeysByRepository: {
+        "trusted-repo": ["trusted.validation"],
+        "other-repo": ["other.validation"],
+      },
+    }),
+  });
+  const args = argsFixture({ notePath: undefined });
+  (args.package as Record<string, unknown>).repositoryKey = "other-repo";
+  (args.package as Record<string, unknown>).validationRequirementKeys = [
+    "other.validation",
+  ];
+
+  await assert.rejects(
+    fixture.tool.execute(
+      args,
+      initiatingNoteContext(
+        "run-catalog-model-authority",
+        "call-catalog-model-authority",
+      ),
+    ),
+    /exactly one must be affirmatively named/iu,
+  );
+  assert.equal(fixture.noteWrites.length, 0);
+  assert.equal(fixture.grants.length, 0);
+  assert.equal(fixture.publisher.publishCount, 0);
+});
+
+test("multi-profile catalog rejects a mission that names more than one repository", async () => {
+  const fixture = createFixture("created", {
+    describeTrustedRepositoryCatalog: () => ({
+      repositoryKeys: ["trusted-repo", "other-repo"],
+      validationKeysByRepository: {
+        "trusted-repo": ["trusted.validation"],
+        "other-repo": ["other.validation"],
+      },
+    }),
+  });
+  const context = initiatingNoteContext(
+    "run-catalog-ambiguous",
+    "call-catalog-ambiguous",
+  );
+  context.originalPrompt =
+    "Publish the accepted research to Linear using either trusted-repo or other-repo.";
+
+  await assert.rejects(
+    fixture.tool.execute(argsFixture({ notePath: undefined }), context),
+    /exactly one must be affirmatively named/iu,
+  );
+  assert.equal(fixture.noteWrites.length, 0);
+  assert.equal(fixture.grants.length, 0);
+  assert.equal(fixture.publisher.publishCount, 0);
+});
+
+test("multi-key validation catalog rejects a model-selected command absent from the mission", async () => {
+  const fixture = createFixture("created", {
+    describeTrustedRepositoryCatalog: () => ({
+      repositoryKeys: ["trusted-repo"],
+      validationKeysByRepository: {
+        "trusted-repo": [
+          "trusted.validation",
+          "trusted-repo.validation.1",
+        ],
+      },
+    }),
+  });
+  const args = argsFixture({ notePath: undefined });
+  (args.package as Record<string, unknown>).validationRequirementKeys = [
+    "trusted-repo.validation.1",
+  ];
+
+  await assert.rejects(
+    fixture.tool.execute(
+      args,
+      initiatingNoteContext(
+        "run-catalog-validation-model-authority",
+        "call-catalog-validation-model-authority",
+      ),
+    ),
+    /must affirmatively name at least one exact trusted validation requirement/iu,
+  );
+  assert.equal(fixture.noteWrites.length, 0);
+  assert.equal(fixture.grants.length, 0);
+  assert.equal(fixture.publisher.publishCount, 0);
 });
 
 test("code package with several trusted profiles still fails closed but names them", async () => {

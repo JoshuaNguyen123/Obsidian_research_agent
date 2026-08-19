@@ -19,6 +19,10 @@ import type {
   WorkItemAcceptanceCriterionV1,
   WorkItemRiskClass,
 } from "./WorkItemSpecV1";
+import {
+  parseProjectIdeaAcceptedResearchSeedV1,
+  type ProjectIdeaAcceptedResearchSeedV1,
+} from "../../../packages/core-api/src/projectIdeaBriefV1";
 
 export const ACCEPTED_RESEARCH_ARTIFACT_SCHEMA_VERSION = 1 as const;
 
@@ -44,6 +48,7 @@ export interface AcceptedResearchArtifactV1 {
   riskClass: WorkItemRiskClass;
   acceptedAt: string;
   acceptedBy: "host";
+  projectIdeaSeed?: ProjectIdeaAcceptedResearchSeedV1;
   artifactFingerprint: string;
 }
 
@@ -115,6 +120,13 @@ function parseUnsigned(value: unknown): AcceptedResearchArtifactV1Unsigned {
     riskClass: expectEnum(record.riskClass, "risk class", ["low", "medium", "high"]),
     acceptedAt: expectIsoTimestamp(record.acceptedAt, "accepted at"),
     acceptedBy: "host",
+    ...(record.projectIdeaSeed === undefined
+      ? {}
+      : {
+          projectIdeaSeed: parseProjectIdeaAcceptedResearchSeedV1(
+            record.projectIdeaSeed,
+          ),
+        }),
   };
 }
 
@@ -211,7 +223,7 @@ function assertKeys(record: Record<string, unknown>, signed: boolean): void {
       "acceptedBy",
       ...(signed ? ["artifactFingerprint"] : []),
     ],
-    [],
+    ["projectIdeaSeed"],
     "accepted research artifact",
   );
 }

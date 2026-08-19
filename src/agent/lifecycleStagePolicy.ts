@@ -3,7 +3,8 @@ import {
   type ProjectLifecycleStageV1,
 } from "./projectLifecycle";
 import { PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME } from "../tools/researchPublicationTool";
-import { REPORT_PROGRESS_TO_LINEAR_TOOL_NAME } from "../tools/reportProgressToLinearTool";
+import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTool";
+import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
 import { PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME } from "../tools/researchProjectHierarchyTool";
 import {
   CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
@@ -58,6 +59,8 @@ export const PROJECT_LIFECYCLE_STAGE_MUTATION_TOOL_NAMES = new Set<string>([
   ...PROOF_BOUND_PROVIDER_LIFECYCLE_TOOL_NAMES,
   ...GITHUB_CATALOG_MUTATION_TOOL_NAMES,
   "code_commit_verified",
+  APPEND_JUPYTER_REFLECTION_TOOL_NAME,
+  "write_project_results",
 ]);
 
 /**
@@ -65,8 +68,7 @@ export const PROJECT_LIFECYCLE_STAGE_MUTATION_TOOL_NAMES = new Set<string>([
  * MissionGraph frontier fallbacks, and route-base schema shrink. Envelope
  * layers may add note companions on top; do not diverge the code_* core.
  */
-export const CODE_EXECUTION_TOOL_ALLOW = [
-  "code_sandbox_status",
+export const CODE_IMPLEMENTATION_TOOL_ALLOW = [
   "code_workspace_create",
   "code_workspace_status",
   "code_workspace_read",
@@ -79,12 +81,22 @@ export const CODE_EXECUTION_TOOL_ALLOW = [
   "code_workspace_append",
   "code_workspace_patch",
   "code_workspace_write_expected",
+] as const;
+
+export const CODE_VALIDATION_TOOL_ALLOW = [
+  "code_sandbox_status",
   "code_validate_fast",
   "code_validate_targeted",
   "code_validate_full",
   "code_repair_record_cycle",
   "code_repair_status",
   "code_commit_verified",
+] as const;
+
+/** Backward-compatible union for code routes that are not lifecycle staged. */
+export const CODE_EXECUTION_TOOL_ALLOW = [
+  ...CODE_IMPLEMENTATION_TOOL_ALLOW,
+  ...CODE_VALIDATION_TOOL_ALLOW,
 ] as const;
 
 const LINEAR_HANDOFF_CONSUMER_TOOL_NAMES = new Set<string>([
@@ -110,6 +122,7 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
   accepted_research: [
     "web_search",
     "web_fetch",
+    CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
     "read_current_file",
     "read_file",
     "read_markdown_files",
@@ -122,7 +135,6 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     "replace_current_file",
     "count_words",
     PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
-    REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
   ],
   linear_hierarchy: [
     PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
@@ -131,18 +143,20 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     "linear_create_issue",
     "linear_get_issue",
     "linear_search_issues",
-    // Deliberately NOT report_progress_to_linear. Once linear_hierarchy is no
-    // longer the earliest unpaid stage, toolsOfferedForSetLooseTurn deletes
-    // every tool in this list — so listing the progress report here strips it
-    // from the reflection turn, which is the one turn it exists for.
   ],
-  code_execution: [...CODE_EXECUTION_TOOL_ALLOW],
+  code_execution: [...CODE_IMPLEMENTATION_TOOL_ALLOW],
+  code_validation: [...CODE_VALIDATION_TOOL_ALLOW],
   private_github_publication: [
     CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
     PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
     ...GITHUB_STAGE_READ_TOOL_ALLOW,
     ...GITHUB_STAGE_SAFE_MUTATION_TOOL_ALLOW,
-    REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
+  ],
+  reflection: [
+    APPEND_JUPYTER_REFLECTION_TOOL_NAME,
+    "write_project_results",
+    "append_to_current_file",
+    "read_current_file",
   ],
   reconciliation_cleanup: [
     "linear_trash_issue",

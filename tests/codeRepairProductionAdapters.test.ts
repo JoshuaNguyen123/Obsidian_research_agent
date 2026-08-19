@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 
 import { sha256Fingerprint } from "../packages/headless-runtime/src/canonicalize";
 import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+  type AgentGitCommitIdentityV1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
+import {
   CallbackCodeRepairCheckpointStoreV1,
   CommitOnlyVerifiedCommitGatewayV1,
   ProductionAdapterErrorV1,
@@ -32,6 +37,12 @@ const PATCH = [
   "+fixed",
   "",
 ].join("\n");
+const COMMIT_IDENTITY = {
+  authorName: AGENT_GIT_COMMIT_NAME_V1,
+  authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+  committerName: AGENT_GIT_COMMIT_NAME_V1,
+  committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+};
 
 test("callback checkpoint store provides serialized create/update CAS without aliasing", async () => {
   let namespace: CodeRepairCheckpointNamespaceV1 | null = null;
@@ -207,6 +218,7 @@ test("commit-only gateway rechecks exact evidence, disables hooks, and reads Git
   assert.deepEqual(readback.artifactHashes, [
     { path: PATH, sha256: AFTER_HASH, bytes: 128 },
   ]);
+  assert.deepEqual(readback.identity, COMMIT_IDENTITY);
 
   const reconciliation = await gateway.reconcilePreparedCommit({
     operationId: "commit-operation-reconcile",
@@ -248,6 +260,28 @@ test("commit-only gateway rejects unauthorized paths before invoking Git", async
       error instanceof ProductionAdapterErrorV1 && error.code === "commit_path_not_allowed",
   );
   assert.equal(git.calls.length, 0);
+});
+
+test("commit-only gateway rejects a non-neutral raw commit identity", async () => {
+  const git = new FakeFixedGit({
+    identity: {
+      ...COMMIT_IDENTITY,
+      authorEmail: "linked@users.noreply.github.com",
+      committerEmail: "linked@users.noreply.github.com",
+    },
+  });
+  git.committed = true;
+  const gateway = gatewayFor(git);
+  await assert.rejects(
+    gateway.readCommit({
+      operationId: "readback-identity-drift",
+      request: repairRequest(),
+      commitSha: COMMIT_SHA,
+    }),
+    (error: unknown) =>
+      error instanceof ProductionAdapterErrorV1 &&
+      error.code === "commit_identity_mismatch",
+  );
 });
 
 test("artifact or staged patch drift prevents commit", async (t) => {
@@ -435,7 +469,10 @@ class FakeFixedGit implements FixedArgvGitRunnerV1 {
   commitCalls = 0;
   validationCommandCalls = 0;
 
-  constructor(private readonly options: { stagedPatch?: string } = {}) {}
+  constructor(private readonly options: {
+    stagedPatch?: string;
+    identity?: AgentGitCommitIdentityV1;
+  } = {}) {}
 
   async run(input: { cwd: string; args: readonly string[] }) {
     this.calls.push({ cwd: input.cwd, args: [...input.args] });
@@ -479,6 +516,15 @@ class FakeFixedGit implements FixedArgvGitRunnerV1 {
       return ok("committed\n");
     }
     if (argv[0] === "diff-tree") return ok(`M\u0000${PATH}\u0000`);
+    if (argv[0] === "show") {
+      const identity = this.options.identity ?? COMMIT_IDENTITY;
+      return ok([
+        identity.authorName,
+        identity.authorEmail,
+        identity.committerName,
+        identity.committerEmail,
+      ].join("\0"));
+    }
     return failed(`unexpected Git argv: ${argv.join(" ")}`);
   }
 }

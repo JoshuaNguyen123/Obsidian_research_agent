@@ -14,6 +14,74 @@ import {
 } from "./autonomyEffectClass";
 import { pendingToolsAllowSetLooseWithoutGrant } from "./setLooseCompoundAutonomy";
 
+const MAX_FOREGROUND_COMPLETION_SEGMENTS = 48;
+const ADAPTIVE_LEAD_SEGMENT_STEPS = 10;
+
+/**
+ * Resolve the host's foreground segment ceiling without silently shrinking the
+ * configured completion budget. Proof debt, no-progress detection, approvals,
+ * and the run wall-clock remain the actual continuation gates.
+ */
+export function resolveForegroundSegmentLimit(input: {
+  autoContinue: boolean;
+  completionDriven: boolean;
+  configuredCompletionSegments?: number;
+  configuredLongRunSegments?: number;
+  explicitLongRunningResearch: boolean;
+}): number {
+  if (!input.autoContinue) return 1;
+  if (input.completionDriven) {
+    return clampSegmentLimit(
+      input.configuredCompletionSegments,
+      24,
+      MAX_FOREGROUND_COMPLETION_SEGMENTS,
+    );
+  }
+  return Math.min(
+    input.explicitLongRunningResearch ? 3 : 1,
+    clampSegmentLimit(input.configuredLongRunSegments, 2, 24),
+  );
+}
+
+/**
+ * Give the adaptive-team Lead enough bounded slices to spend its existing
+ * model-step budget. This does not raise autonomy: the configured completion
+ * ceiling, shared tool budget, no-progress detector, approvals, and wall-clock
+ * deadline still gate every continuation.
+ */
+export function resolveAdaptiveLeadSegmentLimitV1(input: {
+  leadModelSteps: number;
+  configuredCompletionSegments?: number;
+}): number {
+  const modelSteps =
+    Number.isFinite(input.leadModelSteps) && input.leadModelSteps > 0
+      ? Math.trunc(input.leadModelSteps)
+      : 1;
+  const slicesRequired = Math.max(
+    1,
+    Math.ceil(modelSteps / ADAPTIVE_LEAD_SEGMENT_STEPS),
+  );
+  const configuredLimit = resolveForegroundSegmentLimit({
+    autoContinue: true,
+    completionDriven: true,
+    configuredCompletionSegments: input.configuredCompletionSegments,
+    explicitLongRunningResearch: false,
+  });
+  return Math.min(slicesRequired, configuredLimit);
+}
+
+function clampSegmentLimit(
+  value: number | undefined,
+  fallback: number,
+  maximum: number,
+): number {
+  const candidate =
+    typeof value === "number" && Number.isFinite(value)
+      ? Math.trunc(value)
+      : fallback;
+  return Math.max(1, Math.min(maximum, candidate));
+}
+
 /**
  * Prefer Bound required writes over Soft proof-debt next tools.
  * Soft research often leaves write_receipt debt mapped to append; when the

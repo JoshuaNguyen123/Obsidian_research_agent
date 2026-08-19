@@ -71,6 +71,9 @@ import {
   createTrustedGitHubRepositoryBindingV1,
 } from "../src/integrations/github/TrustedGitHubRepositoryBindingV1";
 import {
+  upgradeTrustedGitHubRepositoryBindingV1ToV2,
+} from "../src/integrations/github/TrustedGitHubRepositoryBindingV2";
+import {
   VerifiedGitPushGatewayV1,
   type EphemeralGitAskpassBrokerV1,
   type GitPushAttemptRecordV1,
@@ -1471,6 +1474,12 @@ function verifiedHandoff(profileKey: string, profileFingerprint: string) {
     changedPaths: ["src/fix.ts"],
     artifactHashes: [{ path: "src/fix.ts", sha256: fp("e"), bytes: 42 }],
     changedArtifacts: [{ path: "src/fix.ts", sha256: fp("e") }],
+    identity: {
+      authorName: AGENT_GIT_COMMIT_NAME_V1,
+      authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+      committerName: AGENT_GIT_COMMIT_NAME_V1,
+      committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+    },
     targetedValidationReceiptId: "targeted-1",
     fullValidationReceiptId: "full-1",
     targetedValidationFingerprint: fp("f"),
@@ -1573,6 +1582,23 @@ function runtimeFor(
     },
     remoteHeads: {
       async read() { return overrides.remoteHead?.() ?? null; },
+    },
+    privateRepositoryBindings: {
+      async verify(binding) {
+        return upgradeTrustedGitHubRepositoryBindingV1ToV2({
+          binding,
+          repositoryReadback: {
+            id: binding.repositoryId,
+            fullName: `${binding.owner}/${binding.repository}`,
+            htmlUrl: `https://github.com/${binding.owner}/${binding.repository}`,
+            defaultBranch: binding.defaultBranch,
+            private: true,
+            visibility: "private",
+            archived: false,
+          },
+          observedAt: NOW,
+        });
+      },
     },
     workflows,
     autoMerge,

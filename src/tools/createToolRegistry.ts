@@ -13,6 +13,9 @@ import { createWebViewerTools } from "./webViewerTools";
 import { createWebTools } from "./webTools";
 import { createClarificationTools } from "./clarificationTools";
 import { createSemanticSearchTools } from "./semanticSearchTools";
+import { createProjectIdeaBriefTool } from "./projectIdeaBriefTool";
+import { createJupyterReflectionTool } from "./jupyterReflectionTool";
+import { createProjectResultsTool } from "./projectResultsTool";
 import { withExplicitToolDescriptor } from "./toolDescriptors";
 import {
   createLinearTools,
@@ -322,6 +325,9 @@ function createCoreBuiltInTools(
 
 function createCoreOwnedTools(): AgentTool[] {
   return [
+    createProjectIdeaBriefTool(),
+    createJupyterReflectionTool(),
+    createProjectResultsTool(),
     ...createVaultTools(),
     ...createVaultIndexTools(),
     ...createSemanticSearchTools(),

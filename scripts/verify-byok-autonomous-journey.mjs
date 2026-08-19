@@ -48,9 +48,11 @@ const expectedObserved = {
     "github:private_repository",
     "github:draft_pull_request",
     "vault:completion_reflection",
+    "vault:jupyter_completion_reflection",
   ],
   proofs: [
     "research:four_distinct_sources",
+    "research:grounded_selected_project_idea",
     "research:accepted_lineage",
     "linear:provider_readback",
     "linear:independent_phase_b_read",
@@ -63,6 +65,8 @@ const expectedObserved = {
     "github:remote_sha_readback",
     "github:single_open_draft_readback",
     "reflection:human_35_100_words",
+    "reflection:verified_commit_bound_code_example",
+    "reflection:jupyter_no_execution_readback",
     "graph:authoritative",
     "idempotency:no_duplicates",
     "authority:no_unapproved_mutations",
@@ -72,6 +76,7 @@ const expectedObserved = {
     "authorization:sandbox_execution",
     "approval:github_private_repository_create",
     "approval:github_publish",
+    "approval:jupyter_reflection",
   ],
   bindings: [
     "binding:note_linear_issue",
@@ -80,6 +85,7 @@ const expectedObserved = {
     "binding:note_pr",
     "binding:desktop_commit_tree",
     "binding:durable_workspace_identity",
+    "binding:jupyter_commit",
   ],
   cleanup: [
     "cleanup:linear_fixture",
@@ -183,8 +189,8 @@ requireCondition(
   "The BYOK daily-use metrics do not represent complete runtime acceptance.",
 );
 requireCondition(
-  metrics.approvalBoundaryProofCount === 4,
-  `Expected four fingerprint-bound approval or host-authorization proofs, observed ${String(
+  metrics.approvalBoundaryProofCount === 5,
+  `Expected five fingerprint-bound approval or host-authorization proofs, observed ${String(
     metrics.approvalBoundaryProofCount,
   )}.`,
 );

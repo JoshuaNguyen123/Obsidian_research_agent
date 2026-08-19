@@ -44,6 +44,7 @@ export const ROUTE_BASE_TOOLS: Readonly<
     "replace_current_file",
   ],
   research: [
+    "create_project_idea_brief",
     "read_current_file",
     "list_markdown_files",
     "read_file",
@@ -106,6 +107,9 @@ export const ROUTE_BASE_TOOLS: Readonly<
  * not re-expand them.
  */
 const LIFECYCLE_WORKFLOW_TOOLS = new Set([
+  "create_project_idea_brief",
+  "append_jupyter_reflection",
+  "write_project_results",
   "publish_research_to_linear",
   "publish_research_project_to_linear",
   // End-of-mission progress report. It must survive the note/research route

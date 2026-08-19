@@ -11,6 +11,7 @@ import {
 } from "../src/agent/pipelineLineage";
 import { computeProofDebt } from "../src/agent/proofDebt";
 import type { ProjectLineageV1 } from "../src/agent/projectLifecycle";
+import { verifiedCodeReflectionFixture } from "./fixtures/verifiedCodeReflection";
 
 const fp = (char: string) => `sha256:${char.repeat(64)}`;
 
@@ -176,6 +177,7 @@ test("reflectMissionCompletion stays open for unpaid debt, WAL, conflicts, or wr
 });
 
 test("planCompoundCompletionReflection bundles note write plan from lineage cites", () => {
+  const { examples } = verifiedCodeReflectionFixture();
   const emptyDebt = computeProofDebt({
     status: "complete",
     acceptance: { status: "pass", missing: [] },
@@ -198,6 +200,7 @@ test("planCompoundCompletionReflection bundles note write plan from lineage cite
     reflectionContext: context,
     initiatingNotePath: "Projects/Initiating.md",
     linearIssueUrls: ["https://linear.app/acme/issue/ISSUE-1"],
+    codeExamples: examples,
   });
 
   assert.equal(planned.completion.done, true);
@@ -210,8 +213,24 @@ test("planCompoundCompletionReflection bundles note write plan from lineage cite
     planned.initiatingNote.markdown,
     /https:\/\/github\.com\/acme\/demo\/pull\/3/u,
   );
+  assert.match(planned.initiatingNote.markdown, /### Verified code example/u);
+  for (const example of examples.examples) {
+    assert.ok(
+      planned.initiatingNote.markdown.includes(
+        `excerpt hash \`${example.codeSha256}\``,
+      ),
+    );
+  }
+  const markdownWithoutVerifiedExcerptHashes = examples.examples.reduce(
+    (markdown, example) => markdown
+      .split(example.codeSha256)
+      .join("[verified excerpt hash]"),
+    planned.initiatingNote.markdown,
+  );
   assert.equal(
-    findRawReceiptDumpInReflectionMarkdown(planned.initiatingNote.markdown),
+    findRawReceiptDumpInReflectionMarkdown(
+      markdownWithoutVerifiedExcerptHashes,
+    ),
     null,
   );
 });

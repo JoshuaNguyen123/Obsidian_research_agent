@@ -1,4 +1,8 @@
 import { sha256Fingerprint } from "../../../packages/headless-runtime/src/canonicalize";
+import {
+  isAgentGitCommitIdentityV1,
+  type AgentGitCommitIdentityV1,
+} from "../../../packages/core-api/src/agentGitCommitIdentityV1";
 
 import { assertSafeRepositoryRelativePath } from "./protectedControls";
 import {
@@ -540,6 +544,21 @@ export class CommitOnlyVerifiedCommitGatewayV1
     files.sort(comparePath);
     artifacts.sort(comparePath);
     const fingerprint = await diffFingerprint({ baseSha: parentSha, patch, files });
+    const identity = this.parseCommitIdentity(
+      await this.gitText(input.request.worktree.path, [
+        "show",
+        "--no-patch",
+        "--no-show-signature",
+        "--format=%an%x00%ae%x00%cn%x00%ce",
+        commitSha,
+      ]),
+    );
+    if (!isAgentGitCommitIdentityV1(identity)) {
+      throw new ProductionAdapterErrorV1(
+        "commit_identity_mismatch",
+        "Commit author or committer is not the host-pinned Agentic Researcher identity.",
+      );
+    }
     return {
       operationId,
       commitSha,
@@ -548,6 +567,7 @@ export class CommitOnlyVerifiedCommitGatewayV1
       diffFingerprint: fingerprint,
       changedPaths: files.map((file) => file.path),
       artifactHashes: artifacts,
+      identity,
       readAt: this.timestamp(),
     };
   }
@@ -774,6 +794,25 @@ export class CommitOnlyVerifiedCommitGatewayV1
 
   private async gitOk(cwd: string, args: readonly string[]): Promise<void> {
     await this.git(cwd, args, [0]);
+  }
+
+  private parseCommitIdentity(input: string): AgentGitCommitIdentityV1 {
+    const fields = input.split("\0");
+    if (
+      fields.length !== 4 ||
+      fields.some((field) => !field || field.length > 1_024 || /[\0\r\n]/u.test(field))
+    ) {
+      throw new ProductionAdapterErrorV1(
+        "commit_identity_invalid",
+        "Git commit author and committer readback is invalid.",
+      );
+    }
+    return {
+      authorName: fields[0],
+      authorEmail: fields[1],
+      committerName: fields[2],
+      committerEmail: fields[3],
+    };
   }
 
   private async git(

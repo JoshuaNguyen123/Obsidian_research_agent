@@ -44,6 +44,7 @@ const ALLOWED_GIT_COMMANDS = new Set([
   "diff-tree",
   "read-tree",
   "rev-parse",
+  "show",
   "status",
 ]);
 
@@ -734,6 +735,23 @@ function validateGitArgs(input: readonly string[]): string[] {
       "git_command_not_allowed",
       `Git command ${command} is outside the fixed repair catalog.`,
     );
+  }
+  if (command === "show") {
+    const boundary = args.indexOf("--literal-pathspecs");
+    const operation = boundary >= 0 ? args.slice(boundary + 1) : [];
+    if (
+      operation.length !== 5 ||
+      operation[0] !== "show" ||
+      operation[1] !== "--no-patch" ||
+      operation[2] !== "--no-show-signature" ||
+      operation[3] !== "--format=%an%x00%ae%x00%cn%x00%ce" ||
+      !GIT_SHA.test(operation[4] ?? "")
+    ) {
+      throw new GitRepairProofErrorV1(
+        "git_command_not_allowed",
+        "Git show is limited to exact raw author and committer identity readback for one commit SHA.",
+      );
+    }
   }
   return args;
 }

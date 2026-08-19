@@ -219,6 +219,12 @@ test("the BYOK autonomous journey proves every handoff through production bounda
     "linearIssueId",
     "assertSandboxValidationReceipt",
     "activeFixture.snapshotTree(canonicalExport)",
+    "assertVerifiedCommitBoundCodeExamplesV1",
+    "expectedCommitSha: handoff.commitSha",
+    "example.path === \"crdt_sync.py\"",
+    "allowedApprovalToolNames: BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS",
+    "requirePrivateRepositoryApproval: true",
+    "requireExactPreparedActionApproval: true",
     "listPullRequestsForHead",
     "researchVia=owned-fixture",
     "recordDailyUseAcceptance",
@@ -324,6 +330,14 @@ test("the compound live lane awards acceptance only from exact durable proof bin
     "publication.remoteSha === codeProbe.commitSha",
     "publication.pullRequestHeadSha === codeProbe.commitSha",
     "draftPrMatch?.[0] === publication.pullRequestHtmlUrl",
+    "assertVerifiedCommitBoundCodeExamplesV1",
+    "expectedCommitSha: codeProbe.commitSha",
+    "example.path === relativeCodePath && example.code.includes(marker)",
+    "allowedApprovalToolNames: FLOW_REAL_ALLOWED_PREPARED_APPROVAL_TOOLS",
+    "requirePrivateRepositoryApproval: true",
+    "requireExactPreparedActionApproval: true",
+    "linearPreparedApprovals",
+    "approval:linear_issue_create",
   ]) {
     assert.match(spec, new RegExp(escapeRegExp(required), "u"), required);
   }
@@ -371,6 +385,21 @@ test("the real AI harness counts whole-team model calls by coordinator usage sco
   );
 });
 
+test("the real AI harness clicks only the exact rendered prepared action", () => {
+  const harness = readFileText("../e2e/fixtures/realAiHarness.ts");
+  for (const required of [
+    "approvalBroker?.getPending?.()",
+    "matching.length !== 1",
+    "prepared.toolName !== toolName",
+    "prepared.runId !== request?.runId",
+    "prepared.payloadFingerprint !== payloadFingerprint",
+    "toolName === \"github_create_repository\"",
+    "visibility !== \"private\"",
+  ]) {
+    assert.match(harness, new RegExp(escapeRegExp(required), "u"), required);
+  }
+});
+
 test("the exclusive runner preserves both execution JSON and scorecard reports", () => {
   const runner = readFileText("../scripts/run-e2e-exclusive.mjs");
   assert.match(
@@ -396,7 +425,7 @@ test("the BYOK post-run verifier checks retained code and disposable GitHub clea
     "authority:no_unapproved_mutations",
     "phaseAScorecard.runId !== phaseBScorecard.runId",
     "JSON.stringify(scorecard) === JSON.stringify(phaseBScorecard.scorecard)",
-    "approvalBoundaryProofCount === 4",
+    "approvalBoundaryProofCount === 5",
     "validatePhaseProviderUsage",
     "terminalUsageScopeId",
     "metrics.modelCalls",
@@ -434,6 +463,8 @@ test("the retained journey closes its provider, graph, note, UI, and clone proof
     "code_validate_full",
     "assertMissionUiSurfacesV1",
     "DAILY_USE_SCORECARD_ANNOTATION",
+    "assertVerifiedCommitBoundCodeExamplesV1",
+    "expectedCommitSha: artifacts.commitSha",
   ]) {
     assert.match(spec, new RegExp(escapeRegExp(required), "u"), required);
   }
@@ -444,6 +475,9 @@ test("the retained journey closes its provider, graph, note, UI, and clone proof
     "Linear issue assignee is the configured viewer",
     "Research cites the exact retained source URLs",
     "MissionGraph completed the retained lifecycle tools",
+    "Reflection includes one or two concise commit-bound code examples",
+    "Reflection code examples match the exact private GitHub commit",
+    "git/trees/${artifacts.commitSha}?recursive=1",
     "clonedHead === artifacts.commitSha",
   ]) {
     assert.match(verifier, new RegExp(escapeRegExp(required), "u"), required);

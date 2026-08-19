@@ -236,7 +236,7 @@ test("bundledPreviewToApprovalRequest is recognizable by the broker helper", asy
   assert.match(request.reason, /separate exact confirmation/i);
 });
 
-test("boundMayAutoWithoutChatGrant prefers bundle grant and still blocks Hard", async () => {
+test("boundMayAutoWithoutChatGrant preserves exact approval for Linear mutations and blocks Hard", async () => {
   const t0 = new Date();
   const preview = await buildBundledApprovalPreview({
     runId: "run-bundle-5",
@@ -249,7 +249,8 @@ test("boundMayAutoWithoutChatGrant prefers bundle grant and still blocks Hard", 
     now: t0,
   });
 
-  // Bundle covers Bound even when set-loose would be off (conservative).
+  // A family-level bundle is not an exact prepared-action approval for an
+  // externally visible Linear mutation.
   assert.equal(
     boundMayAutoWithoutGrant({
       toolName: "linear_create_issue",
@@ -266,7 +267,7 @@ test("boundMayAutoWithoutChatGrant prefers bundle grant and still blocks Hard", 
       bundledGrant: grant,
       now: t0,
     }),
-    true,
+    false,
   );
   assert.equal(
     boundMayAutoWithoutChatGrant({

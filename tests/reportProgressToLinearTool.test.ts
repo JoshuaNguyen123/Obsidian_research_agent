@@ -89,84 +89,53 @@ test("progress issue authority is limited to the current root or segment lineage
   );
 });
 
-test("the tool is both offered and budgeted on every stage that can report", () => {
-  // Two parallel allowlists govern a stage: lifecycleStagePolicy decides what
-  // reaches the model's frontier, missionStageEnvelope decides what the
-  // mutation budget authorizes. Wiring only the envelope means the tool is
-  // authorized but never offered — the live run proved that silently, with the
-  // model never seeing it. Keep them in step.
-  for (const stage of [
-    "accepted_research",
-    "private_github_publication",
-  ] as const) {
-    assert.ok(
-      toolsAllowedForLifecycleStage(stage).includes(
-        REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
-      ),
-      `${stage} must offer the tool on the frontier`,
-    );
-  }
+test("the model-driven progress tool stays outside the autonomous lifecycle", () => {
   for (const stage of [
     "accepted_research",
     "linear_hierarchy",
+    "code_execution",
+    "code_validation",
     "private_github_publication",
+    "reflection",
+    "reconciliation_cleanup",
   ] as const) {
-    assert.ok(
+    assert.equal(
+      toolsAllowedForLifecycleStage(stage).includes(
+        REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
+      ),
+      false,
+      `${stage} must rely on receipt-driven host progress`,
+    );
+    assert.equal(
       toolsAllowedForEnvelopeStage(stage).includes(
         REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
       ),
-      `${stage} must budget the tool's mutation`,
+      false,
+      `${stage} must not budget a model-selected progress mutation`,
     );
   }
-  // Listing it under linear_hierarchy would delete it from the reflection
-  // turn, because that stage's tools are withdrawn once it is no longer the
-  // earliest unpaid one.
-  assert.equal(
-    toolsAllowedForLifecycleStage("linear_hierarchy").includes(
-      REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
-    ),
-    false,
-  );
-  // Cleanup is trash-only; a progress report has no business there.
-  assert.equal(
-    toolsAllowedForLifecycleStage("reconciliation_cleanup").includes(
-      REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
-    ),
-    false,
-  );
 });
 
-test("set-loose actually offers the tool at the reflection moment", () => {
-  // The allowlists above are necessary but not sufficient. Under set-loose —
-  // the autonomous mode — the offered frontier comes from this hardcoded
-  // switch, keyed on the earliest unpaid delivery item. Two live runs passed
-  // with the tool wired into both allowlists and still never offered, because
-  // nothing routed it here.
-  assert.ok(
-    pendingToolsForUnpaidSetLooseDelivery(["note_reflection"]).includes(
-      REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
-    ),
-    "reflection must be able to report back to the issue",
-  );
-  assert.ok(
-    pendingToolsForUnpaidSetLooseDelivery(["linear_hierarchy"]).includes(
-      REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
-    ),
-  );
-  // Code and GitHub stages have no business reporting progress.
-  assert.equal(
-    pendingToolsForUnpaidSetLooseDelivery(["code_execution"]).includes(
-      REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
-    ),
-    false,
-  );
+test("set-loose never offers the model-driven progress tool", () => {
+  for (const unpaid of [
+    "accepted_research",
+    "linear_hierarchy",
+    "code_execution",
+    "code_validation",
+    "private_github_publication",
+    "note_reflection",
+    "reflection",
+  ] as const) {
+    assert.equal(
+      pendingToolsForUnpaidSetLooseDelivery([unpaid]).includes(
+        REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
+      ),
+      false,
+    );
+  }
 });
 
-test("the reflection turn's real offered frontier contains the tool", () => {
-  // The full chain the runner actually applies, not just the raw stage lists.
-  // Three live runs could not answer this: run telemetry does not reliably
-  // capture frontier contents (one capture reported zero rejected calls while
-  // the operator watched several). Assert it deterministically instead.
+test("the reflection frontier writes Results while progress remains host-owned", () => {
   const scope = {
     read: { currentNote: true, vault: true, folders: [], files: [], web: true },
     write: {
@@ -198,11 +167,8 @@ test("the reflection turn's real offered frontier contains the tool", () => {
     scope,
   );
 
-  assert.ok(
-    offered.includes(REPORT_PROGRESS_TO_LINEAR_TOOL_NAME),
-    `reflection frontier was: ${offered.join(", ")}`,
-  );
-  assert.ok(offered.includes("append_to_current_file"));
+  assert.equal(offered.includes(REPORT_PROGRESS_TO_LINEAR_TOOL_NAME), false);
+  assert.ok(offered.includes("write_project_results"));
 
   // The same chain with current-note writes unauthorized is what stranded a
   // live run: the host asked for a write while offering no write tool. If that

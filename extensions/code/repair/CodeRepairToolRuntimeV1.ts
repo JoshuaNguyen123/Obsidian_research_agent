@@ -9,6 +9,7 @@ import type {
 } from "@agentic-researcher/core-api";
 
 import { sha256Fingerprint } from "../../../packages/headless-runtime/src/canonicalize";
+import { isAgentGitCommitIdentityV1 } from "../../../packages/core-api/src/agentGitCommitIdentityV1";
 import {
   classifyProtectedControlChangesV2,
   parseRepositoryProfileV2,
@@ -2183,6 +2184,7 @@ async function createVerifiedCommitReceipt(
       path: file.path,
       sha256: file.afterSha256,
     })),
+    identity: { ...readback.identity },
     targetedValidationReceiptId: targeted.id,
     fullValidationReceiptId: full.id,
     targetedValidationFingerprint: targeted.fingerprint,
@@ -2213,6 +2215,9 @@ function compareCommitReadback(
     return "Commit parent does not match the trusted base SHA.";
   }
   if (!GIT_SHA.test(readback.treeSha)) return "Commit tree SHA is invalid.";
+  if (!isAgentGitCommitIdentityV1(readback.identity)) {
+    return "Commit author or committer does not match the host-pinned neutral identity.";
+  }
   if (readback.diffFingerprint !== diff.fingerprint) {
     return "Commit diff fingerprint does not match the approved diff.";
   }

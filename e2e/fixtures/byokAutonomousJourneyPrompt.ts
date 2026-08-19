@@ -6,6 +6,7 @@ export function buildByokPhaseAResearchPrompt(input: {
   return [
     `Deeply research a small dependency-free Python CRDT library for marker ${input.marker}.`,
     "Use and fetch at least four independent sources exposed through the configured research backend. Reconcile their guidance on state-based G-Counter joins and observed-remove sets, including convergence, idempotence, concurrent add versus remove, and practical validation.",
+    "After all four fetches, call create_project_idea_brief exactly once. Compare at least two dependency-free CRDT library directions, select one, and ground it with the exact four fetched source URLs. Treat its returned promotion seed as authoritative and copy every shared title, problem, evidence, proposed-work, non-goal, acceptance-criterion, and risk field byte-for-byte into accepted research publication.",
     "Write accepted research into the initiating note as a concise but substantive implementation brief, then publish that accepted research to exactly one Linear implementation issue in the configured destination.",
     "Keep the issue standalone; do not create a Linear project or initiative.",
     `The accepted package is executable code work for trusted repository key ${input.profileKey} and validation requirement key ${input.validationProfileKey}.`,

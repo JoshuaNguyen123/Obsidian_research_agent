@@ -15,6 +15,10 @@ import type {
 } from "../packages/headless-runtime/src/backgroundContinuation";
 import { sha256Fingerprint } from "../packages/headless-runtime/src/canonicalize";
 import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
+import {
   BackgroundCodeContinuationRuntimeV1,
   type BackgroundCodeContinuationDependenciesV1,
 } from "../extensions/code/background";
@@ -393,6 +397,12 @@ function verifiedCommitReceipt(checkpoint: CodeRepairCheckpointV1): VerifiedLoca
     changedPaths: ["src/index.ts"],
     artifactHashes: [{ path: "src/index.ts", sha256: fp("e"), bytes: 32 }],
     changedArtifacts: [{ path: "src/index.ts", sha256: fp("e") }],
+    identity: {
+      authorName: AGENT_GIT_COMMIT_NAME_V1,
+      authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+      committerName: AGENT_GIT_COMMIT_NAME_V1,
+      committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+    },
     targetedValidationReceiptId: "targeted-validation",
     fullValidationReceiptId: "full-validation",
     targetedValidationFingerprint: fp("f"),

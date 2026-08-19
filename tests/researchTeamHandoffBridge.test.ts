@@ -9,13 +9,16 @@ import {
 import type { MissionEvidence } from "../src/agent/missionLedger";
 import type { WorkerHandoff } from "../src/orchestrator/types";
 
-function readyHandoff(): WorkerHandoff {
+const NOTE_SHA256 = `sha256:${"b".repeat(64)}`;
+const NOTE_RECEIPT_ID = "research-note-verified-checkers";
+
+function acceptedHandoff(): WorkerHandoff {
   return {
     id: "handoff-1",
     fromParticipantId: "researcher-1",
     toParticipantId: "lead-1",
     taskId: "task-research",
-    status: "ready",
+    status: "accepted",
     summary: "Gathered checkers rules.",
     sourceIds: ["https://rules.example.org/checkers"],
     evidenceIds: ["web_fetch:https://rules.example.org/checkers"],
@@ -43,12 +46,14 @@ function usableEvidence(): MissionEvidence[] {
   ];
 }
 
-test("bridge builds accepted artifact and researcher handoff from ready worker evidence", () => {
-  const handoff = readyHandoff();
+test("bridge builds accepted artifact and researcher handoff only from host-accepted, receipt-backed note evidence", () => {
+  const handoff = acceptedHandoff();
   const evidence = usableEvidence();
   const artifact = buildAcceptedResearchArtifactFromWorkerHandoff({
     handoff,
     notePath: "Research/Checkers.md",
+    noteSha256: NOTE_SHA256,
+    noteReceiptId: NOTE_RECEIPT_ID,
     runId: "run-team-1",
     evidence,
   });
@@ -68,6 +73,7 @@ test("bridge builds accepted artifact and researcher handoff from ready worker e
     taskId: "task-research",
     notePath: artifact.notePath,
     noteSha256: artifact.noteSha256,
+    noteReceiptId: artifact.noteReceiptId,
     acceptedArtifactFingerprint: artifact.artifactFingerprint,
     artifact,
     evidence,
@@ -85,10 +91,12 @@ test("bridge builds accepted artifact and researcher handoff from ready worker e
 });
 
 test("bridge never invents example.com provenance for opaque evidence ids", () => {
-  const handoff = readyHandoff();
+  const handoff = acceptedHandoff();
   const withoutEvidence = buildAcceptedResearchArtifactFromWorkerHandoff({
     handoff,
     notePath: "Research/Checkers.md",
+    noteSha256: NOTE_SHA256,
+    noteReceiptId: NOTE_RECEIPT_ID,
     runId: "run-team-1",
   });
   assert.deepEqual(withoutEvidence, {
@@ -108,12 +116,14 @@ test("bridge never invents example.com provenance for opaque evidence ids", () =
 });
 
 test("bridge accepts vault markdown paths from mission evidence", () => {
-  const handoff = readyHandoff();
+  const handoff = acceptedHandoff();
   handoff.sourceIds = ["Notes/Local source.md"];
   handoff.evidenceIds = ["vault:Notes/Local source.md"];
   const artifact = buildAcceptedResearchArtifactFromWorkerHandoff({
     handoff,
     notePath: "Research/Checkers.md",
+    noteSha256: NOTE_SHA256,
+    noteReceiptId: NOTE_RECEIPT_ID,
     runId: "run-team-1",
     evidence: [
       {
@@ -134,17 +144,59 @@ test("bridge accepts vault markdown paths from mission evidence", () => {
 });
 
 test("bridge rejects preparing handoff with zero evidence", () => {
-  const handoff = readyHandoff();
+  const handoff = acceptedHandoff();
   handoff.status = "preparing";
   handoff.evidenceIds = [];
   handoff.sourceIds = [];
   const artifact = buildAcceptedResearchArtifactFromWorkerHandoff({
     handoff,
     notePath: "Research/Checkers.md",
+    noteSha256: NOTE_SHA256,
+    noteReceiptId: NOTE_RECEIPT_ID,
     runId: "run-team-1",
   });
   assert.deepEqual(artifact, {
     ok: false,
     reason: "handoff_status_preparing",
   });
+});
+
+test("bridge does not promote a merely ready worker handoff to accepted research", () => {
+  const handoff = acceptedHandoff();
+  handoff.status = "ready";
+  const artifact = buildAcceptedResearchArtifactFromWorkerHandoff({
+    handoff,
+    notePath: "Research/Checkers.md",
+    noteSha256: NOTE_SHA256,
+    noteReceiptId: NOTE_RECEIPT_ID,
+    runId: "run-team-1",
+    evidence: usableEvidence(),
+  });
+  assert.deepEqual(artifact, { ok: false, reason: "handoff_status_ready" });
+});
+
+test("bridge requires the exact host-observed note hash and durable receipt", () => {
+  const handoff = acceptedHandoff();
+  assert.deepEqual(
+    buildAcceptedResearchArtifactFromWorkerHandoff({
+      handoff,
+      notePath: "Research/Checkers.md",
+      noteSha256: "",
+      noteReceiptId: NOTE_RECEIPT_ID,
+      runId: "run-team-1",
+      evidence: usableEvidence(),
+    }),
+    { ok: false, reason: "verified_note_hash_required" },
+  );
+  assert.deepEqual(
+    buildAcceptedResearchArtifactFromWorkerHandoff({
+      handoff,
+      notePath: "Research/Checkers.md",
+      noteSha256: NOTE_SHA256,
+      noteReceiptId: "",
+      runId: "run-team-1",
+      evidence: usableEvidence(),
+    }),
+    { ok: false, reason: "verified_note_receipt_required" },
+  );
 });

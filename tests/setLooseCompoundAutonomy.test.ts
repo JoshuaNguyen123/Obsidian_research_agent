@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { portableSha256Text } from "../packages/core-api/src/portableSha256";
+
 import {
   advanceCompoundStageBudget,
   buildCompoundRunBudgetPlanV1,
@@ -321,7 +323,32 @@ test("boundMayAutoWithoutGrant and mayAutoExecute set-loose flag", () => {
       autonomyProfile: "automatic",
       compoundLifecycleDetected: true,
     }),
-    true,
+    false,
+    "Linear mutations require their exact prepared-action approval even in set-loose mode",
+  );
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      toolName: "publish_research_to_linear",
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+    }),
+    false,
+  );
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      toolName: "publish_research_project_to_linear",
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+    }),
+    false,
+  );
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      toolName: "linear_update_issue",
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+    }),
+    false,
   );
   assert.equal(
     boundMayAutoWithoutGrant({
@@ -356,6 +383,27 @@ test("boundMayAutoWithoutGrant and mayAutoExecute set-loose flag", () => {
     }),
     false,
     "Hard trash never auto under set-loose",
+  );
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      toolName: "append_jupyter_reflection",
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+      currentPrompt:
+        "Do not call append_jupyter_reflection; leave `Notes/result.ipynb` unchanged.",
+    }),
+    false,
+    "negated Jupyter reflection never receives automatic mutation authority",
+  );
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      toolName: "append_jupyter_reflection",
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+      currentPrompt:
+        "Append the verified reflection to `Notes/result.ipynb`.",
+    }),
+    true,
   );
   assert.equal(
     mayAutoExecute({
@@ -518,20 +566,25 @@ test("stage budgets build, format, and advance", () => {
 });
 
 test("toolsOfferedForSetLooseStage unions Soft companions", () => {
-  const offered = toolsOfferedForSetLooseStage("code_execution");
-  assert.ok(offered.includes("code_commit_verified"));
-  assert.ok(offered.includes("semantic_search_notes"));
-  assert.ok(offered.includes("append_to_current_file"));
-  assert.ok(offered.includes("replace_current_file"));
-  assert.ok(offered.includes("code_workspace_patch"));
-  assert.ok(offered.includes("code_workspace_mkdir"));
-  assert.ok(offered.includes("code_repair_record_cycle"));
+  const implementation = toolsOfferedForSetLooseStage("code_execution");
+  assert.ok(implementation.includes("semantic_search_notes"));
+  assert.ok(implementation.includes("append_to_current_file"));
+  assert.ok(implementation.includes("replace_current_file"));
+  assert.ok(implementation.includes("code_workspace_patch"));
+  assert.ok(implementation.includes("code_workspace_mkdir"));
+  assert.equal(implementation.includes("code_repair_record_cycle"), false);
+  assert.equal(implementation.includes("code_commit_verified"), false);
+
+  const validation = toolsOfferedForSetLooseStage("code_validation");
+  assert.ok(validation.includes("code_repair_record_cycle"));
+  assert.ok(validation.includes("code_commit_verified"));
+  assert.equal(validation.includes("code_workspace_patch"), false);
   assert.ok(
-    offered.includes("read_template"),
+    implementation.includes("read_template"),
     "set-loose Soft companions must offer read_template so Linear template gates are callable",
   );
   assert.ok(
-    offered.includes("list_templates"),
+    validation.includes("list_templates"),
     "set-loose Soft companions should offer list_templates alongside read_template",
   );
 });
@@ -660,6 +713,7 @@ test("toolsOfferedForSetLoosePipeline keeps later-stage Bound tools from accepte
     "accepted_research",
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
     "reconciliation_cleanup",
   ];
@@ -683,6 +737,7 @@ test("toolsOfferedForSetLoosePipeline keeps later-stage Bound tools from accepte
       "accepted_research",
       "linear_hierarchy",
       "code_execution",
+      "code_validation",
       "private_github_publication",
     ],
     currentStage: "accepted_research",
@@ -710,11 +765,12 @@ test("toolsOfferedForSetLoosePipeline withholds commit until passed fast repair 
   const stages: ProjectLifecycleStageV1[] = [
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
   ];
   const before = toolsOfferedForSetLoosePipeline({
     stages,
-    currentStage: "code_execution",
+    currentStage: "code_validation",
     passedFastRepairCycle: false,
   });
   assert.ok(before.includes("code_validate_fast"));
@@ -723,7 +779,7 @@ test("toolsOfferedForSetLoosePipeline withholds commit until passed fast repair 
 
   const after = toolsOfferedForSetLoosePipeline({
     stages,
-    currentStage: "code_execution",
+    currentStage: "code_validation",
     passedFastRepairCycle: true,
   });
   assert.ok(after.includes("code_commit_verified"));
@@ -768,10 +824,17 @@ test("lifecycleStagePaidBySuccessfulTool maps key tools and fails closed", () =>
   );
   assert.equal(
     lifecycleStagePaidBySuccessfulTool({
-      toolName: "code_commit_verified",
+      toolName: "code_workspace_patch",
       ok: true,
     }),
     "code_execution",
+  );
+  assert.equal(
+    lifecycleStagePaidBySuccessfulTool({
+      toolName: "code_commit_verified",
+      ok: true,
+    }),
+    "code_validation",
   );
   assert.equal(
     lifecycleStagePaidBySuccessfulTool({
@@ -796,6 +859,20 @@ test("lifecycleStagePaidBySuccessfulTool maps key tools and fails closed", () =>
   );
   assert.equal(
     lifecycleStagePaidBySuccessfulTool({
+      toolName: "write_project_results",
+      ok: true,
+    }),
+    "reflection",
+  );
+  assert.equal(
+    lifecycleStagePaidBySuccessfulTool({
+      toolName: "append_jupyter_reflection",
+      ok: true,
+    }),
+    "reflection",
+  );
+  assert.equal(
+    lifecycleStagePaidBySuccessfulTool({
       toolName: "linear_create_issue",
       ok: false,
     }),
@@ -815,14 +892,17 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
     "accepted_research",
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
+    "reflection",
   ];
   const missingLinearGithub = setLooseDeliveryComplete({
     stages,
     proofs: {
       acceptedResearchPublication: true,
       linearIssueUrlOrId: false,
-      codeWorkspaceReadback: true,
+      codeImplementationReadback: true,
+      codeValidationAndCommit: true,
       githubPrivateRepoOrPrUrl: false,
       noteReflectionWithMarkers: true,
     },
@@ -836,7 +916,8 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
     proofs: {
       acceptedResearchPublication: true,
       linearIssueUrlOrId: true,
-      codeWorkspaceReadback: true,
+      codeImplementationReadback: true,
+      codeValidationAndCommit: true,
       githubPrivateRepoOrPrUrl: true,
       noteReflectionWithMarkers: true,
     },
@@ -849,7 +930,8 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
     proofs: {
       acceptedResearchPublication: true,
       linearIssueUrlOrId: true,
-      codeWorkspaceReadback: true,
+      codeImplementationReadback: true,
+      codeValidationAndCommit: true,
       githubPrivateRepoOrPrUrl: true,
     },
   });
@@ -862,6 +944,8 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
         "accepted_research",
         "linear_hierarchy",
         "code_execution",
+        "code_validation",
+        "reflection",
       ],
     }),
     ["private_github_publication"],
@@ -871,6 +955,7 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
     "accepted_research",
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
     "note_reflection",
   ]);
@@ -883,7 +968,13 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
   assert.ok(pending.includes("code_commit_verified"));
   assert.ok(pending.includes("github_create_repository"));
   assert.ok(pending.includes("publish_verified_code_to_github"));
-  assert.ok(pending.includes("append_to_current_file"));
+  assert.ok(pending.includes("write_project_results"));
+
+  const reflectionPending = pendingToolsForUnpaidSetLooseDelivery([
+    "note_reflection",
+  ]);
+  assert.ok(reflectionPending.includes("write_project_results"));
+  assert.equal(reflectionPending.includes("append_to_current_file"), false);
 });
 
 test("toolsOfferedForSetLooseCodeStage withholds GitHub until code paid", () => {
@@ -1091,14 +1182,14 @@ test("accepted_research allowlist includes semantic tools", () => {
   assert.ok(research.includes("get_note_graph_context"));
 });
 
-test("set-loose Bound pending continues without grant", () => {
+test("set-loose pauses for exact approval when a Linear mutation is pending", () => {
   assert.equal(
     pendingToolsAllowSetLooseWithoutGrant({
       pendingToolNames: ["linear_create_issue"],
       autonomyProfile: "automatic",
       compoundLifecycleDetected: true,
     }),
-    true,
+    false,
   );
   assert.deepEqual(
     decideAutoContinuation({
@@ -1118,11 +1209,11 @@ test("set-loose Bound pending continues without grant", () => {
       hasMatchingGrant: false,
       compoundLifecycleDetected: true,
     }),
-    { recommended: true, reason: "budget_exhausted" },
+    { recommended: false, reason: "effect_class_blocked" },
   );
 });
 
-test("seedSetLooseDeliveryStateFromReceipts restores Linear and commit proofs", () => {
+test("seedSetLooseDeliveryStateFromReceipts restores six-stage Linear, code, and Results proofs", () => {
   const seeded = seedSetLooseDeliveryStateFromReceipts([
     {
       toolName: "linear_create_issue",
@@ -1137,26 +1228,49 @@ test("seedSetLooseDeliveryStateFromReceipts restores Linear and commit proofs", 
       },
     },
     {
+      toolName: "code_workspace_patch",
+      output: { path: "src/index.ts", readbackVerified: true },
+    },
+    {
       toolName: "code_commit_verified",
       output: { commitSha: "a".repeat(40) },
+    },
+    {
+      toolName: "write_project_results",
+      path: "Agent Work/Results/demo/2026-08-19-run.md",
+      output: { readbackVerified: true },
+      resource: {
+        system: "vault",
+        id: "Agent Work/Results/demo/2026-08-19-run.md",
+      },
+      readback: {
+        status: "verified",
+      },
     },
   ]);
   assert.deepEqual(seeded.paidStages.sort(), [
     "code_execution",
+    "code_validation",
     "linear_hierarchy",
+    "reflection",
   ]);
   assert.equal(seeded.proofs.linearIssueUrlOrId, true);
+  assert.equal(seeded.proofs.codeImplementationReadback, true);
   assert.equal(seeded.proofs.codeWorkspaceReadback, true);
+  assert.equal(seeded.proofs.codeValidationAndCommit, true);
+  assert.equal(seeded.proofs.noteReflectionWithMarkers, true);
   assert.deepEqual(
     setLooseDeliveryComplete({
       stages: [
         "linear_hierarchy",
         "code_execution",
+        "code_validation",
         "private_github_publication",
+        "reflection",
       ],
       proofs: seeded.proofs,
     }).unpaid,
-    ["private_github_publication", "note_reflection"],
+    ["private_github_publication"],
   );
 });
 
@@ -1474,22 +1588,71 @@ test("a generic Linear issue does not pay accepted research publication", () => 
   );
 });
 
-test("applySetLooseDeliveryProofFromSuccessfulTool pays note reflection markers", () => {
-  const proofs = applySetLooseDeliveryProofFromSuccessfulTool({
+test("set-loose reflection pays only from a verified meaningful writeback or finalized publication", () => {
+  const sparse = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "append_to_current_file",
     argumentsText:
       "Flow real reflection FLOW_REAL_abc https://linear.app/x https://github.com/o/r/pull/3",
     proofs: {},
   });
-  assert.equal(proofs.noteReflectionWithMarkers, true);
+  assert.equal(sparse.noteReflectionWithMarkers, undefined);
 
-  const byokProof = applySetLooseDeliveryProofFromSuccessfulTool({
+  const verifiedCode = [
+    "export const answer = 42;",
+    "export default answer;",
+  ].join("\n");
+  const meaningfulReflection = [
+    "FLOW_REAL_abc",
+    "The accepted research became a tracked Linear issue and a tested code change with clear evidence.",
+    "Targeted and full validation passed before the draft was published for human review.",
+    "https://linear.app/x https://github.com/o/r/pull/4",
+    "### Verified code example",
+    `\`src/index.ts\` lines 1-2 at commit \`aaaaaaaaaaaa\` (file hash \`bbbbbbbbbbbb\`; excerpt hash \`sha256:${portableSha256Text(verifiedCode)}\`).`,
+    "```typescript",
+    verifiedCode,
+    "```",
+  ].join("\n");
+  const verified = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "append_to_current_file",
-    argumentsText:
-      "BYOK_AUTONOMOUS_abc123 https://linear.app/x https://github.com/o/r/pull/4",
+    output: {
+      kind: "verified_reflection_writeback",
+      status: "committed",
+      readbackVerified: true,
+    },
+    argumentsText: meaningfulReflection,
     proofs: {},
   });
-  assert.equal(byokProof.noteReflectionWithMarkers, true);
+  assert.equal(verified.noteReflectionWithMarkers, true);
+
+  const missingExcerptHash = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "append_to_current_file",
+    output: {
+      kind: "verified_reflection_writeback",
+      status: "committed",
+      readbackVerified: true,
+    },
+    argumentsText: meaningfulReflection.replace(
+      /; excerpt hash `sha256:[0-9a-f]{64}`/u,
+      "",
+    ),
+    proofs: {},
+  });
+  assert.equal(missingExcerptHash.noteReflectionWithMarkers, undefined);
+
+  const mismatchedExcerptHash = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "append_to_current_file",
+    output: {
+      kind: "verified_reflection_writeback",
+      status: "committed",
+      readbackVerified: true,
+    },
+    argumentsText: meaningfulReflection.replace(
+      /excerpt hash `sha256:[0-9a-f]{64}`/u,
+      `excerpt hash \`sha256:${"f".repeat(64)}\``,
+    ),
+    proofs: {},
+  });
+  assert.equal(mismatchedExcerptHash.noteReflectionWithMarkers, undefined);
 
   const finalizedPublication = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "publish_verified_code_to_github",
@@ -1526,6 +1689,22 @@ test("applySetLooseDeliveryProofFromSuccessfulTool pays note reflection markers"
     proofs: {},
   });
   assert.equal(repoOnly.noteReflectionWithMarkers, undefined);
+
+  for (const toolName of [
+    "write_project_results",
+    "append_jupyter_reflection",
+  ]) {
+    const canonicalReflection = applySetLooseDeliveryProofFromSuccessfulTool({
+      toolName,
+      output: { readbackVerified: true },
+      proofs: {},
+    });
+    assert.equal(
+      canonicalReflection.noteReflectionWithMarkers,
+      true,
+      `${toolName} exact readback must pay destination-neutral reflection proof`,
+    );
+  }
 });
 
 test("applySetLooseDeliveryProofFromSuccessfulTool requires draft PR URL for GitHub delivery", () => {

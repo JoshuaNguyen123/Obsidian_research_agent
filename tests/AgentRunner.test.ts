@@ -61,9 +61,13 @@ import {
   resolveMissionGraphToolResultOk,
   resolveToolOutcomeMemoryDispositionV1,
   resolveActiveCompoundLifecycleStageV1,
+  resolveCompletedCompoundLifecycleStagesV1,
   resolveCompoundCompletionSegmentBudgetV1,
   restrictCompoundResearchClosureToolsV1,
   resolveThinkingMode,
+  canonicalLifecycleReflectionReceiptPaysV1,
+  shouldPlanGenericInitiatingNoteReflectionV1,
+  shouldOfferStandaloneLinearProgressReportV1,
   rememberLatestFastValidationDiagnostic,
   restoreLatestFastValidationDiagnosticFromReceipts,
   restorePassedFastRepairCycleFromReceipts,
@@ -74,6 +78,7 @@ import {
   shouldDeferAdditionalProjectLifecycleMutation,
   shouldDeferAdditionalWorkspaceCorrection,
   buildStreamingWritebackPromptForTests,
+  buildSetLooseLifecycleReflectionToolCallV1,
   type AgentRunCompleteEvent,
   type AgentRunConfigEvent,
   type AgentRunMetricEvent,
@@ -105,6 +110,7 @@ import {
   constrainSetLooseTemplateDiscoveryToMissionIntent,
   getExplicitMermaidWorkflowToolNames,
   getUnsafeModelLinearIssueCreateOutputMessage,
+  hasAffirmativeJoinedDeveloperLifecycleIntent,
   hasPreparedBackgroundCodeValidationCommitIntent,
   hasIgnoreRememberedContextIntent,
 } from "../src/agent/promptIntentClassifiers";
@@ -217,7 +223,17 @@ import {
   createGitHubPrivateRepositoryTool,
 } from "../src/tools/githubPrivateRepositoryTool";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
-import { hasExplicitResearchPublicationIntent } from "../src/tools/researchPublicationTool";
+import {
+  hasExplicitResearchPublicationIntent,
+  PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+} from "../src/tools/researchPublicationTool";
+import {
+  PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+} from "../src/tools/researchProjectHierarchyTool";
+import {
+  CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
+  type ProjectIdeaBriefToolOutputV1,
+} from "../src/tools/projectIdeaBriefTool";
 import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
 import { isCompletedAcceptedResearchPublicationReceipt } from "../src/agent/setLooseCompoundAutonomy";
 import { completedResearchPublicationReceiptFixture } from "./fixtures/completedResearchPublicationReceipt";
@@ -433,6 +449,278 @@ test("GitHub repository publication without visibility still routes creation bef
   assert.ok(
     publishIndex > createIndex,
     `repository creation must precede publication: ${required.join(", ")}`,
+  );
+});
+
+test("a natural developer mission routes the full canonical executable ladder without a workflow toggle", () => {
+  const prompt = [
+    "Research a conflict-free counter and create measurable Linear work.",
+    "Implement and test it on desktop, then push a private draft PR to GitHub.",
+  ].join(" ");
+  const allowed = [
+    PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+    PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+    "linear_create_issue",
+    "report_progress_to_linear",
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+    CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    "publish_verified_code_to_github",
+    "append_jupyter_reflection",
+    "write_project_results",
+  ];
+  const required = getRequiredWriteToolNamesForTests(prompt, allowed);
+  assert.deepEqual(required, [
+    PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+    PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+    CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    "publish_verified_code_to_github",
+    "write_project_results",
+  ]);
+  assert.equal(required.includes("append_jupyter_reflection"), false);
+  assert.equal(required.includes("report_progress_to_linear"), false);
+  assert.equal(required.includes("linear_create_issue"), false);
+  assert.deepEqual(getRequiredCodeWorkflowToolNames(prompt), [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+  ]);
+});
+
+test("joined developer inference preserves explicit Linear, code, and GitHub negations", () => {
+  const affirmative = [
+    "Research a conflict-free counter and create measurable Linear work.",
+    "Build and test it on desktop, then push a private draft PR to GitHub.",
+  ].join(" ");
+  assert.equal(
+    hasAffirmativeJoinedDeveloperLifecycleIntent(affirmative),
+    true,
+  );
+  for (const prompt of [
+    affirmative.replace(
+      "create measurable Linear work",
+      "do not create Linear work",
+    ),
+    affirmative.replace(
+      "Build and test it",
+      "Do not implement code; test the design only",
+    ),
+    affirmative.replace(
+      "push a private draft PR to GitHub",
+      "do not push or publish anything to GitHub",
+    ),
+  ]) {
+    assert.equal(
+      hasAffirmativeJoinedDeveloperLifecycleIntent(prompt),
+      false,
+      prompt,
+    );
+  }
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      affirmative.replace(
+        "Build and test it",
+        "Do not implement code; test the design only",
+      ),
+    ),
+    [],
+  );
+});
+
+test("canonical lifecycle reflection receipts suppress the generic initiating-note fallback", () => {
+  const verifiedResultsReceipt = {
+    toolName: "write_project_results",
+    path: "Projects/CRDT Results.md",
+    payloadFingerprint: `sha256:${"a".repeat(64)}`,
+    readback: {
+      status: "verified" as const,
+      checkedAt: "2026-08-19T20:00:00.000Z",
+      observedFingerprint: `sha256:${"b".repeat(64)}`,
+    },
+  };
+  const verifiedNotebookReceipt = {
+    toolName: "append_jupyter_reflection",
+    path: "Experiments/crdt-results.ipynb",
+    payloadFingerprint: `sha256:${"c".repeat(64)}`,
+    readback: {
+      status: "verified" as const,
+      checkedAt: "2026-08-19T20:00:01.000Z",
+      observedFingerprint: `sha256:${"d".repeat(64)}`,
+    },
+  };
+  assert.equal(
+    canonicalLifecycleReflectionReceiptPaysV1(verifiedResultsReceipt),
+    true,
+  );
+  assert.equal(
+    canonicalLifecycleReflectionReceiptPaysV1(verifiedNotebookReceipt),
+    true,
+  );
+  assert.equal(
+    canonicalLifecycleReflectionReceiptPaysV1({
+      ...verifiedResultsReceipt,
+      toolName: "append_to_current_file",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldPlanGenericInitiatingNoteReflectionV1({
+      compoundLifecycleDetected: true,
+      pipelineLineagePresent: true,
+      successfulTerminal: true,
+      reflectionWritebackPreconditionFailed: false,
+      explicitJupyterReflection: false,
+      canonicalLifecycleReflectionPaid: true,
+      setLooseCompoundEnabled: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldPlanGenericInitiatingNoteReflectionV1({
+      compoundLifecycleDetected: true,
+      pipelineLineagePresent: true,
+      successfulTerminal: true,
+      reflectionWritebackPreconditionFailed: false,
+      explicitJupyterReflection: false,
+      canonicalLifecycleReflectionPaid: false,
+      setLooseCompoundEnabled: false,
+    }),
+    true,
+  );
+});
+
+test("legacy Linear progress reporting remains standalone and stays out of the six-stage journey", () => {
+  const standalone =
+    "Post a progress update to Linear issue LIN-42 with the verified test result.";
+  assert.equal(shouldOfferStandaloneLinearProgressReportV1(standalone), true);
+  assert.deepEqual(
+    getRequiredWriteToolNamesForTests(standalone, [
+      "report_progress_to_linear",
+    ]),
+    ["report_progress_to_linear"],
+  );
+
+  const journey = [
+    "Research CRDTs and turn the accepted findings into Linear work.",
+    "Implement the design in the repository, test it, open a private draft PR on GitHub, and write the final reflection.",
+    "Do not call report_progress_to_linear; provider progress is host-derived from receipts.",
+  ].join(" ");
+  assert.equal(shouldOfferStandaloneLinearProgressReportV1(journey), false);
+  assert.equal(
+    getRequiredWriteToolNamesForTests(journey, [
+      "report_progress_to_linear",
+      "write_project_results",
+    ]).includes("report_progress_to_linear"),
+    false,
+  );
+});
+
+test("an explicit notebook naturally overrides Results while reflection negation opts out", () => {
+  const base =
+    "Research the design, create Linear work, implement and test it, then open a private draft PR on GitHub";
+  const allowed = [
+    "linear_create_issue",
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+    CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    "publish_verified_code_to_github",
+    "append_jupyter_reflection",
+    "write_project_results",
+  ];
+  const notebook = getRequiredWriteToolNamesForTests(
+    `${base}, and append the final reflection to \`Experiments/counter-results.ipynb\`.`,
+    allowed,
+  );
+  assert.equal(notebook.at(-1), "append_jupyter_reflection");
+  assert.equal(notebook.includes("write_project_results"), false);
+
+  const optedOut = getRequiredWriteToolNamesForTests(
+    `${base}. Do not write a reflection, report, Results note, or notebook.`,
+    allowed,
+  );
+  assert.equal(optedOut.includes("write_project_results"), false);
+  assert.equal(optedOut.includes("append_jupyter_reflection"), false);
+});
+
+test("set-loose terminal reflection is destination-neutral and never redirects a new mission to the active note", () => {
+  const stages = [
+    "accepted_research",
+    "linear_hierarchy",
+    "code_execution",
+    "code_validation",
+    "private_github_publication",
+    "reflection",
+  ] as const;
+  assert.deepEqual(
+    buildSetLooseLifecycleReflectionToolCallV1({
+      prompt: "Research, plan, implement, test, and open a private draft PR.",
+      stages,
+      receipts: [],
+    }),
+    {
+      toolName: "write_project_results",
+      arguments: {},
+      renderedContent: null,
+    },
+  );
+
+  const notebook = buildSetLooseLifecycleReflectionToolCallV1({
+    prompt:
+      "Research, plan, implement, test, open a private draft PR, and write the final report to `Experiments/run.ipynb`.",
+    stages,
+    receipts: [],
+  });
+  assert.equal(notebook?.toolName, "append_jupyter_reflection");
+  assert.equal(notebook?.arguments.path, "Experiments/run.ipynb");
+  assert.match(String(notebook?.arguments.markdown), /Verified phases: research and high-level design/iu);
+  assert.doesNotMatch(String(notebook?.arguments.markdown), /```|`|<code/iu);
+
+  const pathlessNotebook = buildSetLooseLifecycleReflectionToolCallV1({
+    prompt:
+      "Research, plan, implement, test, open a private draft PR, and write the final reflection to a Jupyter notebook.",
+    stages,
+    receipts: [],
+  });
+  assert.equal(pathlessNotebook?.toolName, "append_jupyter_reflection");
+  assert.equal("path" in (pathlessNotebook?.arguments ?? {}), false);
+  assert.match(
+    String(pathlessNotebook?.arguments.markdown),
+    /durable lab record/iu,
+  );
+
+  assert.equal(
+    buildSetLooseLifecycleReflectionToolCallV1({
+      prompt:
+        "Write the final Jupyter reflection to `Experiments/one.ipynb` or `Experiments/two.ipynb`.",
+      stages,
+      receipts: [],
+    }),
+    null,
   );
 });
 
@@ -8683,13 +8971,13 @@ test("prepared Bound execute envelope gate fails closed without silent retry", a
 
   assert.equal(
     lifecycleStageForEnvelopeTool("code_commit_verified"),
-    "code_execution",
+    "code_validation",
   );
   const fingerprint = `sha256:${"9".repeat(64)}`;
   let envelope = ensureMissionStageEnvelope({
     existing: null,
     runId: "run-envelope-bound",
-    stage: "code_execution",
+    stage: "code_validation",
     authorityFingerprint: fingerprint,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     grantId: "grant-envelope",
@@ -11002,13 +11290,8 @@ test("negated cleanup after a research path does not become a delete mission", a
   assert.equal(
     statuses.some(
       (message) =>
-        message.includes("Pipeline: 1/2 Research and Obsidian note") &&
-        // Set-loose (automatic + multi-stage) omits mid-run approval from the
-        // Linear stage label; classic wording still mentions approval.
-        (message.includes("2/2 Linear prepare, create, and readback") ||
-          message.includes(
-            "2/2 Linear prepare, approval, create, and readback",
-          )) &&
+        message.includes("Pipeline: 1/2 Research & design") &&
+        message.includes("2/2 Linear planning") &&
         message.includes("6-18 minutes"),
     ),
     true,
@@ -11598,7 +11881,7 @@ test("broad vault mutation without a target removes write tools and records no w
   assert.equal(vault.content.get("Current.md"), "Do not overwrite this note.");
 });
 
-test("BYOK research binds initiating-note authority only to a real active Markdown note", async () => {
+test("BYOK research keeps ambient note authority host-bound while pathless publication can create its deterministic note", async () => {
   const prompt = [
     "Deeply research a small dependency-free Python CRDT library for marker E2E_BYOK_SCOPE_UNIT.",
     "Use and fetch at least four independent sources exposed through the configured research backend. Reconcile their guidance on state-based G-Counter joins and observed-remove sets, including convergence, idempotence, concurrent add versus remove, and practical validation.",
@@ -11683,6 +11966,7 @@ test("BYOK research binds initiating-note authority only to a real active Markdo
     };
   };
 
+  const unbound = await run(false);
   const bound = await run(true);
   assert.equal(bound.config.autonomyScope.write.currentNote, true);
   assert.equal(bound.config.writeAutonomy, true);
@@ -11701,12 +11985,12 @@ test("BYOK research binds initiating-note authority only to a real active Markdo
     ),
   );
 
-  const unbound = await run(false);
   assert.equal(unbound.config.autonomyScope.write.currentNote, false);
   assert.ok(!unbound.config.allowedToolNames.includes("append_to_current_file"));
   assert.ok(!unbound.config.allowedToolNames.includes("replace_current_file"));
   assert.ok(
-    !unbound.config.allowedToolNames.includes("publish_research_to_linear"),
+    unbound.config.allowedToolNames.includes("publish_research_to_linear"),
+    JSON.stringify(unbound.config),
   );
   assert.ok(
     !unbound.toolNames.includes("append_to_current_file"),
@@ -11964,9 +12248,14 @@ test("BYOK Phase A authority graph excludes future GitHub tools and redundant no
     false,
     `atomic publication must not create an append node; graph=${graphTools.join(",")}`,
   );
+  const latestGraphTools = Object.values(graphs.at(-1)?.nodes ?? {}).flatMap(
+    (node) => node.allowedTools,
+  );
   assert.equal(
-    graphTools.filter((name) => name === "publish_research_to_linear").length,
+    latestGraphTools.filter((name) => name === "publish_research_to_linear")
+      .length,
     1,
+    "the current graph must contain exactly one atomic publication node",
   );
   assert.equal(
     catalogTools.includes("linear_create_issue"),
@@ -12020,6 +12309,53 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
     "https://crdt-three.example.net/convergence",
     "https://crdt-four.example.dev/validation",
   ];
+  const projectIdeaArguments = {
+    ideaId: "dependency-free-crdt-library",
+    title: "Dependency-free state-based CRDT library",
+    problem:
+      "Small Python applications need deterministic offline convergence without adding a runtime dependency.",
+    hypothesis:
+      "A focused G-Counter and observed-remove set module can provide understandable convergence semantics with a compact validation surface.",
+    options: [
+      {
+        id: "gcounter-orset",
+        title: "G-Counter plus observed-remove set",
+        summary:
+          "Implement both monotonic counting and concurrent add/remove set semantics in one small module.",
+      },
+      {
+        id: "gcounter-only",
+        title: "G-Counter only",
+        summary:
+          "Ship the smaller counter primitive without covering concurrent set membership.",
+      },
+    ],
+    selectedOptionId: "gcounter-orset",
+    proposedWork: [
+      "Implement replica-local non-negative G-Counter increments and pointwise-max merge.",
+      "Implement observed-remove set tags, observed removal, and union-style merge.",
+      "Validate idempotence, convergence, and concurrent add survival.",
+    ],
+    nonGoals: ["Do not add networking, persistence, or third-party dependencies."],
+    constraints: ["Keep the public implementation in crdt_sync.py."],
+    risks: ["Incorrect tag removal could silently violate convergence."],
+    acceptanceCriteria: [
+      {
+        id: "AC-1",
+        text: "Repeated and reordered G-Counter merges converge to the same value.",
+      },
+      {
+        id: "AC-2",
+        text: "A concurrent unseen OR-Set add survives an observed remove.",
+      },
+    ],
+    riskClass: "medium",
+    limitations: ["The first version does not compact historical OR-Set tags."],
+    groundingReferences: sourceUrls.map((reference) => ({
+      kind: "web",
+      reference,
+    })),
+  };
   const requests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const completions: AgentRunCompleteEvent[] = [];
@@ -12031,6 +12367,7 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
   }> = [];
   const plannerCatalogs: MissionGraphHostCatalogNode[][] = [];
   const runReceipts: AgentRunReceipt[] = [];
+  const projectIdeaOutputs: ProjectIdeaBriefToolOutputV1[] = [];
   let terminalAgentRequestOrdinal: number | null = null;
   let terminalResponseReturned = false;
   let optionalLinearReadSelected = false;
@@ -12254,9 +12591,16 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
       null,
     execute: async (call, context) => {
       executedCalls.push(structuredClone(call));
-      return publicationRegistry.getDescriptor(call.name)
-        ? publicationRegistry.execute(call, context)
-        : baseRegistry.execute(call, context);
+      if (publicationRegistry.getDescriptor(call.name)) {
+        return publicationRegistry.execute(call, context);
+      }
+      const output = await baseRegistry.execute(call, context);
+      if (call.name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME && output.ok) {
+        projectIdeaOutputs.push(
+          structuredClone(output.output) as ProjectIdeaBriefToolOutputV1,
+        );
+      }
+      return output;
     },
   };
 
@@ -12349,6 +12693,18 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
         "",
       );
     }
+    if (
+      toolNames.includes(CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME) &&
+      !executedCalls.some(
+        (call) => call.name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
+      )
+    ) {
+      return responseWithToolCall(
+        CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
+        projectIdeaArguments,
+        "",
+      );
+    }
     if (toolNames.includes(publicationTool.name)) {
       return responseWithToolCall(publicationTool.name, {}, "");
     }
@@ -12426,6 +12782,24 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
     ).length,
     1,
   );
+  assert.equal(
+    executedCalls.filter(
+      (call) => call.name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
+    ).length,
+    1,
+  );
+  assert.ok(
+    executedCalls.findIndex(
+      (call) => call.name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
+    ) <
+      executedCalls.findIndex(
+        (call) => call.name === "publish_research_to_linear",
+      ),
+    "the grounded project idea must execute before accepted-research publication",
+  );
+  assert.equal(projectIdeaOutputs.length, 1);
+  assert.equal(projectIdeaOutputs[0]?.promotion.eligible, true);
+  assert.ok(projectIdeaOutputs[0]?.promotion.seed);
   assert.equal(
     executedCalls.filter((call) => call.name === "web_search").length,
     1,
@@ -16669,6 +17043,29 @@ test("compound adaptive research uses persisted lifecycle graph stage before in-
   assert.equal(
     resolveActiveCompoundLifecycleStageV1(null, stages, "linear_hierarchy"),
     "linear_hierarchy",
+  );
+  assert.deepEqual(
+    resolveCompletedCompoundLifecycleStagesV1(
+      graph,
+      stages,
+      new Set(["accepted_research", "linear_hierarchy", "code_execution"]),
+    ),
+    {
+      authoritative: true,
+      completed: ["accepted_research", "linear_hierarchy"],
+    },
+    "a successful tool-name cache must not pay a graph stage that is still ready",
+  );
+  assert.deepEqual(
+    resolveCompletedCompoundLifecycleStagesV1(
+      null,
+      stages,
+      new Set(["accepted_research", "linear_hierarchy"]),
+    ),
+    {
+      authoritative: false,
+      completed: ["accepted_research", "linear_hierarchy"],
+    },
   );
 });
 
@@ -22370,11 +22767,23 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
   const allowed = new Set(configs[0]?.allowedToolNames ?? []);
   assert.equal(allowed.has("code_workspace_create_file"), true);
   const graphNodes = Object.values(graphs.at(-1)?.nodes ?? {});
-  const lifecycle = graphNodes
+  const lifecycles = graphNodes
     .map((node) => getMissionCompositeLifecycleSpecV1(node))
-    .find((candidate) => candidate !== null);
-  assert.ok(lifecycle, traces.join(" | "));
-  const graphTools = lifecycle.actions.map((action) => action.toolName);
+    .filter((candidate) => candidate !== null);
+  const implementationLifecycle = lifecycles.find(
+    (candidate) => candidate.stage === "code_execution",
+  );
+  const validationLifecycle = lifecycles.find(
+    (candidate) => candidate.stage === "code_validation",
+  );
+  assert.ok(implementationLifecycle, traces.join(" | "));
+  assert.ok(validationLifecycle, traces.join(" | "));
+  const graphTools = implementationLifecycle.actions.map(
+    (action) => action.toolName,
+  );
+  const validationGraphTools = validationLifecycle.actions.map(
+    (action) => action.toolName,
+  );
   assert.equal(graphTools.includes("append_file"), false);
   assert.equal(graphTools.includes("create_file"), false);
   // The terminal graph projection may omit the already-offered readiness node;
@@ -22389,7 +22798,7 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
     5,
   );
   assert.deepEqual(
-    lifecycle.actions
+    implementationLifecycle.actions
       .filter((action) => action.toolName === "code_workspace_create_file")
       .map((action) => action.selector),
     [
@@ -22409,11 +22818,11 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
     10,
   );
   assert.equal(
-    graphTools.filter((name) => name === "code_validate_fast").length,
+    validationGraphTools.filter((name) => name === "code_validate_fast").length,
     3,
   );
   assert.equal(
-    graphTools.filter((name) => name === "code_repair_record_cycle").length,
+    validationGraphTools.filter((name) => name === "code_repair_record_cycle").length,
     3,
   );
   assert.equal(graphTools.includes("code_workspace_patch"), false);
@@ -23469,7 +23878,7 @@ test("set-loose compound GitHub catalog mutation still binds explicit approval b
     "Then update GitHub issue 12 in repository profile trusted-repository with title Checkers implementation.",
     "Finish with a reflection in the current note.",
   ].join(" ");
-  const fixedNow = new Date("2026-07-22T12:00:00.000Z");
+  const fixedNow = new Date("2099-07-22T12:00:00.000Z");
   const vault = createRunnerVaultContext({ prompt, now: fixedNow });
   vault.context.settings.githubEnabled = true;
   vault.context.settings.autonomyProfile = "automatic";
@@ -23478,6 +23887,8 @@ test("set-loose compound GitHub catalog mutation still binds explicit approval b
   const broker = new ApprovalBroker();
   const approvalRequests: ApprovalRequest[] = [];
   const statuses: string[] = [];
+  const traces: string[] = [];
+  const chatRequests: ModelChatRequest[] = [];
   const executedGrantIds: string[] = [];
   let preparedExecutions = 0;
   const descriptor: ToolDescriptor = {
@@ -23544,8 +23955,8 @@ test("set-loose compound GitHub catalog mutation still binds explicit approval b
           outboundBytes: 23,
         },
         idempotencyKey: `${context.runId}:github-update-issue-call-1`,
-        preparedAt: "2026-07-22T12:00:00.000Z",
-        expiresAt: "2026-07-22T12:05:00.000Z",
+        preparedAt: "2099-07-22T12:00:00.000Z",
+        expiresAt: "2099-07-22T12:05:00.000Z",
       }),
     }),
     executePrepared: async (action, context) => {
@@ -23571,12 +23982,12 @@ test("set-loose compound GitHub catalog mutation still binds explicit approval b
           payloadFingerprint: action.payloadFingerprint,
           grantId: context.authorizedAction!.grantId,
           idempotencyKey: action.idempotencyKey,
-          startedAt: "2026-07-22T12:00:01.000Z",
-          committedAt: "2026-07-22T12:00:03.000Z",
+          startedAt: "2099-07-22T12:00:01.000Z",
+          committedAt: "2099-07-22T12:00:03.000Z",
           commitKind: "committed",
           readback: {
             status: "verified",
-            checkedAt: "2026-07-22T12:00:02.000Z",
+            checkedAt: "2099-07-22T12:00:02.000Z",
             observedRevision: "issue-updated-at-1",
           },
           effects: { affectedCount: 1, changedFields: ["title"] },
@@ -23588,7 +23999,7 @@ test("set-loose compound GitHub catalog mutation still binds explicit approval b
   await runAgentMission({
     prompt,
     modelClient: createClient({
-      chatRequests: [],
+      chatRequests,
       chatResponders: [
         () =>
           responseWithToolCall("github_update_issue", {
@@ -23606,6 +24017,7 @@ test("set-loose compound GitHub catalog mutation still binds explicit approval b
     approvalBroker: broker,
     events: {
       onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traces.push(event.message),
       onApprovalRequest: (request) => {
         approvalRequests.push(request);
         broker.resolve(request.id, "approved");
@@ -23613,7 +24025,17 @@ test("set-loose compound GitHub catalog mutation still binds explicit approval b
     },
   });
 
-  assert.equal(preparedExecutions, 1);
+  assert.equal(
+    preparedExecutions,
+    1,
+    JSON.stringify({
+      statuses,
+      traces,
+      offered: chatRequests.map((request) =>
+        request.tools?.map((candidate) => candidate.function.name),
+      ),
+    }),
+  );
   assert.equal(approvalRequests.length, 1);
   assert.match(executedGrantIds[0] ?? "", /^grant:approval-/u);
   assert.notEqual(executedGrantIds[0], "policy:scoped-read");

@@ -9,6 +9,7 @@ import {
 } from "../src/agent/repositories/RepositoryProfile";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
 import { createFlowRealTypeScriptFixture } from "./fixtures/phase4GitRepo";
+import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import {
   assertProductionAdoptedSandboxV1,
@@ -18,6 +19,7 @@ import {
 } from "./fixtures/realAiHarness";
 import { DAILY_USE_SCORECARD_ANNOTATION } from "./fixtures/dailyUseAcceptance";
 import { assertMissionUiSurfacesV1 } from "./fixtures/uiSurfaceAssertions";
+import { assertVerifiedCommitBoundCodeExamplesV1 } from "./fixtures/reflectionAssertions";
 
 const LANE = "retained-journey";
 const LINEAR_CONTAINER_NAME = "Application_testing_dumping_grounds";
@@ -265,6 +267,12 @@ test("DU-06 RETAINED-JOURNEY research to Linear to code to private GitHub, with 
       readGitHubPublicationCheckpoint(harness.page, repositoryName),
       null,
     );
+    const workspaceBinding = artifacts.workspaceId
+      ? await boundedRead(
+          resolveRetainedWorkspaceBinding(harness.page, artifacts.workspaceId),
+          null,
+        )
+      : null;
     const sourceUrls = externalSourceUrlsFromNote(noteBody);
     const completedGraphToolNames = completedMissionGraphToolNames(snapshot);
     const artifactRecord: Record<string, any> = {
@@ -275,6 +283,7 @@ test("DU-06 RETAINED-JOURNEY research to Linear to code to private GitHub, with 
       linearViewerId: linearReady.viewerId,
       linearIssueReadback,
       githubPublicationReadback,
+      workspaceRoot: workspaceBinding?.root ?? null,
       sourceUrls,
       completedGraphToolNames,
       providerUsage: snapshot?.providerUsage ?? null,
@@ -339,6 +348,10 @@ test("DU-06 RETAINED-JOURNEY research to Linear to code to private GitHub, with 
       head: { sha: artifacts.commitSha },
     });
     expect(githubPublicationReadback?.remoteSha).toBe(artifacts.commitSha);
+    expect(
+      workspaceBinding,
+      "retained journey needs the exact committed workspace for reflection proof",
+    ).not.toBeNull();
 
     for (const requiredTool of [
       "code_workspace_read",
@@ -381,6 +394,24 @@ test("DU-06 RETAINED-JOURNEY research to Linear to code to private GitHub, with 
     expect(finalNote).toContain(
       githubPublicationReadback!.pullRequest!.htmlUrl,
     );
+    if (!workspaceBinding || !artifacts.commitSha) {
+      throw new Error("Retained commit-bound reflection proof is unavailable.");
+    }
+    const reflectionCodeExamples =
+      await assertVerifiedCommitBoundCodeExamplesV1({
+        note: finalNote,
+        repositoryRoot: workspaceBinding.root,
+        expectedCommitSha: artifacts.commitSha,
+      });
+    expect(reflectionCodeExamples.length).toBeGreaterThanOrEqual(1);
+    expect(reflectionCodeExamples.length).toBeLessThanOrEqual(2);
+    expect(
+      reflectionCodeExamples.some(
+        (example) =>
+          example.path === relativeCodePath && example.code.includes(safeMarker),
+      ),
+      "retained reflection must contain exact marker-bearing code from the published commit",
+    ).toBe(true);
 
     if (!snapshot?.lastMissionScorecard) {
       throw new Error("The completed retained journey emitted no mission scorecard.");
@@ -531,6 +562,33 @@ async function readRunSnapshot(page: Page): Promise<any> {
     const app = (window as typeof window & { app?: any }).app;
     return app?.plugins?.plugins?.[pluginId]?.getMissionRunSnapshot?.() ?? null;
   }, NATIVE_CORE_PLUGIN_ID);
+}
+
+async function resolveRetainedWorkspaceBinding(
+  page: Page,
+  workspaceId: string,
+): Promise<{ root: string; branch: string }> {
+  return page.evaluate(
+    async ({ corePluginId, codePluginId, workspaceId }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const code = app?.plugins?.plugins?.[corePluginId]?.getBundledCapability?.(
+        codePluginId,
+      );
+      const manager = code?.workspaceManager ?? code?.runtime?.workspaceManager;
+      const manifest = await manager?.loadManifest?.(workspaceId);
+      const root = String(manifest?.canonicalRoot ?? "").trim();
+      const branch = String(manifest?.repositoryBinding?.branch ?? "").trim();
+      if (!root || !branch) {
+        throw new Error("Retained workspace binding is incomplete.");
+      }
+      return { root, branch };
+    },
+    {
+      corePluginId: NATIVE_CORE_PLUGIN_ID,
+      codePluginId: PHASE4_CODE_PLUGIN_ID,
+      workspaceId,
+    },
+  );
 }
 
 /** Pull the real artifact identities out of the run's own receipts. */

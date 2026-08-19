@@ -19,6 +19,7 @@ import {
   type LinearIssueRecord,
 } from "../src/integrations/linear";
 import type { ToolExecutionContext } from "../src/tools/types";
+import { verifiedCodeReflectionFixture } from "./fixtures/verifiedCodeReflection";
 
 const NOW = "2026-07-12T20:00:00.000Z";
 const HASH = `sha256:${"a".repeat(64)}`;
@@ -308,6 +309,10 @@ test("resume reuses the checkpoint-bound initiating note even when a different n
     targetedValidationReceiptId: "checkers-targeted-validation",
     fullValidationReceiptId: "checkers-full-validation",
     localCommitReceiptId: "checkers-local-commit",
+    codeHandoffFingerprint:
+      verifiedCodeReflectionFixture("b".repeat(40)).handoff.fingerprint,
+    codeExamples:
+      verifiedCodeReflectionFixture("b".repeat(40)).examples,
   });
   assert.equal(reflection.path, initiatingPath);
   assert.match(

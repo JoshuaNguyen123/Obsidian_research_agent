@@ -178,7 +178,9 @@ export const MISSION_COMPOSITE_LIFECYCLE_STAGES_V1 = Object.freeze([
   "accepted_research",
   "linear_hierarchy",
   "code_execution",
+  "code_validation",
   "private_github_publication",
+  "reflection",
   "reconciliation_cleanup",
 ] as const);
 

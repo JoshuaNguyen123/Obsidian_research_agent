@@ -18,7 +18,7 @@ export const TOOL_USAGE_POLICY = `TOOL USAGE POLICY (host):
   research note → Linear create/get → code_workspace_create → edit → validate_fast → repair →
   validate_targeted/full → code_commit_verified (host git add+commit) →
   ask public-or-private → github_create_repository with that exact choice → publish_verified_code_to_github publish_draft →
-  note reflect → report_progress_to_linear (comment + level) when that tool is offered.
+  write_project_results (or append_jupyter_reflection for an explicit notebook). In compound missions, Linear phase updates are host-projected from verified receipts; use report_progress_to_linear only for an explicit standalone progress request.
 - Do not invent git_*, verify_all, patch, send_email, or tools not listed.`;
 
 if (TOOL_USAGE_POLICY.length > TOOL_USAGE_POLICY_MAX_CHARS) {

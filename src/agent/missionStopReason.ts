@@ -99,19 +99,21 @@ export function stopReasonChatLine(
       // useless line was what got saved into conversation history.
       return suffix
         ? `Blocked:${suffix} Send the next message to continue, or open Run Details.`
-        : "Blocked — open Run Details for the blocker, or send the next message to continue.";
+        : "Blocked: the run did not retain a concrete blocker. Retry the mission to regenerate diagnostics; no mutation will be replayed automatically.";
     case "approval_denied":
       return `Approval denied.${suffix}`;
     case "relevance_rejected":
       return `Stopped: output failed the relevance check.${suffix}`;
     case "provider_error":
-      return `Could not finish that turn. Open Run Details for the error, then send the next message.${suffix}`;
+      return suffix
+        ? `Could not finish that turn.${suffix} Send the next message after resolving the provider error.`
+        : "Could not finish that turn because the provider error detail was unavailable after restart. Retry the mission to regenerate diagnostics.";
     case "repeated_tool_no_progress":
       return `Paused: repeated tool calls without progress. Ask me to continue with a different approach.${suffix}`;
     case "required_tools_failed":
       return suffix
         ? `Blocked: a required tool failed.${suffix}`
-        : "Blocked: a required tool failed. Open Run Details for details.";
+        : "Blocked: a required tool failed, but its exact error was unavailable after restart. Retry the mission to regenerate diagnostics.";
     case "unknown":
     default:
       return `Run finished.${suffix}`;

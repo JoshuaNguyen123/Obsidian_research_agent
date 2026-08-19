@@ -37,6 +37,22 @@ const execFileAsync = promisify(execFile);
 const NOW = new Date("2026-07-12T20:00:00.000Z");
 const SHA = (character: string) => `sha256:${character.repeat(64)}`;
 
+test("fixed Git runner permits only the exact raw identity show shape", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agentic-git-show-shape-"));
+  try {
+    const runner = new SpawnFixedArgvGitRunnerV1();
+    await assert.rejects(
+      runner.run({
+        cwd: root,
+        args: ["--literal-pathspecs", "show", "HEAD"],
+      }),
+      /Git show is limited to exact raw author and committer identity readback/u,
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("durable validation registry captures only exact request-scoped sandbox evidence", async () => {
   let namespace: DurableValidationReceiptNamespaceV1 | null = null;
   const registry = new DurableValidationReceiptRegistryV1({

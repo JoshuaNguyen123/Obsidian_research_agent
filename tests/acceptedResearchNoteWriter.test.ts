@@ -6,8 +6,20 @@ import {
   type AcceptedResearchNotePackageV1,
 } from "../src/integrations/linear/AcceptedResearchNoteWriter";
 import { sha256DiagramContent } from "../src/design/diagramArtifactStore";
+import { verifiedCodeReflectionFixture } from "./fixtures/verifiedCodeReflection";
+import { extractVerifiedCommitBoundCodeExamplesV1 } from "../e2e/fixtures/reflectionAssertions";
 
 const HASH = `sha256:${"a".repeat(64)}`;
+
+function reflectionCodeProof(commitCharacter: string) {
+  const { handoff, examples } = verifiedCodeReflectionFixture(
+    commitCharacter.repeat(40),
+  );
+  return {
+    codeHandoffFingerprint: handoff.fingerprint,
+    codeExamples: examples,
+  };
+}
 
 test("accepted research is formatted, persisted, hashed, accepted, and backlinked in order", async () => {
   const vault = new ResearchVault();
@@ -257,6 +269,7 @@ test("project completion reflection appends concise human prose and hidden proof
     targetedValidationReceiptId: "receipt-checkers-targeted",
     fullValidationReceiptId: "receipt-checkers-full",
     localCommitReceiptId: "receipt-checkers-commit",
+    ...reflectionCodeProof("b"),
   });
   const note = vault.files.get(written.path) ?? "";
   assert.equal(reflected.operation, "append");
@@ -280,6 +293,18 @@ test("project completion reflection appends concise human prose and hidden proof
     /\[draft pull request #17\]\(https:\/\/github\.com\/acme\/checkers\/pull\/17\)/u,
   );
   assert.match(visibleReflection, /Targeted and full validation passed/u);
+  assert.match(visibleReflection, /### Verified code example/u);
+  assert.match(visibleReflection, /return left \+ right/u);
+  const renderedExample = reflectionCodeProof("b").codeExamples.examples[0]!;
+  assert.ok(
+    visibleReflection.includes(
+      `file hash \`${renderedExample.artifactSha256.slice(7, 19)}\`; excerpt hash \`${renderedExample.codeSha256}\``,
+    ),
+  );
+  const parsedExamples = extractVerifiedCommitBoundCodeExamplesV1(visibleReflection);
+  assert.equal(parsedExamples.length, 1);
+  assert.equal(parsedExamples[0]?.codeSha256, renderedExample.codeSha256);
+  assert.equal(parsedExamples[0]?.code, renderedExample.code);
   assert.match(
     visibleReflection,
     /The leading accepted outcome was: The note exists before Linear mutation/u,
@@ -291,7 +316,7 @@ test("project completion reflection appends concise human prose and hidden proof
   const visibleWords =
     visibleReflection.match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]*\b/gu) ?? [];
   assert.ok(visibleWords.length >= 35);
-  assert.ok(visibleWords.length <= 100);
+  assert.ok(visibleWords.length <= 150);
 
   const retry = await writer.appendProjectCompletionReflection({
     artifact: written.artifact,
@@ -307,6 +332,7 @@ test("project completion reflection appends concise human prose and hidden proof
     targetedValidationReceiptId: "receipt-checkers-targeted",
     fullValidationReceiptId: "receipt-checkers-full",
     localCommitReceiptId: "receipt-checkers-commit",
+    ...reflectionCodeProof("b"),
   });
   assert.equal(retry.operation, "no_op");
   assert.equal(vault.files.get(written.path), note);
@@ -325,9 +351,149 @@ test("project completion reflection appends concise human prose and hidden proof
       targetedValidationReceiptId: "receipt-checkers-targeted",
       fullValidationReceiptId: "receipt-checkers-full",
       localCommitReceiptId: "receipt-checkers-commit",
+      ...reflectionCodeProof("b"),
     }),
     /collides with different or incomplete proof/u,
   );
+});
+
+test("six-stage publication writes a concise delivery checkpoint instead of a second full reflection", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const written = await writer.writeAcceptedPackage({
+    path: "Research/Single canonical results.md",
+    mode: "create",
+    artifactId: "accepted-research-single-results",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  });
+  const request = {
+    artifact: written.artifact,
+    expectedNoteSha256: written.afterSha256,
+    publicationId: "publication-single-results-1",
+    issueIdentifier: "GAME-31",
+    issueUrl: "https://linear.app/acme/issue/GAME-31",
+    pullRequestNumber: 31,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/31",
+    completionProof: "draft_pr" as const,
+    proofRevision: "f".repeat(40),
+    changedPaths: ["src/checkers.ts"],
+    targetedValidationReceiptId: "receipt-targeted-status",
+    fullValidationReceiptId: "receipt-full-status",
+    localCommitReceiptId: "receipt-commit-status",
+    presentation: "delivery_status" as const,
+    ...reflectionCodeProof("f"),
+  };
+  const plan = await writer.planProjectCompletionReflection(request);
+  assert.equal(plan.presentation, "delivery_status");
+  assert.equal(plan.codeExcerpt, "");
+  assert.match(plan.reflectionMarkdown, /^## Delivery status$/mu);
+  assert.match(
+    plan.reflectionMarkdown,
+    /canonical report is written separately after this publication checkpoint/u,
+  );
+  assert.doesNotMatch(plan.reflectionMarkdown, /## Agent project reflection/u);
+  assert.doesNotMatch(plan.reflectionMarkdown, /### Verified code example/u);
+  assert.doesNotMatch(plan.reflectionMarkdown, /```/u);
+  await assert.rejects(
+    writer.planProjectCompletionReflection({
+      ...request,
+      presentation: "model_selected" as never,
+    }),
+    /Unsupported project completion note presentation/u,
+  );
+
+  const committed = await writer.appendPreparedProjectCompletionReflection(plan);
+  assert.equal(committed.operation, "append");
+  const note = vault.files.get(written.path) ?? "";
+  assert.match(note, /agentic-project-delivery:publication-single-results-1/u);
+  assert.match(note, /Draft pull request #31/u);
+
+  const replay = await writer.appendProjectCompletionReflection({
+    ...request,
+    expectedNoteSha256: committed.afterSha256,
+  });
+  assert.equal(replay.operation, "no_op");
+  assert.equal(vault.files.get(written.path), note);
+});
+
+test("project reflection plan seals exact append bytes and rejects drift or mutation", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const written = await writer.writeAcceptedPackage({
+    path: "Research/Sealed reflection.md",
+    mode: "create",
+    artifactId: "accepted-research-sealed",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  });
+  const request = {
+    artifact: written.artifact,
+    expectedNoteSha256: written.afterSha256,
+    publicationId: "publication-sealed-1",
+    issueIdentifier: "GAME-20",
+    issueUrl: "https://linear.app/acme/issue/GAME-20",
+    pullRequestNumber: 20,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/20",
+    completionProof: "draft_pr" as const,
+    proofRevision: "e".repeat(40),
+    changedPaths: ["src/checkers.ts"],
+    targetedValidationReceiptId: "receipt-targeted",
+    fullValidationReceiptId: "receipt-full",
+    localCommitReceiptId: "receipt-commit",
+    ...reflectionCodeProof("e"),
+  };
+  const before = vault.files.get(written.path) ?? "";
+  const plan = await writer.planProjectCompletionReflection(request);
+
+  assert.equal(plan.operation, "append");
+  assert.equal(
+    plan.proposedAppendSha256,
+    await sha256DiagramContent(plan.proposedAppendMarkdown),
+  );
+  assert.equal(
+    plan.proposedAppendBytes,
+    new TextEncoder().encode(plan.proposedAppendMarkdown).byteLength,
+  );
+  assert.equal(
+    plan.expectedAfterSha256,
+    await sha256DiagramContent(`${before}${plan.proposedAppendMarkdown}`),
+  );
+  assert.ok(plan.reflectionMarkdown.includes(plan.markdownExcerpt));
+  assert.ok(plan.proposedAppendMarkdown.includes(plan.codeExcerpt));
+  assert.match(plan.codeExcerpt, /return left \+ right/u);
+
+  await assert.rejects(
+    writer.appendPreparedProjectCompletionReflection({
+      ...plan,
+      proposedAppendMarkdown: `${plan.proposedAppendMarkdown}\n// invented after approval`,
+    }),
+    /no longer matches its sealed bytes/u,
+  );
+  assert.equal(vault.files.get(written.path), before);
+
+  vault.files.set(written.path, `${before}\nUser edit during approval.`);
+  await assert.rejects(
+    writer.appendPreparedProjectCompletionReflection(plan),
+    /changed before approved project completion reflection append/u,
+  );
+  assert.equal(vault.files.get(written.path), `${before}\nUser edit during approval.`);
+
+  vault.files.set(written.path, before);
+  const committed = await writer.appendPreparedProjectCompletionReflection(plan);
+  assert.equal(committed.operation, "append");
+  assert.equal(vault.files.get(written.path), `${before}${plan.proposedAppendMarkdown}`);
+  assert.equal(committed.afterSha256, plan.expectedAfterSha256);
+
+  const retryPlan = await writer.planProjectCompletionReflection({
+    ...request,
+    expectedNoteSha256: committed.afterSha256,
+  });
+  assert.equal(retryPlan.operation, "no_op");
+  assert.equal(retryPlan.proposedAppendMarkdown, "");
+  const reconciled = await writer.appendPreparedProjectCompletionReflection(retryPlan);
+  assert.equal(reconciled.operation, "no_op");
+  assert.equal(reconciled.afterSha256, committed.afterSha256);
 });
 
 test("project reflection encodes proof metadata and requires an exact retry block", async () => {
@@ -355,6 +521,7 @@ test("project reflection encodes proof metadata and requires an exact retry bloc
     targetedValidationReceiptId: injectedReceipt,
     fullValidationReceiptId: "receipt-full",
     localCommitReceiptId: "receipt-commit",
+    ...reflectionCodeProof("c"),
   });
   const note = vault.files.get(written.path) ?? "";
   assert.equal(reflected.operation, "append");
@@ -378,6 +545,7 @@ test("project reflection encodes proof metadata and requires an exact retry bloc
     targetedValidationReceiptId: injectedReceipt,
     fullValidationReceiptId: "receipt-full",
     localCommitReceiptId: "receipt-commit",
+    ...reflectionCodeProof("c"),
   });
   assert.equal(retry.operation, "no_op");
 });
@@ -415,6 +583,7 @@ test("project reflection normalizes and bounds the visible acceptance excerpt", 
     targetedValidationReceiptId: "receipt-targeted",
     fullValidationReceiptId: "receipt-full",
     localCommitReceiptId: "receipt-commit",
+    ...reflectionCodeProof("d"),
   });
   const note = vault.files.get(written.path) ?? "";
   const visibleReflection = note
@@ -426,7 +595,7 @@ test("project reflection normalizes and bounds the visible acceptance excerpt", 
   const visibleWords =
     visibleReflection.match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]*\b/gu) ?? [];
   assert.ok(visibleWords.length >= 35);
-  assert.ok(visibleWords.length <= 100);
+  assert.ok(visibleWords.length <= 150);
 });
 
 function packageFixture(): AcceptedResearchNotePackageV1 {

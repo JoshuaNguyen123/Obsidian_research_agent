@@ -15,6 +15,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile, mkdir, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -223,6 +224,150 @@ if (note) {
   } else {
     record("Note links the real draft pull request", false, "no draft PR URL was produced");
   }
+
+  let reflectionExamples = [];
+  try {
+    reflectionExamples = parseVerifiedCommitBoundCodeExamples(note);
+    record(
+      "Reflection includes one or two concise commit-bound code examples",
+      reflectionExamples.length >= 1 && reflectionExamples.length <= 2,
+      `${reflectionExamples.length} example(s)`,
+    );
+  } catch (error) {
+    record(
+      "Reflection includes one or two concise commit-bound code examples",
+      false,
+      String(error?.message ?? error).slice(0, 200),
+    );
+  }
+  if (repoFullName && artifacts.commitSha && reflectionExamples.length > 0) {
+    try {
+      const tree = JSON.parse(
+        await gh([
+          "api",
+          `repos/${repoFullName}/git/trees/${artifacts.commitSha}?recursive=1`,
+        ]),
+      );
+      if (tree?.truncated === true || !Array.isArray(tree?.tree)) {
+        throw new Error("Remote commit tree readback was truncated or invalid.");
+      }
+      for (const example of reflectionExamples) {
+        const entry = tree.tree.find(
+          (candidate) =>
+            candidate?.type === "blob" && candidate?.path === example.path,
+        );
+        if (!entry?.sha) {
+          throw new Error(`Remote commit is missing ${example.path}.`);
+        }
+        const blob = JSON.parse(
+          await gh(["api", `repos/${repoFullName}/git/blobs/${entry.sha}`]),
+        );
+        if (blob?.encoding !== "base64" || typeof blob?.content !== "string") {
+          throw new Error(`Remote blob readback is invalid for ${example.path}.`);
+        }
+        const sourceBuffer = Buffer.from(blob.content.replace(/\s/gu, ""), "base64");
+        const source = sourceBuffer.toString("utf8").replace(/\r\n?/gu, "\n");
+        const exactCode = source
+          .split("\n")
+          .slice(example.startLine - 1, example.endLine)
+          .join("\n");
+        if (
+          example.commitPrefix !== artifacts.commitSha.slice(0, 12) ||
+          example.code !== exactCode ||
+          sha256Hex(sourceBuffer).slice(0, 12) !== example.artifactSha256Prefix ||
+          `sha256:${sha256Hex(Buffer.from(example.code, "utf8"))}` !==
+            example.codeSha256
+        ) {
+          throw new Error(
+            `Reflection example ${example.path}:${example.startLine}-${example.endLine} does not match the exact remote commit.`,
+          );
+        }
+      }
+      record(
+        "Reflection code examples match the exact private GitHub commit",
+        true,
+        `${artifacts.commitSha.slice(0, 12)} ${reflectionExamples.map((example) => example.path).join(",")}`,
+      );
+    } catch (error) {
+      record(
+        "Reflection code examples match the exact private GitHub commit",
+        false,
+        String(error?.message ?? error).slice(0, 200),
+      );
+    }
+  } else {
+    record(
+      "Reflection code examples match the exact private GitHub commit",
+      false,
+      "repository, commit, or verified example is missing",
+    );
+  }
+}
+
+function parseVerifiedCommitBoundCodeExamples(note) {
+  const lines = note.replace(/\r\n?/gu, "\n").split("\n");
+  const examples = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index]?.trim() !== "### Verified code example") continue;
+    const metadata = lines[index + 1] ?? "";
+    const match = metadata.match(
+      /^`([^`\r\n]+)` (?:line (\d+)|lines (\d+)-(\d+)) at commit `([a-f0-9]{12})` \(file hash `([a-f0-9]{12})`; excerpt hash `(sha256:[a-f0-9]{64})`\)\.$/u,
+    );
+    if (!match) throw new Error(`Invalid code example metadata: ${metadata}`);
+    const pathValue = String(match[1] ?? "").replace(/\\/gu, "/").trim();
+    if (
+      !pathValue ||
+      pathValue.startsWith("/") ||
+      /^[A-Za-z]:/u.test(pathValue) ||
+      pathValue.includes(":") ||
+      pathValue.split("/").some((part) => !part || part === "." || part === "..")
+    ) {
+      throw new Error(`Unsafe code example path: ${pathValue}`);
+    }
+    const startLine = Number.parseInt(match[2] ?? match[3] ?? "0", 10);
+    const endLine = Number.parseInt(match[2] ?? match[4] ?? "0", 10);
+    if (
+      !Number.isSafeInteger(startLine) ||
+      !Number.isSafeInteger(endLine) ||
+      startLine < 1 ||
+      endLine < startLine ||
+      endLine - startLine + 1 > 20
+    ) {
+      throw new Error(`Invalid bounded line range: ${startLine}-${endLine}`);
+    }
+    const fenceMatch = String(lines[index + 2] ?? "").match(/^(`{3,})([^`]*)$/u);
+    if (!fenceMatch) throw new Error(`Missing code fence for ${pathValue}.`);
+    const fence = fenceMatch[1];
+    let closingIndex = index + 3;
+    while (closingIndex < lines.length && lines[closingIndex] !== fence) {
+      closingIndex += 1;
+    }
+    if (closingIndex >= lines.length) {
+      throw new Error(`Unclosed code fence for ${pathValue}.`);
+    }
+    const code = lines.slice(index + 3, closingIndex).join("\n");
+    if (!code.trim() || code.split("\n").length !== endLine - startLine + 1) {
+      throw new Error(`Code excerpt range mismatch for ${pathValue}.`);
+    }
+    examples.push({
+      path: pathValue,
+      startLine,
+      endLine,
+      commitPrefix: match[5],
+      artifactSha256Prefix: match[6],
+      codeSha256: match[7],
+      code,
+    });
+    index = closingIndex;
+  }
+  if (examples.length < 1 || examples.length > 2) {
+    throw new Error(`Expected 1-2 verified code examples; observed ${examples.length}.`);
+  }
+  return examples;
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 // 5. Required graph and UI proof.

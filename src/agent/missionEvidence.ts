@@ -10,6 +10,7 @@ import {
   evaluateSourceUsability,
   normalizeSourceParserStatus,
 } from "./sourceUsability";
+import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTool";
 
 const MAX_CLAIM_PASSAGES_PER_TOOL = 6;
 
@@ -41,6 +42,39 @@ export function evidenceFromToolResult(
 ): MissionEvidence | null {
   if (!result.ok) {
     return null;
+  }
+
+  if (
+    toolName === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME &&
+    isRecord(result.output)
+  ) {
+    const brief = isRecord(result.output.brief) ? result.output.brief : null;
+    const promotion = isRecord(result.output.promotion)
+      ? result.output.promotion
+      : null;
+    const seed = isRecord(promotion?.seed) ? promotion.seed : null;
+    const fingerprint = getString(brief?.fingerprint) ?? "";
+    const evidenceStatus = getString(brief?.evidenceStatus);
+    const selectedOptionId = getString(brief?.selectedOptionId);
+    if (
+      !/^sha256:[a-f0-9]{64}$/u.test(fingerprint) ||
+      (evidenceStatus !== "grounded" && evidenceStatus !== "unverified")
+    ) {
+      return null;
+    }
+    const selected = Boolean(selectedOptionId);
+    const promoted =
+      promotion?.eligible === true &&
+      seed?.projectIdeaFingerprint === fingerprint;
+    return {
+      id: `project_idea:${fingerprint}:${evidenceStatus}:${selected ? "selected" : "unselected"}:${promoted ? "promoted" : "not_promoted"}`,
+      kind: "tool_result",
+      title: "Native project idea brief",
+      summary: `Host-created project idea brief is ${evidenceStatus}, ${
+        selected ? "selected" : "unselected"
+      }, and ${promoted ? "promotion eligible" : "not promotion eligible"}.`,
+      confidence: "high",
+    };
   }
 
   if (

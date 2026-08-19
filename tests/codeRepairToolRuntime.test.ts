@@ -10,6 +10,10 @@ import type {
 } from "@agentic-researcher/core-api";
 import { sha256Fingerprint } from "../packages/headless-runtime/src/canonicalize";
 import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
+import {
   CallbackCodeRepairCheckpointStoreV1,
   codeRepairCheckpointIdV1,
   createCodeRepairToolRuntimeV1,
@@ -36,6 +40,12 @@ const AFTER_HASH = `sha256:${"2".repeat(64)}`;
 const FAILURE_HASH = `sha256:${"3".repeat(64)}`;
 const NOW = new Date("2026-07-12T18:00:00.000Z");
 const SCOPE = { runId: "mission-1", workspaceId: "workspace-1", requestId: "request-1" };
+const COMMIT_IDENTITY = {
+  authorName: AGENT_GIT_COMMIT_NAME_V1,
+  authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+  committerName: AGENT_GIT_COMMIT_NAME_V1,
+  committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+};
 
 test("normal exact repair proof commits only after fresh proof readback", async (t) => {
   const harness = await createHarness(t, "src/index.ts");
@@ -779,6 +789,7 @@ class FakeCommitGateway implements VerifiedCommitGatewayV1 {
       diffFingerprint: this.last.diff.fingerprint,
       changedPaths: [...this.last.diff.changedPaths],
       artifactHashes: structuredClone(this.last.artifactHashes),
+      identity: { ...COMMIT_IDENTITY },
       readAt: NOW.toISOString(),
     };
   }

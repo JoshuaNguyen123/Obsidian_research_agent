@@ -33,6 +33,8 @@ export interface TrustedGitHubRepositoryBindingV2 {
   visibility: RepositoryVisibility;
   repositoryReadbackFingerprint: string;
   observedAt: string;
+  /** Integrity-binds the visibility observation and timestamps to this identity. */
+  visibilityAttestationFingerprint: string;
   remoteName: "origin";
   agentBranchPrefix: "codex/";
   verifiedAccountId: number;
@@ -77,7 +79,10 @@ export function createTrustedGitHubRepositoryBindingV2(
     profile.defaultBranch,
     expectedVisibility,
   );
-  const unsigned: Omit<TrustedGitHubRepositoryBindingV2, "fingerprint"> = {
+  const unsigned: Omit<
+    TrustedGitHubRepositoryBindingV2,
+    "fingerprint" | "visibilityAttestationFingerprint"
+  > = {
     version: TRUSTED_GITHUB_REPOSITORY_BINDING_V2_VERSION,
     key: logicalKey(input.key, "binding key"),
     repositoryProfileKey: profile.key,
@@ -97,7 +102,7 @@ export function createTrustedGitHubRepositoryBindingV2(
     verifiedAccountLogin: githubLogin(input.verifiedAccountLogin, "verified account login"),
     trustedAt: timestamp(input.trustedAt, "trustedAt"),
   };
-  return { ...unsigned, fingerprint: fingerprintTrustedGitHubRepositoryBindingV2(unsigned) };
+  return sealTrustedGitHubRepositoryBindingV2(unsigned);
 }
 
 export function upgradeTrustedGitHubRepositoryBindingV1ToV2(input: {
@@ -117,7 +122,10 @@ export function upgradeTrustedGitHubRepositoryBindingV1ToV2(input: {
   if (readback.id !== legacy.repositoryId) {
     fail("GitHub repository readback ID does not match the legacy trusted binding.");
   }
-  const unsigned: Omit<TrustedGitHubRepositoryBindingV2, "fingerprint"> = {
+  const unsigned: Omit<
+    TrustedGitHubRepositoryBindingV2,
+    "fingerprint" | "visibilityAttestationFingerprint"
+  > = {
     version: 2,
     key: legacy.key,
     repositoryProfileKey: legacy.repositoryProfileKey,
@@ -137,7 +145,7 @@ export function upgradeTrustedGitHubRepositoryBindingV1ToV2(input: {
     verifiedAccountLogin: legacy.verifiedAccountLogin,
     trustedAt: legacy.trustedAt,
   };
-  return { ...unsigned, fingerprint: fingerprintTrustedGitHubRepositoryBindingV2(unsigned) };
+  return sealTrustedGitHubRepositoryBindingV2(unsigned);
 }
 
 export function parseTrustedGitHubRepositoryBindingV2(
@@ -147,7 +155,7 @@ export function parseTrustedGitHubRepositoryBindingV2(
     "version", "key", "repositoryProfileKey", "repositoryProfileFingerprint",
     "canonicalRepositoryRoot", "githubHost", "owner", "repository",
     "repositoryId", "defaultBranch", "visibility", "repositoryReadbackFingerprint",
-    "observedAt", "remoteName", "agentBranchPrefix", "verifiedAccountId",
+    "observedAt", "visibilityAttestationFingerprint", "remoteName", "agentBranchPrefix", "verifiedAccountId",
     "verifiedAccountLogin", "trustedAt", "fingerprint",
   ], "trusted GitHub repository binding v2");
   if (
@@ -173,6 +181,10 @@ export function parseTrustedGitHubRepositoryBindingV2(
     visibility: record.visibility,
     repositoryReadbackFingerprint: fingerprint(record.repositoryReadbackFingerprint, "repository readback fingerprint"),
     observedAt: timestamp(record.observedAt, "repository observation time"),
+    visibilityAttestationFingerprint: fingerprint(
+      record.visibilityAttestationFingerprint,
+      "visibility attestation fingerprint",
+    ),
     remoteName: "origin",
     agentBranchPrefix: "codex/",
     verifiedAccountId: positiveInteger(record.verifiedAccountId, "verified account id"),
@@ -182,6 +194,12 @@ export function parseTrustedGitHubRepositoryBindingV2(
   };
   if (result.fingerprint !== fingerprintTrustedGitHubRepositoryBindingV2(result)) {
     fail("Trusted GitHub repository binding v2 fingerprint does not match its evidence.");
+  }
+  if (
+    result.visibilityAttestationFingerprint !==
+      fingerprintVisibilityAttestationV2(result)
+  ) {
+    fail("Trusted GitHub repository visibility attestation does not match its observation.");
   }
   return result;
 }
@@ -208,15 +226,52 @@ export function parseTrustedGitHubRepositoryBindingMapV2(
 }
 
 export function fingerprintTrustedGitHubRepositoryBindingV2(
-  value: Omit<TrustedGitHubRepositoryBindingV2, "fingerprint"> | TrustedGitHubRepositoryBindingV2,
+  value:
+    | Omit<
+        TrustedGitHubRepositoryBindingV2,
+        "fingerprint" | "visibilityAttestationFingerprint"
+      >
+    | Omit<TrustedGitHubRepositoryBindingV2, "fingerprint">
+    | TrustedGitHubRepositoryBindingV2,
 ): string {
   const {
     fingerprint: _fingerprint,
+    visibilityAttestationFingerprint: _visibilityAttestationFingerprint,
     observedAt: _observedAt,
     trustedAt: _trustedAt,
     ...stable
   } = value as TrustedGitHubRepositoryBindingV2;
   return sha256(stable);
+}
+
+function sealTrustedGitHubRepositoryBindingV2(
+  unsigned: Omit<
+    TrustedGitHubRepositoryBindingV2,
+    "fingerprint" | "visibilityAttestationFingerprint"
+  >,
+): TrustedGitHubRepositoryBindingV2 {
+  const fingerprint = fingerprintTrustedGitHubRepositoryBindingV2(unsigned);
+  const unsealed = {
+    ...unsigned,
+    fingerprint,
+  } as Omit<TrustedGitHubRepositoryBindingV2, "visibilityAttestationFingerprint">;
+  return {
+    ...unsealed,
+    visibilityAttestationFingerprint:
+      fingerprintVisibilityAttestationV2(unsealed),
+  };
+}
+
+function fingerprintVisibilityAttestationV2(
+  value: Omit<TrustedGitHubRepositoryBindingV2, "visibilityAttestationFingerprint">,
+): string {
+  return sha256({
+    bindingFingerprint: value.fingerprint,
+    repositoryReadbackFingerprint: value.repositoryReadbackFingerprint,
+    visibility: value.visibility,
+    observedAt: value.observedAt,
+    trustedAt: value.trustedAt,
+  });
 }
 
 export function fingerprintGitHubRepositoryReadbackV2(

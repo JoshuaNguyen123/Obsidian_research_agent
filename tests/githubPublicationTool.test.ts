@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { createVerifiedCodePublicationHandoffV1 } from "../packages/core-api/src";
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import type { VerifiedLocalCommitReceiptV1 } from "../extensions/code/repair";
 import type { ActionReceipt } from "../src/agent/actions";
 import { verifyPreparedActionFingerprint } from "../src/agent/actions/canonicalize";
@@ -943,6 +947,12 @@ function localCommitReceipt(): VerifiedLocalCommitReceiptV1 {
     changedPaths: ["src/fix.ts"],
     artifactHashes: [{ path: "src/fix.ts", sha256: FP_A, bytes: 42 }],
     changedArtifacts: [{ path: "src/fix.ts", sha256: FP_A }],
+    identity: {
+      authorName: AGENT_GIT_COMMIT_NAME_V1,
+      authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+      committerName: AGENT_GIT_COMMIT_NAME_V1,
+      committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+    },
     targetedValidationReceiptId: "targeted-1",
     fullValidationReceiptId: "full-1",
     targetedValidationFingerprint: FP_A,

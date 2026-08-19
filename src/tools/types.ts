@@ -19,8 +19,14 @@ import type {
 } from "../agent/actions";
 import type { ClarificationOutcome } from "../agent/clarificationBroker";
 import type { ProjectLineageV1 } from "../agent/projectLifecycle";
+import type { ProjectStageEventV1 } from "../agent/projectRunReport";
 import type { ToolOutcomeMemoryV1 } from "../agent/outcomeMemory";
 import type { CapabilityReadinessV2 } from "../agent/capabilityReadiness";
+import type {
+  ProjectIdeaAcceptedResearchSeedV1,
+  ProjectIdeaBriefV1,
+  VerifiedCodeReflectionExamplesV1,
+} from "@agentic-researcher/core-api";
 
 export type AgentMissionMode =
   | "chat_only"
@@ -189,6 +195,57 @@ export interface ToolExecutionContext {
   /** Host-validated project lineage used to bind downstream provider reads. */
   getProjectLineages?: () => ProjectLineageV1[];
   /**
+   * Receipt-derived, host-verified evidence for the current/root Developer
+   * Mission. Results writers consume this closed projection instead of model
+   * summaries or mutable worktree state.
+   */
+  getProjectStageEvents?: (runId?: string) => readonly ProjectStageEventV1[];
+  /**
+   * Persist and project one already-verified stage receipt while the mission is
+   * still running. This lets implementation move its exact Linear work unit to
+   * In progress when the first workspace mutation lands, instead of backfilling
+   * every status only after the final commit.
+   */
+  persistProjectStageReceipt?: (
+    receipt: ActionReceipt,
+    context: ToolExecutionContext,
+  ) => Promise<void>;
+  /**
+   * Production host persistence for the two canonical terminal reflection
+   * tools. The runner calls this only after a validated ActionReceipt with
+   * exact readback exists, allowing the host to durably advance lineage.
+   */
+  persistProjectReflectionReceipt?: (
+    receipt: ActionReceipt,
+    context: ToolExecutionContext,
+  ) => Promise<void>;
+  /**
+   * Reconcile every receipt-derived Linear phase boundary after the canonical
+   * Results/Jupyter artifact is already durable. This is deliberately
+   * separate from reflection persistence: a transient provider/configuration
+   * failure must pause completion without replaying the no-overwrite report.
+   */
+  verifyProjectLifecycleCompletion?: (
+    context: ToolExecutionContext,
+  ) => Promise<void>;
+  /**
+   * Resolve immutable, commit-bound source excerpts for completion reflection.
+   * The host must re-read its durable code handoff and return null when the
+   * requested profile/commit is not the exact verified publication candidate.
+   */
+  resolveVerifiedCodeReflectionExamples?: (input: {
+    repositoryProfileKey: string;
+    commitSha: string;
+  }) => Promise<VerifiedCodeReflectionExamplesV1 | null>;
+  /**
+   * Resolve examples from the latest durable verified handoff for one
+   * host-trusted profile. Used when standalone/cross-run code delivery has no
+   * current-run ProjectLineage commit projection.
+   */
+  resolveLatestVerifiedCodeReflectionExamples?: (input: {
+    repositoryProfileKey: string;
+  }) => Promise<VerifiedCodeReflectionExamplesV1 | null>;
+  /**
    * Trusted repository profile keys from the plugin registry. Used to host-bind
    * `code_workspace_create` when the mission names exactly one of them.
    */
@@ -262,6 +319,14 @@ export type NestedToolApprovalDecision =
 
 export interface AgentRuntimeCache {
   toolResults: Map<string, ToolExecutionResult>;
+  /**
+   * Exact native ideation output and its optional accepted-research seed.
+   * This bridge is deliberately run-local: it is never serialized, and a
+   * restart must recreate the brief from host-verified context before a joined
+   * publication can regain ideation binding.
+   */
+  projectIdeaBrief?: ProjectIdeaBriefV1;
+  projectIdeaAcceptedResearchSeed?: ProjectIdeaAcceptedResearchSeedV1;
   /** Successful strong-hash web reads retained for proof-bound downstream tools. */
   trustedWebFetchResults?: Map<string, ToolExecutionResult>;
   /**

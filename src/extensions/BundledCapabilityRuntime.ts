@@ -9,7 +9,10 @@ import {
   type ExtensionStateMigrationOfferV1,
 } from "../../packages/core-api/src";
 import { createSessionBootstrapTokenLeaseV1 } from "../../packages/headless-runtime/src";
-import type { VerifiedCodePublicationHandoffV1 } from "../../packages/core-api/src";
+import type {
+  VerifiedCodePublicationHandoffV1,
+  VerifiedCodeReflectionExamplesV1,
+} from "../../packages/core-api/src";
 import {
   CODE_EXTENSION_VERSION_V2,
   CodeExtensionRuntimeV2,
@@ -235,6 +238,13 @@ export class BundledCodeCapability {
     profileKey: string,
   ): Promise<VerifiedCodePublicationHandoffV1 | null> {
     return this.runtime.resolveLatestVerifiedPublicationHandoff(profileKey);
+  }
+
+  async resolveVerifiedCodeReflectionExamples(
+    profileKey: string,
+    handoff: unknown,
+  ): Promise<VerifiedCodeReflectionExamplesV1 | null> {
+    return this.runtime.resolveVerifiedCodeReflectionExamples(profileKey, handoff);
   }
 
   async resolveTrustedRepositoryProfile(

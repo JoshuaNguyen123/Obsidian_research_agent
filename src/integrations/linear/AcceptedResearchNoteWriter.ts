@@ -5,6 +5,7 @@ import {
   type DiagramArtifactStoreOptions,
   type DiagramArtifactUpdateReceipt,
   type DiagramArtifactVaultLike,
+  sha256DiagramContent,
 } from "../../design/diagramArtifactStore";
 import {
   createAcceptedResearchArtifactV1,
@@ -29,6 +30,14 @@ import type {
   WorkItemExecutionClass,
   WorkItemRiskClass,
 } from "./WorkItemSpecV1";
+import {
+  parseVerifiedCodeReflectionExamplesV1,
+  type VerifiedCodeReflectionExamplesV1,
+} from "../../../packages/core-api/src/verifiedCodePublicationHandoffV1";
+import {
+  parseProjectIdeaAcceptedResearchSeedV1,
+  type ProjectIdeaAcceptedResearchSeedV1,
+} from "../../../packages/core-api/src/projectIdeaBriefV1";
 
 const MAX_SECTION_CHARS = 8_000;
 const MAX_LIST_ENTRIES = 50;
@@ -57,6 +66,12 @@ export interface AcceptedResearchNotePackageV1 {
   repositoryKey?: string;
   vaultBindingKey: string;
   originRunId: string;
+  /**
+   * Host-derived, fingerprint-verifiable ideation lineage. Omitted for valid
+   * independent research publication that did not originate in native
+   * project ideation.
+   */
+  projectIdeaSeed?: ProjectIdeaAcceptedResearchSeedV1;
 }
 
 export interface AcceptedResearchNoteWriteRequestV1 {
@@ -114,7 +129,7 @@ export function parseAcceptedResearchNotePackageV1(
       "vaultBindingKey",
       "originRunId",
     ],
-    ["repositoryKey"],
+    ["repositoryKey", "projectIdeaSeed"],
     "accepted research note package",
   );
   if (record.schemaVersion !== 1) {
@@ -195,7 +210,15 @@ export function parseAcceptedResearchNotePackageV1(
       "accepted research origin run id",
       160,
     ),
+    ...(record.projectIdeaSeed === undefined
+      ? {}
+      : {
+          projectIdeaSeed: parseProjectIdeaAcceptedResearchSeedV1(
+            record.projectIdeaSeed,
+          ),
+        }),
   });
+  assertProjectIdeaSeedMatchesAcceptedPackage(normalized);
 
   // Reuse the signed artifact contract to validate evidence references,
   // criterion authority boundaries, and the risk class before persistence.
@@ -219,6 +242,9 @@ export function parseAcceptedResearchNotePackageV1(
     riskClass: normalized.riskClass,
     acceptedAt: "2000-01-01T00:00:00.000Z",
     acceptedBy: "host",
+    ...(normalized.projectIdeaSeed
+      ? { projectIdeaSeed: normalized.projectIdeaSeed }
+      : {}),
   });
   return normalized;
 }
@@ -246,6 +272,57 @@ export interface ResearchNoteProjectReflectionResultV1
   extends ResearchNoteGitHubCompletionResultV1 {
   issueUrl: string;
   publicationId: string;
+}
+
+export interface ProjectCompletionReflectionRequestV1 {
+  artifact: AcceptedResearchArtifactV1;
+  expectedNoteSha256: string;
+  publicationId: string;
+  issueIdentifier: string;
+  issueUrl: string;
+  pullRequestNumber: number;
+  pullRequestUrl: string;
+  completionProof: "draft_pr" | "merged_pr";
+  proofRevision: string;
+  changedPaths: string[];
+  targetedValidationReceiptId: string;
+  fullValidationReceiptId: string;
+  localCommitReceiptId: string;
+  codeHandoffFingerprint: string;
+  codeExamples: VerifiedCodeReflectionExamplesV1;
+  /**
+   * Full prose remains the independently callable legacy behavior. A six-stage
+   * Developer Mission uses a concise publication checkpoint here because its
+   * canonical scientific reflection is written by Results/Jupyter afterward.
+   */
+  presentation?: "full_reflection" | "delivery_status";
+  mergeCommitUrl?: string;
+  mergeSha?: string;
+}
+
+export interface ProjectCompletionReflectionPlanV1 {
+  version: 1;
+  presentation: "full_reflection" | "delivery_status";
+  path: string;
+  operation: "append" | "no_op";
+  beforeSha256: string;
+  expectedAfterSha256: string;
+  proposedAppendMarkdown: string;
+  proposedAppendSha256: string;
+  proposedAppendBytes: number;
+  reflectionMarkdown: string;
+  reflectionMarkdownSha256: string;
+  marker: string;
+  exactProofBlock: string;
+  markdownExcerpt: string;
+  markdownExcerptTruncated: boolean;
+  codeExcerpt: string;
+  codeExcerptSha256: string;
+  codeExcerptTruncated: boolean;
+  issueUrl: string;
+  publicationId: string;
+  pullRequestUrl: string;
+  mergeCommitUrl: string | null;
 }
 
 /** Host-owned note writer. External integration code never receives the vault. */
@@ -285,6 +362,9 @@ export class AcceptedResearchNoteWriter {
       riskClass: normalized.riskClass,
       acceptedAt: request.acceptedAt,
       acceptedBy: "host",
+      ...(normalized.projectIdeaSeed
+        ? { projectIdeaSeed: normalized.projectIdeaSeed }
+        : {}),
     });
     const renderedPackage = renderAcceptedResearchNotePackageV1(normalized);
     const marker = acceptedResearchMarker(request.artifactId);
@@ -384,6 +464,9 @@ export class AcceptedResearchNoteWriter {
       riskClass: normalized.riskClass,
       acceptedAt: request.acceptedAt,
       acceptedBy: "host",
+      ...(normalized.projectIdeaSeed
+        ? { projectIdeaSeed: normalized.projectIdeaSeed }
+        : {}),
     });
     return {
       path: request.path,
@@ -574,32 +657,133 @@ export class AcceptedResearchNoteWriter {
    * Final, append-once project reflection. It records verified handoff evidence
    * in the accepted research note instead of treating links alone as closure.
    */
-  async appendProjectCompletionReflection(input: {
-    artifact: AcceptedResearchArtifactV1;
-    expectedNoteSha256: string;
-    publicationId: string;
-    issueIdentifier: string;
-    issueUrl: string;
-    pullRequestNumber: number;
-    pullRequestUrl: string;
-    completionProof: "draft_pr" | "merged_pr";
-    proofRevision: string;
-    changedPaths: string[];
-    targetedValidationReceiptId: string;
-    fullValidationReceiptId: string;
-    localCommitReceiptId: string;
-    mergeCommitUrl?: string;
-    mergeSha?: string;
-  }): Promise<ResearchNoteProjectReflectionResultV1> {
+  async planProjectCompletionReflection(
+    input: ProjectCompletionReflectionRequestV1,
+  ): Promise<ProjectCompletionReflectionPlanV1> {
     const current = await this.store.read(input.artifact.notePath);
-    if (current.sha256 !== input.expectedNoteSha256) {
+    return await planProjectCompletionReflectionV1({
+      ...input,
+      currentPath: current.path,
+      currentContent: current.content,
+      currentSha256: current.sha256,
+    });
+  }
+
+  async appendPreparedProjectCompletionReflection(
+    plan: ProjectCompletionReflectionPlanV1,
+  ): Promise<ResearchNoteProjectReflectionResultV1> {
+    await validateProjectCompletionReflectionPlanV1(plan);
+    const current = await this.store.read(plan.path);
+    if (plan.operation === "no_op") {
+      if (
+        current.sha256 !== plan.beforeSha256 ||
+        current.sha256 !== plan.expectedAfterSha256 ||
+        !current.content.includes(plan.reflectionMarkdown)
+      ) {
+        throw new DiagramArtifactStoreError(
+          "expected_hash_mismatch",
+          "Research note changed before project completion reflection reconciliation.",
+        );
+      }
+      return {
+        path: current.path,
+        operation: "no_op",
+        beforeSha256: current.sha256,
+        afterSha256: current.sha256,
+        issueUrl: plan.issueUrl,
+        publicationId: plan.publicationId,
+        pullRequestUrl: plan.pullRequestUrl,
+        mergeCommitUrl: plan.mergeCommitUrl,
+        transaction: null,
+      };
+    }
+    if (current.sha256 !== plan.beforeSha256) {
       throw new DiagramArtifactStoreError(
         "expected_hash_mismatch",
-        "Research note changed before project completion reflection append.",
+        "Research note changed before approved project completion reflection append.",
+      );
+    }
+    const candidate = `${current.content}${plan.proposedAppendMarkdown}`;
+    if (await sha256DiagramContent(candidate) !== plan.expectedAfterSha256) {
+      throw new DiagramArtifactStoreError(
+        "validation_failed",
+        "Approved project reflection bytes do not produce the sealed after hash.",
+      );
+    }
+    const update = await this.store.update({
+      path: current.path,
+      expectedSha256: plan.beforeSha256,
+      content: candidate,
+      validator: ({ content, sha256 }) => ({
+        ok:
+          sha256 === plan.expectedAfterSha256 &&
+          content === candidate &&
+          content.endsWith(plan.proposedAppendMarkdown),
+        errors: ["Project completion reflection readback did not match the approved bytes."],
+      }),
+    });
+    if (
+      update.status !== "committed" ||
+      update.afterSha256 !== plan.expectedAfterSha256 ||
+      update.expectedAfterSha256 !== plan.expectedAfterSha256
+    ) {
+      throw new Error(
+        update.error?.message ?? "Project completion reflection append rolled back.",
+      );
+    }
+    return {
+      path: current.path,
+      operation: "append",
+      beforeSha256: current.sha256,
+      afterSha256: update.afterSha256,
+      issueUrl: plan.issueUrl,
+      publicationId: plan.publicationId,
+      pullRequestUrl: plan.pullRequestUrl,
+      mergeCommitUrl: plan.mergeCommitUrl,
+      transaction: update,
+    };
+  }
+
+  async appendProjectCompletionReflection(
+    input: ProjectCompletionReflectionRequestV1,
+  ): Promise<ResearchNoteProjectReflectionResultV1> {
+    return await this.appendPreparedProjectCompletionReflection(
+      await this.planProjectCompletionReflection(input),
+    );
+  }
+}
+
+export async function planProjectCompletionReflectionV1(
+  input: ProjectCompletionReflectionRequestV1 & {
+    currentPath: string;
+    currentContent: string;
+    currentSha256: string;
+  },
+): Promise<ProjectCompletionReflectionPlanV1> {
+    if (input.currentPath !== input.artifact.notePath) {
+      throw new Error("Project reflection current note path does not match its accepted artifact.");
+    }
+    const currentSha256 = expectSha256(input.currentSha256, "current research note SHA-256");
+    if (
+      await sha256DiagramContent(input.currentContent) !== currentSha256 ||
+      currentSha256 !== input.expectedNoteSha256
+    ) {
+      throw new DiagramArtifactStoreError(
+        "expected_hash_mismatch",
+        "Research note changed before project completion reflection planning.",
       );
     }
     const publicationId = markerId(input.publicationId);
-    const marker = `<!-- agentic-project-reflection:${publicationId} -->`;
+    const presentation = input.presentation ?? "full_reflection";
+    if (
+      presentation !== "full_reflection" &&
+      presentation !== "delivery_status"
+    ) {
+      throw new Error("Unsupported project completion note presentation.");
+    }
+    const marker = presentation === "delivery_status"
+      ? `<!-- agentic-project-delivery:${publicationId} -->`
+      : `<!-- agentic-project-reflection:${publicationId} -->`;
     const issueUrl = normalizeHttpsUrl(input.issueUrl);
     const issueIdentifier = boundedText(input.issueIdentifier, "issue identifier", 100);
     const pullRequestUrl = normalizeGitHubUrl(
@@ -637,6 +821,18 @@ export class AcceptedResearchNoteWriter {
       "local commit receipt ID",
       240,
     );
+    const codeExamples = parseVerifiedCodeReflectionExamplesV1(
+      input.codeExamples,
+    );
+    const codeHandoffFingerprint = expectSha256(
+      input.codeHandoffFingerprint,
+      "verified code handoff fingerprint",
+    );
+    if (codeExamples.handoffFingerprint !== codeHandoffFingerprint) {
+      throw new Error(
+        "Project reflection code examples do not match the verified publication handoff.",
+      );
+    }
     const proofMetadata = [
       "<!-- agentic-project-proof:v1",
       `issue-url: ${encodeURIComponent(issueUrl)}`,
@@ -645,6 +841,15 @@ export class AcceptedResearchNoteWriter {
       `targeted-validation-receipt: ${encodeURIComponent(targetedReceipt)}`,
       `full-validation-receipt: ${encodeURIComponent(fullReceipt)}`,
       `local-commit-receipt: ${encodeURIComponent(commitReceipt)}`,
+      `code-handoff-fingerprint: ${encodeURIComponent(codeHandoffFingerprint)}`,
+      `code-examples-fingerprint: ${encodeURIComponent(codeExamples.fingerprint)}`,
+      ...codeExamples.examples.flatMap((example) => [
+        `code-example-path: ${encodeURIComponent(example.path)}`,
+        `code-example-commit: ${encodeURIComponent(example.commitSha)}`,
+        `code-example-artifact-sha256: ${encodeURIComponent(example.artifactSha256)}`,
+        `code-example-sha256: ${encodeURIComponent(example.codeSha256)}`,
+        `code-example-lines: ${example.startLine}-${example.endLine}`,
+      ]),
       ...changedPaths.map((path) => `changed-path: ${encodeURIComponent(path)}`),
       ...(mergeCommitUrl
         ? [`merge-commit-url: ${encodeURIComponent(mergeCommitUrl)}`]
@@ -653,25 +858,6 @@ export class AcceptedResearchNoteWriter {
       "-->",
     ].join("\n");
     const exactProofBlock = `${marker}\n${proofMetadata}`;
-    if (current.content.includes(marker)) {
-      if (!current.content.includes(exactProofBlock)) {
-        throw new DiagramArtifactStoreError(
-          "validation_failed",
-          "Project reflection marker collides with different or incomplete proof.",
-        );
-      }
-      return {
-        path: current.path,
-        operation: "no_op",
-        beforeSha256: current.sha256,
-        afterSha256: current.sha256,
-        issueUrl,
-        publicationId,
-        pullRequestUrl,
-        mergeCommitUrl,
-        transaction: null,
-      };
-    }
     const criterionCount = input.artifact.acceptanceCriteria.length;
     const primaryCriterion = input.artifact.acceptanceCriteria[0]?.text
       ? reflectionCriterionExcerpt(input.artifact.acceptanceCriteria[0].text)
@@ -696,43 +882,113 @@ export class AcceptedResearchNoteWriter {
     const closureSentence = input.completionProof === "merged_pr"
       ? "The merge is complete; deployment and future product learning remain separate work."
       : "The published evidence stops at this draft; review, merge, and any later deployment remain open.";
-    const reflection = [
-      "## Agent project reflection",
-      exactProofBlock,
-      "",
-      `Research in [Linear issue ${escapeMarkdown(issueIdentifier)}](${issueUrl}) became a tested code change at revision \`${proofRevision.slice(0, 12)}\`.`,
-      "Targeted and full validation passed.",
-      outcomeSentence,
-      publicationSentence,
-      closureSentence,
-    ].join("\n");
-    const candidate = appendSection(current.content, reflection);
-    const update = await this.store.update({
-      path: current.path,
-      expectedSha256: current.sha256,
-      content: candidate,
-      validator: ({ content }) => ({
-        ok:
-          content.includes(exactProofBlock) &&
-          content.includes(issueUrl) &&
-          content.includes(pullRequestUrl),
-        errors: ["Project completion reflection was not persisted with its proof."],
-      }),
-    });
-    if (update.status !== "committed" || !update.afterSha256) {
-      throw new Error(update.error?.message ?? "Project completion reflection append rolled back.");
+    const reflection = presentation === "delivery_status"
+      ? [
+          "## Delivery status",
+          exactProofBlock,
+          "",
+          `- Linear: [${escapeMarkdown(issueIdentifier)}](${issueUrl})`,
+          `- GitHub: [${mergeSha ? "Pull request" : "Draft pull request"} #${pullRequestNumber}](${pullRequestUrl})`,
+          `- Verified revision: \`${proofRevision.slice(0, 12)}\``,
+          "- Results: the mission's canonical report is written separately after this publication checkpoint, with research, implementation, validation, limitations, and exact-commit examples.",
+        ].join("\n")
+      : [
+          "## Agent project reflection",
+          exactProofBlock,
+          "",
+          `Research in [Linear issue ${escapeMarkdown(issueIdentifier)}](${issueUrl}) became a tested code change at revision \`${proofRevision.slice(0, 12)}\`.`,
+          "Targeted and full validation passed.",
+          outcomeSentence,
+          publicationSentence,
+          closureSentence,
+          "",
+          ...codeExamples.examples.flatMap((example) =>
+            renderVerifiedProjectCodeExample(example),
+          ),
+        ].join("\n");
+    const hasMarker = input.currentContent.includes(marker);
+    if (hasMarker && !input.currentContent.includes(reflection)) {
+      throw new DiagramArtifactStoreError(
+        "validation_failed",
+        "Project reflection marker collides with different or incomplete proof.",
+      );
     }
+    const operation = hasMarker ? "no_op" : "append";
+    const proposedAppendMarkdown = operation === "append"
+      ? exactAppendMarkdown(input.currentContent, reflection)
+      : "";
+    const expectedAfterSha256 = operation === "append"
+      ? await sha256DiagramContent(`${input.currentContent}${proposedAppendMarkdown}`)
+      : currentSha256;
+    const visibleStart = presentation === "delivery_status"
+      ? reflection.indexOf("- Linear: ")
+      : reflection.indexOf("Research in ");
+    const visibleMarkdown = visibleStart >= 0 ? reflection.slice(visibleStart) : reflection;
+    const markdownPreview = exactBoundedExcerpt(visibleMarkdown, 2_000);
+    const codePreview = exactBoundedExcerpt(
+      presentation === "delivery_status"
+        ? ""
+        : codeExamples.examples[0]?.code ?? "",
+      2_000,
+    );
     return {
-      path: current.path,
-      operation: "append",
-      beforeSha256: current.sha256,
-      afterSha256: update.afterSha256,
+      version: 1,
+      presentation,
+      path: input.currentPath,
+      operation,
+      beforeSha256: currentSha256,
+      expectedAfterSha256,
+      proposedAppendMarkdown,
+      proposedAppendSha256: await sha256DiagramContent(proposedAppendMarkdown),
+      proposedAppendBytes: new TextEncoder().encode(proposedAppendMarkdown).byteLength,
+      reflectionMarkdown: reflection,
+      reflectionMarkdownSha256: await sha256DiagramContent(reflection),
+      marker,
+      exactProofBlock,
+      markdownExcerpt: markdownPreview.excerpt,
+      markdownExcerptTruncated: markdownPreview.truncated,
+      codeExcerpt: codePreview.excerpt,
+      codeExcerptSha256: await sha256DiagramContent(codePreview.excerpt),
+      codeExcerptTruncated: codePreview.truncated,
       issueUrl,
       publicationId,
       pullRequestUrl,
       mergeCommitUrl,
-      transaction: update,
     };
+}
+
+async function validateProjectCompletionReflectionPlanV1(
+  plan: ProjectCompletionReflectionPlanV1,
+): Promise<void> {
+  if (
+    plan.version !== 1 ||
+    (plan.presentation !== "full_reflection" &&
+      plan.presentation !== "delivery_status") ||
+    (plan.operation !== "append" && plan.operation !== "no_op")
+  ) {
+    throw new Error("Unsupported project completion reflection plan.");
+  }
+  expectSha256(plan.beforeSha256, "project reflection before SHA-256");
+  expectSha256(plan.expectedAfterSha256, "project reflection expected after SHA-256");
+  if (
+    await sha256DiagramContent(plan.proposedAppendMarkdown) !== plan.proposedAppendSha256 ||
+    new TextEncoder().encode(plan.proposedAppendMarkdown).byteLength !== plan.proposedAppendBytes ||
+    await sha256DiagramContent(plan.reflectionMarkdown) !== plan.reflectionMarkdownSha256 ||
+    await sha256DiagramContent(plan.codeExcerpt) !== plan.codeExcerptSha256 ||
+    !plan.reflectionMarkdown.includes(plan.exactProofBlock) ||
+    !plan.exactProofBlock.startsWith(plan.marker) ||
+    (plan.presentation === "delivery_status" &&
+      (!plan.reflectionMarkdown.startsWith("## Delivery status\n") ||
+        plan.codeExcerpt !== "")) ||
+    (plan.presentation === "full_reflection" &&
+      !plan.reflectionMarkdown.startsWith("## Agent project reflection\n")) ||
+    (plan.operation === "append" && !plan.proposedAppendMarkdown.endsWith(`${plan.reflectionMarkdown}\n`)) ||
+    (plan.operation === "no_op" && plan.proposedAppendMarkdown !== "")
+  ) {
+    throw new DiagramArtifactStoreError(
+      "validation_failed",
+      "Project completion reflection plan no longer matches its sealed bytes.",
+    );
   }
 }
 
@@ -759,6 +1015,7 @@ export function renderAcceptedResearchNotePackageV1(
     validationRequirementKeys: value.validationRequirementKeys,
     evidenceIds: value.evidence.map((entry) => entry.id),
     originRunId: value.originRunId,
+    projectIdeaSeed: value.projectIdeaSeed ?? null,
   };
   return [
     `# ${value.title}`,
@@ -925,7 +1182,7 @@ function expectPackageText(
 
 function normalizePackage(input: AcceptedResearchNotePackageV1): AcceptedResearchNotePackageV1 {
   if (!input || input.schemaVersion !== 1) throw new Error("Unsupported research note package version.");
-  return {
+  const normalized: AcceptedResearchNotePackageV1 = {
     schemaVersion: 1,
     title: boundedText(input.title, "title", 240),
     problemImpact: boundedText(input.problemImpact, "problem and impact", MAX_SECTION_CHARS),
@@ -953,7 +1210,55 @@ function normalizePackage(input: AcceptedResearchNotePackageV1): AcceptedResearc
       : {}),
     vaultBindingKey: boundedText(input.vaultBindingKey, "vault binding key", 128),
     originRunId: boundedText(input.originRunId, "origin run id", 160),
+    ...(input.projectIdeaSeed
+      ? {
+          projectIdeaSeed: parseProjectIdeaAcceptedResearchSeedV1(
+            input.projectIdeaSeed,
+          ),
+        }
+      : {}),
   };
+  assertProjectIdeaSeedMatchesAcceptedPackage(normalized);
+  return normalized;
+}
+
+function assertProjectIdeaSeedMatchesAcceptedPackage(
+  package_: AcceptedResearchNotePackageV1,
+): void {
+  const seed = package_.projectIdeaSeed;
+  if (!seed) return;
+  const acceptedProjection = {
+    title: package_.title,
+    problemImpact: package_.problemImpact,
+    objective: package_.objective,
+    proposedWork: package_.proposedWork,
+    nonGoals: package_.nonGoals,
+    acceptanceCriteria: package_.acceptanceCriteria,
+    evidence: package_.evidence.map(
+      ({ id, kind, reference, contentSha256 }) => ({
+        id,
+        kind,
+        reference,
+        contentSha256,
+      }),
+    ),
+    riskClass: package_.riskClass,
+  };
+  const seedProjection = {
+    title: seed.title,
+    problemImpact: seed.problemImpact,
+    objective: seed.selectedDirection.summary,
+    proposedWork: seed.proposedWork,
+    nonGoals: seed.nonGoals,
+    acceptanceCriteria: seed.acceptanceCriteria,
+    evidence: seed.evidence,
+    riskClass: seed.riskClass,
+  };
+  if (JSON.stringify(acceptedProjection) !== JSON.stringify(seedProjection)) {
+    throw new DurableLinearContractError(
+      "Accepted research fields drifted from their durable project idea seed.",
+    );
+  }
 }
 
 function normalizeEvidence(
@@ -985,6 +1290,28 @@ function boundedText(value: unknown, label: string, maximum: number): string {
     throw new Error(`${label} must contain safe bounded text.`);
   }
   return normalized;
+}
+
+function renderVerifiedProjectCodeExample(
+  example: VerifiedCodeReflectionExamplesV1["examples"][number],
+): string[] {
+  const fenceLength = Math.max(
+    3,
+    ...Array.from(example.code.matchAll(/`+/gu), (match) => match[0].length + 1),
+  );
+  const fence = "`".repeat(fenceLength);
+  const lineLabel =
+    example.startLine === example.endLine
+      ? `line ${example.startLine}`
+      : `lines ${example.startLine}-${example.endLine}`;
+  return [
+    "### Verified code example",
+    `\`${escapeInline(example.path)}\` ${lineLabel} at commit \`${example.commitSha.slice(0, 12)}\` (file hash \`${example.artifactSha256.slice(7, 19)}\`; excerpt hash \`${example.codeSha256}\`).`,
+    `${fence}${example.language === "text" ? "" : example.language}`,
+    example.code,
+    fence,
+    "",
+  ];
 }
 
 function reflectionCriterionExcerpt(value: string): string {
@@ -1040,6 +1367,28 @@ function boundedRepositoryPaths(value: unknown): string[] {
 
 function appendSection(existing: string, section: string): string {
   return `${existing.replace(/\s*$/u, "")}\n\n${section.replace(/^\s*/u, "").replace(/\s*$/u, "")}\n`;
+}
+
+function exactAppendMarkdown(existing: string, section: string): string {
+  const separator = existing.length === 0
+    ? ""
+    : existing.endsWith("\n\n")
+      ? ""
+      : existing.endsWith("\n")
+        ? "\n"
+        : "\n\n";
+  return `${separator}${section}\n`;
+}
+
+function exactBoundedExcerpt(
+  value: string,
+  maximumCodePoints: number,
+): { excerpt: string; truncated: boolean } {
+  const codePoints = Array.from(value);
+  return {
+    excerpt: codePoints.slice(0, maximumCodePoints).join(""),
+    truncated: codePoints.length > maximumCodePoints,
+  };
 }
 
 function renderList(values: readonly string[], empty = "No entries recorded."): string {

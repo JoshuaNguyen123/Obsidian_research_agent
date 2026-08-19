@@ -10,8 +10,13 @@ import test from "node:test";
 import type { Plugin } from "obsidian";
 import {
   parseVerifiedCodePublicationHandoffV1,
+  parseVerifiedCodeReflectionExamplesV1,
   type ScopedExtensionContextV1,
 } from "../packages/core-api/src";
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import { canonicalJson } from "../packages/headless-runtime/src";
 import {
   createRepositoryProfile,
@@ -42,6 +47,12 @@ import { WorkspaceManagerV2 } from "../extensions/code/workspaces";
 const NOW = "2026-07-12T18:00:00.000Z";
 const SHA = (character: string) => `sha256:${character.repeat(64)}`;
 const execFileAsync = promisify(execFile);
+const COMMIT_IDENTITY = {
+  authorName: AGENT_GIT_COMMIT_NAME_V1,
+  authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+  committerName: AGENT_GIT_COMMIT_NAME_V1,
+  committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+};
 
 test("CodeExtensionRuntimeV2 migrates RepositoryProfileV1 once and preserves the migration snapshot", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "code-runtime-profile-"));
@@ -308,6 +319,147 @@ test("CodeExtensionRuntimeV2 resolves only a terminal verified commit through th
       handoff.fingerprint,
     );
     assert.equal(await runtime.resolveLatestVerifiedPublicationHandoff("missing-profile"), null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 acquires reflection examples from the exact verified commit instead of the mutable worktree", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-reflection-"));
+  try {
+    const repositoryRoot = path.join(root, "repository");
+    const worktreeRoot = path.join(root, "worktree");
+    await mkdir(repositoryRoot);
+    const git = async (cwd: string, args: string[]) =>
+      (await execFileAsync("git", args, { cwd, windowsHide: true })).stdout.trim();
+    await git(repositoryRoot, ["init", "-b", "main"]);
+    await git(repositoryRoot, ["config", "user.name", "Agentic Researcher"]);
+    await git(repositoryRoot, ["config", "user.email", "agentic-researcher@example.invalid"]);
+    await mkdir(path.join(repositoryRoot, "src"));
+    await writeFile(
+      path.join(repositoryRoot, "src", "value.ts"),
+      "export function answer(): number {\n  return 1;\n}\n",
+      "utf8",
+    );
+    await git(repositoryRoot, ["add", "--", "src/value.ts"]);
+    await git(repositoryRoot, ["commit", "-m", "initial"]);
+    const baseSha = await git(repositoryRoot, ["rev-parse", "HEAD"]);
+    const branch = "codex/reflection-runtime";
+    await git(repositoryRoot, ["worktree", "add", "-b", branch, worktreeRoot, baseSha]);
+    const verifiedContent = [
+      "export function answer(): number {",
+      "  const verified = 42;",
+      "  return verified;",
+      "}",
+      "",
+    ].join("\n");
+    const verifiedBytes = new TextEncoder().encode(verifiedContent);
+    await writeFile(path.join(worktreeRoot, "src", "value.ts"), verifiedBytes);
+    await git(worktreeRoot, ["add", "--", "src/value.ts"]);
+    await git(worktreeRoot, ["commit", "-m", "verified reflection source"]);
+    const commitSha = await git(worktreeRoot, ["rev-parse", "HEAD"]);
+    const treeSha = await git(worktreeRoot, ["rev-parse", "HEAD^{tree}"]);
+
+    const profile = createRepositoryProfile({
+      key: "reflection-repository",
+      displayName: "Reflection repository",
+      repositoryRoot,
+      defaultBranch: "main",
+      allowedPathPrefixes: ["src"],
+      validationProfile: createNodeNpmValidationProfile(),
+    });
+    const workspaceId = "reflection-workspace";
+    const runId = "reflection-run";
+    const requestId = "reflection-repair";
+    const checkpoint = terminalCheckpointFixture({
+      request: {
+        id: requestId,
+        runId,
+        objective: "Create a verified reflection source.",
+        worktree: {
+          id: workspaceId,
+          path: worktreeRoot,
+          repositoryRoot,
+          branch,
+          baseSha,
+          profileId: profile.key,
+        },
+        commitMessage: "verified reflection source",
+        maxCycles: 3,
+        expectedArtifacts: [],
+        protectedControlPaths: [],
+      },
+      commitSha,
+      treeSha,
+      artifactSha: sha256Bytes(verifiedBytes),
+      artifactBytes: verifiedBytes.byteLength,
+    });
+    const plugin = new MemoryPluginData({
+      schemaVersion: 1,
+      extensionStateMigration: migrationRecord(codeSnapshot([profile])),
+      codeRepairCheckpointsV1: {
+        version: 1,
+        revision: 1,
+        checkpoints: { [checkpoint.id]: checkpoint },
+      },
+    });
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(root, "app-data"),
+      now: () => new Date(NOW),
+      randomId: incrementingId(),
+    });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: manager,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await manager.registerTrustedRepositoryWorkspace({
+      workspaceId,
+      ownerRunId: runId,
+      profileKey: profile.key,
+      repositoryRoot,
+      worktreeRoot,
+      branch,
+      baseSha,
+      bindingFingerprint: SHA("6"),
+      trusted: true,
+    });
+    const handoff = await runtime.resolveLatestVerifiedPublicationHandoff(profile.key);
+    assert.ok(handoff);
+
+    await writeFile(
+      path.join(worktreeRoot, "src", "value.ts"),
+      "export const MUTABLE_WORKTREE_POISON = true;\n",
+      "utf8",
+    );
+    const examples = await runtime.resolveVerifiedCodeReflectionExamples(
+      profile.key,
+      handoff,
+    );
+    assert.ok(examples);
+    assert.deepEqual(parseVerifiedCodeReflectionExamplesV1(examples, handoff), examples);
+    assert.equal(examples.commitSha, commitSha);
+    assert.equal(examples.examples.length, 1);
+    assert.equal(examples.examples[0]?.path, "src/value.ts");
+    assert.match(examples.examples[0]?.code ?? "", /verified = 42/u);
+    assert.doesNotMatch(examples.examples[0]?.code ?? "", /MUTABLE_WORKTREE_POISON/u);
+    assert.ok(
+      (examples.examples[0]?.endLine ?? 0) -
+        (examples.examples[0]?.startLine ?? 0) +
+        1 <= 20,
+    );
+    assert.equal(
+      await runtime.resolveVerifiedCodeReflectionExamples("missing-profile", handoff),
+      null,
+    );
+    assert.equal(
+      await runtime.resolveVerifiedCodeReflectionExamples(profile.key, {
+        ...handoff,
+        commitSha: "f".repeat(40),
+      }),
+      null,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -826,6 +978,7 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
       randomId: incrementingId(),
     });
     let sandboxProbeCount = 0;
+    let sandboxExecutionCount = 0;
     const executionRoot = path.join(root, "sandbox-execution");
     const sandboxRunner: SandboxCommandRunnerV2 = {
       async run(spec, input) {
@@ -848,6 +1001,7 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
             stderr: "",
           };
         }
+        sandboxExecutionCount += 1;
         await mkdir(executionRoot, { recursive: true });
         for (const stagedFile of input?.stagedFiles ?? []) {
           const target = path.join(executionRoot, ...stagedFile.path.split("/"));
@@ -880,8 +1034,9 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
         }
       },
     };
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
     const runtime = new CodeExtensionRuntimeV2({
-      plugin: new MemoryPluginData({ schemaVersion: 1 }) as unknown as Plugin,
+      plugin: plugin as unknown as Plugin,
       workspaceManager: manager,
       sandboxRunner,
       now: () => new Date(NOW),
@@ -1026,7 +1181,47 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
       "verified",
       "the canonical receipt must verify that the full-validation result was red",
     );
-    assert.equal(sandboxProbeCount, 5);
+    const neverDispatched = await fullContribution.tool.prepare(
+      {
+        workspaceId: manifest.workspaceId,
+        repairRequestId: "scratch-never-dispatched",
+      },
+      extensionContext(),
+    );
+    assert.equal(neverDispatched.ok, true);
+    assert.ok(plugin.read().codeSandboxExecutionJournalV1);
+
+    const executionsBeforeRestart = sandboxExecutionCount;
+    const restarted = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: manager,
+      sandboxRunner,
+      now: () => new Date(NOW),
+    });
+    await restarted.initialize();
+    const restartedFull = restarted.getContributions().find(
+      (candidate: any) =>
+        candidate?.descriptor?.kind === "tool" &&
+        candidate?.tool?.name === "code_validate_full",
+    ) as any;
+    assert.ok(restartedFull?.tool?.reconcile);
+    const committed = await restartedFull.tool.reconcile(
+      preparedAction,
+      extensionContext(),
+    );
+    assert.equal(committed.outcome, "committed");
+    assert.equal(committed.receipt.readback.status, "verified");
+    const notApplied = await restartedFull.tool.reconcile(
+      neverDispatched.action,
+      extensionContext(),
+    );
+    assert.equal(notApplied.outcome, "not_applied");
+    assert.equal(
+      sandboxExecutionCount,
+      executionsBeforeRestart,
+      "restart reconciliation must never dispatch the sandbox",
+    );
+    assert.equal(sandboxProbeCount, 6);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1992,6 +2187,7 @@ function terminalCheckpointFixture(input: {
     diffFingerprint,
     changedPaths: [changedPath],
     artifactHashes: artifactReadback,
+    identity: { ...COMMIT_IDENTITY },
     readAt: NOW,
   };
   const commitEvidence = {
@@ -2008,6 +2204,7 @@ function terminalCheckpointFixture(input: {
     changedPaths: [changedPath],
     artifactHashes: artifactReadback,
     changedArtifacts: [{ path: changedPath, sha256: input.artifactSha }],
+    identity: { ...COMMIT_IDENTITY },
     targetedValidationReceiptId: targetedValidation.id,
     fullValidationReceiptId: fullValidation.id,
     targetedValidationFingerprint: targetedValidation.fingerprint,

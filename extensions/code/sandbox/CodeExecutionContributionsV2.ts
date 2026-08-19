@@ -28,6 +28,11 @@ import {
   type SandboxPrepareInputV2,
   type SandboxStagedFileBytesV2,
 } from "./SandboxManager";
+import type {
+  SandboxExecutionJournalV1,
+  SandboxExecutionReconciliationV2,
+  SandboxNotAppliedProofV2,
+} from "./DurableSandboxExecutionJournalV1";
 
 export const CODE_EXECUTION_TOOL_NAMES_V2 = [
   "code_repository_detect_profile",
@@ -42,6 +47,8 @@ export const CODE_EXECUTION_TOOL_NAMES_V2 = [
 
 export interface CodeExecutionContributionFactoryOptionsV2 {
   sandboxManager: SandboxManagerV2 | (() => SandboxManagerV2);
+  /** Required durable write-ahead execution journal for every caller. */
+  executionJournal: SandboxExecutionJournalV1;
   getProfile(profileKey: string): Promise<RepositoryProfileV2 | null>;
   /** Resolve mutable workspace proof on the host; model arguments never carry hashes. */
   resolvePreparationInput?(input: {
@@ -75,6 +82,17 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
     diagnostics: SandboxValidationDiagnosticsV1;
     context: ScopedExtensionContextV1;
   }): Promise<JsonValueV1>;
+  /**
+   * Optional read-only supplemental receipt source. The mandatory execution
+   * journal remains authoritative: supplemental evidence may complete an
+   * uncertain dispatch with exact receipts, but it cannot downgrade durable
+   * dispatch uncertainty to `not_applied` or replace a terminal journal state.
+   */
+  reconcileExecutionReceipt?(input: {
+    runId: string;
+    action: PreparedSandboxActionV2;
+    context: ScopedExtensionContextV1;
+  }): Promise<SandboxExecutionReconciliationV2>;
 }
 
 interface ParsedSandboxToolArgsV2
@@ -101,6 +119,7 @@ interface ParsedSandboxToolArgsV2
 export function createCodeExecutionContributionsV2(
   options: CodeExecutionContributionFactoryOptionsV2,
 ): ExtensionContributionV1[] {
+  requireExecutionJournal(options);
   return [
     detectProfileContribution(),
     sandboxStatusToolContribution(options.sandboxManager),
@@ -251,9 +270,19 @@ function preparedSandboxContribution(
         if (prepared.status === "blocked") {
           return failure(prepared.blocker.code, prepared.blocker.message);
         }
+        const action = corePreparedAction(name, resourceType, prepared.action, context);
+        const journal = await options.executionJournal.recordPrepared({
+          runId: action.runId,
+          action: prepared.action,
+        });
+        if (journal.status !== "prepared") {
+          throw new Error(
+            `Durable sandbox action already has terminal or ambiguous state ${journal.status}; reconcile it instead of preparing a replay.`,
+          );
+        }
         return {
           ok: true,
-          action: corePreparedAction(name, resourceType, prepared.action, context),
+          action,
         };
       } catch (error) {
         return failure(
@@ -281,6 +310,20 @@ function preparedSandboxContribution(
         sandboxAction,
         context,
       );
+      try {
+        const dispatch = await options.executionJournal.markDispatching({
+          runId: action.runId,
+          action: sandboxAction,
+        });
+        if (dispatch.status !== "dispatch_uncertain") {
+          throw new Error(`Unexpected durable dispatch state ${dispatch.status}.`);
+        }
+      } catch (error) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_journal_dispatch_failed",
+          `Sandbox execution did not start because its durable dispatch marker failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       const result = await resolveSandboxManager(
         options.sandboxManager,
       ).executePrepared(sandboxAction, {
@@ -297,6 +340,18 @@ function preparedSandboxContribution(
         throw new CodeSandboxContributionErrorV2(
           result.blocker.code,
           result.blocker.message,
+        );
+      }
+      try {
+        await options.executionJournal.recordExecutionReceipt({
+          runId: action.runId,
+          action: sandboxAction,
+          receipt: result.receipt,
+        });
+      } catch (error) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_journal_receipt_failed",
+          `Sandbox executed, but its durable execution receipt failed persistence/readback: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
       let validationReceipt: JsonValueV1 | undefined;
@@ -330,6 +385,11 @@ function preparedSandboxContribution(
               "Durable validation receipt readback does not match the sandbox receipt identity.",
             );
           }
+          await options.executionJournal.recordValidationReceipt({
+            runId: action.runId,
+            action: sandboxAction,
+            validationReceipt,
+          });
         } catch (error) {
           throw new CodeSandboxContributionErrorV2(
             "validation_receipt_persistence_failed",
@@ -360,12 +420,97 @@ function preparedSandboxContribution(
         mutationState: "applied" as const,
       };
     },
-    async reconcile(action) {
+    async reconcile(action, context) {
+      const sandboxAction = extractSandboxAction(action);
+      let reconciliation: SandboxExecutionReconciliationV2;
+      try {
+        reconciliation = await options.executionJournal.reconcile({
+          runId: action.runId,
+          action: sandboxAction,
+        });
+        if (
+          reconciliation.outcome === "still_uncertain" &&
+          options.reconcileExecutionReceipt
+        ) {
+          const supplemental = await options.reconcileExecutionReceipt({
+            runId: action.runId,
+            action: sandboxAction,
+            context,
+          });
+          if (supplemental.outcome === "committed") {
+            await options.executionJournal.recordExecutionReceipt({
+              runId: action.runId,
+              action: sandboxAction,
+              receipt: supplemental.receipt,
+            });
+            if (
+              sandboxAction.repairRequestId !== null &&
+              supplemental.validationReceipt !== undefined
+            ) {
+              await options.executionJournal.recordValidationReceipt({
+                runId: action.runId,
+                action: sandboxAction,
+                validationReceipt: supplemental.validationReceipt,
+              });
+            }
+            reconciliation = await options.executionJournal.reconcile({
+              runId: action.runId,
+              action: sandboxAction,
+            });
+          } else if (supplemental.outcome === "not_applied") {
+            return {
+              outcome: "still_uncertain" as const,
+              message: boundedReconciliationMessage(
+                "The durable journal marks sandbox dispatch as uncertain; supplemental not-applied evidence cannot downgrade that write-ahead state.",
+              ),
+            };
+          } else {
+            reconciliation = supplemental;
+          }
+        }
+      } catch (error) {
+        return {
+          outcome: "still_uncertain" as const,
+          message: boundedReconciliationMessage(
+            `Durable sandbox receipt readback failed: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        };
+      }
+      if (reconciliation.outcome === "still_uncertain") {
+        return {
+          outcome: "still_uncertain" as const,
+          message: boundedReconciliationMessage(reconciliation.message),
+        };
+      }
+      if (reconciliation.outcome === "not_applied") {
+        verifyNotAppliedProof(reconciliation.proof, sandboxAction);
+        return {
+          outcome: "not_applied" as const,
+          message: boundedReconciliationMessage(reconciliation.message),
+        };
+      }
+      const sandboxReceipt = verifyReconciledSandboxReceipt(
+        reconciliation.receipt,
+        sandboxAction,
+      );
+      if (sandboxAction.repairRequestId !== null) {
+        verifyReconciledValidationReceipt(
+          reconciliation.validationReceipt,
+          sandboxAction,
+          sandboxReceipt,
+        );
+      }
+      const receipt = actionReceipt(
+        action,
+        context,
+        sandboxReceipt,
+        capabilityAction,
+        "reconciled",
+      );
       return {
-        outcome: "still_uncertain" as const,
-        message:
-          `Sandbox action ${action.id} has no trusted committed receipt in this process. ` +
-          "Preserve the pending action and inspect the workspace hash index before preparing a replacement; never use native execution as reconciliation.",
+        outcome: "committed" as const,
+        receipt,
+        message: "Durable sandbox execution and validation receipt readback matches the exact prepared action.",
       };
     },
   };
@@ -687,13 +832,17 @@ function actionReceipt(
   sandboxReceipt: {
     id: string;
     fingerprint: string;
+    authorizationGrantId?: string;
     startedAt: string;
     completedAt: string;
     importedArtifacts: Array<{ path: string }>;
   },
   operation: ActionReceiptV1["operation"],
+  commitKind: ActionReceiptV1["commitKind"] = "committed",
 ): ActionReceiptV1 {
-  const authorized = context.authorizedAction!;
+  const grantId = commitKind === "reconciled"
+    ? requiredId(sandboxReceipt.authorizationGrantId, "sandbox receipt authorizationGrantId")
+    : requiredId(context.authorizedAction?.grantId, "authorized action grantId");
   return {
     version: 1,
     id: sandboxReceipt.id,
@@ -705,12 +854,12 @@ function actionReceipt(
     relatedResources: action.relatedResources.map((resource) => ({ ...resource })),
     message: `Sandbox ${operation} completed with canonical validation and artifact readback receipt.`,
     payloadFingerprint: action.payloadFingerprint,
-    grantId: authorized.grantId,
+    grantId,
     idempotencyKey: action.idempotencyKey,
     providerRequestId: sandboxReceipt.fingerprint,
     startedAt: sandboxReceipt.startedAt,
     committedAt: sandboxReceipt.completedAt,
-    commitKind: "committed",
+    commitKind,
     readback: {
       status: "verified",
       checkedAt: sandboxReceipt.completedAt,
@@ -722,6 +871,199 @@ function actionReceipt(
       changedFields: sandboxReceipt.importedArtifacts.map((artifact) => artifact.path),
     },
   };
+}
+
+function verifyReconciledSandboxReceipt(
+  input: SandboxExecutionReceiptV2,
+  action: PreparedSandboxActionV2,
+): SandboxExecutionReceiptV2 {
+  const receipt = JSON.parse(JSON.stringify(input)) as SandboxExecutionReceiptV2;
+  const expectedKeys = [
+    "version", "id", "actionId", "provider", "profileKey", "projectId",
+    "commandId", "purpose", "status", "exitCode", "commandFingerprint",
+    "stagingManifestFingerprint", "boundaryProbeFingerprint", "stdoutSha256",
+    "stderrSha256", "stdoutBytes", "stderrBytes", "importedArtifacts",
+    "authorizationGrantId", "startedAt", "completedAt", "fingerprint",
+  ].sort();
+  if (
+    !receipt ||
+    typeof receipt !== "object" ||
+    Array.isArray(receipt) ||
+    canonicalJson(Object.keys(receipt).sort()) !== canonicalJson(expectedKeys)
+  ) {
+    throw new CodeSandboxContributionErrorV2(
+      "sandbox_reconciliation_receipt_invalid",
+      "Durable sandbox reconciliation receipt has unknown or missing fields.",
+    );
+  }
+  const { fingerprint, ...evidence } = receipt;
+  if (
+    receipt.version !== 1 ||
+    receipt.actionId !== action.id ||
+    receipt.provider !== action.provider ||
+    receipt.profileKey !== action.profileKey ||
+    receipt.projectId !== action.projectId ||
+    receipt.commandId !== action.commandId ||
+    receipt.purpose !== action.purpose ||
+    receipt.commandFingerprint !== sha256Canonical(action.command) ||
+    receipt.stagingManifestFingerprint !== sha256Canonical(action.stagingManifest) ||
+    receipt.boundaryProbeFingerprint !== action.probeFingerprint ||
+    !["verified", "failed"].includes(receipt.status) ||
+    (receipt.status === "verified") !== (receipt.exitCode === 0) ||
+    !Number.isSafeInteger(receipt.exitCode) ||
+    fingerprint !== sha256Canonical(evidence)
+  ) {
+    throw new CodeSandboxContributionErrorV2(
+      "sandbox_reconciliation_receipt_mismatch",
+      "Durable sandbox receipt does not match the exact prepared action or canonical execution evidence.",
+    );
+  }
+  requiredId(receipt.id, "sandbox receipt id");
+  requiredId(receipt.authorizationGrantId, "sandbox receipt authorizationGrantId");
+  requiredFingerprint(receipt.stdoutSha256, "sandbox stdout hash");
+  requiredFingerprint(receipt.stderrSha256, "sandbox stderr hash");
+  if (
+    !Number.isSafeInteger(receipt.stdoutBytes) || receipt.stdoutBytes < 0 ||
+    !Number.isSafeInteger(receipt.stderrBytes) || receipt.stderrBytes < 0 ||
+    !Number.isFinite(Date.parse(receipt.startedAt)) ||
+    !Number.isFinite(Date.parse(receipt.completedAt)) ||
+    Date.parse(receipt.completedAt) < Date.parse(receipt.startedAt) ||
+    !Array.isArray(receipt.importedArtifacts) ||
+    receipt.importedArtifacts.length > 100
+  ) {
+    throw new CodeSandboxContributionErrorV2(
+      "sandbox_reconciliation_receipt_invalid",
+      "Durable sandbox receipt metadata is invalid.",
+    );
+  }
+  const importedPaths = new Set<string>();
+  for (const artifact of receipt.importedArtifacts) {
+    if (
+      !artifact ||
+      typeof artifact !== "object" ||
+      Array.isArray(artifact) ||
+      canonicalJson(Object.keys(artifact).sort()) !==
+        canonicalJson(["bytes", "path", "readbackSha256", "sha256"])
+    ) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_reconciliation_receipt_invalid",
+        "Durable sandbox artifact receipt is invalid.",
+      );
+    }
+    const path = requiredString(artifact.path, "sandbox artifact path", 2_048);
+    if (
+      path.includes("\\") ||
+      path.startsWith("/") ||
+      path.split("/").some((part) => !part || part === "." || part === "..") ||
+      importedPaths.has(path) ||
+      artifact.sha256 !== artifact.readbackSha256 ||
+      !/^sha256:[0-9a-f]{64}$/u.test(artifact.sha256) ||
+      !Number.isSafeInteger(artifact.bytes) ||
+      artifact.bytes < 0 ||
+      artifact.bytes > 10 * 1024 * 1024
+    ) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_reconciliation_receipt_invalid",
+        "Durable sandbox artifact readback evidence is unsafe or mismatched.",
+      );
+    }
+    importedPaths.add(path);
+  }
+  return receipt;
+}
+
+function verifyReconciledValidationReceipt(
+  input: JsonValueV1 | undefined,
+  action: PreparedSandboxActionV2,
+  sandboxReceipt: SandboxExecutionReceiptV2,
+): void {
+  const receipt = requiredRecord(input, "durable validation receipt");
+  const binding = requiredRecord(receipt.binding, "durable validation receipt binding");
+  const { version: _version, kindName: _kindName, id: _id, fingerprint, ...evidence } = receipt;
+  const expectedKind = action.purpose === "validation_fast"
+    ? "fast"
+    : action.purpose === "validation_targeted"
+      ? "targeted"
+      : "full";
+  if (
+    receipt.version !== 1 ||
+    receipt.kindName !== "code_validation" ||
+    receipt.id !== sandboxReceipt.id ||
+    receipt.operationId !== action.id ||
+    receipt.kind !== expectedKind ||
+    receipt.status !== (sandboxReceipt.status === "verified" ? "passed" : "failed") ||
+    receipt.startedAt !== sandboxReceipt.startedAt ||
+    receipt.completedAt !== sandboxReceipt.completedAt ||
+    binding.requestId !== action.repairRequestId ||
+    binding.workspaceId !== action.workspaceId ||
+    binding.profileKey !== action.profileKey ||
+    binding.inputWorkspaceManifestFingerprint !== action.workspaceManifestFingerprint ||
+    binding.stagingManifestFingerprint !== sha256Canonical(action.stagingManifest) ||
+    typeof fingerprint !== "string" ||
+    fingerprint !== sha256Canonical(evidence)
+  ) {
+    throw new CodeSandboxContributionErrorV2(
+      "validation_reconciliation_receipt_mismatch",
+      "Durable validation receipt does not match the exact repair-bound sandbox action.",
+    );
+  }
+}
+
+function verifyNotAppliedProof(
+  input: SandboxNotAppliedProofV2,
+  action: PreparedSandboxActionV2,
+): void {
+  const proof = requiredRecord(input, "sandbox not-applied proof");
+  const evidence = {
+    actionId: proof.actionId,
+    actionFingerprint: proof.actionFingerprint,
+    checkedAt: proof.checkedAt,
+  };
+  if (
+    proof.actionId !== action.id ||
+    proof.actionFingerprint !== action.payloadFingerprint ||
+    !Number.isFinite(Date.parse(String(proof.checkedAt))) ||
+    proof.fingerprint !== sha256Canonical(evidence)
+  ) {
+    throw new CodeSandboxContributionErrorV2(
+      "sandbox_reconciliation_not_applied_invalid",
+      "Sandbox not-applied outcome lacks exact fingerprinted durable readback proof.",
+    );
+  }
+}
+
+function boundedReconciliationMessage(input: string): string {
+  const value = input
+    .replace(/(?:token|password|secret|authorization|credential)\s*[=:]\s*\S+/giu, "credential=[REDACTED]")
+    .trim();
+  return (value || "Sandbox reconciliation remains uncertain.").slice(0, 1_000);
+}
+
+function requireExecutionJournal(
+  options: CodeExecutionContributionFactoryOptionsV2,
+): SandboxExecutionJournalV1 {
+  const journal = (
+    options as CodeExecutionContributionFactoryOptionsV2 & {
+      executionJournal?: SandboxExecutionJournalV1;
+    }
+  ).executionJournal;
+  const requiredMethods = [
+    "recordPrepared",
+    "markDispatching",
+    "recordExecutionReceipt",
+    "recordValidationReceipt",
+    "reconcile",
+  ] as const;
+  if (
+    !journal ||
+    requiredMethods.some((method) => typeof journal[method] !== "function")
+  ) {
+    throw new CodeSandboxContributionErrorV2(
+      "sandbox_execution_journal_required",
+      "Code execution contributions require a durable write-ahead journal before they can be constructed.",
+    );
+  }
+  return journal;
 }
 
 function failure(code: string, message: string): PreparedActionResultV1 {

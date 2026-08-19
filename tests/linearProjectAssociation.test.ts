@@ -276,52 +276,100 @@ test("an existing project on page two is found instead of creating a duplicate",
   assert.equal(listCalls[1]?.after, "cursor-1");
 });
 
-test("the page sweep is capped and a mutation-ack readback resolves across pages", async () => {
-  // The create path re-lists to find the new project when the adapter returns
-  // only a mutation ack; that readback must also paginate, or a create could
-  // throw after succeeding and orphan the project.
-  let phase: "before" | "after" = "before";
-  let listCallsThisPhase = 0;
+test("a capped association search fails closed before project creation", async () => {
+  let createCalls = 0;
+  let listCalls = 0;
   const client: LinearToolClient = {
     execute: async (key, variables = {}) => {
       if (key === "projects.list") {
-        listCallsThisPhase += 1;
+        listCalls += 1;
         const cursor = typeof variables.after === "string" ? variables.after : "";
-        if (phase === "before") {
-          // Endless filler: every page claims another page. The sweep must
-          // stop at its cap rather than crawling forever.
-          const index = cursor ? Number.parseInt(cursor.slice(7), 10) : 0;
-          return page(
-            [project(`filler-${index}`, `Filler ${index}`, "team-other")],
-            true,
-            `cursor-${index + 1}`,
-          );
-        }
-        // Readback after create: the new project appears on page two.
-        return cursor === "rb-1"
-          ? page([project("proj-new", "Checkers research")], false)
-          : page([project("rb-filler", "Filler", "team-other")], true, "rb-1");
+        const index = cursor ? Number.parseInt(cursor.slice(7), 10) : 0;
+        return page(
+          [project(`filler-${index}`, `Filler ${index}`, "team-other")],
+          true,
+          `cursor-${index + 1}`,
+        );
       }
       if (key === "projects.create") {
-        phase = "after";
-        listCallsThisPhase = 0;
-        // Mutation ack with no id: forces the readback path.
-        return { resourceType: "project", id: "", snapshotHash: "hash" } as LinearBaseRecord;
+        createCalls += 1;
+        return project("proj-new", "Checkers research");
       }
       throw new Error(`Unexpected ${key}`);
     },
   };
 
+  await assert.rejects(
+    resolveLinearProjectAssociation({
+      client,
+      prompt: "Publish research findings to Linear for checkers.",
+      associationText: "Checkers research",
+      teamId: "team-1",
+    }),
+    /absence cannot be verified safely/iu,
+  );
+  assert.equal(listCalls, 5);
+  assert.equal(createCalls, 0, "truncated search must not create a duplicate");
+});
+
+test("project association requires positive destination-team evidence", async () => {
+  let created = 0;
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      if (key === "projects.list") {
+        return page([{
+          resourceType: "project",
+          id: "same-name-unknown-team",
+          name: "Checkers research",
+          snapshotHash: "hash",
+        }], false);
+      }
+      if (key === "projects.create") {
+        created += 1;
+        return project("project-safe", "Checkers research");
+      }
+      throw new Error(`Unexpected ${key}`);
+    },
+  };
   const result = await resolveLinearProjectAssociation({
     client,
     prompt: "Publish research findings to Linear for checkers.",
     associationText: "Checkers research",
     teamId: "team-1",
   });
-
   assert.equal(result.created, true);
-  assert.equal(result.projectId, "proj-new");
-  assert.equal(listCallsThisPhase, 2, "readback found the project on page two");
+  assert.equal(result.projectId, "project-safe");
+  assert.equal(created, 1);
+});
+
+test("project association recognizes nested provider team identity", async () => {
+  let created = 0;
+  const candidate = {
+    resourceType: "project",
+    id: "nested-team-project",
+    name: "Checkers research",
+    team: { id: "team-1" },
+    snapshotHash: "hash",
+  } as LinearBaseRecord;
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      if (key === "projects.list") return page([candidate], false);
+      if (key === "projects.create") {
+        created += 1;
+        return project("unexpected", "Checkers research");
+      }
+      throw new Error(`Unexpected ${key}`);
+    },
+  };
+  const result = await resolveLinearProjectAssociation({
+    client,
+    prompt: "Publish research findings to Linear for checkers.",
+    associationText: "Checkers research",
+    teamId: "team-1",
+  });
+  assert.equal(result.created, false);
+  assert.equal(result.projectId, "nested-team-project");
+  assert.equal(created, 0);
 });
 
 test("listAllLinearPages dedupes shifted rows and stops on a repeated cursor", async () => {

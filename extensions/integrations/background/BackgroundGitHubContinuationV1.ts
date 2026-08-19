@@ -31,6 +31,7 @@ import {
   type VerifiedGitPushResultV1,
 } from "../../../src/integrations/github/VerifiedGitPushGateway";
 import type { TrustedGitHubRepositoryBindingV1 } from "../../../src/integrations/github/TrustedGitHubRepositoryBindingV1";
+import type { TrustedGitHubRepositoryBindingV2 } from "../../../src/integrations/github/TrustedGitHubRepositoryBindingV2";
 import {
   type BackgroundGitHubActionAttemptStoreV1,
   type BackgroundGitHubActionAttemptV1,
@@ -63,6 +64,14 @@ export interface BackgroundGitHubRemoteHeadReaderV1 {
     branch: string;
     signal?: AbortSignal;
   }): Promise<string | null>;
+}
+
+/** Fresh provider-backed private visibility evidence for the exact push target. */
+export interface BackgroundGitHubPrivateRepositoryBindingVerifierV1 {
+  verify(
+    binding: TrustedGitHubRepositoryBindingV1,
+    signal?: AbortSignal,
+  ): Promise<TrustedGitHubRepositoryBindingV2>;
 }
 
 /**
@@ -130,6 +139,7 @@ export interface BackgroundGitHubContinuationDependenciesV1 {
   pushGateway: VerifiedGitPushGatewayV1;
   accountVerifier: BackgroundGitHubAccountVerifierV1;
   remoteHeads: BackgroundGitHubRemoteHeadReaderV1;
+  privateRepositoryBindings: BackgroundGitHubPrivateRepositoryBindingVerifierV1;
   workflows: BackgroundGitHubWorkflowFactoryV1;
   autoMerge: BackgroundGitHubAutoMergePortV1;
   approvalReceipts: BackgroundGitHubHostApprovalReceiptVerifierV1;
@@ -254,9 +264,16 @@ export class BackgroundGitHubContinuationRuntimeV1 {
     const action = preparedPackage.action;
     if (action.operation === GITHUB_VERIFIED_BRANCH_PUSH_OPERATION_V1) {
       const handoff = preparedPackage.localPlan.verifiedCodeHandoff!;
+      const privateRepositoryBinding =
+        await this.dependencies.privateRepositoryBindings.verify(
+          preparedPackage.localPlan.repositoryBinding,
+          signal,
+        );
       const pushed = await this.dependencies.pushGateway.push({
         handoff,
         binding: preparedPackage.localPlan.repositoryBinding,
+        privateRepositoryBinding,
+        expectedVisibility: "private",
         profile: publicationProof(preparedPackage.localPlan.repositoryProof),
         credentialReferenceId: action.binding.credentialReferenceId,
         signal,
@@ -326,9 +343,16 @@ export class BackgroundGitHubContinuationRuntimeV1 {
     await this.verifyFreshAccount(action, signal);
     try {
       if (action.operation === GITHUB_VERIFIED_BRANCH_PUSH_OPERATION_V1) {
+        const privateRepositoryBinding =
+          await this.dependencies.privateRepositoryBindings.verify(
+            preparedPackage.localPlan.repositoryBinding,
+            signal,
+          );
         const reconciled = await this.dependencies.pushGateway.reconcile({
           handoff: preparedPackage.localPlan.verifiedCodeHandoff!,
           binding: preparedPackage.localPlan.repositoryBinding,
+          privateRepositoryBinding,
+          expectedVisibility: "private",
           profile: publicationProof(preparedPackage.localPlan.repositoryProof),
           credentialReferenceId: action.binding.credentialReferenceId,
           signal,

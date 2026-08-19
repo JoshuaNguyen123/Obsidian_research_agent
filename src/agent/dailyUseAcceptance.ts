@@ -47,9 +47,11 @@ export const BYOK_01_ACCEPTANCE_TOKENS = Object.freeze({
     "github:private_repository",
     "github:draft_pull_request",
     "vault:completion_reflection",
+    "vault:jupyter_completion_reflection",
   ] as const),
   proofs: Object.freeze([
     "research:four_distinct_sources",
+    "research:grounded_selected_project_idea",
     "research:accepted_lineage",
     "linear:provider_readback",
     "linear:independent_phase_b_read",
@@ -62,6 +64,8 @@ export const BYOK_01_ACCEPTANCE_TOKENS = Object.freeze({
     "github:remote_sha_readback",
     "github:single_open_draft_readback",
     "reflection:human_35_100_words",
+    "reflection:verified_commit_bound_code_example",
+    "reflection:jupyter_no_execution_readback",
     "graph:authoritative",
     "idempotency:no_duplicates",
     "authority:no_unapproved_mutations",
@@ -71,6 +75,7 @@ export const BYOK_01_ACCEPTANCE_TOKENS = Object.freeze({
     "authorization:sandbox_execution",
     "approval:github_private_repository_create",
     "approval:github_publish",
+    "approval:jupyter_reflection",
   ] as const),
   bindings: Object.freeze([
     "binding:note_linear_issue",
@@ -79,6 +84,7 @@ export const BYOK_01_ACCEPTANCE_TOKENS = Object.freeze({
     "binding:note_pr",
     "binding:desktop_commit_tree",
     "binding:durable_workspace_identity",
+    "binding:jupyter_commit",
   ] as const),
   cleanup: Object.freeze([
     "cleanup:linear_fixture",
@@ -157,19 +163,20 @@ export const CORE_01_ACCEPTANCE_TOKENS = Object.freeze({
 });
 
 /**
- * Runtime observations for the unattended single-issue compound chain.
+ * Runtime observations for the single-issue compound chain.
  *
  * Deliberately separate from DU-06. DU-06 proves the *hierarchy* shape — an
  * initiative, a project, and their link — and pays five approval boundaries.
  * FLOW-REAL-01 proves the other production shape: one accepted research note
  * published as exactly one Linear issue via publish_research_to_linear, then
  * carried through a verified commit, a private repository, and a draft pull
- * request with no approval stops at all. Mapping this lane onto DU-06 would
+ * request with an exact prepared approval for the Linear mutation. Mapping this lane onto DU-06 would
  * require recording initiative and project artifacts it never creates.
  *
- * There are no approval boundaries by design: this is the set-loose path, and
- * the lane separately asserts no Approve control survives to Idle. Cleanup is
- * likewise absent — the Linear issue is deliberately retained for the
+ * Set-loose does not waive external mutation authority: the research-to-Linear
+ * write requires a fingerprint-bound prepared action, and the lane refuses an
+ * unexpected tool or non-private GitHub create before clicking. Cleanup is
+ * absent from the acceptance record — the Linear issue is deliberately retained for the
  * pattern-anchored janitor lane, and GitHub teardown runs after acceptance is
  * recorded, so claiming a cleanup token here would assert an unobserved fact.
  */
@@ -183,17 +190,19 @@ export const FLOW_REAL_01_ACCEPTANCE_TOKENS = Object.freeze({
     "vault:completion_reflection",
   ] as const),
   proofs: Object.freeze([
+    "research:grounded_selected_project_idea",
     "research:accepted",
     "research:two_distinct_sources",
     "linear:provider_readback",
     "linear:completion_readback",
     "code:workspace_validated",
     "git:verified_commit",
+    "reflection:verified_commit_bound_code_example",
     "github:private_visibility_readback",
     "github:draft_pr_readback",
     "reconciliation:backlinks_and_status",
   ] as const),
-  approvals: Object.freeze([] as const),
+  approvals: Object.freeze(["approval:linear_issue_create"] as const),
   bindings: Object.freeze([
     "binding:note_linear_issue",
     "binding:note_commit_pr",

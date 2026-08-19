@@ -10,6 +10,8 @@ import {
 } from "../src/agent/missionGraphV3";
 import type { ToolRegistry } from "../src/tools/types";
 import { createPreparedBackgroundGitHubToolDescriptorV1 } from "../extensions/integrations/host/PreparedBackgroundGitHubToolsV1";
+import { createJupyterReflectionTool } from "../src/tools/jupyterReflectionTool";
+import { createProjectIdeaBriefTool } from "../src/tools/projectIdeaBriefTool";
 
 const NOW = new Date("2026-07-11T18:00:00.000Z");
 
@@ -107,6 +109,72 @@ test("a narrative canvas write waits for every planned research fetch", async ()
     new Set(canvas.dependencyIds),
     new Set([search.id, ...fetches.map((node) => node.id)]),
   );
+});
+
+test("joined project ideation waits for every preceding required web fetch", async () => {
+  const projectIdea = createProjectIdeaBriefTool();
+  assert.ok(projectIdea.descriptor);
+  const descriptors = [
+    descriptorFor("web_search"),
+    descriptorFor("web_fetch"),
+    projectIdea.descriptor,
+  ];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-sourced-project-ideation",
+    objective:
+      "Fetch four independent sources, then create one grounded selected project idea brief.",
+    toolRegistry: registryForDescriptors(descriptors),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: [
+      "web_search",
+      "web_fetch",
+      "web_fetch",
+      "web_fetch",
+      "web_fetch",
+      "create_project_idea_brief",
+    ],
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  const nodes = Object.values(host.deterministicProposal.nodes);
+  const fetches = nodes.filter((node) =>
+    node.allowedTools.includes("web_fetch"),
+  );
+  const idea = nodes.find((node) =>
+    node.allowedTools.includes("create_project_idea_brief"),
+  );
+
+  assert.equal(fetches.length, 4);
+  assert.ok(idea);
+  assert.deepEqual(
+    new Set(idea.dependencyIds),
+    new Set(fetches.map((node) => node.id)),
+  );
+});
+
+test("independent unverified project ideation has no sourced-research prerequisite", async () => {
+  const projectIdea = createProjectIdeaBriefTool();
+  assert.ok(projectIdea.descriptor);
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-independent-project-ideation",
+    objective: "Brainstorm two project directions without external research.",
+    toolRegistry: registryForDescriptors([projectIdea.descriptor]),
+    allowedToolNames: [projectIdea.name],
+    modelVisibleToolNames: [projectIdea.name],
+    plannedToolNames: [projectIdea.name],
+    maxToolCalls: 1,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  const idea = Object.values(host.deterministicProposal.nodes).find((node) =>
+    node.allowedTools.includes(projectIdea.name),
+  );
+
+  assert.ok(idea);
+  assert.deepEqual(idea.dependencyIds, []);
 });
 
 test("the current-note selector fallback never binds workspace or GitHub nodes to the vault note", async () => {
@@ -646,11 +714,15 @@ test("host graph binds natural standalone source and test filenames before valid
       "code_workspace_create",
       "code_workspace_create_file",
       "code_workspace_create_file",
-      "code_validate_fast",
-      "code_validate_targeted",
-      "code_validate_full",
       "code_workspace_export_directory",
     ],
+  );
+  const validation = getMissionCompositeLifecycleSpecV1(
+    host.deterministicProposal.nodes["lifecycle-code_validation"],
+  );
+  assert.deepEqual(
+    validation?.actions.map((action) => action.toolName),
+    ["code_validate_fast", "code_validate_targeted", "code_validate_full"],
   );
   assert.deepEqual(
     lifecycle.actions
@@ -702,10 +774,13 @@ test("sandbox-only code missions validate every named file without planning host
       "code_workspace_create",
       "code_workspace_create_file",
       "code_workspace_create_file",
-      "code_validate_fast",
-      "code_validate_targeted",
-      "code_validate_full",
     ],
+  );
+  assert.deepEqual(
+    getMissionCompositeLifecycleSpecV1(
+      host.deterministicProposal.nodes["lifecycle-code_validation"],
+    )?.actions.map((action) => action.toolName),
+    ["code_validate_fast", "code_validate_targeted", "code_validate_full"],
   );
   assert.deepEqual(
     lifecycle.actions
@@ -776,12 +851,19 @@ test("host graph binds a bare Python deliverable to one executable source path",
   const repair = lifecycle.actions.find(
     (action) => action.toolName === "code_repair_record_cycle",
   );
+  const validation = getMissionCompositeLifecycleSpecV1(
+    host.deterministicProposal.nodes["lifecycle-code_validation"],
+  );
+  const validationRepair = validation?.actions.find(
+    (action) => action.toolName === "code_repair_record_cycle",
+  );
   assert.equal(create?.selector, "main.py");
   assert.equal(
     create?.objective,
     "Create the exact new workspace file main.py without overwrite.",
   );
-  assert.equal(repair?.condition, "fast_validation_failed");
+  assert.equal(repair, undefined);
+  assert.equal(validationRepair?.condition, "fast_validation_failed");
 });
 
 test("host graph leaves a BYOK issue-bound repository filename prompt-scoped", async () => {
@@ -1037,7 +1119,7 @@ test("host graph retains every node in a compound daily-use lifecycle", async ()
   assert.equal(planned.graph.nodes.final.dependencyIds.length, names.length);
 });
 
-test("host graph composes a typed four-stage project lifecycle without widening per-action authority", async () => {
+test("host graph composes six typed developer stages without widening per-action authority", async () => {
   const descriptors = [
     lifecycleDescriptor("web_search", "browser", "read"),
     lifecycleDescriptor("web_fetch", "browser", "read"),
@@ -1048,6 +1130,7 @@ test("host graph composes a typed four-stage project lifecycle without widening 
     lifecycleDescriptor("code_commit_verified", "git", "execution"),
     lifecycleDescriptor("github_create_private_repository", "github", "publish"),
     lifecycleDescriptor("github_publish_verified_branch", "github", "publish"),
+    createJupyterReflectionTool().descriptor!,
   ];
   const names = descriptors.map((descriptor) => descriptor.name);
   const plannedNames = [
@@ -1061,12 +1144,14 @@ test("host graph composes a typed four-stage project lifecycle without widening 
     "code_commit_verified",
     "github_create_private_repository",
     "github_publish_verified_branch",
+    "append_jupyter_reflection",
   ];
   const objective = [
     "Research checkers rules using public web sources.",
     "Shape the accepted research into a Linear project and issues.",
     "Implement the code in the repository and commit it.",
     "Publish the verified branch to a private GitHub repository.",
+    "Write back the verified completion reflection to `Research/Workflow Reflection.ipynb`.",
   ].join(" ");
   const host = await buildHostMissionGraphPlanV1({
     missionId: "run-composite-project-lifecycle",
@@ -1084,15 +1169,19 @@ test("host graph composes a typed four-stage project lifecycle without widening 
     "accepted_research",
     "linear_hierarchy",
     "code_execution",
+    "code_validation",
     "private_github_publication",
+    "reflection",
   ]);
   assert.equal(host.projectLifecycleIntent?.exactUserCommand, objective);
   assert.deepEqual(Object.keys(host.deterministicProposal.nodes).sort(), [
     "final",
     "lifecycle-accepted_research",
     "lifecycle-code_execution",
+    "lifecycle-code_validation",
     "lifecycle-linear_hierarchy",
     "lifecycle-private_github_publication",
+    "lifecycle-reflection",
   ]);
   const accepted = host.deterministicProposal.nodes["lifecycle-accepted_research"];
   const acceptedSpec = getMissionCompositeLifecycleSpecV1(accepted);
@@ -1107,7 +1196,28 @@ test("host graph composes a typed four-stage project lifecycle without widening 
     host.deterministicProposal.nodes["lifecycle-linear_hierarchy"].dependencyIds,
     ["lifecycle-accepted_research"],
   );
-  assert.equal(host.capabilityEnvelope.budgets.maxDepth, 5);
+  assert.equal(host.capabilityEnvelope.budgets.maxDepth, 7);
+  const publicationSpec = getMissionCompositeLifecycleSpecV1(
+    host.deterministicProposal.nodes["lifecycle-private_github_publication"],
+  );
+  assert.deepEqual(
+    publicationSpec?.actions.map((action) => action.toolName),
+    [
+      "github_create_private_repository",
+      "github_publish_verified_branch",
+    ],
+  );
+  const reflectionSpec = getMissionCompositeLifecycleSpecV1(
+    host.deterministicProposal.nodes["lifecycle-reflection"],
+  );
+  assert.deepEqual(
+    reflectionSpec?.actions.map((action) => action.toolName),
+    ["append_jupyter_reflection"],
+  );
+  assert.equal(
+    reflectionSpec?.actions.at(-1)?.selector,
+    "Research/Workflow Reflection.ipynb",
+  );
 
   const planned = await planMissionGraphV3({
     mission: { missionId: "run-composite-project-lifecycle", objective },
@@ -1117,12 +1227,64 @@ test("host graph composes a typed four-stage project lifecycle without widening 
     allowedToolDescriptors: host.allowedToolDescriptors,
     now: () => NOW.toISOString(),
   });
-  assert.equal(Object.keys(planned.graph.nodes).length, 5);
+  assert.equal(Object.keys(planned.graph.nodes).length, 7);
   assert.equal(
     getMissionCompositeLifecycleSpecV1(
       planned.graph.nodes["lifecycle-code_execution"],
     )?.actions.length,
-    2,
+    1,
+  );
+  assert.deepEqual(
+    getMissionCompositeLifecycleSpecV1(
+      planned.graph.nodes["lifecycle-code_validation"],
+    )?.actions.map((action) => action.toolName),
+    ["code_commit_verified"],
+  );
+});
+
+test("validation and reflection each compile as an independent lifecycle graph", async () => {
+  const validationDescriptor = workspaceLifecycleDescriptor("code_validate_full");
+  const validation = await buildHostMissionGraphPlanV1({
+    missionId: "run-independent-validation",
+    objective: "Run full validation for the repository test suite.",
+    toolRegistry: registryForDescriptors([validationDescriptor]),
+    allowedToolNames: [validationDescriptor.name],
+    modelVisibleToolNames: [validationDescriptor.name],
+    plannedToolNames: [validationDescriptor.name],
+    maxToolCalls: 1,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  assert.deepEqual(validation.projectLifecycleIntent?.stages, ["code_validation"]);
+  assert.deepEqual(
+    Object.keys(validation.deterministicProposal.nodes).sort(),
+    ["final", "lifecycle-code_validation"],
+  );
+  assert.deepEqual(
+    getMissionCompositeLifecycleSpecV1(
+      validation.deterministicProposal.nodes["lifecycle-code_validation"],
+    )?.actions.map((action) => action.toolName),
+    ["code_validate_full"],
+  );
+
+  const reflectionDescriptor = createJupyterReflectionTool().descriptor!;
+  const reflection = await buildHostMissionGraphPlanV1({
+    missionId: "run-independent-reflection",
+    objective: "Write a results reflection to `Research/Reflection.ipynb`.",
+    toolRegistry: registryForDescriptors([reflectionDescriptor]),
+    allowedToolNames: [reflectionDescriptor.name],
+    modelVisibleToolNames: [reflectionDescriptor.name],
+    plannedToolNames: [reflectionDescriptor.name],
+    maxToolCalls: 1,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  assert.deepEqual(reflection.projectLifecycleIntent?.stages, ["reflection"]);
+  assert.deepEqual(
+    getMissionCompositeLifecycleSpecV1(
+      reflection.deterministicProposal.nodes["lifecycle-reflection"],
+    )?.actions.map((action) => action.toolName),
+    ["append_jupyter_reflection"],
   );
 });
 
