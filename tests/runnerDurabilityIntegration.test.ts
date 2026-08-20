@@ -27,7 +27,7 @@ import {
   flattenMissionPlanTasks,
   type MissionPlan,
 } from "../src/agent/missionPlan";
-import type { ResearchPlan } from "../src/agent/researchPlan";
+import type { ResearchEvidence, ResearchPlan } from "../src/agent/researchPlan";
 import {
   createMissionRuntimeSnapshot,
   createOperationJournalRecord,
@@ -1270,6 +1270,284 @@ test("continue run hydrates plan, evidence, goals, and lineage into a new segmen
   );
 });
 
+test("a restored researcher handoff with a zero-minimum research plan never fakes web retrieval", async () => {
+  // Regression: the PRO-14 research-team handoff deadlock. A continuation Lead
+  // segment restored a research plan whose sourceRequirements.minFetchedSources
+  // was 0, so with an orchestrator handoff context present the handoff check
+  // "fetched sources >= requirement" was vacuously true at zero. The runner
+  // marked web_search/web_fetch as executed and done, pinned the planned
+  // frontier, and the proof-gated append blocked forever on research_plan_items
+  // and subquestion_evidence it was no longer allowed to gather. The handoff
+  // requirement is now floored at one real fetched source.
+  const vault = createVaultHarness();
+  const seedRunId = "run-handoff-zero-floor";
+  const originalMission =
+    "Search the web for the PRO-14 research team deadlock report and append the verified finding to the current note.";
+  await writeResumableResearchSeed({
+    context: vault.context,
+    runId: seedRunId,
+    mission: originalMission,
+    researchPlan: pendingWebResearchPlan(0),
+    evidence: [
+      {
+        id: "vault:prior-notes",
+        kind: "vault_note",
+        title: "Prior local notes",
+        path: "Research/Prior notes.md",
+        summary: "Lead-produced local context; not a fetched web source.",
+        confidence: "medium",
+      },
+    ],
+  });
+
+  const configs: AgentRunConfigEvent[] = [];
+  let hydratedAtModelStart: MissionRuntimeSnapshotV2 | null = null;
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithContent(
+          "The deadlock report finding is ready to append once sources exist.",
+        ),
+      ],
+      [],
+      () => {
+        hydratedAtModelStart ??= parseResumedRuntimeSnapshot(
+          vault.files,
+          seedRunId,
+        );
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 4,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+    },
+    orchestratorContext: acceptedResearcherHandoffContext(),
+  });
+
+  const hydrated = hydratedAtModelStart as MissionRuntimeSnapshotV2 | null;
+  assert.ok(
+    hydrated,
+    "the resumed segment should persist a runtime snapshot before its first model call",
+  );
+  assert.equal(
+    hydrated.operationGoals.web_search,
+    "pending",
+    "zero fetched web sources must not mark web_search done under a zero-minimum plan",
+  );
+  assert.equal(
+    hydrated.operationGoals.web_fetch,
+    "pending",
+    "zero fetched web sources must not mark web_fetch done under a zero-minimum plan",
+  );
+  assert.ok(
+    hydrated.evidence.every((item) => !item.url),
+    "no fetched web source exists that could satisfy the handoff floor",
+  );
+  assert.deepEqual(hydrated.researchPlan?.subquestions[0]?.evidenceIds, []);
+
+  // The mock provider never requests a web tool and the fallback transport
+  // fails, so no later step may legitimately settle retrieval either.
+  const resumedRunId = configs.at(-1)?.runId;
+  assert.ok(resumedRunId);
+  const finalSnapshot = parseMissionRuntimeSnapshotFromMarkdown(
+    vault.files.get(`Agent Runs/${resumedRunId}.md`) ?? "",
+  );
+  assert.ok(finalSnapshot);
+  assert.notEqual(finalSnapshot.operationGoals.web_search, "done");
+  assert.notEqual(finalSnapshot.operationGoals.web_fetch, "done");
+});
+
+test("a restored researcher handoff with one real fetched source satisfies the floored requirement", async () => {
+  // Reachability control for the zero-floor test above: the same zero-minimum
+  // plan accepts the handoff once one genuine fetched source exists, both at
+  // the pre-restore seed check and at the post-restore compatibility binding.
+  const vault = createVaultHarness();
+  const seedRunId = "run-handoff-one-source";
+  const originalMission =
+    "Search the web for the PRO-14 research team deadlock report and append the verified finding to the current note.";
+  await writeResumableResearchSeed({
+    context: vault.context,
+    runId: seedRunId,
+    mission: originalMission,
+    researchPlan: pendingWebResearchPlan(0),
+  });
+
+  const specialist = specialistWebEvidence();
+  let hydratedAtModelStart: MissionRuntimeSnapshotV2 | null = null;
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithContent(
+          "The verified handoff finding is supported by https://example.com/pro-14-deadlock.",
+        ),
+      ],
+      [],
+      () => {
+        hydratedAtModelStart ??= parseResumedRuntimeSnapshot(
+          vault.files,
+          seedRunId,
+        );
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 4,
+    seedMissionEvidence: [specialist],
+    orchestratorContext: acceptedResearcherHandoffContext(),
+  });
+
+  const hydrated = hydratedAtModelStart as MissionRuntimeSnapshotV2 | null;
+  assert.ok(hydrated);
+  assert.equal(
+    hydrated.operationGoals.web_search,
+    "done",
+    "one provider-observed fetched source must satisfy the floored handoff requirement",
+  );
+  assert.equal(hydrated.operationGoals.web_fetch, "done");
+  assert.ok(
+    hydrated.evidence.some((item) => item.url === specialist.url),
+    "the handoff evidence backing the accepted retrieval must be present",
+  );
+});
+
+test("a continuation lead segment keeps re-seeded specialist evidence the snapshot never persisted", async () => {
+  // The host lead-segment loop passes seedMissionEvidence/seedClaimPassages on
+  // every segment, not only segment 0: the resume snapshot persists only what
+  // the Lead itself produced, so a continuation would otherwise lose the
+  // Specialist's provider-observed evidence and deadlock the proof-gated
+  // writeback. This pins the runner contract that per-segment re-seeding
+  // relies on: seeds survive the resume merge and credit the web subquestion.
+  const vault = createVaultHarness();
+  const seedRunId = "run-lead-segment-reseed";
+  const originalMission =
+    "Research the PRO-14 deadlock retrospective on the web and append the verified finding to the current note.";
+  await writeResumableResearchSeed({
+    context: vault.context,
+    runId: seedRunId,
+    mission: originalMission,
+    researchPlan: pendingWebResearchPlan(1),
+  });
+
+  const specialist = specialistWebEvidence();
+  let hydratedAtModelStart: MissionRuntimeSnapshotV2 | null = null;
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithContent(
+          "The retrospective finding is supported by https://example.com/pro-14-deadlock.",
+        ),
+      ],
+      [],
+      () => {
+        hydratedAtModelStart ??= parseResumedRuntimeSnapshot(
+          vault.files,
+          seedRunId,
+        );
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 4,
+    seedMissionEvidence: [specialist],
+    seedClaimPassages: [
+      {
+        id: specialist.passageId!,
+        text: "The retrospective documents the researcher handoff deadlock.",
+        evidenceId: specialist.id,
+        subquestionId: "rq-web",
+      },
+    ],
+    orchestratorContext: acceptedResearcherHandoffContext(),
+  });
+
+  const hydrated = hydratedAtModelStart as MissionRuntimeSnapshotV2 | null;
+  assert.ok(hydrated);
+  const retained = hydrated.evidence.find((item) => item.id === specialist.id);
+  assert.ok(
+    retained,
+    "the Specialist's web evidence must survive the continuation resume merge",
+  );
+  assert.equal(retained.url, specialist.url);
+  assert.deepEqual(retained.passageIds, specialist.passageIds);
+  const webSubquestion = hydrated.researchPlan?.subquestions.find(
+    (item) => item.id === "rq-web",
+  );
+  assert.ok(webSubquestion);
+  assert.deepEqual(
+    webSubquestion.evidenceIds,
+    [specialist.id],
+    "applyResearchEvidence must credit the web subquestion from the seeded evidence",
+  );
+  assert.equal(webSubquestion.status, "complete");
+  assert.ok(
+    hydrated.claimPassages?.some(
+      (passage) => passage.id === specialist.passageId,
+    ),
+    "the Specialist's claim passages must survive the continuation resume merge",
+  );
+  assert.equal(hydrated.operationGoals.web_search, "done");
+  assert.equal(hydrated.operationGoals.web_fetch, "done");
+});
+
+test("a continuation lead segment without re-seeding loses the specialist evidence", async () => {
+  // Documents the failure mode the per-segment re-seeding exists for: the
+  // resume snapshot alone cannot restore worker-produced proof. If this test
+  // starts failing because the runner resurrects Specialist evidence by
+  // itself, the host loop's per-segment re-seeding may have become redundant.
+  const vault = createVaultHarness();
+  const seedRunId = "run-lead-segment-unseeded";
+  const originalMission =
+    "Research the PRO-14 deadlock retrospective on the web and append the verified finding to the current note.";
+  await writeResumableResearchSeed({
+    context: vault.context,
+    runId: seedRunId,
+    mission: originalMission,
+    researchPlan: pendingWebResearchPlan(1),
+  });
+
+  const specialist = specialistWebEvidence();
+  let hydratedAtModelStart: MissionRuntimeSnapshotV2 | null = null;
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithContent(
+          "Continuing the retrospective mission without restored worker proof.",
+        ),
+      ],
+      [],
+      () => {
+        hydratedAtModelStart ??= parseResumedRuntimeSnapshot(
+          vault.files,
+          seedRunId,
+        );
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 4,
+    orchestratorContext: acceptedResearcherHandoffContext(),
+  });
+
+  const hydrated = hydratedAtModelStart as MissionRuntimeSnapshotV2 | null;
+  assert.ok(hydrated);
+  assert.ok(
+    hydrated.evidence.every((item) => item.id !== specialist.id && !item.url),
+    "the snapshot alone must not resurrect the Specialist's web evidence",
+  );
+  assert.deepEqual(hydrated.researchPlan?.subquestions[0]?.evidenceIds, []);
+  assert.equal(hydrated.operationGoals.web_search, "pending");
+});
+
 test("continue run restores receipt-backed completed title work", async () => {
   const vault = createVaultHarness();
   const seedRunId = "run-resume-completed-title";
@@ -1993,6 +2271,113 @@ function createVaultHarness(options: {
   };
 
   return { context, files };
+}
+
+/** A paused web-research run whose next segment must resume via `continue run`. */
+async function writeResumableResearchSeed(input: {
+  context: ToolExecutionContext;
+  runId: string;
+  mission: string;
+  researchPlan: ResearchPlan;
+  evidence?: MissionEvidence[];
+}): Promise<void> {
+  const ledger = createMissionLedger({
+    runId: input.runId,
+    mission: input.mission,
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 12,
+      toolStepBudget: 8,
+      finalizationReserve: 4,
+      expectedTools: ["web_search", "web_fetch", "append_to_current_file"],
+      stopWhenSatisfied: true,
+    },
+    researchPlan: input.researchPlan,
+    now: new Date("2026-08-19T12:00:00.000Z"),
+  });
+  ledger.status = "budget";
+  ledger.evidence = input.evidence ?? [];
+  await writeMissionLedger(input.context, ledger);
+  await writeMissionRuntimeSnapshot(
+    input.context,
+    createMissionRuntimeSnapshot({
+      runId: input.runId,
+      originalMission: input.mission,
+      currentNotePath: "Current.md",
+      status: "paused",
+      researchPlan: input.researchPlan,
+      evidence: input.evidence ?? [],
+      operationGoals: { web_search: "pending", web_fetch: "pending" },
+      lastSafeStep: 6,
+      createdAt: new Date("2026-08-19T12:00:00.000Z"),
+      updatedAt: new Date("2026-08-19T12:05:00.000Z"),
+    }),
+  );
+}
+
+function pendingWebResearchPlan(minFetchedSources: number): ResearchPlan {
+  return {
+    version: 1,
+    mode: "deep_web",
+    sourceRequirements: {
+      minFetchedSources,
+      minDistinctDomains: Math.min(1, minFetchedSources),
+    },
+    coverageRequirements: {
+      minVaultCoverageConfidence: "medium",
+      expandWhenSampledOrTruncated: true,
+    },
+    subquestions: [
+      {
+        id: "rq-web",
+        question: "What does the PRO-14 deadlock retrospective report?",
+        requiredEvidenceType: "web_source",
+        minEvidence: 1,
+        status: "pending",
+        evidenceIds: [],
+      },
+    ],
+    evidenceIds: [],
+    status: "in_progress",
+  };
+}
+
+/** Provider-observed Specialist retrieval, as the host seeds it into the Lead. */
+function specialistWebEvidence(): ResearchEvidence {
+  return {
+    id: "web_fetch:https://example.com/pro-14-deadlock",
+    kind: "web_source",
+    title: "PRO-14 deadlock retrospective",
+    url: "https://example.com/pro-14-deadlock",
+    passageId: "source:pro14:passage:0-120",
+    passageIds: ["source:pro14:passage:0-120"],
+    usableSource: true,
+    parserStatus: "parsed",
+    subquestionId: "rq-web",
+    summary: "The retrospective documents the researcher handoff deadlock.",
+    confidence: "high",
+  };
+}
+
+function acceptedResearcherHandoffContext(): string {
+  return [
+    "Adaptive Specialist handoff (accepted): bounded web retrieval reported complete.",
+    "- The Lead must verify the referenced evidence before any mutation.",
+  ].join("\n");
+}
+
+function parseResumedRuntimeSnapshot(
+  files: Map<string, string>,
+  seedRunId: string,
+): MissionRuntimeSnapshotV2 | null {
+  const resumedMarkdown = [...files.entries()].find(
+    ([path]) =>
+      /^Agent Runs\/[^/]+\.md$/u.test(path) &&
+      path !== `Agent Runs/${seedRunId}.md`,
+  )?.[1];
+  return resumedMarkdown
+    ? parseMissionRuntimeSnapshotFromMarkdown(resumedMarkdown)
+    : null;
 }
 
 function createSettings(): AgentSettings {

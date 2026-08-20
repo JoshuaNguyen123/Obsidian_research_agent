@@ -4089,10 +4089,18 @@ export async function runAgentMission({
                 modelClient,
                 runToolContext.settings?.utilityModel?.trim() || undefined,
               ),
-              modeAssist: buildResearchModeAssist(
-                modelClient,
-                runToolContext.settings?.utilityModel?.trim() || undefined,
-              ),
+              // A Lead consuming a Specialist handoff already holds
+              // provider-observed research; the semantic assist must not
+              // manufacture new research debt that the delegated retrieval
+              // can never satisfy. Deterministic research intent still plans.
+              ...(orchestratorContext?.trim()
+                ? {}
+                : {
+                    modeAssist: buildResearchModeAssist(
+                      modelClient,
+                      runToolContext.settings?.utilityModel?.trim() || undefined,
+                    ),
+                  }),
               ...researchPlanSettingOverrides(runToolContext.settings),
             });
         bootstrapResearchPlanCache = bootstrapResearchPlan;
@@ -5376,10 +5384,18 @@ export async function runAgentMission({
           modelClient,
           runToolContext.settings?.utilityModel?.trim() || undefined,
         ),
-        modeAssist: buildResearchModeAssist(
-          modelClient,
-          runToolContext.settings?.utilityModel?.trim() || undefined,
-        ),
+        // A Lead consuming a Specialist handoff already holds
+        // provider-observed research; the semantic assist must not
+        // manufacture new research debt that the delegated retrieval
+        // can never satisfy. Deterministic research intent still plans.
+        ...(orchestratorContext?.trim()
+          ? {}
+          : {
+              modeAssist: buildResearchModeAssist(
+                modelClient,
+                runToolContext.settings?.utilityModel?.trim() || undefined,
+              ),
+            }),
         ...researchPlanSettingOverrides(runToolContext.settings),
       }));
   const restoredResearchPlan =
