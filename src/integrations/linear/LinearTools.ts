@@ -754,12 +754,26 @@ async function executePreparedMutation(
       payload.variables,
       observation,
     );
+    const descriptionDivergence = mismatchFields.includes("description")
+      ? describeDescriptionDivergence(
+          observation.found
+            ? (observation.record as LinearIssueRecord).description
+            : undefined,
+          recordValue(payload.variables.input).description,
+        )
+      : undefined;
+    // The message stays content-free (it reaches model-visible surfaces);
+    // the bounded divergence preview rides only in host-side details.
     throw new ToolExecutionError(
       "linear_readback_failed",
       `Linear acknowledged ${config.operationKey}, but independent readback did not verify the approved result. Mismatched readback fields: ${mismatchFields.join(", ")}.`,
       {
         mutationState: "may_have_applied",
-        details: { reconciliationKey: journal.operationId, mismatchFields },
+        details: {
+          reconciliationKey: journal.operationId,
+          mismatchFields,
+          ...(descriptionDivergence ? { descriptionDivergence } : {}),
+        },
       },
     );
   }
@@ -1286,6 +1300,30 @@ function descriptionsCompatiblyMatch(
     canonicalizeLinearDescription(expected);
 }
 
+/**
+ * Bounded line-level preview of the first canonical description divergence.
+ * Local triage only — surfaces which provider rewrite the canonicalizer does
+ * not yet absorb, without shipping whole descriptions into error payloads.
+ */
+function describeDescriptionDivergence(
+  actual: unknown,
+  expected: unknown,
+): { line: number; actual: string; expected: string } | undefined {
+  const actualLines = canonicalizeLinearDescription(actual).split("\n");
+  const expectedLines = canonicalizeLinearDescription(expected).split("\n");
+  const max = Math.max(actualLines.length, expectedLines.length);
+  for (let index = 0; index < max; index += 1) {
+    if ((actualLines[index] ?? "") !== (expectedLines[index] ?? "")) {
+      return {
+        line: index + 1,
+        actual: (actualLines[index] ?? "").slice(0, 160),
+        expected: (expectedLines[index] ?? "").slice(0, 160),
+      };
+    }
+  }
+  return undefined;
+}
+
 /** Canonicalize only provider-observed Markdown presentation rewrites. */
 function canonicalizeLinearDescription(value: unknown): string {
   return String(value ?? "")
@@ -1293,6 +1331,14 @@ function canonicalizeLinearDescription(value: unknown): string {
     .split("\n")
     .map((line) => {
       let normalized = line.replace(/[ \t]+$/u, "");
+      // Linear serializes bare URLs back as self-links with angle-bracket
+      // destinations: "[url](<url>)". Collapse only true self-links so a
+      // deliberate "[text](url)" mismatch still fails verification.
+      normalized = normalized.replace(
+        /\[([^\]\n]+)\]\(<?([^)>\s]+)>?\)/gu,
+        (match, text, destination) => (text === destination ? text : match),
+      );
+      normalized = normalized.replace(/<(https?:\/\/[^>\s]+)>/gu, "$1");
       normalized = normalized.replace(
         /^([ \t]*)#{1,6}[ \t]+/u,
         "$1",

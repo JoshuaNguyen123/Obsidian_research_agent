@@ -699,6 +699,102 @@ test("issue create accepts Linear markdown description round-trip normalization"
   assert.equal(result.receipt?.readback.status, "verified");
 });
 
+test("issue create accepts Linear's bare-URL self-link rewrite", async () => {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          // Known provider rewrite: a bare URL is serialized back as a
+          // self-link with an angle-bracket destination.
+          description:
+            "Evidence:\n\n- [https://example.test/proof](<https://example.test/proof>)\n- <https://example.test/second>",
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description:
+          "Evidence:\n\n- https://example.test/proof\n- https://example.test/second",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-self-link-normalize",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.receipt?.readback.status, "verified");
+});
+
+test("issue create still refuses a link whose text and destination differ", async () => {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          // Not a presentation rewrite: the destination silently changed.
+          description:
+            "Evidence:\n\n- [https://example.test/proof](<https://evil.example/other>)",
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description: "Evidence:\n\n- https://example.test/proof",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-link-tamper",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "linear_readback_failed");
+});
+
 test("issue create refuses a provider task check-state flip", async () => {
   let createdInput: Record<string, unknown> | null = null;
   const client: LinearToolClient = {

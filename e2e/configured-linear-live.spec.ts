@@ -295,7 +295,12 @@ test.describe.serial("configured native Linear live proof", () => {
                 }))
               : [];
             throw new Error(
-              `${operation} failed: ${String((error as any)?.code ?? "unknown")}; provider=${JSON.stringify(details)}`,
+              `${operation} failed: ${String((error as any)?.code ?? "unknown")}: ${String(
+                (error as any)?.message ?? "no message",
+              )
+                .replace(/(?:lin_api_|Bearer\s+)[^\s,;]+/giu, "[REDACTED]")
+                .replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]")
+                .slice(0, 500)}; provider=${JSON.stringify(details)}`,
             );
           }
         };
@@ -350,8 +355,17 @@ test.describe.serial("configured native Linear live proof", () => {
                   .slice(0, 300),
               }))
             : [];
+          const hostDetails = JSON.stringify(executed?.error?.details ?? null)
+            .replace(/(?:lin_api_|Bearer\s+)[^\s,;"]+/giu, "[REDACTED]")
+            .replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]")
+            .slice(0, 600);
           throw new Error(
-            `${name} failed: ${String(executed?.error?.code ?? "unknown")}; provider=${JSON.stringify(details)}`,
+            `${name} failed: ${String(executed?.error?.code ?? "unknown")}: ${String(
+              executed?.error?.message ?? "no message",
+            )
+              .replace(/(?:lin_api_|Bearer\s+)[^\s,;]+/giu, "[REDACTED]")
+              .replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]")
+              .slice(0, 500)}; hostDetails=${hostDetails}; provider=${JSON.stringify(details)}`,
           );
         };
 
