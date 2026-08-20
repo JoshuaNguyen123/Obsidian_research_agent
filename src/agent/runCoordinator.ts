@@ -471,11 +471,14 @@ export class RunCoordinator {
     this.lastActivityAtMs = Date.now();
     if (key === "onRunConfig") {
       const config = args[0] as AgentRunConfigEvent | undefined;
-      this.lastConfig = config ? { ...config } : this.lastConfig;
       if (
         !this.activeRunRequiresDurableResumeAuthority ||
         config?.missionLedger
       ) {
+        // Adopt the config only together with its identity: a piecemeal
+        // update (config now, runId later) splits the snapshot into two
+        // run identities the ledger attestation rightly rejects.
+        this.lastConfig = config ? { ...config } : this.lastConfig;
         this.acceptActiveRunAuthority();
         this.runId = config?.runId ?? this.runId;
         this.lastMissionLedger = config?.missionLedger

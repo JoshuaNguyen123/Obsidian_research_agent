@@ -412,6 +412,38 @@ test("graph and orchestrator events cannot replace the configured root run id", 
   assert.equal(snapshot.lastMissionLedger?.runId, "run-root-ledger-lead");
 });
 
+test("a non-authoritative continuation config cannot split the run identity", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onRunConfig?.({
+      runId: "run-root",
+      missionLedger: { runId: "run-root" },
+    } as never);
+    events.onMissionGraphUpdate?.({
+      schemaVersion: 3,
+      missionId: "run-root",
+      objective: "root mission",
+      revision: 1,
+      nodes: {},
+    } as never);
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  await coordinator.start(
+    async (_signal, events) => {
+      // A continuation segment's early config arrives before any mission
+      // ledger. It must not be adopted piecemeal.
+      events.onRunConfig?.({ runId: "run-continuation-segment" } as never);
+      events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "budget" });
+    },
+    { preserveExistingProjectionUntilLedger: true },
+  );
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.runId, "run-root");
+  assert.equal(snapshot.lastConfig?.runId ?? snapshot.runId, snapshot.runId);
+});
+
 test("run coordinator hydrates and replays an idle persisted mission projection", () => {
   const coordinator = new RunCoordinator();
   const graph = {
