@@ -305,7 +305,11 @@ test.describe("Daily-use live research contract", () => {
           maxAgentSteps: 16,
           orchestratorWorkerMaxSteps: 6,
           orchestratorWorkerMaxToolCalls: 6,
-          orchestratorWorkerMaxMinutes: 2,
+          // Three worker minutes: the two-minute window was tighter than the
+          // five-minute end-to-end SLO this scenario pins below, so one slow
+          // provider round killed workers whose missions would still have
+          // met the SLO ("Adaptive Specialist wall-clock budget exhausted").
+          orchestratorWorkerMaxMinutes: 3,
           agenticReflexEnabled: false,
           speechActSemanticRescueMode: "off",
         },
