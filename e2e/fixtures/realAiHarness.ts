@@ -2415,7 +2415,7 @@ async function attestProductionRun(
         : "";
     if (!configRootRunId || configRootRunId !== runId) {
       throw new Error(
-        "Current production run does not match its exact config root identity.",
+        `Current production run does not match its exact config root identity. runId=${JSON.stringify(runId)} configRootRunId=${JSON.stringify(configRootRunId)}`,
       );
     }
     const summaryRunId =
@@ -2428,7 +2428,7 @@ async function attestProductionRun(
         : "";
     if (!summaryRunId || !configLedgerRunId || summaryRunId !== configLedgerRunId) {
       throw new Error(
-        "Current production run does not have one exact config/summary ledger identity.",
+        `Current production run does not have one exact config/summary ledger identity. summaryRunId=${JSON.stringify(summaryRunId)} configLedgerRunId=${JSON.stringify(configLedgerRunId)} runId=${JSON.stringify(runId)}`,
       );
     }
     const ledgerRunId = summaryRunId;

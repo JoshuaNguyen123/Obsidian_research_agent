@@ -444,6 +444,26 @@ test("a non-authoritative continuation config cannot split the run identity", as
   assert.equal(snapshot.lastConfig?.runId ?? snapshot.runId, snapshot.runId);
 });
 
+test("a ledger-less segment config cannot demote an established ledger identity", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onRunConfig?.({ runId: "run-root" } as never);
+    events.onRunConfig?.({
+      runId: "run-root",
+      missionLedger: { runId: "run-root" },
+    } as never);
+    // A continuation segment's early config arrives before its own ledger.
+    events.onRunConfig?.({ runId: "run-segment-2" } as never);
+    events.onRunComplete?.({ step: 2, maxSteps: 4, stopReason: "budget" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.runId, "run-root");
+  assert.equal(snapshot.lastConfig?.runId, "run-root");
+  assert.equal(snapshot.lastMissionLedger?.runId, "run-root");
+  assert.equal(snapshot.lastConfig?.missionLedger?.runId, "run-root");
+});
+
 test("run coordinator hydrates and replays an idle persisted mission projection", () => {
   const coordinator = new RunCoordinator();
   const graph = {

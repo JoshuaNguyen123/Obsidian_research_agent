@@ -163,6 +163,7 @@ export class RunCoordinator {
   private activeRunPublishedAuthority = false;
   private activeRunStartedFromPersistedProjection = false;
   private activeRunRequiresDurableResumeAuthority = false;
+  private activeRunAdoptedLedgerConfig = false;
 
   isRunning(): boolean {
     return this.activePromise !== null;
@@ -270,6 +271,7 @@ export class RunCoordinator {
     this.activeRunStartedFromPersistedProjection = preserveExistingProjection;
     this.activeRunRequiresDurableResumeAuthority =
       this.activeRunStartedFromPersistedProjection;
+    this.activeRunAdoptedLedgerConfig = false;
     this.lastReceipts.splice(0, this.lastReceipts.length);
     this.lastComplete = null;
     this.activeController = new AbortController();
@@ -471,19 +473,28 @@ export class RunCoordinator {
     this.lastActivityAtMs = Date.now();
     if (key === "onRunConfig") {
       const config = args[0] as AgentRunConfigEvent | undefined;
+      const configLedger = config?.missionLedger ?? null;
+      const carriesLedger = configLedger !== null;
+      // Adopt a config only together with its identity, and never let a
+      // ledger-less config demote an established ledger identity: once this
+      // run has adopted a ledger-bearing config, a continuation segment's
+      // early config (config now, ledger later) must not null the ledger or
+      // split the snapshot into two run identities mid-flight — the ledger
+      // attestation rightly rejects both shapes.
       if (
-        !this.activeRunRequiresDurableResumeAuthority ||
-        config?.missionLedger
+        carriesLedger ||
+        (!this.activeRunRequiresDurableResumeAuthority &&
+          !this.activeRunAdoptedLedgerConfig)
       ) {
-        // Adopt the config only together with its identity: a piecemeal
-        // update (config now, runId later) splits the snapshot into two
-        // run identities the ledger attestation rightly rejects.
         this.lastConfig = config ? { ...config } : this.lastConfig;
         this.acceptActiveRunAuthority();
         this.runId = config?.runId ?? this.runId;
-        this.lastMissionLedger = config?.missionLedger
-          ? structuredCloneValue(config.missionLedger)
-          : null;
+        if (configLedger !== null) {
+          this.lastMissionLedger = structuredCloneValue(configLedger);
+          this.activeRunAdoptedLedgerConfig = true;
+        } else {
+          this.lastMissionLedger = null;
+        }
       }
     } else if (key === "onMissionGraphUpdate") {
       const graph = args[0] as MissionGraphV3 | undefined;
