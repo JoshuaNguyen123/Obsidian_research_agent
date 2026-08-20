@@ -1730,9 +1730,17 @@ async function approveFirstVisiblePreparedAction(
       const matching = pending.filter(
         (request: any) => String(request?.toolName ?? "") === toolName,
       );
+      if (allowedToolNames.length > 0 && matching.length === 0) {
+        // A bounded segment can end (clearing the broker) while its approval
+        // card is still rendered; the continuation re-requests the approval.
+        // Treat the stale card as not-ready and let the caller re-poll.
+        return null;
+      }
       if (allowedToolNames.length > 0 && matching.length !== 1) {
         throw new Error(
-          `E2E requires one exact pending approval for ${toolName}; observed ${matching.length}.`,
+          `E2E requires one exact pending approval for ${toolName}; observed ${matching.length}; pending=${JSON.stringify(
+            pending.map((request: any) => String(request?.toolName ?? "unknown")),
+          )}.`,
         );
       }
       const request = matching[0] ?? null;
