@@ -9753,9 +9753,12 @@ export default class AgenticResearcherPlugin extends Plugin {
           events: segmentEvents,
           maxSteps: segmentStepBudget,
           maxToolCalls: segmentToolCallBudget,
-          ...(segmentIndex === 0
-            ? { seedMissionEvidence: seedEvidence, seedClaimPassages }
-            : {}),
+          // Re-seed on every segment: the resume snapshot only persists what
+          // the Lead itself produced, so a continuation would otherwise lose
+          // the Specialist's provider-observed evidence and deadlock the
+          // proof-gated writeback. Restored evidence upserts over seeds.
+          seedMissionEvidence: seedEvidence,
+          seedClaimPassages,
           orchestratorContext: handoffContext,
           orchestratorSnapshot: runtime.getSnapshot() ?? undefined,
           getOrchestratorSnapshot: () => runtime.getSnapshot(),

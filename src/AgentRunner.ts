@@ -5693,7 +5693,7 @@ export async function runAgentMission({
   if (
     orchestratorContext?.trim() &&
     countFetchedWebSources(missionEvidenceRecords) >=
-      (researchPlan?.sourceRequirements.minFetchedSources ?? 1)
+      Math.max(1, researchPlan?.sourceRequirements.minFetchedSources ?? 1)
   ) {
     // A read-only worker handoff is already provider-observed evidence. The
     // Lead must verify and write it, not replay the Researcher's retrieval.
@@ -5957,8 +5957,12 @@ export async function runAgentMission({
   if (researchPlan && missionEvidenceRecords.length > 0) {
     researchPlan = applyResearchEvidence(researchPlan, missionEvidenceRecords);
   }
-  const handoffFetchedSourceRequirement =
-    researchPlan?.sourceRequirements.minFetchedSources ?? 1;
+  // A plan with minFetchedSources 0 must not turn ">= requirement" vacuous:
+  // zero observed fetched sources never proves the Researcher's retrieval.
+  const handoffFetchedSourceRequirement = Math.max(
+    1,
+    researchPlan?.sourceRequirements.minFetchedSources ?? 1,
+  );
   const restoredResearcherHandoffSatisfiesWeb = Boolean(
     orchestratorContext?.trim() &&
       countFetchedWebSources(missionEvidenceRecords) >=
