@@ -1601,7 +1601,9 @@ const EMPTY_STREAMING_WRITEBACK_MESSAGE =
   "The model returned no writable content. Nothing was written.";
 const OFF_TOPIC_MODEL_OUTPUT_MESSAGE =
   "Stopped model output because it drifted off topic from the current mission.";
-const MAX_STRUCTURED_PLANNING_TIMEOUT_MS = 120_000;
+// 150s covers two sequential slow-provider planner rounds (initial +
+// bounded repair); most lanes stay lower because requestTimeoutMs binds.
+const MAX_STRUCTURED_PLANNING_TIMEOUT_MS = 150_000;
 const BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS = 5_000;
 
 export async function settleToolOutcomeMemoryPersistence(

@@ -525,8 +525,8 @@ async function requestStructuredMissionGraph({
     | null
   >;
 }): Promise<StructuredModelCallResult> {
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) {
-    throw new Error("Mission graph planner timeout must be between 1 and 120000 ms.");
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 150_000) {
+    throw new Error("Mission graph planner timeout must be between 1 and 150000 ms.");
   }
   const catalog = context.catalogNodeIds.map((id) => {
     const node = context.deterministicGraph.nodes[id] ?? context.optionalReadNodes[id];

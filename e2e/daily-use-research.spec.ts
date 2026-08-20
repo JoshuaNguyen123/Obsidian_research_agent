@@ -297,11 +297,11 @@ test.describe("Daily-use live research contract", () => {
           specialistConnectionMode: "shared_primary",
           enableStreaming: false,
           thinkingMode: "off",
-          // Structured planning is capped at min(120s, requestTimeoutMs,
-          // run wall clock); 90s starved the planner's sequential cloud
-          // calls under requireStructuredRouting.
-          requestTimeoutMs: 120_000,
-          maxRunMinutes: 3,
+          // Structured planning is capped at min(150s, requestTimeoutMs,
+          // run wall clock); it must cover an initial slow-provider round
+          // plus one bounded repair round under requireStructuredRouting.
+          requestTimeoutMs: 150_000,
+          maxRunMinutes: 4,
           maxAgentSteps: 16,
           orchestratorWorkerMaxSteps: 6,
           orchestratorWorkerMaxToolCalls: 6,
@@ -859,10 +859,10 @@ test.describe("Daily-use live research contract", () => {
           // intentionally still-running team before its host deadline.
           enableStreaming: false,
           thinkingMode: "off",
-          // 120s keeps structured planning at its full cap; see the
+          // 150s keeps structured planning at its full cap; see the
           // adaptive-orchestration-guide scenario above.
-          requestTimeoutMs: 120_000,
-          maxRunMinutes: 3,
+          requestTimeoutMs: 150_000,
+          maxRunMinutes: 4,
           maxAgentSteps: 16,
           orchestratorWorkerMaxSteps: 6,
           orchestratorWorkerMaxToolCalls: 6,
