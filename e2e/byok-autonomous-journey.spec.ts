@@ -900,21 +900,29 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     expect(publication!.evidenceReferences).toEqual(
       expect.arrayContaining(sources),
     );
-    const phaseALinearCreateReceipts = phaseASnapshot.lastReceipts.filter(
+    // Publication proof accepts the workflow's two committed outcomes: a
+    // fresh verified create, or exact-adoption of an identical issue (the
+    // host synthesizes an independent verified readback for dedup, and
+    // adoption requires an exact title/description/fingerprint match —
+    // a stronger identity condition than creation). Both bind downstream
+    // work to the published issueId.
+    const phaseALinearPublicationReceipts = phaseASnapshot.lastReceipts.filter(
       (receipt: any) =>
-        receipt?.toolName === "linear_create_issue" &&
-        receipt?.operation === "create" &&
         receipt?.resource?.system === "linear" &&
         receipt?.resource?.resourceType === "issue" &&
-        receipt?.readback?.status === "verified",
+        receipt?.readback?.status === "verified" &&
+        ((receipt?.toolName === "linear_create_issue" &&
+          receipt?.operation === "create") ||
+          (receipt?.toolName === "linear_read_issue" &&
+            receipt?.operation === "read")),
     );
     addOwnedLinearIssueIdsFromReceipts(
       ownedLinearIssueIds,
-      phaseALinearCreateReceipts,
+      phaseALinearPublicationReceipts,
     );
     expect(
-      phaseALinearCreateReceipts,
-      `Phase A must produce exactly one verified Linear issue creation receipt; receipts=${JSON.stringify(
+      phaseALinearPublicationReceipts,
+      `Phase A must produce exactly one verified Linear publication receipt; receipts=${JSON.stringify(
         (phaseASnapshot.lastReceipts ?? []).map((receipt: any) => ({
           toolName: receipt?.toolName ?? null,
           operation: receipt?.operation ?? null,
@@ -928,7 +936,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
         })),
       )}`,
     ).toHaveLength(1);
-    const publicationReceipts = phaseALinearCreateReceipts.filter(
+    const publicationReceipts = phaseALinearPublicationReceipts.filter(
       (receipt: any) => receipt?.resource?.id === issueId,
     );
     expect(publicationReceipts).toHaveLength(1);
