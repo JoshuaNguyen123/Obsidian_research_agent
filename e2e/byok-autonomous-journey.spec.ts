@@ -3421,13 +3421,20 @@ async function clearModelChatAndActiveNoteContext(
   await harness.clearChat();
   await harness.page.evaluate(async ({ pluginId }) => {
     const app = (window as typeof window & { app?: any }).app;
-    for (const leaf of app?.workspace?.getLeavesOfType?.("markdown") ?? []) {
-      await leaf.detach?.();
+    // Obsidian updates the active file asynchronously after a leaf detach;
+    // re-detach and re-poll until the workspace settles instead of failing
+    // on the immediate stale readback.
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      for (const leaf of app?.workspace?.getLeavesOfType?.("markdown") ?? []) {
+        await leaf.detach?.();
+      }
+      await app?.plugins?.plugins?.[pluginId]?.activateView?.();
+      if (!app?.workspace?.getActiveFile?.()) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    await app?.plugins?.plugins?.[pluginId]?.activateView?.();
-    if (app?.workspace?.getActiveFile?.()) {
-      throw new Error("Active note context survived the Phase B isolation gate.");
-    }
+    throw new Error("Active note context survived the Phase B isolation gate.");
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
 }
 
