@@ -3425,7 +3425,14 @@ async function clearModelChatAndActiveNoteContext(
     // re-detach and re-poll until the workspace settles instead of failing
     // on the immediate stale readback.
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      for (const leaf of app?.workspace?.getLeavesOfType?.("markdown") ?? []) {
+      // Detach every file-bearing leaf, not only markdown: a persisted
+      // canvas (or pdf/image) tab in the vault layout also satisfies
+      // getActiveFile and would leak context into Phase B.
+      const fileLeaves: any[] = [];
+      app?.workspace?.iterateAllLeaves?.((leaf: any) => {
+        if (leaf?.view?.file) fileLeaves.push(leaf);
+      });
+      for (const leaf of fileLeaves) {
         await leaf.detach?.();
       }
       await app?.plugins?.plugins?.[pluginId]?.activateView?.();
@@ -3434,7 +3441,14 @@ async function clearModelChatAndActiveNoteContext(
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    throw new Error("Active note context survived the Phase B isolation gate.");
+    const active = app?.workspace?.getActiveFile?.();
+    const markdownLeaves = (app?.workspace?.getLeavesOfType?.("markdown") ?? [])
+      .length;
+    const activeLeafType =
+      app?.workspace?.activeLeaf?.view?.getViewType?.() ?? "unknown";
+    throw new Error(
+      `Active note context survived the Phase B isolation gate. path=${active?.path ?? "unknown"} markdownLeaves=${markdownLeaves} activeLeafType=${activeLeafType}`,
+    );
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
 }
 
