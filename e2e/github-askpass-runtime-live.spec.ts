@@ -112,12 +112,20 @@ test("production verified git push gateway pushes and reads back a disposable pr
       "user.email",
       "agentic-researcher@example.invalid",
     ]);
+    // The profile detector requires a real ecosystem marker; a comment-only
+    // requirements.txt keeps this docs-shaped proof worktree detectable
+    // without adding validation surface.
+    await writeFile(
+      path.join(worktree, "requirements.txt"),
+      "# Askpass runtime proof fixture; intentionally no dependencies.\n",
+      "utf8",
+    );
     await writeFile(
       path.join(worktree, "README.md"),
       `# Secure askpass runtime proof\n\n${suffix}\n`,
       "utf8",
     );
-    await git(worktree, ["add", "README.md"]);
+    await git(worktree, ["add", "README.md", "requirements.txt"]);
     await git(worktree, ["commit", "-m", `Base commit ${suffix}`]);
     const baseSha = (await git(worktree, ["rev-parse", "HEAD"])).trim();
     await git(worktree, ["checkout", "-b", branch]);
@@ -169,7 +177,7 @@ test("production verified git push gateway pushes and reads back a disposable pr
       displayName: "Askpass runtime proof",
       repositoryRoot: worktree,
       defaultBranch: "main",
-      files: ["README.md", "PROOF.md"],
+      files: ["README.md", "PROOF.md", "requirements.txt"],
     });
     const binding = createTrustedGitHubRepositoryBindingV1({
       key: `github-askpass-proof-${suffix}`,
