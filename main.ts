@@ -9245,6 +9245,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
 
     let workerResult: ResearchWorkerResult | null = null;
+    let specialistFailureMessage: string | null = null;
     const specialistModelClient = createSpecialistModelClient(this.settings);
     const workerStartedAt = Date.now();
     const workerDeadline = createLinkedDeadlineSignal(
@@ -9376,6 +9377,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         throw error;
       }
       const message = getUnknownErrorMessage(error);
+      specialistFailureMessage = message;
       await runtime.blockNode(researchNodeId, message);
       await runtime.updateParticipant("specialist", {
         status: "failed",
@@ -9451,7 +9453,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         commitShas: [],
         verificationStatus: "pending",
         integrationStatus: "not_applicable",
-        blocker: "Adaptive Specialist unavailable; Lead continued independently.",
+        blocker: specialistFailureMessage
+          ? `Adaptive Specialist unavailable (${specialistFailureMessage}); Lead continued independently.`
+          : "Adaptive Specialist unavailable; Lead continued independently.",
         updatedAt: new Date().toISOString(),
       });
       await runtime.progress(handoffNodeId, {
