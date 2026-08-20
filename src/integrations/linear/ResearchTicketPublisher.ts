@@ -30,6 +30,7 @@ import {
   type WorkItemSpecV2Unsigned,
 } from "./WorkItemSpecV2";
 import {
+  LINEAR_MAX_QUERY_CHARS,
   LinearClientError,
   type LinearIssueRecord,
   type LinearOperationResult,
@@ -486,7 +487,14 @@ export class ResearchTicketPublisher {
     const candidates = new Map<string, LinearIssueRecord>();
     // Search with human-facing text only. Exact deduplication still requires
     // an independent readback of the complete title and signed description.
-    for (const query of uniqueStrings([ticket.title, ticket.spec.objective])) {
+    // Clamp host-authored queries to the transport bound: a long mission
+    // objective is a fuzzy-search seed here, not a contract, and an
+    // over-bound query fails the whole publication closed.
+    for (const query of uniqueStrings(
+      [ticket.title, ticket.spec.objective].map((text) =>
+        text.slice(0, LINEAR_MAX_QUERY_CHARS),
+      ),
+    )) {
       const remaining = this.duplicateCandidateLimit - candidates.size;
       if (remaining <= 0) break;
       const result = await this.options.readClient.execute(

@@ -164,6 +164,45 @@ test("publisher preview builds and deduplicates without preparing or dispatching
   assert.equal(executeCount, 0);
 });
 
+test("publisher clamps duplicate-search queries to the transport bound", async () => {
+  const searches: string[] = [];
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") {
+        const query = String((variables as Record<string, unknown>).query ?? "");
+        if (query.length > 500) {
+          throw new LinearClientError(
+            "linear_invalid_arguments",
+            "query exceeds the 500-character bound. (operation issues.search)",
+          );
+        }
+        searches.push(query);
+        return page([]);
+      }
+      throw new LinearClientError(
+        "linear_not_found",
+        "Linear resource was not found.",
+      );
+    },
+  };
+  const publisher = publisherFixture(readClient, unusedExecutor());
+  const longObjective =
+    `Publish accepted research ${"with an extremely long mission objective segment ".repeat(20)}`.trim();
+  assert.ok(longObjective.length > 500);
+
+  const preview = await publisher.preview({
+    context: requestFixture().context,
+    sections: SECTIONS,
+    draft: { ...DRAFT, objective: longObjective },
+  });
+
+  assert.equal(preview.ok, true);
+  assert.ok(searches.length > 0);
+  for (const query of searches) {
+    assert.ok(query.length <= 500, `query length ${query.length} exceeds bound`);
+  }
+});
+
 test("publisher deduplicates only exact clean human content in the pinned queue project", async () => {
   let executeCalls = 0;
   const searches: Array<Record<string, unknown>> = [];
