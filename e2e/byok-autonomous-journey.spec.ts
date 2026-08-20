@@ -72,6 +72,7 @@ import {
 } from "./fixtures/reflectionAssertions";
 import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
+import { ensureDurableLinearQueueProject } from "./fixtures/linearQueueProvisioning";
 import {
   assertProductionAdoptedSandboxV1,
   hostProvisionedSandboxRuntimeDigestV1,
@@ -505,6 +506,19 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     observations.observe("proofs", "sandbox:production_boundary");
 
     await assertLinearReady(harness.page, teamId);
+    // Pin the publication destination to the durable queue project. Without
+    // it the publisher deduplicates team-wide, where residue from retained or
+    // partially-cleaned historical runs can be adopted instead of creating
+    // this journey's own issue.
+    const queueProvisioning = await ensureDurableLinearQueueProject(
+      harness.page,
+      { pluginId: NATIVE_CORE_PLUGIN_ID, teamId },
+    );
+    if (!queueProvisioning.ok) {
+      throw new Error(
+        `BYOK Linear queue provisioning failed: ${queueProvisioning.message}`,
+      );
+    }
     await ensureGitHubConnected(harness.page, envGithubToken || null);
     const vaultGithub = await readGitHubIdentity(harness.page);
     githubLogin = vaultGithub.login;
@@ -897,6 +911,10 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
           system: receipt?.resource?.system ?? null,
           resourceType: receipt?.resource?.resourceType ?? null,
           readback: receipt?.readback?.status ?? null,
+          id: receipt?.resource?.id ?? null,
+          identifier: receipt?.resource?.identifier ?? null,
+          projectId: receipt?.resource?.projectId ?? null,
+          teamId: receipt?.resource?.teamId ?? null,
         })),
       )}`,
     ).toHaveLength(1);
