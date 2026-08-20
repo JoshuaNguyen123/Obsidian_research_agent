@@ -413,9 +413,16 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     }
     const owner = input.owner.trim();
     if (!owner) throw new Error("GitHub probe registration omitted its owner.");
+    // Register the delete against the classic harness token when present: a
+    // probe created by the vault lease (repo scope only) cannot delete
+    // itself, and cleanup must not depend on the credential that just
+    // proved it lacks deletion authority.
+    const deleteCapableClient = envGithubToken
+      ? githubClientForToken(envGithubToken)
+      : input.client;
     ownedGithubProbeRepositories.set(
       `${owner.toLowerCase()}/${input.repository}`,
-      { ...input, owner },
+      { ...input, owner, client: deleteCapableClient },
     );
   };
 
@@ -522,7 +529,10 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     await ensureGitHubConnected(harness.page, envGithubToken || null);
     const vaultGithub = await readGitHubIdentity(harness.page);
     githubLogin = vaultGithub.login;
-    githubClient = githubClientForToken(vaultGithub.token);
+    // Harness-side repository management (probes, disposable cleanup) needs
+    // create+delete authority; the vault lease carries repo scope only. The
+    // app's own pushes still use the vault credential internally.
+    githubClient = githubClientForToken(envGithubToken || vaultGithub.token);
     cleanup.registerAtCreate("GitHub repository cleanup", async () => {
       const cleanupFailures: string[] = [];
       const targets = new Map<string, RegisteredGithubProbeV1>(
