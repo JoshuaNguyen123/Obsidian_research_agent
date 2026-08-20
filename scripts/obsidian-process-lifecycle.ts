@@ -13,6 +13,14 @@ export interface ControlledObsidianTeardownOperations {
   waitForOwnedExit(): Promise<boolean>;
   waitForNoRunningProcess(): Promise<boolean>;
   waitForCdpClose(): Promise<boolean>;
+  /**
+   * Optional targeted kill of surviving application processes. Orphaned
+   * Electron children outlive a self-exited root (the owned tree kill is
+   * skipped once exitCode is set) and a parentage-gapped taskkill /T; the
+   * sweep runs before the terminal drain recheck so they cannot fail the
+   * teardown or poison the next lane's already-running check.
+   */
+  sweepSurvivingProcesses?(): Promise<void>;
 }
 
 interface TeardownProbeResult {
@@ -56,6 +64,13 @@ export async function terminateControlledObsidian(
       );
     }
     if (!probes[1].passed) {
+      if (operations.sweepSurvivingProcesses) {
+        try {
+          await operations.sweepSurvivingProcesses();
+        } catch {
+          // The sweep is best-effort recovery; the recheck below decides.
+        }
+      }
       probes[1] = await runProbe(
         "Obsidian process drain",
         operations.waitForNoRunningProcess,
@@ -78,32 +93,89 @@ export async function terminateControlledObsidian(
   );
 }
 
+export interface WindowsProcessExitProbeOptions {
+  /**
+   * Authoritative exit signal: Node sets exitCode only after the OS reports
+   * the child's exit, so a non-null value ends the wait immediately without
+   * consulting tasklist (whose bare-PID filter can match a recycled PID).
+   */
+  handle?: ControlledProcessHandle;
+  /**
+   * Restrict tasklist matches to this image name so a foreign process that
+   * claimed the recycled PID can never masquerade as the still-live root.
+   */
+  expectedImageName?: string;
+}
+
 export async function waitForWindowsProcessExit(
   pid: number,
   timeoutMs: number,
+  options: WindowsProcessExitProbeOptions = {},
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!(await isWindowsProcessIdRunning(pid))) {
+    if (options.handle && options.handle.exitCode !== null) {
+      return true;
+    }
+    if (!(await isWindowsProcessIdRunning(pid, options.expectedImageName))) {
       return true;
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  return !(await isWindowsProcessIdRunning(pid));
+  if (options.handle && options.handle.exitCode !== null) {
+    return true;
+  }
+  const row = await windowsTasklistRow(pid, options.expectedImageName);
+  if (row !== null) {
+    console.warn(
+      `[obsidian-lifecycle] PID ${pid} still matched tasklist after ${timeoutMs}ms: ${row}`,
+    );
+    return false;
+  }
+  return true;
 }
 
-export function tasklistContainsProcessId(output: string, pid: number): boolean {
+export function tasklistContainsProcessId(
+  output: string,
+  pid: number,
+  expectedImageName?: string,
+): boolean {
+  return tasklistMatchingRow(output, pid, expectedImageName) !== null;
+}
+
+function tasklistMatchingRow(
+  output: string,
+  pid: number,
+  expectedImageName?: string,
+): string | null {
   const escapedPid = String(pid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^"[^"]+","${escapedPid}",`, "imu").test(output);
+  const imagePattern = expectedImageName
+    ? expectedImageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    : "[^\"]+";
+  const match = new RegExp(
+    `^"${imagePattern}","${escapedPid}",[^\r\n]*`,
+    "imu",
+  ).exec(output);
+  return match ? match[0] : null;
 }
 
-async function isWindowsProcessIdRunning(pid: number): Promise<boolean> {
+async function isWindowsProcessIdRunning(
+  pid: number,
+  expectedImageName?: string,
+): Promise<boolean> {
+  return (await windowsTasklistRow(pid, expectedImageName)) !== null;
+}
+
+async function windowsTasklistRow(
+  pid: number,
+  expectedImageName?: string,
+): Promise<string | null> {
   const { stdout } = await execFileAsync(
     "tasklist",
     ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
     { windowsHide: true },
   );
-  return tasklistContainsProcessId(String(stdout), pid);
+  return tasklistMatchingRow(String(stdout), pid, expectedImageName);
 }
 
 async function runProbe(

@@ -1204,10 +1204,42 @@ async function terminateObsidian(
       });
     },
     waitForOwnedExit: () =>
-      waitForWindowsProcessExit(processHandle.pid!, 30_000),
+      waitForWindowsProcessExit(processHandle.pid!, 30_000, {
+        handle: processHandle,
+        expectedImageName: phase4ObsidianImageName(),
+      }),
     waitForNoRunningProcess: () => waitForNoObsidian(30_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
+    sweepSurvivingProcesses: () => sweepObsidianSurvivorsPhase4(),
   });
+}
+
+function phase4ObsidianImageName(): string {
+  return path.basename(process.env.OBSIDIAN_EXE ?? defaultObsidianExe());
+}
+
+/**
+ * Kill surviving Obsidian processes by their own PIDs. taskkill /T misses
+ * grandchildren whose parent already exited, and a self-exited root skips
+ * the tree kill entirely, so orphaned Electron children need a direct sweep.
+ */
+async function sweepObsidianSurvivorsPhase4(): Promise<void> {
+  const image = phase4ObsidianImageName();
+  const { stdout } = await execFileAsync("tasklist", [
+    "/FI",
+    `IMAGENAME eq ${image}`,
+    "/FO",
+    "CSV",
+    "/NH",
+  ]).catch(() => ({ stdout: "" }));
+  const pids = [...String(stdout).matchAll(/^"[^"]+","(\d+)",/gimu)].map(
+    (match) => Number(match[1]),
+  );
+  for (const pid of pids) {
+    await execFileAsync("taskkill", ["/PID", String(pid), "/F"]).catch(
+      () => undefined,
+    );
+  }
 }
 
 async function waitForCdp(

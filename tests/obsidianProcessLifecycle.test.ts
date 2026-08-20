@@ -19,6 +19,15 @@ test("owned process readback matches only the exact tasklist PID row", () => {
   );
 });
 
+test("an image-scoped readback never matches a foreign process on a recycled PID", () => {
+  const foreign = '"notepad.exe","1234","Console","1","10,000 K"';
+  const owned = '"Obsidian.exe","1234","Console","1","100,000 K"';
+  assert.equal(tasklistContainsProcessId(foreign, 1234, "Obsidian.exe"), false);
+  assert.equal(tasklistContainsProcessId(owned, 1234, "Obsidian.exe"), true);
+  // Without an expected image the historical bare-PID behavior is preserved.
+  assert.equal(tasklistContainsProcessId(foreign, 1234), true);
+});
+
 test("controlled Obsidian teardown targets only its owned PID and rejects an incomplete drain", async () => {
   const calls: string[] = [];
 
@@ -171,6 +180,56 @@ test("controlled teardown still rejects a live Obsidian process after terminal r
           return false;
         },
         waitForCdpClose: async () => true,
+      },
+    ),
+    /Controlled Obsidian teardown did not drain cleanly \(Obsidian process drain\)/u,
+  );
+
+  assert.equal(processDrainChecks, 2);
+});
+
+test("a drain failure sweeps orphaned survivors before the terminal recheck", async () => {
+  const calls: string[] = [];
+  let processDrainChecks = 0;
+  await terminateControlledObsidian(
+    { pid: 2468, exitCode: 1 },
+    {
+      terminateOwnedTree: async () => {
+        calls.push("unexpected-terminate");
+      },
+      waitForOwnedExit: async () => true,
+      waitForNoRunningProcess: async () => {
+        processDrainChecks += 1;
+        calls.push(`process-drain:${processDrainChecks}`);
+        // Survivors drain only after the sweep killed them.
+        return processDrainChecks === 2;
+      },
+      waitForCdpClose: async () => true,
+      sweepSurvivingProcesses: async () => {
+        calls.push("sweep");
+      },
+    },
+  );
+
+  assert.deepEqual(calls, ["process-drain:1", "sweep", "process-drain:2"]);
+});
+
+test("a failing survivor sweep still defers to the terminal drain recheck", async () => {
+  let processDrainChecks = 0;
+  await assert.rejects(
+    terminateControlledObsidian(
+      { pid: 1357, exitCode: 1 },
+      {
+        terminateOwnedTree: async () => undefined,
+        waitForOwnedExit: async () => true,
+        waitForNoRunningProcess: async () => {
+          processDrainChecks += 1;
+          return false;
+        },
+        waitForCdpClose: async () => true,
+        sweepSurvivingProcesses: async () => {
+          throw new Error("tasklist unavailable");
+        },
       },
     ),
     /Controlled Obsidian teardown did not drain cleanly \(Obsidian process drain\)/u,

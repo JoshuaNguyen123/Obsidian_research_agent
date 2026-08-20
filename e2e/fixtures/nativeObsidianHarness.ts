@@ -961,10 +961,42 @@ async function terminateObsidian(
       );
     },
     waitForOwnedExit: () =>
-      waitForWindowsProcessExit(processHandle.pid!, 30_000),
+      waitForWindowsProcessExit(processHandle.pid!, 30_000, {
+        handle: processHandle,
+        expectedImageName: obsidianImageName(),
+      }),
     waitForNoRunningProcess: () => waitForNoObsidian(45_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
+    sweepSurvivingProcesses: () => sweepObsidianSurvivors(),
   });
+}
+
+function obsidianImageName(): string {
+  return path.basename(process.env.OBSIDIAN_EXE ?? defaultObsidianExe());
+}
+
+/**
+ * Kill surviving Obsidian processes by their own PIDs. taskkill /T misses
+ * grandchildren whose parent already exited, and a self-exited root skips the
+ * tree kill entirely, so orphaned Electron children need a direct sweep.
+ */
+async function sweepObsidianSurvivors(): Promise<void> {
+  const image = obsidianImageName();
+  const { stdout } = await execFileAsync("tasklist", [
+    "/FI",
+    `IMAGENAME eq ${image}`,
+    "/FO",
+    "CSV",
+    "/NH",
+  ]).catch(() => ({ stdout: "" }));
+  const pids = [...String(stdout).matchAll(/^"[^"]+","(\d+)",/gimu)].map(
+    (match) => Number(match[1]),
+  );
+  for (const pid of pids) {
+    await execFileAsync("taskkill", ["/PID", String(pid), "/F"]).catch(
+      () => undefined,
+    );
+  }
 }
 
 async function assertNoRunningObsidian(): Promise<void> {
@@ -984,14 +1016,16 @@ async function waitForNoObsidian(timeoutMs: number): Promise<boolean> {
 }
 
 async function obsidianRunning(): Promise<boolean> {
+  const image = obsidianImageName();
   const { stdout } = await execFileAsync("tasklist", [
     "/FI",
-    "IMAGENAME eq Obsidian.exe",
+    `IMAGENAME eq ${image}`,
     "/FO",
     "CSV",
     "/NH",
   ]);
-  return /^"Obsidian\.exe"/imu.test(stdout);
+  const escapedImage = image.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^"${escapedImage}"`, "imu").test(stdout);
 }
 
 async function assertPortFree(port: number): Promise<void> {

@@ -463,6 +463,44 @@ test("repository visibility requires an affirmative choice instead of inverting 
   );
 });
 
+test("an unrelated visibility word near the repository noun is not a choice", () => {
+  // The BYOK Phase B shape: an explicit private destination plus the word
+  // "public" describing artifacts in a later sentence must stay private.
+  assert.deepEqual(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it. " +
+        "Implement the requested Python library in its bound trusted repository and honor the issue-required public artifacts while choosing the internal design yourself.",
+    ),
+    { status: "chosen", visibility: "private" },
+  );
+  // Co-occurrence alone in either direction is not an affirmative choice.
+  assert.equal(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "Document the public API surface before touching the repository.",
+    ).status,
+    "waiting",
+  );
+  assert.equal(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "The repository tracks our public roadmap items.",
+    ).status,
+    "waiting",
+  );
+  // Direct modification and predication still resolve.
+  assert.deepEqual(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "Push this to a new private, issue-bound repository.",
+    ),
+    { status: "chosen", visibility: "private" },
+  );
+  assert.deepEqual(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "The repository should be public.",
+    ),
+    { status: "chosen", visibility: "public" },
+  );
+});
+
 function destination(): GitHubPrivateRepositoryDestinationV1 {
   return {
     ownerKind: "organization",

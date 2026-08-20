@@ -88,17 +88,25 @@ function hasRepositoryVisibilityPhrase(
   visibility: RepositoryVisibility,
 ): boolean {
   const escaped = visibility;
+  const destinationNoun = "(?:github\\s+)?(?:repository|repo|destination)";
   return (
     new RegExp(
-      `\\b(?:visibility\\s*(?:is|=|:)\\s*|make\\s+(?:it|the\\s+(?:github\\s+)?(?:repository|repo|destination))\\s+|create\\s+(?:it\\s+as\\s+|a\\s+)?|publish\\s+(?:it\\s+as\\s+|to\\s+a\\s+)?|use\\s+(?:a\\s+)?)(?:an?\\s+)?${escaped}\\b`,
+      `\\b(?:visibility\\s*(?:is|=|:)\\s*|make\\s+(?:it|the\\s+${destinationNoun})\\s+|create\\s+(?:it\\s+as\\s+|a\\s+)?|publish\\s+(?:it\\s+as\\s+|to\\s+a\\s+)?|use\\s+(?:a\\s+)?)(?:an?\\s+)?${escaped}\\b`,
       "u",
     ).test(value) ||
+    // The visibility word must modify the destination noun (allowing a short
+    // adjective run: "private GitHub destination", "private, issue-bound
+    // repository"). Mere sentence co-occurrence — "public artifacts ... in
+    // its repository" — is not a visibility choice; counting it as one made
+    // legitimately private missions read as ambiguous and fail closed.
     new RegExp(
-      `\\b${escaped}\\b[^.\\n]{0,60}\\b(?:github\\s+)?(?:repository|repo|destination)\\b`,
+      `\\b${escaped}\\b(?:[,\\s-]+\\w+){0,3}?[,\\s-]+${destinationNoun}\\b`,
       "u",
     ).test(value) ||
+    // The destination noun is predicated with the visibility: "repository
+    // should be private", "repo stays public", "the destination is private".
     new RegExp(
-      `\\b(?:github\\s+)?(?:repository|repo|destination)\\b[^.\\n]{0,60}\\b${escaped}\\b`,
+      `\\b${destinationNoun}\\b(?:\\s+(?:is|are|as|be|being|should\\s+be|must\\s+be|will\\s+be|stays?|remains?|kept|set\\s+to|made))?\\s+(?:an?\\s+)?${escaped}\\b`,
       "u",
     ).test(value)
   );
