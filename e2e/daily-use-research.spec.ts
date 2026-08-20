@@ -298,10 +298,12 @@ test.describe("Daily-use live research contract", () => {
           enableStreaming: false,
           thinkingMode: "off",
           // Structured planning is capped at min(120s, requestTimeoutMs,
-          // run wall clock); the four-minute run keeps planner time from
-          // starving the Lead under requireStructuredRouting.
+          // run wall clock). The six-minute Lead window absorbs slow-provider
+          // rounds: every observed failure of this scenario force-stopped at
+          // the old four-minute root deadline mid-segment, before the run
+          // could publish its ledger identity.
           requestTimeoutMs: 150_000,
-          maxRunMinutes: 4,
+          maxRunMinutes: 6,
           maxAgentSteps: 16,
           orchestratorWorkerMaxSteps: 6,
           orchestratorWorkerMaxToolCalls: 6,
@@ -313,9 +315,11 @@ test.describe("Daily-use live research contract", () => {
       await harness.installOwnedWebBackend({ sourceCount: 2 });
       const startedAt = Date.now();
       await harness.submitMission(ORCHESTRATION_GUIDE_PROMPT, {
-        // Shared adaptive budget: two Specialist minutes plus a three-minute
-        // Lead window. The observer margin is separate from runtime authority.
-        timeoutMs: 8 * 60_000,
+        // Shared adaptive budget: two Specialist minutes plus the Lead
+        // window above (root 8m). The observer margin stays separate from
+        // runtime authority; the lane's Playwright cap leaves ~3m of boot
+        // and attestation headroom beyond it.
+        timeoutMs: 11 * 60_000,
       });
       const elapsedMs = Date.now() - startedAt;
       const snapshot = await harness.attestProductionRun({
