@@ -890,7 +890,15 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     );
     expect(
       phaseALinearCreateReceipts,
-      "Phase A must produce exactly one verified Linear issue creation receipt",
+      `Phase A must produce exactly one verified Linear issue creation receipt; receipts=${JSON.stringify(
+        (phaseASnapshot.lastReceipts ?? []).map((receipt: any) => ({
+          toolName: receipt?.toolName ?? null,
+          operation: receipt?.operation ?? null,
+          system: receipt?.resource?.system ?? null,
+          resourceType: receipt?.resource?.resourceType ?? null,
+          readback: receipt?.readback?.status ?? null,
+        })),
+      )}`,
     ).toHaveLength(1);
     const publicationReceipts = phaseALinearCreateReceipts.filter(
       (receipt: any) => receipt?.resource?.id === issueId,

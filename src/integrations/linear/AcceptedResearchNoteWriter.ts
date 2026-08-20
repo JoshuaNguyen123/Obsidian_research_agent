@@ -1255,8 +1255,17 @@ function assertProjectIdeaSeedMatchesAcceptedPackage(
     riskClass: seed.riskClass,
   };
   if (JSON.stringify(acceptedProjection) !== JSON.stringify(seedProjection)) {
+    // Name the drifted fields so a provider can repair by re-copying the
+    // exact seed values instead of failing the same way on every retry.
+    const driftedFields = (
+      Object.keys(seedProjection) as Array<keyof typeof seedProjection>
+    ).filter(
+      (key) =>
+        JSON.stringify(acceptedProjection[key]) !==
+        JSON.stringify(seedProjection[key]),
+    );
     throw new DurableLinearContractError(
-      "Accepted research fields drifted from their durable project idea seed.",
+      `Accepted research fields drifted from their durable project idea seed. Drifted fields: ${driftedFields.join(", ") || "unknown"}. Copy each listed field exactly from the created project idea brief.`,
     );
   }
 }
