@@ -34,6 +34,8 @@ export async function clearChatInline(page: Page): Promise<void> {
         hasText: /Chat memory cleared\. Vault notes were not modified/i,
       })
       .last(),
-  ).toBeVisible({ timeout: 5_000 });
+    // Clearing after a long autonomous phase re-renders a large transcript;
+    // the confirmation message can take well over the interactive-path 5s.
+  ).toBeVisible({ timeout: 30_000 });
   await expect(page.locator("textarea.agentic-researcher-prompt")).toBeFocused();
 }
