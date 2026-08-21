@@ -23324,17 +23324,36 @@ function createStreamLifecycleTracker(
   };
 }
 
+const MODEL_WAIT_HEARTBEAT_MS = 5 * 60_000;
+
 async function withModelWaitStatus<T>(
   operation: () => Promise<T>,
   events: AgentRunEvents,
   label: string,
+  step?: number,
 ): Promise<T> {
   const startedAt = nowMs();
+  let heartbeats = 0;
   const interval = setInterval(() => {
     const elapsedSeconds = Math.max(30, Math.round(elapsedMs(startedAt) / 1000));
     events.onStatus?.(
       `Still waiting for ${label} (${elapsedSeconds}s elapsed)...`,
     );
+    // Status lines are ephemeral. A step that waits for minutes must also
+    // leave an attested diagnostic, or a stalled provider looks like an idle
+    // run in Run Details and in E2E snapshots.
+    if (
+      step !== undefined &&
+      elapsedMs(startedAt) >= (heartbeats + 1) * MODEL_WAIT_HEARTBEAT_MS
+    ) {
+      heartbeats += 1;
+      events.onTrace?.({
+        id: `model-wait-${step}-${heartbeats}`,
+        kind: "status",
+        step,
+        message: `model_wait label=${label}; elapsed_s=${elapsedSeconds}`,
+      });
+    }
   }, 30_000);
 
   try {
@@ -23383,6 +23402,7 @@ async function chatForAgentStep(
           () => modelClient.chat(request),
           events,
           "model API response",
+          step,
         ),
       {
         // Cloud 5xx (e.g. Ollama Internal Server Error) needs the full default
@@ -23428,6 +23448,7 @@ async function chatForAgentStep(
             () => modelClient.chat(retryRequest),
             events,
             "model API retry",
+            step,
           ),
         {
           abortSignal: retryRequest.abortSignal,
@@ -23476,6 +23497,7 @@ async function chatForAgentStep(
             () => modelClient.chat(noThinkRequest),
             events,
             "model API retry without thinking",
+            step,
           ),
         {
           abortSignal: noThinkRequest.abortSignal,
@@ -24363,6 +24385,7 @@ async function streamChatWithThinkingFallback({
           () => modelClient.streamChat(request, streamEvents),
           events,
           "streaming model response",
+          step,
         ),
       {
         abortSignal: request.abortSignal,
@@ -24392,6 +24415,7 @@ async function streamChatWithThinkingFallback({
           () => modelClient.streamChat(retryRequest, streamEvents),
           events,
           "streaming model retry",
+          step,
         ),
       {
         abortSignal: retryRequest.abortSignal,

@@ -136,3 +136,84 @@ test("hybrid streaming transport does not re-run a timed-out request over the de
     globalThis.fetch = originalFetch;
   }
 });
+
+function streamingFetchStub(
+  chunks: Array<{ delayMs: number; text?: string }>,
+  options: { hangAfter?: boolean } = {},
+): typeof fetch {
+  return ((_input: unknown, init?: RequestInit) => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const abort = () =>
+          controller.error(new DOMException("The operation was aborted.", "AbortError"));
+        init?.signal?.addEventListener("abort", abort, { once: true });
+        for (const chunk of chunks) {
+          await new Promise((resolve) => setTimeout(resolve, chunk.delayMs));
+          if (init?.signal?.aborted) return;
+          controller.enqueue(encoder.encode(chunk.text ?? ""));
+        }
+        if (!options.hangAfter) controller.close();
+      },
+    });
+    return Promise.resolve(new Response(body, { status: 200 }));
+  }) as typeof fetch;
+}
+
+test("streaming timeout is an idle bound once headers arrive: a slow but live stream completes", async () => {
+  // Regression: the request timeout used to be an absolute cap on the whole
+  // stream, so a long generation (a full source file as a tool-call argument
+  // on a slow provider window) was killed while still delivering tokens, and
+  // every retry repeated the same doomed generation.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = streamingFetchStub([
+    { delayMs: 20, text: "a" },
+    { delayMs: 20, text: "b" },
+    { delayMs: 20, text: "c" },
+    { delayMs: 20, text: "d" },
+    { delayMs: 20, text: "e" },
+  ]);
+  try {
+    const response = await hybridStreamingTransport({
+      url: "http://127.0.0.1:9/api/chat",
+      method: "POST",
+      body: "{}",
+      timeoutMs: 60, // shorter than the ~100ms total stream, longer than any gap
+    });
+    let text = "";
+    for await (const chunk of response.body) text += chunk;
+    assert.equal(text, "abcde");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("streaming timeout still cuts a stream that goes silent after headers", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = streamingFetchStub([{ delayMs: 5, text: "a" }], {
+    hangAfter: true,
+  });
+  try {
+    const response = await hybridStreamingTransport({
+      url: "http://127.0.0.1:9/api/chat",
+      method: "POST",
+      body: "{}",
+      timeoutMs: 40,
+    });
+    await assert.rejects(
+      (async () => {
+        let text = "";
+        for await (const chunk of response.body) text += chunk;
+        return text;
+      })(),
+      (error: unknown) => {
+        assert.ok(error instanceof ModelClientError);
+        assert.equal(error.category, "network");
+        assert.match(error.message, /timed out after 40ms without new data/u);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -1186,3 +1186,37 @@ test("steering does not carry across runs", async () => {
 
   assert.deepEqual(leaked, []);
 });
+
+test("run coordinator attests in-flight model retry and wait diagnostics", async () => {
+  // Regression: a Phase B step that kept timing out and retrying looked like
+  // an idle run because retries were status-only and the diagnostic allowlist
+  // dropped them. A stalled step must be visible while it is still in flight.
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onTrace?.({
+      id: "model-wait-10-1",
+      kind: "status",
+      step: 10,
+      message: "model_wait label=streaming model response; elapsed_s=300",
+    });
+    events.onTrace?.({
+      id: "model-retry-10-2",
+      kind: "status",
+      step: 10,
+      message:
+        "model_retry attempt=2; delay_ms=750; timeout=true; error=Streaming request to Ollama failed: Request timed out after 600000ms.",
+    });
+    events.onTrace?.({
+      id: "model-call-agent-step-10",
+      kind: "status",
+      step: 10,
+      message: "Model call: agent step 10",
+    });
+    events.onRunComplete?.({ step: 10, maxSteps: 25, stopReason: "final" });
+  });
+
+  assert.deepEqual(
+    coordinator.getSnapshot().diagnosticAttestations.map((item) => item.id),
+    ["model-wait-10-1", "model-retry-10-2"],
+  );
+});

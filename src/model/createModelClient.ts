@@ -370,30 +370,97 @@ async function fetchStreamingTransport(
     responseHeaders[key] = value;
   });
 
+  // Headers arrived within the request timeout. From here the timeout is an
+  // idle bound, not an absolute cap: a long generation that keeps delivering
+  // chunks (a full source file as a tool-call argument on a slow provider
+  // window) must be allowed to finish, while a stream that goes silent for the
+  // whole timeout is still cut. The run's own deadline bounds total time.
+  clearAbortTimeout(timeout);
+  let stalled = false;
+  const idle = createIdleAbort(controller, request.timeoutMs, () => {
+    stalled = true;
+  });
+
   return {
     status: response.status,
     headers: responseHeaders,
-    body: decodeStream(response.body, () => {
-      clearAbortTimeout(timeout);
-      unlinkAbort();
-    }),
+    body: decodeStream(
+      response.body,
+      () => {
+        idle.clear();
+        unlinkAbort();
+      },
+      idle.touch,
+      (error) => {
+        if (stalled) {
+          return new ModelClientErrorClass(
+            "network",
+            `Streaming response timed out after ${request.timeoutMs}ms without new data.`,
+            { originalError: error },
+          );
+        }
+        if (request.abortSignal?.aborted) {
+          return new ModelClientErrorClass("network", "Request cancelled.", {
+            originalError: error,
+          });
+        }
+        return error;
+      },
+    ),
+  };
+}
+
+function createIdleAbort(
+  controller: AbortController,
+  timeoutMs: number | undefined,
+  onStall: () => void,
+): { touch: () => void; clear: () => void } {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return { touch: () => undefined, clear: () => undefined };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const arm = () => {
+    timer = setTimeout(() => {
+      onStall();
+      controller.abort();
+    }, timeoutMs);
+  };
+  arm();
+  return {
+    touch: () => {
+      if (timer !== undefined) clearTimeout(timer);
+      arm();
+    },
+    clear: () => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    },
   };
 }
 
 async function* decodeStream(
   stream: ReadableStream<Uint8Array>,
   onDone?: () => void,
+  onChunk?: () => void,
+  mapError?: (error: unknown) => unknown,
 ): AsyncIterable<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      let next: ReadableStreamReadResult<Uint8Array>;
+      try {
+        next = await reader.read();
+      } catch (error) {
+        throw mapError ? mapError(error) : error;
+      }
+      const { done, value } = next;
       if (done) {
         break;
       }
 
+      onChunk?.();
       yield decoder.decode(value, { stream: true });
     }
 
