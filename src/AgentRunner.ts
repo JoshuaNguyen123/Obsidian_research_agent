@@ -5972,6 +5972,11 @@ export async function runAgentMission({
     resumeSnapshot?.evidence ?? resumeLedger?.evidence ?? [];
   for (const evidence of restoredEvidence) {
     upsertMissionEvidenceRecord(missionEvidenceRecords, { ...evidence });
+    // A continuation is a new RunCoordinator segment. Re-emit restored
+    // evidence attestations (mirroring restored receipts) so Run Details and
+    // E2E attestations retain proof gathered by earlier segments instead of
+    // attesting only the final segment's fetches.
+    events.onMissionEvidence?.(toMissionEvidenceAttestation(evidence));
   }
   if (researchPlan && missionEvidenceRecords.length > 0) {
     researchPlan = applyResearchEvidence(researchPlan, missionEvidenceRecords);
