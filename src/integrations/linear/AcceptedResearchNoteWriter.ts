@@ -1255,8 +1255,10 @@ function assertProjectIdeaSeedMatchesAcceptedPackage(
     riskClass: seed.riskClass,
   };
   if (JSON.stringify(acceptedProjection) !== JSON.stringify(seedProjection)) {
-    // Name the drifted fields so a provider can repair by re-copying the
-    // exact seed values instead of failing the same way on every retry.
+    // Name the drifted fields and echo their exact seed values: a provider
+    // whose context no longer holds the brief verbatim cannot repair an
+    // exact-copy contract from the field name alone. The seed is the
+    // provider's own authored brief, so echoing it leaks nothing new.
     const driftedFields = (
       Object.keys(seedProjection) as Array<keyof typeof seedProjection>
     ).filter(
@@ -1264,8 +1266,11 @@ function assertProjectIdeaSeedMatchesAcceptedPackage(
         JSON.stringify(acceptedProjection[key]) !==
         JSON.stringify(seedProjection[key]),
     );
+    const expectations = driftedFields
+      .map((key) => `${key}=${JSON.stringify(seedProjection[key])}`)
+      .join("; ");
     throw new DurableLinearContractError(
-      `Accepted research fields drifted from their durable project idea seed. Drifted fields: ${driftedFields.join(", ") || "unknown"}. Copy each listed field exactly from the created project idea brief.`,
+      `Accepted research fields drifted from their durable project idea seed. Drifted fields: ${driftedFields.join(", ") || "unknown"}. Repair by passing each field exactly as seeded: ${expectations || "re-read the created project idea brief"}.`,
     );
   }
 }
