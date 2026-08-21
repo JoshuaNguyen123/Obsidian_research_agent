@@ -8,7 +8,7 @@ import { allowsWorkflowAuditBaselineBootstrap, applyE2eAiMode, applyE2eLane, app
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
 // @ts-ignore The production workflow-audit runner is an intentionally unbundled Node ESM script.
-import { runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_MODEL, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
+import { protectedWorkflowAuditManifestPathV1, runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_MODEL, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
 
 test("no Playwright lane runs against a mocked model", () => {
   const config = readFileSync(
@@ -205,6 +205,7 @@ test("full workflow audit routes independent functions and the joined journey se
     model: string | undefined;
   }> = [];
   const manifests: any[] = [];
+  const protectedManifests: Array<{ path: string; manifest: any }> = [];
   const result = await runWorkflowAuditE2eV1({
     platform: "win32",
     env: {
@@ -224,6 +225,12 @@ test("full workflow audit routes independent functions and the joined journey se
     },
     persistManifest: async (_path: string, manifest: unknown) => {
       manifests.push(JSON.parse(JSON.stringify(manifest)));
+    },
+    persistProtectedManifest: async (manifestPath: string, manifest: unknown) => {
+      protectedManifests.push({
+        path: manifestPath,
+        manifest: JSON.parse(JSON.stringify(manifest)),
+      });
     },
     readStageEvidence: async (stage: { realAi: boolean; verifier?: string }) => ({
       evidenceSource: "test-playwright-report.json",
@@ -282,6 +289,96 @@ test("full workflow audit routes independent functions and the joined journey se
   assert.equal(manifests.at(-1)?.stages?.[5]?.providerUsage?.modelCallCount, 3);
   assert.equal(manifests.at(-1)?.stages?.[7]?.receipts?.status, "verified_by_independent_verifier");
   assert.equal(manifests.at(-1)?.stages?.[0]?.elapsedMs, 0);
+  assert.equal(protectedManifests.length, 1);
+  assert.equal(protectedManifests[0]?.manifest.status, "passed");
+  assert.match(
+    protectedManifests[0]?.path.replace(/\\/gu, "/") ?? "",
+    new RegExp(`/\\.agentic-proof/${headSha}/workflow-audit-2026-08-19T12-00-00-000Z\\.json$`, "u"),
+  );
+});
+
+test("failed workflow audit preserves one protected exact-SHA red manifest", async () => {
+  const headSha = "b".repeat(40);
+  const protectedManifests: Array<{ path: string; manifest: any }> = [];
+  await assert.rejects(
+    () => runWorkflowAuditE2eV1({
+      platform: "win32",
+      env: {
+        WORKFLOW_AUDIT_LIVE_CONFIRMATION: WORKFLOW_AUDIT_CONFIRMATION,
+        WORKFLOW_AUDIT_EXPECTED_HEAD: headSha,
+        LINEAR_LIVE_TEST_TEAM_ID: "team-disposable",
+        E2E_GITHUB_TOKEN: `ghp_${"x".repeat(24)}`,
+      },
+      gitState: async () => ({ headSha, status: "" }),
+      runChild: async () => 1,
+      persistManifest: async () => undefined,
+      persistProtectedManifest: async (manifestPath: string, manifest: unknown) => {
+        protectedManifests.push({
+          path: manifestPath,
+          manifest: JSON.parse(JSON.stringify(manifest)),
+        });
+      },
+      now: () => new Date("2026-08-20T23:34:00.000Z"),
+    }),
+    /project_ideation_contract.*exited 1/u,
+  );
+  assert.equal(protectedManifests.length, 1);
+  assert.equal(protectedManifests[0]?.manifest.status, "failed");
+  assert.equal(protectedManifests[0]?.manifest.headSha, headSha);
+  assert.match(
+    protectedManifests[0]?.path.replace(/\\/gu, "/") ?? "",
+    new RegExp(`/\\.agentic-proof/${headSha}/workflow-audit-2026-08-20T23-34-00-000Z\\.json$`, "u"),
+  );
+});
+
+test("protected red evidence survives a final Playwright-manifest persistence failure", async () => {
+  const headSha = "d".repeat(40);
+  const protectedManifests: any[] = [];
+  let ordinaryPersistCount = 0;
+  await assert.rejects(
+    () => runWorkflowAuditE2eV1({
+      platform: "win32",
+      env: {
+        WORKFLOW_AUDIT_LIVE_CONFIRMATION: WORKFLOW_AUDIT_CONFIRMATION,
+        WORKFLOW_AUDIT_EXPECTED_HEAD: headSha,
+        LINEAR_LIVE_TEST_TEAM_ID: "team-disposable",
+        E2E_GITHUB_TOKEN: `ghp_${"x".repeat(24)}`,
+      },
+      gitState: async () => ({ headSha, status: "" }),
+      runChild: async () => 1,
+      persistManifest: async () => {
+        ordinaryPersistCount += 1;
+        if (ordinaryPersistCount > 1) {
+          throw new Error("test-results became unavailable");
+        }
+      },
+      persistProtectedManifest: async (_manifestPath: string, manifest: unknown) => {
+        protectedManifests.push(JSON.parse(JSON.stringify(manifest)));
+      },
+      now: () => new Date("2026-08-21T00:01:00.000Z"),
+    }),
+    /could not persist every final evidence copy/u,
+  );
+  assert.equal(protectedManifests.length, 1);
+  assert.equal(protectedManifests[0]?.status, "failed");
+  assert.match(
+    protectedManifests[0]?.failure ?? "",
+    /project_ideation_contract.*exited 1/u,
+  );
+});
+
+test("protected workflow audit paths are exact-SHA-owned outside Playwright output", () => {
+  const headSha = "c".repeat(40);
+  const protectedPath = protectedWorkflowAuditManifestPathV1(
+    headSha,
+    "2026-08-21T00:00:00.000Z",
+  ).replace(/\\/gu, "/");
+  assert.match(protectedPath, new RegExp(`/\\.agentic-proof/${headSha}/`, "u"));
+  assert.doesNotMatch(protectedPath, /test-results/u);
+  assert.throws(
+    () => protectedWorkflowAuditManifestPathV1("main", "2026-08-21T00:00:00.000Z"),
+    /full lowercase Git commit SHA/u,
+  );
 });
 
 test("missing BYOK baseline is allowed only for the explicitly authorized audit bootstrap", () => {

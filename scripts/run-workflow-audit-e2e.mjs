@@ -1,9 +1,14 @@
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import {
+  containsSensitiveProofText,
+  proofDirectoryForSha,
+} from "./run-targeted-protected-release.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(import.meta.url);
@@ -132,6 +137,8 @@ export async function runWorkflowAuditE2eV1(options = {}) {
   const runChild = options.runChild ?? runChildV1;
   const gitState = options.gitState ?? readGitStateV1;
   const persistManifest = options.persistManifest ?? persistManifestV1;
+  const persistProtectedManifest =
+    options.persistProtectedManifest ?? persistProtectedManifestV1;
   const readStageEvidence = options.readStageEvidence ?? readStageEvidenceV1;
   const now = options.now ?? (() => new Date());
   const before = await gitState();
@@ -153,8 +160,13 @@ export async function runWorkflowAuditE2eV1(options = {}) {
     "test-results",
     `workflow-audit-${expectedHead}.json`,
   );
+  const protectedManifestPath = protectedWorkflowAuditManifestPathV1(
+    expectedHead,
+    manifest.startedAt,
+  );
   await persistManifest(manifestPath, manifest);
 
+  let auditError = null;
   try {
     for (const stage of WORKFLOW_AUDIT_STAGES) {
       const boundary = await gitState();
@@ -235,18 +247,60 @@ export async function runWorkflowAuditE2eV1(options = {}) {
     }
     manifest.status = "passed";
     manifest.completedAt = now().toISOString();
-    await persistManifest(manifestPath, manifest);
-    console.log(
-      `Exact-HEAD workflow audit passed: head=${expectedHead} manifest=${manifestPath}`,
-    );
-    return manifest;
   } catch (error) {
+    auditError = error;
     manifest.status = "failed";
     manifest.completedAt = now().toISOString();
-    manifest.failure = String(error?.message ?? error).slice(0, 1_000);
-    await persistManifest(manifestPath, manifest);
-    throw error;
+    manifest.failure = sanitizeWorkflowAuditFailureV1(error);
   }
+  const persistence = await Promise.allSettled([
+    persistManifest(manifestPath, manifest),
+    persistProtectedManifest(protectedManifestPath, manifest),
+  ]);
+  const persistenceErrors = persistence.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (persistenceErrors.length > 0) {
+    throw new AggregateError(
+      [...(auditError ? [auditError] : []), ...persistenceErrors],
+      "Workflow audit could not persist every final evidence copy.",
+    );
+  }
+  if (auditError) throw auditError;
+  console.log(
+    `Exact-HEAD workflow audit passed: head=${expectedHead} manifest=${manifestPath} protected=${protectedManifestPath}`,
+  );
+  return manifest;
+}
+
+export function protectedWorkflowAuditManifestPathV1(headSha, startedAt) {
+  if (!/^[a-f0-9]{40}$/u.test(headSha)) {
+    throw new Error("Protected workflow audit path requires one full lowercase Git commit SHA.");
+  }
+  const timestamp = String(startedAt ?? "")
+    .replace(/[^A-Za-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 80);
+  if (!timestamp) {
+    throw new Error("Protected workflow audit path requires a bounded start timestamp.");
+  }
+  return path.join(
+    proofDirectoryForSha(headSha),
+    `workflow-audit-${timestamp}.json`,
+  );
+}
+
+function sanitizeWorkflowAuditFailureV1(error) {
+  return String(error?.message ?? error)
+    .replace(
+      /(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{16,})/giu,
+      "[credential redacted]",
+    )
+    .replace(/\b[A-Za-z]:[\\/][^\r\n"']+/gu, "[local path redacted]")
+    .replace(/https?:\/\/[^\s"')]+/giu, "[URL redacted]")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 1_000);
 }
 
 function deterministicStageEvidenceV1() {
@@ -438,6 +492,42 @@ async function execGitV1(args) {
 async function persistManifestV1(manifestPath, manifest) {
   await mkdir(path.dirname(manifestPath), { recursive: true });
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+}
+
+async function persistProtectedManifestV1(manifestPath, manifest) {
+  const envelope = {
+    version: 1,
+    kind: "exact_head_workflow_audit_manifest",
+    releaseSha: manifest.headSha,
+    capturedAt: manifest.completedAt,
+    payload: manifest,
+  };
+  const serialized = `${JSON.stringify(envelope, null, 2)}\n`;
+  if (containsSensitiveProofText(serialized)) {
+    throw new Error(
+      "Protected workflow audit manifest contains private or credential-bearing text.",
+    );
+  }
+  await mkdir(path.dirname(manifestPath), { recursive: true });
+  try {
+    await lstat(manifestPath);
+    throw new Error("Protected workflow audit manifest already exists.");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const temporaryPath = `${manifestPath}.tmp-${process.pid}`;
+  try {
+    await writeFile(temporaryPath, serialized, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    await rename(temporaryPath, manifestPath);
+    if (await readFile(manifestPath, "utf8") !== serialized) {
+      throw new Error("Protected workflow audit manifest failed exact readback.");
+    }
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
 }
 
 function runChildV1(command, args, options) {
