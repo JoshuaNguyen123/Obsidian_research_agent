@@ -959,3 +959,92 @@ function workUnitEvent(
       : [],
   });
 }
+
+test("a verified commit readback resolves its exact commit even without code lineage", async () => {
+  // Regression: a Phase B implementation run whose durable lineage begins at
+  // accepted_research has no code_execution/code_validation commit, so the
+  // exact-commit resolver was never consulted. The tool jumped straight to the
+  // latest durable handoff and then rejected it for not matching the commit
+  // the readback named -- the only outcome that ordering can produce. The
+  // audit saw it as "Resolved examples do not match the exact verified code
+  // commit." on the final node of the journey.
+  const vault = new MemoryVault();
+  vault.files.set(PATH, notebook());
+  const { examples } = verifiedCodeReflectionFixture();
+  const exactRequests: unknown[] = [];
+  let latestCalls = 0;
+  const prepared = await createJupyterReflectionTool().prepare!(
+    { path: PATH, markdown: MARKDOWN },
+    toolContext(vault, {
+      getProjectLineages: () => [],
+      getRepositoryProfileKeys: () => ["reflection-fixture"],
+      getProjectStageEvents: () => [commitReadbackEvent(examples.commitSha)],
+      resolveVerifiedCodeReflectionExamples: async (input) => {
+        exactRequests.push(input);
+        return input.commitSha === examples.commitSha ? examples : null;
+      },
+      resolveLatestVerifiedCodeReflectionExamples: async () => {
+        latestCalls += 1;
+        return null;
+      },
+    }),
+  );
+  assert.equal(prepared.ok, true, JSON.stringify(prepared));
+  assert.deepEqual(exactRequests, [
+    { repositoryProfileKey: "reflection-fixture", commitSha: examples.commitSha },
+  ]);
+  assert.equal(latestCalls, 0, "the latest handoff must not be consulted once the exact commit resolves");
+});
+
+test("a commit mismatch names both revisions instead of a bare rejection", async () => {
+  const vault = new MemoryVault();
+  vault.files.set(PATH, notebook());
+  const { examples } = verifiedCodeReflectionFixture();
+  const expected = `${"c".repeat(40)}`;
+  const prepared = await createJupyterReflectionTool().prepare!(
+    { path: PATH, markdown: MARKDOWN },
+    toolContext(vault, {
+      getProjectLineages: () => [],
+      getRepositoryProfileKeys: () => ["reflection-fixture"],
+      originalPrompt:
+        'Record the completed code and validation reflection into `' +
+        PATH +
+        '` with concise examples.',
+      getProjectStageEvents: () => [commitReadbackEvent(expected)],
+      resolveVerifiedCodeReflectionExamples: async () => null,
+      resolveLatestVerifiedCodeReflectionExamples: async () => examples,
+    }),
+  );
+  assert.equal(prepared.ok, false);
+  if (!prepared.ok) {
+    assert.equal(prepared.error.code, "jupyter_reflection_code_examples_unavailable");
+    assert.ok(
+      prepared.error.message.includes(examples.commitSha) &&
+        prepared.error.message.includes(expected),
+      prepared.error.message,
+    );
+  }
+  assert.equal(vault.writes, 0);
+});
+
+function commitReadbackEvent(commitSha: string): ProjectStageEventV1 {
+  return createProjectStageEventV1({
+    schemaVersion: 1,
+    runId: RUN_ID,
+    phase: "test",
+    evidenceKind: "commit_readback",
+    disposition: "verified",
+    occurredAt: "2026-08-21T18:55:00.000Z",
+    sourceReceiptId: "receipt-commit-verified-1",
+    evidenceFingerprint: SHA("f"),
+    resource: {
+      system: "git",
+      resourceType: "verified_local_commit",
+      id: "verified-local-commit-1",
+      url: null,
+      path: null,
+      revision: commitSha,
+    },
+    workUnits: [],
+  });
+}

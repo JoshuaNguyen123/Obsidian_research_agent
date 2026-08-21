@@ -668,6 +668,7 @@ async function resolveCurrentRunCodeExamples(
     ? commitEvent.resource.revision ?? commitEvent.resource.id
     : null;
   let expectedCommitSha = eventCommitSha;
+  let triedExactCommitSha: string | null = null;
   try {
     if (
       codeCommit?.proof.stage === "code_execution" ||
@@ -679,11 +680,36 @@ async function resolveCurrentRunCodeExamples(
         );
       }
       expectedCommitSha = codeCommit.proof.commitSha;
+      triedExactCommitSha = codeCommit.proof.commitSha;
       resolved =
         (await context.resolveVerifiedCodeReflectionExamples?.({
           repositoryProfileKey: codeCommit.proof.repositoryProfileKey,
           commitSha: codeCommit.proof.commitSha,
         })) ?? null;
+    }
+    if (
+      !resolved &&
+      expectedCommitSha !== null &&
+      expectedCommitSha !== triedExactCommitSha &&
+      context.resolveVerifiedCodeReflectionExamples
+    ) {
+      // A verified commit readback can name the exact commit even when the
+      // durable project lineage carries no code stage for this run (a Phase B
+      // implementation run whose lineage begins at accepted_research). Ask for
+      // that exact commit before considering the latest durable handoff:
+      // resolving "latest" first and then rejecting it for not matching is the
+      // only outcome that path can produce.
+      try {
+        triedExactCommitSha = expectedCommitSha;
+        resolved =
+          (await context.resolveVerifiedCodeReflectionExamples({
+            repositoryProfileKey: resolveRepositoryProfileKey(context),
+            commitSha: expectedCommitSha,
+          })) ?? null;
+      } catch {
+        // An ambiguous repository profile is not fatal here; the latest
+        // durable handoff below remains a valid source.
+      }
     }
     if (!resolved && codeCompletionRequested) {
       const repositoryProfileKey = resolveRepositoryProfileKey(context);
@@ -717,13 +743,19 @@ async function resolveCurrentRunCodeExamples(
       `The host returned invalid exact-commit examples: ${safeErrorMessage(error)}`,
     );
   }
-  if (
-    (expectedCommitSha !== null && parsed.commitSha !== expectedCommitSha) ||
-    parsed.examples.length < 1
-  ) {
+  if (parsed.examples.length < 1) {
     throw notApplied(
       "jupyter_reflection_code_examples_unavailable",
-      "Resolved examples do not match the exact verified code commit.",
+      `Exact-commit examples for ${parsed.commitSha} contained no usable source excerpt.`,
+    );
+  }
+  if (expectedCommitSha !== null && parsed.commitSha !== expectedCommitSha) {
+    // Name both revisions. These are Git object ids for a disposable
+    // workspace, not secrets, and a bare "do not match" left three audit runs
+    // unable to tell a stale handoff from a mislabelled expectation.
+    throw notApplied(
+      "jupyter_reflection_code_examples_unavailable",
+      `Resolved examples are bound to commit ${parsed.commitSha}, not the verified ${expectedCommitSha}.`,
     );
   }
   const reportExamples = commitEvent
