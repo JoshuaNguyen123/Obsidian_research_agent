@@ -1027,6 +1027,43 @@ test("a commit mismatch names both revisions instead of a bare rejection", async
   assert.equal(vault.writes, 0);
 });
 
+test("a checkpoint sequence revision never poses as the verified commit", async () => {
+  // Regression: code_commit_verified prepares against the durable repair
+  // checkpoint, so its receipt resource carries the checkpoint id and that
+  // checkpoint sequence ("1") as the revision -- there is no Git object id in
+  // it. Treating that as the expected commit made the final journey node fail
+  // with "Resolved examples are bound to commit 7b407a2c..., not the verified 1".
+  const vault = new MemoryVault();
+  vault.files.set(PATH, notebook());
+  const { examples } = verifiedCodeReflectionFixture();
+  let exactCalls = 0;
+  const prepared = await createJupyterReflectionTool().prepare!(
+    { path: PATH, markdown: MARKDOWN },
+    toolContext(vault, {
+      getProjectLineages: () => [],
+      getRepositoryProfileKeys: () => ["reflection-fixture"],
+      originalPrompt:
+        'Record the completed code and validation reflection into `' +
+        PATH +
+        '` with concise examples.',
+      getProjectStageEvents: () => [commitReadbackEvent("1")],
+      resolveVerifiedCodeReflectionExamples: async () => {
+        exactCalls += 1;
+        return null;
+      },
+      resolveLatestVerifiedCodeReflectionExamples: async () => examples,
+    }),
+  );
+  assert.equal(prepared.ok, true, JSON.stringify(prepared));
+  assert.equal(
+    exactCalls,
+    0,
+    "a checkpoint sequence must not be looked up as a commit",
+  );
+  if (prepared.ok) {
+    assert.equal(prepared.action.normalizedArgs.codeExamples === null, false);
+  }
+});
 function commitReadbackEvent(commitSha: string): ProjectStageEventV1 {
   return createProjectStageEventV1({
     schemaVersion: 1,

@@ -625,6 +625,9 @@ function composeNotebookReportMarkdown(
   return `${renderProjectRunReportMarkdownV1(report).trimEnd()}\n\n## Supplemental assistant notes\n\n> These notes are bounded assistant prose, not completion evidence. Phase status is derived only from the host evidence above.\n\n${assistantMarkdown.trim()}\n`;
 }
 
+/** Git object ids are 40-hex (SHA-1) or 64-hex (SHA-256 repositories). */
+const GIT_COMMIT_SHA_V1 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+
 async function resolveCurrentRunCodeExamples(
   context: ToolExecutionContext,
   runId: string,
@@ -664,9 +667,21 @@ async function resolveCurrentRunCodeExamples(
     return { bundle: null, reportExamples: [] };
   }
   let resolved: VerifiedCodeReflectionExamplesV1 | null = null;
-  const eventCommitSha = commitEvent
+  // A commit_readback event proves a verified local commit happened, but its
+  // resource is the durable repair checkpoint: the id is the checkpoint id and
+  // the revision is that checkpoint's sequence number ("1"), never a Git
+  // object id. Reading it as a commit sha made the tool demand that the
+  // resolved examples be "bound to commit 1" and blocked the final node of the
+  // journey. Only a value that is actually a commit id may constrain which
+  // commit the examples must come from; otherwise the durable publication
+  // handoff remains the authority.
+  const rawEventRevision = commitEvent
     ? commitEvent.resource.revision ?? commitEvent.resource.id
     : null;
+  const eventCommitSha =
+    rawEventRevision !== null && GIT_COMMIT_SHA_V1.test(rawEventRevision)
+      ? rawEventRevision
+      : null;
   let expectedCommitSha = eventCommitSha;
   let triedExactCommitSha: string | null = null;
   try {
