@@ -4,6 +4,10 @@ import {
   escalateMissionEffortDecisionForResearchV1,
   resolveMissionEffortDecisionV1,
 } from "../src/agent/missionEffortDecision";
+import {
+  detectProjectLifecycleStagesV1,
+  missionRequiresExtendedEffortBudgetV1,
+} from "../src/agent/projectLifecycle";
 
 const ORCHESTRATION_GUIDE_PROMPT =
   "I want you to write me an in depth guide/report to agent orchestration. What is it, why is it important, and then finally how to execute agent orcehstration sucessfully.";
@@ -202,4 +206,87 @@ test("extended research requires explicit research language and honors lower cei
   assert.equal(decision.maxToolCalls, 7);
   assert.equal(decision.maxWallClockMs, 4 * 60_000);
   assert.equal(decision.maxSegments, 3);
+});
+
+// A code-delivery mission commits the whole workspace ladder — sandbox status,
+// workspace create, file create, fast/targeted/full validation, directory
+// export — before any repair. Escalating only on multi-stage prompts left that
+// mission on the compose budget: 4 tool calls and a 3-minute wall clock, which
+// killed it mid-validation and left a continuation the reconciler refused.
+const DESKTOP_CODE_PROMPT =
+  "write a number guessing game in Python on my desktop";
+const CODE_LADDER_TOOL_COUNT = 7;
+
+test("a single detected code stage escalates out of the compose budget", () => {
+  assert.equal(
+    missionRequiresExtendedEffortBudgetV1(DESKTOP_CODE_PROMPT),
+    true,
+    "one code_execution stage must escalate on its own",
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(DESKTOP_CODE_PROMPT),
+    ["code_execution"],
+    "the guard must still fire on a genuinely single-stage prompt",
+  );
+
+  const starved = resolveMissionEffortDecisionV1({
+    prompt: DESKTOP_CODE_PROMPT,
+    route: "mission",
+    outputTarget: "chat",
+    configuredMaxRunMinutes: 35,
+  });
+  const escalated = resolveMissionEffortDecisionV1({
+    prompt: DESKTOP_CODE_PROMPT,
+    route: "mission",
+    outputTarget: "chat",
+    configuredMaxRunMinutes: 35,
+    forceExtendedTeam: missionRequiresExtendedEffortBudgetV1(
+      DESKTOP_CODE_PROMPT,
+    ),
+  });
+
+  // The regression this pins: the un-escalated budget cannot even reach the
+  // export receipt the lane requires.
+  assert.ok(
+    starved.maxToolCalls < CODE_LADDER_TOOL_COUNT,
+    `compose was expected to starve the ladder, got ${starved.maxToolCalls}`,
+  );
+  assert.ok(
+    escalated.maxToolCalls >= CODE_LADDER_TOOL_COUNT,
+    `escalated tool budget ${escalated.maxToolCalls} cannot run the ${CODE_LADDER_TOOL_COUNT}-tool ladder`,
+  );
+  assert.ok(
+    escalated.maxWallClockMs >= 10 * 60_000,
+    `escalated wall clock ${escalated.maxWallClockMs} is below the observed 7.7-minute success`,
+  );
+  assert.ok(
+    escalated.maxModelCalls >= starved.maxModelCalls &&
+      escalated.maxToolCalls >= starved.maxToolCalls &&
+      escalated.maxWallClockMs >= starved.maxWallClockMs,
+    "escalation must never lower a budget",
+  );
+});
+
+test("escalation still respects the caller's configured ceilings", () => {
+  const decision = resolveMissionEffortDecisionV1({
+    prompt: DESKTOP_CODE_PROMPT,
+    route: "mission",
+    outputTarget: "chat",
+    configuredMaxModelCalls: 9,
+    configuredMaxToolCalls: 9,
+    configuredMaxRunMinutes: 2,
+    forceExtendedTeam: true,
+  });
+  assert.equal(decision.maxModelCalls, 9);
+  assert.equal(decision.maxToolCalls, 9);
+  assert.equal(decision.maxWallClockMs, 2 * 60_000);
+});
+
+test("a prompt with no code stage keeps the cheap budget", () => {
+  assert.equal(
+    missionRequiresExtendedEffortBudgetV1(
+      "summarize the note I have open in three bullets",
+    ),
+    false,
+  );
 });

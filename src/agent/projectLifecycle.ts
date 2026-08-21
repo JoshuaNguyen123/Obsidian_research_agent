@@ -1046,6 +1046,28 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   return PROJECT_LIFECYCLE_STAGES.filter((stage) => stages.includes(stage));
 }
 
+/**
+ * Whether a prompt's detected lifecycle already implies more tool calls than
+ * the default compose budget grants.
+ *
+ * Escalating only on a multi-stage prompt starved the single most tool-hungry
+ * mission there is. "write a number guessing game in Python on my desktop"
+ * detects exactly one stage (code_execution) and so drew compose: 6 model
+ * calls, 4 tool calls, a 3-minute wall clock. One code_execution stage already
+ * commits the workspace ladder — sandbox status, workspace create, file
+ * create, fast/targeted/full validation, directory export — which is seven
+ * tools before any repair. The run died on the wall clock mid-validation and
+ * its continuation was then refused as an unreconciled mutation.
+ *
+ * A detected code stage therefore escalates on its own. Budgets stay clamped
+ * by the caller's configured ceilings, so this raises the floor without
+ * removing any user-facing cap.
+ */
+export function missionRequiresExtendedEffortBudgetV1(command: string): boolean {
+  const stages = detectProjectLifecycleStagesV1(command);
+  return stages.length > 1 || stages.includes("code_execution");
+}
+
 export function detectProjectLifecycleStagesV2(
   command: string,
 ): ProjectLifecycleStageV2[] {

@@ -35,6 +35,7 @@ import type { AutonomyEffectClass } from "./autonomyEffectClass";
 import { detectLinearIntent } from "./linearIntent";
 import {
   detectProjectLifecycleStagesV1,
+  missionRequiresExtendedEffortBudgetV1,
 } from "./projectLifecycle";
 import {
   classifyMissionSpeechAct,
@@ -202,7 +203,7 @@ export function createRunPlan({
       configuredMaxModelCalls: configuredMaxSteps,
       configuredMaxToolCalls: configuredMaxSteps,
       configuredMaxRunMinutes: settings?.maxRunMinutes,
-      forceExtendedTeam: detectProjectLifecycleStagesV1(prompt).length > 1,
+      forceExtendedTeam: missionRequiresExtendedEffortBudgetV1(prompt),
     });
     return {
       route,
