@@ -41,6 +41,7 @@ export {
   CodeRepairToolRuntimeErrorV1,
   CodeRepairToolRuntimeV1,
   createCodeRepairToolRuntimeV1,
+  parseCommitArgs,
   type CodeRepairToolRuntimeDependenciesV1,
   type RepositoryProfileResolutionForRepairV1,
   type RepositoryProfileResolverForRepairV1,

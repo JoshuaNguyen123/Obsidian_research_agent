@@ -17,6 +17,7 @@ import {
   CallbackCodeRepairCheckpointStoreV1,
   codeRepairCheckpointIdV1,
   createCodeRepairToolRuntimeV1,
+  parseCommitArgs,
   type ArtifactHashReadbackV1,
   type CallbackCheckpointPersistenceV1,
   type CodeCommitReadbackV1,
@@ -946,3 +947,27 @@ function patchFor(changedPath: string): string {
     "",
   ].join("\n");
 }
+
+test("code_commit_verified tolerates the advisory fields its description invites", () => {
+  // Regression: the tool description told the model "Required: commit message
+  // + validation receipt ids" while the exact-key parser rejected both, so a
+  // model following the description failed twice and blocked the commit node.
+  const parsed = parseCommitArgs({
+    runId: "run-2026-08-21T14-38-07.528Z-66db5a52db68",
+    workspaceId: "ws-1",
+    requestId: "req-1",
+    commitMessage: "Implement the CRDT library",
+    validationReceiptId: "validation-receipt-7",
+  });
+  assert.equal(parsed.scope.requestId, "req-1");
+  assert.equal(parsed.targetedValidationReceiptId, null);
+  assert.equal(parsed.fullValidationReceiptId, null);
+  assert.throws(
+    () => parseCommitArgs({ runId: "r", workspaceId: "w", requestId: "q", branch: "main" }),
+    /Unexpected: branch\. Required: runId, workspaceId, requestId\./u,
+  );
+  assert.throws(
+    () => parseCommitArgs({ runId: "r", workspaceId: "w" }),
+    /Missing: requestId\./u,
+  );
+});

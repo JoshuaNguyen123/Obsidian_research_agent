@@ -1575,7 +1575,7 @@ function parseCycleArgs(args: Record<string, unknown>): {
   };
 }
 
-function parseCommitArgs(args: Record<string, unknown>): {
+export function parseCommitArgs(args: Record<string, unknown>): {
   scope: CodeRepairScopeArgsV1;
   checkpointSequence: number | null;
   diffFingerprint: string | null;
@@ -1585,8 +1585,23 @@ function parseCommitArgs(args: Record<string, unknown>): {
   const optionalKeys = [
     "checkpointSequence", "diffFingerprint",
     "targetedValidationReceiptId", "fullValidationReceiptId",
+    // Advisory fields a model reasonably sends to a commit tool. The host
+    // derives the commit message from the mission and resolves the latest
+    // passing targeted/full receipts itself, so these are validated for shape
+    // and otherwise ignored — rejecting them blocked a verified commit twice
+    // in a row and stranded the whole publication behind it.
+    "commitMessage", "validationReceiptId",
   ].filter((key) => args[key] !== undefined);
-  assertExactKeys(args, ["runId", "workspaceId", "requestId", ...optionalKeys]);
+  assertKeyContract(args, {
+    required: ["runId", "workspaceId", "requestId"],
+    optional: optionalKeys,
+  });
+  if (args.commitMessage !== undefined) {
+    boundedString(args.commitMessage, "commitMessage", 1, 4_000);
+  }
+  if (args.validationReceiptId !== undefined) {
+    identifier(args.validationReceiptId, "validationReceiptId");
+  }
   return {
     scope: parseScope(args),
     checkpointSequence: args.checkpointSequence === undefined
@@ -2480,8 +2495,38 @@ function assertExactKeys(
   const actual = Object.keys(value).sort();
   const expected = [...allowed].sort();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`Unexpected or missing fields: ${actual.join(", ")}.`);
+    const unexpected = actual.filter((key) => !expected.includes(key));
+    const missing = expected.filter((key) => !actual.includes(key));
+    throw new Error(
+      `Unexpected or missing fields. ${
+        unexpected.length > 0 ? `Unexpected: ${unexpected.join(", ")}. ` : ""
+      }${missing.length > 0 ? `Missing: ${missing.join(", ")}. ` : ""}Allowed: ${expected.join(", ")}.`,
+    );
   }
+}
+
+/**
+ * Model-facing argument contract: required keys must all be present, optional
+ * keys may be present, anything else is rejected — and the error names the
+ * contract, so a model can repair its next call instead of guessing from an
+ * echo of its own keys.
+ */
+function assertKeyContract(
+  value: Record<string, unknown>,
+  contract: { required: readonly string[]; optional: readonly string[] },
+): void {
+  const actual = Object.keys(value);
+  const allowed = new Set([...contract.required, ...contract.optional]);
+  const unexpected = actual.filter((key) => !allowed.has(key));
+  const missing = contract.required.filter((key) => !actual.includes(key));
+  if (unexpected.length === 0 && missing.length === 0) return;
+  throw new Error(
+    `Unexpected or missing fields. ${
+      unexpected.length > 0 ? `Unexpected: ${unexpected.join(", ")}. ` : ""
+    }${missing.length > 0 ? `Missing: ${missing.join(", ")}. ` : ""}Required: ${contract.required.join(", ")}.${
+      contract.optional.length > 0 ? ` Optional: ${contract.optional.join(", ")}.` : ""
+    }`,
+  );
 }
 
 function comparePath<T extends { path: string }>(left: T, right: T): number {

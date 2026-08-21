@@ -1615,12 +1615,28 @@ test("CodeExtensionRuntimeV2 publishes real tool contributions and probes only i
           (candidate as { tool: { name: string } }).tool.name === toolName,
       );
       const parameters = (contribution as {
-        tool: { parameters: { properties?: Record<string, unknown> } };
+        tool: {
+          parameters: {
+            properties?: Record<string, unknown>;
+            required?: string[];
+          };
+        };
       }).tool.parameters;
+      // Checkpoint sequence, diff fingerprint, and validation receipt ids are
+      // proof and stay host-resolved. The commit tool additionally accepts an
+      // optional advisory commitMessage because its description invites one;
+      // the host still derives the final message.
       assert.deepEqual(
         Object.keys(parameters.properties ?? {}).sort(),
-        ["requestId", "runId", "workspaceId"],
+        toolName === CODE_COMMIT_VERIFIED_TOOL
+          ? ["commitMessage", "requestId", "runId", "workspaceId"]
+          : ["requestId", "runId", "workspaceId"],
         `${toolName} must resolve checkpoint and validation proof on the host`,
+      );
+      assert.deepEqual(
+        [...(parameters.required ?? [])].sort(),
+        ["requestId", "runId", "workspaceId"],
+        `${toolName} must require only the host-bound scope`,
       );
     }
     for (const required of [

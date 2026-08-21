@@ -214,12 +214,20 @@ export function createCodeRepairToolContributionsV1(
       descriptor: contributionDescriptor(CODE_COMMIT_VERIFIED_TOOL, "Commit verified code"),
       tool: {
         name: CODE_COMMIT_VERIFIED_TOOL,
-        description:
-          "Purpose: Host git add of changed paths + verified commit + handoff SHA. Use when: fast (+ ladder) validation passed. Do not use when: before passed fast; do not invent git_commit/git_add. Required: commit message + validation receipt ids. Next: GitHub publish_draft. Side effects: bound. Execute an exact prepared local commit only after protected approvals, artifact readback, and fresh targeted/full sandbox validation.",
+        description: hostResolvesDurableProof
+          ? "Purpose: Host git add of changed paths + verified commit + handoff SHA. Use when: fast (+ ladder) validation passed. Do not use when: before passed fast; do not invent git_commit/git_add. Arguments: runId, workspaceId, requestId (host-bound). The host derives the commit message from the mission and resolves the latest passing targeted and full validation receipts itself; an optional commitMessage is accepted as advisory. Next: GitHub publish_draft. Side effects: bound. Execute an exact prepared local commit only after protected approvals, artifact readback, and fresh targeted/full sandbox validation."
+          : "Purpose: Host git add of changed paths + verified commit + handoff SHA. Use when: fast (+ ladder) validation passed. Do not use when: before passed fast; do not invent git_commit/git_add. Required: checkpointSequence + targetedValidationReceiptId + fullValidationReceiptId; an optional commitMessage is accepted as advisory. Next: GitHub publish_draft. Side effects: bound. Execute an exact prepared local commit only after protected approvals, artifact readback, and fresh targeted/full sandbox validation.",
         parameters: {
           ...scopeSchema(),
           properties: {
             ...scopeSchema().properties,
+            commitMessage: {
+              type: "string",
+              minLength: 1,
+              maxLength: 4000,
+              description:
+                "Optional advisory commit message; the host derives the final message from the mission.",
+            },
             ...(hostResolvesDurableProof ? {} : {
               checkpointSequence: { type: "integer", minimum: 0 },
               diffFingerprint: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
