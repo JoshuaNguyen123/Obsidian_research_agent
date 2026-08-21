@@ -272,24 +272,12 @@ test("runner retries only the terminal Linear drain after a durable canonical re
   assert.doesNotMatch(verifyBlock, /toolExecutor\.execute/u);
 });
 
-test("GitHub finalization persists an exact prepared note receipt before lineage and uses status for project missions", async () => {
+test("GitHub finalization records the note reflection as vault proof, never as an external receipt", async () => {
   const source = await readFile(mainSourceUrl, "utf8");
   const finalize = source.indexOf("finalizeObsidian: async (");
   const plan = source.indexOf(
     "await noteWriter.planProjectCompletionReflection(",
     finalize,
-  );
-  const existingReceipt = source.indexOf(
-    "const existingReflectionReceipt = this.externalActionReceiptLedger.entries",
-    plan,
-  );
-  const reconcileReceipt = source.indexOf(
-    "await this.appendExternalActionReceipt(existingReflectionReceipt)",
-    existingReceipt,
-  );
-  const reconcileLineage = source.indexOf(
-    "await this.persistFinalizedGitHubPublicationLineage({",
-    reconcileReceipt,
   );
   const prepared = source.indexOf(
     "const preparedAction = await withPreparedActionFingerprint({",
@@ -301,69 +289,85 @@ test("GitHub finalization persists an exact prepared note receipt before lineage
     approval,
   );
   const receipt = source.indexOf("const reflectionReceipt: ActionReceipt", finalize);
-  const persistReceipt = source.indexOf(
-    "await this.appendExternalActionReceipt(reflectionReceipt)",
-    receipt,
-  );
   const persistLineage = source.indexOf(
     "await this.persistFinalizedGitHubPublicationLineage({",
-    persistReceipt,
+    receipt,
   );
-  const block = source.slice(receipt, persistLineage);
+  // finalizeObsidian is the last finalizer in the object literal, so bound it
+  // by its own return rather than by a sibling key that appears earlier.
+  const finalizeReturn = source.indexOf("return {", persistLineage);
+  const finalizeObsidianSource = source.slice(finalize, finalizeReturn);
 
   assert.ok(finalize >= 0);
   assert.ok(plan > finalize);
-  assert.ok(existingReceipt > plan);
-  assert.ok(reconcileReceipt > existingReceipt);
-  assert.ok(reconcileLineage > reconcileReceipt);
-  assert.ok(prepared > reconcileLineage);
   assert.ok(prepared > plan);
   assert.ok(approval > prepared);
   assert.ok(exactCommit > approval);
-  assert.ok(receipt > finalize);
-  assert.ok(persistReceipt > receipt);
-  assert.ok(persistLineage > persistReceipt);
-  assert.match(block, /payloadFingerprint: preparedAction\.payloadFingerprint/u);
-  assert.match(block, /grantId: approval\.approvalId/u);
-  assert.match(block, /observedFingerprint: result\.afterSha256/u);
+  assert.ok(receipt > exactCommit);
+  assert.ok(persistLineage > receipt);
+  assert.ok(finalizeReturn > persistLineage);
+  // The slice must really be the reflection finalizer, or the guards below
+  // would pass vacuously.
+  for (const marker of [
+    "planProjectCompletionReflection",
+    "appendPreparedProjectCompletionReflection",
+    "persistFinalizedGitHubPublicationLineage",
+  ]) {
+    assert.ok(finalizeObsidianSource.includes(marker), marker);
+  }
 
-  const retryReconciliationBlock = source.slice(
-    existingReceipt,
-    prepared,
+  // Regression: the finalizer used to push this vault receipt into the
+  // external action receipt ledger, which accepts Linear and GitHub proof
+  // only and rejects every other system by contract. The append threw after
+  // the note bytes were already committed, so publish_verified_code_to_github
+  // blocked with "the originating Markdown reflection remains pending" and no
+  // stated cause. A vault write is proved by the note revision, the
+  // publication checkpoint obsidianReceiptId, and the project lineage.
+  assert.ok(
+    !finalizeObsidianSource.includes("appendExternalActionReceipt"),
+    "the note reflection must not enter the Linear/GitHub external proof ledger",
   );
-  assert.match(
-    retryReconciliationBlock,
-    /existingReflectionReceipt\.readback\?\.status === "verified"/u,
+  assert.ok(
+    !finalizeObsidianSource.includes("externalActionReceiptLedger"),
+    "a vault receipt can never be found in the external ledger, so it must not be searched there",
   );
-  assert.match(
-    retryReconciliationBlock,
-    /reflectionPlan\.expectedAfterSha256/u,
-  );
+  assert.ok(finalizeObsidianSource.includes("system: \"vault\""));
+
+  const block = source.slice(receipt, persistLineage);
+  for (const fragment of [
+    "payloadFingerprint: preparedAction.payloadFingerprint",
+    "grantId: approval.approvalId",
+    "observedFingerprint: result.afterSha256",
+  ]) {
+    assert.ok(block.includes(fragment), fragment);
+  }
 
   const preparedBlock = source.slice(prepared, approval);
-  assert.match(preparedBlock, /proposedAppendMarkdown: reflectionPlan\.proposedAppendMarkdown/u);
-  assert.match(preparedBlock, /proposedAppendSha256: reflectionPlan\.proposedAppendSha256/u);
-  assert.match(preparedBlock, /expectedAfterSha256: reflectionPlan\.expectedAfterSha256/u);
-  assert.match(preparedBlock, /markdownExcerpt: reflectionPlan\.markdownExcerpt/u);
-  assert.match(preparedBlock, /codeExcerpt: reflectionPlan\.codeExcerpt/u);
-  assert.match(preparedBlock, /outboundBytes: reflectionPlan\.proposedAppendBytes/u);
+  for (const fragment of [
+    "proposedAppendMarkdown: reflectionPlan.proposedAppendMarkdown",
+    "proposedAppendSha256: reflectionPlan.proposedAppendSha256",
+    "expectedAfterSha256: reflectionPlan.expectedAfterSha256",
+    "markdownExcerpt: reflectionPlan.markdownExcerpt",
+    "codeExcerpt: reflectionPlan.codeExcerpt",
+    "outboundBytes: reflectionPlan.proposedAppendBytes",
+    "presentation: reflectionPlan.presentation",
+  ]) {
+    assert.ok(preparedBlock.includes(fragment), fragment);
+  }
+
   const finalizeBlock = source.slice(finalize, receipt);
-  assert.match(
-    finalizeBlock,
-    /candidate\.commits\.some\(\(commit\) => commit\.stage === "linear_hierarchy"\)/u,
+  assert.ok(
+    finalizeBlock.includes("commit.stage === \"linear_hierarchy\""),
   );
-  assert.match(
-    finalizeBlock,
-    /projectLineage \? "delivery_status" : "full_reflection"/u,
+  assert.ok(
+    finalizeBlock.includes("projectLineage ? \"delivery_status\" : \"full_reflection\""),
   );
-  assert.match(preparedBlock, /presentation: reflectionPlan\.presentation/u);
+
   const approvalToCommit = source.slice(approval, receipt);
-  assert.match(
-    approvalToCommit,
-    /approval\.approvalFingerprint !== preparedAction\.payloadFingerprint/u,
-  );
-  assert.match(
-    approvalToCommit,
-    /approvedAppendMarkdown !== reflectionPlan\.proposedAppendMarkdown/u,
-  );
+  for (const fragment of [
+    "approval.approvalFingerprint !== preparedAction.payloadFingerprint",
+    "approvedAppendMarkdown !== reflectionPlan.proposedAppendMarkdown",
+  ]) {
+    assert.ok(approvalToCommit.includes(fragment), fragment);
+  }
 });
