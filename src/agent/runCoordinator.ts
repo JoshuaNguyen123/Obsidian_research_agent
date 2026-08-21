@@ -778,6 +778,11 @@ function isAttestedDiagnosticTraceId(id: string): boolean {
     /^(?:agent-step-response-|loop-decision-|model-retry-|model-wait-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|committed-write-acceptance-invariant-|wall-clock-budget-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|checkpoint-resume:|mission-ledger-resume:invalid-handoff$|resume-mutation-reconciliation-required$|operation-goals:)/u.test(
       id,
     ) ||
+    // A create-file collision replans into read -> write_expected. When that
+    // replan is refused, its reason is the only thing that distinguishes a
+    // recoverable collision from a dead frontier, and the model is left
+    // calling a tool whose own advice names an unavailable sibling.
+    id.endsWith(":create-file-collision-replan-failed") ||
     id.endsWith(":proof-gated-writeback-rejected") ||
     id.endsWith(":rejected") ||
     id.endsWith(":append_to_current_file:result") ||

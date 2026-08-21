@@ -1220,3 +1220,30 @@ test("run coordinator attests in-flight model retry and wait diagnostics", async
     ["model-wait-10-1", "model-retry-10-2"],
   );
 });
+
+test("a refused create-file collision replan is attested with its reason", async () => {
+  // Regression: the desktop audit lane blocked because code_workspace_create_file
+  // hit an existing file and the read -> write_expected replan was refused. The
+  // refusal reason was emitted but not attested, so the failure snapshot showed
+  // only a model that stopped calling tools against an unchanged frontier.
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onTrace?.({
+      id: "3:0:code_workspace_create_file:create-file-collision-replan-failed",
+      kind: "error",
+      step: 3,
+      toolName: "code_workspace_create_file",
+      message:
+        "The create-file collision could not be replanned into an exact hash-bound repair.",
+      error: {
+        code: "create_file_collision_replan_failed",
+        message: "Create-file collision repair path main.py does not match the trusted graph selector game.py.",
+      },
+    });
+    events.onRunComplete?.({ step: 3, maxSteps: 16, stopReason: "error" });
+  });
+
+  const attested = coordinator.getSnapshot().diagnosticAttestations;
+  assert.equal(attested.length, 1);
+  assert.equal(attested[0]?.errorCode, "create_file_collision_replan_failed");
+});
