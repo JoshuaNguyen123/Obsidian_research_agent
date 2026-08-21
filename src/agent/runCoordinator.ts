@@ -209,6 +209,44 @@ export class RunCoordinator {
     };
   }
 
+  /**
+   * Adds a bounded host diagnostic directly to Run Details. This bypasses the
+   * model event/history stream and is intended for failures in host-owned
+   * finalizers that would otherwise collapse to a generic workflow blocker.
+   */
+  recordHostDiagnostic(input: {
+    id: string;
+    kind?: string;
+    toolName?: string;
+    message: string;
+    errorCode: string;
+  }): void {
+    const attestation: RunDiagnosticAttestationV1 = {
+      schemaVersion: 1,
+      id: sanitizeTerminalDiagnostic(input.id, 160) || "host-diagnostic",
+      kind: sanitizeTerminalDiagnostic(input.kind ?? "error", 40) || "error",
+      ...(input.toolName
+        ? { toolName: sanitizeTerminalDiagnostic(input.toolName, 120) }
+        : {}),
+      message: sanitizeTerminalDiagnostic(input.message, 500),
+      errorCode:
+        sanitizeTerminalDiagnostic(input.errorCode, 80) ||
+        "host_finalizer_failed",
+      missing: [],
+    };
+    if (
+      this.diagnosticAttestations.some(
+        (item) =>
+          item.id === attestation.id &&
+          item.message === attestation.message,
+      )
+    ) return;
+    this.diagnosticAttestations.push(attestation);
+    if (this.diagnosticAttestations.length > 128) {
+      this.diagnosticAttestations.shift();
+    }
+  }
+
   subscribe(
     listener: AgentRunEvents,
     options: { replay?: boolean } = {},

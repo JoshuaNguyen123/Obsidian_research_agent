@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "artifact": "companion-assets.json",
-  "bundleHash": "sha256:4979a8ce6018325048b88539509f33e409ff8c37828a51cb27f50b6f7f83173c",
+  "bundleHash": "sha256:4229b11decb82063e45e28be57de7814a523cb29d5fc6ebec5d23f5477004ee3",
   "fileHashes": {
     "auth.py": "sha256:b1238fd68b75310637cb4c1a58994a0cf2eaa62e62883f9d4da0245ad69be562",
     "browser_security.py": "sha256:d66ed5a72a0e2e5f2b6e10c1c113f5d4be16b0301fbf7f6b1cad39292efe480f",
@@ -19,7 +19,7 @@
     "server.py": "sha256:1e18d943daf1acc2fe595285b4385ca1d1d5493d81e6bd6f450f690b0b5ac8eb",
     "service_launcher.py": "sha256:2c5f3a4f14a69373880115259fe48a241a66fdb7873940920348603152edaf85",
     "service_manager.py": "sha256:9d226614efa49db510117666b30942c923d2cce4e655d194a905d9aa16b1558e",
-    "standalone-worker.cjs": "sha256:b964218a0a4af2e2d2c41d9f60c029ccec504147565498a498fecbabb0210ff7",
+    "standalone-worker.cjs": "sha256:b487e7976f306827c746e8120662d837d22b57c6716f3066e9ba4003e5e14280",
     "static/ruffle-host.html": "sha256:2d39c92a438253a34e39088b5cef4b6e7f24c99e8e7518ab2e06b065489b667b",
     "web_extract.py": "sha256:afa35840c7d015a9f78342a023ad7eecd6dc991e0fcb1cd26ddd8a256099b563"
   }

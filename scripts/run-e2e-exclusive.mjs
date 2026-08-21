@@ -277,16 +277,25 @@ async function main() {
       // Execution proof first: a scorecard check over a suite that never ran
       // would just be a second way to report a green lie.
       const executionProof = await assertSelectedProjectsExecuted(projects);
-      await assertMissionScorecardSummaryFile({
-        selectedProjects: projects,
-        // A targeted grep may intentionally run an unscored settings/guard
-        // test inside a scored project. In that case compare only baselined
-        // tests that actually ran. Full project lanes remain fail-closed and
-        // still require every committed baseline record.
-        ...(hasTargetedPlaywrightSelection(playwrightArgs)
-          ? { executedTests: executionProof.executedTests }
-          : {}),
-      });
+      try {
+        await assertMissionScorecardSummaryFile({
+          selectedProjects: projects,
+          // A targeted grep may intentionally run an unscored settings/guard
+          // test inside a scored project. In that case compare only baselined
+          // tests that actually ran. Full project lanes remain fail-closed and
+          // still require every committed baseline record.
+          ...(hasTargetedPlaywrightSelection(playwrightArgs)
+            ? { executedTests: executionProof.executedTests }
+            : {}),
+        });
+      } catch (error) {
+        if (!allowsWorkflowAuditBaselineBootstrap(error, projects, process.env)) {
+          throw error;
+        }
+        console.log(
+          "BYOK execution passed with no prior scorecard baseline; the authorized workflow audit must run its independent verifier before harvesting this result.",
+        );
+      }
     }
     process.exitCode = interruptedSignal
       ? SIGNAL_EXIT_CODES[interruptedSignal] ?? 1
@@ -310,6 +319,22 @@ async function main() {
     activeLock = null;
     removeSignalHandlers();
   }
+}
+
+export function allowsWorkflowAuditBaselineBootstrap(
+  error,
+  projects,
+  env = process.env,
+) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return env.E2E_ALLOW_MISSING_SCORECARD_BASELINE === "1" &&
+    env.WORKFLOW_AUDIT_LIVE_CONFIRMATION ===
+      "RESEARCH_LINEAR_DESKTOP_PRIVATE_GITHUB_REFLECTION" &&
+    projects.length === 1 &&
+    projects[0] === "byok-autonomous-journey" &&
+    message.startsWith(
+      "No mission-scorecard baseline exists for: byok-autonomous-journey.",
+    );
 }
 
 async function runE2ePipeline(playwrightArgs) {

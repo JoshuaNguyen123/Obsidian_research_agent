@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -17,6 +17,7 @@ const byokVerifier = path.join(
 
 export const WORKFLOW_AUDIT_CONFIRMATION =
   "RESEARCH_LINEAR_DESKTOP_PRIVATE_GITHUB_REFLECTION";
+export const WORKFLOW_AUDIT_MODEL = "deepseek-v4-pro";
 
 /**
  * Project ideation first proves its independent closed API contract, followed
@@ -30,41 +31,58 @@ export const WORKFLOW_AUDIT_CONFIRMATION =
 export const WORKFLOW_AUDIT_STAGES = Object.freeze([
   Object.freeze({
     id: "project_ideation_contract",
+    canonicalOrder: 1,
+    proofClass: "deterministic_contract",
     testFile: "tests/projectIdeaBriefTool.test.ts",
     realAi: false,
   }),
   Object.freeze({
     id: "natural_developer_mission_routing_contract",
+    canonicalOrder: 2,
+    proofClass: "deterministic_contract",
     testFile: "tests/projectLinearProgressHostIntegration.test.ts",
     realAi: false,
   }),
   Object.freeze({
-    id: "research",
-    project: "daily-use-research",
-    realAi: true,
-  }),
-  Object.freeze({
-    id: "linear_ticket_creation",
-    project: "configured-linear-live",
-    realAi: false,
-  }),
-  Object.freeze({
-    id: "desktop_code_test_execution",
-    project: "desktop-code-delivery-real-live",
-    realAi: true,
-  }),
-  Object.freeze({
-    id: "private_github_push",
-    project: "github-askpass-runtime-live",
-    realAi: false,
-  }),
-  Object.freeze({
     id: "jupyter_reflection_contract",
+    canonicalOrder: 7,
+    proofClass: "deterministic_contract",
     testFile: "tests/jupyterReflectionTool.test.ts",
     realAi: false,
   }),
   Object.freeze({
+    id: "linear_ticket_creation",
+    canonicalOrder: 4,
+    proofClass: "live_external_capability",
+    project: "configured-linear-live",
+    realAi: false,
+  }),
+  Object.freeze({
+    id: "private_github_push",
+    canonicalOrder: 6,
+    proofClass: "live_external_capability",
+    project: "github-askpass-runtime-live",
+    realAi: false,
+  }),
+  Object.freeze({
+    id: "research",
+    canonicalOrder: 3,
+    proofClass: "live_model_capability",
+    project: "daily-use-research",
+    grep: "DU-02 proof-gated sourced writeback binds owned fetched passages",
+    realAi: true,
+  }),
+  Object.freeze({
+    id: "desktop_code_test_execution",
+    canonicalOrder: 5,
+    proofClass: "live_model_capability",
+    project: "desktop-code-delivery-real-live",
+    realAi: true,
+  }),
+  Object.freeze({
     id: "linked_phase_research_to_note_and_jupyter_reflection",
+    canonicalOrder: 8,
+    proofClass: "joined_live_workflow",
     project: "byok-autonomous-journey",
     realAi: true,
     verifier: byokVerifier,
@@ -114,15 +132,17 @@ export async function runWorkflowAuditE2eV1(options = {}) {
   const runChild = options.runChild ?? runChildV1;
   const gitState = options.gitState ?? readGitStateV1;
   const persistManifest = options.persistManifest ?? persistManifestV1;
+  const readStageEvidence = options.readStageEvidence ?? readStageEvidenceV1;
   const now = options.now ?? (() => new Date());
   const before = await gitState();
   assertExactCleanHeadV1(before, expectedHead, "before workflow audit");
 
   const manifest = {
-    version: 1,
+    version: 2,
     kind: "exact_head_workflow_audit",
     headSha: expectedHead,
     githubVisibility: "private",
+    model: WORKFLOW_AUDIT_MODEL,
     startedAt: now().toISOString(),
     completedAt: null,
     status: "running",
@@ -146,12 +166,18 @@ export async function runWorkflowAuditE2eV1(options = {}) {
             exclusiveRunner,
             ...(stage.realAi ? ["--real-ai"] : []),
             `--project=${stage.project}`,
+            ...(stage.grep ? ["--grep", stage.grep] : []),
           ];
       const exitCode = await runChild(process.execPath, args, {
         cwd: repoRoot,
         env: {
           ...env,
           E2E_GITHUB_VISIBILITY: "private",
+          ...(stage.realAi ? { E2E_AI_MODEL: WORKFLOW_AUDIT_MODEL } : {}),
+          ...(stage.id === "linked_phase_research_to_note_and_jupyter_reflection" &&
+              env.WORKFLOW_AUDIT_BASELINE_BOOTSTRAP === "1"
+            ? { E2E_ALLOW_MISSING_SCORECARD_BASELINE: "1" }
+            : {}),
         },
       });
       if (exitCode !== 0) {
@@ -176,15 +202,34 @@ export async function runWorkflowAuditE2eV1(options = {}) {
       }
       const afterStage = await gitState();
       assertExactCleanHeadV1(afterStage, expectedHead, `after ${stage.id}`);
+      const completedAt = now().toISOString();
+      const runtimeEvidence = stage.project
+        ? await readStageEvidence(stage)
+        : deterministicStageEvidenceV1();
       manifest.stages.push({
         id: stage.id,
+        canonicalOrder: stage.canonicalOrder,
+        proofClass: stage.proofClass,
         project: stage.project ?? null,
         testFile: stage.testFile ?? null,
+        grep: stage.grep ?? null,
         headSha: expectedHead,
         startedAt,
-        completedAt: now().toISOString(),
+        completedAt,
+        elapsedMs: Math.max(
+          0,
+          Date.parse(completedAt) - Date.parse(startedAt),
+        ),
         status: "passed",
-        verifier: stage.verifier ? path.basename(stage.verifier) : null,
+        model: stage.realAi ? WORKFLOW_AUDIT_MODEL : null,
+        providerUsage: runtimeEvidence.providerUsage,
+        receipts: runtimeEvidence.receipts,
+        cleanup: runtimeEvidence.cleanup,
+        acceptance: runtimeEvidence.acceptance,
+        evidenceSource: runtimeEvidence.evidenceSource,
+        verifier: stage.verifier
+          ? { name: path.basename(stage.verifier), status: "passed" }
+          : null,
       });
       await persistManifest(manifestPath, manifest);
     }
@@ -202,6 +247,155 @@ export async function runWorkflowAuditE2eV1(options = {}) {
     await persistManifest(manifestPath, manifest);
     throw error;
   }
+}
+
+function deterministicStageEvidenceV1() {
+  return {
+    evidenceSource: "node_test_contract",
+    providerUsage: { modelCallCount: 0, toolCallCount: 0 },
+    receipts: { status: "not_applicable", verifiedCount: 0, proofTokens: [] },
+    cleanup: { status: "not_applicable", proofCount: 0 },
+    acceptance: { status: "passed", missing: [] },
+  };
+}
+
+async function readStageEvidenceV1(stage) {
+  const reportPath = path.join(
+    repoRoot,
+    "test-results",
+    "playwright-execution-report.json",
+  );
+  const report = JSON.parse(await readFile(reportPath, "utf8"));
+  const matches = collectPlaywrightTestsV1(report?.suites).filter(
+    (entry) => entry.projectName === stage.project,
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      `Workflow audit evidence expected one ${stage.project} result, found ${matches.length}.`,
+    );
+  }
+  const entry = matches[0];
+  const passed = [...entry.results]
+    .reverse()
+    .find((result) => result?.status === "passed");
+  if (entry.status !== "expected" || !passed) {
+    throw new Error(`Workflow audit evidence for ${stage.project} is not a passing result.`);
+  }
+  const annotations = new Map();
+  for (const annotation of [
+    ...(entry.annotations ?? []),
+    ...(passed.annotations ?? []),
+  ]) {
+    if (
+      typeof annotation?.type === "string" &&
+      typeof annotation?.description === "string"
+    ) annotations.set(annotation.type, annotation.description);
+  }
+  const custom = parseJsonAnnotationV1(
+    annotations.get("workflow-audit-runtime-evidence-v1"),
+  );
+  const metrics = parseJsonAnnotationV1(
+    annotations.get("daily-use-metrics-v1"),
+  );
+  const observed = parseJsonAnnotationV1(
+    annotations.get("daily-use-observed-v1"),
+  );
+  const modelCallCount = boundedEvidenceCount(
+    custom?.modelCallCount ?? metrics?.modelCalls ?? 0,
+    "model-call count",
+  );
+  if (stage.realAi && modelCallCount < 1) {
+    throw new Error(
+      `Workflow audit evidence for ${stage.project} omitted its model-call count.`,
+    );
+  }
+  const toolCallCount = boundedEvidenceCount(
+    custom?.toolCallCount ?? metrics?.toolCalls ?? 0,
+    "tool-call count",
+  );
+  const proofTokens = Array.isArray(observed?.proofs)
+    ? [...new Set(observed.proofs.filter(
+        (value) => typeof value === "string" && /^receipt:[a-z0-9_:-]+$/u.test(value),
+      ))].sort()
+    : [];
+  const cleanupTokens = Array.isArray(observed?.cleanup)
+    ? [...new Set(observed.cleanup.filter(
+        (value) => typeof value === "string" && /^cleanup:[a-z0-9_:-]+$/u.test(value),
+      ))].sort()
+    : [];
+  const verifiedReceiptCount = boundedEvidenceCount(
+    custom?.verifiedReceiptCount ?? proofTokens.length,
+    "verified receipt count",
+  );
+  const missing = Array.isArray(metrics?.missingAcceptanceCriteria)
+    ? metrics.missingAcceptanceCriteria.filter(
+        (value) => typeof value === "string" && value.length <= 160,
+      ).slice(0, 100)
+    : [];
+  const acceptanceStatus = metrics
+    ? metrics.acceptanceStatus === "pass" && missing.length === 0
+      ? "passed"
+      : "failed"
+    : "passed_by_stage_contract";
+  if (acceptanceStatus === "failed") {
+    throw new Error(`Workflow audit acceptance evidence failed for ${stage.project}.`);
+  }
+  const cleanupStatus = custom?.cleanupStatus === "failed"
+    ? "failed"
+    : cleanupTokens.length > 0
+      ? "verified"
+      : stage.id === "research" || stage.id === "desktop_code_test_execution"
+        ? custom?.cleanupStatus === "verified" ? "verified" : "not_applicable"
+        : "verified_by_stage_contract";
+  if (cleanupStatus === "failed") {
+    throw new Error(`Workflow audit cleanup evidence failed for ${stage.project}.`);
+  }
+  return {
+    evidenceSource: "test-results/playwright-execution-report.json",
+    providerUsage: { modelCallCount, toolCallCount },
+    receipts: {
+      status: verifiedReceiptCount > 0
+        ? "verified"
+        : stage.verifier
+          ? "verified_by_independent_verifier"
+          : "verified_by_stage_contract",
+      verifiedCount: verifiedReceiptCount,
+      proofTokens,
+    },
+    cleanup: { status: cleanupStatus, proofCount: cleanupTokens.length },
+    acceptance: { status: acceptanceStatus, missing },
+  };
+}
+
+function collectPlaywrightTestsV1(suites = []) {
+  const collected = [];
+  const visit = (suite) => {
+    for (const spec of suite?.specs ?? []) {
+      for (const test of spec?.tests ?? []) collected.push(test);
+    }
+    for (const child of suite?.suites ?? []) visit(child);
+  };
+  for (const suite of suites ?? []) visit(suite);
+  return collected;
+}
+
+function parseJsonAnnotationV1(value) {
+  if (typeof value !== "string" || value.length > 1_000_000) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function boundedEvidenceCount(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000) {
+    throw new Error(`Workflow audit ${label} is invalid.`);
+  }
+  return value;
 }
 
 function assertExactCleanHeadV1(state, expectedHead, boundary) {

@@ -1508,10 +1508,10 @@ export class CodeExtensionRuntimeV2 {
     const profile = await this.getRepositoryProfile(profileKey);
     if (!profile) return null;
     const exactRunId = exact
-      ? boundedIdentifier(exact.runId, "queue code run id")
+      ? boundedExecutionIdentity(exact.runId, "queue code run id")
       : null;
     const exactRequestId = exact
-      ? boundedIdentifier(exact.requestId, "queue code request id")
+      ? boundedExecutionIdentity(exact.requestId, "queue code request id")
       : null;
     const rawNamespace = await this.readTopLevelNamespace<CodeRepairCheckpointNamespaceV1>(
       "codeRepairCheckpointsV1",
@@ -1717,8 +1717,8 @@ export class CodeExtensionRuntimeV2 {
     this.assertInitialized();
     const profileKey = boundedIdentifier(input.profileKey, "review-repair profile key");
     const workspaceId = boundedIdentifier(input.workspaceId, "review-repair workspace id");
-    const runId = boundedIdentifier(input.runId, "review-repair run id");
-    const requestId = boundedIdentifier(input.requestId, "review-repair base request id");
+    const runId = boundedExecutionIdentity(input.runId, "review-repair run id");
+    const requestId = boundedExecutionIdentity(input.requestId, "review-repair base request id");
     const expectedFingerprint = fingerprint(
       input.expectedFingerprint,
       "review-repair base handoff fingerprint",
@@ -1744,8 +1744,8 @@ export class CodeExtensionRuntimeV2 {
     signal?: AbortSignal;
   }): Promise<VerifiedCodePublicationHandoffV1 | null> {
     this.assertInitialized();
-    const repairRequestId = boundedIdentifier(input.repairRequestId, "review repair request id");
-    const runId = boundedIdentifier(input.runId, "review repair run id");
+    const repairRequestId = boundedExecutionIdentity(input.repairRequestId, "review repair request id");
+    const runId = boundedExecutionIdentity(input.runId, "review repair run id");
     const profileKey = boundedIdentifier(input.profileKey, "review repair profile key");
     const workspaceId = boundedIdentifier(input.workspaceId, "review repair workspace id");
     const handoff = await this.resolveLatestVerifiedPublicationHandoff(profileKey, {
@@ -1765,12 +1765,12 @@ export class CodeExtensionRuntimeV2 {
     input: CodeReviewRepairPipelineInputV1,
   ): Promise<string> {
     this.assertInitialized();
-    const repairRequestId = boundedIdentifier(input.repairRequestId, "review repair request id");
-    const runId = boundedIdentifier(input.runId, "review repair run id");
+    const repairRequestId = boundedExecutionIdentity(input.repairRequestId, "review repair request id");
+    const runId = boundedExecutionIdentity(input.runId, "review repair run id");
     const profileKey = boundedIdentifier(input.profileKey, "review repair profile key");
     const workspaceId = boundedIdentifier(input.workspaceId, "review repair workspace id");
     const expectedBaseSha = gitObjectId(input.expectedBaseSha, "review repair expected base SHA");
-    const baseRequestId = boundedIdentifier(input.baseRequestId, "review repair base request id");
+    const baseRequestId = boundedExecutionIdentity(input.baseRequestId, "review repair base request id");
     const baseHandoffFingerprint = fingerprint(
       input.baseHandoffFingerprint,
       "review repair base handoff fingerprint",
@@ -2010,10 +2010,10 @@ export class CodeExtensionRuntimeV2 {
     commitMessage: string;
   }): Promise<string> {
     this.assertInitialized();
-    const runId = boundedIdentifier(input.runId, "queue code run id");
+    const runId = boundedExecutionIdentity(input.runId, "queue code run id");
     const workspaceId = boundedIdentifier(input.workspaceId, "queue code workspace id");
     const profileKey = boundedIdentifier(input.profileKey, "queue repository profile key");
-    const requestId = boundedIdentifier(input.requestId, "queue code request id");
+    const requestId = boundedExecutionIdentity(input.requestId, "queue code request id");
     const binding = await this.resolveRepairWorkspaceBinding({ workspaceId, profileKey });
     if (!binding || binding.blockerCode || !binding.worktreeBranch) {
       throw new Error(
@@ -3022,6 +3022,22 @@ function boundedIdentifier(value: unknown, label: string): string {
   if (
     typeof value !== "string" ||
     !/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(value) ||
+    ["__proto__", "prototype", "constructor"].includes(value)
+  ) throw new Error(`${label} is invalid.`);
+  return value;
+}
+
+/**
+ * Durable run and request identities are opaque and case-sensitive. Production
+ * run ids include the uppercase `T`/`Z` characters from an ISO timestamp, so
+ * they must not be parsed with the lowercase-only repository/profile-key
+ * contract above. Exact comparisons remain byte-for-byte; this function does
+ * not normalize or case-fold the supplied identity.
+ */
+function boundedExecutionIdentity(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value) ||
     ["__proto__", "prototype", "constructor"].includes(value)
   ) throw new Error(`${label} is invalid.`);
   return value;

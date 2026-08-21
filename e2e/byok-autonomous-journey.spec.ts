@@ -339,8 +339,6 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     process.env.E2E_AI_MODE !== "real" || process.env.E2E_REAL_AI !== "1",
     "Requires E2E_REAL_AI=1 and E2E_AI_MODE=real.",
   );
-  test.setTimeout(120 * 60_000);
-
   const sandboxReadinessStartedAt = Date.now();
   const suffix = randomUUID().replace(/-/gu, "").slice(0, 12);
   const marker = `BYOK_AUTONOMOUS_${suffix}`;

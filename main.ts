@@ -13468,6 +13468,15 @@ export default class AgenticResearcherPlugin extends Plugin {
           handoff,
           profileKey: binding.profile.key,
         }),
+        onFinalizerDiagnostic: (diagnostic) => {
+          this.runCoordinator.recordHostDiagnostic({
+            id: `github-finalizer:${context.runId ?? approvalIdentity.runId}:${diagnostic.stage}`,
+            kind: "error",
+            toolName: "publish_verified_code_to_github",
+            message: `${diagnostic.stage}: ${diagnostic.message}`,
+            errorCode: diagnostic.code,
+          });
+        },
         persistReconciledReceipt: (receipt) =>
           this.appendExternalActionReceipt(receipt),
         push: {
@@ -13819,6 +13828,42 @@ export default class AgenticResearcherPlugin extends Plugin {
         const reflectionPlan = await noteWriter.planProjectCompletionReflection(
           reflectionRequest,
         );
+        const finalizedReceiptId =
+          `github-note-reflection-${reflectionPlan.expectedAfterSha256.slice(7, 39)}`;
+        const existingReflectionReceipt = this.externalActionReceiptLedger.entries
+          .find((entry) => entry.receipt.id === finalizedReceiptId)
+          ?.receipt ?? null;
+        if (existingReflectionReceipt) {
+          const matchesExactReflection =
+            existingReflectionReceipt.runId === input.handoff.runId &&
+            existingReflectionReceipt.toolName ===
+              FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME &&
+            existingReflectionReceipt.operation === "append" &&
+            existingReflectionReceipt.resource.system === "vault" &&
+            existingReflectionReceipt.resource.path === origin.artifact.notePath &&
+            existingReflectionReceipt.resource.revision ===
+              reflectionPlan.expectedAfterSha256 &&
+            existingReflectionReceipt.idempotencyKey ===
+              `github-note-reflection:${proof.publicationId}:${proof.proofRevision}` &&
+            existingReflectionReceipt.readback?.status === "verified" &&
+            existingReflectionReceipt.readback.observedRevision ===
+              reflectionPlan.expectedAfterSha256;
+          if (!matchesExactReflection) {
+            throw new Error(
+              "Durable Obsidian reflection receipt collides with different finalization evidence.",
+            );
+          }
+          // Re-save the idempotent receipt before advancing lineage. This also
+          // repairs an in-memory ledger update whose earlier plugin-data save
+          // failed after the note write committed.
+          await this.appendExternalActionReceipt(existingReflectionReceipt);
+          await this.persistFinalizedGitHubPublicationLineage({
+            origin,
+            receiptId: existingReflectionReceipt.id,
+            noteSha256: reflectionPlan.expectedAfterSha256,
+          });
+          return { receiptId: existingReflectionReceipt.id };
+        }
         const now = new Date();
         const preparedAction = await withPreparedActionFingerprint({
           version: 1,
@@ -13971,8 +14016,6 @@ export default class AgenticResearcherPlugin extends Plugin {
           expectedAfterSha256: approvedAfterSha256,
           reflectionMarkdownSha256: approvedReflectionSha256,
         });
-        const finalizedReceiptId =
-          `github-note-reflection-${result.afterSha256.slice(7, 39)}`;
         const reflectionCommittedAt = new Date().toISOString();
         const reflectionReceipt: ActionReceipt = {
           version: 1,

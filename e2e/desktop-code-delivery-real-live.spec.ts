@@ -63,6 +63,7 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
   let rawSnapshot: any = null;
   let exportPath: string | null = null;
   let workspaceContainer: string | null = null;
+  const cleanupErrors: string[] = [];
 
   try {
     harness = await startRealAiHarness(
@@ -225,22 +226,53 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
         exportPath,
         desktopEntriesBefore,
       }).catch((error) => {
+        const detail = `Desktop export cleanup failed: ${String(error)}`;
+        cleanupErrors.push(detail);
         testInfo.annotations.push({
           type: "cleanup-error",
-          description: `Desktop export cleanup failed: ${String(error)}`,
+          description: detail,
         });
       });
     }
-    await harness?.close().catch(() => undefined);
+    await harness?.close().catch((error) => {
+      const detail = `Harness cleanup failed: ${String(error)}`;
+      cleanupErrors.push(detail);
+      testInfo.annotations.push({ type: "cleanup-error", description: detail });
+    });
     if (workspaceContainer) {
       await rm(workspaceContainer, { recursive: true, force: true }).catch(
         (error) => {
+          const detail = `Scratch workspace cleanup failed: ${String(error)}`;
+          cleanupErrors.push(detail);
           testInfo.annotations.push({
             type: "cleanup-error",
-            description: `Scratch workspace cleanup failed: ${String(error)}`,
+            description: detail,
           });
         },
       );
     }
+    const receipts = Array.isArray(rawSnapshot?.lastReceipts)
+      ? rawSnapshot.lastReceipts
+      : [];
+    testInfo.annotations.push({
+      type: "workflow-audit-runtime-evidence-v1",
+      description: JSON.stringify({
+        version: 1,
+        modelCallCount:
+          Number.isSafeInteger(rawSnapshot?.providerUsage?.modelCallCount)
+            ? rawSnapshot.providerUsage.modelCallCount
+            : Array.isArray(rawSnapshot?.modelCallEvidence)
+              ? rawSnapshot.modelCallEvidence.length
+              : 0,
+        toolCallCount: Array.isArray(rawSnapshot?.missionEvidence)
+          ? rawSnapshot.missionEvidence.length
+          : 0,
+        receiptCount: receipts.length,
+        verifiedReceiptCount: receipts.filter(
+          (receipt: any) => receipt?.readback?.status === "verified",
+        ).length,
+        cleanupStatus: cleanupErrors.length === 0 ? "verified" : "failed",
+      }),
+    });
   }
 });

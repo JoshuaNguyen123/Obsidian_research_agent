@@ -4,11 +4,11 @@ import test from "node:test";
 import { extractVerifiedCommitBoundCodeExamplesV1 } from "../e2e/fixtures/reflectionAssertions";
 
 // @ts-ignore The production runner is an intentionally unbundled Node ESM script.
-import { applyE2eAiMode, applyE2eLane, applyE2eProviderDefaults, applyPersistedWindowsSandboxEnvironment, assertExternalCredentialProjectPreconditions, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
+import { allowsWorkflowAuditBaselineBootstrap, applyE2eAiMode, applyE2eLane, applyE2eProviderDefaults, applyPersistedWindowsSandboxEnvironment, assertExternalCredentialProjectPreconditions, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
 // @ts-ignore The production workflow-audit runner is an intentionally unbundled Node ESM script.
-import { runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
+import { runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_MODEL, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
 
 test("no Playwright lane runs against a mocked model", () => {
   const config = readFileSync(
@@ -154,23 +154,16 @@ test("full workflow audit routes independent functions and the joined journey se
         testFile: "tests/projectLinearProgressHostIntegration.test.ts",
       },
       {
-        id: "research",
-        project: "daily-use-research",
-        realAi: true,
+        id: "jupyter_reflection_contract",
+        project: undefined,
+        realAi: false,
         verified: false,
-        testFile: null,
+        testFile: "tests/jupyterReflectionTool.test.ts",
       },
       {
         id: "linear_ticket_creation",
         project: "configured-linear-live",
         realAi: false,
-        verified: false,
-        testFile: null,
-      },
-      {
-        id: "desktop_code_test_execution",
-        project: "desktop-code-delivery-real-live",
-        realAi: true,
         verified: false,
         testFile: null,
       },
@@ -182,11 +175,18 @@ test("full workflow audit routes independent functions and the joined journey se
         testFile: null,
       },
       {
-        id: "jupyter_reflection_contract",
-        project: undefined,
-        realAi: false,
+        id: "research",
+        project: "daily-use-research",
+        realAi: true,
         verified: false,
-        testFile: "tests/jupyterReflectionTool.test.ts",
+        testFile: null,
+      },
+      {
+        id: "desktop_code_test_execution",
+        project: "desktop-code-delivery-real-live",
+        realAi: true,
+        verified: false,
+        testFile: null,
       },
       {
         id: "linked_phase_research_to_note_and_jupyter_reflection",
@@ -199,7 +199,11 @@ test("full workflow audit routes independent functions and the joined journey se
   );
 
   const headSha = "a".repeat(40);
-  const calls: Array<{ args: string[]; visibility: string | undefined }> = [];
+  const calls: Array<{
+    args: string[];
+    visibility: string | undefined;
+    model: string | undefined;
+  }> = [];
   const manifests: any[] = [];
   const result = await runWorkflowAuditE2eV1({
     platform: "win32",
@@ -214,12 +218,27 @@ test("full workflow audit routes independent functions and the joined journey se
       calls.push({
         args: args.map((value) => String(value)),
         visibility: options?.env?.E2E_GITHUB_VISIBILITY,
+        model: options?.env?.E2E_AI_MODEL,
       });
       return 0;
     },
     persistManifest: async (_path: string, manifest: unknown) => {
       manifests.push(JSON.parse(JSON.stringify(manifest)));
     },
+    readStageEvidence: async (stage: { realAi: boolean; verifier?: string }) => ({
+      evidenceSource: "test-playwright-report.json",
+      providerUsage: {
+        modelCallCount: stage.realAi ? 3 : 0,
+        toolCallCount: stage.realAi ? 7 : 0,
+      },
+      receipts: {
+        status: stage.verifier ? "verified_by_independent_verifier" : "verified",
+        verifiedCount: stage.realAi ? 2 : 1,
+        proofTokens: [],
+      },
+      cleanup: { status: "verified", proofCount: 1 },
+      acceptance: { status: "passed", missing: [] },
+    }),
     now: () => new Date("2026-08-19T12:00:00.000Z"),
   });
   assert.equal(result.status, "passed");
@@ -242,15 +261,57 @@ test("full workflow audit routes independent functions and the joined journey se
     calls[1]?.args[3],
     "tests/projectLinearProgressHostIntegration.test.ts",
   );
-  assert.deepEqual(calls[6]?.args.slice(0, 3), ["--import", "tsx", "--test"]);
-  assert.equal(calls[6]?.args[3], "tests/jupyterReflectionTool.test.ts");
+  assert.deepEqual(calls[2]?.args.slice(0, 3), ["--import", "tsx", "--test"]);
+  assert.equal(calls[2]?.args[3], "tests/jupyterReflectionTool.test.ts");
+  assert.deepEqual(calls[5]?.args.slice(-2), [
+    "--grep",
+    "DU-02 proof-gated sourced writeback binds owned fetched passages",
+  ]);
   assert.equal(calls.length, 9, "the linked phase lane must run its verifier last");
   assert.equal(calls[8]?.args.some((arg) =>
     arg.endsWith("verify-byok-autonomous-journey.mjs")
   ), true);
   assert.equal(calls.every((call) => call.visibility === "private"), true);
+  assert.equal(
+    calls.filter((call) => call.model).every((call) => call.model === WORKFLOW_AUDIT_MODEL),
+    true,
+  );
+  assert.equal(manifests.at(-1)?.version, 2);
   assert.equal(manifests.at(-1)?.status, "passed");
   assert.equal(manifests.at(-1)?.stages?.length, 8);
+  assert.equal(manifests.at(-1)?.stages?.[5]?.providerUsage?.modelCallCount, 3);
+  assert.equal(manifests.at(-1)?.stages?.[7]?.receipts?.status, "verified_by_independent_verifier");
+  assert.equal(manifests.at(-1)?.stages?.[0]?.elapsedMs, 0);
+});
+
+test("missing BYOK baseline is allowed only for the explicitly authorized audit bootstrap", () => {
+  const error = new Error(
+    "No mission-scorecard baseline exists for: byok-autonomous-journey. Harvest it.",
+  );
+  const env = {
+    E2E_ALLOW_MISSING_SCORECARD_BASELINE: "1",
+    WORKFLOW_AUDIT_LIVE_CONFIRMATION: WORKFLOW_AUDIT_CONFIRMATION,
+  };
+  assert.equal(
+    allowsWorkflowAuditBaselineBootstrap(
+      error,
+      ["byok-autonomous-journey"],
+      env,
+    ),
+    true,
+  );
+  assert.equal(
+    allowsWorkflowAuditBaselineBootstrap(error, ["daily-use-research"], env),
+    false,
+  );
+  assert.equal(
+    allowsWorkflowAuditBaselineBootstrap(
+      new Error("BYOK execution failed."),
+      ["byok-autonomous-journey"],
+      env,
+    ),
+    false,
+  );
 });
 
 test("full workflow audit fails before mutation without exact clean-head authority", () => {

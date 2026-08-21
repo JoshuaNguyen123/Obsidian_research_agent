@@ -279,6 +279,18 @@ test("GitHub finalization persists an exact prepared note receipt before lineage
     "await noteWriter.planProjectCompletionReflection(",
     finalize,
   );
+  const existingReceipt = source.indexOf(
+    "const existingReflectionReceipt = this.externalActionReceiptLedger.entries",
+    plan,
+  );
+  const reconcileReceipt = source.indexOf(
+    "await this.appendExternalActionReceipt(existingReflectionReceipt)",
+    existingReceipt,
+  );
+  const reconcileLineage = source.indexOf(
+    "await this.persistFinalizedGitHubPublicationLineage({",
+    reconcileReceipt,
+  );
   const prepared = source.indexOf(
     "const preparedAction = await withPreparedActionFingerprint({",
     plan,
@@ -301,6 +313,10 @@ test("GitHub finalization persists an exact prepared note receipt before lineage
 
   assert.ok(finalize >= 0);
   assert.ok(plan > finalize);
+  assert.ok(existingReceipt > plan);
+  assert.ok(reconcileReceipt > existingReceipt);
+  assert.ok(reconcileLineage > reconcileReceipt);
+  assert.ok(prepared > reconcileLineage);
   assert.ok(prepared > plan);
   assert.ok(approval > prepared);
   assert.ok(exactCommit > approval);
@@ -310,6 +326,19 @@ test("GitHub finalization persists an exact prepared note receipt before lineage
   assert.match(block, /payloadFingerprint: preparedAction\.payloadFingerprint/u);
   assert.match(block, /grantId: approval\.approvalId/u);
   assert.match(block, /observedFingerprint: result\.afterSha256/u);
+
+  const retryReconciliationBlock = source.slice(
+    existingReceipt,
+    prepared,
+  );
+  assert.match(
+    retryReconciliationBlock,
+    /existingReflectionReceipt\.readback\?\.status === "verified"/u,
+  );
+  assert.match(
+    retryReconciliationBlock,
+    /reflectionPlan\.expectedAfterSha256/u,
+  );
 
   const preparedBlock = source.slice(prepared, approval);
   assert.match(preparedBlock, /proposedAppendMarkdown: reflectionPlan\.proposedAppendMarkdown/u);

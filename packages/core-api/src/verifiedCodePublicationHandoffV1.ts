@@ -9,6 +9,7 @@ export const VERIFIED_CODE_PUBLICATION_HANDOFF_VERSION = 1 as const;
 const GIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
 const IDENTIFIER = /^[a-z0-9][a-z0-9._:-]{0,255}$/u;
+const EXECUTION_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 
 export interface PublicationArtifactHashV1 {
   path: string;
@@ -243,8 +244,8 @@ export function parseVerifiedCodePublicationHandoffV1(
     kind: "verified_code_publication_handoff",
     id: identifier(record.id, "handoff id"),
     status: "verified",
-    requestId: identifier(record.requestId, "request id"),
-    runId: boundedText(record.runId, "run id", 1, 256),
+    requestId: executionIdentity(record.requestId, "request id"),
+    runId: executionIdentity(record.runId, "run id"),
     worktreeId: boundedText(record.worktreeId, "worktree id", 1, 256),
     workspaceId: boundedText(record.workspaceId, "workspace id", 1, 256),
     repositoryProfileKey: identifier(record.repositoryProfileKey, "repository profile key"),
@@ -468,8 +469,8 @@ export function parseVerifiedLocalCommitForPublicationV1(
     kind: "verified_local_commit",
     id: boundedText(record.id, "local commit receipt id", 1, 256),
     status: "verified",
-    requestId: identifier(record.requestId, "request id"),
-    runId: boundedText(record.runId, "run id", 1, 256),
+    requestId: executionIdentity(record.requestId, "request id"),
+    runId: executionIdentity(record.runId, "run id"),
     worktreeId: boundedText(record.worktreeId, "worktree id", 1, 256),
     workspaceId: boundedText(record.workspaceId, "workspace id", 1, 256),
     branch: gitBranch(record.branch, "local commit branch"),
@@ -659,6 +660,17 @@ function timestamp(value: unknown, label: string): string {
 function identifier(value: unknown, label: string): string {
   const result = boundedText(value, label, 1, 256);
   if (!IDENTIFIER.test(result) || ["__proto__", "prototype", "constructor"].includes(result)) {
+    fail(`${label} is invalid.`);
+  }
+  return result;
+}
+
+function executionIdentity(value: unknown, label: string): string {
+  const result = boundedText(value, label, 1, 128);
+  if (
+    !EXECUTION_IDENTITY.test(result) ||
+    ["__proto__", "prototype", "constructor"].includes(result)
+  ) {
     fail(`${label} is invalid.`);
   }
   return result;

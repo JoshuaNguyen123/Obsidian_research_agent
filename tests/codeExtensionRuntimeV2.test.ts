@@ -195,8 +195,8 @@ test("CodeExtensionRuntimeV2 resolves only a terminal verified commit through th
       validationProfile: createNodeNpmValidationProfile(),
     });
     const workspaceId = "publication-workspace";
-    const runId = "publication-run";
-    const requestId = "publication-repair";
+    const runId = "run-2026-08-21T04:15:10.123Z-AbCd1234";
+    const requestId = "request-2026-08-21T04:15:11.456Z-EfGh5678";
     const branch = "codex/workspace-publication-workspace";
     const baseSha = "a".repeat(40);
     const commitSha = "b".repeat(40);
@@ -308,6 +308,22 @@ test("CodeExtensionRuntimeV2 resolves only a terminal verified commit through th
       "publication handoff resolution must be stable across calls and restart",
     );
     assert.equal(
+      (await runtime.resolveLatestVerifiedPublicationHandoff(profile.key, {
+        runId,
+        requestId,
+      }))?.fingerprint,
+      handoff.fingerprint,
+      "production ISO identities must resolve without case normalization",
+    );
+    assert.equal(
+      await runtime.resolveLatestVerifiedPublicationHandoff(profile.key, {
+        runId: runId.toLowerCase(),
+        requestId,
+      }),
+      null,
+      "exact identity comparison must remain case-sensitive",
+    );
+    assert.equal(
       (await runtime.resolveVerifiedReviewRepairBase({
         profileKey: profile.key,
         workspaceId,
@@ -319,6 +335,11 @@ test("CodeExtensionRuntimeV2 resolves only a terminal verified commit through th
       handoff.fingerprint,
     );
     assert.equal(await runtime.resolveLatestVerifiedPublicationHandoff("missing-profile"), null);
+    await assert.rejects(
+      runtime.resolveLatestVerifiedPublicationHandoff("Trusted-Publication-Repository"),
+      /repository profile key is invalid/u,
+      "profile keys retain their lowercase-only contract",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

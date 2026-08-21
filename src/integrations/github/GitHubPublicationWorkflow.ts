@@ -327,6 +327,8 @@ export interface GitHubPublicationWorkflowOptionsV1 {
   preapprovedApprovals?: GitHubPublicationPreapprovedApprovalPortV1;
   checkpoints: GitHubPublicationCheckpointPortV1;
   finalizers?: GitHubPublicationFinalizerPortV1;
+  /** Run Details-only diagnostic sink; never copied into blocker/model text. */
+  onFinalizerDiagnostic?: (diagnostic: GitHubPublicationFinalizerDiagnosticV1) => void;
   persistReconciledReceipt?: (receipt: ActionReceipt) => Promise<void>;
   approvalIdentity: {
     runId: string;
@@ -334,6 +336,12 @@ export interface GitHubPublicationWorkflowOptionsV1 {
     toolName: string;
   };
   now?: () => Date;
+}
+
+export interface GitHubPublicationFinalizerDiagnosticV1 {
+  stage: "linear_link" | "obsidian_reflection" | "linear_completion";
+  code: string;
+  message: string;
 }
 
 export interface PublishVerifiedCodeRequestV1 {
@@ -1536,7 +1544,12 @@ export class GitHubPublicationWorkflowV1 {
           blocker: null,
         };
         await this.options.checkpoints.persist(current);
-      } catch {
+      } catch (error) {
+        this.emitFinalizerDiagnostic(
+          "linear_link",
+          "github_linear_link_finalizer_failed",
+          error,
+        );
         const linkCommitted = Boolean(current.linearLinkReceiptId);
         current = {
           ...current,
@@ -1553,7 +1566,7 @@ export class GitHubPublicationWorkflowV1 {
         return current;
       }
     }
-    // The originating notebook reflection is part of completion, not an
+    // The originating Markdown research-note reflection is part of completion, not an
     // optional backlink after the ticket has already been closed.
     if (!current.obsidianReceiptId) {
       try {
@@ -1569,7 +1582,12 @@ export class GitHubPublicationWorkflowV1 {
           blocker: null,
         };
         await this.options.checkpoints.persist(current);
-      } catch {
+      } catch (error) {
+        this.emitFinalizerDiagnostic(
+          "obsidian_reflection",
+          "github_obsidian_finalizer_failed",
+          error,
+        );
         const obsidianCommitted = Boolean(current.obsidianReceiptId);
         current = {
           ...current,
@@ -1581,7 +1599,7 @@ export class GitHubPublicationWorkflowV1 {
             ? null
             : {
                 code: "github_obsidian_finalization_waiting",
-                message: "GitHub proof and the exact Linear link are verified; the originating notebook reflection remains pending.",
+                message: "GitHub proof and the exact Linear link are verified; the originating Markdown reflection remains pending.",
               },
         };
         await this.options.checkpoints.persist(current);
@@ -1600,7 +1618,12 @@ export class GitHubPublicationWorkflowV1 {
           blocker: null,
         };
         await this.options.checkpoints.persist(current);
-      } catch {
+      } catch (error) {
+        this.emitFinalizerDiagnostic(
+          "linear_completion",
+          "github_linear_completion_finalizer_failed",
+          error,
+        );
         const completionCommitted = Boolean(current.linearCompletionReceiptId);
         current = {
           ...current,
@@ -1610,7 +1633,7 @@ export class GitHubPublicationWorkflowV1 {
             ? null
             : {
                 code: "github_linear_completion_waiting",
-                message: "GitHub proof, Linear linkage, and the notebook reflection are durable; Linear completion remains pending.",
+                message: "GitHub proof, Linear linkage, and the Markdown reflection are durable; Linear completion remains pending.",
               },
         };
         await this.options.checkpoints.persist(current);
@@ -1618,6 +1641,22 @@ export class GitHubPublicationWorkflowV1 {
       }
     }
     return current;
+  }
+
+  private emitFinalizerDiagnostic(
+    stage: GitHubPublicationFinalizerDiagnosticV1["stage"],
+    code: string,
+    error: unknown,
+  ): void {
+    try {
+      this.options.onFinalizerDiagnostic?.({
+        stage,
+        code,
+        message: boundedFinalizerDiagnostic(error),
+      });
+    } catch {
+      // Diagnostics are observational only and must never change workflow state.
+    }
   }
 
   private async continueDraftPublication(
@@ -2446,6 +2485,23 @@ function validateHandoff(
     ),
     handoffFingerprint: expectSha256(handoff.handoffFingerprint, "code handoff fingerprint"),
   };
+}
+
+function boundedFinalizerDiagnostic(error: unknown): string {
+  const raw = error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : typeof error === "string"
+      ? error
+      : "Finalizer failed without a structured error.";
+  return raw
+    .replace(/\b(?:gh[pousr]_|sk-)[A-Za-z0-9._-]{8,}\b/gu, "[redacted credential]")
+    .replace(/\bBearer\s+[^\s]+/giu, "Bearer [redacted]")
+    .replace(/[A-Za-z]:\\[^\r\n]*/gu, "[redacted local path]")
+    .replace(/https?:\/\/[^\s]+/giu, "[redacted URL]")
+    .replace(/[\u0000-\u001f\u007f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 500) || "Finalizer failed without a safe diagnostic.";
 }
 
 function validateDraftPublicationRefProof(

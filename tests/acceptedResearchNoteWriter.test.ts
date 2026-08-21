@@ -417,6 +417,66 @@ test("six-stage publication writes a concise delivery checkpoint instead of a se
   assert.equal(vault.files.get(written.path), note);
 });
 
+test("project reflection accepts the core handoff changed-path bounds without widening other lists", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const written = await writer.writeAcceptedPackage({
+    path: "Research/Changed path bounds.md",
+    mode: "create",
+    artifactId: "accepted-research-path-bounds",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  });
+  const request = {
+    artifact: written.artifact,
+    expectedNoteSha256: written.afterSha256,
+    publicationId: "publication-path-bounds-1",
+    issueIdentifier: "GAME-100",
+    issueUrl: "https://linear.app/acme/issue/GAME-100",
+    pullRequestNumber: 100,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/100",
+    completionProof: "draft_pr" as const,
+    proofRevision: "d".repeat(40),
+    targetedValidationReceiptId: "receipt-targeted-path-bounds",
+    fullValidationReceiptId: "receipt-full-path-bounds",
+    localCommitReceiptId: "receipt-commit-path-bounds",
+    ...reflectionCodeProof("d"),
+  };
+  const oneHundredPaths = Array.from(
+    { length: 100 },
+    (_, index) => `src/generated-${String(index).padStart(3, "0")}.ts`,
+  );
+  const plan = await writer.planProjectCompletionReflection({
+    ...request,
+    changedPaths: oneHundredPaths,
+  });
+  assert.equal(
+    (plan.reflectionMarkdown.match(/^changed-path:/gmu) ?? []).length,
+    100,
+  );
+
+  await assert.rejects(
+    writer.planProjectCompletionReflection({
+      ...request,
+      changedPaths: [...oneHundredPaths, "src/overflow.ts"],
+    }),
+    /changed paths require 1-100 entries/u,
+  );
+  const maximumPath = `src/${"a".repeat(1_020)}`;
+  assert.equal(maximumPath.length, 1_024);
+  await writer.planProjectCompletionReflection({
+    ...request,
+    changedPaths: [maximumPath],
+  });
+  await assert.rejects(
+    writer.planProjectCompletionReflection({
+      ...request,
+      changedPaths: [`${maximumPath}a`],
+    }),
+    /changed path 1 must contain safe bounded text/u,
+  );
+});
+
 test("project reflection plan seals exact append bytes and rejects drift or mutation", async () => {
   const vault = new ResearchVault();
   const writer = new AcceptedResearchNoteWriter(vault);
@@ -487,7 +547,9 @@ test("project reflection plan seals exact append bytes and rejects drift or muta
 
   const retryPlan = await writer.planProjectCompletionReflection({
     ...request,
-    expectedNoteSha256: committed.afterSha256,
+    // A process restart can restore the pre-write publication checkpoint even
+    // though the exact reflection bytes already committed to the note.
+    expectedNoteSha256: request.expectedNoteSha256,
   });
   assert.equal(retryPlan.operation, "no_op");
   assert.equal(retryPlan.proposedAppendMarkdown, "");

@@ -183,8 +183,8 @@ test("verified reflection examples reject stale source, oversized excerpts, and 
 
 function localCommitReceipt(): VerifiedLocalCommitReceiptV1 {
   const evidence = {
-    requestId: "repair-1",
-    runId: "run-1",
+    requestId: "request-2026-08-21T04:15:11.456Z-EfGh5678",
+    runId: "run-2026-08-21T04:15:10.123Z-AbCd1234",
     worktreeId: "worktree-1",
     workspaceId: "workspace-1",
     branch: "codex/repair-1",

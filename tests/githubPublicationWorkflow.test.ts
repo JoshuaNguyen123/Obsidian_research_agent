@@ -8,6 +8,7 @@ import {
   isGitHubPublicationLineageProofCheckpointV1,
   type GitHubPublicationApprovalPortV1,
   type GitHubPublicationCheckpointV1,
+  type GitHubPublicationFinalizerDiagnosticV1,
   type GitHubPublicationProviderPortV1,
   type GitHubPublicationPullRequestV1,
   type PublishVerifiedCodeRequestV1,
@@ -189,6 +190,44 @@ test("finalization resumes at the first unfinished persisted substate without re
   assert.equal(harness.linearLinkCalls, 1);
   assert.equal(harness.linearCompletionCalls, 2);
   assert.equal(harness.obsidianCalls, 1);
+});
+
+test("Obsidian finalizer failure stays generic for the workflow and emits one redacted Run Details diagnostic", async () => {
+  const harness = createHarness({
+    failObsidianOnce: true,
+    obsidianError:
+      "reflection failed for ghp_abcdefghijklmnopqrstuvwxyz at C:\\Users\\private\\note.md https://private.example/note",
+  });
+  const workflow = new GitHubPublicationWorkflowV1(harness.options);
+  const waiting = await workflow.publishDraft({
+    ...request(),
+    completionProof: "draft_pr",
+  });
+
+  assert.equal(waiting.status, "waiting_obsidian");
+  assert.match(waiting.blocker?.message ?? "", /Markdown reflection remains pending/u);
+  assert.doesNotMatch(waiting.blocker?.message ?? "", /ghp_|Users|private\.example/u);
+  assert.equal(harness.finalizerDiagnostics.length, 1);
+  assert.deepEqual(
+    {
+      stage: harness.finalizerDiagnostics[0]?.stage,
+      code: harness.finalizerDiagnostics[0]?.code,
+    },
+    {
+      stage: "obsidian_reflection",
+      code: "github_obsidian_finalizer_failed",
+    },
+  );
+  assert.match(harness.finalizerDiagnostics[0]?.message ?? "", /redacted credential/u);
+  assert.match(harness.finalizerDiagnostics[0]?.message ?? "", /redacted local path/u);
+  assert.doesNotMatch(
+    harness.finalizerDiagnostics[0]?.message ?? "",
+    /ghp_|private\.example/u,
+  );
+
+  const resumed = await workflow.resumeFinalization(waiting, request().binding);
+  assert.equal(resumed.status, "finalized");
+  assert.equal(harness.obsidianCalls, 2);
 });
 
 test("production lineage proof accepts waiting_linear_link on restart when immutable draft proof still matches", async () => {
@@ -385,6 +424,8 @@ function createHarness(options: {
   mergeResponseSha?: string;
   failLinearCompletionOnce?: boolean;
   failLinearLinkOnce?: boolean;
+  failObsidianOnce?: boolean;
+  obsidianError?: string;
   failCheckpointStatusOnce?: GitHubPublicationCheckpointV1["status"];
 } = {}) {
   const checkpoints: GitHubPublicationCheckpointV1[] = [];
@@ -400,6 +441,11 @@ function createHarness(options: {
   let linearLinkDispatches = 0;
   let linearCompletionCalls = 0;
   let obsidianCalls = 0;
+  const finalizerDiagnostics: Array<{
+    stage: string;
+    code: string;
+    message: string;
+  }> = [];
   let now = Date.parse("2026-07-12T12:00:00.000Z");
   let pullRequest: GitHubPublicationPullRequestV1 = pr({ draft: true });
   let draftPullRequestApplied = false;
@@ -538,6 +584,7 @@ function createHarness(options: {
     get obsidianCalls() {
       return obsidianCalls;
     },
+    finalizerDiagnostics,
     options: {
       push: {
         async publish() {
@@ -619,8 +666,14 @@ function createHarness(options: {
         },
         async finalizeObsidian() {
           obsidianCalls += 1;
+          if (options.failObsidianOnce && obsidianCalls === 1) {
+            throw new Error(options.obsidianError ?? "simulated Obsidian failure");
+          }
           return { receiptId: "receipt-obsidian" };
         },
+      },
+      onFinalizerDiagnostic(diagnostic: GitHubPublicationFinalizerDiagnosticV1) {
+        finalizerDiagnostics.push({ ...diagnostic });
       },
       now: () => new Date((now += 1_000)),
     },

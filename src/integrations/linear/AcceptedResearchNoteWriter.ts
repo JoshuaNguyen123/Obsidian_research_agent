@@ -41,6 +41,8 @@ import {
 
 const MAX_SECTION_CHARS = 8_000;
 const MAX_LIST_ENTRIES = 50;
+const MAX_REFLECTION_CHANGED_PATHS = 100;
+const MAX_REFLECTION_CHANGED_PATH_LENGTH = 1_024;
 
 export interface AcceptedResearchEvidenceNoteEntryV1
   extends AcceptedResearchEvidenceV1 {
@@ -764,13 +766,14 @@ export async function planProjectCompletionReflectionV1(
       throw new Error("Project reflection current note path does not match its accepted artifact.");
     }
     const currentSha256 = expectSha256(input.currentSha256, "current research note SHA-256");
-    if (
-      await sha256DiagramContent(input.currentContent) !== currentSha256 ||
-      currentSha256 !== input.expectedNoteSha256
-    ) {
+    const expectedNoteSha256 = expectSha256(
+      input.expectedNoteSha256,
+      "expected research note SHA-256",
+    );
+    if (await sha256DiagramContent(input.currentContent) !== currentSha256) {
       throw new DiagramArtifactStoreError(
         "expected_hash_mismatch",
-        "Research note changed before project completion reflection planning.",
+        "Research note content does not match its current project reflection revision.",
       );
     }
     const publicationId = markerId(input.publicationId);
@@ -906,11 +909,24 @@ export async function planProjectCompletionReflectionV1(
             renderVerifiedProjectCodeExample(example),
           ),
         ].join("\n");
-    const hasMarker = input.currentContent.includes(marker);
+    const markerCount = input.currentContent.split(marker).length - 1;
+    const hasMarker = markerCount > 0;
+    if (markerCount > 1) {
+      throw new DiagramArtifactStoreError(
+        "validation_failed",
+        "Project reflection marker appears more than once.",
+      );
+    }
     if (hasMarker && !input.currentContent.includes(reflection)) {
       throw new DiagramArtifactStoreError(
         "validation_failed",
         "Project reflection marker collides with different or incomplete proof.",
+      );
+    }
+    if (currentSha256 !== expectedNoteSha256 && !hasMarker) {
+      throw new DiagramArtifactStoreError(
+        "expected_hash_mismatch",
+        "Research note changed before project completion reflection planning.",
       );
     }
     const operation = hasMarker ? "no_op" : "append";
@@ -1358,11 +1374,21 @@ function acceptedResearchMarker(artifactId: unknown): string {
 }
 
 function boundedRepositoryPaths(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_LIST_ENTRIES) {
-    throw new Error(`changed paths require 1-${MAX_LIST_ENTRIES} entries.`);
+  if (
+    !Array.isArray(value) ||
+    value.length < 1 ||
+    value.length > MAX_REFLECTION_CHANGED_PATHS
+  ) {
+    throw new Error(
+      `changed paths require 1-${MAX_REFLECTION_CHANGED_PATHS} entries.`,
+    );
   }
   const normalized = value.map((entry, index) => {
-    const path = boundedText(entry, `changed path ${index + 1}`, 500);
+    const path = boundedText(
+      entry,
+      `changed path ${index + 1}`,
+      MAX_REFLECTION_CHANGED_PATH_LENGTH,
+    );
     if (
       path.includes("\\") ||
       path.startsWith("/") ||
