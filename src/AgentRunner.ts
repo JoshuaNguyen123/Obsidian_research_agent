@@ -241,6 +241,7 @@ import {
 import {
   buildMissionGraphFrontierTurnContext,
   constrainToolsToMissionGraphFrontier,
+  narrowAdaptiveCodeMutationsToPlannedWritesV1,
   filterSetLooseToolNamesByMissionGraphAuthority,
   getActiveValidationRecoveryFrontierV1,
   getPendingMissionGraphWriteToolNames,
@@ -16554,7 +16555,8 @@ export async function runAgentMission({
     let stepTools = bindVerifiedWorkspaceIdentityToolSchemas(
       constrainValidationRecoveryWorkspaceToolsV1({
         tools: bindExactWorkspaceDestinationToolSchemas(
-          constrainToolsToMissionGraphFrontier(
+          narrowAdaptiveCodeMutationsToPlannedWritesV1(
+            constrainToolsToMissionGraphFrontier(
             tools,
             stepGraph,
             {
@@ -16569,6 +16571,11 @@ export async function runAgentMission({
               maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
               setLooseOfferedToolNames,
             },
+          ),
+            // The authoritative graph, even when the menu above was built
+            // from the broad route catalog (non-explicit plans pass a null
+            // graph into the frontier constraint and rely on authority alone).
+            missionGraphSession?.graph ?? stepGraph,
           ),
           missionGraphUsesExactPlannedFrontier && !setLooseCompoundEnabled
             ? stepGraph

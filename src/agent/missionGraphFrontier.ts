@@ -158,6 +158,46 @@ export function isAdaptiveCodeWorkspaceMutationToolNameV1(
   return CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName);
 }
 
+/**
+ * While a ready/running node pins one exact workspace mutation (a planned
+ * code_workspace_append, for example), sibling adaptive mutations are noise
+ * rather than freedom: a model that writes the same file through
+ * code_workspace_create_file succeeds at the tool level but leaves the planned
+ * node ready forever, and every validator gated behind it is deferred. Observed
+ * live on deepseek-v4-pro: twenty steps of create_file / write_expected /
+ * status calls against an 18-tool menu while tool-05-code_workspace_append
+ * stayed ready, until the segment budget expired. Offer only the pinned
+ * write(s) until that node completes; the adaptive companions return as soon
+ * as no ready node names a specific workspace mutation.
+ */
+export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
+  tools: ModelToolDefinition[],
+  graph:
+    | Pick<MissionGraphV3, "nodes">
+    | { nodes: Record<string, { status: string; allowedTools: readonly string[] }> }
+    | null
+    | undefined,
+): ModelToolDefinition[] {
+  if (!graph) return tools;
+  const pinned = new Set<string>();
+  for (const node of Object.values(graph.nodes)) {
+    if (node.status !== "ready" && node.status !== "running") continue;
+    for (const toolName of getMissionGraphNodeFrontierToolNames(
+      node as MissionGraphV3["nodes"][string],
+    )) {
+      if (CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName)) {
+        pinned.add(toolName);
+      }
+    }
+  }
+  if (pinned.size === 0) return tools;
+  return tools.filter(
+    (tool) =>
+      !CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(tool.function.name) ||
+      pinned.has(tool.function.name),
+  );
+}
+
 function filterValidationRecoveryToolNamesV1(
   toolNames: readonly string[],
   graph: MissionGraphV3,
