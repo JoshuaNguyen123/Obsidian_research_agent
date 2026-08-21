@@ -142,7 +142,16 @@ export interface GitHubPublicationCheckpointV1 {
   obsidianReceiptId: string | null;
   receiptIds: string[];
   pendingAction: PendingExternalActionStateV2 | null;
-  blocker: { code: string; message: string } | null;
+  blocker: {
+    code: string;
+    message: string;
+    /**
+     * Bounded, credential/path/URL-redacted cause of the most recent
+     * finalizer failure. Absent when the blocker was not raised by a thrown
+     * finalizer. Safe to show in Run Details and tool errors.
+     */
+    detail?: string;
+  } | null;
   /** Present after a verified review-repair epoch advances the publication head. */
   repairBaseSha?: string | null;
   /** Durable review-repair identity; never sourced from GitHub review prose. */
@@ -1550,6 +1559,7 @@ export class GitHubPublicationWorkflowV1 {
           "github_linear_link_finalizer_failed",
           error,
         );
+        const detail = boundedFinalizerDiagnostic(error);
         const linkCommitted = Boolean(current.linearLinkReceiptId);
         current = {
           ...current,
@@ -1560,6 +1570,7 @@ export class GitHubPublicationWorkflowV1 {
             : {
                 code: "github_linear_link_waiting",
                 message: "GitHub proof is verified; the exact Linear linkage remains pending.",
+                detail,
               },
         };
         await this.options.checkpoints.persist(current);
@@ -1588,6 +1599,7 @@ export class GitHubPublicationWorkflowV1 {
           "github_obsidian_finalizer_failed",
           error,
         );
+        const detail = boundedFinalizerDiagnostic(error);
         const obsidianCommitted = Boolean(current.obsidianReceiptId);
         current = {
           ...current,
@@ -1600,6 +1612,7 @@ export class GitHubPublicationWorkflowV1 {
             : {
                 code: "github_obsidian_finalization_waiting",
                 message: "GitHub proof and the exact Linear link are verified; the originating Markdown reflection remains pending.",
+                detail,
               },
         };
         await this.options.checkpoints.persist(current);
@@ -1624,6 +1637,7 @@ export class GitHubPublicationWorkflowV1 {
           "github_linear_completion_finalizer_failed",
           error,
         );
+        const detail = boundedFinalizerDiagnostic(error);
         const completionCommitted = Boolean(current.linearCompletionReceiptId);
         current = {
           ...current,
@@ -1634,6 +1648,7 @@ export class GitHubPublicationWorkflowV1 {
             : {
                 code: "github_linear_completion_waiting",
                 message: "GitHub proof, Linear linkage, and the Markdown reflection are durable; Linear completion remains pending.",
+                detail,
               },
         };
         await this.options.checkpoints.persist(current);

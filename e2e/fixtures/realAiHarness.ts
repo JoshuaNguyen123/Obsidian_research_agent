@@ -1233,7 +1233,20 @@ async function approveUntilMissionComplete(
             .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
             .slice(0, 500),
           diagnostics: Array.isArray(snapshot?.diagnosticAttestations)
-            ? snapshot.diagnosticAttestations.slice(-12).map((item: any) => ({
+            ? ((all: any[]) => {
+              // Recent entries plus every error-kind host diagnostic: a
+              // blocked publish node's finalizer cause was recorded several
+              // steps before the failure and fell outside a recency window.
+              const recent = all.slice(-12);
+              const errors = all
+                .filter((item: any) => item?.kind === "error" || typeof item?.errorCode === "string")
+                .slice(-12);
+              const merged: any[] = [];
+              for (const item of [...errors, ...recent]) {
+                if (!merged.includes(item)) merged.push(item);
+              }
+              return merged;
+            })(snapshot.diagnosticAttestations).map((item: any) => ({
                 id: item.id ?? null,
                 errorCode: item.errorCode ?? null,
                 message: typeof item.message === "string"
@@ -1649,7 +1662,20 @@ async function approveUntilMissionComplete(
       acceptance: snapshot?.lastMissionLedger?.acceptance ?? null,
       providerUsage: snapshot?.providerUsage ?? null,
       diagnostics: Array.isArray(snapshot?.diagnosticAttestations)
-        ? snapshot.diagnosticAttestations.slice(-12).map((item: any) => ({
+        ? ((all: any[]) => {
+              // Recent entries plus every error-kind host diagnostic: a
+              // blocked publish node's finalizer cause was recorded several
+              // steps before the failure and fell outside a recency window.
+              const recent = all.slice(-12);
+              const errors = all
+                .filter((item: any) => item?.kind === "error" || typeof item?.errorCode === "string")
+                .slice(-12);
+              const merged: any[] = [];
+              for (const item of [...errors, ...recent]) {
+                if (!merged.includes(item)) merged.push(item);
+              }
+              return merged;
+            })(snapshot.diagnosticAttestations).map((item: any) => ({
             id: item.id ?? null,
             errorCode: item.errorCode ?? null,
             message: typeof item.message === "string"

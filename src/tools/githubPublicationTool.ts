@@ -113,10 +113,17 @@ export function createGitHubPublicationTool(
       );
     }
     if (!isGitHubPublicationActionComplete(args.action, checkpoint)) {
+      // A finalizer that threw leaves a bounded, redacted cause on the
+      // blocker. Surface it: without it two identical "remains pending"
+      // failures block the graph node with no way to tell a stale note hash
+      // from a missing code example or a denied approval.
+      const cause = checkpoint.blocker?.detail?.trim();
       throw new ToolExecutionError(
         "github_publication_finalization_pending",
-        checkpoint.blocker?.message ??
-          `GitHub publication reached ${checkpoint.status}, but the requested ${String(args.action)} proof is not durably complete. Retry the same publication to resume from its checkpoint.`,
+        `${
+          checkpoint.blocker?.message ??
+            `GitHub publication reached ${checkpoint.status}, but the requested ${String(args.action)} proof is not durably complete. Retry the same publication to resume from its checkpoint.`
+        }${cause ? ` Cause: ${cause}` : ""}`,
         { mutationState: "may_have_applied" },
       );
     }

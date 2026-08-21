@@ -636,12 +636,23 @@ function parseRef(value: unknown, label: string): { ref: string; sha: string } {
   return { ref: branch(record.ref), sha: gitSha(record.sha, `${label} SHA`) };
 }
 
-function parseBlocker(value: unknown): { code: string; message: string } {
+function parseBlocker(
+  value: unknown,
+): { code: string; message: string; detail?: string } {
   const record = expectRecord(value, "GitHub publication blocker");
-  assertKeys(record, ["code", "message"], [], "GitHub publication blocker");
+  assertKeys(record, ["code", "message"], ["detail"], "GitHub publication blocker");
   return {
     code: expectIdentifier(record.code, "GitHub publication blocker code", 120),
     message: expectText(record.message, "GitHub publication blocker message", 1_000),
+    ...(record.detail === undefined
+      ? {}
+      : {
+          detail: expectText(
+            record.detail,
+            "GitHub publication blocker detail",
+            1_000,
+          ),
+        }),
   };
 }
 

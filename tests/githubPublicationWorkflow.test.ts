@@ -207,6 +207,16 @@ test("Obsidian finalizer failure stays generic for the workflow and emits one re
   assert.equal(waiting.status, "waiting_obsidian");
   assert.match(waiting.blocker?.message ?? "", /Markdown reflection remains pending/u);
   assert.doesNotMatch(waiting.blocker?.message ?? "", /ghp_|Users|private\.example/u);
+  // The redacted cause is persisted on the blocker so the publish tool's
+  // error, the graph blocker, and E2E failure summaries can name it. Two
+  // identical "remains pending" failures were otherwise undiagnosable.
+  assert.ok(
+    (waiting.blocker?.detail ?? "").includes(
+      "reflection failed for [redacted credential] at [redacted local path]",
+    ),
+    waiting.blocker?.detail,
+  );
+  assert.doesNotMatch(waiting.blocker?.detail ?? "", /ghp_|Users|private.example/u);
   assert.equal(harness.finalizerDiagnostics.length, 1);
   assert.deepEqual(
     {
