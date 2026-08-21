@@ -14181,10 +14181,14 @@ export async function runAgentMission({
       }
     } else {
       const failureCode = result.error?.code;
+      // The workspace tool resolves the target with requiredPath(args, "path",
+      // "sourcePath"); reading only "path" here dropped the repair entirely
+      // whenever a model spelled the argument the other supported way.
       const createFileCollisionPath =
         toolCall.name === "code_workspace_create_file" &&
         failureCode === "path_exists"
-          ? getString(toolCall.arguments.path)
+          ? getString(toolCall.arguments.path) ??
+            getString(toolCall.arguments.sourcePath)
           : undefined;
       const durableWorkspaceIdForAck =
         getSingleVerifiedDurableWorkspaceId(writeReceipts);

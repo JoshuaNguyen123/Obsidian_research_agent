@@ -1621,6 +1621,74 @@ test("a create collision replans the same node into read then hash-bound write",
   assert.doesNotThrow(() => validateMissionGraphV3(completed));
 });
 
+// The runner hands the repair the model's raw `path` argument while the graph
+// holds the planned selector. The workspace tool canonicalizes host-absolute
+// spellings before it touches disk, so the two named the same file through
+// different strings and the repair refused itself -- leaving the model on a
+// frontier whose only tool had just failed.
+test("a create collision repairs when the model spells the bound path host-absolutely", async () => {
+  const harness = createVaultHarness();
+  const graph = await workspaceCollisionGraphFor(
+    "session-create-file-collision-absolute-spelling",
+    "src/app.py",
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const create = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file"),
+  );
+  await session.finishToolExecution(create, {
+    ok: false,
+    failureFingerprint: fp("c"),
+    failureMessage: "path_exists",
+  });
+
+  const repaired = await session.scheduleCreateFileCollisionRepair(
+    create,
+    "/home/agent/workspace/src/app.py",
+  );
+
+  assert.equal(
+    repaired.nodes[create.nodeId]?.blocker?.code,
+    "create_file_path_exists",
+  );
+  // The repair binds to the trusted graph selector, never the requested string.
+  const repairReadNode = toolNode(repaired, "code_workspace_read");
+  const repairWriteNode = toolNode(repaired, "code_workspace_write_expected");
+  assert.equal(repairReadNode.inputs.resource?.kind, "binding");
+  assert.equal(repairReadNode.inputs.resource?.selector, "src/app.py");
+  assert.equal(repairWriteNode.destination?.selector, "src/app.py");
+  assert.doesNotThrow(() => validateMissionGraphV3(repaired));
+});
+
+test("a create collision repair still refuses a genuinely different path", async () => {
+  const harness = createVaultHarness();
+  const graph = await workspaceCollisionGraphFor(
+    "session-create-file-collision-foreign-path",
+    "src/app.py",
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const create = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file"),
+  );
+  await session.finishToolExecution(create, {
+    ok: false,
+    failureFingerprint: fp("c"),
+    failureMessage: "path_exists",
+  });
+
+  await assert.rejects(
+    () =>
+      session.scheduleCreateFileCollisionRepair(create, "src/other.py"),
+    /does not match the trusted graph selector/u,
+  );
+});
+
 test("a composite code lifecycle resumes after bounded create collision repair", async () => {
   const harness = createVaultHarness();
   const graph = await compositeCodeCollisionGraphFor(
@@ -2697,6 +2765,7 @@ async function graphFor(input: {
 
 async function workspaceCollisionGraphFor(
   missionId: string,
+  targetPath = "app.py",
 ): Promise<MissionGraphV3> {
   const descriptors = [
     workspaceFileDescriptor("code_workspace_create_file"),
@@ -2716,7 +2785,7 @@ async function workspaceCollisionGraphFor(
     getDescriptor: (name) => byName.get(name) ?? null,
     execute: async (call) => ({ ok: true, toolName: call.name }),
   };
-  const objective = "Create app.py in the current code workspace.";
+  const objective = `Create ${targetPath} in the current code workspace.`;
   const host = await buildHostMissionGraphPlanV1({
     missionId,
     objective,

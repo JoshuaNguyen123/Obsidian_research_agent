@@ -31,6 +31,25 @@ import type { MissionGraphStoreReferenceV1 } from "./runStore";
 import { missionGraphToolNodeWallClockMs } from "./missionGraphHost";
 import { collectRequiredDependencyIds } from "./missionGraphAuthority";
 import { sha256Fingerprint } from "../../packages/headless-runtime/src/canonicalize";
+import { assertWorkspaceRelativePathV2 } from "../../extensions/code/workspaces/WorkspaceManifestV2";
+
+/**
+ * Canonicalize a workspace selector the same way the code extension does before
+ * it touches the filesystem. The workspace tools coerce host-absolute paths to
+ * workspace-relative ones and strip a trailing slash, so a model argument and
+ * the planned graph selector can name the identical file through different
+ * spellings. Comparing raw strings made every such collision unrepairable.
+ * Returns null when the value cannot be a workspace path at all, which must
+ * always fail the comparison rather than widen it.
+ */
+function canonicalWorkspaceSelectorV1(value: string | null): string | null {
+  if (value === null) return null;
+  try {
+    return assertWorkspaceRelativePathV2(value);
+  } catch {
+    return null;
+  }
+}
 
 export interface MissionGraphSessionEvents {
   onGraphUpdate?: (
@@ -2109,7 +2128,17 @@ export class MissionGraphSession {
         lifecycleAction?.selector ?? node.destination?.selector ?? null;
       const bindingId =
         lifecycleAction?.bindingId ?? node.destination?.bindingId ?? null;
-      if (selector !== requestedSelector) {
+      // Compare canonical forms, not spellings. The repair still binds to the
+      // trusted graph selector below, so an equivalent spelling can never
+      // redirect the repair at a different file.
+      const canonicalSelector = canonicalWorkspaceSelectorV1(selector);
+      const canonicalRequested =
+        canonicalWorkspaceSelectorV1(requestedSelector);
+      if (
+        canonicalSelector === null ||
+        canonicalRequested === null ||
+        canonicalSelector !== canonicalRequested
+      ) {
         throw new Error(
           `Create-file collision repair path ${requestedSelector} does not match the trusted graph selector ${selector ?? "(missing)"}.`,
         );
