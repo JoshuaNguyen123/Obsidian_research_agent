@@ -643,6 +643,45 @@ test("workspace tools prepare every mutation and return exact readback receipts"
       authorize(context, appendPrepared),
     );
     assert.equal(append.receipt.operation, "append");
+
+    // Appending to an absent path creates the file. A planned append node is
+    // routinely the first write of a new implementation file; once sibling
+    // create tools are pinned out of the menu, refusing it strands the graph.
+    const createViaAppend = await requirePrepared(
+      appendTool,
+      {
+        workspaceId: "tool-space",
+        path: "src/crdt_sync.py",
+        content: "def merge(a, b):\n    return a | b\n",
+      },
+      context,
+    );
+    assert.equal(createViaAppend.normalizedArgs.expectedTargetState, "absent");
+    assert.equal(createViaAppend.normalizedArgs.mutationMode, "create");
+    assert.equal(createViaAppend.normalizedArgs.expectedSha256, null);
+    const appendCreated = await appendTool.executePrepared!(
+      createViaAppend,
+      authorize(context, createViaAppend),
+    );
+    assert.equal(appendCreated.mutationState, "applied");
+    assert.equal(
+      (await fixture.manager.read("tool-space", "src/crdt_sync.py")).content,
+      "def merge(a, b):\n    return a | b\n",
+    );
+    // A stale hash against an existing file is still refused.
+    await assert.rejects(
+      requirePrepared(
+        appendTool,
+        {
+          workspaceId: "tool-space",
+          path: "src/crdt_sync.py",
+          content: "\n",
+          expectedSha256: "sha256:" + "0".repeat(64),
+        },
+        context,
+      ),
+      /stale/u,
+    );
     const preview = await tools.get("preview_workspace_html")!.execute(
       { workspaceId: "tool-space", htmlPath: "index.html" },
       context,

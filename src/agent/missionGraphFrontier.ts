@@ -174,21 +174,51 @@ export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
   tools: ModelToolDefinition[],
   graph:
     | Pick<MissionGraphV3, "nodes">
-    | { nodes: Record<string, { status: string; allowedTools: readonly string[] }> }
+    | {
+        nodes: Record<
+          string,
+          {
+            status: string;
+            allowedTools: readonly string[];
+            attempts?: number;
+            retries?: { attempts?: number };
+          }
+        >;
+      }
     | null
     | undefined,
 ): ModelToolDefinition[] {
   if (!graph) return tools;
+  // A red validation deliberately opens the diagnostic + mutation recovery
+  // set. Pinning inside that window would remove the correction tools the
+  // repair cycle exists to offer.
+  if (
+    getActiveValidationRecoveryFrontierV1(
+      graph as MissionGraphV3,
+    ) !== null
+  ) {
+    return tools;
+  }
   const pinned = new Set<string>();
   for (const node of Object.values(graph.nodes)) {
     if (node.status !== "ready" && node.status !== "running") continue;
-    for (const toolName of getMissionGraphNodeFrontierToolNames(
+    const names = getMissionGraphNodeFrontierToolNames(
       node as MissionGraphV3["nodes"][string],
-    )) {
-      if (CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName)) {
-        pinned.add(toolName);
-      }
-    }
+    ).filter((toolName) =>
+      CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName),
+    );
+    if (names.length === 0) continue;
+    // The real graph nests attempts under retries; UI/E2E projections flatten
+    // it. A pinned tool that already failed must not stay pinned: its own
+    // error names a sibling as the remedy (patch -> create_file,
+    // create_file -> write_expected), and pinning that remedy out of the menu
+    // is exactly how a recoverable step becomes a dead end.
+    const attempts =
+      (node as { retries?: { attempts?: number } }).retries?.attempts ??
+      (node as { attempts?: number }).attempts ??
+      0;
+    if (attempts > 0) return tools;
+    for (const toolName of names) pinned.add(toolName);
   }
   if (pinned.size === 0) return tools;
   return tools.filter(

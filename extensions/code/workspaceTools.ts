@@ -332,21 +332,37 @@ class WorkspaceToolRuntimeV2 {
           }
           action = "create";
         } else if (name === "code_workspace_append") {
-          const stat = await this.manager.stat(workspaceId, targetPath);
-          if (stat.kind !== "file") throw new WorkspaceManagerErrorV2("path_conflict", `${targetPath} is not a regular file.`);
-          expected = stat.sha256;
-          assertRequestedFingerprint(args.expectedSha256, expected);
           const content = requiredString(args.content, "content", true);
           outboundBytes = byteLength(content);
-          normalizedArgs.expectedTargetState = "existing";
-          normalizedArgs.expectedKind = "file";
-          normalizedArgs.expectedSha256 = expected;
           normalizedArgs.content = content;
-          const current = await this.manager.read(workspaceId, targetPath);
-          normalizedArgs.expectedAfterSha256 = sha256Text(`${current.content}${content}`);
           normalizedArgs.payloadBytes = outboundBytes;
-          summary = `Append ${outboundBytes} byte(s) to ${targetPath} only if SHA-256 remains ${expected}.`;
-          action = "append";
+          const stat = await statOrMissing(this.manager, workspaceId, targetPath);
+          if (!stat) {
+            // Appending to a path that does not exist yet creates it with the
+            // appended bytes. A planned append node is routinely the first
+            // write of a new implementation file; refusing it stranded the
+            // graph twice in a row once sibling create tools were no longer
+            // offered beside the pinned append.
+            expected = absentFingerprint(workspaceId, targetPath);
+            normalizedArgs.expectedTargetState = "absent";
+            normalizedArgs.expectedSha256 = null;
+            normalizedArgs.mutationMode = "create";
+            normalizedArgs.expectedAfterSha256 = sha256Text(content);
+            summary = `Create ${targetPath} with ${outboundBytes} appended byte(s) while the target remains absent.`;
+            action = "create";
+          } else {
+            if (stat.kind !== "file") throw new WorkspaceManagerErrorV2("path_conflict", `${targetPath} is not a regular file.`);
+            expected = stat.sha256;
+            assertRequestedFingerprint(args.expectedSha256, expected);
+            normalizedArgs.expectedTargetState = "existing";
+            normalizedArgs.expectedKind = "file";
+            normalizedArgs.expectedSha256 = expected;
+            normalizedArgs.mutationMode = "append";
+            const current = await this.manager.read(workspaceId, targetPath);
+            normalizedArgs.expectedAfterSha256 = sha256Text(`${current.content}${content}`);
+            summary = `Append ${outboundBytes} byte(s) to ${targetPath} only if SHA-256 remains ${expected}.`;
+            action = "append";
+          }
         } else if (name === "code_workspace_write_expected" || name === "write_workspace_file") {
           const content = requiredString(args.content, "content", true);
           const sourceLanguage = detectCodeCreationLanguageV1(targetPath);
@@ -593,7 +609,9 @@ class WorkspaceToolRuntimeV2 {
     } else if (name === "code_workspace_append") {
       const content = requiredString(args.content, "content", true);
       assertPayloadBytes(args, byteLength(content));
-      result = await this.manager.appendFile(workspaceId, leaseId, targetPath, content, requiredFingerprint(args.expectedSha256));
+      result = args.mutationMode === "create"
+        ? await this.manager.createFile(workspaceId, leaseId, targetPath, content)
+        : await this.manager.appendFile(workspaceId, leaseId, targetPath, content, requiredFingerprint(args.expectedSha256));
     } else if (name === "code_workspace_write_expected" || name === "write_workspace_file") {
       const content = requiredString(args.content, "content", true);
       assertPayloadBytes(args, byteLength(content));
@@ -2094,7 +2112,9 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
       ["destinationRoot", "destinationPath"],
     );
   }
-  if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content", "expectedSha256"]);
+  // expectedSha256 binds an append to an existing file's observed hash; it is
+  // optional because appending to an absent path creates the file.
+  if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content"]);
   if (name === "code_workspace_write_expected" || name === "write_workspace_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content"]);
   if (name === "code_workspace_patch") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: stringSchema(), replacements: { type: "array", items: objectSchema({ oldText: stringSchema(), newText: stringSchema(), expectedOccurrences: { type: "integer", enum: [1] } }, ["oldText", "newText"]) } }, ["path", "replacements"]);
   if (name === "code_workspace_move" || name === "code_workspace_copy") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), destinationPath: stringSchema(), expectedSha256: stringSchema() }, ["path", "destinationPath"]);
@@ -2136,6 +2156,8 @@ function description(name: string): string {
   } else if (name === "code_workspace_create_file") {
     text = `Purpose: Create a new file in the real local filesystem workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for vault-sibling delivery unless another destination was explicit. Side effects: bound local write. ${base} Retrying is safe only when the existing file is byte-identical: that case returns a verified no-op. Different content is never overwritten by create; the error reports its SHA-256 and requires code_workspace_read followed by code_workspace_write_expected. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
     text += " Missing parent directories are created automatically, so paths such as src/game/ui/checkers.py are valid in one call.";
+  } else if (name === "code_workspace_append") {
+    text = `Purpose: Append content to a workspace file, creating the file when the path does not exist yet. Use when: writing a planned implementation file or adding to one you have read. Required: path + content; expectedSha256 only when appending to an existing file you have read (it must match the observed SHA-256). Next: code_validate_fast. Side effects: bound local write. ${base}`;
   } else if (name === "code_workspace_patch") {
     text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
   } else if (

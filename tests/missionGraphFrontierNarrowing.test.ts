@@ -94,3 +94,76 @@ test("two ready planned writes keep both pinned mutations", () => {
   assert.ok(!names.includes("code_workspace_write_expected"));
   assert.ok(names.includes("code_workspace_read"));
 });
+
+test("a failed planned write unpins its siblings so the named remedy stays callable", () => {
+  // Pinning is a first-attempt focus aid, not a cage. Each adaptive mutation's
+  // failure names a sibling as the remedy (patch -> create_file, create_file ->
+  // write_expected, append on an absent path used to -> create_file). Keeping
+  // the pin after a failure removes exactly the tool the error asks for.
+  const nested = narrowAdaptiveCodeMutationsToPlannedWritesV1(CODE_MENU, {
+    nodes: {
+      "tool-05-code_workspace_patch": {
+        status: "ready",
+        allowedTools: ["code_workspace_patch"],
+        // The production graph nests attempts under retries.
+        retries: { attempts: 1 },
+      },
+    },
+  });
+  assert.deepEqual(nested, CODE_MENU);
+
+  // UI/E2E projections flatten attempts; both shapes must unpin.
+  const flat = narrowAdaptiveCodeMutationsToPlannedWritesV1(CODE_MENU, {
+    nodes: {
+      "tool-05-code_workspace_create_file": {
+        status: "ready",
+        allowedTools: ["code_workspace_create_file"],
+        attempts: 2,
+      },
+    },
+  });
+  assert.deepEqual(flat, CODE_MENU);
+
+  // A fresh node still pins.
+  const fresh = narrowAdaptiveCodeMutationsToPlannedWritesV1(CODE_MENU, {
+    nodes: {
+      "tool-05-code_workspace_append": {
+        status: "ready",
+        allowedTools: ["code_workspace_append"],
+        retries: { attempts: 0 },
+      },
+    },
+  });
+  assert.ok(!fresh.some((item) => item.function.name === "code_workspace_create_file"));
+  assert.ok(fresh.some((item) => item.function.name === "code_workspace_append"));
+});
+
+test("an active validation recovery window is never narrowed", () => {
+  // A red validation opens the diagnostic + correction set on purpose. If a
+  // ready node also names an adaptive mutation, pinning would strip exactly
+  // the correction tools the repair cycle depends on.
+  const narrowed = narrowAdaptiveCodeMutationsToPlannedWritesV1(CODE_MENU, {
+    nodes: {
+      "tool-06-code_validate_fast": {
+        status: "queued",
+        allowedTools: ["code_validate_fast"],
+        outputs: {
+          validationRecovery: {
+            status: "awaiting_correction",
+            fastNodeId: "tool-06-code_validate_fast",
+            repairNodeId: "tool-07-code_repair_record_cycle",
+          },
+        },
+      },
+      "tool-07-code_repair_record_cycle": {
+        status: "ready",
+        allowedTools: ["code_repair_record_cycle"],
+      },
+      "tool-05-code_workspace_append": {
+        status: "ready",
+        allowedTools: ["code_workspace_append"],
+      },
+    },
+  });
+  assert.deepEqual(narrowed, CODE_MENU);
+});

@@ -16557,21 +16557,21 @@ export async function runAgentMission({
         tools: bindExactWorkspaceDestinationToolSchemas(
           narrowAdaptiveCodeMutationsToPlannedWritesV1(
             constrainToolsToMissionGraphFrontier(
-            tools,
-            stepGraph,
-            {
-              // Exploratory reads remain available only for non-explicit plans.
-              // MissionGraphSession materializes each such call as a bounded dynamic
-              // node. Explicit ordered workflows expose the exact ready node only.
-              // Set-loose compound expands to the stage Soft-union instead.
-              includeCapabilityReads:
-                setLooseCompoundEnabled || !missionGraphUsesExactPlannedFrontier,
-              // Shrink schemas for cloud tool-calling models by route bucket.
-              route: runPlan.route,
-              maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
-              setLooseOfferedToolNames,
-            },
-          ),
+              tools,
+              stepGraph,
+              {
+                // Exploratory reads remain available only for non-explicit plans.
+                // MissionGraphSession materializes each such call as a bounded dynamic
+                // node. Explicit ordered workflows expose the exact ready node only.
+                // Set-loose compound expands to the stage Soft-union instead.
+                includeCapabilityReads:
+                  setLooseCompoundEnabled || !missionGraphUsesExactPlannedFrontier,
+                // Shrink schemas for cloud tool-calling models by route bucket.
+                route: runPlan.route,
+                maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
+                setLooseOfferedToolNames,
+              },
+            ),
             // The authoritative graph, even when the menu above was built
             // from the broad route catalog (non-explicit plans pass a null
             // graph into the frontier constraint and rely on authority alone).
