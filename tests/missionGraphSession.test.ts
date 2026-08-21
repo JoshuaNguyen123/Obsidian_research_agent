@@ -2329,14 +2329,45 @@ test("approval expiry is not misreported as a user denial", async () => {
   );
   await session.waitForToolApproval(execution);
   const expired = await session.resolveToolApproval(execution, "expired");
-  assert.equal(expired.nodes[execution.nodeId].status, "blocked");
-  assert.equal(expired.nodes[execution.nodeId].blocker?.code, "approval_expired");
-  assert.doesNotMatch(
-    expired.nodes[execution.nodeId].blocker?.message ?? "",
-    /User denied/u,
-  );
+  // Undecided approvals are not denials: the node reopens so a continuation
+  // can prepare the action and ask again, and no blocker carries "denied".
+  assert.equal(expired.nodes[execution.nodeId].status, "ready");
+  assert.equal(expired.nodes[execution.nodeId].blocker, null);
   const stored = await requireStored(harness.context, graph.missionId);
   assert.deepEqual(stored.record.resourceLocks.locks, {});
+});
+
+test("an approval aborted by a run deadline reopens the node for continuation", async () => {
+  // Regression: the effort wall-clock budget expired while code_validate_full
+  // was waiting for its card; the node was blocked as approval_aborted, so
+  // Continue could never pick it up even though the ledger said it could.
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-approval-aborted",
+    allowedTools: ["replace_current_file"],
+    plannedTools: ["replace_current_file"],
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const execution = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  await session.waitForToolApproval(execution);
+  const aborted = await session.resolveToolApproval(execution, "aborted");
+  assert.equal(aborted.nodes[execution.nodeId].status, "ready");
+  assert.equal(aborted.nodes[execution.nodeId].blocker, null);
+  const stored = await requireStored(harness.context, graph.missionId);
+  assert.deepEqual(stored.record.resourceLocks.locks, {});
+  // The reopened node accepts a fresh execution and a real denial still blocks.
+  const again = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  await session.waitForToolApproval(again);
+  const denied = await session.resolveToolApproval(again, "denied");
+  assert.equal(denied.nodes[again.nodeId].status, "blocked");
+  assert.equal(denied.nodes[again.nodeId].blocker?.code, "approval_denied");
 });
 
 async function publicationReconciliationFixture(

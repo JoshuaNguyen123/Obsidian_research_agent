@@ -2585,6 +2585,13 @@ export class MissionGraphSession {
   /**
    * Resolve a durable approval wait. Approval resumes the same prepared
    * execution. Denial blocks the node and releases its resource lease.
+   *
+   * An approval that expired or was aborted (run deadline, user Stop) was
+   * never decided. The node returns to `ready` with its lease released so a
+   * continuation re-prepares the action and asks again — which is what the
+   * run's own failure copy promises ("Click Continue ... when the card
+   * appears again"). Leaving it blocked stranded a mission whose wall-clock
+   * budget expired while a validation card was pending.
    */
   async resolveToolApproval(
     execution: MissionGraphToolExecution,
@@ -2592,33 +2599,28 @@ export class MissionGraphSession {
   ): Promise<MissionGraphV3> {
     return this.enqueueMutation(async () => {
       const approved = resolution === true || resolution === "approved";
-      const deniedCode = resolution === false || resolution === "denied"
-        ? "approval_denied"
-        : `approval_${resolution}`;
-      const deniedMessage = deniedCode === "approval_denied"
-        ? `User denied approval for ${execution.toolName}.`
-        : deniedCode === "approval_expired"
-          ? `Approval expired before ${execution.toolName} could run.`
-          : `Approval for ${execution.toolName} was aborted before execution.`;
+      const denied = resolution === false || resolution === "denied";
       const node = this.requireExecutionNode(execution, "waiting_approval");
       const graph = await this.applyUnlocked(
         approved
           ? `Resume approved mission node ${node.id}.`
-          : `Block denied mission node ${node.id}.`,
+          : denied
+            ? `Block denied mission node ${node.id}.`
+            : `Reopen mission node ${node.id} after an undecided approval (${resolution}).`,
         [
           {
             op: "set_status",
             nodeId: node.id,
             expectedStatus: "waiting_approval",
-            status: approved ? "running" : "blocked",
-            blocker: approved
-              ? null
-              : {
-                  code: deniedCode,
-                  message: deniedMessage,
+            status: approved ? "running" : denied ? "blocked" : "ready",
+            blocker: denied
+              ? {
+                  code: "approval_denied",
+                  message: `User denied approval for ${execution.toolName}.`,
                   requiredAction:
                     "Revise the mission or request a new exact approval before retrying.",
-                },
+                }
+              : null,
           },
         ],
       );
