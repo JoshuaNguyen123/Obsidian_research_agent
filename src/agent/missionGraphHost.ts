@@ -60,6 +60,12 @@ interface CompositeLifecyclePlanV1 {
 // observation). This reserve never adds a tool grant or an effectful action.
 const COMPOSITE_SAFE_READ_CONTINUATION_RESERVE = 8;
 
+// A resumed non-composite current-note mission performs one host-owned active
+// note refresh before returning control to the model. Keep one existing graph
+// call/node slot out of the optional read catalog so that refresh can be
+// journaled without widening the capability envelope or adding authority.
+const NON_COMPOSITE_ACTIVE_NOTE_CONTINUATION_READ_RESERVE = 1;
+
 export interface BuildHostMissionGraphPlanInput {
   missionId: string;
   objective: string;
@@ -336,6 +342,15 @@ export async function buildHostMissionGraphPlanV1(
         Math.max(0, toolCallCapacity - mandatoryToolCallCount),
       )
     : 0;
+  const nonCompositeActiveNoteContinuationReadReserve =
+    compositeLifecyclePlan === null &&
+    Boolean(input.currentNotePath?.trim()) &&
+    plannedSet.has("read_current_file")
+      ? Math.min(
+          NON_COMPOSITE_ACTIVE_NOTE_CONTINUATION_READ_RESERVE,
+          Math.max(0, toolCallCapacity - mandatoryToolCallCount),
+        )
+      : 0;
   const optionalReadNames = allowedNames
     .filter((name) => !plannedSet.has(name) && !postAcceptanceNames.includes(name))
     // The capability envelope deliberately contains every host-safe read so a
@@ -345,7 +360,15 @@ export async function buildHostMissionGraphPlanV1(
     .filter((name) => modelVisibleNames.has(name))
     .filter((name) => descriptorByName.get(name)?.effect === "read")
     .filter(() => compositeLifecyclePlan === null)
-    .slice(0, Math.max(0, toolCallCapacity - selectedPlanned.length));
+    .slice(
+      0,
+      Math.max(
+        0,
+        toolCallCapacity -
+          mandatoryToolCallCount -
+          nonCompositeActiveNoteContinuationReadReserve,
+      ),
+    );
 
   const capabilities = sortedUnique(
     descriptors.map((descriptor) => capabilityId(descriptor)),

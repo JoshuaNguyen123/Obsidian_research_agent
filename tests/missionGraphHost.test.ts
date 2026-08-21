@@ -262,6 +262,48 @@ test("dormant safe-read grants cannot become structured graph debt unless the ro
   );
 });
 
+test("current-note graphs reserve one bounded continuation read after optional model reads", async () => {
+  const names = [
+    "read_current_file",
+    "append_to_current_file",
+    "replace_current_file",
+    "web_search",
+    "web_fetch",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-current-note-continuation-reserve",
+    objective: "Read the current note, research, and append a bounded result.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: ["read_current_file", "append_to_current_file"],
+    postAcceptanceToolNames: ["replace_current_file"],
+    currentNotePath: "Research/Brief.md",
+    maxToolCalls: 5,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const deterministicToolNodes = Object.values(
+    host.deterministicProposal.nodes,
+  ).filter((node) => node.allowedTools.length > 0);
+  const optionalReadNodes = Object.values(
+    host.deterministicProposal.optionalReadNodes ?? {},
+  );
+
+  assert.equal(optionalReadNodes.length, 1);
+  assert.equal(deterministicToolNodes.length, 3);
+  assert.equal(
+    deterministicToolNodes.length + optionalReadNodes.length,
+    host.capabilityEnvelope.budgets.maxTotalToolCalls - 1,
+  );
+  assert.equal(
+    Object.values(host.deterministicProposal.nodes).length +
+      optionalReadNodes.length,
+    host.capabilityEnvelope.budgets.maxNodes - 1,
+  );
+});
+
 test("host graph preserves repeated source fetches as distinct budgeted nodes", async () => {
   const registry = registryFor([
     "web_search",
