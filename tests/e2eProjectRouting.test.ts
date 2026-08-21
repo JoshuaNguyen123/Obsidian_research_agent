@@ -1294,6 +1294,25 @@ test("live external secret leases stay within the production boundary", () => {
   );
 });
 
+test("workflow audit research prompt names every required report section", () => {
+  const source = readFileSync(
+    new URL("../e2e/daily-use-research.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const scenarioStart = source.indexOf(
+    'test("DU-02 proof-gated sourced writeback binds owned fetched passages"',
+  );
+  assert.notEqual(
+    scenarioStart,
+    -1,
+    "DU-02 must remain an independently selectable live scenario",
+  );
+  const scenario = source.slice(scenarioStart);
+  assert.match(scenario, /a ## Findings section/u);
+  assert.match(scenario, /a ## Limitations section/u);
+  assert.match(scenario, /a ## Confidence section/u);
+});
+
 function liveEnvironment(): NodeJS.ProcessEnv {
   return {
     LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: "DISPOSABLE_ONLY",

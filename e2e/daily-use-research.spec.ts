@@ -467,7 +467,7 @@ test.describe("Daily-use live research contract", () => {
       await harness.installOwnedWebBackend({ conflictingEvidence: true });
       const before = await readFile(harness.noteFilePath, "utf8");
       await harness.submitMission(
-        `Read the current note as vault context. Search the web for the owned alpha and beta evidence, fetch both returned sources, and compare their deliberately conflicting conclusions about controlled onboarding validation. Append a ## Findings section with exactly two cited finding sentences and a ## Limitations section to the current note; explicitly say the two sources conflict. End each finding sentence with the exact source:<id>:passage:<start>-<end> identifier returned by the fetch result that supports it, and use both fetched passage identifiers. Include ${harness.marker}. Do not write before fetch, comparison, and verification.`,
+        `Read the current note as vault context. Search the web for the owned alpha and beta evidence, fetch both returned sources, and compare their deliberately conflicting conclusions about controlled onboarding validation. Append a ## Findings section with exactly two cited finding sentences, a ## Limitations section that explicitly says the two sources conflict, and a ## Confidence section that briefly calibrates confidence in light of that conflict to the current note. End each finding sentence with the exact source:<id>:passage:<start>-<end> identifier returned by the fetch result that supports it, and use both fetched passage identifiers. Include ${harness.marker}. Do not write before fetch, comparison, and verification.`,
         { timeoutMs: 600_000 },
       );
       const after = await readFile(harness.noteFilePath, "utf8");
