@@ -293,12 +293,21 @@ function getObsidianRequestUrl(): ObsidianRequestUrl {
   return obsidianModule.requestUrl;
 }
 
-async function hybridStreamingTransport(
+export async function hybridStreamingTransport(
   request: HttpRequest,
 ): Promise<StreamingHttpResponse> {
   try {
     return await fetchStreamingTransport(request);
   } catch (fetchError) {
+    // The desktop fallback exists for runtimes where fetch streaming is
+    // unavailable, not for a provider that accepted the request and then sat
+    // silent for the whole request timeout. Re-running the same request over
+    // a second transport doubles every stalled attempt (10 min fetch timeout
+    // + 10 min socket idle timeout), which is how one slow agent step once
+    // consumed a 100-minute observation window. Surface the timeout now.
+    if (isTimeoutOrCancellation(fetchError)) {
+      throw fetchError;
+    }
     try {
       return await nodeStreamingTransport(request);
     } catch (nodeError) {
@@ -540,6 +549,15 @@ function getErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+function isTimeoutOrCancellation(error: unknown): boolean {
+  return (
+    error instanceof ModelClientErrorClass &&
+    error.category === "network" &&
+    (/\btimed out after \d+ms\b/iu.test(error.message) ||
+      error.message === "Request cancelled.")
+  );
 }
 
 function withTimeout<T>(

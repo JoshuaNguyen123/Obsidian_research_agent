@@ -22,7 +22,11 @@ import {
 } from "./orchestrator/watchdogWorker";
 import { appendToolTranscript } from "./model/toolTranscript";
 import { serializeToolResultForModel } from "./model/toolResultPayload";
-import { isTransientModelError, withModelRetry } from "./model/retry";
+import {
+  isModelRequestTimeoutError,
+  isTransientModelError,
+  withModelRetry,
+} from "./model/retry";
 import {
   createObservableModelClient,
   extractProviderTokenUsage,
@@ -23395,6 +23399,7 @@ async function chatForAgentStep(
           events.onStatus?.(
             `Transient model provider error; retrying model step ${step} (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
           );
+          emitModelRetryDiagnostic(events, step, attempt, delayMs, error);
         },
       },
     );
@@ -23430,6 +23435,7 @@ async function chatForAgentStep(
             events.onStatus?.(
               `Transient model provider error; retrying model step ${step} without thinking (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(retryError)}`,
             );
+            emitModelRetryDiagnostic(events, step, attempt, delayMs, retryError);
           },
         },
       );
@@ -23448,7 +23454,13 @@ async function chatForAgentStep(
       return retryResponse;
     }
 
-    if (request.think !== undefined && isTransientModelError(error)) {
+    if (
+      request.think !== undefined &&
+      isTransientModelError(error) &&
+      // A full request timeout is a capacity signal; thinking mode is not the
+      // cause, and a second full retry series would only hide the stall.
+      !isModelRequestTimeoutError(error)
+    ) {
       events.onStatus?.(
         "Transient model provider error persisted; retrying without thinking mode...",
       );
@@ -23474,6 +23486,7 @@ async function chatForAgentStep(
             events.onStatus?.(
               `Transient model provider error; retrying model step ${step} without thinking (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(retryError)}`,
             );
+            emitModelRetryDiagnostic(events, step, attempt, delayMs, retryError);
           },
         },
       );
@@ -23531,6 +23544,7 @@ async function chatForAgentStepStreaming(
       events,
       streamEvents,
       onThinkingUnsupported,
+      step,
     });
     thinkingStream.done();
     emitMetricEvent(events, {
@@ -23546,7 +23560,13 @@ async function chatForAgentStepStreaming(
   } catch (error) {
     thinkingStream.done();
 
-    if (request.think !== undefined && isTransientModelError(error)) {
+    if (
+      request.think !== undefined &&
+      isTransientModelError(error) &&
+      // A full request timeout is a capacity signal; thinking mode is not the
+      // cause, and a second full retry series would only hide the stall.
+      !isModelRequestTimeoutError(error)
+    ) {
       events.onStatus?.(
         "Transient model provider error persisted; retrying without thinking mode...",
       );
@@ -23565,6 +23585,7 @@ async function chatForAgentStepStreaming(
           onThinkingDelta: (delta) => retryThinkingStream.onDelta(delta),
         },
         onThinkingUnsupported,
+        step,
       });
       retryThinkingStream.done();
       emitMetricEvent(events, {
@@ -24296,6 +24317,27 @@ const SHORT_PROMPT_ANCHOR_TOKENS = new Set([
   "web",
 ]);
 
+/**
+ * Retries used to be status-only, so a provider that kept timing out looked
+ * like an idle run in Run Details and E2E snapshots. Record every retry as a
+ * step diagnostic so a stalled step is visible while it is still in flight.
+ */
+function emitModelRetryDiagnostic(
+  events: AgentRunEvents,
+  step: number | undefined,
+  attempt: number,
+  delayMs: number,
+  error: unknown,
+): void {
+  if (step === undefined) return;
+  events.onTrace?.({
+    id: `model-retry-${step}-${attempt}`,
+    kind: "status",
+    step,
+    message: `model_retry attempt=${attempt}; delay_ms=${delayMs}; timeout=${isModelRequestTimeoutError(error)}; error=${getUnknownErrorMessage(error).slice(0, 200)}`,
+  });
+}
+
 async function streamChatWithThinkingFallback({
   modelClient,
   request,
@@ -24303,6 +24345,7 @@ async function streamChatWithThinkingFallback({
   streamEvents,
   onThinkingUnsupported,
   shouldRetry,
+  step,
 }: {
   modelClient: ModelClient;
   request: ModelChatRequest;
@@ -24310,6 +24353,8 @@ async function streamChatWithThinkingFallback({
   streamEvents: ModelChatStreamEvents;
   onThinkingUnsupported: () => void;
   shouldRetry?: (error: unknown, attempt: number) => boolean;
+  /** Agent-loop step, when known; retries are then recorded as diagnostics. */
+  step?: number;
 }): Promise<ModelChatResponse> {
   try {
     return await withModelRetry(
@@ -24326,6 +24371,7 @@ async function streamChatWithThinkingFallback({
           events.onStatus?.(
             `Transient streaming model error; retrying stream (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
           );
+          emitModelRetryDiagnostic(events, step, attempt, delayMs, error);
         },
       },
     );
@@ -24354,6 +24400,7 @@ async function streamChatWithThinkingFallback({
           events.onStatus?.(
             `Transient streaming model error; retrying stream without thinking (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(retryError)}`,
           );
+          emitModelRetryDiagnostic(events, step, attempt, delayMs, retryError);
         },
       },
     );

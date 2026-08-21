@@ -24,6 +24,28 @@ export function isTransientModelError(error: unknown): boolean {
   return isTransientModelErrorShape(error.category, error.status);
 }
 
+/**
+ * A request that consumed its whole `requestTimeoutMs` without a response is a
+ * capacity signal, not a transient blip. It is still a `network` error (and so
+ * transient by shape), but each retry costs another full timeout window with
+ * no user-visible progress, so callers must bound it separately.
+ */
+export function isModelRequestTimeoutError(error: unknown): boolean {
+  const record = error instanceof ModelClientError
+    ? error
+    : isRecord(error) && error.name === "ModelClientError"
+      ? error
+      : null;
+  if (!record || record.category !== "network") {
+    return false;
+  }
+  const message = typeof record.message === "string" ? record.message : "";
+  return /\btimed out after \d+ms\b/iu.test(message);
+}
+
+/** Request timeouts are retried at most this many times in total. */
+export const MAX_MODEL_REQUEST_TIMEOUT_RETRIES = 1;
+
 export async function withModelRetry<T>(
   run: () => Promise<T>,
   options: {
@@ -48,6 +70,8 @@ export async function withModelRetry<T>(
       if (
         attempt >= policy.maxAttempts ||
         !isTransientModelError(error) ||
+        (isModelRequestTimeoutError(error) &&
+          attempt > MAX_MODEL_REQUEST_TIMEOUT_RETRIES) ||
         options.shouldRetry?.(error, attempt) === false
       ) {
         throw error;

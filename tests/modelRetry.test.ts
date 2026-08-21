@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ModelClientError } from "../src/model/types";
 import {
+  MAX_MODEL_REQUEST_TIMEOUT_RETRIES,
+  isModelRequestTimeoutError,
   isTransientModelError,
   parseRetryAfterMs,
   withModelRetry,
@@ -112,4 +114,78 @@ test("withModelRetry respects shouldRetry=false after partial apply", async () =
     /Internal Server Error/,
   );
   assert.equal(attempts, 1);
+});
+
+test("request timeouts are classified distinctly from other network errors", () => {
+  assert.equal(
+    isModelRequestTimeoutError(
+      new ModelClientError("network", "Request timed out after 600000ms."),
+    ),
+    true,
+  );
+  // Client wrappers prefix the transport message; the classifier must see
+  // through that so the retry bound applies to the production error shape.
+  assert.equal(
+    isModelRequestTimeoutError(
+      new ModelClientError(
+        "network",
+        "Streaming request to Ollama failed: Request timed out after 600000ms.",
+      ),
+    ),
+    true,
+  );
+  assert.equal(
+    isModelRequestTimeoutError(new ModelClientError("network", "offline")),
+    false,
+  );
+  assert.equal(
+    isModelRequestTimeoutError(
+      new ModelClientError("api", "Request timed out after 600000ms.", {
+        status: 504,
+      }),
+    ),
+    false,
+  );
+  assert.equal(isModelRequestTimeoutError(new Error("timed out after 5ms")), false);
+});
+
+test("withModelRetry retries a request timeout at most once", async () => {
+  // Regression: a provider that accepts requests and then sits silent for the
+  // whole request timeout used to get the full transient-retry budget, so one
+  // agent step could spend maxAttempts × requestTimeoutMs with no visible
+  // progress. A timeout is a capacity signal; bound it independently.
+  let attempts = 0;
+  const retries: number[] = [];
+  await assert.rejects(
+    withModelRetry(
+      async () => {
+        attempts += 1;
+        throw new ModelClientError(
+          "network",
+          "Streaming request to Ollama failed: Request timed out after 600000ms.",
+        );
+      },
+      {
+        policy: { maxAttempts: 5, baseDelayMs: 1, maxDelayMs: 2 },
+        onRetry: (attempt) => retries.push(attempt),
+      },
+    ),
+    (error: unknown) => isModelRequestTimeoutError(error),
+  );
+  assert.equal(attempts, 1 + MAX_MODEL_REQUEST_TIMEOUT_RETRIES);
+  assert.deepEqual(retries, [2]);
+});
+
+test("withModelRetry keeps the full budget for non-timeout transient errors", async () => {
+  let attempts = 0;
+  await assert.rejects(
+    withModelRetry(
+      async () => {
+        attempts += 1;
+        throw new ModelClientError("api", "upstream", { status: 502 });
+      },
+      { policy: { maxAttempts: 4, baseDelayMs: 1, maxDelayMs: 2 } },
+    ),
+  );
+  assert.equal(attempts, 4);
 });
