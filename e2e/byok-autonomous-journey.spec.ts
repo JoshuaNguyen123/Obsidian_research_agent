@@ -1025,7 +1025,10 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     phaseBSubmitted = true;
     await harness.submitMission(phaseBPrompt, {
       waitForCompletion: false,
-      timeoutMs: 70 * 60_000,
+      // A hardened-lifecycle Phase B on a slow strong provider ran healthy
+      // for the full former 70-minute window without finishing; the mission
+      // budget, not the observer, should decide when it is out of time.
+      timeoutMs: 100 * 60_000,
     });
     const phaseBSubmissionPage = harness.page;
     const capturedPhaseBRun = { id: "" };
@@ -1055,7 +1058,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     phaseBRunId = capturedPhaseBRun.id;
     expect(phaseBRunId).not.toBe(phaseASnapshot.runId);
     try {
-      await harness.approveUntilMissionComplete(70 * 60_000, {
+      await harness.approveUntilMissionComplete(100 * 60_000, {
         maxContinuations: 18,
         allowedApprovalToolNames: BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS,
         requirePrivateRepositoryApproval: true,

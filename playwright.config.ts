@@ -23,7 +23,7 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
   ? 120 * 60_000
   : activeLanes.has("retained-journey") ||
       activeLanes.has("byok-autonomous-journey")
-    ? 135 * 60_000
+    ? 165 * 60_000
   : activeLanes.has("daily-use-code-live") ||
       activeLanes.has("desktop-code-delivery-real-live") ||
       activeLanes.has("vault-sibling-code-delivery-real-live") ||
@@ -113,7 +113,7 @@ export default defineConfig({
       name: "byok-autonomous-journey",
       testMatch: /byok-autonomous-journey\.spec\.ts/u,
       retries: 0,
-      timeout: 7_200_000,
+      timeout: 9_000_000,
       expect: { timeout: 180_000 },
       use: { trace: "off", screenshot: "off", video: "off" },
     },
