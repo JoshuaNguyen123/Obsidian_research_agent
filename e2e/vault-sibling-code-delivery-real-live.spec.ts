@@ -14,10 +14,12 @@ import { expect, test } from "@playwright/test";
 
 import {
   exportedDirectoryPath,
+  extractWorkspaceIdFromSnapshot,
   graphFrontiers,
   listFilesBounded,
   readRawRunSnapshot,
   requireExportReceipt,
+  resolveOwnedWorkspaceContainerById,
   resolveScratchWorkspaceContainer,
 } from "./fixtures/desktopDelivery";
 import {
@@ -62,6 +64,9 @@ test("VAULT-SIBLING-CODE-REAL delivers a tested standalone project beside the ac
   let harness: RealAiHarness | null = null;
   let rawSnapshot: any = null;
   let exportPath: string | null = null;
+  // Eagerly-captured workspaceId: kept even if lastReceipts is cleared by a
+  // blocked-resume or failure before the finally block runs.
+  let capturedWorkspaceId: string | null = null;
   let workspaceContainer: string | null = null;
   let siblingContainer = "";
   let siblingContainerExisted = false;
@@ -120,12 +125,27 @@ test("VAULT-SIBLING-CODE-REAL delivers a tested standalone project beside the ac
         waitForCompletion: false,
         timeoutMs: 35 * 60_000,
       });
-      await harness.approveUntilMissionComplete(35 * 60_000);
+      // onProgress fires on every approval/continuation tick; capture the
+      // workspaceId as soon as the create receipt appears.  Fire-and-forget is
+      // intentional: onProgress is a void callback and reads are idempotent.
+      await harness.approveUntilMissionComplete(35 * 60_000, {
+        onProgress: () => {
+          if (capturedWorkspaceId) return;
+          readRawRunSnapshot(harness!.page)
+            .then((snap) => {
+              const id = extractWorkspaceIdFromSnapshot(snap);
+              if (id && !capturedWorkspaceId) capturedWorkspaceId = id;
+            })
+            .catch(() => {});
+        },
+      });
     } catch (error) {
       missionFailure = error;
     }
 
     rawSnapshot = await readRawRunSnapshot(harness.page);
+    // Keep first capture: if onProgress already set it, this is a no-op.
+    capturedWorkspaceId ??= extractWorkspaceIdFromSnapshot(rawSnapshot);
     exportPath = exportedDirectoryPath(rawSnapshot);
     workspaceContainer = await resolveScratchWorkspaceContainer(
       harness.page,
@@ -136,6 +156,7 @@ test("VAULT-SIBLING-CODE-REAL delivers a tested standalone project beside the ac
 
     const snapshot = await harness.attestProductionRun();
     rawSnapshot = snapshot;
+    capturedWorkspaceId ??= extractWorkspaceIdFromSnapshot(snapshot);
     exportPath = exportedDirectoryPath(snapshot);
     workspaceContainer ??= await resolveScratchWorkspaceContainer(
       harness.page,
@@ -214,13 +235,22 @@ test("VAULT-SIBLING-CODE-REAL delivers a tested standalone project beside the ac
   } finally {
     if (rawSnapshot) {
       exportPath ??= exportedDirectoryPath(rawSnapshot);
-      if (harness) {
-        workspaceContainer ??= await resolveScratchWorkspaceContainer(
+      // Keep first capture: receipt may already be cleared in rawSnapshot.
+      capturedWorkspaceId ??= extractWorkspaceIdFromSnapshot(rawSnapshot);
+      if (harness && !workspaceContainer) {
+        workspaceContainer = await resolveScratchWorkspaceContainer(
           harness.page,
           rawSnapshot,
           EXACT_PROMPT,
         ).catch(() => null);
       }
+    }
+    // Fall back to the filesystem-only resolver when resolveScratchWorkspaceContainer
+    // returned null because lastReceipts was cleared (blocked-resume scenario).
+    if (!workspaceContainer && capturedWorkspaceId) {
+      workspaceContainer = await resolveOwnedWorkspaceContainerById(
+        capturedWorkspaceId,
+      ).catch(() => null);
     }
     if (exportPath && siblingContainer) {
       try {

@@ -322,6 +322,120 @@ export async function listFilesBounded(
   return matches.sort();
 }
 
+/**
+ * Extract the workspaceId recorded in a `code_workspace_create` receipt.
+ * Returns null when the snapshot has no such receipt (e.g. receipts were
+ * cleared after a failed/blocked run).  Pure function — no I/O.
+ */
+export function extractWorkspaceIdFromSnapshot(snapshot: any): string | null {
+  const createReceipt = (snapshot?.lastReceipts ?? []).find(
+    (candidate: any) =>
+      candidate?.toolName === "code_workspace_create" &&
+      candidate?.operation === "create",
+  );
+  const workspaceId = createReceipt?.resource?.workspaceId;
+  return typeof workspaceId === "string" && workspaceId ? workspaceId : null;
+}
+
+/**
+ * Resolve the workspace container directory that owns a given workspaceId
+ * without requiring the plugin or a live snapshot.  Safe to call in a
+ * `finally` block even when `lastReceipts` has been cleared.
+ *
+ * Invariants enforced before returning a path:
+ *  - workspaceId contains no path separators or traversal sequences.
+ *  - The candidate path is a direct child of workspaces-v2 both before and
+ *    after `realpath()` resolves any junctions/symlinks on Windows.
+ *  - `basename(realpath(candidate)) === workspaceId`.
+ *
+ * Returns null when the directory does not exist yet (never created, or
+ * already cleaned up).  Throws for unsafe inputs or unexpected filesystem
+ * layouts.
+ *
+ * @param workspaceId - value from `extractWorkspaceIdFromSnapshot`.
+ * @param overrideWorkspacesRoot - pass a temp directory in unit tests instead
+ *   of relying on `%LOCALAPPDATA%`.
+ */
+export async function resolveOwnedWorkspaceContainerById(
+  workspaceId: string,
+  overrideWorkspacesRoot?: string,
+): Promise<string | null> {
+  if (!workspaceId) return null;
+
+  // Reject workspaceIds that would navigate outside the root directory.
+  if (
+    workspaceId.includes("/") ||
+    workspaceId.includes("\\") ||
+    workspaceId.includes("..") ||
+    path.isAbsolute(workspaceId)
+  ) {
+    throw new Error(`Unsafe workspaceId rejected for cleanup: ${workspaceId}`);
+  }
+
+  let workspacesRoot: string;
+  if (overrideWorkspacesRoot) {
+    workspacesRoot = overrideWorkspacesRoot;
+  } else {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (!localAppData) {
+      throw new Error("LOCALAPPDATA is required to resolve workspace container.");
+    }
+    workspacesRoot = path.resolve(
+      localAppData,
+      "AgenticResearcher",
+      "code",
+      "workspaces-v2",
+    );
+  }
+
+  const candidate = path.join(workspacesRoot, workspaceId);
+
+  // Pre-realpath guard: the joined path must be a direct child.
+  const relBeforeRealpath = path.relative(workspacesRoot, candidate);
+  if (
+    !relBeforeRealpath ||
+    relBeforeRealpath !== workspaceId ||
+    relBeforeRealpath.includes(path.sep) ||
+    path.isAbsolute(relBeforeRealpath)
+  ) {
+    throw new Error(
+      `Refusing cleanup: workspaceId resolved outside workspaces-v2 root: ${workspaceId}`,
+    );
+  }
+
+  const info = await lstat(candidate).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info) return null;
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error(
+      `Workspace container is not a normal directory: ${candidate}`,
+    );
+  }
+
+  const [canonical, canonicalRoot] = await Promise.all([
+    realpath(candidate),
+    realpath(workspacesRoot),
+  ]);
+
+  // Post-realpath guard: Windows junctions must not redirect outside the root.
+  if (
+    path.dirname(canonical).toLowerCase() !== canonicalRoot.toLowerCase()
+  ) {
+    throw new Error(
+      `Workspace container resolved outside workspaces-v2 after realpath: ${canonical}`,
+    );
+  }
+  if (path.basename(canonical) !== workspaceId) {
+    throw new Error(
+      `Workspace container basename mismatch after realpath: expected ${workspaceId}, got ${path.basename(canonical)}`,
+    );
+  }
+
+  return canonical;
+}
+
 export async function resolveScratchWorkspaceContainer(
   page: Page,
   snapshot: any,

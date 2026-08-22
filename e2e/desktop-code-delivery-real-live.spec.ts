@@ -9,11 +9,13 @@ import {
   captureCatalogAndFrontierTrace,
   cleanupOwnedExportDirectory,
   exportedDirectoryPath,
+  extractWorkspaceIdFromSnapshot,
   graphFrontiers,
   listFilesBounded,
   readRawRunSnapshot,
   requireExportReceipt,
   resolveDesktopRoot,
+  resolveOwnedWorkspaceContainerById,
   pythonStandardLibraryModuleNames,
   resolveScratchWorkspaceContainer,
   unresolvedScratchPythonImports,
@@ -62,6 +64,10 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
   let harness: RealAiHarness | null = null;
   let rawSnapshot: any = null;
   let exportPath: string | null = null;
+  // Eagerly-captured workspaceId: set as soon as the code_workspace_create
+  // receipt appears in any mid-run snapshot, then kept even if lastReceipts is
+  // cleared by a blocked-resume or failure before the finally block runs.
+  let capturedWorkspaceId: string | null = null;
   let workspaceContainer: string | null = null;
   const cleanupErrors: string[] = [];
 
@@ -100,12 +106,27 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
         waitForCompletion: false,
         timeoutMs: 35 * 60_000,
       });
-      await harness.approveUntilMissionComplete(35 * 60_000);
+      // onProgress fires on every approval/continuation tick; capture the
+      // workspaceId as soon as the create receipt appears.  Fire-and-forget is
+      // intentional: onProgress is a void callback and reads are idempotent.
+      await harness.approveUntilMissionComplete(35 * 60_000, {
+        onProgress: () => {
+          if (capturedWorkspaceId) return;
+          readRawRunSnapshot(harness!.page)
+            .then((snap) => {
+              const id = extractWorkspaceIdFromSnapshot(snap);
+              if (id && !capturedWorkspaceId) capturedWorkspaceId = id;
+            })
+            .catch(() => {});
+        },
+      });
     } catch (error) {
       missionFailure = error;
     }
 
     rawSnapshot = await readRawRunSnapshot(harness.page);
+    // Keep first capture: if onProgress already set it, this is a no-op.
+    capturedWorkspaceId ??= extractWorkspaceIdFromSnapshot(rawSnapshot);
     const traceCapture = await captureCatalogAndFrontierTrace(harness.page);
     await testInfo.attach("desktop-code-offered-catalog", {
       body: JSON.stringify(
@@ -129,6 +150,7 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
 
     const snapshot = await harness.attestProductionRun();
     rawSnapshot = snapshot;
+    capturedWorkspaceId ??= extractWorkspaceIdFromSnapshot(snapshot);
     exportPath = exportedDirectoryPath(snapshot);
     workspaceContainer ??= await resolveScratchWorkspaceContainer(
       harness.page,
@@ -212,13 +234,22 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
   } finally {
     if (rawSnapshot) {
       exportPath ??= exportedDirectoryPath(rawSnapshot);
-      if (harness) {
-        workspaceContainer ??= await resolveScratchWorkspaceContainer(
+      // Keep first capture: receipt may already be cleared in rawSnapshot.
+      capturedWorkspaceId ??= extractWorkspaceIdFromSnapshot(rawSnapshot);
+      if (harness && !workspaceContainer) {
+        workspaceContainer = await resolveScratchWorkspaceContainer(
           harness.page,
           rawSnapshot,
           EXACT_PROMPT,
         ).catch(() => null);
       }
+    }
+    // Fall back to the filesystem-only resolver when resolveScratchWorkspaceContainer
+    // returned null because lastReceipts was cleared (blocked-resume scenario).
+    if (!workspaceContainer && capturedWorkspaceId) {
+      workspaceContainer = await resolveOwnedWorkspaceContainerById(
+        capturedWorkspaceId,
+      ).catch(() => null);
     }
     if (exportPath) {
       await cleanupOwnedExportDirectory({
