@@ -4,10 +4,9 @@ import {
   escalateMissionEffortDecisionForResearchV1,
   resolveMissionEffortDecisionV1,
 } from "../src/agent/missionEffortDecision";
-import {
-  detectProjectLifecycleStagesV1,
-  missionRequiresExtendedEffortBudgetV1,
-} from "../src/agent/projectLifecycle";
+import { detectProjectLifecycleStagesV1 } from "../src/agent/projectLifecycle";
+import { missionRequiresExtendedEffortBudgetV1 } from "../src/agent/missionEffortEscalation";
+import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
 
 const ORCHESTRATION_GUIDE_PROMPT =
   "I want you to write me an in depth guide/report to agent orchestration. What is it, why is it important, and then finally how to execute agent orcehstration sucessfully.";
@@ -289,4 +288,77 @@ test("a prompt with no code stage keeps the cheap budget", () => {
     ),
     false,
   );
+});
+
+// The BYOK journey's Phase A detects only ["accepted_research"], so the
+// lifecycle half of the guard never fired. It drew grounded_research's 12 tool
+// calls, spent nine of them gathering evidence, and could not add
+// publish_research_to_linear at all: "the host envelope is exhausted and its
+// nonterminal continuation node lacks enough reserved budget". Its lane asks
+// for maxAgentSteps 160 and still got 12, because a configured ceiling only
+// ever lowers a profile default.
+const PUBLICATION_LADDER_TOOL_COUNT = 12;
+
+test("explicit research-publication intent escalates past the grounded budget", () => {
+  const phaseA = buildByokPhaseAResearchPrompt({
+    marker: "effort-budget-regression",
+    profileKey: "profile-key",
+    validationProfileKey: "validation-profile-key",
+  });
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(phaseA),
+    ["accepted_research"],
+    "the lifecycle half of the guard must still not fire on this prompt",
+  );
+  assert.equal(
+    missionRequiresExtendedEffortBudgetV1(phaseA),
+    true,
+    "publication intent must escalate even with a single detected stage",
+  );
+
+  const starved = resolveMissionEffortDecisionV1({
+    prompt: phaseA,
+    route: "grounded_workflow",
+    outputTarget: "new_note",
+    configuredMaxModelCalls: 160,
+    configuredMaxToolCalls: 160,
+    configuredMaxRunMinutes: 90,
+  });
+  const escalated = resolveMissionEffortDecisionV1({
+    prompt: phaseA,
+    route: "grounded_workflow",
+    outputTarget: "new_note",
+    configuredMaxModelCalls: 160,
+    configuredMaxToolCalls: 160,
+    configuredMaxRunMinutes: 90,
+    forceExtendedTeam: missionRequiresExtendedEffortBudgetV1(phaseA),
+  });
+
+  assert.equal(
+    starved.maxToolCalls,
+    PUBLICATION_LADDER_TOOL_COUNT,
+    "the regression baseline is the grounded tool budget",
+  );
+  assert.ok(
+    escalated.maxToolCalls > PUBLICATION_LADDER_TOOL_COUNT,
+    `escalated tool budget ${escalated.maxToolCalls} still cannot outrun evidence gathering`,
+  );
+  assert.ok(
+    escalated.maxModelCalls >= starved.maxModelCalls &&
+      escalated.maxWallClockMs >= starved.maxWallClockMs,
+    "escalation must never lower a budget",
+  );
+});
+
+test("plain research without publication intent keeps the grounded budget", () => {
+  const prompt =
+    "Research agent orchestration using current sources and citations.";
+  assert.equal(missionRequiresExtendedEffortBudgetV1(prompt), false);
+  const decision = resolveMissionEffortDecisionV1({
+    prompt,
+    route: "grounded_workflow",
+    outputTarget: "new_note",
+    forceExtendedTeam: missionRequiresExtendedEffortBudgetV1(prompt),
+  });
+  assert.equal(decision.profile, "grounded_research");
 });

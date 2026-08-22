@@ -1047,7 +1047,7 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
 }
 
 /**
- * Whether a prompt's detected lifecycle already implies more tool calls than
+ * Whether a prompt's detected lifecycle already commits more tool calls than
  * the default compose budget grants.
  *
  * Escalating only on a multi-stage prompt starved the single most tool-hungry
@@ -1059,11 +1059,11 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
  * tools before any repair. The run died on the wall clock mid-validation and
  * its continuation was then refused as an unreconciled mutation.
  *
- * A detected code stage therefore escalates on its own. Budgets stay clamped
- * by the caller's configured ceilings, so this raises the floor without
- * removing any user-facing cap.
+ * This is the lifecycle half of the effort escalation; see
+ * missionRequiresExtendedEffortBudgetV1 in ./missionEffortEscalation for the
+ * predicate the run plan actually consults.
  */
-export function missionRequiresExtendedEffortBudgetV1(command: string): boolean {
+export function missionLifecycleCommitsToolLadderV1(command: string): boolean {
   const stages = detectProjectLifecycleStagesV1(command);
   return stages.length > 1 || stages.includes("code_execution");
 }

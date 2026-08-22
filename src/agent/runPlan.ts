@@ -35,8 +35,8 @@ import type { AutonomyEffectClass } from "./autonomyEffectClass";
 import { detectLinearIntent } from "./linearIntent";
 import {
   detectProjectLifecycleStagesV1,
-  missionRequiresExtendedEffortBudgetV1,
 } from "./projectLifecycle";
+import { missionRequiresExtendedEffortBudgetV1 } from "./missionEffortEscalation";
 import {
   classifyMissionSpeechAct,
   type ExecutionTier,
