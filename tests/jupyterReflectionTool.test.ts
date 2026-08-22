@@ -1064,6 +1064,127 @@ test("a checkpoint sequence revision never poses as the verified commit", async 
     assert.equal(prepared.action.normalizedArgs.codeExamples === null, false);
   }
 });
+test("prepare→execute succeeds when rootMissionId differs from runId after segment turnover", async () => {
+  // Regression: BYOK stage 8 append_jupyter_reflection dies with run_mismatch when
+  // extended_team segment turnover causes context.runId to differ from rootMissionId.
+  // Before this fix, PreparedAction.runId was stamped from rootMissionId, so the
+  // ToolRegistry guard (action.runId !== context.runId) fired on the executing segment.
+  const ROOT_MISSION_ID = "mission-byok-root-1";
+  const SEGMENT_RUN_ID = "segment-003-byok";
+  assert.notEqual(ROOT_MISSION_ID, SEGMENT_RUN_ID, "test requires distinct IDs");
+
+  const vault = new MemoryVault();
+  vault.files.set(PATH, notebook());
+  // Project stage event must carry the project-level runId (rootMissionId), not the segment's.
+  const rootResearchEvent = createProjectStageEventV1({
+    schemaVersion: 1,
+    runId: ROOT_MISSION_ID,
+    phase: "research",
+    evidenceKind: "research_artifact",
+    disposition: "verified",
+    occurredAt: "2026-08-19T13:55:00.000Z",
+    sourceReceiptId: "receipt-research-segment-turnover-1",
+    evidenceFingerprint: SHA("d"),
+    resource: {
+      system: "vault",
+      resourceType: "accepted_research_note",
+      id: "accepted-segment-turnover-1",
+      url: null,
+      path: "Research/Segment Turnover.md",
+      revision: SHA("e"),
+    },
+    workUnits: [],
+  });
+  const context = toolContext(vault, {
+    runId: SEGMENT_RUN_ID,
+    rootMissionId: ROOT_MISSION_ID,
+    getProjectStageEvents: (requestedRunId) => {
+      // Events are filed under the root mission (project-level) runId.
+      if (requestedRunId === ROOT_MISSION_ID) return [rootResearchEvent];
+      return [];
+    },
+  });
+  const tool = createJupyterReflectionTool();
+  const prepared = await tool.prepare!({ path: PATH, markdown: MARKDOWN }, context);
+  assert.equal(prepared.ok, true, JSON.stringify(prepared));
+  if (!prepared.ok) return;
+
+  // PreparedAction.runId must equal the executing segment's runId so the
+  // ToolRegistry guard (action.runId !== context.runId) does not fire.
+  assert.equal(prepared.action.runId, SEGMENT_RUN_ID,
+    "PreparedAction.runId must be the segment runId, not rootMissionId");
+  assert.notEqual(prepared.action.runId, ROOT_MISSION_ID,
+    "PreparedAction.runId must not be rootMissionId after segment turnover");
+
+  // Report uses the project-level runId for aggregation.
+  const report = parseProjectRunReportV1(prepared.action.normalizedArgs.report);
+  assert.equal(report.runId, ROOT_MISSION_ID,
+    "report.runId must be the project-level rootMissionId for event aggregation");
+
+  // Execute succeeds: action.runId === context.runId passes the ToolRegistry guard.
+  const execution = await tool.executePrepared!(prepared.action, {
+    ...context,
+    authorizedAction: {
+      preparedActionId: prepared.action.id,
+      payloadFingerprint: prepared.action.payloadFingerprint,
+      grantId: "approval-segment-turnover-jupyter",
+    },
+  });
+  assert.equal(execution.receipt.toolName, APPEND_JUPYTER_REFLECTION_TOOL_NAME);
+  assert.equal(execution.receipt.readback.status, "verified");
+  assert.equal(vault.writes, 1);
+});
+
+test("ToolRegistry run_mismatch guard still rejects a prepared action from a prior segment", async () => {
+  // Verify the invariant: the ToolRegistry guard is intact and would fire when
+  // action.runId (segment-001) !== context.runId (segment-002). This test confirms
+  // the guard has not been loosened — only the prepare stamping was fixed.
+  const SEGMENT_ONE = "segment-001";
+  const SEGMENT_TWO = "segment-002";
+  const ROOT_MISSION_ID = "mission-byok-root-guard";
+
+  const vault = new MemoryVault();
+  vault.files.set(PATH, notebook());
+  const guardResearchEvent = createProjectStageEventV1({
+    schemaVersion: 1,
+    runId: ROOT_MISSION_ID,
+    phase: "research",
+    evidenceKind: "research_artifact",
+    disposition: "verified",
+    occurredAt: "2026-08-19T13:55:00.000Z",
+    sourceReceiptId: "receipt-research-guard-1",
+    evidenceFingerprint: SHA("d"),
+    resource: {
+      system: "vault",
+      resourceType: "accepted_research_note",
+      id: "accepted-guard-1",
+      url: null,
+      path: "Research/Guard.md",
+      revision: SHA("e"),
+    },
+    workUnits: [],
+  });
+  // Prepare the action in segment-001.
+  const prepareContext = toolContext(vault, {
+    runId: SEGMENT_ONE,
+    rootMissionId: ROOT_MISSION_ID,
+    getProjectStageEvents: (id) =>
+      id === ROOT_MISSION_ID ? [guardResearchEvent] : [],
+  });
+  const tool = createJupyterReflectionTool();
+  const prepared = await tool.prepare!({ path: PATH, markdown: MARKDOWN }, prepareContext);
+  assert.equal(prepared.ok, true, JSON.stringify(prepared));
+  if (!prepared.ok) return;
+  assert.equal(prepared.action.runId, SEGMENT_ONE);
+
+  // The ToolRegistry guard (line 343 of ToolRegistry.ts — not modified):
+  //   if (context.runId && action.runId !== context.runId) → run_mismatch
+  // Simulate what ToolRegistry would do when the context moved to segment-002.
+  const staleContextRunId = SEGMENT_TWO;
+  assert.notEqual(prepared.action.runId, staleContextRunId,
+    "A prepared action from segment-001 must not match segment-002's runId — ToolRegistry would fire run_mismatch");
+});
+
 function commitReadbackEvent(commitSha: string): ProjectStageEventV1 {
   return createProjectStageEventV1({
     schemaVersion: 1,

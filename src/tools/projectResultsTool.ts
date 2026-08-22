@@ -87,10 +87,14 @@ async function prepareProjectResults(
   try {
     assertExactArgs(args);
     const context = rawContext;
+    // projectRunId is used for report/event/lineage aggregation across segments.
+    // segmentRunId (context.runId) is what ToolRegistry stamps on PreparedAction.runId
+    // so the run_mismatch guard passes on the executing segment.
     const runId = requireIdentifier(
       context.rootMissionId?.trim() || context.runId,
       "project run id",
     );
+    const segmentRunId = requireIdentifier(context.runId, "segment run id");
     const toolCallId = requireIdentifier(context.operationId, "tool call id");
     const generatedAt = canonicalNow(context);
     const events = resolveHostProjectEvents(context, runId);
@@ -206,7 +210,7 @@ async function prepareProjectResults(
     const action = await withPreparedActionFingerprint({
       version: 1,
       id: actionId,
-      runId,
+      runId: segmentRunId,
       toolCallId,
       toolName: WRITE_PROJECT_RESULTS_TOOL_NAME,
       target: {
@@ -246,7 +250,7 @@ async function prepareProjectResults(
         outboundBytes: proposedBytes,
       },
       expectedTargetRevision: ABSENT_REVISION,
-      idempotencyKey: `${runId}:${toolCallId}:${WRITE_PROJECT_RESULTS_TOOL_NAME}`,
+      idempotencyKey: `${segmentRunId}:${toolCallId}:${WRITE_PROJECT_RESULTS_TOOL_NAME}`,
       reconciliationKey: `${destination.path}:${expectedAfterSha256}`,
       requiredConfirmations: 1,
       preparedAt,
