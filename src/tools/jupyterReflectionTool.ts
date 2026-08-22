@@ -111,10 +111,14 @@ async function prepareJupyterReflection(
       assistantMarkdown,
       "Jupyter reflection assistant notes",
     );
+    // projectRunId is used for report/event/lineage aggregation across segments.
+    // segmentRunId (context.runId) is what ToolRegistry stamps on PreparedAction.runId
+    // so the run_mismatch guard passes on the executing segment.
     const runId = requireIdentifier(
       context.rootMissionId?.trim() || context.runId,
       "project run id",
     );
+    const segmentRunId = requireIdentifier(context.runId, "segment run id");
     const toolCallId = requireIdentifier(context.operationId, "tool call id");
     const preparedAt = canonicalNow(context);
     const projectName = resolveProjectName(context, runId);
@@ -253,7 +257,7 @@ async function prepareJupyterReflection(
     const action = await withPreparedActionFingerprint({
       version: 1,
       id: prospectiveReflection.sourceReceiptId,
-      runId,
+      runId: segmentRunId,
       toolCallId,
       toolName: APPEND_JUPYTER_REFLECTION_TOOL_NAME,
       target: {
@@ -310,7 +314,7 @@ async function prepareJupyterReflection(
         outboundBytes: proposedBytes,
       },
       expectedTargetRevision: expectedTargetState,
-      idempotencyKey: `${runId}:${toolCallId}:${APPEND_JUPYTER_REFLECTION_TOOL_NAME}`,
+      idempotencyKey: `${segmentRunId}:${toolCallId}:${APPEND_JUPYTER_REFLECTION_TOOL_NAME}`,
       reconciliationKey: `${path}:${expectedAfterSha256}`,
       requiredConfirmations: 1,
       preparedAt,
@@ -904,7 +908,10 @@ function parsePreparedPayload(action: PreparedAction): PreparedPayloadV1 {
     action.target.resourceType !== "jupyter_notebook" ||
     action.target.id !== path ||
     action.target.path !== path ||
-    action.runId !== report.runId ||
+    // action.runId carries the executing segment's runId (context.runId); report.runId
+    // carries the project-level runId (rootMissionId || runId). They can legitimately
+    // differ after segment turnover. The ToolRegistry run_mismatch guard (not loosened)
+    // enforces action.runId === context.runId at dispatch time.
     report.destination.kind !== "jupyter" ||
     report.destination.source !== destinationSource ||
     report.destination.path !== path ||
