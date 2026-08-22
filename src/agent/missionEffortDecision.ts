@@ -17,8 +17,8 @@ export interface MissionFinalizationReserveV1 {
 
 /**
  * One pre-execution decision separates how much to write from how much to
- * research. Settings remain ceilings: this object may narrow them, never raise
- * them.
+ * research. Configured values override profile defaults in either direction;
+ * the profile default is only used when no configured value is provided.
  */
 export interface MissionEffortDecisionV1 {
   version: 1;
@@ -122,7 +122,7 @@ export function resolveMissionEffortDecisionV1(
     maxWallClockMs:
       configuredWallClockMs === null
         ? defaults.maxWallClockMs
-        : Math.min(defaults.maxWallClockMs, configuredWallClockMs),
+        : configuredWallClockMs,
     maxSegments: defaults.maxSegments,
     finalizationReserve: {
       modelCalls: Math.min(defaults.finalizationModelCalls, maxModelCalls),
@@ -203,7 +203,7 @@ export function escalateMissionEffortDecisionForResearchV1(
     decision.maxWallClockMs,
     configuredWallClockMs === null
       ? grounded.maxWallClockMs
-      : Math.min(grounded.maxWallClockMs, configuredWallClockMs),
+      : configuredWallClockMs,
   );
 
   return {
@@ -291,7 +291,7 @@ function applyPositiveCeiling(defaultValue: number, ceiling: number | null | und
   if (typeof ceiling !== "number" || !Number.isFinite(ceiling) || ceiling <= 0) {
     return defaultValue;
   }
-  return Math.max(1, Math.min(defaultValue, Math.trunc(ceiling)));
+  return Math.max(1, Math.trunc(ceiling));
 }
 
 function applyNonNegativeCeiling(
@@ -301,5 +301,5 @@ function applyNonNegativeCeiling(
   if (typeof ceiling !== "number" || !Number.isFinite(ceiling) || ceiling < 0) {
     return defaultValue;
   }
-  return Math.max(0, Math.min(defaultValue, Math.trunc(ceiling)));
+  return Math.max(0, Math.trunc(ceiling));
 }

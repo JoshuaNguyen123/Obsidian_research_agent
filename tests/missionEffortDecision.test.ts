@@ -23,9 +23,12 @@ test("in-depth writing selects Compose without inventing research", () => {
   assert.equal(decision.outputDepth, "in_depth");
   assert.equal(decision.researchDepth, "none");
   assert.equal(decision.outputTarget, "new_note");
-  assert.equal(decision.maxModelCalls, 6);
+  // Configured values now take effect in either direction; 100 > compose
+  // default (6) so the configured value wins.
+  assert.equal(decision.maxModelCalls, 100);
   assert.equal(decision.maxToolCalls, 4);
-  assert.equal(decision.maxWallClockMs, 3 * 60_000);
+  // 60-minute configured run time raises the compose default of 3 minutes.
+  assert.equal(decision.maxWallClockMs, 60 * 60_000);
   assert.deepEqual(decision.finalizationReserve.requiredActions, [
     "write_output",
     "read_back_output",
@@ -336,8 +339,8 @@ test("explicit research-publication intent escalates past the grounded budget", 
 
   assert.equal(
     starved.maxToolCalls,
-    PUBLICATION_LADDER_TOOL_COUNT,
-    "the regression baseline is the grounded tool budget",
+    160,
+    "with ceiling math fixed, configured 160 overrides the grounded default of 12",
   );
   assert.ok(
     escalated.maxToolCalls > PUBLICATION_LADDER_TOOL_COUNT,
@@ -361,4 +364,68 @@ test("plain research without publication intent keeps the grounded budget", () =
     forceExtendedTeam: missionRequiresExtendedEffortBudgetV1(prompt),
   });
   assert.equal(decision.profile, "grounded_research");
+});
+
+// --- P3: ceiling math regression pins ---
+
+test("grounded + configured 160 → tools follow configured", () => {
+  const decision = resolveMissionEffortDecisionV1({
+    prompt:
+      "Research the latest sources on transformer architectures and write a note.",
+    route: "grounded_workflow",
+    outputTarget: "new_note",
+    configuredMaxModelCalls: 160,
+    configuredMaxToolCalls: 160,
+    configuredMaxRunMinutes: 35,
+  });
+  assert.equal(decision.profile, "grounded_research");
+  // Configured 160 > grounded default (16/12); it must win.
+  assert.equal(decision.maxModelCalls, 160);
+  assert.equal(decision.maxToolCalls, 160);
+  assert.equal(decision.maxWallClockMs, 35 * 60_000);
+});
+
+test("configured 8 on a grounded profile → 8", () => {
+  const decision = resolveMissionEffortDecisionV1({
+    prompt:
+      "Fact-check this claim using current sources and provide citations.",
+    route: "grounded_workflow",
+    outputTarget: "chat",
+    configuredMaxModelCalls: 8,
+    configuredMaxToolCalls: 8,
+    configuredMaxRunMinutes: 7,
+  });
+  assert.equal(decision.profile, "grounded_research");
+  // Configured 8 < grounded defaults (16/12); it still wins (acts as a ceiling).
+  assert.equal(decision.maxModelCalls, 8);
+  assert.equal(decision.maxToolCalls, 8);
+  assert.equal(decision.maxWallClockMs, 7 * 60_000);
+});
+
+test("escalation floor + lower configured still clamps", () => {
+  // A compose decision with a very low configured cap escalates to grounded,
+  // but the configured lower ceiling still constrains the escalated budget.
+  const decision = resolveMissionEffortDecisionV1({
+    prompt: TRANSFORMER_BRIEF_PROMPT,
+    route: "single_model_writeback",
+    outputTarget: "new_note",
+    configuredMaxModelCalls: 4,
+    configuredMaxToolCalls: 3,
+    configuredMaxRunMinutes: 2,
+  });
+  assert.equal(decision.profile, "compose");
+  assert.equal(decision.maxModelCalls, 4);
+  assert.equal(decision.maxToolCalls, 3);
+  const escalated = escalateMissionEffortDecisionForResearchV1(decision, {
+    researchContractAttached: true,
+    configuredMaxModelCalls: 4,
+    configuredMaxToolCalls: 3,
+    configuredMaxRunMinutes: 2,
+  });
+  assert.equal(escalated.profile, "grounded_research");
+  // Grounded floor is (16/12/10min), but configured ceiling is (4/3/2min).
+  // The configured lower value must still clamp after escalation.
+  assert.equal(escalated.maxModelCalls, 4);
+  assert.equal(escalated.maxToolCalls, 3);
+  assert.equal(escalated.maxWallClockMs, 2 * 60_000);
 });
