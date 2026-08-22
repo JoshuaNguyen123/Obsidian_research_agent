@@ -83,6 +83,24 @@ test("short Chat answers retain the one-call Direct ceiling", () => {
   assert.equal(decision.maxToolCalls, 0);
 });
 
+test("direct profile ignores a large configured step budget", () => {
+  // The runner always passes configuredMaxModelCalls = MAX_AGENT_STEPS (100) even
+  // when the user has not explicitly set anything. The direct profile must stay at
+  // 1 model call and 0 tool calls regardless of configured ceiling values.
+  const decision = resolveMissionEffortDecisionV1({
+    prompt: "What is 2+2?",
+    route: "single_model_answer",
+    outputTarget: "chat",
+    configuredMaxModelCalls: 100,
+    configuredMaxToolCalls: 100,
+    configuredMaxRunMinutes: 60,
+  });
+  assert.equal(decision.profile, "direct");
+  assert.equal(decision.maxModelCalls, 1);
+  assert.equal(decision.maxToolCalls, 0);
+  assert.equal(decision.maxWallClockMs, 60_000);
+});
+
 const TRANSFORMER_BRIEF_PROMPT =
   "Can you write me a brief including diagrams, explaining in depth the transformer architecture and its importance?";
 

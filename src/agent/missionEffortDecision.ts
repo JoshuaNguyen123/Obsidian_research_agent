@@ -95,14 +95,18 @@ export function resolveMissionEffortDecisionV1(
         ? "direct"
         : "compose";
   const defaults = profileDefaults(profile);
-  const maxModelCalls = applyPositiveCeiling(
-    defaults.maxModelCalls,
-    input.configuredMaxModelCalls,
-  );
-  const maxToolCalls = applyNonNegativeCeiling(
-    defaults.maxToolCalls,
-    input.configuredMaxToolCalls,
-  );
+  // The `direct` profile is a hard single-call invariant (1 model call, 0 tools,
+  // 1 min). A caller's step budget (which defaults to MAX_AGENT_STEPS=100 even
+  // when not explicitly configured) must not raise it via the ceiling path.
+  // All other profiles honor the caller's configured values in both directions.
+  const maxModelCalls =
+    profile === "direct"
+      ? defaults.maxModelCalls
+      : applyPositiveCeiling(defaults.maxModelCalls, input.configuredMaxModelCalls);
+  const maxToolCalls =
+    profile === "direct"
+      ? defaults.maxToolCalls
+      : applyNonNegativeCeiling(defaults.maxToolCalls, input.configuredMaxToolCalls);
   const configuredWallClockMs =
     typeof input.configuredMaxRunMinutes === "number" &&
     Number.isFinite(input.configuredMaxRunMinutes) &&
@@ -120,7 +124,7 @@ export function resolveMissionEffortDecisionV1(
     maxModelCalls,
     maxToolCalls,
     maxWallClockMs:
-      configuredWallClockMs === null
+      profile === "direct" || configuredWallClockMs === null
         ? defaults.maxWallClockMs
         : configuredWallClockMs,
     maxSegments: defaults.maxSegments,
