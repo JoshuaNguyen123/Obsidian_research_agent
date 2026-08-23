@@ -123,6 +123,7 @@ import {
 import {
   createToolOutcomeMemory,
   isValidToolOutcomeMemory,
+  mergeToolOutcomeMemoryV1,
   type ToolOutcomeMemoryV1,
 } from "./src/agent/outcomeMemory";
 import {
@@ -8125,9 +8126,15 @@ export default class AgenticResearcherPlugin extends Plugin {
     const researchMemoryIndex = await this.readProjectMemoryJson(
       location.researchIndexPath,
     );
-    const toolOutcomeMemory = await this.readProjectMemoryJson(
-      location.toolOutcomePath,
-    );
+    // The ledger is vault-wide now. Fold in any folder-scoped file this vault
+    // still carries from before the promotion, so existing observed history
+    // survives rather than being silently discarded per project.
+    const [vaultToolOutcomeMemory, folderToolOutcomeMemory] = await Promise.all([
+      this.readProjectMemoryJson(location.vaultToolOutcomePath),
+      location.toolOutcomePath === location.vaultToolOutcomePath
+        ? Promise.resolve(null)
+        : this.readProjectMemoryJson(location.toolOutcomePath),
+    ]);
 
     const currentLocation = getProjectMemoryLocation(
       this.getProjectMemoryAnchorPath(),
@@ -8154,12 +8161,16 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
 
     // Fail closed to an empty ledger: a corrupt or tampered file must not be
-    // able to steer tool ranking in a later run.
-    this.toolOutcomeMemory =
-      toolOutcomeMemory !== null &&
-      isValidToolOutcomeMemory(toolOutcomeMemory as ToolOutcomeMemoryV1)
-        ? (toolOutcomeMemory as ToolOutcomeMemoryV1)
+    // able to steer tool ranking in a later run. Each tier fails closed on its
+    // own, so one corrupt file cannot take the other down with it.
+    const readLedger = (value: unknown): ToolOutcomeMemoryV1 =>
+      value !== null && isValidToolOutcomeMemory(value as ToolOutcomeMemoryV1)
+        ? (value as ToolOutcomeMemoryV1)
         : createToolOutcomeMemory();
+    this.toolOutcomeMemory = mergeToolOutcomeMemoryV1(
+      readLedger(vaultToolOutcomeMemory),
+      readLedger(folderToolOutcomeMemory),
+    );
   }
 
   private invalidateProjectMemoryLoads(): void {
@@ -8177,7 +8188,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.researchMemoryIndex,
     );
     await this.writeProjectMemoryJson(
-      location.toolOutcomePath,
+      location.vaultToolOutcomePath,
       this.toolOutcomeMemory,
     );
   }

@@ -937,6 +937,7 @@ import { canonicalMissionGraphId } from "./agent/missionGraphIds";
 import { planMissionGraphV3 } from "./agent/missionGraphPlanner";
 import {
   MissionGraphSession,
+  createFileCollisionRepairRefusalCodeV1,
   resolveMissionGraphEvidenceKind,
   type MissionGraphToolExecution,
 } from "./agent/missionGraphSession";
@@ -14689,12 +14690,15 @@ export async function runAgentMission({
           } catch (error) {
             failedToolNames.push(toolCall.name);
             const replanFailureReason = getUnknownErrorMessage(error);
+            const refusalCode =
+              createFileCollisionRepairRefusalCodeV1(error);
             // The trace alone proved insufficient in the field: retention
             // windows dropped it, leaving no way to tell WHICH repair
             // precondition failed. Surface the reason on the durable status
-            // stream too.
+            // stream too, now carrying the exact precondition rather than
+            // prose a later reader has to reverse-engineer.
             events.onStatus?.(
-              `Create-file collision repair unavailable for ${createFileCollisionPath}: ${replanFailureReason}`,
+              `Create-file collision repair unavailable for ${createFileCollisionPath} (${refusalCode}): ${replanFailureReason}`,
             );
             events.onTrace?.({
               id: `${toolEventBase.id}:create-file-collision-replan-failed`,
@@ -14705,9 +14709,43 @@ export async function runAgentMission({
                 "The create-file collision could not be replanned into an exact hash-bound repair.",
               error: {
                 code: "create_file_collision_replan_failed",
-                message: replanFailureReason,
+                message: `${refusalCode}: ${replanFailureReason}`,
+              },
+              outputPreview: {
+                path: createFileCollisionPath,
+                refusalCode,
               },
             });
+            // The instruction below tells the model to stop calling tools, but
+            // the origin node was still `ready`, so the frontier kept demanding
+            // the tool that had just failed. The model complied, two no-tool
+            // turns were counted against an unchanged frontier, and the run
+            // died blaming the model for a host refusal. Block the node so the
+            // frontier and the instruction agree: the mission still fails,
+            // because there is no repair path, but it fails with the refusal
+            // recorded as its blocker instead of as an unexplained stall.
+            try {
+              missionGraph =
+                await missionGraphSession.blockUnrepairableCreateFileCollision(
+                  missionGraphExecution,
+                  createFileCollisionPath,
+                  { code: refusalCode, message: replanFailureReason },
+                );
+              missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
+            } catch (blockError) {
+              events.onTrace?.({
+                id: `${toolEventBase.id}:create-file-collision-replan-failed`,
+                kind: "error",
+                step,
+                toolName: toolCall.name,
+                message:
+                  "The unrepairable create-file collision could not be recorded as a node blocker.",
+                error: {
+                  code: "create_file_collision_replan_failed",
+                  message: getUnknownErrorMessage(blockError),
+                },
+              });
+            }
             // Without the repair nodes, the collision error's own advice
             // ("use code_workspace_write_expected") is unfollowable — the
             // frontier will reject that tool. Tell the model the truth once
@@ -14718,7 +14756,7 @@ export async function runAgentMission({
               messages.push({
                 role: "system" as const,
                 content:
-                  `${createFileCollisionPath} already exists with different content and the host could not open a hash-bound repair path this run. ` +
+                  `${createFileCollisionPath} already exists with different content and the host could not open a hash-bound repair path this run (${refusalCode}). ` +
                   `Do not retry code_workspace_create_file for ${createFileCollisionPath} and do not attempt code_workspace_write_expected — it is not available. ` +
                   "Report the blocker in your final answer instead.",
               });

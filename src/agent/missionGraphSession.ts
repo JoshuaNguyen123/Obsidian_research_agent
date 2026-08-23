@@ -42,6 +42,47 @@ import { assertWorkspaceRelativePathV2 } from "../../extensions/code/workspaces/
  * Returns null when the value cannot be a workspace path at all, which must
  * always fail the comparison rather than widen it.
  */
+/**
+ * Why a create-file collision repair was refused.
+ *
+ * `cc9f06e` attested the refusal *message* to the durable trace, which was the
+ * right instinct but not enough on its own: the message is prose, and ten
+ * distinct preconditions in `scheduleCreateFileCollisionRepair` all arrive at
+ * the same generic catch. A stable code is what makes the difference between
+ * "the model stopped calling tools" and "the read grant is missing from this
+ * envelope" legible in a snapshot read hours later.
+ */
+export type CreateFileCollisionRepairRefusalCodeV1 =
+  | "node_not_ready"
+  | "path_missing"
+  | "lifecycle_cursor_mismatch"
+  | "selector_mismatch"
+  | "binding_missing"
+  | "capability_grant_missing"
+  | "read_executor_missing"
+  | "execution_host_mismatch"
+  | "reserve_node_missing"
+  | "budget_exhausted";
+
+export class CreateFileCollisionRepairErrorV1 extends Error {
+  constructor(
+    readonly refusalCode: CreateFileCollisionRepairRefusalCodeV1,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CreateFileCollisionRepairErrorV1";
+  }
+}
+
+/** The refusal code for any error, defaulting to the unclassified case. */
+export function createFileCollisionRepairRefusalCodeV1(
+  error: unknown,
+): CreateFileCollisionRepairRefusalCodeV1 | "unclassified" {
+  return error instanceof CreateFileCollisionRepairErrorV1
+    ? error.refusalCode
+    : "unclassified";
+}
+
 function canonicalWorkspaceSelectorV1(value: string | null): string | null {
   if (value === null) return null;
   try {
@@ -2106,13 +2147,17 @@ export class MissionGraphSession {
         execution.toolName !== "code_workspace_create_file" ||
         node.status !== "ready"
       ) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "node_not_ready",
           `Create-file collision repair requires a ready failed create node; ${node.id} is ${node.status}.`,
         );
       }
       const requestedSelector = targetPath.trim();
       if (!requestedSelector) {
-        throw new Error("Create-file collision repair requires an exact path.");
+        throw new CreateFileCollisionRepairErrorV1(
+          "path_missing",
+          "Create-file collision repair requires an exact path.",
+        );
       }
       const lifecycleAction =
         getCurrentMissionCompositeLifecycleActionV1(node);
@@ -2120,7 +2165,8 @@ export class MissionGraphSession {
         lifecycleAction &&
         lifecycleAction.toolName !== "code_workspace_create_file"
       ) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "lifecycle_cursor_mismatch",
           `Create-file collision repair expected the current lifecycle action to be code_workspace_create_file, not ${lifecycleAction.toolName}.`,
         );
       }
@@ -2139,12 +2185,14 @@ export class MissionGraphSession {
         canonicalRequested === null ||
         canonicalSelector !== canonicalRequested
       ) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "selector_mismatch",
           `Create-file collision repair path ${requestedSelector} does not match the trusted graph selector ${selector ?? "(missing)"}.`,
         );
       }
       if (!bindingId) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "binding_missing",
           `Create-file collision repair lost the trusted workspace binding for ${node.id}.`,
         );
       }
@@ -2154,7 +2202,8 @@ export class MissionGraphSession {
         this.record.graph.capabilityEnvelope.tools
           .code_workspace_write_expected;
       if (!readGrant || !writeGrant) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "capability_grant_missing",
           "Create-file collision repair requires code_workspace_read and code_workspace_write_expected grants.",
         );
       }
@@ -2174,7 +2223,8 @@ export class MissionGraphSession {
           executor.allowedEffects.includes("read"),
       );
       if (!readExecutionHost || !readExecutor) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "read_executor_missing",
           "Create-file collision repair has no installed read executor.",
         );
       }
@@ -2183,7 +2233,8 @@ export class MissionGraphSession {
         !writeGrant.executionHosts.includes(node.executionHost) ||
         writeGrant.effect !== node.effect
       ) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "execution_host_mismatch",
           "Create-file collision repair cannot preserve the original execution host and mutation effect.",
         );
       }
@@ -2193,19 +2244,28 @@ export class MissionGraphSession {
       );
       const reserveNode = findContinuationReserveNode(this.record.graph);
       if (!reserveNode || reserveNode.id === node.id) {
-        throw new Error(
+        throw new CreateFileCollisionRepairErrorV1(
+          "reserve_node_missing",
           "Create-file collision repair has no nonterminal continuation budget reserve.",
         );
       }
-      const allocation = transferReservedBudgetForContinuation(
-        this.record.graph,
-        reserveNode,
-        {
-          toolCalls: 2,
-          externalActions: 0,
-          wallClockMs: perNodeWallClockMs * 2,
-        },
-      );
+      let allocation: ReturnType<typeof transferReservedBudgetForContinuation>;
+      try {
+        allocation = transferReservedBudgetForContinuation(
+          this.record.graph,
+          reserveNode,
+          {
+            toolCalls: 2,
+            externalActions: 0,
+            wallClockMs: perNodeWallClockMs * 2,
+          },
+        );
+      } catch (error) {
+        throw new CreateFileCollisionRepairErrorV1(
+          "budget_exhausted",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
       const idSuffix = sanitizeMissionId(
         `${this.record.graph.revision + 1}-${node.id}`,
       );
@@ -2359,6 +2419,54 @@ export class MissionGraphSession {
       return this.applyUnlocked(
         `Replan create-file collision at ${selector} into exact read and hash-bound write.`,
         operations,
+      );
+    });
+  }
+
+  /**
+   * Close a create-file collision the repair could not open.
+   *
+   * When `scheduleCreateFileCollisionRepair` refuses, the origin node stays
+   * `ready` and the frontier keeps demanding the tool that just failed, while
+   * the runner tells the model not to call tools and to report the blocker. The
+   * model complies, two no-tool turns are counted against an unchanged
+   * frontier, and the run dies blaming the model for a host refusal.
+   *
+   * Blocking the node makes the two agree. The mission still fails -- there is
+   * no repair path -- but it fails with the refusal recorded as its blocker
+   * rather than as an unexplained stall, and the instruction the model was
+   * given is now true.
+   *
+   * Deliberately the cheapest mutation in this class: one status patch, no new
+   * nodes, no budget transfer, no capability or executor resolution. It has to
+   * be able to succeed in exactly the situations where the repair could not.
+   */
+  async blockUnrepairableCreateFileCollision(
+    execution: MissionGraphToolExecution,
+    targetPath: string,
+    refusal: { code: string; message: string },
+  ): Promise<MissionGraphV3> {
+    return this.enqueueMutation(async () => {
+      const node = this.requireNode(execution.nodeId);
+      if (node.status !== "ready") return this.record.graph;
+      return this.applyUnlocked(
+        `Block unrepairable create-file collision at ${targetPath}.`,
+        [
+          {
+            op: "set_status",
+            nodeId: node.id,
+            expectedStatus: "ready",
+            status: "blocked",
+            blocker: {
+              code: "create_file_collision_unrepairable",
+              message:
+                `${targetPath} already exists with different content and the hash-bound ` +
+                `read -> write_expected repair could not be opened (${refusal.code}): ${refusal.message}`,
+              requiredAction:
+                "Report the collision and the refusal reason in the final answer; no tool can resolve it in this run.",
+            },
+          },
+        ],
       );
     });
   }

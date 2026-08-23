@@ -387,6 +387,7 @@ class WorkspaceToolRuntimeV2 {
             normalizedArgs.expectedTargetState = "absent";
             normalizedArgs.expectedSha256 = null;
             normalizedArgs.mutationMode = "create";
+            assertNotebookResultV1(targetPath, content);
             normalizedArgs.expectedAfterSha256 = sha256Text(content);
             summary = `Create ${targetPath} with ${outboundBytes} appended byte(s) while the target remains absent.`;
             action = "create";
@@ -399,6 +400,7 @@ class WorkspaceToolRuntimeV2 {
             normalizedArgs.expectedSha256 = expected;
             normalizedArgs.mutationMode = "append";
             const current = await this.manager.read(workspaceId, targetPath);
+            assertNotebookResultV1(targetPath, `${current.content}${content}`);
             normalizedArgs.expectedAfterSha256 = sha256Text(`${current.content}${content}`);
             summary = `Append ${outboundBytes} byte(s) to ${targetPath} only if SHA-256 remains ${expected}.`;
             action = "append";
@@ -406,6 +408,7 @@ class WorkspaceToolRuntimeV2 {
         } else if (name === "code_workspace_write_expected" || name === "write_workspace_file") {
           const content = requiredString(args.content, "content", true);
           const sourceLanguage = detectCodeCreationLanguageV1(targetPath);
+          assertNotebookResultV1(targetPath, content);
           normalizedArgs.content = content;
           if (sourceLanguage) normalizedArgs.creationLanguage = sourceLanguage.id;
           normalizedArgs.expectedAfterSha256 = sha256Text(content);
@@ -449,7 +452,9 @@ class WorkspaceToolRuntimeV2 {
           const replacements = parseReplacements(args.replacements);
           normalizedArgs.replacements = replacements;
           const current = await this.manager.read(workspaceId, targetPath);
-          normalizedArgs.expectedAfterSha256 = sha256Text(applyExactReplacements(current.content, replacements));
+          const patched = applyExactReplacements(current.content, replacements);
+          assertNotebookResultV1(targetPath, patched);
+          normalizedArgs.expectedAfterSha256 = sha256Text(patched);
           outboundBytes = byteLength(JSON.stringify(replacements));
           normalizedArgs.expectedTargetState = "existing";
           normalizedArgs.expectedKind = "file";
@@ -2559,6 +2564,36 @@ function description(name: string): string {
   }
   return text;
 }
+/**
+ * Structural nbformat validation for every write that can produce a notebook.
+ *
+ * `resolveCreateFileContentV1` validated .ipynb content, but it is reachable
+ * only from code_workspace_create_file. write_expected, patch, and append all
+ * took raw strings with no notebook check at all -- and patch and
+ * write_expected are both in CODE_IMPLEMENTATION_TOOL_ALLOW, so a notebook
+ * created validly could be corrupted into non-nbformat JSON, or into something
+ * that is not JSON at all, by the very next planned step. Nothing caught it:
+ * the workspace hashes whatever bytes it is given.
+ *
+ * Validation runs at prepare time on the *resulting* content, so the approval
+ * the user sees is already known to leave a readable notebook behind, and a
+ * malformed one is refused as invalid arguments rather than written and then
+ * discovered later.
+ */
+function assertNotebookResultV1(targetPath: string, content: string): void {
+  if (!/\.ipynb$/iu.test(targetPath)) return;
+  try {
+    validateJupyterNotebookContentV1(content);
+  } catch (error) {
+    throw new WorkspaceManagerErrorV2(
+      "invalid_arguments",
+      error instanceof Error
+        ? `${error.message} Read the notebook first and write back complete, valid nbformat 4 JSON.`
+        : "Notebook content is invalid.",
+    );
+  }
+}
+
 function resolveCreateFileContentV1(
   args: Record<string, unknown>,
   targetPath: string,

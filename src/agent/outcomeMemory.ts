@@ -189,6 +189,42 @@ export function recordToolOutcome(
 }
 
 /**
+ * Fold two ledgers into one, summing counters per identity.
+ *
+ * Needed because the ledger moved from folder scope to vault scope. Existing
+ * vaults hold a `tool-outcome-memory.json` under each project folder the agent
+ * ever ran in, and each one is real observed history -- discarding it would
+ * make the promotion cost the user everything the agent had learned so far.
+ * Records are keyed by tool name, error code, and target kind, and the
+ * timestamps bracket rather than order, so folding is exact: two ledgers that
+ * saw the same failure twice each report four failures, not two.
+ */
+export function mergeToolOutcomeMemoryV1(
+  left: ToolOutcomeMemoryV1,
+  right: ToolOutcomeMemoryV1,
+): ToolOutcomeMemoryV1 {
+  const byId = new Map<string, ToolOutcomeRecordV1>();
+  for (const record of [...left.records, ...right.records]) {
+    const existing = byId.get(record.id);
+    byId.set(
+      record.id,
+      finalizeRecord({
+        version: 1,
+        id: record.id,
+        toolName: record.toolName,
+        errorCode: record.errorCode,
+        targetKind: record.targetKind,
+        successes: (existing?.successes ?? 0) + record.successes,
+        failures: (existing?.failures ?? 0) + record.failures,
+        firstSeen: earlierTimestamp(existing?.firstSeen, record.firstSeen),
+        lastSeen: laterTimestamp(existing?.lastSeen, record.lastSeen),
+      }),
+    );
+  }
+  return { version: 1, records: evictToCap([...byId.values()]) };
+}
+
+/**
  * Bounded ranking penalty for one candidate tool.
  *
  * Grows with the log of the failure count so a long tail of failures cannot run

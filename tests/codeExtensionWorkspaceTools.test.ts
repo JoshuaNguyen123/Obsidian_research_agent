@@ -1404,6 +1404,96 @@ test("retried create_file self-heals over prior-run debris with hash-verified id
   }
 });
 
+test("every write path that can produce a notebook validates nbformat", async () => {
+  // resolveCreateFileContentV1 validated .ipynb, but it is reachable only from
+  // code_workspace_create_file. write_expected, patch, and append took raw
+  // strings with no check at all -- and patch and write_expected are both in
+  // CODE_IMPLEMENTATION_TOOL_ALLOW, so the step right after a valid create
+  // could corrupt the notebook and nothing would notice.
+  const fixture = await createFixture("notebook");
+  try {
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const context = fixture.context("Write an analysis notebook.");
+    await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "run-tools-v2", kind: "scratch" },
+      context,
+    );
+    const notebook = JSON.stringify(
+      {
+        cells: [{ cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: ["print(1)\n"] }],
+        metadata: {},
+        nbformat: 4,
+        nbformat_minor: 5,
+      },
+      null,
+      2,
+    );
+    await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      { path: "analysis.ipynb", content: notebook },
+      context,
+    );
+
+    await assert.rejects(
+      () =>
+        requirePrepared(
+          tools.get("code_workspace_write_expected")!,
+          { path: "analysis.ipynb", content: "not a notebook" },
+          context,
+        ),
+      /must be valid JSON/u,
+    );
+    await assert.rejects(
+      () =>
+        requirePrepared(
+          tools.get("code_workspace_append")!,
+          { path: "analysis.ipynb", content: "trailing garbage" },
+          context,
+        ),
+      /must be valid JSON/u,
+    );
+    await assert.rejects(
+      () =>
+        requirePrepared(
+          tools.get("code_workspace_patch")!,
+          {
+            path: "analysis.ipynb",
+            replacements: [{ oldText: '"nbformat": 4', newText: '"nbformat": 3' }],
+          },
+          context,
+        ),
+      /must use nbformat 4/u,
+    );
+
+    // The notebook on disk is untouched by any of the refusals.
+    const read = (await tools.get("code_workspace_read")!.execute(
+      { path: "analysis.ipynb" },
+      context,
+    )) as { content: string };
+    assert.equal(JSON.parse(read.content).nbformat, 4);
+
+    // A valid replacement still goes through.
+    const rewritten = notebook.replace("print(1)", "print(2)");
+    await prepareAndExecute(
+      tools.get("code_workspace_write_expected")!,
+      { path: "analysis.ipynb", content: rewritten },
+      context,
+    );
+    const after = (await tools.get("code_workspace_read")!.execute(
+      { path: "analysis.ipynb" },
+      context,
+    )) as { content: string };
+    assert.match(after.content, /print\(2\)/u);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 async function createFixture(name: string) {
   const root = await mkdtemp(path.join(tmpdir(), `code-tools-v2-${name}-`));
   const repositoryRoot = path.join(root, "repository");
