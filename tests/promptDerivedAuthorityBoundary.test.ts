@@ -14,6 +14,7 @@ import {
   evaluateActionPolicy,
   isPromptDerivedAuthorityGrantV1,
 } from "../src/agent/policyEngine";
+import { preparedApprovalMayAutoWithoutCardV1 } from "../src/agent/setLooseCompoundAutonomy";
 import { createJupyterReflectionTool } from "../src/tools/jupyterReflectionTool";
 import { createProjectResultsTool } from "../src/tools/projectResultsTool";
 
@@ -254,6 +255,61 @@ test("an ordinary vault mutation still runs under write autonomy", async () => {
   assert.equal(decision.action, "allow");
   assert.ok(decision.tags.includes("write_autonomy"));
   assert.ok(decision.tags.includes("prepared_fingerprint"));
+});
+
+test("the Bound approval gate keeps the card for a prompt-grant refuser", () => {
+  // The runner's central Bound gate skips the Chat card under set-loose or a
+  // bundled stage grant. For these descriptors that would be prompt-derived
+  // authority, and the auto branch resolves an approval on a node that never
+  // entered waiting_approval — the run then dies with
+  // "Mission node ... is running; expected waiting_approval".
+  for (const descriptor of [JUPYTER_DESCRIPTOR, PROJECT_RESULTS_DESCRIPTOR]) {
+    assert.equal(
+      preparedApprovalMayAutoWithoutCardV1({
+        hasPreparedAction: true,
+        descriptors: [descriptor, descriptor],
+      }),
+      false,
+      `${descriptor.name} must keep its approval card`,
+    );
+  }
+
+  // An ordinary prepared descriptor still auto-approves under set-loose.
+  assert.equal(
+    preparedApprovalMayAutoWithoutCardV1({
+      hasPreparedAction: true,
+      descriptors: [permissiveClone(JUPYTER_DESCRIPTOR)],
+    }),
+    true,
+  );
+
+  // A mixed pair is refused: the stricter descriptor governs.
+  assert.equal(
+    preparedApprovalMayAutoWithoutCardV1({
+      hasPreparedAction: true,
+      descriptors: [permissiveClone(JUPYTER_DESCRIPTOR), JUPYTER_DESCRIPTOR],
+    }),
+    false,
+  );
+
+  // Tools declaring preparation "none" never reached the descriptor-aware
+  // policy path, so this gate deliberately leaves them alone.
+  assert.equal(
+    preparedApprovalMayAutoWithoutCardV1({
+      hasPreparedAction: false,
+      descriptors: [JUPYTER_DESCRIPTOR],
+    }),
+    true,
+  );
+
+  // An unknown tool name resolves to no descriptor and must not be blocked.
+  assert.equal(
+    preparedApprovalMayAutoWithoutCardV1({
+      hasPreparedAction: true,
+      descriptors: [null, undefined],
+    }),
+    true,
+  );
 });
 
 test("prompt-derived classification covers every prompt-bound grant kind", () => {

@@ -9,6 +9,8 @@ import {
   effectClassForTool,
   type AutonomyProfile,
 } from "./autonomyEffectClass";
+import type { ToolDescriptor } from "./actions";
+import { descriptorAllowsPromptIssuedGrantV1 } from "./authority/grants";
 import {
   boundMayAutoUnderBundledGrant,
   type BundledStageGrantV1,
@@ -151,6 +153,27 @@ export function isSetLooseEnabled(input: {
       (input.workingMode ?? "").trim().toLowerCase() === "automatic");
   return (
     automaticAutonomy && input.compoundLifecycleDetected === true
+  );
+}
+
+/**
+ * Whether the runner's Bound approval gate may skip the Chat card for a
+ * prepared action. Both set-loose and a bundled stage grant derive their
+ * authority from the mission prompt and the autonomy profile, so a descriptor
+ * that declares `allowPromptGrant: false` must keep its card — skipping it
+ * would hand the tool exactly the authority it declined.
+ *
+ * Scoped to prepared actions so it lines up with the descriptor-aware policy
+ * path: a tool declaring `preparation: "none"` never reached that policy and
+ * keeps whatever gate it already had.
+ */
+export function preparedApprovalMayAutoWithoutCardV1(input: {
+  hasPreparedAction: boolean;
+  descriptors: readonly (ToolDescriptor | null | undefined)[];
+}): boolean {
+  if (!input.hasPreparedAction) return true;
+  return input.descriptors.every(
+    (descriptor) => !descriptor || descriptorAllowsPromptIssuedGrantV1(descriptor),
   );
 }
 

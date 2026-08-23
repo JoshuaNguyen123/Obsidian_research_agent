@@ -616,6 +616,7 @@ import {
   isCompletedAcceptedResearchPublicationReceipt,
   isSetLooseEnabled,
   isSetLooseGithubPublishHealableBlock,
+  preparedApprovalMayAutoWithoutCardV1,
   lifecycleStagePaidBySuccessfulTool,
   missionRequestsGithubMerge,
   resolveNumCtxForCompoundRun,
@@ -10152,7 +10153,18 @@ export async function runAgentMission({
     // Central Bound gate: early bundled stage grant OR set-loose. Catalog
     // mutations retain exact approval/grant authority. Hard never auto.
     const setLooseLive = resolveSetLooseCompoundEnabled();
+    // Without this the auto branch below resolves an approval on a node that
+    // never entered waiting_approval, which surfaces as the opaque "is
+    // running; expected waiting_approval" rather than a policy refusal.
+    const approvalDescriptorAllowsPromptIssuedGrant =
+      preparedApprovalMayAutoWithoutCardV1({
+        hasPreparedAction: Boolean(preparedAction),
+        descriptors: [toolCall.name, approvalToolName].map(
+          (name) => toolRegistry.getDescriptor?.(name) ?? null,
+        ),
+      });
     const mayAutoBound =
+      approvalDescriptorAllowsPromptIssuedGrant &&
       !isGeneralGitHubCatalogMutationToolName(toolCall.name) &&
       !isGeneralGitHubCatalogMutationToolName(approvalToolName) &&
       (runnerBoundMayAutoWithoutChatGrant({
