@@ -4,12 +4,18 @@ import {
   TAbstractFile,
   TFile,
   WorkspaceLeaf,
+  type Editor,
   type EventRef,
 } from "obsidian";
 import { AgentView, AGENT_VIEW_TYPE } from "./src/AgentView";
 import {
   buildSelectionResearchPrompt,
+  isUsableContinuationLeadIn,
   isUsableEditorSelection,
+  SELECTION_RESEARCH_ACTIONS,
+  SELECTION_RESEARCH_MENU_SECTION,
+  getSelectionResearchAction,
+  type SelectionResearchActionV1,
   type SelectionResearchMode,
 } from "./src/agent/selectionResearchPrompt";
 import {
@@ -1175,86 +1181,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       },
     });
 
-    this.addCommand({
-      id: "research-selection-web",
-      name: "Research selection (web)",
-      editorCheckCallback: (checking, editor, ctx) => {
-        const selection = editor?.getSelection?.() ?? "";
-        if (!isUsableEditorSelection(selection)) {
-          return false;
-        }
-        if (checking) {
-          return true;
-        }
-        const notePath =
-          ctx?.file instanceof TFile ? ctx.file.path : this.resolveCurrentMarkdownPath();
-        void this.runSelectionResearch({
-          selection,
-          notePath,
-          mode: "stream_page",
-        });
-        return true;
-      },
-    });
-
-    this.addCommand({
-      id: "research-selection-chat-only",
-      name: "Research selection (chat only)",
-      editorCheckCallback: (checking, editor, ctx) => {
-        const selection = editor?.getSelection?.() ?? "";
-        if (!isUsableEditorSelection(selection)) {
-          return false;
-        }
-        if (checking) {
-          return true;
-        }
-        const notePath =
-          ctx?.file instanceof TFile ? ctx.file.path : this.resolveCurrentMarkdownPath();
-        void this.runSelectionResearch({
-          selection,
-          notePath,
-          mode: "chat_only",
-        });
-        return true;
-      },
-    });
-
-    this.registerEvent(
-      this.app.workspace.on("editor-menu", (menu, editor, info) => {
-        const selection = editor?.getSelection?.() ?? "";
-        if (!isUsableEditorSelection(selection)) {
-          return;
-        }
-        const notePath =
-          info?.file instanceof TFile
-            ? info.file.path
-            : this.resolveCurrentMarkdownPath();
-        menu.addItem((item) => {
-          item
-            .setTitle("Research selection (web)")
-            .setIcon("search")
-            .onClick(() => {
-              void this.runSelectionResearch({
-                selection,
-                notePath,
-                mode: "stream_page",
-              });
-            });
-        });
-        menu.addItem((item) => {
-          item
-            .setTitle("Research selection (chat only)")
-            .setIcon("message-square")
-            .onClick(() => {
-              void this.runSelectionResearch({
-                selection,
-                notePath,
-                mode: "chat_only",
-              });
-            });
-        });
-      }),
-    );
+    // Command palette + editor menu + note menu all come from one table, so a
+    // new quick action cannot reach one surface and miss the others.
+    this.registerQuickActionSurfaces();
 
     this.addCommand({
       id: "rebuild-semantic-vault-index",
@@ -1817,17 +1746,197 @@ export default class AgenticResearcherPlugin extends Plugin {
     return this.resolveCurrentMarkdownFile()?.path ?? "current note";
   }
 
+  /**
+   * An action is only offered when the product can actually carry it out. A
+   * menu entry that opens the panel and then reports a missing credential is
+   * worse than no entry at all.
+   */
+  private isQuickActionAvailable(action: SelectionResearchActionV1): boolean {
+    if (action.requiresLinear === true && !this.hasLinearApiKey()) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Collect the text a quick action operates on, or null when the editor is
+   * not in a state that supports it. Cursor actions take everything before the
+   * caret; the prompt builder keeps the tail, which is the join point.
+   */
+  private readQuickActionText(
+    action: SelectionResearchActionV1,
+    editor: Editor | null,
+  ): string | null {
+    if (action.scope === "note") {
+      return "";
+    }
+    if (!editor) {
+      return null;
+    }
+    if (action.scope === "selection") {
+      const selection = editor.getSelection?.() ?? "";
+      return isUsableEditorSelection(selection) ? selection : null;
+    }
+    const cursor = editor.getCursor?.();
+    if (!cursor) {
+      return null;
+    }
+    const leadIn = editor.getRange?.({ line: 0, ch: 0 }, cursor) ?? "";
+    return isUsableContinuationLeadIn(leadIn) ? leadIn : null;
+  }
+
+  private registerQuickActionSurfaces(): void {
+    for (const action of SELECTION_RESEARCH_ACTIONS) {
+      if (action.scope === "note") {
+        this.addCommand({
+          id: action.commandId,
+          name: action.label,
+          checkCallback: (checking) => {
+            const file = this.resolveCurrentMarkdownFile();
+            if (!file || !this.isQuickActionAvailable(action)) {
+              return false;
+            }
+            if (checking) {
+              return true;
+            }
+            void this.runSelectionResearch({
+              selection: "",
+              notePath: file.path,
+              mode: action.mode,
+            });
+            return true;
+          },
+        });
+        continue;
+      }
+      this.addCommand({
+        id: action.commandId,
+        name: action.label,
+        editorCheckCallback: (checking, editor, ctx) => {
+          const text = this.readQuickActionText(action, editor ?? null);
+          if (text === null || !this.isQuickActionAvailable(action)) {
+            return false;
+          }
+          if (checking) {
+            return true;
+          }
+          const notePath =
+            ctx?.file instanceof TFile
+              ? ctx.file.path
+              : this.resolveCurrentMarkdownPath();
+          void this.runSelectionResearch({
+            selection: text,
+            notePath,
+            mode: action.mode,
+          });
+          return true;
+        },
+      });
+    }
+
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor, info) => {
+        const notePath =
+          info?.file instanceof TFile
+            ? info.file.path
+            : this.resolveCurrentMarkdownPath();
+        // With a selection the menu offers the selection actions; without one
+        // it offers the cursor actions. Neither list ever exceeds four items,
+        // so the quick actions stay readable inside Obsidian's own menu.
+        const hasSelection = isUsableEditorSelection(
+          editor?.getSelection?.() ?? "",
+        );
+        for (const action of SELECTION_RESEARCH_ACTIONS) {
+          if (!action.inEditorMenu || !this.isQuickActionAvailable(action)) {
+            continue;
+          }
+          if (hasSelection !== (action.scope === "selection")) {
+            continue;
+          }
+          const text = this.readQuickActionText(action, editor ?? null);
+          if (text === null) {
+            continue;
+          }
+          menu.addItem((item) => {
+            item
+              .setTitle(action.label)
+              .setIcon(action.icon)
+              .setSection(SELECTION_RESEARCH_MENU_SECTION)
+              .onClick(() => {
+                void this.runSelectionResearch({
+                  selection: text,
+                  notePath,
+                  mode: action.mode,
+                });
+              });
+          });
+        }
+      }),
+    );
+
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (!(file instanceof TFile) || file.extension !== "md") {
+          return;
+        }
+        for (const action of SELECTION_RESEARCH_ACTIONS) {
+          if (!action.inFileMenu || !this.isQuickActionAvailable(action)) {
+            continue;
+          }
+          menu.addItem((item) => {
+            item
+              .setTitle(action.label)
+              .setIcon(action.icon)
+              .setSection(SELECTION_RESEARCH_MENU_SECTION)
+              .onClick(() => {
+                void this.runSelectionResearch({
+                  selection: "",
+                  notePath: file.path,
+                  mode: action.mode,
+                });
+              });
+          });
+        }
+      }),
+    );
+  }
+
   async runSelectionResearch(input: {
     selection: string;
     notePath: string;
     mode: SelectionResearchMode;
   }): Promise<void> {
-    if (!isUsableEditorSelection(input.selection)) {
+    const action = getSelectionResearchAction(input.mode);
+    if (
+      action.scope === "selection" &&
+      !isUsableEditorSelection(input.selection)
+    ) {
       new Notice("Select text in a markdown note before researching.");
       return;
     }
+    if (
+      action.scope === "cursor" &&
+      !isUsableContinuationLeadIn(input.selection)
+    ) {
+      new Notice(
+        "Place the cursor after some existing prose so the continuation has a voice to match.",
+      );
+      return;
+    }
+    if (action.scope === "note" && !this.app.vault.getFileByPath(input.notePath.trim())) {
+      new Notice("Open a markdown note first.");
+      return;
+    }
+    if (!this.isQuickActionAvailable(action)) {
+      new Notice(
+        `${action.label} needs a Linear connection. Add one in Agentic Researcher settings.`,
+      );
+      return;
+    }
     if (this.isMissionRunning()) {
-      new Notice("A mission is already running. Stop it or wait, then research the selection.");
+      new Notice(
+        `A mission is already running. Stop it or wait, then use ${action.label.toLowerCase()}.`,
+      );
       return;
     }
 
@@ -1837,7 +1946,11 @@ export default class AgenticResearcherPlugin extends Plugin {
       mode: input.mode,
     });
     if (built.truncated) {
-      new Notice("Selection was truncated for the research mission.");
+      new Notice(
+        action.scope === "cursor"
+          ? "Only the text closest to your cursor was sent as context."
+          : "Selection was truncated for the research mission.",
+      );
     }
     // Selection research is the DU-02 cloud happy path (cited append / chat).
     if (built.dailyUseId === "DU-02" && input.mode === "stream_page") {
@@ -1882,8 +1995,10 @@ export default class AgenticResearcherPlugin extends Plugin {
       return;
     }
 
+    // chatOnly comes from the same action record that wrote the prompt, so the
+    // host flag and the prompt's own "chat only" wording can never disagree.
     const outcome = await view.submitMissionPrompt(built.prompt, {
-      forceChatOnly: input.mode === "chat_only",
+      forceChatOnly: built.chatOnly,
     });
     if (!outcome) {
       new Notice("Could not start selection research (mission busy or panel not ready).");
