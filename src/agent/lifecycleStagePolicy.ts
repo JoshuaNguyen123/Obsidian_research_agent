@@ -81,10 +81,23 @@ export const CODE_IMPLEMENTATION_TOOL_ALLOW = [
   "code_workspace_append",
   "code_workspace_patch",
   "code_workspace_write_expected",
+  // Relocation and removal have been registered, hash-bound, receipted, and
+  // reconcilable since the V2 workspace landed, but were in no lifecycle
+  // allowlist -- so mid-mission the agent could create a file and then never
+  // rename or delete it. Every one of these is a prepared, exactly-approved
+  // mutation inside the same durable workspace as the writes above; trash is
+  // recoverable through code_workspace_restore rather than a hard delete.
+  "code_workspace_move",
+  "code_workspace_copy",
+  "code_workspace_trash",
+  "code_workspace_restore",
 ] as const;
 
 export const CODE_VALIDATION_TOOL_ALLOW = [
   "code_sandbox_status",
+  // Scratch missions must be able to create the repository the verified
+  // commit binds to; without it code_commit_verified has nothing to bind.
+  "code_workspace_init_repository",
   "code_validate_fast",
   "code_validate_targeted",
   "code_validate_full",
@@ -143,6 +156,14 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     "linear_create_issue",
     "linear_get_issue",
     "linear_search_issues",
+    // The stage could open work but never close it, so in a compound mission
+    // the host moved issues to Done on the agent's behalf while the agent's
+    // own tickets sat open. A state change is an ordinary reversible Linear
+    // mutation and still runs prepare -> exact approval -> execute ->
+    // independent readback -> reconcile; listing workflow states is the read
+    // that makes the target state id discoverable rather than guessed.
+    "linear_list_workflow_states",
+    "linear_update_issue",
   ],
   code_execution: [...CODE_IMPLEMENTATION_TOOL_ALLOW],
   code_validation: [...CODE_VALIDATION_TOOL_ALLOW],
@@ -171,6 +192,56 @@ export function toolsAllowedForLifecycleStage(
   stage: ProjectLifecycleStageV1,
 ): readonly string[] {
   return LIFECYCLE_STAGE_TOOL_ALLOW[stage] ?? [];
+}
+
+/**
+ * How many tool calls each lifecycle stage necessarily commits.
+ *
+ * This is not the allowlist length — an allowlist is what a stage *may* call,
+ * and is far larger than what it *must*. These are the ordered ladders the
+ * deterministic planner seeds, counted:
+ *
+ * - `accepted_research`: two evidence fetches, a search, the note write, and
+ *   its read-back.
+ * - `linear_hierarchy`: connection context, publication, readback.
+ * - `code_execution`: the scratch delivery ladder the desktop lanes pin —
+ *   sandbox status, workspace create, file create, fast/targeted/full
+ *   validation, directory export. `missionEffortLadder.test.ts` asserts this
+ *   number against `getRequiredCodeWorkflowToolNames` itself, so it can never
+ *   silently fall behind the real ladder.
+ * - `code_validation`: repair-record cycle, repository promotion, commit, and
+ *   the two validations a commit requires afresh.
+ * - `private_github_publication`: repository creation and publication.
+ * - `reflection`: the notebook reflection and the project results write.
+ * - `reconciliation_cleanup`: two cleanup mutations.
+ *
+ * Budgets are ceilings, not targets: a mission that finishes early does not
+ * spend the rest. Sizing a budget below this number does not make a mission
+ * cheaper, it makes it die partway with a ledger that says it could have
+ * continued — which is exactly what happened when a seven-tool code ladder
+ * drew the four-tool `compose` budget.
+ */
+export const PROJECT_LIFECYCLE_STAGE_COMMITTED_TOOL_CALLS_V1: Readonly<
+  Record<ProjectLifecycleStageV1, number>
+> = Object.freeze({
+  accepted_research: 5,
+  linear_hierarchy: 3,
+  code_execution: 7,
+  code_validation: 5,
+  private_github_publication: 2,
+  reflection: 2,
+  reconciliation_cleanup: 2,
+});
+
+/** Total tool calls the detected lifecycle stages commit, in order. */
+export function committedToolCallsForLifecycleStagesV1(
+  stages: readonly ProjectLifecycleStageV1[],
+): number {
+  return [...new Set(stages)].reduce(
+    (total, stage) =>
+      total + (PROJECT_LIFECYCLE_STAGE_COMMITTED_TOOL_CALLS_V1[stage] ?? 0),
+    0,
+  );
 }
 
 export function nextLifecycleStageAfter(

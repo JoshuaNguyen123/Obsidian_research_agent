@@ -2,9 +2,30 @@ export interface ProjectMemoryLocation {
   memoryFolder: string;
   conversationPath: string;
   researchIndexPath: string;
-  /** Cross-run tool outcome ledger; see `outcomeMemory.ts`. */
+  /**
+   * Folder-scoped tool outcome ledger. Read for migration only; new
+   * observations go to {@link vaultToolOutcomePath}.
+   */
   toolOutcomePath: string;
   researchNotesFolder: string;
+  /** Vault-wide memory folder, independent of the active note's parent. */
+  vaultMemoryFolder: string;
+  /**
+   * Vault-wide tool outcome ledger; see `outcomeMemory.ts`.
+   *
+   * Everything else here is deliberately scoped to the active note's folder:
+   * a conversation and a research index belong to the project being worked on.
+   * "which tools keep failing, and how" does not. It is a property of the
+   * vault, the machine, and the configured providers, and scoping it by folder
+   * meant a research mission run from `Projects/CRDT/` taught the agent
+   * nothing a later coding mission run from `Desktop notes/` could use --
+   * every folder relearned the same failures from scratch.
+   *
+   * The records are counters keyed by tool name, error code, and a coarse
+   * target kind, and carry no paths or URLs by construction, so promoting them
+   * to vault scope moves no vault structure between projects.
+   */
+  vaultToolOutcomePath: string;
 }
 
 export interface ProjectMemoryLoadSnapshot {
@@ -26,6 +47,7 @@ export function getProjectMemoryLocation(
 ): ProjectMemoryLocation {
   const projectRoot = getProjectRoot(activeFilePath);
   const memoryFolder = joinVaultPath(projectRoot, PROJECT_MEMORY_FOLDER);
+  const vaultMemoryFolder = joinVaultPath(PROJECT_MEMORY_FOLDER);
 
   return {
     memoryFolder,
@@ -33,6 +55,11 @@ export function getProjectMemoryLocation(
     researchIndexPath: joinVaultPath(memoryFolder, "research-memory-index.json"),
     toolOutcomePath: joinVaultPath(memoryFolder, "tool-outcome-memory.json"),
     researchNotesFolder: joinVaultPath(memoryFolder, "Research"),
+    vaultMemoryFolder,
+    vaultToolOutcomePath: joinVaultPath(
+      vaultMemoryFolder,
+      "tool-outcome-memory.json",
+    ),
   };
 }
 

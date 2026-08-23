@@ -838,12 +838,16 @@ test("satisfied required tools outrank the repeated-call stop; unsatisfied repet
 });
 
 test("project memory paths live under the active note folder", () => {
+  // The tool outcome ledger is the one exception and resolves to vault scope;
+  // see tests/vaultGlobalToolOutcomeMemory.test.ts for why.
   assert.deepEqual(getProjectMemoryLocation("Projects/Grapes.md"), {
     memoryFolder: "Projects/Agent Memory",
     conversationPath: "Projects/Agent Memory/conversation-history.json",
     researchIndexPath: "Projects/Agent Memory/research-memory-index.json",
     toolOutcomePath: "Projects/Agent Memory/tool-outcome-memory.json",
     researchNotesFolder: "Projects/Agent Memory/Research",
+    vaultMemoryFolder: "Agent Memory",
+    vaultToolOutcomePath: "Agent Memory/tool-outcome-memory.json",
   });
 
   assert.deepEqual(getProjectMemoryLocation("Root.md"), {
@@ -852,6 +856,8 @@ test("project memory paths live under the active note folder", () => {
     researchIndexPath: "Agent Memory/research-memory-index.json",
     toolOutcomePath: "Agent Memory/tool-outcome-memory.json",
     researchNotesFolder: "Agent Memory/Research",
+    vaultMemoryFolder: "Agent Memory",
+    vaultToolOutcomePath: "Agent Memory/tool-outcome-memory.json",
   });
 });
 

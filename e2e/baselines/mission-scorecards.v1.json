@@ -16,49 +16,57 @@
             "id": "acceptance_coverage",
             "score": 1,
             "weight": 0.3,
-            "detail": "23/23 criteria met"
+            "detail": "23/23 criteria met",
+            "applicable": true
           },
           {
             "id": "evidence_grounding",
             "score": 1,
             "weight": 0.25,
-            "detail": "0/0 claims cited"
+            "detail": "0/0 claims cited",
+            "applicable": false
           },
           {
             "id": "receipt_coverage",
             "score": 1,
             "weight": 0.15,
-            "detail": "10/10 mutations receipted"
+            "detail": "10/10 mutations receipted",
+            "applicable": true
           },
           {
             "id": "source_independence",
             "score": 1,
             "weight": 0.05,
-            "detail": "no web sources required"
+            "detail": "no web sources required",
+            "applicable": false
           },
           {
             "id": "research_depth",
             "score": 1,
             "weight": 0.05,
-            "detail": "no web sources required"
+            "detail": "no web sources required",
+            "applicable": false
           },
           {
             "id": "recovery_cleanliness",
             "score": 1,
             "weight": 0.1,
-            "detail": "0 recovery attempts"
+            "detail": "0 recovery attempts",
+            "applicable": true
           },
           {
             "id": "model_call_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "23/98 model calls"
+            "detail": "23/98 model calls",
+            "applicable": true
           },
           {
             "id": "wall_clock_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "159s/3600s"
+            "detail": "159s/3600s",
+            "applicable": true
           }
         ],
         "total": 1
@@ -148,49 +156,57 @@
             "id": "acceptance_coverage",
             "score": 1,
             "weight": 0.3,
-            "detail": "12/12 criteria met"
+            "detail": "12/12 criteria met",
+            "applicable": true
           },
           {
             "id": "evidence_grounding",
             "score": 1,
             "weight": 0.25,
-            "detail": "4/4 claims cited"
+            "detail": "4/4 claims cited",
+            "applicable": true
           },
           {
             "id": "receipt_coverage",
             "score": 1,
             "weight": 0.15,
-            "detail": "1/1 mutations receipted"
+            "detail": "1/1 mutations receipted",
+            "applicable": true
           },
           {
             "id": "source_independence",
             "score": 1,
             "weight": 0.05,
-            "detail": "2/2 distinct domains"
+            "detail": "2/2 distinct domains",
+            "applicable": true
           },
           {
             "id": "research_depth",
             "score": 0.5,
             "weight": 0.05,
-            "detail": "2 cited passages, 2 domains, 0 quotes, 2 sections"
+            "detail": "2 cited passages, 2 domains, 0 quotes, 2 sections",
+            "applicable": true
           },
           {
             "id": "recovery_cleanliness",
             "score": 1,
             "weight": 0.1,
-            "detail": "0 recovery attempts"
+            "detail": "0 recovery attempts",
+            "applicable": true
           },
           {
             "id": "model_call_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "4/47 model calls"
+            "detail": "4/47 model calls",
+            "applicable": true
           },
           {
             "id": "wall_clock_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "33s/840s"
+            "detail": "33s/840s",
+            "applicable": true
           }
         ],
         "total": 0.975

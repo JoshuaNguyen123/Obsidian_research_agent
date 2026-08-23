@@ -8,6 +8,7 @@ import {
   resolveMissionGraphEvidenceKind,
   type MissionGraphToolExecution,
   type MissionGraphToolStartResult,
+  createFileCollisionRepairRefusalCodeV1,
 } from "../src/agent/missionGraphSession";
 import {
   reconcileCompositeOwnedCurrentNoteGraphOnResume,
@@ -1686,6 +1687,59 @@ test("a create collision repair still refuses a genuinely different path", async
     () =>
       session.scheduleCreateFileCollisionRepair(create, "src/other.py"),
     /does not match the trusted graph selector/u,
+  );
+
+  // The refusal now names which of the ten preconditions fired. cc9f06e
+  // attested the prose message, but every precondition arrived at the same
+  // generic catch, so a snapshot read later could not tell a selector mismatch
+  // from a missing capability grant.
+  const refusal = await session
+    .scheduleCreateFileCollisionRepair(create, "src/other.py")
+    .catch((error: unknown) => error);
+  assert.equal(
+    createFileCollisionRepairRefusalCodeV1(refusal),
+    "selector_mismatch",
+  );
+  assert.equal(
+    createFileCollisionRepairRefusalCodeV1(new Error("something else")),
+    "unclassified",
+  );
+
+  // And the origin node can still be closed even though the repair could not
+  // be opened. Without this the node stayed `ready`, so the frontier kept
+  // demanding the tool that had just failed while the runner told the model to
+  // stop calling tools -- two no-tool turns later the run died blaming the
+  // model for a host refusal.
+  assert.equal(session.graph.nodes[create.nodeId]?.status, "ready");
+  const blocked = await session.blockUnrepairableCreateFileCollision(
+    create,
+    "src/app.py",
+    { code: "selector_mismatch", message: "no repair path" },
+  );
+  assert.equal(blocked.nodes[create.nodeId]?.status, "blocked");
+  assert.equal(
+    blocked.nodes[create.nodeId]?.blocker?.code,
+    "create_file_collision_unrepairable",
+  );
+  assert.match(
+    blocked.nodes[create.nodeId]?.blocker?.message ?? "",
+    /selector_mismatch/u,
+  );
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(
+      [
+        {
+          type: "function" as const,
+          function: {
+            name: "code_workspace_create_file",
+            parameters: { type: "object" },
+          },
+        },
+      ],
+      blocked,
+    ),
+    [],
+    "a blocked collision node must stop demanding the tool that just failed",
   );
 });
 

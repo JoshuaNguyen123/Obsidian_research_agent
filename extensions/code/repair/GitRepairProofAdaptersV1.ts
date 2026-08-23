@@ -42,11 +42,26 @@ const ALLOWED_GIT_COMMANDS = new Set([
   "config",
   "diff",
   "diff-tree",
+  // Creates the first repository for an agent-owned scratch workspace. The
+  // promotion path that uses it refuses any directory that already carries a
+  // .git marker and refuses any root outside the workspace metadata container,
+  // so this can never reinitialize or adopt a user checkout.
+  "init",
   "read-tree",
   "rev-parse",
   "show",
   "status",
 ]);
+
+/**
+ * The single branch-name predicate for the fixed-argv Git surface. Repository
+ * identity readback and scratch-repository promotion must agree on what a
+ * branch may be named, so they share this one expression instead of each
+ * carrying a copy that can drift apart.
+ */
+export function isSafeGitBranchNameV1(value: unknown): value is string {
+  return typeof value === "string" && SAFE_BRANCH.test(value);
+}
 
 export interface FixedArgvGitBytesResultV1 {
   exitCode: number;
@@ -358,7 +373,7 @@ export class FixedArgvRepairProofAdapterV1
     if (
       !sameHostPath(root, input.manifest.canonicalRoot) ||
       !GIT_SHA.test(head) ||
-      !SAFE_BRANCH.test(branch) ||
+      !isSafeGitBranchNameV1(branch) ||
       input.manifest.repositoryBinding.branch === null ||
       branch !== input.manifest.repositoryBinding.branch
     ) {

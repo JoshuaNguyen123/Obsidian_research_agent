@@ -396,6 +396,92 @@ export function detectRepositoryProfileV2(input: RepositoryDetectionInputV2): Re
   });
 }
 
+/**
+ * Detect a profile for a repository that has source but no ecosystem marker.
+ *
+ * `detectRepositoryProfileV2` fails closed when nothing matches an adapter
+ * marker, which is correct for an existing checkout: a repository with no
+ * manifest, lockfile, or build file has no trustworthy validation contract to
+ * infer. But a repository the agent just created from a scratch workspace is
+ * usually exactly that — a Python game is three `.py` files, not a
+ * `pyproject.toml` — and refusing it would make the scratch-to-repository
+ * promotion unusable for the missions it exists for.
+ *
+ * The profile this returns carries the same **unresolved** runtime pin a
+ * detected profile does, so `repositoryProfileExecutionBlockersV2` still
+ * reports a blocker until a verified sandbox digest is bound. Validation
+ * authority is therefore unchanged; only the commit and publication gateways,
+ * which need a profile to exist at all, become reachable.
+ *
+ * Returns null when the inventory has no source this host can validate, so the
+ * caller can refuse with a specific reason instead of inventing a contract.
+ */
+export function detectSourceOnlyRepositoryProfileV2(
+  input: RepositoryDetectionInputV2,
+): RepositoryProfileV2 | null {
+  const files = uniquePaths(input.files, "repository files", 1, 20_000, false);
+  const pythonPaths = files.filter((file) => file.toLowerCase().endsWith(".py"));
+  if (pythonPaths.length === 0) return null;
+  const projectId = "root";
+  const testPaths = pythonPaths.filter((file) =>
+    /^test[^/]*\.py$/iu.test(file.split("/").at(-1) ?? ""),
+  );
+  const testDirectories = [
+    ...new Set(
+      testPaths.map((file) => {
+        const separator = file.lastIndexOf("/");
+        return separator < 0 ? "." : file.slice(0, separator) || ".";
+      }),
+    ),
+  ];
+  const startDirectory =
+    testDirectories.length === 1 ? testDirectories[0]! : ".";
+  const validationCatalog: RepositoryValidationCommandV2[] = (
+    ["fast", "targeted", "full"] as const
+  ).map((phase) => ({
+    id: `source-only-python-${phase}`,
+    phase,
+    projectId,
+    executable: "python",
+    args:
+      phase === "fast" || testPaths.length === 0
+        ? ["-m", "compileall", "-q", "."]
+        : ["-m", "unittest", "discover", "-s", startDirectory, "-p", "test*.py"],
+    cwd: ".",
+    timeoutMs: 60_000,
+    network: "disabled",
+    credentialPolicy: "none",
+    lockfile: null,
+  }));
+  return createRepositoryProfileV2({
+    key: input.key,
+    displayName: input.displayName,
+    repositoryRoot: input.repositoryRoot,
+    defaultBranch: input.defaultBranch,
+    projects: [{
+      id: projectId,
+      root: ".",
+      ecosystems: ["python"],
+      allowedPaths: ["."],
+    }],
+    ecosystems: ["python"],
+    allowedPaths: ["."],
+    protectedControls: detectProtectedControls(files),
+    pinnedRuntimes: [
+      unresolvedRuntime(
+        projectId,
+        "python",
+        "python",
+        input.runtimeDigests?.python,
+      ),
+    ],
+    validationCatalog,
+    generatedOutputs: [],
+    requiredGitHubChecks: [...(input.requiredGitHubChecks ?? [])],
+    mergePolicy: defaultRepositoryMergePolicyV2(),
+  });
+}
+
 /** Preserve V1 policy while moving it into the richer closed V2 contract. */
 export function migrateRepositoryProfileV1(profile: RepositoryProfileV1): RepositoryProfileV2 {
   const projectId = "root";

@@ -470,6 +470,149 @@ export class WorkspaceManagerV2 {
     });
   }
 
+  /**
+   * Adopt a repository binding for a scratch workspace the agent has just
+   * turned into a Git repository in place.
+   *
+   * `registerTrustedRepositoryWorkspace` refuses `repositoryRoot ===
+   * worktreeRoot` with `base_checkout_forbidden`, and that refusal must stay:
+   * it stops the user's own checkout from becoming an agent workspace. A
+   * promoted scratch workspace is the opposite case — the repository did not
+   * exist until the agent created it inside this manager's own container — so
+   * it gets a separate door with a *stricter* precondition instead of a
+   * relaxed one: the canonical root must live under the workspace's own
+   * metadata container, which no externally-rooted path ever can.
+   *
+   * Repeating the same promotion is a readback-only reconciliation.
+   */
+  async promoteScratchWorkspaceToRepositoryAfterVerifiedReadback(input: {
+    operationId: string;
+    workspaceId: string;
+    ownerRunId: string;
+    leaseId: string;
+    profileKey: string;
+    repositoryRoot: string;
+    branch: string;
+    baseSha: string;
+    bindingFingerprint: string;
+    handoffFingerprint: string;
+    readback: VerifiedWorkspaceBaseReadbackV2;
+  }): Promise<WorkspaceManifestV2> {
+    return this.serializeWrite(async () => {
+      const operationId = workspaceIdentifier(input.operationId);
+      const workspaceId = workspaceIdentifier(input.workspaceId);
+      const ownerRunId = boundedText(input.ownerRunId, "owner run id", 256);
+      const profileKey = workspaceIdentifier(input.profileKey);
+      const branch = boundedText(input.branch, "repository branch", 255);
+      const baseSha = gitSha(input.baseSha, "promoted repository base SHA");
+      if (!isSha256FingerprintV2(input.bindingFingerprint)) {
+        throw new WorkspaceManagerErrorV2("invalid_binding", "Promoted repository binding fingerprint is invalid.");
+      }
+      if (!isSha256FingerprintV2(input.handoffFingerprint)) {
+        throw new WorkspaceManagerErrorV2("invalid_handoff_fingerprint", "Verified handoff fingerprint is invalid.");
+      }
+      let manifest = await this.requireLease(
+        await this.requireReadable(await this.loadManifest(workspaceId)),
+        input.leaseId,
+      );
+      if (manifest.ownerRunId !== ownerRunId) {
+        throw new WorkspaceManagerErrorV2("workspace_owner_mismatch", "Workspace belongs to another run.");
+      }
+      await this.assertWorkspaceRoot(manifest);
+      // The containment rule that replaces base_checkout_forbidden here.
+      const container = await fs.realpath(this.containerPath(workspaceId));
+      if (
+        samePath(manifest.canonicalRoot, container) ||
+        !isSameOrDescendantPath(container, manifest.canonicalRoot) ||
+        !samePath(manifest.canonicalRoot, input.repositoryRoot)
+      ) {
+        throw new WorkspaceManagerErrorV2(
+          "scratch_promotion_root_forbidden",
+          "Only a workspace root inside its own durable container can be promoted to a repository in place.",
+        );
+      }
+      if (manifest.kind === "repository") {
+        const binding = manifest.repositoryBinding;
+        if (
+          binding?.profileKey === profileKey &&
+          binding.branch === branch &&
+          binding.bindingFingerprint === input.bindingFingerprint &&
+          samePath(binding.repositoryRoot, manifest.canonicalRoot) &&
+          samePath(binding.worktreeRoot, manifest.canonicalRoot) &&
+          manifest.baseSha === baseSha
+        ) {
+          return manifest;
+        }
+        throw new WorkspaceManagerErrorV2(
+          "workspace_binding_conflict",
+          "Workspace is already bound to different durable repository state.",
+        );
+      }
+      if (manifest.kind !== "scratch") {
+        throw new WorkspaceManagerErrorV2(
+          "scratch_promotion_kind_invalid",
+          `Only a scratch workspace can be promoted; ${workspaceId} is ${manifest.kind}.`,
+        );
+      }
+      const readback = normalizeBaseReadback(input.readback);
+      const expectedReadbackFingerprint = sha256Json({
+        operationId,
+        workspaceId,
+        worktreeRoot: manifest.canonicalRoot,
+        branch,
+        headSha: baseSha,
+        clean: true,
+        handoffFingerprint: input.handoffFingerprint,
+      });
+      if (
+        !samePath(readback.worktreeRoot, manifest.canonicalRoot) ||
+        readback.branch !== branch ||
+        readback.headSha !== baseSha ||
+        readback.clean !== true ||
+        readback.fingerprint !== expectedReadbackFingerprint
+      ) {
+        throw new WorkspaceManagerErrorV2(
+          "scratch_promotion_readback_mismatch",
+          "Fixed-argv Git readback does not prove a clean exact branch at the initial commit.",
+        );
+      }
+      manifest = parseWorkspaceManifestV2({
+        ...manifest,
+        kind: "repository",
+        repositoryBinding: {
+          profileKey,
+          repositoryRoot: manifest.canonicalRoot,
+          worktreeRoot: manifest.canonicalRoot,
+          branch,
+          bindingFingerprint: input.bindingFingerprint,
+        },
+        baseSha,
+        updatedAt: this.isoNow(),
+        // The initial commit is the new epoch: everything committed is now
+        // baseline, so the per-mission change budget starts over. Hashes stay
+        // as drift guards for the newly baselined bytes.
+        budget: { ...manifest.budget, changedPaths: [], changedBytes: 0 },
+      });
+      await this.persistManifest(manifest);
+      const persisted = await this.loadManifest(workspaceId);
+      if (
+        persisted.kind !== "repository" ||
+        persisted.baseSha !== baseSha ||
+        persisted.ownerRunId !== ownerRunId ||
+        persisted.repositoryBinding?.profileKey !== profileKey ||
+        persisted.repositoryBinding.branch !== branch ||
+        persisted.repositoryBinding.bindingFingerprint !== input.bindingFingerprint ||
+        !samePath(persisted.canonicalRoot, manifest.canonicalRoot)
+      ) {
+        throw new WorkspaceManagerErrorV2(
+          "scratch_promotion_readback_failed",
+          "Promoted repository workspace manifest failed exact readback.",
+        );
+      }
+      return persisted;
+    });
+  }
+
   async status(workspaceId: string): Promise<{
     manifest: WorkspaceManifestV2;
     rootReadable: boolean;

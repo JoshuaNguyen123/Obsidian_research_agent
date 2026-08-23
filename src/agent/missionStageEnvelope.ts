@@ -67,6 +67,8 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
     "linear_create_issue",
     "linear_get_issue",
     "linear_search_issues",
+    "linear_list_workflow_states",
+    "linear_update_issue",
     "append_to_current_file",
     "read_current_file",
   ],

@@ -17,7 +17,7 @@
     "check:path-hygiene": "node scripts/check-path-hygiene.mjs",
     "check:style-tokens": "node scripts/check-style-tokens.mjs",
     "validate:public-site-media": "node scripts/validate-public-demo-media.mjs",
-    "test:ci": "npm run check:path-hygiene && npm run check:style-tokens && npm test && npm run build",
+    "test:ci": "npm run check:path-hygiene && npm run check:style-tokens && npm run check:mission-scorecards && npm test && npm run build",
     "test:public-site:e2e": "playwright test --config=playwright.public-site.config.ts",
     "check:mission-scorecards": "node scripts/mission-scorecard-regression.mjs",
     "scorecards:harvest": "node scripts/harvest-mission-scorecards.mjs",

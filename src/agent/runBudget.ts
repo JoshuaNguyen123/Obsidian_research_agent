@@ -185,18 +185,53 @@ export function estimateLoopBudget({
   return estimated <= 0 ? 0 : Math.min(estimated, cap);
 }
 
-export function resolveConfiguredMaxAgentSteps(
+/**
+ * Whether the user narrowed the step budget for this mission, and to what.
+ *
+ * `maxAgentSteps` is the system-wide hard cap on a run, not a per-mission
+ * budget. Both safety-ceiling presets pin it to `MAX_AGENT_STEPS`
+ * (`safetyCeiling.ts:38,52`), `settingsNormalize` defaults it to the same
+ * number, and `resolveConfiguredMaxAgentSteps` materializes that value when
+ * the setting is missing entirely. At the cap, "the user never touched it" and
+ * "the user chose the maximum" are therefore not merely indistinguishable --
+ * they mean the same thing, because the maximum *is* no narrowing.
+ *
+ * This is the one place that reads that intent, so everything downstream
+ * receives a real `number | null` and never reconstructs it. Feeding the raw
+ * number through instead is what made `compose` (6/4) and `grounded_research`
+ * (16/12) stop constraining anything: every profile resolved to the cap, and a
+ * short composed note was budgeted 100 model calls.
+ *
+ * A value below the cap is a deliberate narrowing and is returned as-is, so it
+ * still binds in either direction exactly as the ceiling math intends.
+ *
+ * Known limitation, recorded rather than hidden: a user who deliberately types
+ * the cap into the settings box is read as "not narrowed". Separating those
+ * would need the settings schema to represent "unset" distinctly from "the
+ * cap", and today `AgentSettings.maxAgentSteps` is a required number defaulted
+ * to the cap -- so that intent was never recorded and cannot be recovered here.
+ */
+export function resolveConfiguredAgentStepSettingV1(
   rawMaxSteps?: number | null,
-): number {
+): number | null {
   if (
     typeof rawMaxSteps !== "number" ||
     !Number.isFinite(rawMaxSteps) ||
     rawMaxSteps <= 0
   ) {
-    return MAX_AGENT_STEPS;
+    return null;
   }
+  const configured = Math.max(1, Math.trunc(rawMaxSteps));
+  return configured >= MAX_AGENT_STEPS ? null : configured;
+}
 
-  return Math.min(MAX_AGENT_STEPS, Math.max(1, Math.trunc(rawMaxSteps)));
+export function resolveConfiguredMaxAgentSteps(
+  rawMaxSteps?: number | null,
+): number {
+  const configured = resolveConfiguredAgentStepSettingV1(rawMaxSteps);
+  return configured === null
+    ? MAX_AGENT_STEPS
+    : Math.min(MAX_AGENT_STEPS, configured);
 }
 
 function estimateUncappedLoopBudget({

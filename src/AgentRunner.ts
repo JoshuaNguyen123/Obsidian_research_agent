@@ -106,6 +106,7 @@ import {
 import {
   estimateLoopBudget,
   getRunBudgetProfile,
+  resolveConfiguredAgentStepSettingV1,
   resolveConfiguredMaxAgentSteps,
 } from "./agent/runBudget";
 import { planReadOnlyFollowups } from "./agent/autoFollowups";
@@ -936,6 +937,7 @@ import { canonicalMissionGraphId } from "./agent/missionGraphIds";
 import { planMissionGraphV3 } from "./agent/missionGraphPlanner";
 import {
   MissionGraphSession,
+  createFileCollisionRepairRefusalCodeV1,
   resolveMissionGraphEvidenceKind,
   type MissionGraphToolExecution,
 } from "./agent/missionGraphSession";
@@ -1928,6 +1930,12 @@ export async function runAgentMission({
       MAX_AGENT_STEPS,
       providedMaxSteps ?? toolContext.settings?.maxAgentSteps ?? MAX_AGENT_STEPS,
     ),
+  );
+  // The loop cap above materializes MAX_AGENT_STEPS for "unset". The effort
+  // decision needs the user's actual choice, where unset must stay null so a
+  // profile default can stand rather than being overwritten by the hard cap.
+  const configuredStepBudgetSetting = resolveConfiguredAgentStepSettingV1(
+    providedMaxSteps ?? toolContext.settings?.maxAgentSteps,
   );
   const preliminaryModelCallCap = configuredStepBudget * 3 + 8;
   const configuredContextTokens = Math.max(
@@ -5475,8 +5483,8 @@ export async function runAgentMission({
         researchContractAttached:
           researchPlan.sourceRequirements.minFetchedSources > 0 ||
           Boolean(researchPlan.effort),
-        configuredMaxModelCalls: configuredStepBudget,
-        configuredMaxToolCalls: configuredStepBudget,
+        configuredMaxModelCalls: configuredStepBudgetSetting,
+        configuredMaxToolCalls: configuredStepBudgetSetting,
         configuredMaxRunMinutes:
           configuredMaxRunMs == null ? null : configuredMaxRunMs / 60_000,
       },
@@ -14682,12 +14690,15 @@ export async function runAgentMission({
           } catch (error) {
             failedToolNames.push(toolCall.name);
             const replanFailureReason = getUnknownErrorMessage(error);
+            const refusalCode =
+              createFileCollisionRepairRefusalCodeV1(error);
             // The trace alone proved insufficient in the field: retention
             // windows dropped it, leaving no way to tell WHICH repair
             // precondition failed. Surface the reason on the durable status
-            // stream too.
+            // stream too, now carrying the exact precondition rather than
+            // prose a later reader has to reverse-engineer.
             events.onStatus?.(
-              `Create-file collision repair unavailable for ${createFileCollisionPath}: ${replanFailureReason}`,
+              `Create-file collision repair unavailable for ${createFileCollisionPath} (${refusalCode}): ${replanFailureReason}`,
             );
             events.onTrace?.({
               id: `${toolEventBase.id}:create-file-collision-replan-failed`,
@@ -14698,9 +14709,43 @@ export async function runAgentMission({
                 "The create-file collision could not be replanned into an exact hash-bound repair.",
               error: {
                 code: "create_file_collision_replan_failed",
-                message: replanFailureReason,
+                message: `${refusalCode}: ${replanFailureReason}`,
+              },
+              outputPreview: {
+                path: createFileCollisionPath,
+                refusalCode,
               },
             });
+            // The instruction below tells the model to stop calling tools, but
+            // the origin node was still `ready`, so the frontier kept demanding
+            // the tool that had just failed. The model complied, two no-tool
+            // turns were counted against an unchanged frontier, and the run
+            // died blaming the model for a host refusal. Block the node so the
+            // frontier and the instruction agree: the mission still fails,
+            // because there is no repair path, but it fails with the refusal
+            // recorded as its blocker instead of as an unexplained stall.
+            try {
+              missionGraph =
+                await missionGraphSession.blockUnrepairableCreateFileCollision(
+                  missionGraphExecution,
+                  createFileCollisionPath,
+                  { code: refusalCode, message: replanFailureReason },
+                );
+              missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
+            } catch (blockError) {
+              events.onTrace?.({
+                id: `${toolEventBase.id}:create-file-collision-replan-failed`,
+                kind: "error",
+                step,
+                toolName: toolCall.name,
+                message:
+                  "The unrepairable create-file collision could not be recorded as a node blocker.",
+                error: {
+                  code: "create_file_collision_replan_failed",
+                  message: getUnknownErrorMessage(blockError),
+                },
+              });
+            }
             // Without the repair nodes, the collision error's own advice
             // ("use code_workspace_write_expected") is unfollowable — the
             // frontier will reject that tool. Tell the model the truth once
@@ -14711,7 +14756,7 @@ export async function runAgentMission({
               messages.push({
                 role: "system" as const,
                 content:
-                  `${createFileCollisionPath} already exists with different content and the host could not open a hash-bound repair path this run. ` +
+                  `${createFileCollisionPath} already exists with different content and the host could not open a hash-bound repair path this run (${refusalCode}). ` +
                   `Do not retry code_workspace_create_file for ${createFileCollisionPath} and do not attempt code_workspace_write_expected — it is not available. ` +
                   "Report the blocker in your final answer instead.",
               });
@@ -24972,6 +25017,7 @@ const TOOL_GOALS: Partial<Record<string, OperationGoal[]>> = {
 
 const CODE_TOOL_NAMES = new Set([
   "code_workspace_create",
+  "code_workspace_init_repository",
   "code_workspace_status",
   "code_workspace_stat",
   "code_workspace_list",
@@ -25132,6 +25178,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   export_workspace_artifact: "code",
   install_code_dependency: "code",
   code_workspace_create: "code",
+  code_workspace_init_repository: "code",
   code_workspace_status: "code",
   code_workspace_stat: "code",
   code_workspace_list: "code",
@@ -27333,6 +27380,14 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
     /\bcommit\b/i.test(prompt) ||
     joinedDeveloperLifecycle
   ) {
+    // A scratch delivery has no repository for the verified commit to bind to,
+    // and until the promotion tool existed there was no production path that
+    // could create one — code_commit_verified simply bailed on the missing
+    // manifest.repositoryBinding after the files were already authored.
+    // Repository missions already carry a binding and must never be promoted.
+    if (!repositoryMutation && !hasRepositoryCodeEditIntent(prompt)) {
+      tools.push("code_workspace_init_repository");
+    }
     tools.push("code_commit_verified");
   }
   return [...new Set(tools)];

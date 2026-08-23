@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_MISSION_SCORECARD_BASELINE_PATH,
   assertMissionScorecardRegressions,
   missionScorecardRecordKey,
 } from "../scripts/mission-scorecard-regression.mjs";
@@ -346,4 +347,52 @@ test("core-native mission proof passes when classification and scorecard are com
     }),
     { checkedRecords: 1, skipped: false },
   );
+});
+
+test("a baseline record harvested before `applicable` existed is rejected", () => {
+  // Such a record asserts a hard 1.0 floor on dimensions that measured nothing
+  // — "0/0 claims cited" scoring a perfect evidence_grounding — which is the
+  // vacuous-perfect bug the field was added to close. It must invalidate the
+  // whole manifest loudly and demand a fresh harvest, not read green forever.
+  const stale = baseline();
+  stale.records[0].scorecard = {
+    ...stale.records[0].scorecard,
+    dimensions: stale.records[0].scorecard.dimensions.map(
+      ({ applicable: _dropped, ...rest }) => rest,
+    ),
+  };
+  assert.throws(
+    () =>
+      assertMissionScorecardRegressions({
+        summary: summary(),
+        baseline: stale,
+        selectedProjects: ["daily-use-note"],
+      }),
+    /invalid dimension/u,
+  );
+});
+
+test("the committed baseline manifest carries `applicable` on every dimension", async () => {
+  // The gate now runs in `npm run test:ci`, where there is no run summary to
+  // compare against. Validating the committed manifest is what that CI run
+  // actually checks, so this pins the file itself rather than only the parser.
+  const { readFile } = await import("node:fs/promises");
+  const manifest = JSON.parse(
+    await readFile(DEFAULT_MISSION_SCORECARD_BASELINE_PATH, "utf8"),
+  ) as {
+    records: Array<{
+      project: string;
+      scorecard: { dimensions: Array<{ applicable?: unknown }> };
+    }>;
+  };
+  assert.ok(manifest.records.length > 0, "the baseline must not be empty");
+  for (const record of manifest.records) {
+    for (const dimension of record.scorecard.dimensions) {
+      assert.equal(
+        typeof dimension.applicable,
+        "boolean",
+        `${record.project} carries a dimension with no applicable flag`,
+      );
+    }
+  }
 });

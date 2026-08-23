@@ -282,13 +282,6 @@ export async function listDurableMissionManifests(
   });
 }
 
-export async function readLatestRecoverableDurableMission(
-  context: ToolExecutionContext,
-  now: Date = context.now?.() ?? new Date(),
-): Promise<RecoverableDurableMission | null> {
-  return (await listRecoverableDurableMissions(context, now))[0] ?? null;
-}
-
 /** Serializes reads and compare-and-swap writes per vault and mission id. */
 export async function withSerializedDurableMissionWrite<T>(
   vault: object,

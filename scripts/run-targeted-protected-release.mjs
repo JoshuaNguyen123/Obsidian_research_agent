@@ -11,7 +11,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { acquireE2eLock } from "./run-e2e-exclusive.mjs";
-import { assertMissionScorecardSummaryFile } from "./mission-scorecard-regression.mjs";
+import {
+  DIMENSION_IDS,
+  assertMissionScorecardSummaryFile,
+} from "./mission-scorecard-regression.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const playwrightCli = path.join(
@@ -738,7 +741,12 @@ function projectPublicMissionScorecard(value) {
     value.version !== 1 ||
     typeof value.acceptancePassed !== "boolean" ||
     !Array.isArray(value.dimensions) ||
-    value.dimensions.length !== 6
+    // Derived from the scorer, not restated. This was pinned at a literal 6
+    // and never moved when the scorecard grew to eight dimensions, so any
+    // protected lane whose summary actually carried a runtime scorecard would
+    // have thrown here and lost its proof. The two fixtures that exercise this
+    // projector both omit missionScorecard, so only the null branch ever ran.
+    value.dimensions.length !== DIMENSION_IDS.length
   ) {
     throw new Error("Daily-use proof contains an invalid mission scorecard.");
   }
@@ -750,6 +758,9 @@ function projectPublicMissionScorecard(value) {
       id: boundedPublicToken(dimension.id, 80),
       score: boundedPublicScore(dimension.score),
       weight: boundedPublicScore(dimension.weight),
+      // Whether a dimension measured anything is part of what the score means:
+      // without it a reader cannot tell a real 1.0 from a vacuous one.
+      applicable: dimension.applicable !== false,
     })),
   };
 }

@@ -9,15 +9,32 @@ const RELOCATION_TOOLS = new Set([
   "code_workspace_trash",
 ]);
 
+export interface SelectCodeWorkspaceEditToolOptionsV1 {
+  /**
+   * Permit a relocation tool as the mission's *seed* edit step.
+   *
+   * Off by default, and deliberately not derived from the allowlist. Move,
+   * copy, and trash all require a file that already exists, while the seed
+   * edit step is by definition the first write into a workspace the mission is
+   * about to create -- so seeding one plants an unsatisfiable node at the head
+   * of the ladder. Relocation is a mid-mission capability the frontier offers
+   * once files exist; it is never the planned first move.
+   */
+  allowRelocationSeed?: boolean;
+}
+
 /**
  * Choose the workspace mutation tool for an implementation prompt.
- * Never returns copy/move/trash unless present in allowlist.
+ * Never returns copy/move/trash unless the caller explicitly opts in and the
+ * tool is allowlisted.
  */
 export function selectCodeWorkspaceEditToolName(
   prompt: string,
   allowlist: ReadonlySet<string>,
+  options: SelectCodeWorkspaceEditToolOptionsV1 = {},
 ): string {
   const text = String(prompt ?? "");
+  const relocationSeed = options.allowRelocationSeed === true;
 
   if (
     isWorkspaceDirectoryCreationRequest(text) &&
@@ -27,6 +44,7 @@ export function selectCodeWorkspaceEditToolName(
   }
 
   if (
+    relocationSeed &&
     /\b(copy|duplicate)\b[\s\S]{0,80}\b(file|folder|directory|path)\b/i.test(text) &&
     allowlist.has("code_workspace_copy")
   ) {
@@ -34,6 +52,7 @@ export function selectCodeWorkspaceEditToolName(
   }
 
   if (
+    relocationSeed &&
     /\b(rename|move)\b[\s\S]{0,80}\b(file|folder|directory|path)\b/i.test(text) &&
     allowlist.has("code_workspace_move")
   ) {
@@ -41,6 +60,7 @@ export function selectCodeWorkspaceEditToolName(
   }
 
   if (
+    relocationSeed &&
     /\b(remove|delete|trash)\b[\s\S]{0,80}\b(file|folder|directory|path)\b/i.test(
       text,
     ) &&

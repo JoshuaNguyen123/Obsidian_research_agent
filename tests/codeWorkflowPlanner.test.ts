@@ -3,11 +3,16 @@ import test from "node:test";
 import { CODE_EXECUTION_TOOL_ALLOW } from "../src/agent/lifecycleStagePolicy";
 import {
   filterCodeWorkflowToolsToAllowlist,
+  isCodeWorkspaceRelocationTool,
   selectCodeWorkspaceEditToolName,
 } from "../src/agent/codeWorkflowPlanner";
 
-test("does not select copy/move/trash for compound allowlist", () => {
+test("does not seed copy/move/trash even when they are allowlisted", () => {
+  // Relocation is allowlisted for mid-mission use, but it must never be the
+  // planned first edit: move/copy/trash all need a file that does not exist
+  // yet when the seed ladder is built.
   const allow = new Set<string>(CODE_EXECUTION_TOOL_ALLOW);
+  assert.ok(allow.has("code_workspace_copy"));
   assert.equal(
     selectCodeWorkspaceEditToolName(
       "copy the file path and then implement hello",
@@ -32,7 +37,11 @@ test("does not select copy/move/trash for compound allowlist", () => {
 });
 
 test("filters relocation tools not on allowlist", () => {
-  const allow = new Set<string>(CODE_EXECUTION_TOOL_ALLOW);
+  const allow = new Set<string>(
+    [...CODE_EXECUTION_TOOL_ALLOW].filter(
+      (name) => !isCodeWorkspaceRelocationTool(name),
+    ),
+  );
   assert.deepEqual(
     filterCodeWorkflowToolsToAllowlist(
       [
@@ -51,13 +60,14 @@ test("filters relocation tools not on allowlist", () => {
   );
 });
 
-test("allows copy when allowlisted", () => {
+test("allows copy when allowlisted and the caller opts in to a relocation seed", () => {
   const withCopy = new Set<string>(CODE_EXECUTION_TOOL_ALLOW);
   withCopy.add("code_workspace_copy");
   assert.equal(
     selectCodeWorkspaceEditToolName(
       "copy the file path into backups",
       withCopy,
+      { allowRelocationSeed: true },
     ),
     "code_workspace_copy",
   );

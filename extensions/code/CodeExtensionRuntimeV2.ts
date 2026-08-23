@@ -56,6 +56,7 @@ import {
   createRepositoryProfileV2,
   defaultRepositoryMergePolicyV2,
   detectRepositoryProfileV2,
+  detectSourceOnlyRepositoryProfileV2,
   migrateRepositoryProfileV1,
   parseRepositoryProfileV2,
   repositoryProfileExecutionBlockersV2,
@@ -72,6 +73,7 @@ import {
   type KnownHostDirectoryV2,
   type RepositoryInspectionV2,
   type RepositoryWorktreeProvisionV2,
+  type ScratchRepositoryPromotionV2,
   type WorkspaceRepositoryProvisionerV2,
 } from "./workspaceTools";
 import {
@@ -622,6 +624,12 @@ export class CodeExtensionRuntimeV2 {
     profileKey: string;
     inspection: RepositoryInspectionV2;
     context: ScopedExtensionContextV1;
+    /**
+     * A repository the agent just created from a scratch workspace usually has
+     * no ecosystem marker at all. Only that path opts into the source-only
+     * fallback; an existing user checkout still fails closed.
+     */
+    allowSourceOnlyFallback?: boolean;
   }): Promise<RepositoryProfileV2> {
     this.assertInitialized();
     if (!input.context.authorizedAction) {
@@ -714,12 +722,28 @@ export class CodeExtensionRuntimeV2 {
       fileContents: inventory.fileContents,
       fileHashes: inventory.fileHashes,
     };
-    const discovered = detectRepositoryProfileV2(detectionInput);
+    const detect = (extra: { runtimeDigests?: Partial<Record<RepositoryEcosystemV2, string>> } = {}) => {
+      try {
+        return detectRepositoryProfileV2({ ...detectionInput, ...extra });
+      } catch (error) {
+        if (!input.allowSourceOnlyFallback) throw error;
+        const sourceOnly = detectSourceOnlyRepositoryProfileV2({
+          ...detectionInput,
+          ...extra,
+        });
+        if (sourceOnly) return sourceOnly;
+        throw new WorkspaceManagerErrorV2(
+          "repository_profile_unsupported_source",
+          "This workspace has no ecosystem marker and no source this host can validate, so no repository profile can be derived for it.",
+        );
+      }
+    };
+    const discovered = detect();
     const runtimeDigests = this.verifiedSandboxRuntimeDigests(
       discovered.ecosystems,
     );
     const profile = Object.keys(runtimeDigests).length > 0
-      ? detectRepositoryProfileV2({ ...detectionInput, runtimeDigests })
+      ? detect({ runtimeDigests })
       : discovered;
     const record: CodeRepositoryProfileRecordV2 = {
       version: 2,
@@ -2595,6 +2619,60 @@ export class ProfileAwareRepositoryProvisionerV2
       );
     }
     return provisioned;
+  }
+
+  /**
+   * Promotion runs Git first and detects the profile from the committed tree.
+   * The reverse order is impossible: there is no repository to detect an
+   * ecosystem, default branch, or protected controls from until the initial
+   * commit exists.
+   */
+  async initializeScratchRepository(input: {
+    workspaceId: string;
+    profileKey: string;
+    canonicalRoot: string;
+    branch: string;
+    commitMessage: string;
+    trackedPaths: readonly string[];
+    context: ScopedExtensionContextV1;
+  }): Promise<ScratchRepositoryPromotionV2> {
+    if (!this.delegate.initializeScratchRepository) {
+      throw new WorkspaceManagerErrorV2(
+        "scratch_promotion_unavailable",
+        "This host cannot initialize a repository inside a scratch workspace.",
+      );
+    }
+    const existing = await this.runtime.getRepositoryProfile(input.profileKey);
+    if (existing && !samePath(existing.repositoryRoot, input.canonicalRoot)) {
+      throw new WorkspaceManagerErrorV2(
+        "repository_profile_binding_conflict",
+        `Repository profile ${input.profileKey} is already bound to another canonical root.`,
+      );
+    }
+    const promoted = await this.delegate.initializeScratchRepository(input);
+    const profile = await this.runtime.persistDetectedRepositoryProfile({
+      allowSourceOnlyFallback: true,
+      profileKey: promoted.profileKey,
+      inspection: {
+        repositoryRoot: promoted.repositoryRoot,
+        baseSha: promoted.baseSha,
+        // The publication base, not the agent branch, so a later pull request
+        // has a target that is not the branch it is opened from.
+        branch: promoted.defaultBranch,
+        clean: promoted.clean,
+      },
+      context: input.context,
+    });
+    if (
+      profile.key !== promoted.profileKey ||
+      !samePath(profile.repositoryRoot, promoted.repositoryRoot)
+    ) {
+      throw new WorkspaceManagerErrorV2(
+        "repository_profile_binding_drift",
+        "The promoted repository escaped its detected repository profile.",
+      );
+    }
+    return promoted;
   }
 }
 

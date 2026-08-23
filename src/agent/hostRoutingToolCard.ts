@@ -39,6 +39,8 @@ export const COMPOUND_TOOL_PURPOSE: Readonly<Record<string, string>> = {
   code_repair_record_cycle:
     "record fast-validation proof; open repair only when red",
   code_repair_status: "repair cycle status",
+  code_workspace_init_repository:
+    "turn a scratch workspace into a real repository so a verified commit can bind",
   code_commit_verified: "host git add + verified commit + handoff SHA",
   linear_create_issue: "create Linear issue with provider readback",
   linear_get_issue: "read verified Linear issue",

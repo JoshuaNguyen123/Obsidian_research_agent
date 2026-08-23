@@ -7,6 +7,7 @@ import type { MissionIntent } from "../tools/types";
 import {
   buildRouteBudgetProfile,
   estimateLoopBudget,
+  resolveConfiguredAgentStepSettingV1,
   resolveConfiguredMaxAgentSteps,
   type RouteBudgetProfile,
 } from "./runBudget";
@@ -36,7 +37,10 @@ import { detectLinearIntent } from "./linearIntent";
 import {
   detectProjectLifecycleStagesV1,
 } from "./projectLifecycle";
-import { missionRequiresExtendedEffortBudgetV1 } from "./missionEffortEscalation";
+import {
+  missionCommittedWorkV1,
+  missionRequiresExtendedEffortBudgetV1,
+} from "./missionEffortEscalation";
 import {
   classifyMissionSpeechAct,
   type ExecutionTier,
@@ -138,6 +142,14 @@ export function createRunPlan({
     speechAct.executionTier !== "direct_chat";
   const requiresEnglishGuard = isLikelyEnglishPrompt(prompt);
   const configuredMaxSteps = resolveConfiguredMaxAgentSteps(settings?.maxAgentSteps);
+  // The loop cap and the per-mission budget are different questions, and
+  // `resolveConfiguredMaxAgentSteps` answers only the first: it materializes
+  // the hard cap for "unset". The effort decision needs the second, where
+  // "unset" must stay null so a profile default can stand.
+  const configuredStepBudget = resolveConfiguredAgentStepSettingV1(
+    settings?.maxAgentSteps,
+  );
+  const committedWork = missionCommittedWorkV1(prompt);
   const explicitModelStepTarget = parseExplicitModelStepTarget(prompt);
   const allowReflexReadRouting =
     !missionIntent.explicitMutation && !missionIntent.explicitDelete;
@@ -200,9 +212,11 @@ export function createRunPlan({
       route,
       outputTarget:
         outputTarget ?? (missionIntent.noteOutput ? "new_note" : "chat"),
-      configuredMaxModelCalls: configuredMaxSteps,
-      configuredMaxToolCalls: configuredMaxSteps,
+      configuredMaxModelCalls: configuredStepBudget,
+      configuredMaxToolCalls: configuredStepBudget,
       configuredMaxRunMinutes: settings?.maxRunMinutes,
+      committedToolCalls: committedWork.toolCalls,
+      committedWorkReasons: committedWork.reasons,
       forceExtendedTeam: missionRequiresExtendedEffortBudgetV1(prompt),
     });
     return {
