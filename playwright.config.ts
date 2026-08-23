@@ -74,9 +74,11 @@ export default defineConfig({
       },
     },
     {
-      // Native UI security proof; no model or external service is required.
+      // Native UI proofs that need no model and no external service: the
+      // renderer security probe, and the daily quick-action surface (command
+      // palette + both context menus + blocked-run evidence).
       name: "safe-assistant-renderer",
-      testMatch: /safe-assistant-renderer\.spec\.ts/u,
+      testMatch: /(?:safe-assistant-renderer|daily-quick-actions)\.spec\.ts/u,
       retries: 0,
       timeout: 240_000,
       expect: { timeout: 30_000 },
