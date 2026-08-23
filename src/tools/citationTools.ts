@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 
 import type { HttpRequest } from "../model/types";
 import type { AgentTool, ToolExecutionContext } from "./types";
-import { normalizeForMatch } from "../agent/quoteMatch";
+import {
+  findPinpointLocator,
+  findQuoteRawOffset,
+  normalizeForMatch,
+} from "../agent/quoteMatch";
 import { collapseWhitespace, stripJats, xmlText } from "./atomText";
 import { readSourceSection } from "./sourceCache";
 import {
@@ -157,6 +161,15 @@ const verifyCitationTool: AgentTool = {
           ? first
           : await readSourceSection(context, { url, path }, section);
       if (normalizeForMatch(cached.content).includes(needle)) {
+        // A section index into our own cached copy is useless to a reader
+        // holding a different edition. Where the source carries a real
+        // pinpoint — chapter:verse, a statute section, a paragraph, a PDF page
+        // — report that instead, because in primary-text disciplines the
+        // pinpoint is the citation.
+        const pinpoint = findPinpointLocator(
+          cached.content,
+          findQuoteRawOffset(quote, cached.content),
+        );
         return {
           status: "supported",
           section,
@@ -164,6 +177,9 @@ const verifyCitationTool: AgentTool = {
           sourcePath: cached.vaultPath,
           sourceUrl: cached.url,
           contentHash: sha256(cached.content),
+          ...(pinpoint
+            ? { pinpoint: { label: pinpoint.label, kind: pinpoint.kind } }
+            : {}),
         };
       }
     }
