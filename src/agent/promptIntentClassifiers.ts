@@ -67,7 +67,41 @@ export function hasPriorAssistantResponseWritebackIntent(prompt: string): boolea
 export function hasVaultContextQuestionIntent(prompt: string): boolean {
   return /\b(what\s+(did|do)\s+you\s+(learn|know|remember)\s+about\s+me|what\s+have\s+i\s+told\s+you|what\s+do\s+my\s+notes\s+say|based\s+on\s+my\s+notes|in\s+my\s+notes|across\s+my\s+notes|search\s+(my\s+)?notes|find\s+(notes?|details?|mentions?|references?)|where\s+did\s+i\s+mention|summari[sz]e\s+what\s+i\s+(know|have|wrote)|look\s+through\s+(my\s+)?vault|check\s+(my\s+)?folders?)\b/i.test(
     prompt,
-  ) || hasFolderContentQuestionIntent(prompt) || hasGraphConnectionIntent(prompt);
+  ) ||
+    hasOwnPriorThinkingRecallIntent(prompt) ||
+    hasFolderContentQuestionIntent(prompt) ||
+    hasGraphConnectionIntent(prompt);
+}
+
+/**
+ * The user asking what *they* previously concluded, decided, or wrote.
+ *
+ * "What did I conclude about onboarding?" is the single most ordinary thing to
+ * ask a note-taking assistant, and it named neither "notes" nor "vault", so it
+ * matched nothing above: the mission drew `single_model_answer` with an empty
+ * tool list and the model answered a question about the user's own vault
+ * entirely from its own memory. Nothing could search, so nothing could be
+ * grounded, and the vault body-read debt had nothing to levy against.
+ *
+ * Deliberately narrow — a first-person subject plus a recall verb about the
+ * user's own recorded thinking. "What should I do about onboarding?" is advice
+ * and stays a chat answer.
+ */
+export function hasOwnPriorThinkingRecallIntent(prompt: string): boolean {
+  return (
+    /\bwhat\s+(?:did|have|had)\s+i\s+(?:ever\s+|already\s+|previously\s+)?(?:conclude|decide|determine|discover|find|learn|note|observe|record|say|state|write|argue|settle\s+on)\b/i.test(
+      prompt,
+    ) ||
+    /\bwhat\s+(?:are|were)\s+my\s+(?:prior\s+|previous\s+|earlier\s+|existing\s+)?(?:thoughts?|conclusions?|findings?|takeaways?|notes?|views?|reasons?|arguments?|decisions?)\b/i.test(
+      prompt,
+    ) ||
+    /\bmy\s+(?:prior\s+|previous\s+|earlier\s+)?(?:conclusions?|findings?|takeaways?|decisions?|reasoning)\s+(?:on|about|regarding)\b/i.test(
+      prompt,
+    ) ||
+    /\b(?:remind\s+me|recap)\b[\s\S]{0,40}\bwhat\s+i\s+(?:concluded|decided|found|learned|wrote|said)\b/i.test(
+      prompt,
+    )
+  );
 }
 
 export function hasExplicitWritePersistenceIntent(prompt: string): boolean {

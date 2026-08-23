@@ -37,6 +37,11 @@ import {
   detectProjectLifecycleStagesV1,
 } from "./projectLifecycle";
 import { missionRequiresExtendedEffortBudgetV1 } from "./missionEffortEscalation";
+// One definition, two consumers. The router below and the tool selector in
+// AgentRunner both have to agree that a first-person recall question is a vault
+// question; when they disagreed, the mission was routed as chat with no vault
+// tools at all, so nothing could search and nothing could be grounded.
+import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
 import {
   classifyMissionSpeechAct,
   type ExecutionTier,
@@ -703,7 +708,10 @@ function hasTopicSearchVaultQuestionIntent(prompt: string): boolean {
 function hasVaultContextQuestionIntent(prompt: string): boolean {
   return /\b(what\s+(did|do)\s+you\s+(learn|know|remember)\s+about\s+me|what\s+have\s+i\s+told\s+you|what\s+do\s+my\s+notes\s+say|based\s+on\s+my\s+notes|in\s+my\s+notes|across\s+my\s+notes|search\s+(my\s+)?notes|find\s+(notes?|details?|mentions?|references?)|where\s+did\s+i\s+mention|summari[sz]e\s+what\s+i\s+(know|have|wrote)|look\s+through\s+(my\s+)?vault|check\s+(my\s+)?folders?)\b/i.test(
     prompt,
-  ) || hasFolderContentQuestionIntent(prompt) || hasGraphConnectionIntent(prompt);
+  ) ||
+    hasOwnPriorThinkingRecallIntent(prompt) ||
+    hasFolderContentQuestionIntent(prompt) ||
+    hasGraphConnectionIntent(prompt);
 }
 
 function hasWordCountIntent(prompt: string): boolean {
