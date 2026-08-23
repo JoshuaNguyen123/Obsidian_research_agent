@@ -59,6 +59,53 @@ const MULTI_PART_SUFFIXES = new Set([
   "co.kr", "ac.kr", "go.kr",
 ]);
 
+/**
+ * Hosts whose pages are primary legal text — a judicial opinion, a statute, a
+ * regulation — rather than commentary about one.
+ *
+ * Without this a court opinion scored as a generic `.gov` page, which is the
+ * same score a press release gets. In law the primary text *is* the evidence,
+ * so misclassifying it costs the ranking its whole point.
+ */
+const LEGAL_PRIMARY_HOSTS = [
+  "courtlistener.com",
+  "supremecourt.gov",
+  "uscourts.gov",
+  "law.cornell.edu",
+  "govinfo.gov",
+  "ecfr.gov",
+  "federalregister.gov",
+  "legislation.gov.uk",
+  "bailii.org",
+  "canlii.org",
+  "curia.europa.eu",
+  "eur-lex.europa.eu",
+];
+
+/**
+ * Hosts that serve primary texts rather than commentary on them.
+ *
+ * In theology, classics and history the text itself is the evidence, and these
+ * were all scoring as generic `web` — below a blog post about the same work.
+ * All of them serve plain, stable, addressable HTML, which is also what makes
+ * a chapter:verse or section pinpoint resolvable.
+ */
+const PRIMARY_TEXT_HOSTS = [
+  "ccel.org",
+  "perseus.tufts.edu",
+  "scaife.perseus.org",
+  "newadvent.org",
+  "sacred-texts.com",
+  "biblegateway.com",
+  "biblehub.com",
+  "gutenberg.org",
+  "wikisource.org",
+  "thelatinlibrary.com",
+  "documentacatholicaomnia.eu",
+  "vatican.va",
+  "earlychristianwritings.com",
+];
+
 /** Hosts that reliably serve parseable open-access HTML. */
 const OPEN_ACCESS_HOSTS = [
   "arxiv.org",
@@ -145,6 +192,17 @@ export function inferSourceType(
 ): ResearchSourceType {
   const url = (urlValue ?? "").toLowerCase();
   const lower = `${urlValue} ${title}`.toLowerCase();
+  // A legal primary host outranks the extension check: a slip opinion served
+  // as a PDF is still the opinion, and calling it a generic `pdf` throws away
+  // the only fact about it that matters.
+  const primaryHost = hostOf(urlValue);
+  if (
+    primaryHost &&
+    (LEGAL_PRIMARY_HOSTS.some((known) => hostMatches(primaryHost, known)) ||
+      PRIMARY_TEXT_HOSTS.some((known) => hostMatches(primaryHost, known)))
+  ) {
+    return "primary";
+  }
   if (/\.pdf(?:$|[?#])/.test(url)) return "pdf";
   if (/\.(docx?|pptx?|xlsx?|epub)(?:$|[?#])/.test(url)) return "document";
   if (/arxiv\.org|doi\.org|\b(journal|study|paper|research)\b/.test(lower)) return "paper";
@@ -189,6 +247,8 @@ export function inferQuality(input: {
     score += 0.05;
   }
 
+  score += inferCourtAuthority(input.url, input.title ?? "");
+
   // Snippet length is the cheapest available signal for whether a page will
   // yield extractable passages; an empty snippet often means a JS shell.
   const snippet = (input.snippet ?? "").trim();
@@ -196,6 +256,58 @@ export function inferQuality(input: {
   else if (snippet.length > 0 && snippet.length < 40) score -= 0.05;
 
   return clamp01(score);
+}
+
+/**
+ * Court-hierarchy weight for a legal source, as a quality adjustment.
+ *
+ * In case law "which court said it" is the authority, and the existing host
+ * lists were STEM-only: a Supreme Court opinion and an unpublished district
+ * order both scored as a generic `.gov` page. Precedential weight runs
+ * SCOTUS > circuit > district, and an explicitly unpublished or
+ * non-precedential disposition is worth less than a published one from the
+ * same court.
+ *
+ * Returns 0 for anything that is not identifiably a court source, so nothing
+ * outside law is disturbed.
+ */
+export function inferCourtAuthority(urlValue: string, title = ""): number {
+  const host = hostOf(urlValue) ?? "";
+  const text = `${urlValue} ${title}`.toLowerCase();
+  const isLegal =
+    LEGAL_PRIMARY_HOSTS.some((known) => hostMatches(host, known)) ||
+    /\b(court|opinion|v\.|appellee|appellant|cert(?:iorari)?)\b/u.test(text);
+  if (!isLegal) return 0;
+
+  let bonus = 0;
+  if (
+    hostMatches(host, "supremecourt.gov") ||
+    /\bsupreme\s+court\b/u.test(text) ||
+    /\bscotus\b/u.test(text) ||
+    /\bs\.\s?ct\.\b/u.test(text)
+  ) {
+    bonus = 0.12;
+  } else if (
+    /\bca\d{1,2}\.uscourts\.gov\b/u.test(host) ||
+    /\bcourt\s+of\s+appeals?\b/u.test(text) ||
+    /\b(?:\d{1,2}(?:st|nd|rd|th)|d\.c\.|federal)\s+cir(?:cuit)?\b/u.test(text) ||
+    /\bf\.\s?\d?d\b/u.test(text)
+  ) {
+    bonus = 0.07;
+  } else if (
+    /\b[a-z]{1,3}d\.uscourts\.gov\b/u.test(host) ||
+    /\bdistrict\s+court\b/u.test(text) ||
+    /\bf\.\s?supp\b/u.test(text)
+  ) {
+    bonus = 0.03;
+  }
+
+  // An unpublished or non-precedential disposition binds nobody. It is still a
+  // source, so this reduces rather than disqualifies.
+  if (/\b(unpublished|non[-\s]?precedential|not\s+for\s+publication)\b/u.test(text)) {
+    bonus -= 0.06;
+  }
+  return bonus;
 }
 
 /**
@@ -247,6 +359,20 @@ export function inferFetchability(urlValue: string): number {
     // doi.org is a redirector: it resolves reliably but often lands on a
     // publisher page we cannot read, so it sits between the two.
     if (hostMatches(host, "doi.org")) return 0.6;
+    // Legal primary hosts serve opinions and statutes as plain HTML, which is
+    // the one thing the parser handles best.
+    if (
+      hostMatches(host, "courtlistener.com") ||
+      hostMatches(host, "law.cornell.edu") ||
+      hostMatches(host, "clinicaltrials.gov") ||
+      hostMatches(host, "ecfr.gov") ||
+      hostMatches(host, "federalregister.gov") ||
+      // Primary-text archives serve plain, stable HTML, which is both the
+      // easiest thing to parse and what makes a pinpoint resolvable.
+      PRIMARY_TEXT_HOSTS.some((known) => hostMatches(host, known))
+    ) {
+      return 0.9;
+    }
     const suffix = host.split(".").pop() ?? "";
     if (suffix === "gov" || suffix === "mil") return 0.85;
   }
