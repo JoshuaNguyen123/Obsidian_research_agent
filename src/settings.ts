@@ -2565,6 +2565,28 @@ export class AgentSettingTab extends PluginSettingTab {
             });
         });
 
+      // Documented as an opt-out ("Returns null when the user has opted out",
+      // resolveLinearDefaultAssigneeIdV1) with nothing to opt out with. Shown
+      // only once discovery knows who the viewer is, so the label can name
+      // them instead of describing an abstraction.
+      new Setting(section)
+        .setName("Assign published issues to me")
+        .setDesc(
+          `Issues the agent files are assigned to the connected Linear user (${
+            linearSnapshot.viewer.name ?? linearSnapshot.viewer.id
+          }). Turn this off to leave them unassigned.`,
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(
+              this.plugin.settings.linearAssignPublishedIssuesToViewer !== false,
+            )
+            .onChange(async (value) => {
+              this.plugin.settings.linearAssignPublishedIssuesToViewer = value;
+              await this.plugin.saveSettings();
+            }),
+        );
+
       const selectedTeamId = this.plugin.settings.linearDefaultTeamId ?? "";
       const projects = linearSnapshot.projects.filter(
         (project) =>
