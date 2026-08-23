@@ -19,6 +19,23 @@ import type {
 } from "./types";
 
 const DEFAULT_GRANT_TTL_MS = 5 * 60_000;
+
+/**
+ * Whether a descriptor accepts authority manufactured from the mission prompt
+ * and the autonomy profile alone — no human gesture behind it.
+ *
+ * This is the single predicate behind every prompt-issued grant in the product:
+ * `createOneShotGrant` refuses the mint, the policy engine refuses the
+ * write-autonomy shortcut that would ask for it, and the runner's set-loose
+ * bridge declines to try. They must answer identically; a descriptor that says
+ * no here has to reach its declared approval fallback instead, and previously
+ * each site decided this for itself, so a run could die in the gap.
+ */
+export function descriptorAllowsPromptIssuedGrantV1(
+  descriptor: ToolDescriptor,
+): boolean {
+  return descriptor.approval.allowPromptGrant === true;
+}
 const READ_ACTIONS = new Set(["read", "list", "search"]);
 const EXTERNAL_MUTATION_SYSTEMS = new Set(["linear", "github", "browser"]);
 
@@ -31,8 +48,14 @@ export async function createOneShotGrant({
   expiresAt,
 }: OneShotGrantInput): Promise<AuthorityGrantV1> {
   assertDescriptorMatchesAction(descriptor, action);
-  if (!descriptor.approval.allowPromptGrant) {
-    throw new TypeError("This tool descriptor does not permit one-shot approval grants.");
+  // `allowPromptGrant: false` withholds authority that the prompt alone would
+  // manufacture. A one-shot grant minted from a real approval gesture is not
+  // that, and refusing it stranded every such descriptor: `fallback: "exact"`
+  // asks for precisely this grant once the user has approved.
+  if (issuer === "user_prompt" && !descriptorAllowsPromptIssuedGrantV1(descriptor)) {
+    throw new TypeError(
+      "This tool descriptor does not permit prompt-issued one-shot grants.",
+    );
   }
   if (!(await verifyPreparedActionFingerprint(action))) {
     throw new TypeError("Cannot grant authority to a tampered prepared action.");

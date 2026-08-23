@@ -16,6 +16,7 @@ import type {
   ToolPrincipal,
 } from "./actions";
 import type { AuthorityGrantV1 } from "./authority";
+import { descriptorAllowsPromptIssuedGrantV1 } from "./authority/grants";
 import {
   hasCodeDeliverableIntent,
   hasExplicitCodeExecutionProhibition,
@@ -85,6 +86,47 @@ const RESEARCH_SETUP_MUTATION_TOOLS = new Set([
 const EXTERNAL_WRITE_AUTONOMY_SYSTEMS = new Set<
   ToolDescriptor["capability"]["system"]
 >(["github", "linear", "browser"]);
+
+/**
+ * A grant carries prompt-derived authority when nothing but the mission prompt
+ * and the autonomy profile stood behind it. `allowPromptGrant: false` forbids
+ * exactly that; it does not forbid a one-shot grant minted from a real approval
+ * gesture, which is what `fallback: "exact"` asks for.
+ */
+export function isPromptDerivedAuthorityGrantV1(
+  grant: Pick<AuthorityGrantV1, "kind" | "issuer">,
+): boolean {
+  if (grant.kind === "prompt_bound") return true;
+  return grant.kind === "one_shot" && grant.issuer === "user_prompt";
+}
+
+/**
+ * The single predicate behind the write-autonomy bridge. `policyEngine` uses it
+ * to decide whether a scoped reversible mutation may proceed without an
+ * approval gesture, and `AgentRunner` uses the same function to decide whether
+ * it may mint the prompt-issued one-shot grant that decision implies. Both
+ * subsystems must answer identically or a run dies in the gap between them.
+ *
+ * `allowPromptGrant` is load-bearing here: a descriptor that declares it false
+ * has opted out of prompt-derived authority entirely, so it must fall through
+ * to the exact approval its `fallback` names.
+ */
+export function descriptorAllowsWriteAutonomyPromptGrantV1(
+  descriptor: ToolDescriptor,
+): boolean {
+  return (
+    !EXTERNAL_WRITE_AUTONOMY_SYSTEMS.has(descriptor.capability.system) &&
+    descriptor.effect === "reversible_mutation" &&
+    descriptor.risk !== "high" &&
+    descriptor.risk !== "critical" &&
+    (descriptor.capability.action === "replace" ||
+      descriptor.capability.action === "append" ||
+      descriptor.capability.action === "update" ||
+      descriptor.capability.action === "create") &&
+    descriptor.approval.fallback === "exact" &&
+    descriptorAllowsPromptIssuedGrantV1(descriptor)
+  );
+}
 
 export function evaluateToolPolicy(ctx: ToolPolicyContext): PolicyDecision {
   if (Object.prototype.hasOwnProperty.call(ctx, "descriptor")) {
@@ -271,7 +313,7 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
       ]);
     }
     if (
-      (grant.kind === "one_shot" || grant.kind === "prompt_bound") &&
+      isPromptDerivedAuthorityGrantV1(grant) &&
       !descriptor.approval.allowPromptGrant
     ) {
       return block("This tool does not permit prompt-bound grants.", [
@@ -301,15 +343,7 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
   if (
     action &&
     ctx.writeAutonomy &&
-    !EXTERNAL_WRITE_AUTONOMY_SYSTEMS.has(descriptor.capability.system) &&
-    descriptor.effect === "reversible_mutation" &&
-    descriptor.risk !== "high" &&
-    descriptor.risk !== "critical" &&
-    (descriptor.capability.action === "replace" ||
-      descriptor.capability.action === "append" ||
-      descriptor.capability.action === "update" ||
-      descriptor.capability.action === "create") &&
-    descriptor.approval.fallback === "exact"
+    descriptorAllowsWriteAutonomyPromptGrantV1(descriptor)
   ) {
     return allow(
       "Scoped reversible mutation proceeds under write autonomy with a fingerprint-bound prepared action.",
@@ -327,11 +361,13 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
     descriptorConfirmations,
     action?.requiredConfirmations ?? 0,
   ) as 0 | 1 | 2;
-  if (
-    action &&
-    descriptor.approval.allowPromptGrant &&
-    requiredConfirmations > 0
-  ) {
+  // `allowPromptGrant` deliberately does NOT gate this path. It governs whether
+  // authority may be derived from the prompt alone; an exact approval is the
+  // opposite of that — a human gesture. Gating the approval card on it left
+  // every `allowPromptGrant: false` + `fallback: "exact"` descriptor with no
+  // reachable authority path at all, so the descriptor's own stated fallback
+  // could never be honoured.
+  if (action && requiredConfirmations > 0) {
     const approvalCount: 1 | 2 = requiredConfirmations === 2 ? 2 : 1;
     return {
       action: "require_approval",

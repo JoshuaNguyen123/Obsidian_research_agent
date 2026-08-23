@@ -140,6 +140,11 @@ const BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS = Object.freeze([
   "finalize_github_link_in_linear",
   "finalize_linear_issue_completion",
   "append_to_current_file",
+  // The reflection descriptor declines prompt-derived authority and names an
+  // exact fallback, so the notebook append surfaces its own approval card. The
+  // journey already asserts it reaches preparedAuthorizedTools; omitting it
+  // here made the harness refuse the very approval the assertion requires.
+  "append_jupyter_reflection",
 ] as const);
 
 const TRUSTED_REPOSITORY_WRITE_PATHS = [
