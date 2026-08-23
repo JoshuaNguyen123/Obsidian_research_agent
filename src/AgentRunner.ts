@@ -20,6 +20,11 @@ import {
   runSpecialistRecoveryVerifier,
   summarizeTranscriptForWatchdog,
 } from "./orchestrator/watchdogWorker";
+import {
+  CRITIC_MAX_STEPS,
+  CRITIC_MAX_TOOL_CALLS,
+  runCriticWorker,
+} from "./orchestrator/criticWorker";
 import { appendToolTranscript } from "./model/toolTranscript";
 import { serializeToolResultForModel } from "./model/toolResultPayload";
 import {
@@ -8013,6 +8018,115 @@ export async function runAgentMission({
       });
     }
   };
+  let singleAgentCriticReviewed = false;
+  /**
+   * Bounded, advisory self-critique for a mission that never touches the
+   * orchestrator.
+   *
+   * The independent critic existed but was unreachable here: its only call site
+   * required an active Lead *and* Specialist, a second model client, and an
+   * unspent Specialist step, so an ordinary research mission got no
+   * self-critique at all. This makes one bounded pass reachable on the plain
+   * path while keeping every invariant the orchestrator version holds:
+   *
+   *  - Advisory only. `acceptance` is already computed and is not touched here;
+   *    `missionAcceptance` remains the sole gate on terminal success, and the
+   *    check is deliberately not folded into `lastVerificationChecks` so it
+   *    cannot move the mission scorecard either.
+   *  - The read-only registry is enforced at execution by `runCriticWorker`.
+   *  - At most once per run, and only inside the run's own leftover model-step
+   *    headroom, so reviewing a mission can never starve it.
+   *  - Only for a mission that actually retrieved something. Critiquing a
+   *    chat answer with no evidence tells the reader nothing.
+   */
+  const runSingleAgentCriticReview = async (
+    acceptance: MissionAcceptanceResult,
+    stopReason: AgentRunStopReason,
+    step: number,
+    maxSteps: number,
+  ): Promise<void> => {
+    if (
+      singleAgentCriticReviewed ||
+      // Explicitly enabled, not merely "not disabled": a host that supplies no
+      // settings at all has not opted into spending an extra model call.
+      runToolContext.settings?.agenticReflexEnabled !== true ||
+      orchestratorContext !== undefined ||
+      (stopReason !== "final" && stopReason !== "write_completed") ||
+      acceptance.status !== "pass" ||
+      !lastFinalOutput.trim() ||
+      abortSignal?.aborted
+    ) {
+      return;
+    }
+    // Retrieval, not merely "the run touched a note". Reading the current note
+    // is what almost every mission does; reviewing an answer against that is
+    // not a source check. A fetched web source, or a vault search whose hits
+    // were opened, is.
+    const retrieved =
+      missionEvidenceRecords.some((record) => record.kind === "web_source") ||
+      (vaultSearchSurfacedPaths.length > 0 && vaultNoteBodyReadPaths.length > 0);
+    if (!retrieved) {
+      return;
+    }
+    const criticSteps = Math.min(
+      CRITIC_MAX_STEPS,
+      Math.max(0, maxSteps - step),
+    );
+    if (criticSteps <= 0) {
+      return;
+    }
+    singleAgentCriticReviewed = true;
+    try {
+      events.onStatus?.("Reviewing the finished answer against its sources...");
+      const criticResult = await runCriticWorker({
+        runId,
+        objective: activeIntentPrompt,
+        finalOutput: lastFinalOutput,
+        evidence: missionEvidenceRecords,
+        receiptIds: writeReceipts
+          .map((receipt) => receipt.id)
+          .filter((id): id is string => typeof id === "string"),
+        modelClient,
+        toolRegistry,
+        toolContext: runToolContext,
+        abortSignal,
+        maxSteps: criticSteps,
+        maxToolCalls: CRITIC_MAX_TOOL_CALLS,
+        now: () => runToolContext.now?.() ?? new Date(),
+      });
+      events.onTrace?.({
+        id: `single-agent-critic-${step}`,
+        kind: "verification",
+        step,
+        message: `critic (advisory): ${criticResult.status} — ${criticResult.check.message}`,
+        outputPreview: {
+          status: criticResult.status,
+          missing: criticResult.check.missing,
+          modelSteps: criticResult.modelSteps,
+          toolCalls: criticResult.toolCalls,
+          advisory: true,
+        },
+      });
+      if (
+        criticResult.status === "needs_more_work" &&
+        criticResult.check.missing.length > 0
+      ) {
+        events.onStatus?.(
+          `Self-review flagged ${criticResult.check.missing.length} gap(s) for you to check: ${criticResult.check.missing
+            .slice(0, 3)
+            .join("; ")}`,
+        );
+      }
+    } catch (error) {
+      // Review failure is never a mission failure.
+      events.onTrace?.({
+        id: `single-agent-critic-error-${step}`,
+        kind: "status",
+        step,
+        message: `Self-review skipped: ${getErrorMessage(error)}`,
+      });
+    }
+  };
   const finishRun = async (
     stopReason: AgentRunStopReason,
     step: number,
@@ -8205,6 +8319,7 @@ export async function runAgentMission({
         }
       }
     }
+    await runSingleAgentCriticReview(acceptance, stopReason, step, maxSteps);
     // Completion reflection is a required terminal mutation for a requested
     // compound workflow. Perform and verify it before accepting or persisting
     // a terminal mission state, so a failed append can never leave a durable

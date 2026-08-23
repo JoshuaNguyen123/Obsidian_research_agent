@@ -41,8 +41,13 @@ export const CRITIC_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "verify_citation",
 ]);
 
-const CRITIC_MAX_STEPS = 8;
-const CRITIC_MAX_TOOL_CALLS = 8;
+/**
+ * The critic's own ceiling. Exported so call sites spend the module's declared
+ * budget instead of quietly passing 1 step / 0 tool calls, which left the only
+ * model-driven self-critique in the system unable to open a source it reviewed.
+ */
+export const CRITIC_MAX_STEPS = 8;
+export const CRITIC_MAX_TOOL_CALLS = 8;
 const MAX_SEED_EVIDENCE = 24;
 const MAX_FINAL_OUTPUT_CHARS = 12_000;
 const MAX_MISSING = 12;

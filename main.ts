@@ -324,7 +324,11 @@ import {
 } from "./src/orchestrator/specialistHandoff";
 import { resolveAdaptiveTeamDispatchV2 } from "./src/agent/researchTeamDispatch";
 import { runExtensionVerifiers } from "./src/agent/extensionVerifiers";
-import { runCriticWorker } from "./src/orchestrator/criticWorker";
+import {
+  CRITIC_MAX_STEPS,
+  CRITIC_MAX_TOOL_CALLS,
+  runCriticWorker,
+} from "./src/orchestrator/criticWorker";
 import type { VerificationCheck } from "./src/agent/verifiers";
 import { runResearchWorker } from "./src/orchestrator/researchWorker";
 import { mergeResearchWorkerResult } from "./src/orchestrator/teamEvidenceMerge";
@@ -9829,8 +9833,16 @@ export default class AgenticResearcherPlugin extends Plugin {
             toolRegistry: teamReadOnlyRegistry,
             toolContext: this.createToolExecutionContext(input.prompt),
             abortSignal: rootDeadline.signal,
-            maxSteps: 1,
-            maxToolCalls: 0,
+            // The module declares 8/8 and carries a read-only registry holding
+            // exactly the tools needed to check a claim against its source. At
+            // 1 step / 0 tool calls the critic was one turn over the final text
+            // and structurally unable to open a single artifact it reviewed.
+            //
+            // Bounded by what the Specialist has actually left rather than by a
+            // fresh allowance, so raising the ceiling cannot starve the mission
+            // being reviewed and `consumeOrThrow` below can always settle.
+            maxSteps: Math.min(CRITIC_MAX_STEPS, specialistReviewStepsRemaining),
+            maxToolCalls: CRITIC_MAX_TOOL_CALLS,
             onModelCallEvidence: (event) => {
               input.events.onModelCallEvidence?.(event);
             },
