@@ -109,6 +109,16 @@ import {
   type TeamRoleStripPhase,
 } from "./ui/agentViewCopy";
 import {
+  blockedSummaryFromFactsV1,
+  buildRunFailureEvidenceV1,
+  isRunFailureDiagnosticTraceV1,
+  reframeBlockedWhyV1,
+  runFailureEvidenceHeadingV1,
+  type RunFailureDiagnosticV1,
+  type RunFailureFactV1,
+  type RunFailureToolFailureV1,
+} from "./ui/runFailureEvidence";
+import {
   formatAutonomyStatsLine,
   formatTeamStatsLine,
 } from "./ui/autonomyStatsCopy";
@@ -159,6 +169,8 @@ const MAX_RECEIPT_ROWS = 256;
 const MAX_CODE_OUTPUT_ROWS = 100;
 const MAX_VERIFICATION_ROWS = 100;
 const MAX_DETAIL_ROWS = 100;
+/** Blocked-run evidence keeps only the newest refusals; older ones are noise. */
+const MAX_FAILURE_DIAGNOSTICS = 8;
 const MAX_CHAT_ROWS = 80;
 const STEERING_KIND_OPTIONS: readonly {
   value: SteeringDirectiveKind;
@@ -282,6 +294,13 @@ export class AgentView extends ItemView {
   private runCommitSha: string | null = null;
   private runResearchNotePath: string | null = null;
   private runResultsPath: string | null = null;
+  /**
+   * Hard evidence for a blocked run, kept as the run produces it. The stop
+   * reason arrives last and is the least reliable thing in the run; these are
+   * the artifacts it is supposed to be describing.
+   */
+  private lastToolFailure: RunFailureToolFailureV1 | null = null;
+  private readonly failureDiagnostics: RunFailureDiagnosticV1[] = [];
   private developerMissionProgress: DeveloperMissionProgressViewV1 | null = null;
   private developerMissionCompletion: DeveloperMissionCompletionViewV1 | null = null;
   private noteStreamingAnnounced = false;
@@ -1879,7 +1898,13 @@ export class AgentView extends ItemView {
       onApprovalResolved: (event) =>
         this.renderApprovalResolved(event.request, event.decision),
       onCodeOutput: (event) => this.appendCodeOutput(event),
-      onTrace: (event) => this.appendTraceEvent(event),
+      onTrace: (event) => {
+        // Record before rendering: appendTraceEvent short-circuits when the
+        // panel has no log element, and a blocked run must not lose its
+        // evidence because the view was not mounted.
+        this.recordRunFailureEvidence(event);
+        this.appendTraceEvent(event);
+      },
       onMissionGraphUpdate: (graph) => {
         this.missionGraphProjection = projectMissionGraphRunDetails(graph);
         this.developerMissionProgress = applyDeveloperMissionGraphV1(
@@ -2154,6 +2179,8 @@ export class AgentView extends ItemView {
     this.runCommitSha = null;
     this.runResearchNotePath = null;
     this.runResultsPath = null;
+    this.lastToolFailure = null;
+    this.failureDiagnostics.length = 0;
     this.developerMissionProgress = null;
     this.developerMissionCompletion = null;
     this.noteStreamingAnnounced = false;
@@ -2373,10 +2400,69 @@ export class AgentView extends ItemView {
     this.appendTrace("tool", event.message ?? `Running tool: ${event.name}`);
   }
 
+  /**
+   * Keep the checkable artifacts of a failure as the run emits them.
+   *
+   * Tool arguments only exist on the trace stream (`AgentToolRunEvent` carries
+   * no arguments), and attested refusals arrive as traces too, so this is the
+   * only place both are visible to the view.
+   */
+  private recordRunFailureEvidence(event: AgentTraceEvent) {
+    if (!isRunFailureDiagnosticTraceV1(event)) {
+      return;
+    }
+    if (event.toolName) {
+      this.lastToolFailure = {
+        name: event.toolName,
+        step: event.step ?? null,
+        errorCode: event.error?.code ?? null,
+        errorMessage: event.error?.message ?? event.message ?? null,
+        args: event.inputPreview,
+      };
+    }
+    this.failureDiagnostics.push({
+      id: event.id,
+      code: event.error?.code ?? null,
+      message: event.error?.message ?? event.message ?? null,
+      detail: event.outputPreview,
+    });
+    // Newest wins: a long run must not push the terminal refusal out of view.
+    const overflow = this.failureDiagnostics.length - MAX_FAILURE_DIAGNOSTICS;
+    if (overflow > 0) {
+      this.failureDiagnostics.splice(0, overflow);
+    }
+  }
+
+  private buildRunFailureFacts(): RunFailureFactV1[] {
+    const active = this.missionGraphProjection?.activeNode;
+    return buildRunFailureEvidenceV1({
+      blocker: active?.blocker ?? null,
+      activeNodeId: active?.id ?? null,
+      lastToolFailure: this.lastToolFailure,
+      // Read newest-first: the refusal that ended the run is the one that
+      // explains it, and older ones are usually already-recovered noise.
+      diagnostics: [...this.failureDiagnostics].reverse(),
+    });
+  }
+
   private handleToolDone(event: AgentToolRunEvent) {
     const itemEl = this.ensureToolTimelineItem(event);
     const ok = event.ok !== false;
     const skipped = !ok && isToolIntentGateFailure(event);
+    if (!ok && !skipped) {
+      // Fallback for a tool failure that never produced a trace. Arguments
+      // stay from the trace when one already named this tool.
+      this.lastToolFailure = {
+        name: event.name,
+        step: event.step ?? null,
+        errorCode: event.error?.code ?? null,
+        errorMessage: event.error?.message ?? event.message ?? null,
+        args:
+          this.lastToolFailure?.name === event.name
+            ? this.lastToolFailure.args
+            : undefined,
+      };
+    }
 
     itemEl.removeClass("is-complete");
     itemEl.removeClass("is-error");
@@ -2665,6 +2751,7 @@ export class AgentView extends ItemView {
         this.stopRequested = false;
       this.setRunning(false);
       this.currentRunChatId = null;
+      const failureFacts = this.buildRunFailureFacts();
       this.renderChatBlockedContinueAttention(
         blockerCopy,
         missionStop === "graph_blocked" ||
@@ -2679,6 +2766,7 @@ export class AgentView extends ItemView {
           allowOpenSettings:
             missionStop === "provider_error" &&
             /api key|credential|auth|missing_api_key/i.test(detail),
+          facts: failureFacts,
         },
       );
       this.setRunDetailsNeedsAttention(true);
@@ -2687,7 +2775,12 @@ export class AgentView extends ItemView {
         this.presentDeveloperMissionCompletionV1(
           this.buildTrackedDeveloperMissionCompletion(
             "blocked",
-            event.stopDetail?.trim() || stopLine,
+            // The completion card has room for one sentence. When the stop
+            // reason blames the model, the leading artifact goes first.
+            blockedSummaryFromFactsV1({
+              summary: event.stopDetail?.trim() || stopLine,
+              facts: failureFacts,
+            }),
           ),
         );
       }
@@ -5592,6 +5685,7 @@ export class AgentView extends ItemView {
     options: {
       allowOpenSettings?: boolean;
       forceSettingsOnly?: boolean;
+      facts?: readonly RunFailureFactV1[];
     } = {},
   ) {
     const banner = this.chatAttentionEl;
@@ -5605,12 +5699,40 @@ export class AgentView extends ItemView {
       text: title,
       cls: "agentic-researcher-chat-attention-title",
     });
+    // Evidence before narrative. The stop reason is the run's own account of
+    // itself and has misdirected in every case investigated so far; these rows
+    // are what it actually recorded.
+    const facts = options.facts ?? [];
+    if (facts.length > 0) {
+      const evidenceEl = banner.createDiv({
+        cls: "agentic-researcher-chat-attention-evidence",
+        attr: { "data-testid": "chat-blocked-evidence" },
+      });
+      evidenceEl.createDiv({
+        text: runFailureEvidenceHeadingV1(),
+        cls: "agentic-researcher-chat-attention-evidence-title",
+      });
+      for (const fact of facts) {
+        const rowEl = evidenceEl.createDiv({
+          cls: "agentic-researcher-chat-attention-evidence-row",
+          attr: { "data-failure-fact": fact.key },
+        });
+        rowEl.createSpan({
+          text: fact.label,
+          cls: "agentic-researcher-chat-attention-evidence-label",
+        });
+        rowEl.createSpan({
+          text: fact.value,
+          cls: "agentic-researcher-chat-attention-evidence-value",
+        });
+      }
+    }
     banner.createDiv({
       text: `What: ${copy.what}`,
       cls: "agentic-researcher-chat-attention-body",
     });
     banner.createDiv({
-      text: `Why: ${copy.why}`,
+      text: `Why: ${reframeBlockedWhyV1({ why: copy.why, facts })}`,
       cls: "agentic-researcher-chat-attention-body",
     });
     banner.createDiv({

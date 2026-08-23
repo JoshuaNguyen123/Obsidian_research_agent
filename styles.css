@@ -1400,6 +1400,46 @@
   min-width: 0;
 }
 
+/*
+ * Blocked-run evidence: the run's own artifacts, above its narrative. Data
+ * columns, so monospace is earned here; the surrounding copy stays prose.
+ */
+.agentic-researcher-chat-attention-evidence {
+  border-left: 2px solid var(--agent-rule-strong);
+  display: grid;
+  gap: var(--agent-space-2);
+  min-width: 0;
+  padding-left: var(--agent-space-3);
+}
+
+.agentic-researcher-chat-attention-evidence-title {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
+  font-weight: var(--agent-weight-strong);
+}
+
+.agentic-researcher-chat-attention-evidence-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-3);
+  min-width: 0;
+}
+
+.agentic-researcher-chat-attention-evidence-label {
+  color: var(--agent-text-muted);
+  flex: 0 0 auto;
+  font-size: var(--agent-type-label);
+}
+
+.agentic-researcher-chat-attention-evidence-value {
+  color: var(--agent-text);
+  flex: 1 1 0;
+  font-family: var(--font-monospace);
+  font-size: var(--agent-type-label);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* Clarifying question: a quiet prompt, not an alarm. */
 .agentic-researcher-chat-attention.is-clarification {
   border-left: 2px solid var(--interactive-accent);
