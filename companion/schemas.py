@@ -160,6 +160,55 @@ class BrowserExtractMarkdownRequest(ClosedModel):
     safetyDecision: SafetyPolicyDecisionV1
 
 
+class DocumentExtractRequest(ClosedModel):
+    """Extract text from caller-supplied document bytes.
+
+    The companion deliberately does not fetch the document itself. Its outbound
+    policy is not "validate the URL, then fetch": every browser connection is
+    pinned to an address validated at connect time
+    (``open_pinned_public_connection`` / ``PinnedPublicProxy``), and a plain
+    server-side fetch would re-resolve the hostname after validation and
+    reopen exactly the rebinding hole that pinning closes. Bytes in, text out
+    keeps this route off the network entirely, so it adds no outbound surface.
+
+    ``contentBase64`` is bounded here, but the operative ceiling is the
+    companion boundary's ``max_body_bytes`` (1 MiB by default).
+    """
+
+    contentBase64: str = Field(min_length=1, max_length=6_000_000, repr=False)
+    sourceUrl: str | None = Field(default=None, max_length=8_192)
+    title: str | None = Field(default=None, max_length=2_048)
+    maxPages: int = Field(default=100, ge=1, le=2_000)
+    maxChars: int = Field(default=60_000, ge=1, le=250_000)
+
+    @field_validator("sourceUrl")
+    @classmethod
+    def validate_source_url(cls, value: str | None) -> str | None:
+        # Provenance only, never fetched: it still has to be a public HTTP(S)
+        # locator so a citation cannot claim a local or credentialed origin.
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Document source URLs must be HTTP(S).")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("Document source URLs cannot contain credentials.")
+        return value
+
+
+class DocumentExtractResponse(BaseModel):
+    ok: bool = True
+    status: Literal["parsed", "empty"]
+    reason: str | None = None
+    url: str | None = None
+    title: str | None = None
+    text: str
+    pageCount: int
+    pagesExtracted: int
+    pagesSkipped: int
+    truncated: bool
+
+
 class Bounds(BaseModel):
     x: float
     y: float

@@ -4,6 +4,7 @@ playwright==1.60.0
 pydantic==2.13.4
 beautifulsoup4==4.14.3
 html2text==2025.4.15
+pypdf==6.7.5
 pytest==8.4.2
 pytest-asyncio==0.24.0
 httpx==0.28.1
