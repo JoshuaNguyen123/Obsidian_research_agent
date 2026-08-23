@@ -47,34 +47,6 @@ export function buildHtmlPreviewDocument(
   ].join("\n");
 }
 
-export function renderHtmlPreview(
-  container: HTMLElement,
-  html: string,
-  options: HtmlPreviewOptions = {},
-): HtmlPreviewRenderResult {
-  const wrapper = document.createElement("div");
-  wrapper.className = HTML_PREVIEW_CLASS;
-  const iframe = document.createElement("iframe");
-  iframe.className = HTML_PREVIEW_IFRAME_CLASS;
-  iframe.title = options.title?.trim() || "HTML Preview";
-  iframe.referrerPolicy = "no-referrer";
-  iframe.setAttribute("sandbox", HTML_PREVIEW_IFRAME_SANDBOX);
-  // Propagate the embedder's light/dark scheme into the srcdoc so its
-  // Canvas/CanvasText system colors resolve to the active Obsidian theme.
-  iframe.style.colorScheme = "light dark";
-  const srcdoc = buildHtmlPreviewDocument(html, options);
-  iframe.srcdoc = srcdoc;
-  wrapper.appendChild(iframe);
-  container.appendChild(wrapper);
-
-  return {
-    wrapper,
-    iframe,
-    srcdoc,
-    sandbox: HTML_PREVIEW_IFRAME_SANDBOX,
-  };
-}
-
 export function renderSandboxedHtmlPreview(
   container: HTMLElement,
   srcdoc: string,
