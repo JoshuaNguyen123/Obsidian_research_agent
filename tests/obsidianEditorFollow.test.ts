@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  computeMinimalEditRange,
   followEditorStreamingEnd,
+  hasStreamFollowDetached,
   setEditorValueFollowingStreamEnd,
   type StreamingFollowEditor,
 } from "../src/obsidianEditorFollow";

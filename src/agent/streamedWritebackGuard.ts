@@ -104,3 +104,58 @@ export function createIdempotentStreamRetryPolicy(
     reason: "partial_write_no_safe_retry",
   };
 }
+
+/**
+ * A concurrent writer — almost always the reader typing in the open note —
+ * changed the target between two flushes of an in-flight stream.
+ */
+export interface ExternalStreamEdit {
+  reason: "external_note_edit";
+  expectedChars: number;
+  observedChars: number;
+}
+
+/**
+ * Compare the live note against the exact bytes this stream last committed.
+ *
+ * Line endings are normalized because an editor buffer holds LF for a note
+ * stored with CRLF. Nothing else is forgiven: an otherwise unexplained
+ * difference means someone else owns those bytes now, and the next
+ * whole-document flush would silently destroy them.
+ */
+export function detectExternalStreamEdit({
+  expected,
+  observed,
+}: {
+  expected: string;
+  observed: string;
+}): ExternalStreamEdit | null {
+  if (normalizeLineEndings(expected) === normalizeLineEndings(observed)) {
+    return null;
+  }
+  return {
+    reason: "external_note_edit",
+    expectedChars: expected.length,
+    observedChars: observed.length,
+  };
+}
+
+/**
+ * Same shape as `createIdempotentStreamRetryPolicy`'s failure: say what
+ * stopped, say what was kept, and do not offer a retry that would overwrite.
+ */
+export function formatExternalStreamEditMessage(
+  path: string | null | undefined,
+  appliedChars: number,
+): string {
+  const target = path ? ` (${path})` : "";
+  return (
+    `Stopped streamed writeback: the note${target} changed outside this run ` +
+    `after ${appliedChars} streamed characters were applied. The edit was kept ` +
+    "and nothing was overwritten; re-run the mission to continue writing."
+  );
+}
+
+function normalizeLineEndings(value: string): string {
+  return value.replace(/\r\n/gu, "\n");
+}

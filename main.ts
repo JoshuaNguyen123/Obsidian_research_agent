@@ -174,6 +174,7 @@ import {
   followEditorStreamingEnd,
   setEditorValueFollowingStreamEnd,
   type SetCurrentMarkdownContentOptions,
+  type StreamingFollowEditor,
 } from "./src/obsidianEditorFollow";
 import {
   DURABLE_MISSION_MAX_MODEL_STEPS,
@@ -15298,9 +15299,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (recentEditor?.setValue) {
       setEditorValueFollowingStreamEnd(recentEditor, content, options);
       if (options.followStreamingEnd) {
-        // Re-follow after Obsidian finishes layout from the writeback.
+        // Re-follow after Obsidian finishes layout from the writeback. Pass the
+        // same options so the re-follow shares this stream's follow state and
+        // does not re-attach a viewport the reader just scrolled away from.
         queueMicrotask(() =>
-          followEditorStreamingEnd(recentEditor, content),
+          followEditorStreamingEnd(recentEditor, content, options),
         );
       }
       return true;
@@ -15311,7 +15314,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       if (editor?.setValue) {
         setEditorValueFollowingStreamEnd(editor, content, options);
         if (options.followStreamingEnd) {
-          queueMicrotask(() => followEditorStreamingEnd(editor, content));
+          queueMicrotask(() =>
+            followEditorStreamingEnd(editor, content, options),
+          );
         }
         return true;
       }
@@ -16787,42 +16792,20 @@ function getMarkdownTextFromLeaf(
   return typeof value === "string" ? value : null;
 }
 
+/**
+ * The live Obsidian editor, typed as the structural subset streamed writeback
+ * uses. Keeping this identical to `StreamingFollowEditor` is what lets a flush
+ * take the ranged `replaceRange` path instead of replacing the whole buffer —
+ * a narrower type here silently degrades every stream to a full overwrite.
+ */
 function getMarkdownEditorFromLeaf(
   leaf: WorkspaceLeaf | null,
   file: TFile,
-):
-  | {
-      getValue?: () => string;
-      setValue?: (value: string) => void;
-      offsetToPos?: (offset: number) => { line: number; ch: number };
-      lastLine?: () => number;
-      getLine?: (line: number) => string;
-      scrollIntoView?: (
-        range: {
-          from: { line: number; ch: number };
-          to: { line: number; ch: number };
-        },
-        center?: boolean,
-      ) => void;
-    }
-  | null {
+): StreamingFollowEditor | null {
   const view = leaf?.view as
     | {
         file?: TFile | null;
-        editor?: {
-          getValue?: () => string;
-          setValue?: (value: string) => void;
-          offsetToPos?: (offset: number) => { line: number; ch: number };
-          lastLine?: () => number;
-          getLine?: (line: number) => string;
-          scrollIntoView?: (
-            range: {
-              from: { line: number; ch: number };
-              to: { line: number; ch: number };
-            },
-            center?: boolean,
-          ) => void;
-        };
+        editor?: StreamingFollowEditor;
       }
     | undefined;
   if (!view || view.file?.path !== file.path) {

@@ -238,6 +238,8 @@ import {
   shouldAbortReleasedChunk,
   shouldKeepPostReleaseBuffer as shouldKeepPostReleaseBufferFromGuard,
   createIdempotentStreamRetryPolicy,
+  detectExternalStreamEdit,
+  formatExternalStreamEditMessage,
   type StreamWriteSession,
 } from "./agent/streamedWritebackGuard";
 import {
@@ -31763,6 +31765,14 @@ async function streamCurrentNoteWriteback({
     events.onFinalDone?.();
     events.onAssistantMessageDone?.();
 
+    const externalEditStop = writer.getExternalEditStop();
+    if (externalEditStop) {
+      // Nothing was overwritten and no readback can verify a note that now
+      // holds someone else's edit, so report the stop instead of a receipt.
+      events.onStatus?.(externalEditStop.message);
+      throw error;
+    }
+
     if (writer.hasWritableContent()) {
       const receipt = await writer.buildReceipt(true);
       onPartialReceipt?.(receipt);
@@ -32376,6 +32386,8 @@ async function chatWithThinkingFallback({
 
 
 
+let streamingNoteWriterSequence = 0;
+
 async function createStreamingNoteWriter({
   kind,
   toolContext,
@@ -32392,6 +32404,28 @@ async function createStreamingNoteWriter({
   let file: ReturnType<typeof getActiveMarkdownFile> | null = null;
   let current = "";
   let createReceiptPath: string | null = null;
+  // One key per writer so the editor's viewport-follow state (including "the
+  // reader scrolled away") resets when a new stream starts, with no reset call.
+  const streamFollowKey = `streamed-writeback-${(streamingNoteWriterSequence += 1)}`;
+  // Exact bytes this writer last committed. Anything else in the live buffer
+  // between two of our flushes belongs to a concurrent writer, so we stop
+  // instead of overwriting it.
+  //
+  // Null until the first flush lands, and deliberately not seeded at setup: an
+  // edit that arrives before any byte of ours is on disk overwrites nothing,
+  // and `makeTitleMetadataAppendBase` already rebases the append base off the
+  // live note for exactly that window. Failing there would break a behaviour
+  // that is correct and pinned.
+  let expectedLiveContent: string | null = null;
+  let externalEditStop: { message: string; appliedChars: number } | null = null;
+  /** Live editor buffer for the target, or null when no editor has it open. */
+  const readLiveEditorSource = (): string | null => {
+    if (!file) {
+      return null;
+    }
+    const value = toolContext.getCurrentMarkdownContent?.(file);
+    return typeof value === "string" ? value : null;
+  };
   const ensureFile = async () => {
     if (file) {
       return file;
@@ -32423,8 +32457,7 @@ async function createStreamingNoteWriter({
   const makeAppendBase = (content: string) =>
     `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}`;
   const getLatestAppendBaseSource = () => {
-    const source =
-      (file && toolContext.getCurrentMarkdownContent?.(file)) ?? current;
+    const source = readLiveEditorSource() ?? current;
     // Live flushes write base+streamed. Callers that refresh the append base
     // (title metadata, replaceContent) must not treat the in-flight draft as
     // permanent note content or word-count corrections will double-append.
@@ -32482,10 +32515,39 @@ async function createStreamingNoteWriter({
   const hasNoteMutation = () => baseContentChanged || hasWritableContent();
   const writeContent = async (content: string) => {
     const target = await ensureFile();
+    if (externalEditStop) {
+      return;
+    }
+    // Every flush is still a whole-document write at the vault layer, so a
+    // concurrent edit must be caught before it, not after. `expectedLiveContent`
+    // is what this writer last put in the buffer; anything else came from
+    // someone else and the write below would destroy it.
+    const observed = readLiveEditorSource();
+    if (expectedLiveContent !== null && observed !== null) {
+      const conflict = detectExternalStreamEdit({
+        expected: expectedLiveContent,
+        observed,
+      });
+      if (conflict) {
+        externalEditStop = {
+          message: formatExternalStreamEditMessage(
+            target.path,
+            getByteLength(streamedContent),
+          ),
+          appliedChars: streamedContent.length,
+        };
+        return;
+      }
+    }
     toolContext.setCurrentMarkdownContent?.(target, content, {
       followStreamingEnd: true,
+      streamKey: streamFollowKey,
     });
     await toolContext.app.vault.modify(target, content);
+    // Deliberately the bytes we wrote, not a re-read: re-reading here would
+    // adopt anything the reader typed during the awaited modify as ours and
+    // the next flush would overwrite exactly the keystrokes we are protecting.
+    expectedLiveContent = content;
   };
   const consumeLeadingTitleIfPresent = (
     delta: string,
@@ -32550,7 +32612,16 @@ async function createStreamingNoteWriter({
   };
 
   return {
+    /** Set once a concurrent writer took the note away from this stream. */
+    getExternalEditStop() {
+      return externalEditStop;
+    },
     push(delta: string) {
+      if (externalEditStop) {
+        // The previous flush found someone else's bytes in the note. Fail here
+        // rather than keep buffering a draft that can never be committed.
+        throw new Error(externalEditStop.message);
+      }
       const writableDelta = consumeLeadingTitleIfPresent(delta);
       if (!writableDelta) {
         return;
@@ -32637,6 +32708,17 @@ async function createStreamingNoteWriter({
       extractedLeadingTitle = null;
     },
     async finish(options: { force?: boolean } = {}) {
+      if (externalEditStop) {
+        // The failure is already reported by push(); finish() runs again from
+        // the interrupt path and must not commit over the concurrent edit or
+        // replace the caller's error with a second one.
+        if (flushTimer !== null) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        await flushChain;
+        return;
+      }
       const trailingTitleContent = consumeLeadingTitleIfPresent("", true);
       if (trailingTitleContent) {
         streamedContent += trailingTitleContent;
@@ -32665,6 +32747,12 @@ async function createStreamingNoteWriter({
       await flushChain;
     },
     async buildReceipt(partial: boolean): Promise<AgentRunReceipt> {
+      if (externalEditStop) {
+        // Readback can never verify here by construction: the note holds the
+        // concurrent edit as well as our bytes. Report the stop, not a
+        // mismatch that reads like corruption.
+        throw new Error(externalEditStop.message);
+      }
       const resolvedPath = file?.path ?? lazyCreatePath ?? "unknown";
       const operation =
         kind === "append" ? "append" : kind === "replace" ? "replace" : "edit";
