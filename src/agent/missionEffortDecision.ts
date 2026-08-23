@@ -1,3 +1,4 @@
+import { MAX_AGENT_STEPS } from "../tools/constants";
 import type { NoteOutputDestination } from "./noteOutputPolicy";
 
 export type MissionEffortProfileV1 =
@@ -17,8 +18,10 @@ export interface MissionFinalizationReserveV1 {
 
 /**
  * One pre-execution decision separates how much to write from how much to
- * research. Configured values override profile defaults in either direction;
- * the profile default is only used when no configured value is provided.
+ * research. An explicitly configured value overrides the profile default in
+ * either direction; the profile default is used when no configured value is
+ * provided, or when the configured value is merely the system-wide hard cap
+ * (see `perMissionCountBudget`).
  */
 export interface MissionEffortDecisionV1 {
   version: 1;
@@ -66,6 +69,29 @@ export function hasExplicitExtendedResearchIntentV1(prompt: string): boolean {
   return EXPLICIT_EXTENDED_PATTERN.test(prompt);
 }
 
+/**
+ * `maxAgentSteps` is the system-wide hard cap on a run, not a per-mission
+ * budget: both safety-ceiling presets pin it to `MAX_AGENT_STEPS` and
+ * `resolveConfiguredMaxAgentSteps` materializes that same value when nothing
+ * is configured, so "the user never touched it" and "the user chose the cap"
+ * are the same number. Passing it through as a configured budget therefore
+ * resolved every profile to the cap and left `compose` (6/4) and
+ * `grounded_research` (16/12) with no effect at all — a mission asking for a
+ * short composed note was budgeted 100 model calls.
+ *
+ * A count at or above the hard cap carries no per-mission intent, so the
+ * profile default stands. Anything below it is a deliberate narrowing and
+ * still wins, in either direction, exactly as the ceiling math intends.
+ */
+function perMissionCountBudget(
+  configured: number | null | undefined,
+): number | null {
+  if (typeof configured !== "number" || !Number.isFinite(configured)) {
+    return null;
+  }
+  return Math.trunc(configured) >= MAX_AGENT_STEPS ? null : configured;
+}
+
 export function resolveMissionEffortDecisionV1(
   input: ResolveMissionEffortDecisionV1Input,
 ): MissionEffortDecisionV1 {
@@ -102,11 +128,17 @@ export function resolveMissionEffortDecisionV1(
   const maxModelCalls =
     profile === "direct"
       ? defaults.maxModelCalls
-      : applyPositiveCeiling(defaults.maxModelCalls, input.configuredMaxModelCalls);
+      : applyPositiveCeiling(
+          defaults.maxModelCalls,
+          perMissionCountBudget(input.configuredMaxModelCalls),
+        );
   const maxToolCalls =
     profile === "direct"
       ? defaults.maxToolCalls
-      : applyNonNegativeCeiling(defaults.maxToolCalls, input.configuredMaxToolCalls);
+      : applyNonNegativeCeiling(
+          defaults.maxToolCalls,
+          perMissionCountBudget(input.configuredMaxToolCalls),
+        );
   const configuredWallClockMs =
     typeof input.configuredMaxRunMinutes === "number" &&
     Number.isFinite(input.configuredMaxRunMinutes) &&
@@ -191,11 +223,17 @@ export function escalateMissionEffortDecisionForResearchV1(
   const grounded = profileDefaults("grounded_research");
   const flooredModelCalls = Math.max(
     decision.maxModelCalls,
-    applyPositiveCeiling(grounded.maxModelCalls, input.configuredMaxModelCalls),
+    applyPositiveCeiling(
+      grounded.maxModelCalls,
+      perMissionCountBudget(input.configuredMaxModelCalls),
+    ),
   );
   const flooredToolCalls = Math.max(
     decision.maxToolCalls,
-    applyNonNegativeCeiling(grounded.maxToolCalls, input.configuredMaxToolCalls),
+    applyNonNegativeCeiling(
+      grounded.maxToolCalls,
+      perMissionCountBudget(input.configuredMaxToolCalls),
+    ),
   );
   const configuredWallClockMs =
     typeof input.configuredMaxRunMinutes === "number" &&

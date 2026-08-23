@@ -1,3 +1,9 @@
+import {
+  extractVaultSearchResultPathsV1,
+  isVaultSearchToolNameV1,
+  normalizeVaultPathV1,
+} from "./researchRetrievalGate";
+
 export interface AutoFollowupInput {
   mission: string;
   lastToolName: string;
@@ -6,10 +12,26 @@ export interface AutoFollowupInput {
   alreadyFetchedUrls: string[];
   alreadyReadPaths: string[];
   maxFollowups: number;
+  /**
+   * The query the last vault search ran. Used verbatim for corroboration
+   * because the model already distilled the mission into it, and a
+   * re-derived query would search for something the user never asked.
+   */
+  lastToolQuery?: string;
+  /**
+   * True when the last semantic retrieval did not score by meaning, so its
+   * ranking must not be the only thing an answer rests on. The caller owns
+   * firing this at most once per mission.
+   */
+  requiresKeywordCorroboration?: boolean;
 }
 
 export interface AutoFollowupRequest {
-  toolName: "web_fetch" | "read_file" | "read_source_section";
+  toolName:
+    | "web_fetch"
+    | "read_file"
+    | "read_source_section"
+    | "search_markdown_files";
   args: Record<string, unknown>;
   reason: string;
 }
@@ -33,15 +55,50 @@ export function planReadOnlyFollowups(input: AutoFollowupInput): AutoFollowupReq
         reason: "auto_fetch_search_result_for_source_proof",
       }));
   }
-  if (input.lastToolName === "semantic_search_notes" && needsVaultRead(input)) {
-    return extractResultPaths(input.lastToolResult)
-      .filter((path) => !input.alreadyReadPaths.includes(path))
-      .slice(0, maxFollowups)
-      .map((path) => ({
+  /*
+   * Reading a vault search's own results is unconditional, not a courtesy.
+   *
+   * This used to require either acceptance already naming vault evidence or the
+   * mission literally saying "my notes" / "vault" / "related notes", so an
+   * ordinary "what did I conclude about onboarding?" surfaced paths and then
+   * answered from snippets -- and `search_markdown_files` was never covered at
+   * all. The search having run is itself the signal: if the agent went to the
+   * vault, the host opens what it found. These reads are read-only, deduplicated
+   * against what was already read, and bounded by `maxFollowups`.
+   */
+  if (isVaultSearchToolNameV1(input.lastToolName)) {
+    const alreadyRead = new Set(
+      input.alreadyReadPaths.map((path) => normalizeVaultPathV1(path)),
+    );
+    const followups: AutoFollowupRequest[] = [];
+    const corroborationQuery = input.requiresKeywordCorroboration
+      ? (input.lastToolQuery ?? "").trim()
+      : "";
+    // Corroboration is scheduled before the reads because it can outrank them.
+    // A degraded `semantic_search_notes` scores chunks from at most the first
+    // MAX_LISTED_FILES notes and never matches the exact phrase;
+    // `search_markdown_files` reads every note in the vault and does. When
+    // embeddings are down that difference is the whole retrieval, not a
+    // second opinion on it.
+    if (corroborationQuery && input.lastToolName !== "search_markdown_files") {
+      followups.push({
+        toolName: "search_markdown_files",
+        args: { query: corroborationQuery },
+        reason: "auto_keyword_corroboration_for_degraded_semantic_search",
+      });
+    }
+    for (const path of extractVaultSearchResultPathsV1(input.lastToolResult)) {
+      if (followups.length >= maxFollowups) break;
+      // Compared through the same normalizer the proof gate uses, so a path
+      // that differs only by separator or case is not re-read.
+      if (alreadyRead.has(normalizeVaultPathV1(path))) continue;
+      followups.push({
         toolName: "read_file",
         args: { path, maxChars: 6000 },
-        reason: "auto_read_semantic_result_for_vault_proof",
-      }));
+        reason: "auto_read_vault_search_result_for_body_proof",
+      });
+    }
+    return followups;
   }
   return [];
 }
@@ -78,13 +135,6 @@ function needsSourceFetch(input: AutoFollowupInput): boolean {
     input.acceptanceNeeds.some((need) =>
       /web_evidence|fetched_sources|distinct_domains|source|citation/i.test(need),
     ) || /\b(cite|citation|source|sources|verify|current|latest|web)\b/i.test(input.mission)
-  );
-}
-
-function needsVaultRead(input: AutoFollowupInput): boolean {
-  return (
-    input.acceptanceNeeds.some((need) => /vault_evidence|research_plan_items/i.test(need)) ||
-    /\b(my notes|vault|across notes|semantic|related notes)\b/i.test(input.mission)
   );
 }
 
@@ -159,16 +209,6 @@ function getRankingTerms(value: string): string[] {
         ?.filter((term) => term.length >= 3 && !RANKING_STOP_WORDS.has(term)) ?? [],
     ),
   ];
-}
-
-function extractResultPaths(value: unknown): string[] {
-  const output = getOutput(value);
-  if (!isRecord(output) || !Array.isArray(output.results)) {
-    return [];
-  }
-  return output.results
-    .map((item) => (isRecord(item) && typeof item.path === "string" ? item.path : ""))
-    .filter((path) => path.endsWith(".md"));
 }
 
 function getOutput(value: unknown): unknown {

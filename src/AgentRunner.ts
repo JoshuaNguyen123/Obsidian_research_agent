@@ -105,9 +105,26 @@ import {
 } from "./languageGuard";
 import {
   estimateLoopBudget,
+  getRunBudgetProfile,
   resolveConfiguredMaxAgentSteps,
 } from "./agent/runBudget";
 import { planReadOnlyFollowups } from "./agent/autoFollowups";
+import {
+  classifySemanticRetrievalHealthV1,
+  readSemanticRetrievalOutcomeV1,
+  type SemanticRetrievalHealthV1,
+} from "./agent/semanticRetrievalHealth";
+import {
+  evaluateVaultBodyReadDebtV1,
+  extractRequestedVaultReadPathsV1,
+  extractVaultBodyReadPathsV1,
+  extractVaultSearchResultPathsV1,
+  isVaultBodyReadToolNameV1,
+  isVaultSearchToolNameV1,
+  normalizeVaultPathV1,
+  VAULT_BODY_READ_PROOF_V1,
+  type VaultBodyReadDebtV1,
+} from "./agent/researchRetrievalGate";
 import {
   detectLinearIntent,
   extractExplicitLinearIssueReadIdentity,
@@ -2985,6 +3002,37 @@ export async function runAgentMission({
     allowedToolNames,
     missionIntent,
   );
+  /**
+   * Every markdown path a vault search surfaced this run, in the order it was
+   * ranked. The write permit compares this against what was actually read so a
+   * vault answer cannot be written from snippets alone.
+   */
+  const vaultSearchSurfacedPaths: string[] = [];
+  /**
+   * Every markdown path whose *body* a read tool returned this run.
+   *
+   * Tracked separately from mission evidence on purpose. `evidenceFromToolResult`
+   * stamps a vault search's own top hit onto the evidence record's `path`, so
+   * reading paths out of the evidence list made a search pay the read debt it
+   * had just created -- and made the auto-follow-up skip the best hit as
+   * "already read". Only a tool that handed back note text lands here.
+   */
+  const vaultNoteBodyReadPaths: string[] = [];
+  /**
+   * Every markdown path a read was *requested* for, whether or not it returned
+   * a body. A note that was tried and could not be opened owes nothing further:
+   * without this, an unreadable surfaced note would hold the write until the
+   * step budget ran out.
+   */
+  const vaultNoteBodyReadAttemptedPaths: string[] = [];
+  /**
+   * The query a degraded `semantic_search_notes` ran, waiting for the host to
+   * corroborate it with a full-vault keyword scan. Consumed once per mission:
+   * corroboration is about covering the notes the fallback could not see, not
+   * about searching twice for every result set.
+   */
+  let pendingKeywordCorroborationQuery: string | null = null;
+  let keywordCorroborationUsed = false;
   let executedModelTool = false;
   let wroteToNote = false;
   let unavailableToolCorrectionUsed = false;
@@ -7361,6 +7409,35 @@ export async function runAgentMission({
     });
     await persistMissionLedger(`mission-ledger-plan-review-${step}`);
   };
+  /**
+   * Whether this route lets the host spend extra tool calls on its own.
+   *
+   * `allowsAutoFollowups` was declared per profile and never read, so a route
+   * budgeted for a single tool call still got two or three host reads for free.
+   * Read lazily: `runPlan` is reassigned on resume and continuation.
+   */
+  const hostAutoFollowupsAllowed = (): boolean =>
+    getRunBudgetProfile(runPlan.route).allowsAutoFollowups;
+  /**
+   * The vault body-read debt as it stands right now.
+   *
+   * Owed only when a read tool is on the frontier and the host is permitted to
+   * open what a search surfaced. Levying it on a route whose profile forbids
+   * auto follow-ups would demand a read nothing is allowed to perform: the
+   * routes that forbid them are budgeted for at most one tool call, which the
+   * model has already spent on the search itself.
+   */
+  const evaluateVaultBodyReadDebtNow = (): VaultBodyReadDebtV1 =>
+    evaluateVaultBodyReadDebtV1({
+      surfacedPaths: vaultSearchSurfacedPaths,
+      readPaths: vaultNoteBodyReadPaths,
+      attemptedPaths: vaultNoteBodyReadAttemptedPaths,
+      requiresBodyRead:
+        hostAutoFollowupsAllowed() &&
+        (allowedToolNames.has("read_file") ||
+          allowedToolNames.has("read_markdown_files")) &&
+        vaultSearchSurfacedPaths.length > 0,
+    });
   const evaluateCurrentAcceptance = (
     finalOutput?: string,
   ): MissionAcceptanceResult => {
@@ -7455,6 +7532,34 @@ export async function runAgentMission({
             `Return exactly ${exactFindings.requiredCount} material finding sentence(s) inside the Findings section and no material preamble outside it.`,
         };
       }
+    }
+    // A vault answer owes an opened note.
+    //
+    // This is the only place the debt becomes real. Naming it in the write
+    // permit's message did nothing: that branch keys on
+    // `durablePreWriteProofSatisfied` and the proposed-write acceptance, both
+    // of which read `evaluateCurrentAcceptance().missing`. Emitting the token
+    // here is what makes `isBlockingPreWriteProof` match it, what keeps the
+    // loop running until a note is opened, and what makes a snippet-only
+    // answer report `needs_more_work` instead of passing.
+    const vaultBodyReadDebt = evaluateVaultBodyReadDebtNow();
+    if (!vaultBodyReadDebt.satisfied) {
+      acceptance = {
+        ...acceptance,
+        status: acceptance.status === "fail" ? "fail" : "needs_more_work",
+        confidence: Math.min(acceptance.confidence, 0.65),
+        missing: [
+          ...new Set([...acceptance.missing, VAULT_BODY_READ_PROOF_V1]),
+        ],
+        reasons: [
+          ...new Set([...acceptance.reasons, vaultBodyReadDebt.reason]),
+        ],
+        nextAction:
+          acceptance.nextAction ??
+          `Open ${vaultBodyReadDebt.unreadPaths
+            .slice(0, 3)
+            .join(", ")} before answering from the vault search results.`,
+      };
     }
     // Final acceptance only after verify-complete for research-bearing missions.
     const phase = refreshResearchPhase(
@@ -7944,12 +8049,17 @@ export async function runAgentMission({
               nextAction: "Retry the direct-chat response.",
             }
         : evaluateCurrentAcceptance(lastFinalOutput || undefined);
-    if (stopReason === "write_completed") {
-      acceptance = reconcileCommittedProofGatedWriteAcceptance(
-        acceptance,
-        step,
-      );
-    }
+    // Keyed on whether a proof-gated write was actually committed, not on the
+    // terminal label. `reconcileCommittedProofGatedWriteAcceptance` is already
+    // fail-closed on every condition that matters -- a recorded commit with a
+    // passing pre-commit acceptance, a matching payload fingerprint, a verified
+    // non-partial receipt, and only repairable projection debt left. Gating it
+    // on `write_completed` added no safety and silently skipped the
+    // reconciliation whenever a committed write ended the run under another
+    // terminal, which is exactly what an adaptive-team segment does: the Lead
+    // commits the append, a later segment closes the mission as `final`, and
+    // the write-specific proof was dropped on the floor.
+    acceptance = reconcileCommittedProofGatedWriteAcceptance(acceptance, step);
     let onlyFinalProjectionProofMissing =
       missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
     if (
@@ -7968,12 +8078,8 @@ export async function runAgentMission({
       missionGraph = missionGraphSession.graph;
       missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
       acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
-      if (stopReason === "write_completed") {
-        acceptance = reconcileCommittedProofGatedWriteAcceptance(
-          acceptance,
-          step,
-        );
-      }
+      // Same invariant as above: the committed write, not the label, decides.
+      acceptance = reconcileCommittedProofGatedWriteAcceptance(acceptance, step);
       onlyFinalProjectionProofMissing =
         missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
     }
@@ -11151,16 +11257,59 @@ export async function runAgentMission({
     result,
     step,
     toolIndex,
+    depth = 0,
   }: {
     toolName: string;
     result: ToolExecutionResult;
     step: number;
     toolIndex: number | string;
+    /**
+     * Host follow-ups run with `origin: "runner"`, which does not re-enter this
+     * planner. One deliberate level of cascade is allowed so the keyword scan
+     * scheduled to corroborate a degraded semantic search also gets its own
+     * hits opened -- corroboration that nobody reads corroborates nothing.
+     */
+    depth?: number;
   }) => {
     if (!result.ok) {
       return;
     }
+    // Auto follow-ups spend extra tool calls inside one step. A route budgeted
+    // for one must not get three more for free.
+    if (!hostAutoFollowupsAllowed()) {
+      return;
+    }
     const acceptanceNeeds = evaluateCurrentAcceptance().missing;
+    // `allowedToolNames` is the run's catalogue, not the step's authority: a
+    // follow-up naming a tool the mission graph has no ready node for is
+    // rejected as `mission_graph_authority_blocked` after it has already been
+    // announced as scheduled. Drop those here instead of spending a tool call
+    // to be refused.
+    //
+    // Deliberately only a filter. Substituting a reader the graph *is* ready
+    // for was tried and reverted: on an explicit semantic-retrieval prompt the
+    // graph hands `read_markdown_files` to the model as its only legal next
+    // step, so the host taking it consumes a node the model was meant to use.
+    // The graph is already enforcing that read.
+    const isFollowupExecutable = (toolName: string): boolean => {
+      if (!allowedToolNames.has(toolName)) return false;
+      const graph = missionGraphSession?.graph ?? missionGraph;
+      return (
+        !missionGraphUsesExactPlannedFrontier ||
+        !graph ||
+        countReadyMissionGraphToolSlots(graph, toolName) > 0
+      );
+    };
+    const corroborationQuery =
+      toolName === "semantic_search_notes" && !keywordCorroborationUsed
+        ? pendingKeywordCorroborationQuery
+        : null;
+    // Cleared only by the search that set it. A parallel read batch runs its
+    // follow-ups in call order, so an unconditional clear here let a sibling
+    // tool consume the semantic search's pending corroboration and drop it.
+    if (toolName === "semantic_search_notes") {
+      pendingKeywordCorroborationQuery = null;
+    }
     const maxReadOnlyFollowups = Math.min(
       3,
       Math.max(2, researchPlan?.sourceRequirements.minFetchedSources ?? 2),
@@ -11173,11 +11322,21 @@ export async function runAgentMission({
       alreadyFetchedUrls: missionEvidenceRecords
         .map((item) => item.url)
         .filter((url): url is string => Boolean(url)),
-      alreadyReadPaths: missionEvidenceRecords
-        .map((item) => item.path)
-        .filter((path): path is string => Boolean(path)),
+      alreadyReadPaths: vaultNoteBodyReadPaths,
+      ...(corroborationQuery
+        ? {
+            lastToolQuery: corroborationQuery,
+            requiresKeywordCorroboration: true,
+          }
+        : {}),
       maxFollowups: maxReadOnlyFollowups,
-    }).filter((request) => allowedToolNames.has(request.toolName));
+    }).filter((request) => isFollowupExecutable(request.toolName));
+    if (
+      corroborationQuery &&
+      followups.some((request) => request.toolName === "search_markdown_files")
+    ) {
+      keywordCorroborationUsed = true;
+    }
 
     for (let index = 0; index < followups.length; index += 1) {
       const request = followups[index];
@@ -11192,7 +11351,7 @@ export async function runAgentMission({
           arguments: redactToolArguments(request.toolName, request.args),
         },
       });
-      await runObservedModelToolCall({
+      const followupResult = await runObservedModelToolCall({
         origin: "runner",
         toolCall: {
           name: request.toolName,
@@ -11201,6 +11360,15 @@ export async function runAgentMission({
         step,
         toolIndex: `auto-${toolIndex}-${index}`,
       });
+      if (depth === 0 && isVaultSearchToolNameV1(request.toolName)) {
+        await runAutoFollowupsAfterTool({
+          toolName: request.toolName,
+          result: followupResult,
+          step,
+          toolIndex: `auto-${toolIndex}-${index}`,
+          depth: depth + 1,
+        });
+      }
     }
   };
   const executeObservedModelToolCall = async ({
@@ -13476,6 +13644,23 @@ export async function runAgentMission({
       }
     }
 
+    // Recorded before the ok/failure split on purpose. A read that failed is
+    // still an attempt, and a surfaced note that was tried and could not be
+    // opened must stop owing a body read -- otherwise the acceptance debt has
+    // no way to discharge and the run burns its whole step budget being told
+    // to open a note that does not open.
+    if (isVaultBodyReadToolNameV1(toolCall.name)) {
+      for (const path of extractRequestedVaultReadPathsV1(toolCall.arguments)) {
+        if (
+          !vaultNoteBodyReadAttemptedPaths.some(
+            (seen) => normalizeVaultPathV1(seen) === normalizeVaultPathV1(path),
+          )
+        ) {
+          vaultNoteBodyReadAttemptedPaths.push(path);
+        }
+      }
+    }
+
     const backgroundSubmitted = Boolean(
       result.ok &&
         isRecord(result.output) &&
@@ -13848,6 +14033,85 @@ export async function runAgentMission({
         executedWebFetchTool = true;
       }
 
+      // Say out loud what the retrieval actually was. The payload has always
+      // carried the truth -- `mode` flips to `lexical_fallback` and
+      // `fallbackReason` names the runtime failure -- but nothing surfaced it,
+      // so a user whose embeddings were missing believed they had received
+      // conceptual search over their notes.
+      if (isVaultSearchToolNameV1(toolCall.name)) {
+        for (const path of extractVaultSearchResultPathsV1(result.output)) {
+          if (
+            !vaultSearchSurfacedPaths.some(
+              (seen) => normalizeVaultPathV1(seen) === normalizeVaultPathV1(path),
+            )
+          ) {
+            vaultSearchSurfacedPaths.push(path);
+          }
+        }
+      }
+
+      if (isVaultBodyReadToolNameV1(toolCall.name)) {
+        for (const path of extractVaultBodyReadPathsV1(result.output)) {
+          if (
+            !vaultNoteBodyReadPaths.some(
+              (seen) => normalizeVaultPathV1(seen) === normalizeVaultPathV1(path),
+            )
+          ) {
+            vaultNoteBodyReadPaths.push(path);
+          }
+          // A successful read is also an attempt. Recording it here covers the
+          // batch and active-note readers, whose returned paths are not always
+          // the ones named in the call arguments.
+          if (
+            !vaultNoteBodyReadAttemptedPaths.some(
+              (seen) => normalizeVaultPathV1(seen) === normalizeVaultPathV1(path),
+            )
+          ) {
+            vaultNoteBodyReadAttemptedPaths.push(path);
+          }
+        }
+      }
+
+      let semanticRetrievalHealth: SemanticRetrievalHealthV1 | null = null;
+      if (toolCall.name === "semantic_search_notes") {
+        const outcome = readSemanticRetrievalOutcomeV1(result.output);
+        semanticRetrievalHealth = outcome
+          ? classifySemanticRetrievalHealthV1(outcome)
+          : null;
+        if (semanticRetrievalHealth && semanticRetrievalHealth.status !== "ok") {
+          events.onStatus?.(
+            semanticRetrievalHealth.setupAction
+              ? `${semanticRetrievalHealth.message} ${semanticRetrievalHealth.setupAction}`
+              : semanticRetrievalHealth.message,
+          );
+          events.onTrace?.({
+            id: `${toolEventBase.id}:semantic-retrieval-health`,
+            kind: "status",
+            step,
+            toolName: toolCall.name,
+            message: semanticRetrievalHealth.message,
+            outputPreview: {
+              status: semanticRetrievalHealth.status,
+              cause: semanticRetrievalHealth.cause,
+              setupAction: semanticRetrievalHealth.setupAction,
+              semanticScoringUsed: semanticRetrievalHealth.semanticScoringUsed,
+            },
+          });
+        }
+        // Saying "this was keyword matching" is honest but inert on its own.
+        // The fallback inside `semantic_search_notes` scores chunks from at
+        // most the first MAX_LISTED_FILES notes and never matches the exact
+        // phrase, so the notes it could not see are covered only by handing
+        // the same query to a full-vault keyword scan.
+        if (
+          semanticRetrievalHealth?.requiresKeywordCorroboration &&
+          !keywordCorroborationUsed
+        ) {
+          pendingKeywordCorroborationQuery =
+            getString(toolCall.arguments.query)?.trim() || null;
+        }
+      }
+
       if (
         toolCall.name === "semantic_search_notes" &&
         !vaultCoverageExpansionUsed &&
@@ -13857,8 +14121,12 @@ export async function runAgentMission({
         vaultCoverageExpansionUsed = true;
         events.onStatus?.(
           formatFailureCopy(
+            // One cause, the one worth acting on -- not the old
+            // "sampled, truncated, fallback, or low confidence", which named
+            // four different problems and left the user with no action.
             semanticCoverageSecondPassCopy(
-              "Vault retrieval coverage was sampled, truncated, fallback, or low confidence.",
+              semanticRetrievalHealth?.message ??
+                "Vault retrieval coverage was too weak for deep vault research.",
             ),
           ),
         );
@@ -19649,6 +19917,8 @@ export async function runAgentMission({
         }
       }
       const durablePreWriteProofSatisfied = hasSatisfiedDurablePreWriteProof();
+      // `vault_note_body_read` now arrives through acceptance like every other
+      // blocking proof, so this filter picks it up without a special case.
       const blockingPreWriteMissing = durablePreWriteProofSatisfied
         ? []
         : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
@@ -33239,7 +33509,7 @@ function hasRuntimeSnapshotPersistence(context: ToolExecutionContext): boolean {
 }
 
 function isBlockingPreWriteProof(item: string): boolean {
-  return /web_evidence|source_coverage|source_domains|citation_coverage|fetched_sources|distinct_domains|vault_evidence|word_count|code_execution|research_plan_items/i.test(
+  return /web_evidence|source_coverage|source_domains|citation_coverage|fetched_sources|distinct_domains|vault_evidence|vault_note_body_read|word_count|code_execution|research_plan_items/i.test(
     item,
   );
 }

@@ -7,6 +7,7 @@ import {
 import { detectProjectLifecycleStagesV1 } from "../src/agent/projectLifecycle";
 import { missionRequiresExtendedEffortBudgetV1 } from "../src/agent/missionEffortEscalation";
 import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
+import { MAX_AGENT_STEPS } from "../src/tools/constants";
 
 const ORCHESTRATION_GUIDE_PROMPT =
   "I want you to write me an in depth guide/report to agent orchestration. What is it, why is it important, and then finally how to execute agent orcehstration sucessfully.";
@@ -23,11 +24,13 @@ test("in-depth writing selects Compose without inventing research", () => {
   assert.equal(decision.outputDepth, "in_depth");
   assert.equal(decision.researchDepth, "none");
   assert.equal(decision.outputTarget, "new_note");
-  // Configured values now take effect in either direction; 100 > compose
-  // default (6) so the configured value wins.
-  assert.equal(decision.maxModelCalls, 100);
+  // 100 is MAX_AGENT_STEPS, the system-wide hard cap that both safety-ceiling
+  // presets pin and that settings materialize when the user configures
+  // nothing. It expresses no per-mission intent, so the compose budget stands.
+  assert.equal(decision.maxModelCalls, 6);
   assert.equal(decision.maxToolCalls, 4);
-  // 60-minute configured run time raises the compose default of 3 minutes.
+  // maxRunMinutes has no such cap, so a 60-minute configured run time is a
+  // real choice and still raises the compose default of 3 minutes.
   assert.equal(decision.maxWallClockMs, 60 * 60_000);
   assert.deepEqual(decision.finalizationReserve.requiredActions, [
     "write_output",
@@ -357,8 +360,8 @@ test("explicit research-publication intent escalates past the grounded budget", 
 
   assert.equal(
     starved.maxToolCalls,
-    160,
-    "with ceiling math fixed, configured 160 overrides the grounded default of 12",
+    PUBLICATION_LADDER_TOOL_COUNT,
+    "the regression baseline is the grounded tool budget: 160 is above the hard cap, so it carries no per-mission intent",
   );
   assert.ok(
     escalated.maxToolCalls > PUBLICATION_LADDER_TOOL_COUNT,
@@ -386,21 +389,63 @@ test("plain research without publication intent keeps the grounded budget", () =
 
 // --- P3: ceiling math regression pins ---
 
-test("grounded + configured 160 → tools follow configured", () => {
+test("grounded + an explicit budget below the hard cap → counts follow configured", () => {
   const decision = resolveMissionEffortDecisionV1({
     prompt:
       "Research the latest sources on transformer architectures and write a note.",
     route: "grounded_workflow",
     outputTarget: "new_note",
-    configuredMaxModelCalls: 160,
-    configuredMaxToolCalls: 160,
+    // Deliberately below MAX_AGENT_STEPS: a value at or above the hard cap is
+    // indistinguishable from an untouched setting, and `maxAgentSteps` is
+    // clamped to the cap before it ever reaches here.
+    configuredMaxModelCalls: 60,
+    configuredMaxToolCalls: 60,
     configuredMaxRunMinutes: 35,
   });
   assert.equal(decision.profile, "grounded_research");
-  // Configured 160 > grounded default (16/12); it must win.
-  assert.equal(decision.maxModelCalls, 160);
-  assert.equal(decision.maxToolCalls, 160);
+  // Configured 60 > grounded default (16/12); it must win.
+  assert.equal(decision.maxModelCalls, 60);
+  assert.equal(decision.maxToolCalls, 60);
   assert.equal(decision.maxWallClockMs, 35 * 60_000);
+});
+
+test("the system hard cap carries no per-mission budget intent", () => {
+  // The regression this pins: feeding MAX_AGENT_STEPS through as a configured
+  // budget resolved every profile to it, so `compose` and `grounded_research`
+  // stopped constraining anything and a short composed note was budgeted 100
+  // model calls.
+  const compose = resolveMissionEffortDecisionV1({
+    prompt: ORCHESTRATION_GUIDE_PROMPT,
+    route: "single_model_writeback",
+    outputTarget: "new_note",
+    configuredMaxModelCalls: MAX_AGENT_STEPS,
+    configuredMaxToolCalls: MAX_AGENT_STEPS,
+  });
+  assert.equal(compose.profile, "compose");
+  assert.equal(compose.maxModelCalls, 6);
+  assert.equal(compose.maxToolCalls, 4);
+
+  const grounded = resolveMissionEffortDecisionV1({
+    prompt: "Write a report using current sources and citations.",
+    route: "grounded_workflow",
+    outputTarget: "new_note",
+    configuredMaxModelCalls: MAX_AGENT_STEPS,
+    configuredMaxToolCalls: MAX_AGENT_STEPS,
+  });
+  assert.equal(grounded.profile, "grounded_research");
+  assert.equal(grounded.maxModelCalls, 16);
+  assert.equal(grounded.maxToolCalls, 12);
+
+  // One step below the cap is a deliberate narrowing and still binds.
+  const narrowed = resolveMissionEffortDecisionV1({
+    prompt: "Write a report using current sources and citations.",
+    route: "grounded_workflow",
+    outputTarget: "new_note",
+    configuredMaxModelCalls: MAX_AGENT_STEPS - 1,
+    configuredMaxToolCalls: MAX_AGENT_STEPS - 1,
+  });
+  assert.equal(narrowed.maxModelCalls, MAX_AGENT_STEPS - 1);
+  assert.equal(narrowed.maxToolCalls, MAX_AGENT_STEPS - 1);
 });
 
 test("configured 8 on a grounded profile → 8", () => {

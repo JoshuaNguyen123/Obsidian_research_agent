@@ -7970,9 +7970,12 @@ test("conceptual vault prompts expose semantic search as a read tool", async () 
   assert.ok(toolNames.includes("semantic_search_notes"));
   assert.ok(toolNames.includes("search_markdown_files"));
   assert.ok(!toolNames.includes("append_to_current_file"));
+  // The read is the host opening what the search surfaced. It used to be
+  // skipped: the "already read" set came from mission evidence, and a vault
+  // search stamps its own top hit onto the evidence record it produces.
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["semantic_search_notes"],
+    ["semantic_search_notes", "read_file"],
   );
 });
 
@@ -14527,9 +14530,14 @@ test("duplicate read-only tool calls hit the run-local cache", async () => {
   });
 
   assert.equal(chatRequests.length, 3);
+  // The duplicate search is served from the run-local cache. The read is the
+  // host opening what that search surfaced: while the "already read" set was
+  // sourced from mission evidence, a vault search stamped its own top hit onto
+  // the evidence record, the follow-up treated the best match as already read,
+  // and the note was never opened.
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["search_markdown_files"],
+    ["search_markdown_files", "read_file"],
   );
   assert.ok(
     metrics.some(
@@ -14573,9 +14581,14 @@ test("duplicate semantic search tool calls hit the run-local cache", async () =>
   });
 
   assert.equal(chatRequests.length, 3);
+  // The duplicate search is served from the run-local cache. The read is the
+  // host opening what that search surfaced: while the "already read" set was
+  // sourced from mission evidence, a vault search stamped its own top hit onto
+  // the evidence record, the follow-up treated the best match as already read,
+  // and the note was never opened.
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["semantic_search_notes"],
+    ["semantic_search_notes", "read_file"],
   );
   assert.ok(
     metrics.some(

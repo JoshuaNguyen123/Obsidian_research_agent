@@ -7,9 +7,15 @@ import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import { assertApprovalSurfaceUsableV1 } from "./fixtures/uiSurfaceAssertions";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import { resolveMissionEffortDecisionV1 } from "../src/agent/missionEffortDecision";
+import { MAX_AGENT_STEPS } from "../src/tools/constants";
 import { resolveNoteOutputPlan } from "../src/agent/noteOutputPolicy";
 import { resolveAdaptiveTeamDispatchV2 } from "../src/agent/researchTeamDispatch";
 import { extractClaimsFromDraft } from "../src/agent/claimLedger";
+import {
+  classifySemanticRetrievalHealthV1,
+  readSemanticRetrievalOutcomeV1,
+  semanticModeSatisfiedV1,
+} from "../src/agent/semanticRetrievalHealth";
 import { randomUUID } from "node:crypto";
 import {
   startAuthenticatedOllamaProxyV1,
@@ -32,12 +38,17 @@ test.describe("Daily-use live research contract", () => {
       streamWritebackMode: "all_current_note_content_writes",
       autoTitleOnWrite: true,
     });
+    // Mirror the shipped safety ceiling exactly: both presets pin
+    // `maxAgentSteps` to the MAX_AGENT_STEPS hard cap and leave
+    // `maxRunMinutes` null, so this asserts the real default contract rather
+    // than a configuration no user ships with.
     const effort = resolveMissionEffortDecisionV1({
       prompt: ORCHESTRATION_GUIDE_PROMPT,
       route: "single_model_writeback",
       outputTarget: output.destination,
-      configuredMaxModelCalls: 100,
-      configuredMaxRunMinutes: 60,
+      configuredMaxModelCalls: MAX_AGENT_STEPS,
+      configuredMaxToolCalls: MAX_AGENT_STEPS,
+      configuredMaxRunMinutes: null,
     });
     const team = await resolveAdaptiveTeamDispatchV2({
       prompt: ORCHESTRATION_GUIDE_PROMPT,
@@ -721,6 +732,87 @@ test.describe("Daily-use live research contract", () => {
     }
   });
 
+  test("degraded semantic retrieval reports lexical fallback instead of passing as semantic", async () => {
+    let harness: RealAiHarness | null = null;
+    try {
+      harness = await startRealAiHarness(
+        "live-semantic-degraded-honesty",
+        {},
+        {
+          // Force the embedding call to fail. FastEmbed is normally installed
+          // on a development machine, so the degraded path never appears
+          // locally -- which is precisely why it shipped unannounced. The lane
+          // creates the condition rather than waiting to observe it, otherwise
+          // it stays green here and is wrong on a user's machine.
+          //
+          // The lever is the model, not `semanticPythonCommand`: that setting
+          // is a preference, not an override -- `getPythonCommands` appends
+          // "python" and "py", so a bogus interpreter silently falls through
+          // to the system one and semantic search keeps working.
+          semanticEmbeddingModel: "agentic-researcher/no-such-embedding-model",
+          semanticIndexEnabled: true,
+          enableStreaming: false,
+          thinkingMode: "off",
+          agenticReflexEnabled: false,
+        },
+      );
+      const sourcePath = `E2E Agent Tests/semantic-degraded-${harness.marker}.md`;
+      await harness.seedNote(
+        sourcePath,
+        [
+          "# Controlled onboarding validation",
+          "",
+          "Moving validation before writes reduced user-visible errors.",
+        ].join(String.fromCharCode(10)),
+      );
+
+      // Drive the real tool against the real (broken) runtime. Asking a model
+      // to choose `semantic_search_notes` would make this lane depend on model
+      // behaviour: the first version of this test did exactly that, the model
+      // called no tool at all, and the assertion failed for a reason that had
+      // nothing to do with semantic honesty.
+      const probe = await harness.page.evaluate(async (pluginId) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        if (!plugin) throw new Error("Core plugin unavailable.");
+        const registry = plugin.createToolRegistry();
+        const context = plugin.createToolExecutionContext(
+          "semantic retrieval honesty probe",
+        );
+        const result = await registry.execute(
+          {
+            name: "semantic_search_notes",
+            arguments: { query: "controlled onboarding validation" },
+          },
+          context,
+        );
+        return { ok: result?.ok ?? null, output: result?.output ?? null };
+      }, NATIVE_CORE_PLUGIN_ID);
+
+      const state = JSON.stringify(probe);
+      // The tool still answers -- degrading, not failing -- but it says so.
+      expect(probe.ok, state).toBe(true);
+      const outcome = readSemanticRetrievalOutcomeV1(probe.output);
+      expect(outcome, state).not.toBeNull();
+      expect(outcome?.fallbackUsed, state).toBe(true);
+      expect(outcome?.mode, state).toBe("lexical_fallback");
+
+      // A lane that asked for meaning must fail on this receipt, not pass.
+      expect(semanticModeSatisfiedV1(outcome?.mode ?? null), state).toBe(false);
+
+      // And the run has one actionable cause to show the user, not four.
+      const health = classifySemanticRetrievalHealthV1(outcome!);
+      expect(health.status, state).not.toBe("ok");
+      expect(health.cause, state).toBe("embedding_call_failed");
+      expect(health.semanticScoringUsed, state).toBe(false);
+      expect(health.message, state).toMatch(/keyword search/iu);
+      // A keyword-matched answer must still owe a real note read.
+      expect(health.requiresKeywordCorroboration, state).toBe(true);
+    } finally {
+      await harness?.close();
+    }
+  });
+
   test("bounded recovery changes action after a retryable owned-source failure", async () => {
     let harness: RealAiHarness | null = null;
     try {
@@ -1008,10 +1100,18 @@ test.describe("Daily-use live research contract", () => {
       // The Lead already produced a verified append receipt. A root deadline
       // racing that receipt must not demote the applied mission to a resumable
       // budget/blocked terminal.
+      //
+      // Both completed-success terminals satisfy that. An adaptive-team run is
+      // multi-segment: the Lead segment commits the append and finishes
+      // `write_completed`, then the closing segment ends the mission `final`,
+      // and `lastComplete` is whichever fired last. Pinning the literal
+      // `write_completed` asserted segment ordering, not the invariant. The
+      // write-specific acceptance reconciliation no longer depends on which of
+      // the two fired, so the label carries no behavioural difference here.
       expect(
-        snapshot.lastComplete.stopReason,
+        ["write_completed", "final"],
         JSON.stringify(safeState),
-      ).toBe("write_completed");
+      ).toContain(snapshot.lastComplete.stopReason);
 
       // OrchestratorTab.restoreRenderState() re-finds three scroll containers
       // by class after every snapshot, so a stylesheet change that moves
