@@ -85,6 +85,9 @@ export const CODE_IMPLEMENTATION_TOOL_ALLOW = [
 
 export const CODE_VALIDATION_TOOL_ALLOW = [
   "code_sandbox_status",
+  // Scratch missions must be able to create the repository the verified
+  // commit binds to; without it code_commit_verified has nothing to bind.
+  "code_workspace_init_repository",
   "code_validate_fast",
   "code_validate_targeted",
   "code_validate_full",

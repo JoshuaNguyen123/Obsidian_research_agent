@@ -19,6 +19,7 @@ import {
   WorkspaceManagerErrorV2,
   WorkspaceManagerV2,
   assertWorkspaceRelativePathV2,
+  createVerifiedWorkspaceBaseReadbackV2,
   isSha256FingerprintV2,
   type WorkspaceManifestV2,
   type WorkspaceMutationReceiptV2,
@@ -28,6 +29,14 @@ import {
   type RepositoryFileChangeV2,
   type RepositoryProfileV2,
 } from "./repositories";
+import {
+  initializeScratchGitRepositoryV1,
+  scratchRepositoryAgentBranchV1,
+} from "./repositories/ScratchRepositoryPromotionV1";
+import {
+  SpawnFixedArgvGitRunnerV1,
+  type FixedArgvGitBytesRunnerV1,
+} from "./repair/GitRepairProofAdaptersV1";
 import { canonicalJson } from "../../packages/headless-runtime/src/canonicalize";
 import {
   CODE_CREATION_LANGUAGE_SUMMARY_V1,
@@ -41,6 +50,7 @@ import {
 
 export const CODE_WORKSPACE_TOOL_NAMES_V2 = [
   "code_workspace_create",
+  "code_workspace_init_repository",
   "code_workspace_status",
   "code_workspace_stat",
   "code_workspace_list",
@@ -97,6 +107,17 @@ export interface RepositoryWorktreeProvisionV2 extends RepositoryInspectionV2 {
   bindingFingerprint: string;
 }
 
+/**
+ * Result of turning an agent-owned scratch workspace into a repository in
+ * place. `repositoryRoot === worktreeRoot` here by construction, which is
+ * exactly why promotion has its own manager door rather than reusing
+ * `registerTrustedRepositoryWorkspace`.
+ */
+export interface ScratchRepositoryPromotionV2 extends RepositoryWorktreeProvisionV2 {
+  defaultBranch: string;
+  trackedPaths: string[];
+}
+
 export interface WorkspaceRepositoryProvisionerV2 {
   resolveProfile?(profileKey: string, context: ScopedExtensionContextV1): Promise<string | null>;
   resolveProfileContract?(profileKey: string, context: ScopedExtensionContextV1): Promise<RepositoryProfileV2 | null>;
@@ -109,6 +130,19 @@ export interface WorkspaceRepositoryProvisionerV2 {
     inspection: RepositoryInspectionV2;
     context: ScopedExtensionContextV1;
   }): Promise<RepositoryWorktreeProvisionV2>;
+  /**
+   * `git init` + initial commit inside an agent-owned scratch workspace root.
+   * Optional so a host that cannot offer it simply never exposes the tool.
+   */
+  initializeScratchRepository?(input: {
+    workspaceId: string;
+    profileKey: string;
+    canonicalRoot: string;
+    branch: string;
+    commitMessage: string;
+    trackedPaths: readonly string[];
+    context: ScopedExtensionContextV1;
+  }): Promise<ScratchRepositoryPromotionV2>;
 }
 
 export interface CodeWorkspaceToolFactoryOptionsV2 {
@@ -239,6 +273,12 @@ class WorkspaceToolRuntimeV2 {
         return {
           ok: true,
           action: await this.prepareDirectoryExport(args, context),
+        };
+      }
+      if (name === "code_workspace_init_repository") {
+        return {
+          ok: true,
+          action: await this.prepareScratchRepositoryPromotion(args, context),
         };
       }
       const workspaceId = workspaceIdFrom(args, context);
@@ -541,6 +581,9 @@ class WorkspaceToolRuntimeV2 {
     if (name === "code_workspace_export_directory") {
       return this.executePreparedDirectoryExport(action, context);
     }
+    if (name === "code_workspace_init_repository") {
+      return this.executePreparedScratchRepositoryPromotion(action, context);
+    }
     const args = action.normalizedArgs;
     const workspaceId = requiredString(args.workspaceId, "workspaceId");
     const leaseId = requiredString(args.leaseId, "leaseId");
@@ -669,6 +712,43 @@ class WorkspaceToolRuntimeV2 {
       const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
       if (name === "code_workspace_export_directory") {
         return this.reconcileDirectoryExport(action, context);
+      }
+      if (name === "code_workspace_init_repository") {
+        const promoted = await this.manager.loadManifest(workspaceId);
+        const binding = promoted.repositoryBinding;
+        // The binding fingerprint covers the initial commit SHA, which cannot
+        // exist at prepare time. The branch is deterministic from the
+        // workspace id, and in-place promotion pins both roots to the
+        // canonical root, so those three together identify this promotion.
+        if (
+          promoted.kind === "repository" &&
+          promoted.ownerRunId === ownerRunId &&
+          binding?.branch === requiredString(args.branch, "branch") &&
+          samePath(binding.repositoryRoot, promoted.canonicalRoot) &&
+          samePath(binding.worktreeRoot, promoted.canonicalRoot)
+        ) {
+          return {
+            outcome: "committed" as const,
+            message: `Workspace ${workspaceId} carries its exact promoted repository binding.`,
+            receipt: workspaceCreationReceipt(
+              action,
+              reconcileContext(context, action),
+              promoted,
+              binding.bindingFingerprint,
+              `Reconciled scratch repository promotion for ${workspaceId}.`,
+            ),
+          };
+        }
+        if (promoted.kind === "scratch") {
+          return {
+            outcome: "not_applied" as const,
+            message: `Workspace ${workspaceId} is still a scratch workspace; its promotion was not applied.`,
+          };
+        }
+        return {
+          outcome: "still_uncertain" as const,
+          message: `Workspace ${workspaceId} carries a repository binding that does not match the approved promotion.`,
+        };
       }
       const manifest = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
       if (name === "code_workspace_create") {
@@ -1457,6 +1537,246 @@ class WorkspaceToolRuntimeV2 {
     };
   }
 
+  /**
+   * Prepare the scratch -> repository promotion.
+   *
+   * The approval the user sees names the exact workspace, the exact files that
+   * will become the initial commit, and the branch. Nothing here is
+   * model-chosen except an optional commit message: the branch is derived from
+   * the workspace id, and the file list is the manager's own durable hash
+   * index, so the model cannot widen what gets committed.
+   */
+  private async prepareScratchRepositoryPromotion(
+    args: Record<string, unknown>,
+    context: ScopedExtensionContextV1,
+  ): Promise<PreparedActionV1> {
+    if (!this.repositories.initializeScratchRepository) {
+      throw new WorkspaceManagerErrorV2(
+        "scratch_promotion_unavailable",
+        "This host cannot initialize a repository inside a scratch workspace.",
+      );
+    }
+    const workspaceId = workspaceIdFrom(args, context);
+    const ownerRunId = runId(context);
+    const leaseId = await this.ensureLease(workspaceId, context);
+    const leaseOwnerId = `extension:${ownerRunId}`;
+    const manifest = await this.assertBoundWorkspace(
+      workspaceId,
+      ownerRunId,
+      leaseId,
+      leaseOwnerId,
+    );
+    if (manifest.kind !== "scratch") {
+      throw new WorkspaceManagerErrorV2(
+        "scratch_promotion_kind_invalid",
+        `Only a scratch workspace can be promoted to a repository; ${workspaceId} is ${manifest.kind}.`,
+      );
+    }
+    const trackedPaths = Object.keys(manifest.hashes.files).sort();
+    if (trackedPaths.length < 1) {
+      throw new WorkspaceManagerErrorV2(
+        "scratch_promotion_empty",
+        "Promote a workspace to a repository only after it holds at least one durable file.",
+      );
+    }
+    const branch = scratchRepositoryAgentBranchV1(workspaceId);
+    const profileKey = `scratch-${workspaceId}`.slice(0, 128);
+    const commitMessage =
+      optionalString(args.commitMessage)?.trim() ||
+      `Initial commit for ${workspaceId}`;
+    const expected = sha256Json({
+      workspaceId,
+      ownerRunId,
+      kind: "scratch",
+      canonicalRoot: manifest.canonicalRoot,
+      indexFingerprint: manifest.hashes.indexFingerprint,
+      trackedPaths,
+      branch,
+    });
+    return preparedAction({
+      name: "code_workspace_init_repository",
+      context,
+      workspaceId,
+      targetPath: workspaceId,
+      normalizedArgs: {
+        workspaceId,
+        ownerRunId,
+        leaseId,
+        leaseOwnerId,
+        profileKey,
+        branch,
+        commitMessage,
+        trackedPaths,
+        indexFingerprint: manifest.hashes.indexFingerprint,
+        canonicalRoot: manifest.canonicalRoot,
+        expectedWorkspaceState: "scratch",
+        payloadBytes: 0,
+      },
+      expected,
+      summary:
+        `Initialize a Git repository inside workspace ${workspaceId} and commit ` +
+        `${trackedPaths.length} file(s) on branch ${branch}.`,
+      action: "create",
+      outboundBytes: 0,
+      targetType: "code_workspace",
+      previewDestination: manifest.canonicalRoot,
+      relatedResources: [{
+        system: "git",
+        resourceType: "repository",
+        id: `repository:${manifest.canonicalRoot}`,
+        path: manifest.canonicalRoot,
+      }],
+      repositoryProfileId: profileKey,
+      warnings: [
+        "This creates a new local Git repository inside the agent workspace. It does not touch any existing repository and does not add a remote.",
+      ],
+    });
+  }
+
+  private async executePreparedScratchRepositoryPromotion(
+    action: PreparedActionV1,
+    context: ScopedExtensionContextV1,
+  ) {
+    const initialize =
+      this.repositories.initializeScratchRepository?.bind(this.repositories);
+    if (!initialize) {
+      throw new WorkspaceManagerErrorV2(
+        "scratch_promotion_unavailable",
+        "This host cannot initialize a repository inside a scratch workspace.",
+      );
+    }
+    const args = action.normalizedArgs;
+    const workspaceId = requiredString(args.workspaceId, "workspaceId");
+    const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
+    const leaseId = requiredString(args.leaseId, "leaseId");
+    const leaseOwnerId = requiredString(args.leaseOwnerId, "leaseOwnerId");
+    const profileKey = requiredString(args.profileKey, "profileKey");
+    const branch = requiredString(args.branch, "branch");
+    const commitMessage = requiredString(args.commitMessage, "commitMessage");
+    const trackedPaths = requiredStringArray(args.trackedPaths, "trackedPaths");
+    if (
+      ownerRunId !== runId(context) ||
+      action.target.workspaceId !== workspaceId ||
+      action.target.path !== workspaceId ||
+      args.expectedWorkspaceState !== "scratch"
+    ) {
+      throw new WorkspaceManagerErrorV2(
+        "prepared_binding_drift",
+        "Prepared scratch repository promotion binding changed.",
+      );
+    }
+    assertPayloadBytes(args, 0);
+    const manifest = await this.assertBoundWorkspace(
+      workspaceId,
+      ownerRunId,
+      leaseId,
+      leaseOwnerId,
+    );
+    if (manifest.kind === "repository") {
+      // Idempotent retry over an already-applied promotion.
+      const binding = manifest.repositoryBinding;
+      if (
+        binding?.profileKey !== profileKey ||
+        binding.branch !== branch ||
+        !samePath(binding.worktreeRoot, manifest.canonicalRoot)
+      ) {
+        throw new WorkspaceManagerErrorV2(
+          "workspace_binding_conflict",
+          "Workspace is already bound to different durable repository state.",
+        );
+      }
+      return {
+        output: {
+          ...manifest,
+          repositoryWriteScope: await this.resolveRepositoryWriteScopeOutput(
+            profileKey,
+            context,
+          ),
+        },
+        receipt: workspaceCreationReceipt(
+          action,
+          context,
+          manifest,
+          binding.bindingFingerprint,
+          `Reused the promoted repository binding for ${workspaceId}.`,
+        ),
+        mutationState: "applied" as const,
+      };
+    }
+    if (
+      manifest.kind !== "scratch" ||
+      manifest.hashes.indexFingerprint !== requiredFingerprint(args.indexFingerprint) ||
+      !samePath(manifest.canonicalRoot, requiredString(args.canonicalRoot, "canonicalRoot"))
+    ) {
+      throw new WorkspaceManagerErrorV2(
+        "precondition_failed",
+        "The workspace changed between approval and promotion.",
+      );
+    }
+    const promoted = await initialize({
+      workspaceId,
+      profileKey,
+      canonicalRoot: manifest.canonicalRoot,
+      branch,
+      commitMessage,
+      trackedPaths,
+      context,
+    });
+    if (
+      promoted.branch !== branch ||
+      promoted.profileKey !== profileKey ||
+      !samePath(promoted.repositoryRoot, manifest.canonicalRoot) ||
+      !samePath(promoted.worktreeRoot, manifest.canonicalRoot)
+    ) {
+      throw new WorkspaceManagerErrorV2(
+        "repository_binding_drift",
+        "The initialized repository does not match the approved workspace, branch, and profile.",
+      );
+    }
+    const readback = createVerifiedWorkspaceBaseReadbackV2({
+      operationId: action.id,
+      workspaceId,
+      worktreeRoot: promoted.worktreeRoot,
+      branch: promoted.branch,
+      headSha: promoted.baseSha,
+      clean: true,
+      handoffFingerprint: action.payloadFingerprint,
+    });
+    const bound = await this.manager.promoteScratchWorkspaceToRepositoryAfterVerifiedReadback({
+      operationId: action.id,
+      workspaceId,
+      ownerRunId,
+      leaseId,
+      profileKey,
+      repositoryRoot: promoted.repositoryRoot,
+      branch: promoted.branch,
+      baseSha: promoted.baseSha,
+      bindingFingerprint: promoted.bindingFingerprint,
+      handoffFingerprint: action.payloadFingerprint,
+      readback,
+    });
+    await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+    return {
+      output: {
+        ...bound,
+        defaultBranch: promoted.defaultBranch,
+        trackedPaths: promoted.trackedPaths,
+        repositoryWriteScope: await this.resolveRepositoryWriteScopeOutput(
+          profileKey,
+          context,
+        ),
+      },
+      receipt: workspaceCreationReceipt(
+        action,
+        context,
+        bound,
+        promoted.bindingFingerprint,
+        `Initialized repository ${branch} at ${promoted.baseSha} inside workspace ${workspaceId}.`,
+      ),
+      mutationState: "applied" as const,
+    };
+  }
+
   private async resolveRepositoryWriteScopeOutput(
     profileKey: string,
     context: ScopedExtensionContextV1,
@@ -1514,6 +1834,8 @@ class WorkspaceToolRuntimeV2 {
 }
 
 export class LocalGitWorkspaceProvisionerV2 implements WorkspaceRepositoryProvisionerV2 {
+  private scratchGitRunner: FixedArgvGitBytesRunnerV1 | null = null;
+
   constructor(private readonly manager: WorkspaceManagerV2) {}
 
   async inspect(repositoryRoot: string, context: ScopedExtensionContextV1): Promise<RepositoryInspectionV2> {
@@ -1567,6 +1889,71 @@ export class LocalGitWorkspaceProvisionerV2 implements WorkspaceRepositoryProvis
       }),
     };
   }
+
+  async initializeScratchRepository(input: {
+    workspaceId: string;
+    profileKey: string;
+    canonicalRoot: string;
+    branch: string;
+    commitMessage: string;
+    trackedPaths: readonly string[];
+    context: ScopedExtensionContextV1;
+  }): Promise<ScratchRepositoryPromotionV2> {
+    const initialized = await initializeScratchGitRepositoryV1({
+      git: this.scratchGit(),
+      canonicalRoot: input.canonicalRoot,
+      branch: input.branch,
+      commitMessage: input.commitMessage,
+      trackedPaths: input.trackedPaths,
+      disabledHooksPath: await ensureScratchPromotionHooksDirectory(
+        this.manager.applicationDataRoot,
+      ),
+      signal: input.context.abortSignal,
+    });
+    return {
+      repositoryRoot: initialized.repositoryRoot,
+      worktreeRoot: initialized.worktreeRoot,
+      branch: initialized.branch,
+      defaultBranch: initialized.defaultBranch,
+      baseSha: initialized.baseSha,
+      clean: initialized.clean,
+      trackedPaths: initialized.trackedPaths,
+      profileKey: input.profileKey,
+      bindingFingerprint: sha256Json({
+        profileKey: input.profileKey,
+        repositoryRoot: initialized.repositoryRoot,
+        baseSha: initialized.baseSha,
+        branch: initialized.branch,
+      }),
+    };
+  }
+
+  private scratchGit(): FixedArgvGitBytesRunnerV1 {
+    // The hardened runner: argv-only spawn, no interactive credentials, no
+    // system/global config, pinned neutral agent identity, and a local
+    // clean/smudge filter refusal on add/commit.
+    this.scratchGitRunner ??= new SpawnFixedArgvGitRunnerV1();
+    return this.scratchGitRunner;
+  }
+}
+
+/**
+ * Host-owned empty directory used as `core.hooksPath` for the promotion
+ * commit, mirroring the verified commit gateway's disabled-hooks path.
+ */
+async function ensureScratchPromotionHooksDirectory(
+  applicationDataRoot: string,
+): Promise<string> {
+  const hooks = path.join(applicationDataRoot, "scratch-promotion-disabled-hooks");
+  await fs.mkdir(hooks, { recursive: true });
+  const stat = await fs.lstat(hooks);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new WorkspaceManagerErrorV2(
+      "hooks_path_invalid",
+      "Host-controlled disabled-hooks path is not a safe directory.",
+    );
+  }
+  return fs.realpath(hooks);
 }
 
 async function ensureSafeWorktreeParent(applicationDataRoot: string): Promise<string> {
@@ -1654,6 +2041,7 @@ function toolDescriptor(
   const destructive = name === "code_workspace_trash";
   const action: ResourceActionV1 = read
     ? name.includes("list") ? "list" : name.includes("search") ? "search" : "read"
+    : name === "code_workspace_init_repository" ? "create"
     : name.includes("restore") ? "restore"
       : destructive ? "trash"
         : name.includes("move") ? "move"
@@ -2079,6 +2467,7 @@ function cleanGitEnvironment(nullDevice: string): NodeJS.ProcessEnv {
 
 function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
   if (name === "code_workspace_create") return objectSchema({ workspaceId: stringSchema(), kind: { type: "string", enum: ["scratch", "repository"] }, repositoryProfileKey: stringSchema(), repositoryRoot: stringSchema() });
+  if (name === "code_workspace_init_repository") return objectSchema({ workspaceId: stringSchema(), commitMessage: stringSchema() });
   if (name === "code_workspace_status") return objectSchema({ workspaceId: stringSchema() });
   if (name === "code_workspace_search") return objectSchema({ workspaceId: stringSchema(), query: stringSchema(), path: stringSchema(), caseSensitive: { type: "boolean" }, limit: { type: "integer" } }, ["query"]);
   if (name === "code_workspace_list" || name === "list_workspace_files") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() });
@@ -2149,6 +2538,8 @@ function description(name: string): string {
   let text = base;
   if (name === "code_workspace_create") {
     text = `${base} This is the bootstrap step, not the final deliverable. After it succeeds, code_workspace_mkdir and code_workspace_create_file become available. Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
+  } else if (name === "code_workspace_init_repository") {
+    text = `Purpose: Turn this scratch workspace into a real Git repository so the commit and GitHub publication steps become available. Use when: the project files are written and validated and the mission asks for a commit, a repository, or a GitHub publication, and code_commit_verified reports that no repository is bound. Do not use when: the workspace was created from an existing repository. Required: nothing beyond the workspace; commitMessage is optional. Next: code_commit_verified, then create_private_github_repository and publish_verified_code_to_github. Side effects: exact approval-gated git init plus one initial commit of the files this workspace already tracks, inside the workspace directory only. ${base} It never touches an existing repository, never adds a remote, and refuses a workspace that already contains one.`;
   } else if (name === "code_workspace_mkdir") {
     text = `Purpose: Create a nested directory path inside the bounded code workspace. Required: path. Side effects: bound write. ${base} Every missing parent directory is created safely; an existing directory is accepted, but a file conflict is rejected.`;
   } else if (name === "code_workspace_export_directory") {
@@ -2768,6 +3159,7 @@ function runId(context: ScopedExtensionContextV1): string { return context.rootM
 function actionRunId(context: ScopedExtensionContextV1): string { return context.missionId ?? context.rootMissionId ?? context.operationId ?? "adhoc"; }
 function requiredPath(args: Record<string, unknown>, ...names: string[]): string { for (const name of names) { const value = optionalString(args[name]); if (value) return assertWorkspaceRelativePathV2(value); } throw new WorkspaceManagerErrorV2("invalid_arguments", `${names[0]} is required.`); }
 function requiredString(value: unknown, label: string, allowEmpty = false): string { if (typeof value !== "string" || (!allowEmpty && !value.length)) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a string${allowEmpty ? "" : " with content"}.`); return value; }
+function requiredStringArray(value: unknown, label: string): string[] { if (!Array.isArray(value) || value.length < 1) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a non-empty array.`); return value.map((entry) => requiredString(entry, label)); }
 function optionalString(value: unknown): string | null { return typeof value === "string" && value.trim() ? value.trim() : null; }
 function optionalInteger(value: unknown): number | undefined { return Number.isSafeInteger(value) ? Number(value) : undefined; }
 function requiredFingerprint(value: unknown): string { if (!isSha256FingerprintV2(value)) throw new WorkspaceManagerErrorV2("invalid_arguments", "A SHA-256 fingerprint is required."); return value; }

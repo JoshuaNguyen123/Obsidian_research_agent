@@ -469,6 +469,7 @@ test("a natural developer mission routes the full canonical executable ladder wi
     "code_repair_record_cycle",
     "code_validate_targeted",
     "code_validate_full",
+    "code_workspace_init_repository",
     "code_commit_verified",
     CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
     "publish_verified_code_to_github",
@@ -486,6 +487,7 @@ test("a natural developer mission routes the full canonical executable ladder wi
     "code_repair_record_cycle",
     "code_validate_targeted",
     "code_validate_full",
+    "code_workspace_init_repository",
     "code_commit_verified",
     CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
     "publish_verified_code_to_github",
@@ -502,6 +504,7 @@ test("a natural developer mission routes the full canonical executable ladder wi
     "code_repair_record_cycle",
     "code_validate_targeted",
     "code_validate_full",
+    "code_workspace_init_repository",
     "code_commit_verified",
   ]);
 });

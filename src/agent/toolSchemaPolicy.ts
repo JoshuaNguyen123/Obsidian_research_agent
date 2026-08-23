@@ -95,6 +95,7 @@ export const ROUTE_BASE_TOOLS: Readonly<
     "code_validate_full",
     "code_repair_record_cycle",
     "code_repair_status",
+    "code_workspace_init_repository",
     "code_commit_verified",
   ],
   default: ["read_current_file", "list_markdown_files", "read_file"],

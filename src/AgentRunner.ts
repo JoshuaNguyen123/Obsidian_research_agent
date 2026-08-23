@@ -24972,6 +24972,7 @@ const TOOL_GOALS: Partial<Record<string, OperationGoal[]>> = {
 
 const CODE_TOOL_NAMES = new Set([
   "code_workspace_create",
+  "code_workspace_init_repository",
   "code_workspace_status",
   "code_workspace_stat",
   "code_workspace_list",
@@ -25132,6 +25133,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   export_workspace_artifact: "code",
   install_code_dependency: "code",
   code_workspace_create: "code",
+  code_workspace_init_repository: "code",
   code_workspace_status: "code",
   code_workspace_stat: "code",
   code_workspace_list: "code",
@@ -27333,6 +27335,14 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
     /\bcommit\b/i.test(prompt) ||
     joinedDeveloperLifecycle
   ) {
+    // A scratch delivery has no repository for the verified commit to bind to,
+    // and until the promotion tool existed there was no production path that
+    // could create one — code_commit_verified simply bailed on the missing
+    // manifest.repositoryBinding after the files were already authored.
+    // Repository missions already carry a binding and must never be promoted.
+    if (!repositoryMutation && !hasRepositoryCodeEditIntent(prompt)) {
+      tools.push("code_workspace_init_repository");
+    }
     tools.push("code_commit_verified");
   }
   return [...new Set(tools)];

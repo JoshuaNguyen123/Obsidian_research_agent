@@ -78,6 +78,7 @@ export interface CoreToolNameReservation {
 
 export const CODE_EXTENSION_V2_TOOL_NAMES = Object.freeze([
   "code_workspace_create",
+  "code_workspace_init_repository",
   "code_workspace_status",
   "code_workspace_stat",
   "code_workspace_list",

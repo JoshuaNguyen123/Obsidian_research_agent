@@ -36,7 +36,7 @@ test("workspace contribution factory replaces every new and legacy tool name", a
       contributions.map((item) => item.tool.name),
       [...CODE_WORKSPACE_TOOL_NAMES_V2],
     );
-    assert.equal(new Set(contributions.map((item) => item.tool.name)).size, 22);
+    assert.equal(new Set(contributions.map((item) => item.tool.name)).size, 23);
     for (const contribution of contributions) {
       assert.equal(contribution.descriptor.kind, "tool");
       assert.equal(contribution.tool.descriptor.capability.system === "workspace" || contribution.tool.descriptor.capability.system === "git", true);

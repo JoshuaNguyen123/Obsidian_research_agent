@@ -419,6 +419,7 @@ export function bindTrustedRepositoryWorkspaceCreate(
 }
 
 export const VERIFIED_WORKSPACE_LIFECYCLE_TOOL_NAMES = new Set([
+  "code_workspace_init_repository",
   "code_validate_fast",
   "code_validate_targeted",
   "code_validate_full",
