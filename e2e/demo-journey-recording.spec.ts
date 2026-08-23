@@ -80,7 +80,7 @@ test("DEMO researcher mission appends a cited recommendation with verified sourc
       },
     );
 
-    await assertProductionAdoptedSandboxV1(harness.page, startedAt);
+    await assertProductionAdoptedSandboxV1(harness.page);
     await installDemoPublicSourceBoundaryV1(
       harness.page,
       DEMO_SOURCE_URLS,

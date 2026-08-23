@@ -127,10 +127,7 @@ test("OBS-HELLO Obsidian prompt creates TypeScript app and private GitHub draft 
     const startedAt = Date.now();
     // No injected provider configuration: the plugin must adopt the
     // host-provisioned binding and pass its own boundary probe.
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      startedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     await expectTrustedRepositoryProfile(harness.page, PROFILE_KEY, fixture.root);
 

@@ -1870,6 +1870,85 @@ test("CodeExtensionRuntimeV2 shares one host probe across readiness and direct c
   }
 });
 
+test("CodeExtensionRuntimeV2 re-proves a durable probe once per session and then serves it", async () => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), "code-runtime-sandbox-session-freshness-"),
+  );
+  try {
+    const provider = sandboxProviderForCurrentHost();
+    let probeCalls = 0;
+    const runner: SandboxCommandRunnerV2 = {
+      async run(spec) {
+        assert.equal(spec.purpose, "boundary_probe");
+        probeCalls += 1;
+        return validBoundaryProbe(provider.runtimeDigest);
+      },
+    };
+    // One durable store carried across two runtime lifetimes, exactly as the
+    // vault's data.json is carried across two Obsidian launches.
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    const earlierSession = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({
+        applicationDataRoot: path.join(root, "app-data-earlier"),
+      }),
+      sandboxRunner: runner,
+      now: () => new Date(NOW),
+    });
+    await earlierSession.initialize();
+    await earlierSession.configureSandboxProvider(provider);
+    await earlierSession.ensureHostProvisionedSandboxReadinessV1();
+    assert.equal(
+      earlierSession.readState().sandbox.lastProbe?.observedAt,
+      NOW,
+      "the earlier session must leave a durable observation behind",
+    );
+
+    // A later session loads that observation far outside the freshness window.
+    const later = new Date(Date.parse(NOW) + 4 * 24 * 60 * 60_000).toISOString();
+    const currentSession = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({
+        applicationDataRoot: path.join(root, "app-data-current"),
+      }),
+      sandboxRunner: runner,
+      now: () => new Date(later),
+    });
+    await currentSession.initialize();
+    assert.equal(
+      currentSession.readState().sandbox.lastProbe?.observedAt,
+      NOW,
+      "durable history must survive a restart so staleness is observable",
+    );
+
+    // Startup readiness: the stale durable observation is replaced by this
+    // session's own proof.
+    const startup = await currentSession.ensureHostProvisionedSandboxReadinessV1();
+    assert.equal(startup.executionAvailable, true);
+    assert.equal(probeCalls, 2, "a stale durable observation must be re-proven");
+    assert.equal(
+      currentSession.readState().sandbox.lastProbe?.observedAt,
+      later,
+      "the re-probe result must reach durable state",
+    );
+
+    // Every later readiness caller in the same session is served that one
+    // proof. It does not restamp observedAt, so a consumer that demands an
+    // observation newer than some mid-session instant is asserting something
+    // the product deliberately never promises.
+    const served = await currentSession.ensureHostProvisionedSandboxReadinessV1();
+    assert.deepEqual(served, startup);
+    assert.equal(probeCalls, 2, "a fresh session proof must not be re-run");
+    assert.equal(
+      currentSession.readState().sandbox.lastProbe?.observedAt,
+      later,
+      "serving a fresh session proof must not restamp its observation time",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CodeExtensionRuntimeV2 clears a failed shared probe so a later probe can recover", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "code-runtime-sandbox-retry-"));
   try {

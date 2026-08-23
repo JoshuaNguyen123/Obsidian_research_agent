@@ -62,7 +62,7 @@ test.describe("Daily-use Code capability real-model repository delivery", () => 
       );
       // The plugin must reach a verified sandbox on its own, exactly as it
       // does for a user: no test-injected provider configuration.
-      await assertProductionAdoptedSandboxV1(liveHarness.page, startedAt);
+      await assertProductionAdoptedSandboxV1(liveHarness.page);
       observed.proofs.add("sandbox:boundary_attested");
 
       const requestId = `du03-request-${startedAt}`;

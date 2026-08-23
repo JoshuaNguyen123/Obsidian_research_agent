@@ -417,13 +417,9 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     linearClient ??= createPageBackedLinearReadbackClient(harness.page);
     const activeLinearClient = linearClient;
 
-    const startedAt = Date.now();
     // No injected provider configuration: the plugin must adopt the
     // host-provisioned binding and pass its own boundary probe.
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      startedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     await expectTrustedRepositoryProfile(
       harness.page,
@@ -1463,7 +1459,6 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
   const protectedModel = getE2EAiConfig();
   expect(process.env.E2E_MODEL_PROVIDER?.trim() || "ollama").toBe("ollama");
   expect(normalizeEndpoint(protectedModel.baseUrl)).toBe("https://ollama.com/api");
-  const startedAt = Date.now();
   const suffix = randomUUID().replace(/-/gu, "").slice(0, 16);
   const marker = `DU03_CHECKERS_${suffix}`;
   const workspaceId = `du03-checkers-${suffix}`;
@@ -1529,10 +1524,7 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
     );
     // No injected provider configuration: the plugin must adopt the
     // host-provisioned binding and pass its own boundary probe.
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      startedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     await expectTrustedRepositoryProfile(
       harness.page,

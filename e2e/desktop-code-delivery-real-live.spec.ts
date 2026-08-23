@@ -94,10 +94,7 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
     // No injected provider configuration: the plugin must adopt the
     // host-provisioned binding and pass its own boundary probe, exactly as it
     // must for a user typing this prompt.
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      startedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
 
     let missionFailure: unknown = null;
