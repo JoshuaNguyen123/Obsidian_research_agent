@@ -192,43 +192,45 @@ test("daily quick actions register as commands and route to the right context me
       );
     }
 
+    // Obsidian's own listeners answer the same event, so the collected menu
+    // holds core items too ("Search for …"). Only our labels are ours to
+    // assert on; the rest is the host's menu, not this plugin's contract.
+    const ALL_LABELS = new Set(
+      SELECTION_RESEARCH_ACTIONS.map((action) => action.label),
+    );
+    const ours = (items: Array<{ title: string; section: string | null; icon: string | null }>) =>
+      items.filter((item) => ALL_LABELS.has(item.title));
     const titles = (items: Array<{ title: string }>) =>
       items.map((item) => item.title);
 
-    // A selection offers the selection actions and never the cursor action.
-    expect(titles(probe.withSelection)).toEqual(
-      expect.arrayContaining(SELECTION_LABELS),
-    );
-    for (const label of CURSOR_LABELS) {
-      expect(titles(probe.withSelection)).not.toContain(label);
-    }
+    // A selection offers exactly the selection actions, never the cursor one.
+    expect(titles(ours(probe.withSelection))).toEqual(SELECTION_LABELS);
 
-    // A bare caret after real prose offers only the cursor action.
-    expect(titles(probe.withCaretOnly)).toEqual(CURSOR_LABELS);
+    // A bare caret after real prose offers exactly the cursor action.
+    expect(titles(ours(probe.withCaretOnly))).toEqual(CURSOR_LABELS);
 
     // A caret with nothing before it offers nothing: there is no voice to
     // match, and an entry that opens the panel to complain is worse than none.
-    expect(titles(probe.onEmptyNote)).toEqual([]);
+    expect(titles(ours(probe.onEmptyNote))).toEqual([]);
 
-    // Whole-note actions live in the file menu, not the editor menu.
-    expect(titles(probe.fileMenu)).toEqual(
-      expect.arrayContaining(FILE_LABELS),
-    );
-    for (const label of FILE_LABELS) {
-      expect(titles(probe.withSelection)).not.toContain(label);
-    }
-
-    // Linear publication is hidden until a Linear credential exists.
+    // Whole-note actions live in the file menu, and only there. Linear
+    // publication appears only once a Linear credential exists.
+    const expectedFileLabels = probe.linearConnected
+      ? SELECTION_RESEARCH_ACTIONS.filter((action) => action.inFileMenu).map(
+          (action) => action.label,
+        )
+      : FILE_LABELS;
+    expect(titles(ours(probe.fileMenu))).toEqual(expectedFileLabels);
     if (!probe.linearConnected) {
       for (const label of LINEAR_LABELS) {
         expect(titles(probe.fileMenu)).not.toContain(label);
       }
     }
 
-    // Everything clusters in one menu section instead of scattering through
-    // Obsidian's own items.
+    // Our items cluster in one menu section instead of scattering through
+    // Obsidian's own, and each carries an icon.
     for (const items of [probe.withSelection, probe.withCaretOnly, probe.fileMenu]) {
-      for (const item of items) {
+      for (const item of ours(items)) {
         expect(item.section, item.title).toBe(SELECTION_RESEARCH_MENU_SECTION);
         expect(item.icon, item.title).toBeTruthy();
       }

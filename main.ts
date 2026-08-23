@@ -1761,8 +1761,9 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   /**
    * Collect the text a quick action operates on, or null when the editor is
-   * not in a state that supports it. Cursor actions take everything before the
-   * caret; the prompt builder keeps the tail, which is the join point.
+   * not in a state that supports it. Cursor actions take a bounded window of
+   * lines before the caret; the prompt builder keeps the tail of it, which is
+   * the join point the continuation has to match.
    */
   private readQuickActionText(
     action: SelectionResearchActionV1,
