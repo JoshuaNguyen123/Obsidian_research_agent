@@ -1,6 +1,7 @@
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import { FINALIZATION_RESERVE_STEPS } from "./AgentBudget";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
 import type { RunBudgetProfile, RunBudgetRoute } from "./runBudget";
 import { getRunBudgetProfile, resolveConfiguredMaxAgentSteps } from "./runBudget";
 import type { GeneratedOutputPolicy } from "./generatedOutputPolicy";
@@ -124,6 +125,17 @@ function getExpectedTools(
     !hasPrimaryTextCitationIntent(prompt)
   ) {
     return ["web_search", "web_fetch"];
+  }
+
+  // "What did I conclude about X" is vault retrieval, and the authoritative
+  // MissionGraph plans only what is expected here. Without a slot the router
+  // offers vault tools, the graph reserves nothing for them, and the model's
+  // own `search_markdown_files` is refused as off-frontier — so a question
+  // about the user's own vault ends up answered from model memory. Search then
+  // read, because a search result is a snippet and the vault body-read debt is
+  // only payable by opening the note.
+  if (hasOwnPriorThinkingRecallIntent(prompt)) {
+    return ["search_markdown_files", "read_file"];
   }
 
   return [];

@@ -182,6 +182,7 @@ import {
   followEditorStreamingEnd,
   setEditorValueFollowingStreamEnd,
   type SetCurrentMarkdownContentOptions,
+  type StreamingFollowEditor,
 } from "./src/obsidianEditorFollow";
 import {
   DURABLE_MISSION_MAX_MODEL_STEPS,
@@ -331,7 +332,11 @@ import {
 } from "./src/orchestrator/specialistHandoff";
 import { resolveAdaptiveTeamDispatchV2 } from "./src/agent/researchTeamDispatch";
 import { runExtensionVerifiers } from "./src/agent/extensionVerifiers";
-import { runCriticWorker } from "./src/orchestrator/criticWorker";
+import {
+  CRITIC_MAX_STEPS,
+  CRITIC_MAX_TOOL_CALLS,
+  runCriticWorker,
+} from "./src/orchestrator/criticWorker";
 import type { VerificationCheck } from "./src/agent/verifiers";
 import { runResearchWorker } from "./src/orchestrator/researchWorker";
 import { mergeResearchWorkerResult } from "./src/orchestrator/teamEvidenceMerge";
@@ -9961,8 +9966,16 @@ export default class AgenticResearcherPlugin extends Plugin {
             toolRegistry: teamReadOnlyRegistry,
             toolContext: this.createToolExecutionContext(input.prompt),
             abortSignal: rootDeadline.signal,
-            maxSteps: 1,
-            maxToolCalls: 0,
+            // The module declares 8/8 and carries a read-only registry holding
+            // exactly the tools needed to check a claim against its source. At
+            // 1 step / 0 tool calls the critic was one turn over the final text
+            // and structurally unable to open a single artifact it reviewed.
+            //
+            // Bounded by what the Specialist has actually left rather than by a
+            // fresh allowance, so raising the ceiling cannot starve the mission
+            // being reviewed and `consumeOrThrow` below can always settle.
+            maxSteps: Math.min(CRITIC_MAX_STEPS, specialistReviewStepsRemaining),
+            maxToolCalls: CRITIC_MAX_TOOL_CALLS,
             onModelCallEvidence: (event) => {
               input.events.onModelCallEvidence?.(event);
             },
@@ -15431,9 +15444,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (recentEditor?.setValue) {
       setEditorValueFollowingStreamEnd(recentEditor, content, options);
       if (options.followStreamingEnd) {
-        // Re-follow after Obsidian finishes layout from the writeback.
+        // Re-follow after Obsidian finishes layout from the writeback. Pass the
+        // same options so the re-follow shares this stream's follow state and
+        // does not re-attach a viewport the reader just scrolled away from.
         queueMicrotask(() =>
-          followEditorStreamingEnd(recentEditor, content),
+          followEditorStreamingEnd(recentEditor, content, options),
         );
       }
       return true;
@@ -15444,7 +15459,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       if (editor?.setValue) {
         setEditorValueFollowingStreamEnd(editor, content, options);
         if (options.followStreamingEnd) {
-          queueMicrotask(() => followEditorStreamingEnd(editor, content));
+          queueMicrotask(() =>
+            followEditorStreamingEnd(editor, content, options),
+          );
         }
         return true;
       }
@@ -16920,42 +16937,20 @@ function getMarkdownTextFromLeaf(
   return typeof value === "string" ? value : null;
 }
 
+/**
+ * The live Obsidian editor, typed as the structural subset streamed writeback
+ * uses. Keeping this identical to `StreamingFollowEditor` is what lets a flush
+ * take the ranged `replaceRange` path instead of replacing the whole buffer —
+ * a narrower type here silently degrades every stream to a full overwrite.
+ */
 function getMarkdownEditorFromLeaf(
   leaf: WorkspaceLeaf | null,
   file: TFile,
-):
-  | {
-      getValue?: () => string;
-      setValue?: (value: string) => void;
-      offsetToPos?: (offset: number) => { line: number; ch: number };
-      lastLine?: () => number;
-      getLine?: (line: number) => string;
-      scrollIntoView?: (
-        range: {
-          from: { line: number; ch: number };
-          to: { line: number; ch: number };
-        },
-        center?: boolean,
-      ) => void;
-    }
-  | null {
+): StreamingFollowEditor | null {
   const view = leaf?.view as
     | {
         file?: TFile | null;
-        editor?: {
-          getValue?: () => string;
-          setValue?: (value: string) => void;
-          offsetToPos?: (offset: number) => { line: number; ch: number };
-          lastLine?: () => number;
-          getLine?: (line: number) => string;
-          scrollIntoView?: (
-            range: {
-              from: { line: number; ch: number };
-              to: { line: number; ch: number };
-            },
-            center?: boolean,
-          ) => void;
-        };
+        editor?: StreamingFollowEditor;
       }
     | undefined;
   if (!view || view.file?.path !== file.path) {

@@ -20,6 +20,11 @@ import {
   runSpecialistRecoveryVerifier,
   summarizeTranscriptForWatchdog,
 } from "./orchestrator/watchdogWorker";
+import {
+  CRITIC_MAX_STEPS,
+  CRITIC_MAX_TOOL_CALLS,
+  runCriticWorker,
+} from "./orchestrator/criticWorker";
 import { appendToolTranscript } from "./model/toolTranscript";
 import { serializeToolResultForModel } from "./model/toolResultPayload";
 import {
@@ -239,6 +244,8 @@ import {
   shouldAbortReleasedChunk,
   shouldKeepPostReleaseBuffer as shouldKeepPostReleaseBufferFromGuard,
   createIdempotentStreamRetryPolicy,
+  detectExternalStreamEdit,
+  formatExternalStreamEditMessage,
   type StreamWriteSession,
 } from "./agent/streamedWritebackGuard";
 import {
@@ -315,7 +322,11 @@ import {
   isBroadUnscopedVaultMutation,
   type AutonomyScope,
 } from "./agent/missionScope";
-import { buildLivenessProbe, recheckLinkLiveness } from "./agent/deadLinkCheck";
+import {
+  buildLivenessProbe,
+  recheckLinkLiveness,
+  type LinkLivenessResult,
+} from "./agent/deadLinkCheck";
 import { buildMissionResearchSignalsV1 } from "./agent/missionResearchSignals";
 import {
   MAX_VERIFIED_WORKSPACE_READ_CONTENT_CHARS,
@@ -498,9 +509,15 @@ import {
   shouldRequireLinearIssueTemplateRead,
 } from "./agent/promptIntentClassifiers";
 import {
+  LIVENESS_CAVEAT_HEADING,
   decideSingleAgentLivenessRecheck,
   formatLivenessCaveat,
+  formatLivenessCaveatSection,
 } from "./agent/livenessRecheckPolicy";
+import {
+  buildResearchNoteFrontmatter,
+  type ResearchNoteFrontmatterInput,
+} from "./agent/researchNoteFrontmatter";
 import {
   addLedgerBlocker,
   addLedgerReceipt,
@@ -694,6 +711,7 @@ import {
   type ClaimLedger,
   type ClaimPassageRef,
   shouldRequireClaimGrounding,
+  shouldVerifyQuoteSpansV1,
 } from "./agent/claimLedger";
 import {
   acknowledgeEvidenceConflict,
@@ -6841,6 +6859,7 @@ export async function runAgentMission({
             });
           },
           missionPrompt: activeIntentPrompt,
+          researchFrontmatter: buildStreamedResearchFrontmatter,
           onPartialReceipt: (value) => {
             partialReceipt = value;
           },
@@ -7483,6 +7502,17 @@ export async function runAgentMission({
     // block ordinary sourced writeback when the model uses URL citations instead
     // of passage ids; research acceptance still enforces fetched-source coverage.
     const requireClaimGrounding = shouldRequireClaimGrounding(activeIntentPrompt);
+    // Verbatim quote checking used to need the prompt to literally say "quote".
+    // A deep sourced writeback is a claim of thoroughness and its passages are
+    // already persisted, so the quotations it does contain get checked against
+    // the passage they cite. Verification, not a requirement: quoting nothing
+    // stays a legitimate answer.
+    const verifyQuoteSpans = shouldVerifyQuoteSpansV1({
+      tier: researchPlan?.effort?.tier,
+      sourcedWriteback:
+        effectivePassages.length > 0 ||
+        missionEvidenceRecords.some((item) => item.kind === "web_source"),
+    });
     const verification = runMissionVerifiers({
       plan: missionPlan,
       evidence: missionEvidenceRecords,
@@ -7494,6 +7524,7 @@ export async function runAgentMission({
       passages: effectivePassages,
       conflicts: candidateConflicts,
       requireClaimGrounding,
+      verifyQuoteSpans,
       now: runToolContext.now?.() ?? new Date(),
     });
     lastVerificationChecks = verification.checks;
@@ -8019,6 +8050,244 @@ export async function runAgentMission({
       });
     }
   };
+  /**
+   * Frontmatter for a note the streamed writeback creates.
+   *
+   * `withResearchNoteFrontmatter` existed and was called from exactly one
+   * place — the research-template workflow — so every note the main writeback
+   * path produced landed with no title, no date, no tags and no run id. In a
+   * graph-native app that is a note you can read once and then never find
+   * again.
+   *
+   * Applied only to notes this run creates. Prepending YAML to a note the user
+   * already owns is a destructive edit rather than an enhancement, which is
+   * why the writer excludes the append/replace/edit kinds rather than merely
+   * not handling them.
+   *
+   * `sources` counts real evidence records, so a run that retrieved nothing
+   * says `sources: 0` rather than implying grounding it does not have.
+   */
+  const buildStreamedResearchFrontmatter = (input: {
+    title: string | null;
+    path: string;
+  }): ResearchNoteFrontmatterInput | null => {
+    const sourceUrls = new Set<string>();
+    const sourcePaths = new Set<string>();
+    for (const record of missionEvidenceRecords) {
+      if (record.kind === "web_source" && typeof record.url === "string" && record.url) {
+        sourceUrls.add(record.url);
+      } else if (
+        record.kind === "vault_note" &&
+        typeof record.path === "string" &&
+        record.path
+      ) {
+        sourcePaths.add(record.path);
+      }
+    }
+    const sourceCount = sourceUrls.size + sourcePaths.size;
+    const basename = input.path.replace(/^.*\//u, "").replace(/\.md$/iu, "");
+    const title = input.title?.trim() || basename;
+    return {
+      title,
+      created: (runToolContext.now?.() ?? new Date()).toISOString(),
+      tags: [title, researchPlan?.mode ?? ""].filter(Boolean),
+      sourceCount,
+      // No `confidence`: the only run-level value available here is the effort
+      // tier, and "confidence: deep" is not a confidence. A property that
+      // cannot be read correctly is worse than an absent one.
+      runId,
+    };
+  };
+  /**
+   * The markdown note this run committed, which a liveness caveat can be
+   * appended to. The newest markdown write wins: that is the deliverable the
+   * reader will open.
+   */
+  const resolveLivenessCaveatNotePath = (): string | null => {
+    for (let index = writeReceipts.length - 1; index >= 0; index -= 1) {
+      const receipt = writeReceipts[index];
+      const path = typeof receipt?.path === "string" ? receipt.path : "";
+      if (!path.toLowerCase().endsWith(".md")) continue;
+      if (
+        receipt.operation === "append" ||
+        receipt.operation === "create" ||
+        receipt.operation === "replace" ||
+        receipt.operation === "edit"
+      ) {
+        return path;
+      }
+    }
+    return null;
+  };
+  /**
+   * Append the dead-citation caveat to the committed note and receipt it.
+   *
+   * Host-owned and append-only. The note is already committed and verified, so
+   * this never rewrites body text; it adds a section under a fixed heading and
+   * is idempotent on that heading, so a re-finalized or resumed run cannot
+   * stack two copies.
+   */
+  const appendLivenessCaveatToNote = async (
+    liveness: readonly LinkLivenessResult[],
+    step: number,
+  ): Promise<void> => {
+    const notePath = resolveLivenessCaveatNotePath();
+    if (!notePath) return;
+    const section = formatLivenessCaveatSection(liveness, {
+      checkedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+    });
+    if (!section) return;
+    const file = runToolContext.app.vault.getFileByPath(notePath);
+    if (!file || file.extension.toLowerCase() !== "md") return;
+    const current = await runToolContext.app.vault.read(file);
+    if (current.includes(LIVENESS_CAVEAT_HEADING)) return;
+    const next = `${current}${current.endsWith("\n") ? "" : "\n"}\n${section}`;
+    await runToolContext.app.vault.modify(file, next);
+    const observed = await runToolContext.app.vault.read(file);
+    if (observed !== next) {
+      events.onTrace?.({
+        id: `liveness-caveat-readback-${step}`,
+        kind: "status",
+        step,
+        message:
+          "Liveness caveat readback did not match; the caveat is reported in the run details only.",
+      });
+      return;
+    }
+    const receipt: AgentRunReceipt = {
+      toolName: "append_to_current_file",
+      operation: "append",
+      path: notePath,
+      bytesWritten: getByteLength(section),
+      readback: {
+        status: "verified",
+        checkedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+        observedRevision: hashOperationInput({ path: notePath, content: observed }),
+        observedFingerprint: hashOperationInput(observed),
+      },
+      output: {
+        path: notePath,
+        operation: "append",
+        bytesWritten: getByteLength(section),
+        livenessCaveat: true,
+        deadUrls: liveness
+          .filter((result) => result.liveness === "dead")
+          .map((result) => result.url),
+      },
+      message: `append ${notePath}; liveness caveat`,
+    };
+    writeReceipts.push(receipt);
+    events.onReceipt?.(receipt);
+  };
+  let singleAgentCriticReviewed = false;
+  /**
+   * Bounded, advisory self-critique for a mission that never touches the
+   * orchestrator.
+   *
+   * The independent critic existed but was unreachable here: its only call site
+   * required an active Lead *and* Specialist, a second model client, and an
+   * unspent Specialist step, so an ordinary research mission got no
+   * self-critique at all. This makes one bounded pass reachable on the plain
+   * path while keeping every invariant the orchestrator version holds:
+   *
+   *  - Advisory only. `acceptance` is already computed and is not touched here;
+   *    `missionAcceptance` remains the sole gate on terminal success, and the
+   *    check is deliberately not folded into `lastVerificationChecks` so it
+   *    cannot move the mission scorecard either.
+   *  - The read-only registry is enforced at execution by `runCriticWorker`.
+   *  - At most once per run, and only inside the run's own leftover model-step
+   *    headroom, so reviewing a mission can never starve it.
+   *  - Only for a mission that actually retrieved something. Critiquing a
+   *    chat answer with no evidence tells the reader nothing.
+   */
+  const runSingleAgentCriticReview = async (
+    acceptance: MissionAcceptanceResult,
+    stopReason: AgentRunStopReason,
+    step: number,
+    maxSteps: number,
+  ): Promise<void> => {
+    if (
+      singleAgentCriticReviewed ||
+      // Explicitly enabled, not merely "not disabled": a host that supplies no
+      // settings at all has not opted into spending an extra model call.
+      runToolContext.settings?.agenticReflexEnabled !== true ||
+      orchestratorContext !== undefined ||
+      (stopReason !== "final" && stopReason !== "write_completed") ||
+      acceptance.status !== "pass" ||
+      !lastFinalOutput.trim() ||
+      abortSignal?.aborted
+    ) {
+      return;
+    }
+    // Retrieval, not merely "the run touched a note". Reading the current note
+    // is what almost every mission does; reviewing an answer against that is
+    // not a source check. A fetched web source, or a vault search whose hits
+    // were opened, is.
+    const retrieved =
+      missionEvidenceRecords.some((record) => record.kind === "web_source") ||
+      (vaultSearchSurfacedPaths.length > 0 && vaultNoteBodyReadPaths.length > 0);
+    if (!retrieved) {
+      return;
+    }
+    const criticSteps = Math.min(
+      CRITIC_MAX_STEPS,
+      Math.max(0, maxSteps - step),
+    );
+    if (criticSteps <= 0) {
+      return;
+    }
+    singleAgentCriticReviewed = true;
+    try {
+      events.onStatus?.("Reviewing the finished answer against its sources...");
+      const criticResult = await runCriticWorker({
+        runId,
+        objective: activeIntentPrompt,
+        finalOutput: lastFinalOutput,
+        evidence: missionEvidenceRecords,
+        receiptIds: writeReceipts
+          .map((receipt) => receipt.id)
+          .filter((id): id is string => typeof id === "string"),
+        modelClient,
+        toolRegistry,
+        toolContext: runToolContext,
+        abortSignal,
+        maxSteps: criticSteps,
+        maxToolCalls: CRITIC_MAX_TOOL_CALLS,
+        now: () => runToolContext.now?.() ?? new Date(),
+      });
+      events.onTrace?.({
+        id: `single-agent-critic-${step}`,
+        kind: "verification",
+        step,
+        message: `critic (advisory): ${criticResult.status} — ${criticResult.check.message}`,
+        outputPreview: {
+          status: criticResult.status,
+          missing: criticResult.check.missing,
+          modelSteps: criticResult.modelSteps,
+          toolCalls: criticResult.toolCalls,
+          advisory: true,
+        },
+      });
+      if (
+        criticResult.status === "needs_more_work" &&
+        criticResult.check.missing.length > 0
+      ) {
+        events.onStatus?.(
+          `Self-review flagged ${criticResult.check.missing.length} gap(s) for you to check: ${criticResult.check.missing
+            .slice(0, 3)
+            .join("; ")}`,
+        );
+      }
+    } catch (error) {
+      // Review failure is never a mission failure.
+      events.onTrace?.({
+        id: `single-agent-critic-error-${step}`,
+        kind: "status",
+        step,
+        message: `Self-review skipped: ${getErrorMessage(error)}`,
+      });
+    }
+  };
   const finishRun = async (
     stopReason: AgentRunStopReason,
     step: number,
@@ -8164,11 +8433,10 @@ export async function runAgentMission({
       graphComplete,
     });
     // A content hash attests what was fetched, not that the page is still
-    // there. Deep and extended runs re-probe their cited sources and surface
-    // anything definitively gone. Non-blocking by design: the note is already
-    // committed, and a dead link is a caveat for the reader, not grounds to
-    // retract verified work. Gated on tier so lanes that count transport calls
-    // to prove cache reuse are unaffected.
+    // there. A run that committed a note re-probes its cited sources and
+    // surfaces anything definitively gone. Non-blocking by design: the note is
+    // already committed, and a dead link is a caveat for the reader, not
+    // grounds to retract verified work.
     {
       const citedUrls = [
         ...new Set(
@@ -8185,6 +8453,7 @@ export async function runAgentMission({
         enabled: runToolContext.settings?.deadLinkRecheckEnabled,
         hasTransport: typeof runToolContext.httpTransport === "function",
         citedUrlCount: citedUrls.length,
+        committedNote: Boolean(resolveLivenessCaveatNotePath()),
       });
       if (decision.recheck) {
         try {
@@ -8205,12 +8474,16 @@ export async function runAgentMission({
               step,
               message: caveat,
             });
+            // The sidebar scrolls away; the note does not. A 404'd citation the
+            // reader is never told about again is the same as not checking.
+            await appendLivenessCaveatToNote(liveness, step);
           }
         } catch {
           // A probe failure must never turn a completed mission into an error.
         }
       }
     }
+    await runSingleAgentCriticReview(acceptance, stopReason, step, maxSteps);
     // Completion reflection is a required terminal mutation for a requested
     // compound workflow. Perform and verify it before accepting or persisting
     // a terminal mission state, so a failed append can never leave a durable
@@ -31358,6 +31631,7 @@ async function streamCurrentNoteWriteback({
   missionPrompt,
   lazyCreatePath,
   onNoteCreated,
+  researchFrontmatter,
 }: {
   kind: StreamingWritebackKind;
   preparedSectionEdit: PreparedStreamingSectionEdit | null;
@@ -31377,6 +31651,10 @@ async function streamCurrentNoteWriteback({
   missionPrompt?: string;
   lazyCreatePath?: string | null;
   onNoteCreated?: (file: { path: string; basename: string }) => void;
+  researchFrontmatter?: (input: {
+    title: string | null;
+    path: string;
+  }) => ResearchNoteFrontmatterInput | null;
 }): Promise<AgentRunReceipt> {
   let originalNoteContentForSafety = "";
   try {
@@ -31397,6 +31675,7 @@ async function streamCurrentNoteWriteback({
     preparedSectionEdit,
     lazyCreatePath,
     onNoteCreated,
+    researchFrontmatter,
   });
   const activeBasename =
     toolContext.getCurrentMarkdownFile?.()?.basename ??
@@ -31817,6 +32096,14 @@ async function streamCurrentNoteWriteback({
     await writer.finish();
     events.onFinalDone?.();
     events.onAssistantMessageDone?.();
+
+    const externalEditStop = writer.getExternalEditStop();
+    if (externalEditStop) {
+      // Nothing was overwritten and no readback can verify a note that now
+      // holds someone else's edit, so report the stop instead of a receipt.
+      events.onStatus?.(externalEditStop.message);
+      throw error;
+    }
 
     if (writer.hasWritableContent()) {
       const receipt = await writer.buildReceipt(true);
@@ -32431,22 +32718,55 @@ async function chatWithThinkingFallback({
 
 
 
+let streamingNoteWriterSequence = 0;
+
 async function createStreamingNoteWriter({
   kind,
   toolContext,
   preparedSectionEdit,
   lazyCreatePath,
   onNoteCreated,
+  researchFrontmatter,
 }: {
   kind: StreamingWritebackKind;
   toolContext: ToolExecutionContext;
   preparedSectionEdit: PreparedStreamingSectionEdit | null;
   lazyCreatePath?: string | null;
   onNoteCreated?: (file: { path: string; basename: string }) => void;
+  /**
+   * Frontmatter for a note this writer creates. Returning null means the run
+   * is not research-bearing and the note is left as plain markdown.
+   */
+  researchFrontmatter?: (input: {
+    title: string | null;
+    path: string;
+  }) => ResearchNoteFrontmatterInput | null;
 }) {
   let file: ReturnType<typeof getActiveMarkdownFile> | null = null;
   let current = "";
   let createReceiptPath: string | null = null;
+  // One key per writer so the editor's viewport-follow state (including "the
+  // reader scrolled away") resets when a new stream starts, with no reset call.
+  const streamFollowKey = `streamed-writeback-${(streamingNoteWriterSequence += 1)}`;
+  // Exact bytes this writer last committed. Anything else in the live buffer
+  // between two of our flushes belongs to a concurrent writer, so we stop
+  // instead of overwriting it.
+  //
+  // Null until the first flush lands, and deliberately not seeded at setup: an
+  // edit that arrives before any byte of ours is on disk overwrites nothing,
+  // and `makeTitleMetadataAppendBase` already rebases the append base off the
+  // live note for exactly that window. Failing there would break a behaviour
+  // that is correct and pinned.
+  let expectedLiveContent: string | null = null;
+  let externalEditStop: { message: string; appliedChars: number } | null = null;
+  /** Live editor buffer for the target, or null when no editor has it open. */
+  const readLiveEditorSource = (): string | null => {
+    if (!file) {
+      return null;
+    }
+    const value = toolContext.getCurrentMarkdownContent?.(file);
+    return typeof value === "string" ? value : null;
+  };
   const ensureFile = async () => {
     if (file) {
       return file;
@@ -32478,8 +32798,7 @@ async function createStreamingNoteWriter({
   const makeAppendBase = (content: string) =>
     `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}`;
   const getLatestAppendBaseSource = () => {
-    const source =
-      (file && toolContext.getCurrentMarkdownContent?.(file)) ?? current;
+    const source = readLiveEditorSource() ?? current;
     // Live flushes write base+streamed. Callers that refresh the append base
     // (title metadata, replaceContent) must not treat the in-flight draft as
     // permanent note content or word-count corrections will double-append.
@@ -32519,13 +32838,42 @@ async function createStreamingNoteWriter({
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let hasQueuedWrite = false;
 
+  // Computed once and reused, so `created` does not tick forward on every
+  // flush and the readback in buildReceipt keeps matching what is on disk.
+  let researchFrontmatterBlock: string | null | undefined;
+  /**
+   * Prepend research frontmatter to a note this run created.
+   *
+   * Only ever a note the agent created: prepending YAML to a note the user
+   * already owns is a destructive edit, not an enhancement, which is why the
+   * append/replace/edit kinds are excluded rather than merely unhandled.
+   */
+  const withFrontmatter = (body: string): string => {
+    if (!lazyCreatePath || !researchFrontmatter || !body.trim()) {
+      return body;
+    }
+    if (researchFrontmatterBlock === undefined) {
+      const input = researchFrontmatter({
+        title: extractedLeadingTitle,
+        path: createReceiptPath ?? lazyCreatePath,
+      });
+      researchFrontmatterBlock = input
+        ? buildResearchNoteFrontmatter(input)
+        : null;
+    }
+    if (!researchFrontmatterBlock) return body;
+    // Never stack two blocks: Obsidian reads only the first, and the second
+    // renders as a stray horizontal rule in the middle of the note.
+    if (/^﻿?---\r?\n/u.test(body)) return body;
+    return `${researchFrontmatterBlock}${body}`;
+  };
   const render = () => {
     if (kind === "append") {
-      return `${baseContent}${streamedContent}`;
+      return withFrontmatter(`${baseContent}${streamedContent}`);
     }
 
     if (kind === "replace") {
-      return streamedContent;
+      return withFrontmatter(streamedContent);
     }
 
     return `${section?.prefix ?? ""}${formatStreamingSectionBody(
@@ -32537,10 +32885,39 @@ async function createStreamingNoteWriter({
   const hasNoteMutation = () => baseContentChanged || hasWritableContent();
   const writeContent = async (content: string) => {
     const target = await ensureFile();
+    if (externalEditStop) {
+      return;
+    }
+    // Every flush is still a whole-document write at the vault layer, so a
+    // concurrent edit must be caught before it, not after. `expectedLiveContent`
+    // is what this writer last put in the buffer; anything else came from
+    // someone else and the write below would destroy it.
+    const observed = readLiveEditorSource();
+    if (expectedLiveContent !== null && observed !== null) {
+      const conflict = detectExternalStreamEdit({
+        expected: expectedLiveContent,
+        observed,
+      });
+      if (conflict) {
+        externalEditStop = {
+          message: formatExternalStreamEditMessage(
+            target.path,
+            getByteLength(streamedContent),
+          ),
+          appliedChars: streamedContent.length,
+        };
+        return;
+      }
+    }
     toolContext.setCurrentMarkdownContent?.(target, content, {
       followStreamingEnd: true,
+      streamKey: streamFollowKey,
     });
     await toolContext.app.vault.modify(target, content);
+    // Deliberately the bytes we wrote, not a re-read: re-reading here would
+    // adopt anything the reader typed during the awaited modify as ours and
+    // the next flush would overwrite exactly the keystrokes we are protecting.
+    expectedLiveContent = content;
   };
   const consumeLeadingTitleIfPresent = (
     delta: string,
@@ -32605,7 +32982,16 @@ async function createStreamingNoteWriter({
   };
 
   return {
+    /** Set once a concurrent writer took the note away from this stream. */
+    getExternalEditStop() {
+      return externalEditStop;
+    },
     push(delta: string) {
+      if (externalEditStop) {
+        // The previous flush found someone else's bytes in the note. Fail here
+        // rather than keep buffering a draft that can never be committed.
+        throw new Error(externalEditStop.message);
+      }
       const writableDelta = consumeLeadingTitleIfPresent(delta);
       if (!writableDelta) {
         return;
@@ -32692,6 +33078,17 @@ async function createStreamingNoteWriter({
       extractedLeadingTitle = null;
     },
     async finish(options: { force?: boolean } = {}) {
+      if (externalEditStop) {
+        // The failure is already reported by push(); finish() runs again from
+        // the interrupt path and must not commit over the concurrent edit or
+        // replace the caller's error with a second one.
+        if (flushTimer !== null) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        await flushChain;
+        return;
+      }
       const trailingTitleContent = consumeLeadingTitleIfPresent("", true);
       if (trailingTitleContent) {
         streamedContent += trailingTitleContent;
@@ -32720,6 +33117,12 @@ async function createStreamingNoteWriter({
       await flushChain;
     },
     async buildReceipt(partial: boolean): Promise<AgentRunReceipt> {
+      if (externalEditStop) {
+        // Readback can never verify here by construction: the note holds the
+        // concurrent edit as well as our bytes. Report the stop, not a
+        // mismatch that reads like corruption.
+        throw new Error(externalEditStop.message);
+      }
       const resolvedPath = file?.path ?? lazyCreatePath ?? "unknown";
       const operation =
         kind === "append" ? "append" : kind === "replace" ? "replace" : "edit";

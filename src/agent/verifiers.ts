@@ -79,6 +79,8 @@ export interface MissionVerifierInput {
   passages?: ClaimPassageRef[];
   /** Force quote-span validation even when the prompt does not ask for quotes. */
   requireQuoteSpans?: boolean;
+  /** Verify the quotations that exist without requiring the draft to quote. */
+  verifyQuoteSpans?: boolean;
   /** Force or skip claim grounding regardless of prompt heuristics. */
   requireClaimGrounding?: boolean;
   now?: Date;
@@ -95,6 +97,7 @@ export function runMissionVerifiers({
   researchMode,
   passages,
   requireQuoteSpans,
+  verifyQuoteSpans,
   requireClaimGrounding,
   now = new Date(),
 }: MissionVerifierInput): MissionVerificationResult {
@@ -150,6 +153,7 @@ export function runMissionVerifiers({
       researchMode,
       passages,
       requireQuoteSpans,
+      verifyQuoteSpans,
       requireClaimGrounding,
       now: verifierNow,
     });
@@ -481,6 +485,7 @@ function verifyClaimGrounding(input: {
   researchMode?: string;
   passages?: ClaimPassageRef[];
   requireQuoteSpans?: boolean;
+  verifyQuoteSpans?: boolean;
   requireClaimGrounding?: boolean;
   now: Date;
 }): { check: VerificationCheck; ledger: ClaimLedger } | null {
@@ -512,6 +517,7 @@ function verifyClaimGrounding(input: {
     prompt: input.prompt || promptHint || "deep research",
     mode: input.researchMode,
     requireQuoteSpans: input.requireQuoteSpans,
+    verifyQuoteSpans: input.verifyQuoteSpans,
     forceRequire: true,
   });
 

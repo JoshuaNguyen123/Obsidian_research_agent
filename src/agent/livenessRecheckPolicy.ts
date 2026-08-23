@@ -25,6 +25,7 @@ export interface LivenessRecheckDecision {
     | "disabled_by_setting"
     | "no_transport"
     | "tier_below_threshold"
+    | "no_committed_note"
     | "no_cited_urls"
     | "recheck";
 }
@@ -36,6 +37,12 @@ export function decideSingleAgentLivenessRecheck(input: {
   enabled: boolean | undefined;
   hasTransport: boolean;
   citedUrlCount: number;
+  /**
+   * The run committed a note. This is what lets `standard` probe: a caveat is
+   * only worth an outbound request when there is a durable artifact to write it
+   * into and a reader who will come back to it later.
+   */
+  committedNote?: boolean;
 }): LivenessRecheckDecision {
   if (input.enabled === false) {
     return { recheck: false, reason: "disabled_by_setting" };
@@ -43,8 +50,20 @@ export function decideSingleAgentLivenessRecheck(input: {
   if (!input.hasTransport) {
     return { recheck: false, reason: "no_transport" };
   }
-  if (input.tier !== "deep" && input.tier !== "extended") {
+  const deepOrExtended = input.tier === "deep" || input.tier === "extended";
+  // `quick` stays out: a quick answer makes no claim of thoroughness, and its
+  // sources were usually fetched seconds ago in the same session.
+  if (input.tier === "quick") {
     return { recheck: false, reason: "tier_below_threshold" };
+  }
+  // Everything below deep earns the probe only by producing a note. That is
+  // the honest trigger: the caveat exists so a reader who comes back to a
+  // durable artifact learns one of its citations has since died. It is also
+  // what keeps the cache-reuse proof lanes deterministic -- they drive a
+  // chat-only mission that explicitly writes nothing, so their transport
+  // counts are unchanged.
+  if (!deepOrExtended && !input.committedNote) {
+    return { recheck: false, reason: "no_committed_note" };
   }
   if (input.citedUrlCount <= 0) {
     return { recheck: false, reason: "no_cited_urls" };
@@ -69,5 +88,36 @@ export function formatLivenessCaveat(
   return [
     `Liveness recheck: ${dead.length} cited ${noun} no longer resolve and may need replacing before you rely on this.`,
     ...dead.map((result) => `- ${result.url} (HTTP ${result.status ?? "unknown"})`),
+  ].join("\n");
+}
+
+/**
+ * Heading the caveat section is written under, and the marker that keeps the
+ * append idempotent across a resumed or re-finalized run.
+ */
+export const LIVENESS_CAVEAT_HEADING = "## Liveness caveats";
+
+/**
+ * The same caveat as a markdown section for the note itself.
+ *
+ * A dead citation reported only to the sidebar is a warning the reader never
+ * sees again: the status line scrolls away, the note does not. The note is
+ * already committed and a dead link is a caveat, not grounds to retract
+ * verified work, so this appends and never rewrites.
+ */
+export function formatLivenessCaveatSection(
+  results: readonly LinkLivenessResult[],
+  options: { checkedAt?: string } = {},
+): string | null {
+  const caveat = formatLivenessCaveat(results);
+  if (!caveat) return null;
+  const [summary, ...rows] = caveat.split("\n");
+  return [
+    LIVENESS_CAVEAT_HEADING,
+    "",
+    options.checkedAt ? `${summary} (rechecked ${options.checkedAt})` : summary,
+    "",
+    ...rows,
+    "",
   ].join("\n");
 }

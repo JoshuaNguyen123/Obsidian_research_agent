@@ -4830,6 +4830,91 @@ test("streamed writeback does not re-stream after partial note apply on provider
   );
 });
 
+test("streamed writeback stops instead of overwriting a note the reader typed into", async () => {
+  const statuses: string[] = [];
+  const essayChunk = (n: number) =>
+    `${Array.from({ length: 40 }, (_, i) => `holden${n}x${i + 1}`).join(" ")} `;
+  const chunkOne = `# Catcher In The Rye Essay\n\n${essayChunk(1)}`;
+  const chunkTwo = essayChunk(2);
+  const chunkThree = essayChunk(3);
+  const readerKeystrokes = "\n\nreader typed this line";
+  const vault = createRunnerVaultContext({
+    prompt: "Write a 200 word essay about the catcher in the rye.",
+    content: "",
+    liveEditorWrite: true,
+  });
+  vault.context.settings.modelRouterMode = "off";
+
+  // The harness map backs both the vault and the "live editor" read, so
+  // writing into it directly is exactly what a keystroke looks like to the
+  // runner: the buffer no longer holds what the last flush committed.
+  const vaultApi = vault.context.app.vault as unknown as {
+    modify: (file: { path: string }, data: string) => Promise<void>;
+  };
+  const originalModify = vaultApi.modify.bind(vaultApi);
+  let flushes = 0;
+  vaultApi.modify = async (file, data) => {
+    await originalModify(file, data);
+    // The runner also journals run/mission-graph notes through this vault, so
+    // count flushes of the target note only.
+    if (file.path !== "Current.md") {
+      return;
+    }
+    flushes += 1;
+    if (flushes === 1) {
+      vault.content.set(file.path, `${data}${readerKeystrokes}`);
+    }
+  };
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  await assert.rejects(
+    () =>
+      runAgentMission({
+        prompt: "Write a 200 word essay about the catcher in the rye.",
+        modelClient: {
+          chat: async () => {
+            throw new Error("chat should not be required before stream failure");
+          },
+          streamChat: async (_request, events = {}) => {
+            events.onRawChunk?.("{}");
+            events.onContentDelta?.(chunkOne);
+            await settle();
+            events.onContentDelta?.(chunkTwo);
+            await settle();
+            events.onContentDelta?.(chunkThree);
+            await settle();
+            return {
+              message: { role: "assistant", content: "" },
+              raw: {},
+            } as never;
+          },
+        },
+        toolRegistry: createDefaultToolRegistry(),
+        toolContext: vault.context,
+        enableStreaming: true,
+        events: {
+          onStatus: (message) => statuses.push(message),
+        },
+      }),
+    /changed outside this run/i,
+  );
+
+  const note = vault.content.get("Current.md") ?? "";
+  assert.ok(
+    note.includes(readerKeystrokes.trim()),
+    `reader keystrokes were overwritten by a later flush:\n${note}`,
+  );
+  assert.ok(/\bholden1x1\b/.test(note), note);
+  assert.ok(
+    !/\bholden3x1\b/.test(note),
+    `stream kept writing after the note was taken over:\n${note}`,
+  );
+  assert.ok(
+    statuses.some((line) => /changed outside this run/i.test(line)),
+    statuses.join(" | "),
+  );
+});
+
 test("continue after under-target partial essay expands in place instead of appending", async () => {
   const statuses: string[] = [];
   const broker = new ApprovalBroker();
@@ -5260,6 +5345,12 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
           links: [],
         },
       };
+    }
+    // The cited page itself is reachable. Without this it answered 404 to the
+    // pre-finalization liveness probe, and the run would correctly append a
+    // dead-citation caveat to the note this test pins byte for byte.
+    if (request.url.startsWith("https://example.com/grapes-of-wrath")) {
+      return { status: 200, headers: {} };
     }
     return { status: 404, headers: {}, json: { error: "not mocked" } };
   };

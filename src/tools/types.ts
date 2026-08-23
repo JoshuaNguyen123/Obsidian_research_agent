@@ -177,7 +177,7 @@ export interface ToolExecutionContext {
   setCurrentMarkdownContent?: (
     file: TFile,
     content: string,
-    options?: { followStreamingEnd?: boolean },
+    options?: { followStreamingEnd?: boolean; streamKey?: string },
   ) => boolean;
   getResearchMemoryIndex?: () => ResearchMemoryIndexEntry[];
   setResearchMemoryIndex?: (

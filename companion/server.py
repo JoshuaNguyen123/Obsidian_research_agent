@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import time
 import uuid
@@ -30,6 +32,7 @@ from coordinator_store import (
 )
 from memory_store import MemoryStore
 from host_approval_signer import HostApprovalSigner, HostApprovalSignerError
+from pdf_extract import extract_pdf_text
 from schemas import (
     BrowserClickRequest,
     BrowserExtractMarkdownRequest,
@@ -40,6 +43,8 @@ from schemas import (
     BrowserScrollRequest,
     BrowserTypeRequest,
     CompanionStatusResponse,
+    DocumentExtractRequest,
+    DocumentExtractResponse,
     EventAppendRequest,
     EventRecord,
     HealthResponse,
@@ -441,6 +446,41 @@ def create_app(
     async def browser_extract_markdown(request: BrowserExtractMarkdownRequest):
         _verify_browser_action(application, "extract", request)
         return await application.state.browser.extract_markdown(request)
+
+    @application.post("/document/extract_text", response_model=DocumentExtractResponse)
+    async def document_extract_text(
+        request: DocumentExtractRequest, response: Response
+    ) -> DocumentExtractResponse:
+        # No `_verify_browser_action` here on purpose: this route drives no
+        # browser and opens no socket. The caller supplies the bytes, so the
+        # loopback boundary middleware (bearer token plus body cap) is the whole
+        # authority it needs. See DocumentExtractRequest for why it does not
+        # fetch the URL itself.
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            content = base64.b64decode(request.contentBase64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Document content must be valid base64.",
+            ) from exc
+        extraction = await asyncio.to_thread(
+            extract_pdf_text,
+            content,
+            max_pages=request.maxPages,
+            max_chars=request.maxChars,
+        )
+        return DocumentExtractResponse(
+            status=extraction.status,
+            reason=extraction.reason,
+            url=request.sourceUrl,
+            title=request.title,
+            text=extraction.text,
+            pageCount=extraction.page_count,
+            pagesExtracted=extraction.pages_extracted,
+            pagesSkipped=extraction.pages_skipped,
+            truncated=extraction.truncated,
+        )
 
     @application.post("/memory/write", response_model=MemoryWriteResponse)
     async def memory_write(request: MemoryWriteRequest) -> MemoryWriteResponse:

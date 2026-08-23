@@ -41,7 +41,17 @@ import {
   browserExtractMarkdownTool,
   browserOpenPageTool,
 } from "./companionTools";
-import { runFreeSearchFallback } from "./freeSearchProviders";
+import {
+  FREE_SEARCH_PROVIDER_GROUPS,
+  FREE_SEARCH_PROVIDER_IDS,
+  resolveFreeSearchProviders,
+  resolveOpenAccessEditions,
+  runFreeSearchFallback,
+  runFreeSearchProviders,
+} from "./freeSearchProviders";
+import { createDocumentExtractProvider } from "./documentExtract";
+import { inferSourceSignals } from "../agent/sourceSignals";
+import { scoreSourceCandidate } from "../orchestrator/sourceCandidateLedger";
 import { requestWithRetry } from "./httpRetry";
 
 export function createWebTools(): AgentTool[] {
@@ -66,6 +76,14 @@ export const webSearchTool: AgentTool = {
         type: "integer",
         description: "Maximum results to return. Defaults to 5, maximum 10.",
       },
+      index: {
+        type: "string",
+        // Deliberately terse and deliberately not exhaustive: every tool
+        // description rides on every request and a compactness test pins the
+        // total at 30k chars. A wrong value is refused with the complete list
+        // of valid names, so the full set stays discoverable in one turn.
+        description: "Optional index: pubmed|arxiv|courtlistener|scholar|law.",
+      },
     },
     additionalProperties: false,
   },
@@ -77,12 +95,43 @@ export const webSearchTool: AgentTool = {
     }
 
     const maxResults = clampMaxResults(getOptionalInteger(args, "max_results"));
+    const requestedIndex = getOptionalString(args, "index");
+    const requestedProviders = resolveFreeSearchProviders(requestedIndex);
+    if (requestedIndex?.trim() && !requestedProviders && !isGeneralWebIndex(requestedIndex)) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        `web_search index "${requestedIndex}" is not available. Use one of: ` +
+          `${FREE_SEARCH_PROVIDER_IDS.join(", ")}, ` +
+          `${Object.keys(FREE_SEARCH_PROVIDER_GROUPS).join(", ")}, or omit it for the general web.`,
+      );
+    }
+
+    // A named index is an instruction, not a preference: falling through to the
+    // general web would answer a question about PubMed with something else and
+    // give the reader no way to tell.
+    if (requestedProviders) {
+      const targeted = await runFreeSearchProviders({
+        transport: context.httpTransport,
+        query,
+        maxResults,
+        timeoutMs: getOperationTimeoutMs(context),
+        signal: context.abortSignal,
+        providers: requestedProviders,
+      });
+      return {
+        index: requestedProviders.join(","),
+        results: rankWebSearchResults(
+          targeted.map(toWebSearchResult),
+          context,
+        ),
+      };
+    }
 
     let primaryError: unknown = null;
     try {
       const primary = await runOllamaWebSearch(query, maxResults, context);
       if (primary.results.some((result) => result.url)) {
-        return primary;
+        return { results: rankWebSearchResults(primary.results, context) };
       }
     } catch (error) {
       primaryError = error;
@@ -100,15 +149,7 @@ export const webSearchTool: AgentTool = {
       });
       if (fallback.length > 0) {
         return {
-          results: fallback.map((result) => ({
-            title: result.title,
-            url: result.url,
-            snippet: truncateText(result.snippet, MAX_WEB_SEARCH_SNIPPET_CHARS),
-            // Only the scholarly providers know a publication date. Passing it
-            // through lets candidate ranking score freshness for real instead
-            // of assuming a constant, and lets the model reason about recency.
-            ...(result.publishedAt ? { published_at: result.publishedAt } : {}),
-          })),
+          results: rankWebSearchResults(fallback.map(toWebSearchResult), context),
         };
       }
     }
@@ -119,6 +160,79 @@ export const webSearchTool: AgentTool = {
     return { results: [] };
   },
 };
+
+function isGeneralWebIndex(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "" || normalized === "auto" || normalized === "web";
+}
+
+function toWebSearchResult(result: {
+  title: string;
+  url: string;
+  snippet: string;
+  publishedAt?: string;
+}): WebSearchResultV1 {
+  return {
+    title: result.title,
+    url: result.url,
+    snippet: truncateText(result.snippet, MAX_WEB_SEARCH_SNIPPET_CHARS),
+    // Only the scholarly providers know a publication date. Passing it through
+    // lets candidate ranking score freshness for real instead of assuming a
+    // constant, and lets the model reason about recency.
+    ...(result.publishedAt ? { published_at: result.publishedAt } : {}),
+  };
+}
+
+interface WebSearchResultV1 {
+  title: string;
+  url: string;
+  snippet: string;
+  published_at?: string;
+}
+
+/**
+ * Order results by the weighted credibility score the source-candidate ledger
+ * already computes.
+ *
+ * `inferSourceSignals` + `scoreSourceCandidate` were real and tested, but only
+ * `researchWorker` ever called them — ordinary single-agent research got the
+ * provider's own ordering and no ranking at all. Ranking here serves both
+ * paths, and the worker re-ranking a ranked list is harmless.
+ *
+ * Ties keep the provider's order: the score only reorders when the signals
+ * genuinely differ, so a provider that already ranked well is not shuffled by
+ * rounding noise.
+ */
+function rankWebSearchResults<T extends WebSearchResultV1>(
+  results: readonly T[],
+  context: ToolExecutionContext,
+): T[] {
+  if (results.length < 2) return [...results];
+  const now = context.now?.() ?? new Date();
+  const scored = results.map((result, index) => {
+    const signals = inferSourceSignals({
+      url: result.url,
+      title: result.title,
+      snippet: result.snippet,
+      publishedAt: result.published_at,
+      now,
+    });
+    return {
+      result,
+      index,
+      score: scoreSourceCandidate({
+        signals: {
+          quality: signals.quality,
+          freshness: signals.freshness,
+          fetchability: signals.fetchability,
+        },
+        sourceType: signals.sourceType,
+      }),
+    };
+  });
+  scored.sort((left, right) => right.score - left.score || left.index - right.index);
+  return scored.map((entry) => entry.result);
+}
 
 async function runOllamaWebSearch(
   query: string,
@@ -532,7 +646,11 @@ function createRuntimeResearchProviders(
   };
   const browserProvider: ResearchRetrievalProvider = {
     id: "safe-companion-browser",
-    strategies: ["browser_extract", "document_extract", "alternate_result"],
+    // `document_extract` is no longer served here: rendering a PDF viewer's
+    // HTML answers that strategy with junk or nothing. The document provider
+    // parses the bytes instead, and the browser stays the general-page
+    // extractor it actually is.
+    strategies: ["browser_extract", "alternate_result"],
     async retrieve(candidate) {
       assertOperationActive(context);
       const normalizedUrl = normalizeWebFetchUrl(candidate.url);
@@ -568,7 +686,14 @@ function createRuntimeResearchProviders(
       };
     },
   };
-  return [alternateProvider, browserProvider];
+  // Tried in this order by `retrieveUsableResearchSource`: the document parser
+  // sits ahead of the browser so a PDF is read as a document rather than as a
+  // rendered viewer page.
+  return [
+    alternateProvider,
+    createDocumentExtractProvider(context),
+    browserProvider,
+  ];
 }
 
 async function resolveFallbackUrls(
@@ -578,6 +703,20 @@ async function resolveFallbackUrls(
   primaryUrl: string,
 ): Promise<string[]> {
   const values = readAlternateUrlArgs(args.alternate_urls);
+  // An open-access edition of the same work comes first: it is the same
+  // source, readable, rather than a different source that happens to match the
+  // query. Without it a paywalled DOI is simply a dead end.
+  try {
+    const openAccess = await resolveOpenAccessEditions({
+      transport: context.httpTransport,
+      url: primaryUrl,
+      timeoutMs: getOperationTimeoutMs(context),
+      signal: context.abortSignal,
+    });
+    values.unshift(...openAccess);
+  } catch {
+    // The resolver is an optimization; its failure must not cost the fallback.
+  }
   if (query && values.length < 5) {
     try {
       const output = await webSearchTool.execute(

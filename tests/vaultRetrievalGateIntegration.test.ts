@@ -39,6 +39,85 @@ import type {
 const VAULT_RESEARCH_PROMPT =
   "Search my notes for concepts related to onboarding and append a cited answer with passage citations to the current note.";
 
+test("a plain first-person recall question is answered from the vault, not from memory", async () => {
+  // The most ordinary question a note-taking assistant gets, and it named
+  // neither "notes" nor "vault", so no intent classifier matched it. The
+  // mission drew `single_model_answer` with an EMPTY tool list: the model
+  // answered a question about the user's own vault entirely from its own
+  // memory. The body-read gate could not help -- there was nothing to levy
+  // against, because nothing could search in the first place.
+  const vault = createVaultHarness({
+    "Current.md": "# Working note",
+    "Research/Onboarding.md":
+      "Activation, not signup, is the onboarding metric we settled on.",
+    "Research/Pricing.md": "Pricing tiers were deferred to next quarter.",
+  });
+  const executed: ModelToolCall[] = [];
+  let offeredToolNames: string[] = [];
+
+  await runAgentMission({
+    prompt: "What did I conclude about onboarding?",
+    modelClient: createModelClient([
+      responseWithToolCall("search_markdown_files", { query: "onboarding" }),
+      responseWithContent("Activation, not signup, is the onboarding metric."),
+    ]),
+    toolRegistry: observeRegistry(createDefaultToolRegistry(), executed),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onRunConfig: (config) => {
+        offeredToolNames = [...(config.allowedToolNames ?? [])];
+      },
+    },
+  });
+
+  assert.ok(
+    offeredToolNames.includes("search_markdown_files"),
+    `a recall question must be offered vault search, saw: ${JSON.stringify(offeredToolNames)}`,
+  );
+  const names = executed.map((call) => call.name);
+  assert.ok(
+    names.includes("search_markdown_files"),
+    `expected a vault search, saw: ${JSON.stringify(names)}`,
+  );
+  // The route now allows host follow-ups, which is the whole point: a route
+  // budgeted for one tool call can surface notes but never open one, so the
+  // body-read debt is correctly not levied and the answer is written from
+  // search snippets.
+  const readPaths = executed
+    .filter((call) => call.name === "read_file")
+    .map((call) => String(call.arguments.path));
+  assert.ok(
+    readPaths.includes("Research/Onboarding.md"),
+    `the surfaced note must be opened, saw: ${JSON.stringify(names)}`,
+  );
+});
+
+test("advice and drafting prompts are not dragged into vault retrieval", async () => {
+  // The recall classifier has to stay narrow. "What should I do about X" is
+  // advice, not a question about anything the user recorded.
+  const vault = createVaultHarness({ "Current.md": "# Working note" });
+  const executed: ModelToolCall[] = [];
+
+  await runAgentMission({
+    prompt: "What should I do about onboarding?",
+    modelClient: createModelClient([
+      responseWithContent("Start by instrumenting activation."),
+    ]),
+    toolRegistry: observeRegistry(createDefaultToolRegistry(), executed),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {},
+  });
+
+  assert.deepEqual(
+    executed
+      .map((call) => call.name)
+      .filter((name) => name.includes("search") || name === "read_file"),
+    [],
+  );
+});
+
 test("a degraded vault search is corroborated by keyword search and its top hit is opened", async () => {
   const vault = createVaultHarness({
     "Current.md": "# Working note",

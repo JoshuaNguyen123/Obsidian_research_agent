@@ -46,6 +46,13 @@ export interface ClaimLedger {
   reasons: string[];
   nextAction?: string;
   requireQuoteSpans: boolean;
+  /**
+   * Quotations that appear in the draft were checked verbatim against the
+   * passage they cite, without also demanding that the draft quote anything.
+   * Distinct from `requireQuoteSpans`, which additionally fails an answer that
+   * quotes nothing at all.
+   */
+  verifyQuoteSpans?: boolean;
 }
 
 export interface BuildClaimLedgerInput {
@@ -56,6 +63,8 @@ export interface BuildClaimLedgerInput {
   prompt?: string;
   mode?: string;
   requireQuoteSpans?: boolean;
+  /** Verify the quotations that exist without requiring the draft to quote. */
+  verifyQuoteSpans?: boolean;
   /** When true, run claim grounding even if prompt/mode heuristics would skip. */
   forceRequire?: boolean;
   maxClaims?: number;
@@ -332,6 +341,7 @@ export function validateClaimGrounding(
     knownPassageIds: string[];
     passages?: ClaimPassageRef[];
     requireQuoteSpans?: boolean;
+    verifyQuoteSpans?: boolean;
     draft?: string;
   },
 ): {
@@ -380,7 +390,10 @@ export function validateClaimGrounding(
       reasons.push("fabricated_passage_id");
       continue;
     }
-    if (options.requireQuoteSpans) {
+    // Verify whenever either flag is set. The difference between them is only
+    // whether an answer that quotes nothing is a failure, and checking the
+    // quotations that *are* there costs nothing extra.
+    if (options.requireQuoteSpans || options.verifyQuoteSpans) {
       const spans = claim.quoteSpans ?? [];
       for (const span of spans) {
         const passage = passageById.get(span.passageId);
@@ -445,6 +458,7 @@ export function buildClaimLedger(input: BuildClaimLedgerInput): ClaimLedger {
     input.requireQuoteSpans === true ||
     shouldRequireQuoteSpans(prompt) ||
     shouldRequireQuoteSpans(mode);
+  const verifyQuoteSpans = requireQuoteSpans || input.verifyQuoteSpans === true;
 
   if (!requireGrounding) {
     return {
@@ -474,6 +488,7 @@ export function buildClaimLedger(input: BuildClaimLedgerInput): ClaimLedger {
     knownPassageIds,
     passages,
     requireQuoteSpans,
+    verifyQuoteSpans,
     draft: input.draft,
   });
 
@@ -486,7 +501,32 @@ export function buildClaimLedger(input: BuildClaimLedgerInput): ClaimLedger {
     reasons: validated.reasons,
     ...(validated.nextAction ? { nextAction: validated.nextAction } : {}),
     requireQuoteSpans,
+    verifyQuoteSpans,
   };
+}
+
+/**
+ * Whether the quotations in a sourced writeback should be checked verbatim.
+ *
+ * `shouldRequireQuoteSpans` only fires when the prompt literally says
+ * quote/quoted/quotation. "Summarize the evidence with citations" — the actual
+ * shape of most research writebacks — got nothing, so the one check that can
+ * tell a real quotation from a plausible paraphrase was off for exactly the
+ * missions that most need it.
+ *
+ * Deliberately verification, not a requirement: a deep sourced writeback that
+ * quotes nothing is a legitimate answer, and demanding a quotation would fail
+ * it. What is never legitimate is quotation marks around words the source does
+ * not contain.
+ */
+export function shouldVerifyQuoteSpansV1(input: {
+  /** Research effort tier of the active plan, if any. */
+  tier?: string;
+  /** The run cited fetched sources and is writing them back. */
+  sourcedWriteback?: boolean;
+}): boolean {
+  if (!input.sourcedWriteback) return false;
+  return input.tier === "deep" || input.tier === "extended";
 }
 
 export function serializeClaimLedger(ledger: ClaimLedger): Record<string, unknown> {
