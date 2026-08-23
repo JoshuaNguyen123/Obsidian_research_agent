@@ -113,8 +113,16 @@ test("daily quick actions register as commands and route to the right context me
           return items;
         };
 
-        const noteFile = app.vault.getFileByPath(notePath);
-        if (!noteFile) throw new Error(`Harness note is missing: ${notePath}`);
+        // The harness reserves its note path for a mission to create; this
+        // lane runs no mission, so fall back to any note already in the vault.
+        // Reading menu registration must not mutate the user's vault.
+        const noteFile =
+          app.vault.getFileByPath(notePath) ??
+          app.vault.getMarkdownFiles?.()?.[0] ??
+          null;
+        if (!noteFile) {
+          throw new Error("The e2e vault contains no markdown note to test against.");
+        }
 
         const leadIn =
           "The 2024 pouch-cell results changed how the field reads cycle life, and the follow-up work has not caught up.";

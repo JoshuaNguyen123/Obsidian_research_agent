@@ -10,6 +10,7 @@ import {
 import { AgentView, AGENT_VIEW_TYPE } from "./src/AgentView";
 import {
   buildSelectionResearchPrompt,
+  CONTINUATION_LEAD_IN_LINES,
   isUsableContinuationLeadIn,
   isUsableEditorSelection,
   SELECTION_RESEARCH_ACTIONS,
@@ -1781,7 +1782,12 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (!cursor) {
       return null;
     }
-    const leadIn = editor.getRange?.({ line: 0, ch: 0 }, cursor) ?? "";
+    // Bounded read. This runs on every editor right-click, and copying a
+    // whole large note to decide whether one menu item is available is a cost
+    // the user pays for nothing. The prompt builder keeps only the tail
+    // anyway, so a window of recent lines loses nothing.
+    const firstLine = Math.max(0, cursor.line - CONTINUATION_LEAD_IN_LINES);
+    const leadIn = editor.getRange?.({ line: firstLine, ch: 0 }, cursor) ?? "";
     return isUsableContinuationLeadIn(leadIn) ? leadIn : null;
   }
 

@@ -414,3 +414,13 @@ export const CONTINUE_WRITING_MIN_LEAD_IN_CHARS = 40;
 export function isUsableContinuationLeadIn(leadIn: string): boolean {
   return normalizeSelectionText(leadIn).length >= CONTINUE_WRITING_MIN_LEAD_IN_CHARS;
 }
+
+/**
+ * How far back from the caret the host reads for a continuation lead-in.
+ *
+ * Bounded because the editor menu evaluates this on every right-click: reading
+ * a whole large note to decide whether one item is available costs the user
+ * something for nothing. The builder keeps only the tail regardless, so a
+ * window of recent lines is not a loss of context.
+ */
+export const CONTINUATION_LEAD_IN_LINES = 120;
