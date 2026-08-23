@@ -43,9 +43,22 @@ export interface ResolveMissionEffortDecisionV1Input {
   prompt: string;
   route: string;
   outputTarget: NoteOutputDestination;
+  /**
+   * The user's own step budget, or null when they never set one. These are
+   * genuinely different: `resolveConfiguredMaxAgentSteps` used to materialize
+   * the hard cap for "unset", which made the two indistinguishable and forced
+   * this module to guess the difference back out.
+   */
   configuredMaxModelCalls?: number | null;
   configuredMaxToolCalls?: number | null;
   configuredMaxRunMinutes?: number | null;
+  /**
+   * Tool calls the mission's committed ladder requires, from
+   * `missionCommittedWorkV1`. The profile still comes from prompt shape; the
+   * budget comes from here.
+   */
+  committedToolCalls?: number | null;
+  committedWorkReasons?: readonly string[];
   forceExtendedTeam?: boolean;
 }
 
@@ -70,26 +83,68 @@ export function hasExplicitExtendedResearchIntentV1(prompt: string): boolean {
 }
 
 /**
- * `maxAgentSteps` is the system-wide hard cap on a run, not a per-mission
- * budget: both safety-ceiling presets pin it to `MAX_AGENT_STEPS` and
- * `resolveConfiguredMaxAgentSteps` materializes that same value when nothing
- * is configured, so "the user never touched it" and "the user chose the cap"
- * are the same number. Passing it through as a configured budget therefore
- * resolved every profile to the cap and left `compose` (6/4) and
- * `grounded_research` (16/12) with no effect at all — a mission asking for a
- * short composed note was budgeted 100 model calls.
+ * Budget floor implied by the tool ladder a mission has committed to.
  *
- * A count at or above the hard cap carries no per-mission intent, so the
- * profile default stands. Anything below it is a deliberate narrowing and
- * still wins, in either direction, exactly as the ceiling math intends.
+ * Every number below is derived from one committed ladder step, never from
+ * prompt shape:
+ *
+ * - Tool calls: one call per step plus a bounded repair allowance, so a step
+ *   that fails validation can be corrected rather than ending the run.
+ * - Model calls: the ladder's own calls plus the turns that reason between
+ *   them.
+ * - Wall clock: a per-step allowance. This is what actually killed the code
+ *   lane -- applyEffortRunDeadline takes min(configuredMaxRunMs,
+ *   effortMaxWallClockMs), so a lane asking for 35 minutes was silently cut to
+ *   the profile's three.
+ * - Segments: a ladder long enough to cross a segment boundary needs the turns
+ *   to do it.
+ *
+ * The floor can never exceed `extended_team`, the largest sanctioned profile,
+ * so naming more stages cannot buy an unbounded budget. It only ever raises;
+ * configured settings still clamp afterwards.
  */
-function perMissionCountBudget(
-  configured: number | null | undefined,
-): number | null {
-  if (typeof configured !== "number" || !Number.isFinite(configured)) {
+const LADDER_TOOL_CALL_ATTEMPTS_PER_STEP_V1 = 6;
+const LADDER_MODEL_CALLS_PER_TOOL_CALL_V1 = 1.5;
+const LADDER_WALL_CLOCK_MS_PER_STEP_V1 = 3 * 60_000;
+const LADDER_SEGMENT_TURNOVER_STEPS_V1 = 5;
+
+export interface MissionEffortLadderFloorV1 {
+  maxModelCalls: number;
+  maxToolCalls: number;
+  maxWallClockMs: number;
+  maxSegments: number;
+}
+
+export function missionEffortFloorForCommittedToolCallsV1(
+  committedToolCalls: number | null | undefined,
+): MissionEffortLadderFloorV1 | null {
+  if (
+    typeof committedToolCalls !== "number" ||
+    !Number.isFinite(committedToolCalls) ||
+    committedToolCalls <= 0
+  ) {
     return null;
   }
-  return Math.trunc(configured) >= MAX_AGENT_STEPS ? null : configured;
+  const steps = Math.trunc(committedToolCalls);
+  const ceiling = profileDefaults("extended_team");
+  const toolCalls = Math.min(
+    ceiling.maxToolCalls,
+    steps * LADDER_TOOL_CALL_ATTEMPTS_PER_STEP_V1 +
+      ceiling.finalizationToolCalls,
+  );
+  return {
+    maxToolCalls: toolCalls,
+    maxModelCalls: Math.min(
+      Math.min(ceiling.maxModelCalls, MAX_AGENT_STEPS),
+      Math.ceil(toolCalls * LADDER_MODEL_CALLS_PER_TOOL_CALL_V1),
+    ),
+    maxWallClockMs: Math.min(
+      ceiling.maxWallClockMs,
+      steps * LADDER_WALL_CLOCK_MS_PER_STEP_V1,
+    ),
+    maxSegments:
+      steps >= LADDER_SEGMENT_TURNOVER_STEPS_V1 ? ceiling.maxSegments : 1,
+  };
 }
 
 export function resolveMissionEffortDecisionV1(
@@ -121,30 +176,51 @@ export function resolveMissionEffortDecisionV1(
         ? "direct"
         : "compose";
   const defaults = profileDefaults(profile);
-  // The `direct` profile is a hard single-call invariant (1 model call, 0 tools,
-  // 1 min). A caller's step budget (which defaults to MAX_AGENT_STEPS=100 even
-  // when not explicitly configured) must not raise it via the ceiling path.
-  // All other profiles honor the caller's configured values in both directions.
-  const maxModelCalls =
-    profile === "direct"
-      ? defaults.maxModelCalls
-      : applyPositiveCeiling(
-          defaults.maxModelCalls,
-          perMissionCountBudget(input.configuredMaxModelCalls),
-        );
-  const maxToolCalls =
-    profile === "direct"
-      ? defaults.maxToolCalls
-      : applyNonNegativeCeiling(
-          defaults.maxToolCalls,
-          perMissionCountBudget(input.configuredMaxToolCalls),
-        );
+  // The ladder floor raises a prompt-shaped default to what the mission has
+  // actually committed to doing. It never lowers, and it is bounded by
+  // `extended_team`. The `direct` profile keeps its 1/0/1min default when
+  // nothing is committed and nothing is configured -- which, now that "unset"
+  // is a real null rather than the materialized hard cap, needs no exception.
+  const floor = missionEffortFloorForCommittedToolCallsV1(
+    input.committedToolCalls,
+  );
+  // When the committed ladder is known it governs the counts. `extended_team`
+  // is selected because a mission is a multi-stage pipeline, but its 100/200
+  // are then a ceiling rather than a floor: granting a seven-tool code ladder
+  // 200 tool calls and three twenty-minute segments is precisely the runaway
+  // the handoff recorded, where a lane ground into Playwright's 45-minute
+  // ceiling under a provider slowdown instead of finishing or failing. A
+  // ladder-sized budget never drops below `grounded_research`, so a mission
+  // that needs to gather before it writes is still funded to do so.
+  const ladderCeilingProfile = profile === "extended_team" && floor
+    ? profileDefaults("grounded_research")
+    : defaults;
+  const flooredModelCalls = Math.max(
+    ladderCeilingProfile.maxModelCalls,
+    floor?.maxModelCalls ?? 0,
+  );
+  const flooredToolCalls = Math.max(
+    ladderCeilingProfile.maxToolCalls,
+    floor?.maxToolCalls ?? 0,
+  );
+  const maxModelCalls = applyPositiveCeiling(
+    flooredModelCalls,
+    input.configuredMaxModelCalls,
+  );
+  const maxToolCalls = applyNonNegativeCeiling(
+    flooredToolCalls,
+    input.configuredMaxToolCalls,
+  );
   const configuredWallClockMs =
     typeof input.configuredMaxRunMinutes === "number" &&
     Number.isFinite(input.configuredMaxRunMinutes) &&
     input.configuredMaxRunMinutes > 0
       ? Math.floor(input.configuredMaxRunMinutes * 60_000)
       : null;
+  const flooredWallClockMs = Math.max(
+    defaults.maxWallClockMs,
+    floor?.maxWallClockMs ?? 0,
+  );
 
   return {
     version: 1,
@@ -156,10 +232,14 @@ export function resolveMissionEffortDecisionV1(
     maxModelCalls,
     maxToolCalls,
     maxWallClockMs:
+      // A direct mission is one model call, and its one-minute deadline is
+      // part of that contract rather than a budget: a mission-level run cap
+      // must not turn a hung single call into an hour of waiting. Every other
+      // profile takes the configured value, floored by the committed ladder.
       profile === "direct" || configuredWallClockMs === null
-        ? defaults.maxWallClockMs
-        : configuredWallClockMs,
-    maxSegments: defaults.maxSegments,
+        ? flooredWallClockMs
+        : Math.max(configuredWallClockMs, floor?.maxWallClockMs ?? 0),
+    maxSegments: Math.max(defaults.maxSegments, floor?.maxSegments ?? 0),
     finalizationReserve: {
       modelCalls: Math.min(defaults.finalizationModelCalls, maxModelCalls),
       toolCalls: Math.min(defaults.finalizationToolCalls, maxToolCalls),
@@ -172,6 +252,12 @@ export function resolveMissionEffortDecisionV1(
       ...(extended ? ["explicit_extended_research"] : []),
       ...(grounded ? ["explicit_grounding_required"] : []),
       ...(outputDepth === "in_depth" ? ["in_depth_output_requested"] : []),
+      ...(floor
+        ? [
+            `committed_tool_ladder:${Math.trunc(input.committedToolCalls ?? 0)}`,
+            ...(input.committedWorkReasons ?? []),
+          ]
+        : []),
     ],
     stopConditions: [
       "acceptance_passed",
@@ -223,17 +309,11 @@ export function escalateMissionEffortDecisionForResearchV1(
   const grounded = profileDefaults("grounded_research");
   const flooredModelCalls = Math.max(
     decision.maxModelCalls,
-    applyPositiveCeiling(
-      grounded.maxModelCalls,
-      perMissionCountBudget(input.configuredMaxModelCalls),
-    ),
+    applyPositiveCeiling(grounded.maxModelCalls, input.configuredMaxModelCalls),
   );
   const flooredToolCalls = Math.max(
     decision.maxToolCalls,
-    applyNonNegativeCeiling(
-      grounded.maxToolCalls,
-      perMissionCountBudget(input.configuredMaxToolCalls),
-    ),
+    applyNonNegativeCeiling(grounded.maxToolCalls, input.configuredMaxToolCalls),
   );
   const configuredWallClockMs =
     typeof input.configuredMaxRunMinutes === "number" &&

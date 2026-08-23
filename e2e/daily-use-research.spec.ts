@@ -7,6 +7,8 @@ import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import { assertApprovalSurfaceUsableV1 } from "./fixtures/uiSurfaceAssertions";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import { resolveMissionEffortDecisionV1 } from "../src/agent/missionEffortDecision";
+import { missionCommittedWorkV1 } from "../src/agent/missionEffortEscalation";
+import { resolveConfiguredAgentStepSettingV1 } from "../src/agent/runBudget";
 import { MAX_AGENT_STEPS } from "../src/tools/constants";
 import { resolveNoteOutputPlan } from "../src/agent/noteOutputPolicy";
 import { resolveAdaptiveTeamDispatchV2 } from "../src/agent/researchTeamDispatch";
@@ -46,9 +48,11 @@ test.describe("Daily-use live research contract", () => {
       prompt: ORCHESTRATION_GUIDE_PROMPT,
       route: "single_model_writeback",
       outputTarget: output.destination,
-      configuredMaxModelCalls: MAX_AGENT_STEPS,
-      configuredMaxToolCalls: MAX_AGENT_STEPS,
+      configuredMaxModelCalls: resolveConfiguredAgentStepSettingV1(MAX_AGENT_STEPS),
+      configuredMaxToolCalls: resolveConfiguredAgentStepSettingV1(MAX_AGENT_STEPS),
       configuredMaxRunMinutes: null,
+      committedToolCalls: missionCommittedWorkV1(ORCHESTRATION_GUIDE_PROMPT)
+        .toolCalls,
     });
     const team = await resolveAdaptiveTeamDispatchV2({
       prompt: ORCHESTRATION_GUIDE_PROMPT,

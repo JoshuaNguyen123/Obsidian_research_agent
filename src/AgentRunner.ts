@@ -106,6 +106,7 @@ import {
 import {
   estimateLoopBudget,
   getRunBudgetProfile,
+  resolveConfiguredAgentStepSettingV1,
   resolveConfiguredMaxAgentSteps,
 } from "./agent/runBudget";
 import { planReadOnlyFollowups } from "./agent/autoFollowups";
@@ -1928,6 +1929,12 @@ export async function runAgentMission({
       MAX_AGENT_STEPS,
       providedMaxSteps ?? toolContext.settings?.maxAgentSteps ?? MAX_AGENT_STEPS,
     ),
+  );
+  // The loop cap above materializes MAX_AGENT_STEPS for "unset". The effort
+  // decision needs the user's actual choice, where unset must stay null so a
+  // profile default can stand rather than being overwritten by the hard cap.
+  const configuredStepBudgetSetting = resolveConfiguredAgentStepSettingV1(
+    providedMaxSteps ?? toolContext.settings?.maxAgentSteps,
   );
   const preliminaryModelCallCap = configuredStepBudget * 3 + 8;
   const configuredContextTokens = Math.max(
@@ -5475,8 +5482,8 @@ export async function runAgentMission({
         researchContractAttached:
           researchPlan.sourceRequirements.minFetchedSources > 0 ||
           Boolean(researchPlan.effort),
-        configuredMaxModelCalls: configuredStepBudget,
-        configuredMaxToolCalls: configuredStepBudget,
+        configuredMaxModelCalls: configuredStepBudgetSetting,
+        configuredMaxToolCalls: configuredStepBudgetSetting,
         configuredMaxRunMinutes:
           configuredMaxRunMs == null ? null : configuredMaxRunMs / 60_000,
       },

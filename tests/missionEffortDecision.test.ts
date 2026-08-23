@@ -5,7 +5,11 @@ import {
   resolveMissionEffortDecisionV1,
 } from "../src/agent/missionEffortDecision";
 import { detectProjectLifecycleStagesV1 } from "../src/agent/projectLifecycle";
-import { missionRequiresExtendedEffortBudgetV1 } from "../src/agent/missionEffortEscalation";
+import {
+  missionCommittedWorkV1,
+  missionRequiresExtendedEffortBudgetV1,
+} from "../src/agent/missionEffortEscalation";
+import { resolveConfiguredAgentStepSettingV1 } from "../src/agent/runBudget";
 import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
 import { MAX_AGENT_STEPS } from "../src/tools/constants";
 
@@ -17,7 +21,7 @@ test("in-depth writing selects Compose without inventing research", () => {
     prompt: ORCHESTRATION_GUIDE_PROMPT,
     route: "single_model_writeback",
     outputTarget: "new_note",
-    configuredMaxModelCalls: 100,
+    configuredMaxModelCalls: resolveConfiguredAgentStepSettingV1(100),
     configuredMaxRunMinutes: 60,
   });
   assert.equal(decision.profile, "compose");
@@ -26,7 +30,10 @@ test("in-depth writing selects Compose without inventing research", () => {
   assert.equal(decision.outputTarget, "new_note");
   // 100 is MAX_AGENT_STEPS, the system-wide hard cap that both safety-ceiling
   // presets pin and that settings materialize when the user configures
-  // nothing. It expresses no per-mission intent, so the compose budget stands.
+  // nothing. `resolveConfiguredAgentStepSettingV1` is the single production
+  // reader of that intent and resolves it to null, so the compose budget
+  // stands. The test calls the same function production does rather than
+  // restating its rule, so removing it here would fail rather than pass.
   assert.equal(decision.maxModelCalls, 6);
   assert.equal(decision.maxToolCalls, 4);
   // maxRunMinutes has no such cap, so a 60-minute configured run time is a
@@ -87,15 +94,17 @@ test("short Chat answers retain the one-call Direct ceiling", () => {
 });
 
 test("direct profile ignores a large configured step budget", () => {
-  // The runner always passes configuredMaxModelCalls = MAX_AGENT_STEPS (100) even
-  // when the user has not explicitly set anything. The direct profile must stay at
-  // 1 model call and 0 tool calls regardless of configured ceiling values.
+  // The runner passes the settings value, which is MAX_AGENT_STEPS (100) both
+  // when the user configured nothing and when a safety-ceiling preset pinned
+  // it. `resolveConfiguredAgentStepSettingV1` resolves that to "not narrowed",
+  // so the direct profile keeps its single-call default with no
+  // profile-specific exception of its own.
   const decision = resolveMissionEffortDecisionV1({
     prompt: "What is 2+2?",
     route: "single_model_answer",
     outputTarget: "chat",
-    configuredMaxModelCalls: 100,
-    configuredMaxToolCalls: 100,
+    configuredMaxModelCalls: resolveConfiguredAgentStepSettingV1(100),
+    configuredMaxToolCalls: resolveConfiguredAgentStepSettingV1(100),
     configuredMaxRunMinutes: 60,
   });
   assert.equal(decision.profile, "direct");
@@ -340,21 +349,23 @@ test("explicit research-publication intent escalates past the grounded budget", 
     "publication intent must escalate even with a single detected stage",
   );
 
+  const configured = {
+    configuredMaxModelCalls: resolveConfiguredAgentStepSettingV1(160),
+    configuredMaxToolCalls: resolveConfiguredAgentStepSettingV1(160),
+    configuredMaxRunMinutes: 90,
+  };
   const starved = resolveMissionEffortDecisionV1({
     prompt: phaseA,
     route: "grounded_workflow",
     outputTarget: "new_note",
-    configuredMaxModelCalls: 160,
-    configuredMaxToolCalls: 160,
-    configuredMaxRunMinutes: 90,
+    ...configured,
   });
   const escalated = resolveMissionEffortDecisionV1({
     prompt: phaseA,
     route: "grounded_workflow",
     outputTarget: "new_note",
-    configuredMaxModelCalls: 160,
-    configuredMaxToolCalls: 160,
-    configuredMaxRunMinutes: 90,
+    ...configured,
+    committedToolCalls: missionCommittedWorkV1(phaseA).toolCalls,
     forceExtendedTeam: missionRequiresExtendedEffortBudgetV1(phaseA),
   });
 
@@ -418,8 +429,8 @@ test("the system hard cap carries no per-mission budget intent", () => {
     prompt: ORCHESTRATION_GUIDE_PROMPT,
     route: "single_model_writeback",
     outputTarget: "new_note",
-    configuredMaxModelCalls: MAX_AGENT_STEPS,
-    configuredMaxToolCalls: MAX_AGENT_STEPS,
+    configuredMaxModelCalls: resolveConfiguredAgentStepSettingV1(MAX_AGENT_STEPS),
+    configuredMaxToolCalls: resolveConfiguredAgentStepSettingV1(MAX_AGENT_STEPS),
   });
   assert.equal(compose.profile, "compose");
   assert.equal(compose.maxModelCalls, 6);
@@ -429,8 +440,8 @@ test("the system hard cap carries no per-mission budget intent", () => {
     prompt: "Write a report using current sources and citations.",
     route: "grounded_workflow",
     outputTarget: "new_note",
-    configuredMaxModelCalls: MAX_AGENT_STEPS,
-    configuredMaxToolCalls: MAX_AGENT_STEPS,
+    configuredMaxModelCalls: resolveConfiguredAgentStepSettingV1(MAX_AGENT_STEPS),
+    configuredMaxToolCalls: resolveConfiguredAgentStepSettingV1(MAX_AGENT_STEPS),
   });
   assert.equal(grounded.profile, "grounded_research");
   assert.equal(grounded.maxModelCalls, 16);

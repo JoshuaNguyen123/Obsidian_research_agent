@@ -176,6 +176,56 @@ export function toolsAllowedForLifecycleStage(
   return LIFECYCLE_STAGE_TOOL_ALLOW[stage] ?? [];
 }
 
+/**
+ * How many tool calls each lifecycle stage necessarily commits.
+ *
+ * This is not the allowlist length — an allowlist is what a stage *may* call,
+ * and is far larger than what it *must*. These are the ordered ladders the
+ * deterministic planner seeds, counted:
+ *
+ * - `accepted_research`: two evidence fetches, a search, the note write, and
+ *   its read-back.
+ * - `linear_hierarchy`: connection context, publication, readback.
+ * - `code_execution`: the scratch delivery ladder the desktop lanes pin —
+ *   sandbox status, workspace create, file create, fast/targeted/full
+ *   validation, directory export. `missionEffortLadder.test.ts` asserts this
+ *   number against `getRequiredCodeWorkflowToolNames` itself, so it can never
+ *   silently fall behind the real ladder.
+ * - `code_validation`: repair-record cycle, repository promotion, commit, and
+ *   the two validations a commit requires afresh.
+ * - `private_github_publication`: repository creation and publication.
+ * - `reflection`: the notebook reflection and the project results write.
+ * - `reconciliation_cleanup`: two cleanup mutations.
+ *
+ * Budgets are ceilings, not targets: a mission that finishes early does not
+ * spend the rest. Sizing a budget below this number does not make a mission
+ * cheaper, it makes it die partway with a ledger that says it could have
+ * continued — which is exactly what happened when a seven-tool code ladder
+ * drew the four-tool `compose` budget.
+ */
+export const PROJECT_LIFECYCLE_STAGE_COMMITTED_TOOL_CALLS_V1: Readonly<
+  Record<ProjectLifecycleStageV1, number>
+> = Object.freeze({
+  accepted_research: 5,
+  linear_hierarchy: 3,
+  code_execution: 7,
+  code_validation: 5,
+  private_github_publication: 2,
+  reflection: 2,
+  reconciliation_cleanup: 2,
+});
+
+/** Total tool calls the detected lifecycle stages commit, in order. */
+export function committedToolCallsForLifecycleStagesV1(
+  stages: readonly ProjectLifecycleStageV1[],
+): number {
+  return [...new Set(stages)].reduce(
+    (total, stage) =>
+      total + (PROJECT_LIFECYCLE_STAGE_COMMITTED_TOOL_CALLS_V1[stage] ?? 0),
+    0,
+  );
+}
+
 export function nextLifecycleStageAfter(
   stage: ProjectLifecycleStageV1,
   committed: boolean,
