@@ -45,6 +45,80 @@ export interface FreeSearchInput {
   signal?: AbortSignal;
 }
 
+/** Every index a mission may name directly. */
+export const FREE_SEARCH_PROVIDER_IDS = Object.freeze([
+  "wikipedia",
+  "openalex",
+  "arxiv",
+  "crossref",
+  "pubmed",
+  "clinicaltrials",
+  "courtlistener",
+] as const);
+
+export type FreeSearchProviderId = (typeof FREE_SEARCH_PROVIDER_IDS)[number];
+
+/**
+ * The set that runs when no index is named — unchanged from when these clients
+ * existed only as a failure-only fallback. Widening it would add an outbound
+ * request to every general query for a corpus most queries do not want.
+ */
+export const DEFAULT_FREE_SEARCH_PROVIDERS: readonly FreeSearchProviderId[] =
+  Object.freeze([
+    "wikipedia",
+    "openalex",
+    "arxiv",
+    "crossref",
+    "pubmed",
+  ] as const);
+
+/**
+ * Shorthand a mission can name instead of listing indexes, so "search the case
+ * law" does not require knowing that CourtListener is the client behind it.
+ */
+export const FREE_SEARCH_PROVIDER_GROUPS: Readonly<
+  Record<string, readonly FreeSearchProviderId[]>
+> = Object.freeze({
+  scholar: Object.freeze(["openalex", "arxiv", "crossref", "pubmed"] as const),
+  academic: Object.freeze(["openalex", "arxiv", "crossref", "pubmed"] as const),
+  medicine: Object.freeze(["pubmed", "clinicaltrials"] as const),
+  medical: Object.freeze(["pubmed", "clinicaltrials"] as const),
+  trials: Object.freeze(["clinicaltrials"] as const),
+  law: Object.freeze(["courtlistener"] as const),
+  legal: Object.freeze(["courtlistener"] as const),
+  caselaw: Object.freeze(["courtlistener"] as const),
+});
+
+/**
+ * Resolve a caller-supplied index name to the providers it addresses, or null
+ * when the name is not one we serve. Group names and provider ids are both
+ * accepted, and a comma-separated list fuses several.
+ */
+export function resolveFreeSearchProviders(
+  value: string | undefined,
+): readonly FreeSearchProviderId[] | null {
+  const raw = (value ?? "").trim().toLowerCase();
+  if (!raw || raw === "auto" || raw === "web") return null;
+  const requested = raw
+    .split(/[,\s]+/u)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const resolved: FreeSearchProviderId[] = [];
+  for (const name of requested) {
+    const group = FREE_SEARCH_PROVIDER_GROUPS[name];
+    if (group) {
+      for (const id of group) {
+        if (!resolved.includes(id)) resolved.push(id);
+      }
+      continue;
+    }
+    const id = FREE_SEARCH_PROVIDER_IDS.find((candidate) => candidate === name);
+    if (!id) return null;
+    if (!resolved.includes(id)) resolved.push(id);
+  }
+  return resolved.length > 0 ? resolved : null;
+}
+
 const REQUEST_HEADERS: Record<string, string> = {
   // Wikipedia, OpenAlex, Crossref and NCBI all ask API clients to identify
   // themselves; Crossref's "polite pool" gives identified clients better
@@ -59,6 +133,8 @@ const PUBMED_ESEARCH =
   "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
 const PUBMED_ESUMMARY =
   "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
+const CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2/studies";
+const COURTLISTENER_API = "https://www.courtlistener.com/api/rest/v4/search/";
 
 const MAX_SNIPPET_CHARS = 400;
 
@@ -91,15 +167,32 @@ interface RankedResult {
 export async function runFreeSearchFallback(
   input: FreeSearchInput,
 ): Promise<FreeSearchResult[]> {
+  return runFreeSearchProviders(input);
+}
+
+/**
+ * Run a named subset of the free providers and fuse them the same way.
+ *
+ * This is what makes an index addressable. Before it, these clients could only
+ * be reached by the primary provider failing — a researcher could not ask to
+ * search PubMed, and a clinician could not reach clinicaltrials.gov at all.
+ *
+ * The default set is deliberately unchanged from the failure-only fallback:
+ * `clinicaltrials` and `courtlistener` answer narrow questions well and would
+ * only add latency and noise to a general query, so they are opt-in.
+ */
+export async function runFreeSearchProviders(
+  input: FreeSearchInput & { providers?: readonly FreeSearchProviderId[] },
+): Promise<FreeSearchResult[]> {
+  const selected =
+    input.providers && input.providers.length > 0
+      ? input.providers
+      : DEFAULT_FREE_SEARCH_PROVIDERS;
   const perProvider = Math.max(1, Math.min(10, input.maxResults));
   const providerInput = { ...input, maxResults: perProvider };
-  const batches = await Promise.all([
-    safeProvider(() => wikipediaSearch(providerInput)),
-    safeProvider(() => openAlexSearch(providerInput)),
-    safeProvider(() => arxivSearch(providerInput)),
-    safeProvider(() => crossrefSearch(providerInput)),
-    safeProvider(() => pubmedSearch(providerInput)),
-  ]);
+  const batches = await Promise.all(
+    selected.map((id) => safeProvider(() => FREE_SEARCH_PROVIDERS[id](providerInput))),
+  );
 
   const fused = new Map<string, RankedResult>();
   for (const batch of batches) {
@@ -345,6 +438,222 @@ export async function pubmedSearch(
     });
   }
   return results;
+}
+
+/**
+ * clinicaltrials.gov v2.
+ *
+ * A trial registration is a primary record: it states what was pre-registered,
+ * including trials that never published. That is precisely what a clinician or
+ * a reviewer needs and precisely what a literature index cannot give them.
+ */
+export async function clinicalTrialsSearch(
+  input: FreeSearchInput,
+): Promise<FreeSearchResult[]> {
+  const url =
+    `${CLINICAL_TRIALS_API}?query.term=${encodeURIComponent(input.query)}` +
+    `&pageSize=${clampLimit(input.maxResults)}`;
+  const body = await getJson(input, url);
+  const studies = isRecord(body) && Array.isArray(body.studies) ? body.studies : [];
+  const results: FreeSearchResult[] = [];
+  for (const study of studies) {
+    if (!isRecord(study)) continue;
+    const protocol = isRecord(study.protocolSection) ? study.protocolSection : null;
+    if (!protocol) continue;
+    const identification = isRecord(protocol.identificationModule)
+      ? protocol.identificationModule
+      : null;
+    const nctId =
+      identification && typeof identification.nctId === "string"
+        ? identification.nctId.trim()
+        : "";
+    if (!/^NCT\d+$/iu.test(nctId)) continue;
+    const title = collapseWhitespace(
+      (identification && typeof identification.briefTitle === "string"
+        ? identification.briefTitle
+        : "") || nctId,
+    );
+    const status = isRecord(protocol.statusModule) ? protocol.statusModule : null;
+    const overallStatus =
+      status && typeof status.overallStatus === "string" ? status.overallStatus : "";
+    const startDate =
+      status &&
+      isRecord(status.startDateStruct) &&
+      typeof status.startDateStruct.date === "string"
+        ? status.startDateStruct.date
+        : undefined;
+    const description = isRecord(protocol.descriptionModule)
+      ? protocol.descriptionModule
+      : null;
+    const summary =
+      description && typeof description.briefSummary === "string"
+        ? collapseWhitespace(description.briefSummary)
+        : "";
+    results.push({
+      title,
+      url: `https://clinicaltrials.gov/study/${nctId}`,
+      snippet: [overallStatus, summary]
+        .filter(Boolean)
+        .join(" — ")
+        .slice(0, MAX_SNIPPET_CHARS),
+      publishedAt: startDate,
+      sourceTypeHint: "primary",
+      provider: "clinicaltrials",
+    });
+  }
+  return results;
+}
+
+/**
+ * CourtListener opinion search — US case law and dockets, keyless.
+ *
+ * The matched passage lives on the nested `opinions[]` entries rather than on
+ * the cluster, so reading it there is what gives the reader the text that
+ * matched instead of a bare case name.
+ */
+export async function courtListenerSearch(
+  input: FreeSearchInput,
+): Promise<FreeSearchResult[]> {
+  const url =
+    `${COURTLISTENER_API}?q=${encodeURIComponent(input.query)}&type=o` +
+    `&order_by=${encodeURIComponent("score desc")}`;
+  const body = await getJson(input, url);
+  const items = isRecord(body) && Array.isArray(body.results) ? body.results : [];
+  const results: FreeSearchResult[] = [];
+  for (const item of items.slice(0, clampLimit(input.maxResults))) {
+    if (!isRecord(item)) continue;
+    const path = typeof item.absolute_url === "string" ? item.absolute_url : "";
+    if (!path.startsWith("/")) continue;
+    const caseName =
+      (typeof item.caseName === "string" && item.caseName.trim()
+        ? item.caseName
+        : typeof item.caseNameFull === "string"
+          ? item.caseNameFull
+          : "") || path;
+    const court = typeof item.court === "string" ? item.court : "";
+    const citation = firstString(item.citation);
+    const dateFiled =
+      typeof item.dateFiled === "string" && item.dateFiled.trim()
+        ? item.dateFiled
+        : undefined;
+    results.push({
+      // The court belongs in the title: it is the single most load-bearing
+      // fact about an opinion's authority, and ranking reads it from there.
+      title: collapseWhitespace([caseName, court].filter(Boolean).join(" — ")),
+      url: `https://www.courtlistener.com${path}`,
+      snippet: [citation, stripHtml(firstOpinionSnippet(item.opinions))]
+        .filter(Boolean)
+        .join(" — ")
+        .slice(0, MAX_SNIPPET_CHARS),
+      publishedAt: dateFiled,
+      // A judicial opinion is the primary text, not commentary about it.
+      sourceTypeHint: "primary",
+      provider: "courtlistener",
+    });
+  }
+  return results;
+}
+
+function firstOpinionSnippet(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  for (const opinion of value) {
+    if (
+      isRecord(opinion) &&
+      typeof opinion.snippet === "string" &&
+      opinion.snippet.trim()
+    ) {
+      return opinion.snippet;
+    }
+  }
+  return "";
+}
+
+const FREE_SEARCH_PROVIDERS: Readonly<
+  Record<FreeSearchProviderId, (input: FreeSearchInput) => Promise<FreeSearchResult[]>>
+> = Object.freeze({
+  wikipedia: wikipediaSearch,
+  openalex: openAlexSearch,
+  arxiv: arxivSearch,
+  crossref: crossrefSearch,
+  pubmed: pubmedSearch,
+  clinicaltrials: clinicalTrialsSearch,
+  courtlistener: courtListenerSearch,
+});
+
+/**
+ * Ask OpenAlex which open-access editions of a work exist.
+ *
+ * A paywalled DOI is the most common dead end in scientific and medical
+ * research: the fetch returns an abstract-and-paywall interstitial, the source
+ * is unusable, and the run has nothing to cite even though a readable edition
+ * is sitting in a repository. OpenAlex records every OA location it knows for
+ * a work, keylessly, so a DOI can find one.
+ *
+ * Unpaywall is the other obvious resolver and is deliberately not used: it
+ * requires an identifying email on every request, and sending the user's
+ * address to a third party to read a paper is not a trade this makes for them.
+ *
+ * Returns URLs only. It never fetches them, so the caller's existing fetch
+ * path and its safety checks stay the only thing that touches a source.
+ */
+export async function resolveOpenAccessEditions(input: {
+  transport: HttpTransport;
+  url: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<string[]> {
+  const doi = extractDoi(input.url);
+  if (!doi) return [];
+  const body = await getJson(
+    {
+      transport: input.transport,
+      query: "",
+      maxResults: 1,
+      timeoutMs: input.timeoutMs,
+      signal: input.signal,
+    },
+    `https://api.openalex.org/works/doi:${encodeURIComponent(doi)}`,
+  );
+  if (!isRecord(body)) return [];
+
+  const candidates: unknown[] = [];
+  const best = isRecord(body.best_oa_location) ? body.best_oa_location : null;
+  if (best) {
+    candidates.push(best.pdf_url, best.landing_page_url);
+  }
+  if (isRecord(body.open_access)) {
+    candidates.push(body.open_access.oa_url);
+  }
+  if (Array.isArray(body.locations)) {
+    for (const location of body.locations) {
+      if (!isRecord(location) || location.is_oa !== true) continue;
+      candidates.push(location.pdf_url, location.landing_page_url);
+    }
+  }
+
+  const seen = new Set<string>();
+  const editions: string[] = [];
+  const original = input.url.trim().toLowerCase();
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const value = candidate.trim();
+    if (!/^https?:\/\//iu.test(value)) continue;
+    const key = value.toLowerCase();
+    // The DOI landing page is usually the paywall we just failed to read.
+    if (key === original || key.includes("doi.org/")) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    editions.push(value);
+    if (editions.length >= 3) break;
+  }
+  return editions;
+}
+
+/** DOI out of a doi.org URL, a publisher URL that embeds one, or a bare DOI. */
+export function extractDoi(value: string): string | null {
+  const match = /\b(10\.\d{4,9}\/[^\s"'<>&?#]+)/u.exec((value ?? "").trim());
+  if (!match) return null;
+  return match[1].replace(/[.,;)]+$/u, "");
 }
 
 async function getJson(input: FreeSearchInput, url: string): Promise<unknown> {
