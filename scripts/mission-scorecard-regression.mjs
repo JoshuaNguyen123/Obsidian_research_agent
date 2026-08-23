@@ -74,7 +74,7 @@ export const PROOF_CLASS_ENFORCED_PROJECTS = new Set(["core-native"]);
 // adding a dimension invalidates every baseline record until it is
 // regenerated from real runs — deliberately loud rather than silently
 // comparing a subset.
-const DIMENSION_IDS = Object.freeze([
+export const DIMENSION_IDS = Object.freeze([
   "acceptance_coverage",
   "evidence_grounding",
   "receipt_coverage",
@@ -147,20 +147,36 @@ export async function assertMissionScorecardSummaryFile(options = {}) {
   const summaryPath = path.resolve(
     options.summaryPath ?? DEFAULT_DAILY_USE_SUMMARY_PATH,
   );
-  // A bare ENOENT here reads as a broken gate. It usually means only that no
-  // scored lane has run on this machine yet, which is the ordinary state of a
-  // fresh checkout — say so, and name the lane to run.
   let summaryText;
   try {
     summaryText = await readFile(summaryPath, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") {
-      throw new Error(
-        `No daily-use run summary at ${path.relative(process.cwd(), summaryPath).replace(/\\/gu, "/")}. ` +
-          "This gate compares a real run against the harvested baseline, so a scored lane has to run first:\n" +
-          "  npm run test:e2e:research\n" +
-          "Then harvest it with: npm run scorecards:harvest",
-      );
+      // A fresh checkout has no run summary, and that is not proof debt --
+      // nothing has run yet. The baseline manifest is still checkable without
+      // one, and that check is the part worth having in CI: it catches a
+      // baseline that has gone structurally stale (a dimension added, a record
+      // harvested before `applicable` existed) long before anyone next runs a
+      // scored lane against it. Selecting specific lanes still demands a real
+      // comparison, so a lane runner cannot pass here by deleting its summary.
+      validateBaseline(baseline);
+      if (selectedProjects.size > 0) {
+        const relative = path
+          .relative(process.cwd(), summaryPath)
+          .replace(/\\/gu, "/");
+        throw new Error(
+          `No daily-use run summary at ${relative} for selected lane(s): ` +
+            `${[...selectedProjects].join(", ")}. This gate compares a real ` +
+            "run against the harvested baseline, so the lane has to run " +
+            "first, then be harvested with: npm run scorecards:harvest",
+        );
+      }
+      return {
+        checkedRecords: 0,
+        skipped: true,
+        reason: "no_run_summary",
+        validatedBaselineRecords: baseline.records.length,
+      };
     }
     throw error;
   }
@@ -431,8 +447,14 @@ function validateScorecard(value, label) {
       seen.has(dimension.id) ||
       !unitInterval(dimension.score) ||
       !unitInterval(dimension.weight) ||
-      (dimension.applicable !== undefined &&
-        typeof dimension.applicable !== "boolean")
+      // `applicable` is required, not optional. A record harvested before the
+      // field existed asserts a hard 1.0 floor on dimensions that measured
+      // nothing at all -- "0/0 claims cited" scoring a perfect
+      // evidence_grounding -- which is exactly the vacuous-perfect bug the
+      // field was added to close. Rejecting such a record makes the baseline
+      // fail loudly and demand a fresh harvest instead of reading green
+      // forever against a bar it never held.
+      typeof dimension.applicable !== "boolean"
     ) {
       throw new Error(`${label} contains an invalid dimension.`);
     }
@@ -477,9 +499,13 @@ if (
   void assertMissionScorecardSummaryFile()
     .then((result) => {
       console.log(
-        result.skipped
-          ? "Mission scorecard regression gate skipped: no baselined records were selected."
-          : `Mission scorecard regression gate passed for ${result.checkedRecords} record(s).`,
+        result.reason === "no_run_summary"
+          ? `Mission scorecard baseline validated (${result.validatedBaselineRecords} record(s)); ` +
+            "no daily-use run summary on this machine, so no run was compared. " +
+            "Run a scored lane (npm run test:e2e:research) and harvest it to compare one."
+          : result.skipped
+            ? "Mission scorecard regression gate skipped: no baselined records were selected."
+            : `Mission scorecard regression gate passed for ${result.checkedRecords} record(s).`,
       );
     })
     .catch((error) => {

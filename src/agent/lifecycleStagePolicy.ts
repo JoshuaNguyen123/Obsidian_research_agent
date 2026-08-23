@@ -81,6 +81,16 @@ export const CODE_IMPLEMENTATION_TOOL_ALLOW = [
   "code_workspace_append",
   "code_workspace_patch",
   "code_workspace_write_expected",
+  // Relocation and removal have been registered, hash-bound, receipted, and
+  // reconcilable since the V2 workspace landed, but were in no lifecycle
+  // allowlist -- so mid-mission the agent could create a file and then never
+  // rename or delete it. Every one of these is a prepared, exactly-approved
+  // mutation inside the same durable workspace as the writes above; trash is
+  // recoverable through code_workspace_restore rather than a hard delete.
+  "code_workspace_move",
+  "code_workspace_copy",
+  "code_workspace_trash",
+  "code_workspace_restore",
 ] as const;
 
 export const CODE_VALIDATION_TOOL_ALLOW = [
@@ -146,6 +156,14 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     "linear_create_issue",
     "linear_get_issue",
     "linear_search_issues",
+    // The stage could open work but never close it, so in a compound mission
+    // the host moved issues to Done on the agent's behalf while the agent's
+    // own tickets sat open. A state change is an ordinary reversible Linear
+    // mutation and still runs prepare -> exact approval -> execute ->
+    // independent readback -> reconcile; listing workflow states is the read
+    // that makes the target state id discoverable rather than guessed.
+    "linear_list_workflow_states",
+    "linear_update_issue",
   ],
   code_execution: [...CODE_IMPLEMENTATION_TOOL_ALLOW],
   code_validation: [...CODE_VALIDATION_TOOL_ALLOW],
