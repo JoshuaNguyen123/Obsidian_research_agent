@@ -5343,6 +5343,12 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
         },
       };
     }
+    // The cited page itself is reachable. Without this it answered 404 to the
+    // pre-finalization liveness probe, and the run would correctly append a
+    // dead-citation caveat to the note this test pins byte for byte.
+    if (request.url.startsWith("https://example.com/grapes-of-wrath")) {
+      return { status: 200, headers: {} };
+    }
     return { status: 404, headers: {}, json: { error: "not mocked" } };
   };
 

@@ -321,7 +321,11 @@ import {
   isBroadUnscopedVaultMutation,
   type AutonomyScope,
 } from "./agent/missionScope";
-import { buildLivenessProbe, recheckLinkLiveness } from "./agent/deadLinkCheck";
+import {
+  buildLivenessProbe,
+  recheckLinkLiveness,
+  type LinkLivenessResult,
+} from "./agent/deadLinkCheck";
 import { buildMissionResearchSignalsV1 } from "./agent/missionResearchSignals";
 import {
   MAX_VERIFIED_WORKSPACE_READ_CONTENT_CHARS,
@@ -504,8 +508,10 @@ import {
   shouldRequireLinearIssueTemplateRead,
 } from "./agent/promptIntentClassifiers";
 import {
+  LIVENESS_CAVEAT_HEADING,
   decideSingleAgentLivenessRecheck,
   formatLivenessCaveat,
+  formatLivenessCaveatSection,
 } from "./agent/livenessRecheckPolicy";
 import {
   addLedgerBlocker,
@@ -8018,6 +8024,87 @@ export async function runAgentMission({
       });
     }
   };
+  /**
+   * The markdown note this run committed, which a liveness caveat can be
+   * appended to. The newest markdown write wins: that is the deliverable the
+   * reader will open.
+   */
+  const resolveLivenessCaveatNotePath = (): string | null => {
+    for (let index = writeReceipts.length - 1; index >= 0; index -= 1) {
+      const receipt = writeReceipts[index];
+      const path = typeof receipt?.path === "string" ? receipt.path : "";
+      if (!path.toLowerCase().endsWith(".md")) continue;
+      if (
+        receipt.operation === "append" ||
+        receipt.operation === "create" ||
+        receipt.operation === "replace" ||
+        receipt.operation === "edit"
+      ) {
+        return path;
+      }
+    }
+    return null;
+  };
+  /**
+   * Append the dead-citation caveat to the committed note and receipt it.
+   *
+   * Host-owned and append-only. The note is already committed and verified, so
+   * this never rewrites body text; it adds a section under a fixed heading and
+   * is idempotent on that heading, so a re-finalized or resumed run cannot
+   * stack two copies.
+   */
+  const appendLivenessCaveatToNote = async (
+    liveness: readonly LinkLivenessResult[],
+    step: number,
+  ): Promise<void> => {
+    const notePath = resolveLivenessCaveatNotePath();
+    if (!notePath) return;
+    const section = formatLivenessCaveatSection(liveness, {
+      checkedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+    });
+    if (!section) return;
+    const file = runToolContext.app.vault.getFileByPath(notePath);
+    if (!file || file.extension.toLowerCase() !== "md") return;
+    const current = await runToolContext.app.vault.read(file);
+    if (current.includes(LIVENESS_CAVEAT_HEADING)) return;
+    const next = `${current}${current.endsWith("\n") ? "" : "\n"}\n${section}`;
+    await runToolContext.app.vault.modify(file, next);
+    const observed = await runToolContext.app.vault.read(file);
+    if (observed !== next) {
+      events.onTrace?.({
+        id: `liveness-caveat-readback-${step}`,
+        kind: "status",
+        step,
+        message:
+          "Liveness caveat readback did not match; the caveat is reported in the run details only.",
+      });
+      return;
+    }
+    const receipt: AgentRunReceipt = {
+      toolName: "append_to_current_file",
+      operation: "append",
+      path: notePath,
+      bytesWritten: getByteLength(section),
+      readback: {
+        status: "verified",
+        checkedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+        observedRevision: hashOperationInput({ path: notePath, content: observed }),
+        observedFingerprint: hashOperationInput(observed),
+      },
+      output: {
+        path: notePath,
+        operation: "append",
+        bytesWritten: getByteLength(section),
+        livenessCaveat: true,
+        deadUrls: liveness
+          .filter((result) => result.liveness === "dead")
+          .map((result) => result.url),
+      },
+      message: `append ${notePath}; liveness caveat`,
+    };
+    writeReceipts.push(receipt);
+    events.onReceipt?.(receipt);
+  };
   let singleAgentCriticReviewed = false;
   /**
    * Bounded, advisory self-critique for a mission that never touches the
@@ -8272,11 +8359,10 @@ export async function runAgentMission({
       graphComplete,
     });
     // A content hash attests what was fetched, not that the page is still
-    // there. Deep and extended runs re-probe their cited sources and surface
-    // anything definitively gone. Non-blocking by design: the note is already
-    // committed, and a dead link is a caveat for the reader, not grounds to
-    // retract verified work. Gated on tier so lanes that count transport calls
-    // to prove cache reuse are unaffected.
+    // there. A run that committed a note re-probes its cited sources and
+    // surfaces anything definitively gone. Non-blocking by design: the note is
+    // already committed, and a dead link is a caveat for the reader, not
+    // grounds to retract verified work.
     {
       const citedUrls = [
         ...new Set(
@@ -8293,6 +8379,7 @@ export async function runAgentMission({
         enabled: runToolContext.settings?.deadLinkRecheckEnabled,
         hasTransport: typeof runToolContext.httpTransport === "function",
         citedUrlCount: citedUrls.length,
+        committedNote: Boolean(resolveLivenessCaveatNotePath()),
       });
       if (decision.recheck) {
         try {
@@ -8313,6 +8400,9 @@ export async function runAgentMission({
               step,
               message: caveat,
             });
+            // The sidebar scrolls away; the note does not. A 404'd citation the
+            // reader is never told about again is the same as not checking.
+            await appendLivenessCaveatToNote(liveness, step);
           }
         } catch {
           // A probe failure must never turn a completed mission into an error.

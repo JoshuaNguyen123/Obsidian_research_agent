@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  LIVENESS_CAVEAT_HEADING,
   decideSingleAgentLivenessRecheck,
   formatLivenessCaveat,
+  formatLivenessCaveatSection,
 } from "../src/agent/livenessRecheckPolicy";
 import { buildLivenessProbe, recheckLinkLiveness } from "../src/agent/deadLinkCheck";
 
@@ -21,14 +23,64 @@ test("deep and extended runs re-probe their cited sources", () => {
   );
 });
 
-test("quick and standard runs never probe, which is what protects the proof lanes", () => {
-  // The lanes count transport calls to prove cache reuse; extra probes on a
-  // standard-tier run would change those counts. This gate is load-bearing.
-  for (const tier of ["quick", "standard", undefined, "none"]) {
-    const decision = decideSingleAgentLivenessRecheck({ ...READY, tier });
-    assert.equal(decision.recheck, false, `expected no probe at tier ${tier}`);
+test("a standard run that committed a note re-probes its cited sources", () => {
+  // Quick and standard research used to skip this entirely, so the tier whose
+  // links most often rot -- an ordinary sourced note the reader comes back to
+  // -- was the one tier that never checked them.
+  const decision = decideSingleAgentLivenessRecheck({
+    ...READY,
+    tier: "standard",
+    committedNote: true,
+  });
+  assert.equal(decision.recheck, true);
+});
+
+test("a chat-only standard run makes no extra outbound request", () => {
+  // This is what keeps the cache-reuse proof lanes deterministic: they drive a
+  // standard, chat-only mission and count transport calls.
+  const decision = decideSingleAgentLivenessRecheck({
+    ...READY,
+    tier: "standard",
+    committedNote: false,
+  });
+  assert.equal(decision.recheck, false);
+  assert.equal(decision.reason, "no_committed_note");
+});
+
+test("quick runs never probe, with or without a note", () => {
+  // A quick answer makes no claim of thoroughness and its sources were fetched
+  // seconds ago in the same session.
+  for (const committedNote of [true, false]) {
+    const decision = decideSingleAgentLivenessRecheck({
+      ...READY,
+      tier: "quick",
+      committedNote,
+    });
+    assert.equal(decision.recheck, false);
     assert.equal(decision.reason, "tier_below_threshold");
   }
+});
+
+test("an untiered run that committed a note still probes", () => {
+  // Most sourced writebacks never build a research plan at all, so keying the
+  // probe on an effort tier alone left it unreachable for the ordinary case
+  // this feature exists to serve.
+  assert.equal(
+    decideSingleAgentLivenessRecheck({
+      ...READY,
+      tier: undefined,
+      committedNote: true,
+    }).recheck,
+    true,
+  );
+  assert.equal(
+    decideSingleAgentLivenessRecheck({
+      ...READY,
+      tier: undefined,
+      committedNote: false,
+    }).reason,
+    "no_committed_note",
+  );
 });
 
 test("the kill switch outranks the tier gate", () => {
@@ -38,11 +90,12 @@ test("the kill switch outranks the tier gate", () => {
 });
 
 test("an explicitly enabled setting still respects the tier gate", () => {
-  // Turning the setting on must not silently make every standard run probe.
+  // Turning the setting on must not silently make every quick run probe.
   const decision = decideSingleAgentLivenessRecheck({
     ...READY,
-    tier: "standard",
+    tier: "quick",
     enabled: true,
+    committedNote: true,
   });
   assert.equal(decision.recheck, false);
   assert.equal(decision.reason, "tier_below_threshold");
@@ -115,4 +168,23 @@ test("a throwing transport reports unknown rather than dead", async () => {
   });
   assert.equal(results[0].liveness, "unknown");
   assert.equal(formatLivenessCaveat(results), null);
+});
+
+test("the caveat section is a note-shaped block under a stable heading", async () => {
+  const results = await recheckLinkLiveness({
+    urls: ["https://gone.example/a", "https://fine.example/b"],
+    probe: async (url) => (url.includes("gone") ? 404 : 200),
+  });
+  const section = formatLivenessCaveatSection(results, {
+    checkedAt: "2026-08-23T00:00:00.000Z",
+  });
+  assert.ok(section);
+  // The heading is load-bearing: it is what makes appending the caveat
+  // idempotent when a run is resumed or re-finalized.
+  assert.ok(section.startsWith(`${LIVENESS_CAVEAT_HEADING}
+`));
+  assert.match(section, /gone\.example/);
+  assert.doesNotMatch(section, /fine\.example/);
+  assert.match(section, /rechecked 2026-08-23T00:00:00\.000Z/);
+  assert.equal(formatLivenessCaveatSection([]), null);
 });
