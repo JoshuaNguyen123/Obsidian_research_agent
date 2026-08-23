@@ -514,6 +514,10 @@ import {
   formatLivenessCaveatSection,
 } from "./agent/livenessRecheckPolicy";
 import {
+  buildResearchNoteFrontmatter,
+  type ResearchNoteFrontmatterInput,
+} from "./agent/researchNoteFrontmatter";
+import {
   addLedgerBlocker,
   addLedgerReceipt,
   addMissionMilestone,
@@ -706,6 +710,7 @@ import {
   type ClaimLedger,
   type ClaimPassageRef,
   shouldRequireClaimGrounding,
+  shouldVerifyQuoteSpansV1,
 } from "./agent/claimLedger";
 import {
   acknowledgeEvidenceConflict,
@@ -6846,6 +6851,7 @@ export async function runAgentMission({
             });
           },
           missionPrompt: activeIntentPrompt,
+          researchFrontmatter: buildStreamedResearchFrontmatter,
           onPartialReceipt: (value) => {
             partialReceipt = value;
           },
@@ -7488,6 +7494,17 @@ export async function runAgentMission({
     // block ordinary sourced writeback when the model uses URL citations instead
     // of passage ids; research acceptance still enforces fetched-source coverage.
     const requireClaimGrounding = shouldRequireClaimGrounding(activeIntentPrompt);
+    // Verbatim quote checking used to need the prompt to literally say "quote".
+    // A deep sourced writeback is a claim of thoroughness and its passages are
+    // already persisted, so the quotations it does contain get checked against
+    // the passage they cite. Verification, not a requirement: quoting nothing
+    // stays a legitimate answer.
+    const verifyQuoteSpans = shouldVerifyQuoteSpansV1({
+      tier: researchPlan?.effort?.tier,
+      sourcedWriteback:
+        effectivePassages.length > 0 ||
+        missionEvidenceRecords.some((item) => item.kind === "web_source"),
+    });
     const verification = runMissionVerifiers({
       plan: missionPlan,
       evidence: missionEvidenceRecords,
@@ -7499,6 +7516,7 @@ export async function runAgentMission({
       passages: effectivePassages,
       conflicts: candidateConflicts,
       requireClaimGrounding,
+      verifyQuoteSpans,
       now: runToolContext.now?.() ?? new Date(),
     });
     lastVerificationChecks = verification.checks;
@@ -8023,6 +8041,54 @@ export async function runAgentMission({
         message: `Research memory auto-save skipped: ${getErrorMessage(error)}`,
       });
     }
+  };
+  /**
+   * Frontmatter for a note the streamed writeback creates.
+   *
+   * `withResearchNoteFrontmatter` existed and was called from exactly one
+   * place — the research-template workflow — so every note the main writeback
+   * path produced landed with no title, no date, no tags and no run id. In a
+   * graph-native app that is a note you can read once and then never find
+   * again.
+   *
+   * Applied only to notes this run creates. Prepending YAML to a note the user
+   * already owns is a destructive edit rather than an enhancement, which is
+   * why the writer excludes the append/replace/edit kinds rather than merely
+   * not handling them.
+   *
+   * `sources` counts real evidence records, so a run that retrieved nothing
+   * says `sources: 0` rather than implying grounding it does not have.
+   */
+  const buildStreamedResearchFrontmatter = (input: {
+    title: string | null;
+    path: string;
+  }): ResearchNoteFrontmatterInput | null => {
+    const sourceUrls = new Set<string>();
+    const sourcePaths = new Set<string>();
+    for (const record of missionEvidenceRecords) {
+      if (record.kind === "web_source" && typeof record.url === "string" && record.url) {
+        sourceUrls.add(record.url);
+      } else if (
+        record.kind === "vault_note" &&
+        typeof record.path === "string" &&
+        record.path
+      ) {
+        sourcePaths.add(record.path);
+      }
+    }
+    const sourceCount = sourceUrls.size + sourcePaths.size;
+    const basename = input.path.replace(/^.*\//u, "").replace(/\.md$/iu, "");
+    const title = input.title?.trim() || basename;
+    return {
+      title,
+      created: (runToolContext.now?.() ?? new Date()).toISOString(),
+      tags: [title, researchPlan?.mode ?? ""].filter(Boolean),
+      sourceCount,
+      ...(researchPlan?.effort?.tier
+        ? { confidence: researchPlan.effort.tier }
+        : {}),
+      runId,
+    };
   };
   /**
    * The markdown note this run committed, which a liveness caveat can be
@@ -31510,6 +31576,7 @@ async function streamCurrentNoteWriteback({
   missionPrompt,
   lazyCreatePath,
   onNoteCreated,
+  researchFrontmatter,
 }: {
   kind: StreamingWritebackKind;
   preparedSectionEdit: PreparedStreamingSectionEdit | null;
@@ -31529,6 +31596,10 @@ async function streamCurrentNoteWriteback({
   missionPrompt?: string;
   lazyCreatePath?: string | null;
   onNoteCreated?: (file: { path: string; basename: string }) => void;
+  researchFrontmatter?: (input: {
+    title: string | null;
+    path: string;
+  }) => ResearchNoteFrontmatterInput | null;
 }): Promise<AgentRunReceipt> {
   let originalNoteContentForSafety = "";
   try {
@@ -31549,6 +31620,7 @@ async function streamCurrentNoteWriteback({
     preparedSectionEdit,
     lazyCreatePath,
     onNoteCreated,
+    researchFrontmatter,
   });
   const activeBasename =
     toolContext.getCurrentMarkdownFile?.()?.basename ??
@@ -32599,12 +32671,21 @@ async function createStreamingNoteWriter({
   preparedSectionEdit,
   lazyCreatePath,
   onNoteCreated,
+  researchFrontmatter,
 }: {
   kind: StreamingWritebackKind;
   toolContext: ToolExecutionContext;
   preparedSectionEdit: PreparedStreamingSectionEdit | null;
   lazyCreatePath?: string | null;
   onNoteCreated?: (file: { path: string; basename: string }) => void;
+  /**
+   * Frontmatter for a note this writer creates. Returning null means the run
+   * is not research-bearing and the note is left as plain markdown.
+   */
+  researchFrontmatter?: (input: {
+    title: string | null;
+    path: string;
+  }) => ResearchNoteFrontmatterInput | null;
 }) {
   let file: ReturnType<typeof getActiveMarkdownFile> | null = null;
   let current = "";
@@ -32702,13 +32783,42 @@ async function createStreamingNoteWriter({
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let hasQueuedWrite = false;
 
+  // Computed once and reused, so `created` does not tick forward on every
+  // flush and the readback in buildReceipt keeps matching what is on disk.
+  let researchFrontmatterBlock: string | null | undefined;
+  /**
+   * Prepend research frontmatter to a note this run created.
+   *
+   * Only ever a note the agent created: prepending YAML to a note the user
+   * already owns is a destructive edit, not an enhancement, which is why the
+   * append/replace/edit kinds are excluded rather than merely unhandled.
+   */
+  const withFrontmatter = (body: string): string => {
+    if (!lazyCreatePath || !researchFrontmatter || !body.trim()) {
+      return body;
+    }
+    if (researchFrontmatterBlock === undefined) {
+      const input = researchFrontmatter({
+        title: extractedLeadingTitle,
+        path: createReceiptPath ?? lazyCreatePath,
+      });
+      researchFrontmatterBlock = input
+        ? buildResearchNoteFrontmatter(input)
+        : null;
+    }
+    if (!researchFrontmatterBlock) return body;
+    // Never stack two blocks: Obsidian reads only the first, and the second
+    // renders as a stray horizontal rule in the middle of the note.
+    if (/^﻿?---\r?\n/u.test(body)) return body;
+    return `${researchFrontmatterBlock}${body}`;
+  };
   const render = () => {
     if (kind === "append") {
-      return `${baseContent}${streamedContent}`;
+      return withFrontmatter(`${baseContent}${streamedContent}`);
     }
 
     if (kind === "replace") {
-      return streamedContent;
+      return withFrontmatter(streamedContent);
     }
 
     return `${section?.prefix ?? ""}${formatStreamingSectionBody(
