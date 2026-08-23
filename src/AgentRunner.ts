@@ -8084,9 +8084,9 @@ export async function runAgentMission({
       created: (runToolContext.now?.() ?? new Date()).toISOString(),
       tags: [title, researchPlan?.mode ?? ""].filter(Boolean),
       sourceCount,
-      ...(researchPlan?.effort?.tier
-        ? { confidence: researchPlan.effort.tier }
-        : {}),
+      // No `confidence`: the only run-level value available here is the effort
+      // tier, and "confidence: deep" is not a confidence. A property that
+      // cannot be read correctly is worse than an absent one.
       runId,
     };
   };
