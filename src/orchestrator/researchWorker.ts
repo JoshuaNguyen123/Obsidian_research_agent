@@ -250,6 +250,22 @@ export async function runResearchWorker(input: {
   let effectiveMaxToolCalls = maxToolCalls;
   let saturationFinalize = false;
 
+  /**
+   * The host-owned fetch is what actually closes the usable-source floor: a
+   * search only nominates candidates, and a candidate becomes usable only when
+   * a fetch yields passage-backed evidence. Spending the *last* tool call on a
+   * model-requested search therefore leaves the ledger with candidates it can
+   * never promote, and the handoff is graded "rejected" for lack of proof the
+   * worker was no longer allowed to gather. Reserve one call for that fetch
+   * while proof debt is open. The reserve is carved out of the configured
+   * ceiling, never added to it, so the team budget still clamps.
+   */
+  const modelToolCallCeiling = (): number =>
+    webFetchAvailable &&
+    computeSourceProofDebt(sourceLedger).some((item) => item.missing > 0)
+      ? Math.max(1, effectiveMaxToolCalls - 1)
+      : effectiveMaxToolCalls;
+
   const executeHostOwnedCandidateFetch = async (options: {
     candidate: SourceCandidate;
     step: number;
@@ -377,7 +393,8 @@ export async function runResearchWorker(input: {
 
     let callCursor = 0;
     while (callCursor < response.toolCalls.length) {
-      if (toolCalls >= effectiveMaxToolCalls) {
+      const modelCeiling = modelToolCallCeiling();
+      if (toolCalls >= modelCeiling) {
         finalSummary = "Researcher stopped at the shared tool-call budget.";
         break;
       }
@@ -385,7 +402,7 @@ export async function runResearchWorker(input: {
       let batchEnd = callCursor;
       while (
         batchEnd < response.toolCalls.length &&
-        toolCalls + (batchEnd - callCursor) < effectiveMaxToolCalls &&
+        toolCalls + (batchEnd - callCursor) < modelCeiling &&
         batchEnd - callCursor < MAX_RESEARCH_WORKER_PARALLEL_READS &&
         isResearchWorkerParallelSafe(response.toolCalls[batchEnd]!.name)
       ) {

@@ -15,6 +15,7 @@ import {
 } from "../src/orchestrator/specialistAuthority";
 import {
   createSpecialistHandoffV2,
+  isDeliverableWorkerHandoffStatusV2,
   fingerprintSpecialistInput,
   fingerprintSpecialistWorkspaceDiff,
   isSpecialistHandoffV2,
@@ -302,6 +303,60 @@ test("runtime rejects a proof-resolved V2 handoff whose worker status is rejecte
     /status:rejected/iu,
   );
   assert.equal(runtime.getSnapshot()?.handoffs.length, 0);
+});
+
+test("the host gate and its callers read one deliverable-status predicate", async () => {
+  // main.ts decides whether to present a handoff at all, and the runtime gate
+  // decides whether to accept it. When those two read different rules the
+  // caller asserts "handoff ready", completes the node, and the gate then
+  // refuses -- which is how a bounded search with no sources surfaced as
+  // "Specialist handoff proof rejected". One predicate, both sides.
+  const statuses: WorkerHandoff["status"][] = [
+    "preparing",
+    "ready",
+    "accepted",
+    "rejected",
+  ];
+  for (const status of statuses) {
+    const runId = `mission-status-${status}`;
+    const runtime = new OrchestratorRuntime({ runId, mode: "adaptive_team" });
+    const scaffold = createAdaptiveTeamScaffoldV2({
+      runId,
+      mission: "Verify sources",
+      specialistModes: ["researcher"],
+      specialistMaxSteps: 6,
+      specialistMaxToolCalls: 6,
+      specialistMaxMinutes: 2,
+    });
+    await runtime.start(scaffold);
+    const handoff = createSpecialistHandoffV2({
+      handoff: { ...workerHandoff(), taskId: scaffold.nodeIds.specialist, status },
+      missionGraphId: runId,
+      specialistMode: "researcher",
+      missionInput: "Verify sources",
+      acceptanceCriteria: ["Evidence resolves."],
+      recommendedNextAction: "Lead verifies.",
+    });
+    const authority = {
+      missionGraphId: runId,
+      evidenceIds: new Set(["evidence-1"]),
+      receiptIds: new Set<string>(),
+      artifactIds: new Set<string>(),
+      validationIds: new Set<string>(),
+    };
+    const deliverable = isDeliverableWorkerHandoffStatusV2(status);
+    if (deliverable) {
+      await runtime.specialistHandoffReady(handoff, authority);
+      assert.equal(runtime.getSnapshot()?.handoffs.length, 1, status);
+    } else {
+      await assert.rejects(
+        runtime.specialistHandoffReady(handoff, authority),
+        new RegExp(`status:${status}`, "iu"),
+        status,
+      );
+      assert.equal(runtime.getSnapshot()?.handoffs.length, 0, status);
+    }
+  }
 });
 
 test("ledger summary retains the accepted adaptive handoff independently of the canonical graph projection", async () => {

@@ -135,6 +135,19 @@ export function createSpecialistHandoffV2(
   };
 }
 
+/**
+ * The worker grades its own outcome before the host validates any proof.
+ * Only these two grades are deliverable; anything else means the worker
+ * reported a result ("no usable evidence"), not an invalid proof. The host
+ * gate and every caller that decides whether to present a handoff must read
+ * the same predicate, or one of them will assert readiness the other refuses.
+ */
+export function isDeliverableWorkerHandoffStatusV2(
+  status: WorkerHandoff["status"],
+): boolean {
+  return status === "ready" || status === "accepted";
+}
+
 export function isSpecialistHandoffV2(
   value: WorkerHandoff,
 ): value is SpecialistHandoffV2 {

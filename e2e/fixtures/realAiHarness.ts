@@ -219,7 +219,9 @@ export async function assertProductionAdoptedSandboxV1(
       observedAt: state?.sandbox?.lastProbe?.observedAt ?? null,
       // This renderer's own origin, on the same wall clock that stamps
       // observedAt. Every probe from an earlier Obsidian process predates it.
-      sessionStartedAtMs: performance.timeOrigin,
+      sessionStartedAtMs: Number.isFinite(performance.timeOrigin)
+        ? performance.timeOrigin
+        : Date.now() - performance.now(),
     };
   }, CODE_CAPABILITY_ID_V1);
 
