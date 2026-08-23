@@ -141,6 +141,76 @@ export function assertSafeMarkdownPath(path: string) {
   normalizeVaultPath(path, { requireMarkdown: true });
 }
 
+/**
+ * Non-markdown files a research note legitimately needs beside it: an exported
+ * bibliography, an extracted data table, a small structured sidecar.
+ *
+ * This is a closed allowlist on a separate path, not a relaxation of
+ * `assertSafeMarkdownPath`. Markdown-only tools keep rejecting every extension
+ * in this list, and every other rejection in `normalizeVaultPath` — parent
+ * traversal, absolute paths, drive letters, backslashes, empty segments, and
+ * the `.obsidian` / `.trash` / `.agent-backups` roots — still applies first.
+ *
+ * Deliberately absent: anything executable or loadable (`.js`, `.mjs`, `.py`,
+ * `.sh`, `.bat`, `.exe`), and anything Obsidian or a community plugin treats
+ * as configuration. Widening this set is a safety decision, not a convenience
+ * one — add an extension only with a research reason and a test.
+ */
+export const RESEARCH_DATA_FILE_EXTENSIONS: readonly string[] = [
+  "bib",
+  "ris",
+  "csv",
+  "tsv",
+  "json",
+  "yaml",
+  "yml",
+  "txt",
+];
+
+const RESEARCH_DATA_EXTENSION_SET = new Set(RESEARCH_DATA_FILE_EXTENSIONS);
+
+export type VaultContentFileKind = "markdown" | "research_data";
+
+export function getVaultPathExtension(path: string): string {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const dot = name.lastIndexOf(".");
+  // A leading dot is a hidden file, not an extension.
+  if (dot <= 0) {
+    return "";
+  }
+  return name.slice(dot + 1).toLowerCase();
+}
+
+export function isResearchDataFilePath(path: string): boolean {
+  return RESEARCH_DATA_EXTENSION_SET.has(getVaultPathExtension(path));
+}
+
+/**
+ * Safe path for a file the agent may create beside a note: markdown, or one of
+ * the allowlisted research data extensions. Returns which kind it is so the
+ * caller can keep markdown-specific behavior (link rewriting, backups, note
+ * indexing) off the data path.
+ */
+export function normalizeVaultContentPath(path: string): {
+  path: string;
+  kind: VaultContentFileKind;
+} {
+  const normalized = normalizeVaultPath(path);
+  const extension = getVaultPathExtension(normalized);
+  if (extension === "md") {
+    return { path: normalized, kind: "markdown" };
+  }
+  if (RESEARCH_DATA_EXTENSION_SET.has(extension)) {
+    return { path: normalized, kind: "research_data" };
+  }
+  throw new ToolExecutionError(
+    "unsafe_path",
+    `Only markdown files and research data files (${RESEARCH_DATA_FILE_EXTENSIONS.map(
+      (candidate) => `.${candidate}`,
+    ).join(", ")}) are allowed.`,
+  );
+}
+
 export function normalizeVaultPath(
   path: string,
   {

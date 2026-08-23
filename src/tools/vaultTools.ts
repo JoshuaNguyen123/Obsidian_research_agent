@@ -47,6 +47,7 @@ import {
   getString,
   getErrorMessage,
   isRecord,
+  normalizeVaultContentPath,
   normalizeVaultPath,
   truncateText,
 } from "./validation";
@@ -2005,18 +2006,21 @@ export const createFolderTool: AgentTool = {
 
 export const createFileTool: AgentTool = {
   name: "create_file",
-  description: "Create a new markdown file at a vault-relative path.",
+  description:
+    "Create a new markdown note, or a research data file beside one (.bib, .ris, .csv, .tsv, .json, .yaml, .yml, .txt), at a vault-relative path.",
   parameters: {
     type: "object",
     required: ["path", "content"],
     properties: {
       path: {
         type: "string",
-        description: "Vault-relative markdown file path to create.",
+        description:
+          "Vault-relative file path to create. Markdown (.md), or a research data file: .bib, .ris, .csv, .tsv, .json, .yaml, .yml, .txt.",
       },
       content: {
         type: "string",
-        description: "Initial markdown content.",
+        description:
+          "Initial file content. Markdown for .md; the file's own format for a research data file.",
       },
       createFolders: {
         type: "boolean",
@@ -2026,9 +2030,13 @@ export const createFileTool: AgentTool = {
     additionalProperties: false,
   },
   async execute(args, context) {
-    const path = normalizeVaultPath(getRequiredString(args, "path"), {
-      requireMarkdown: true,
-    });
+    // A bibliography, an extracted data table, and a figure-caption sidecar all
+    // want to live next to the note that cites them. The allowlist is closed
+    // and lives beside assertSafeMarkdownPath rather than loosening it, so
+    // every markdown-only tool keeps rejecting these paths.
+    const { path, kind } = normalizeVaultContentPath(
+      getRequiredString(args, "path"),
+    );
     assertCreateIntent(context, "create_file", path);
     const content = getString(args, "content");
     const createFolders = getOptionalBoolean(args, "createFolders") ?? false;
@@ -2053,6 +2061,9 @@ export const createFileTool: AgentTool = {
     return {
       path,
       operation: "create",
+      // The receipt says which kind was written, so a data-file create is
+      // never mistaken for a new note in the run's own record.
+      fileKind: kind,
       bytesWritten: getByteLength(content),
       readback: {
         status: "verified",

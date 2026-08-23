@@ -4064,3 +4064,111 @@ function createMockContext(options: {
 
   return { context, content, folders, operations };
 }
+
+test("create_file writes allowlisted research data beside a note and refuses anything else", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt:
+      "Create Projects/Sources.bib and Projects/Measurements.csv beside the note.",
+    now: new Date(123),
+  });
+
+  const bib = await registry.execute(
+    {
+      name: "create_file",
+      arguments: {
+        path: "Projects/Sources.bib",
+        content: "@article{doe2026, title={Solid state}}",
+      },
+    },
+    mock.context,
+  );
+  assert.equal(bib.ok, true);
+  assert.equal(
+    mock.content.get("Projects/Sources.bib"),
+    "@article{doe2026, title={Solid state}}",
+  );
+  const bibOutput = bib.output as { fileKind?: string; operation?: string };
+  assert.equal(bibOutput.fileKind, "research_data");
+  assert.equal(bibOutput.operation, "create");
+
+  const csv = await registry.execute(
+    {
+      name: "create_file",
+      arguments: {
+        path: "Projects/Measurements.csv",
+        content: "cell,wh_per_kg\nA,412\n",
+      },
+    },
+    mock.context,
+  );
+  assert.equal(csv.ok, true);
+  assert.equal((csv.output as { fileKind?: string }).fileKind, "research_data");
+
+  const markdown = await registry.execute(
+    {
+      name: "create_file",
+      arguments: { path: "Projects/Summary.md", content: "# Summary" },
+    },
+    mock.context,
+  );
+  assert.equal(markdown.ok, true);
+  assert.equal(
+    (markdown.output as { fileKind?: string }).fileKind,
+    "markdown",
+  );
+
+  // Everything outside the allowlist keeps the original rejection, and so does
+  // every unsafe path shape.
+  for (const path of [
+    "Projects/figure.png",
+    "Projects/exporter.js",
+    "../Sources.bib",
+    "C:/Sources.bib",
+    ".obsidian/plugins/Sources.json",
+  ]) {
+    const rejected = await registry.execute(
+      { name: "create_file", arguments: { path, content: "x" } },
+      mock.context,
+    );
+    assert.equal(rejected.ok, false, `${path} should be rejected`);
+    assert.equal(rejected.error?.code, "unsafe_path", path);
+  }
+});
+
+test("markdown-only tools still refuse research data files", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Create Projects/Sources.bib then read and count it.",
+    now: new Date(123),
+  });
+
+  const created = await registry.execute(
+    {
+      name: "create_file",
+      arguments: { path: "Projects/Sources.bib", content: "@book{a}" },
+    },
+    mock.context,
+  );
+  assert.equal(created.ok, true);
+
+  for (const name of ["read_file", "count_words"]) {
+    const result = await registry.execute(
+      { name, arguments: { path: "Projects/Sources.bib" } },
+      mock.context,
+    );
+    assert.equal(result.ok, false, `${name} should refuse a .bib path`);
+    assert.equal(result.error?.code, "unsafe_path", name);
+  }
+
+  // count_words still returns metadata only, never file content.
+  const counted = await registry.execute(
+    { name: "count_words", arguments: { path: "Projects/example.md" } },
+    mock.context,
+  );
+  assert.equal(counted.ok, true);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(counted.output ?? {}, "content"),
+    false,
+  );
+});
