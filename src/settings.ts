@@ -1466,6 +1466,20 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(section)
+      .setName("Stop when the evidence stops improving")
+      .setDesc(
+        "Let a research run judge its own progress: keep going while new sources still add something, and stop early once they repeat what it already has. Turn this off to spend the full depth budget every time.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.adaptiveResearchProgress !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.adaptiveResearchProgress = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
       .setName("Default source count")
       .setDesc(
         "Fetched web sources a research run needs when your prompt names no number. Asking for a specific count always wins.",
