@@ -424,6 +424,23 @@ function assertSerializedBound(value: unknown): void {
   }
 }
 
+/**
+ * Whether a receipt belongs in the external proof ledger at all.
+ *
+ * The ledger is the Linear/GitHub provider-action surface: its parser rejects
+ * anything else, and its resource ids must be identifier-safe. A vault receipt
+ * carries a human vault path, so offering one here fails on the path's own
+ * characters long before the clearer system check is reached. Callers that may
+ * hold either kind must ask this first.
+ */
+export function receiptMayEnterExternalProofLedgerV1(
+  receipt: Pick<ActionReceipt, "resource">,
+): boolean {
+  return (
+    receipt.resource.system === "linear" || receipt.resource.system === "github"
+  );
+}
+
 /** Prefix tools (`github_*`) and publish bridges (`publish_*_to_github`). */
 export function externalReceiptToolMatchesResourceSystem(
   toolName: string,

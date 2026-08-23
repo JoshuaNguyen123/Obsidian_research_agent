@@ -15,6 +15,7 @@ import {
   isPromptDerivedAuthorityGrantV1,
 } from "../src/agent/policyEngine";
 import { preparedApprovalMayAutoWithoutCardV1 } from "../src/agent/setLooseCompoundAutonomy";
+import { receiptMayEnterExternalProofLedgerV1 } from "../src/integrations/linear/ExternalActionReceiptLedger";
 import { createJupyterReflectionTool } from "../src/tools/jupyterReflectionTool";
 import { createProjectResultsTool } from "../src/tools/projectResultsTool";
 
@@ -310,6 +311,37 @@ test("the Bound approval gate keeps the card for a prompt-grant refuser", () => 
     }),
     true,
   );
+});
+
+test("a reflection receipt never reaches the external proof ledger", () => {
+  // Both reflection tools write to the vault, and vault paths are human paths.
+  // "E2E Agent Tests/BYOK-... .ipynb" is rejected by the ledger's identifier
+  // rule before its own linear/github check can give a legible reason, which
+  // is how an approved, already-written notebook still failed the run.
+  for (const descriptor of [JUPYTER_DESCRIPTOR, PROJECT_RESULTS_DESCRIPTOR]) {
+    assert.equal(descriptor.capability.system, "vault");
+    assert.equal(
+      receiptMayEnterExternalProofLedgerV1({
+        resource: {
+          system: descriptor.capability.system,
+          resourceType: descriptor.capability.resourceType,
+          id: "E2E Agent Tests/BYOK-AUTONOMOUS-reflection.ipynb",
+        },
+      }),
+      false,
+      `${descriptor.name} receipts are not external provider actions`,
+    );
+  }
+
+  // The Linear and GitHub receipts the ledger exists for still belong there.
+  for (const system of ["linear", "github"] as const) {
+    assert.equal(
+      receiptMayEnterExternalProofLedgerV1({
+        resource: { system, resourceType: "issue", id: "issue-1" },
+      }),
+      true,
+    );
+  }
 });
 
 test("prompt-derived classification covers every prompt-bound grant kind", () => {
