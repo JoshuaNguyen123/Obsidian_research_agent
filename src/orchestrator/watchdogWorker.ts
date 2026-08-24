@@ -60,6 +60,14 @@ export interface RunWatchdogWorkerInput {
   /** e.g. "research_phase_gate:analyze", or null when only repetition is known. */
   blockerSignature: string | null;
   repeatedToolCalls: number;
+  /**
+   * Whether the primary agent can actually discharge an "ask_user" directive
+   * this run — i.e. whether `ask_user` is on its offered frontier. Required,
+   * not optional: a caller that forgot it would silently reintroduce the
+   * unanswerable question this guard exists to prevent, and the compiler is a
+   * better guard than a default.
+   */
+  interactiveClarificationAvailable: boolean;
   modelClient: ModelClient;
   model?: string;
   abortSignal?: AbortSignal;
@@ -94,9 +102,15 @@ export async function runSpecialistRecoveryVerifier(
         "Decide the single best way to break the loop:",
         '- "force_final_no_tools": it has enough to answer; make it answer now without another tool call.',
         '- "replan": it is attacking the problem the wrong way; say concretely what to do instead.',
-        '- "ask_user": it is missing a fact only the user can supply; give the one question.',
+        ...(input.interactiveClarificationAvailable
+          ? [
+              '- "ask_user": it is missing a fact only the user can supply; give the one question.',
+            ]
+          : []),
         '- "stop": no further progress is possible; it should stop and report honestly.',
-        "Prefer force_final_no_tools or replan. Choose stop only when nothing else can work.",
+        input.interactiveClarificationAvailable
+          ? "Prefer force_final_no_tools or replan. Choose stop only when nothing else can work."
+          : "This run has no interactive user, so asking one is not an option here. Prefer force_final_no_tools or replan. Choose stop only when nothing else can work.",
         'Reply with a single JSON object and nothing else: {"action":"...","revisedApproach":"...","question":"...","rationale":"..."}',
       ].join(" "),
     },
@@ -123,7 +137,10 @@ export async function runSpecialistRecoveryVerifier(
     };
     const response = await observed.client.chat(request);
     return (
-      parseWatchdogVerdict(response.message.content) ?? {
+      parseWatchdogVerdict(response.message.content, {
+        interactiveClarificationAvailable:
+          input.interactiveClarificationAvailable,
+      }) ?? {
         action: "force_final_no_tools",
         rationale:
           "Watchdog returned no parsable verdict; answering with what the run already has is safer than looping.",
@@ -145,7 +162,10 @@ export async function runWatchdogWorker(
 }
 
 /** Exported for tests: the verdict contract is the whole interface. */
-export function parseWatchdogVerdict(raw: string): WatchdogVerdict | null {
+export function parseWatchdogVerdict(
+  raw: string,
+  options: { interactiveClarificationAvailable?: boolean } = {},
+): WatchdogVerdict | null {
   const text = raw?.trim();
   if (!text) {
     return null;
@@ -195,6 +215,20 @@ export function parseWatchdogVerdict(raw: string): WatchdogVerdict | null {
     return {
       action: "force_final_no_tools",
       rationale: `Clarification requested without a question; answering instead. (${rationale})`,
+    };
+  }
+  // The same rule, one step further: a question nobody can answer is exactly
+  // as unexecutable as a missing one. With no interactive user, `ask_user` is
+  // not on the primary agent's frontier at all, so this verdict would order it
+  // to do something it cannot do and then leave it facing an unchanged
+  // frontier with prose as its only remaining move.
+  if (
+    action === "ask_user" &&
+    options.interactiveClarificationAvailable === false
+  ) {
+    return {
+      action: "force_final_no_tools",
+      rationale: `No interactive user can answer "${question}"; answering with what the run already has instead. (${rationale})`,
     };
   }
 

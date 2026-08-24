@@ -239,6 +239,43 @@ test("ask_user without a question degrades to answering", () => {
   assert.equal(verdict?.action, "force_final_no_tools");
 });
 
+test("a clarification verdict degrades when no interactive user can answer", () => {
+  // ask_user is never blanket-offered: isToolWithinAutonomyScope refuses it and
+  // the runner adds it only for a host that can answer. A verdict ordering the
+  // agent to ask is then exactly as unexecutable as one carrying no question
+  // at all, and it leaves the run facing an unchanged frontier with prose as
+  // its only move -- which the two-strike no-tool breaker ends as
+  // model_tool_noncompliance, blaming the model for obeying us.
+  const raw =
+    '{"action":"ask_user","question":"Public or private?","rationale":"Visibility is unclear."}';
+
+  const interactive = parseWatchdogVerdict(raw, {
+    interactiveClarificationAvailable: true,
+  });
+  assert.equal(interactive?.action, "ask_user");
+  assert.equal(interactive?.question, "Public or private?");
+
+  const headless = parseWatchdogVerdict(raw, {
+    interactiveClarificationAvailable: false,
+  });
+  assert.equal(headless?.action, "force_final_no_tools");
+  assert.equal(headless?.question, undefined);
+  assert.match(headless?.rationale ?? "", /no interactive user/iu);
+  assert.match(
+    headless?.rationale ?? "",
+    /Visibility is unclear/u,
+    "the reviewer's own reasoning must survive the degradation",
+  );
+
+  // The existing payload degradation is the same rule and must still hold.
+  assert.equal(
+    parseWatchdogVerdict('{"action":"ask_user","rationale":"Unclear."}', {
+      interactiveClarificationAvailable: true,
+    })?.action,
+    "force_final_no_tools",
+  );
+});
+
 test("an unknown or missing action is rejected rather than guessed", () => {
   assert.equal(parseWatchdogVerdict('{"action":"delete_everything"}'), null);
   assert.equal(parseWatchdogVerdict("not json at all"), null);

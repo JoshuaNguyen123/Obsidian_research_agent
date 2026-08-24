@@ -127,11 +127,48 @@ export function countReadyMissionGraphToolSlots(
   graph: MissionGraphV3,
   toolName: string,
 ): number {
-  return Object.values(graph.nodes).filter(
-    (node) =>
-      node.status === "ready" &&
-      getMissionGraphNodeFrontierToolNames(node).includes(toolName),
+  return Object.values(graph.nodes).filter((node) =>
+    isReadyMissionGraphSlotForToolV1(node, toolName),
   ).length;
+}
+
+/**
+ * One node-level answer to "may this tool run right now?".
+ *
+ * MissionGraphSession admits a call only from a `ready` node whose current
+ * frontier expects the tool. Anything that decides what to offer, what to
+ * schedule, or what to tell the model to call instead has to ask the same
+ * question, or the run offers a tool authority will refuse and the model
+ * cannot tell the difference between "wrong tool" and "wrong moment".
+ */
+export function isReadyMissionGraphSlotForToolV1(
+  node: MissionGraphV3["nodes"][string],
+  toolName: string,
+): boolean {
+  return (
+    node.status === "ready" &&
+    getMissionGraphNodeFrontierToolNames(node).includes(toolName)
+  );
+}
+
+/**
+ * Exact ready-frontier tool names. This is the corrective payload an authority
+ * rejection owes the model: naming what was refused teaches it nothing, and a
+ * model told only that it was wrong will rationally try again.
+ */
+export function readyMissionGraphFrontierToolNamesV1(
+  graph: MissionGraphV3 | null | undefined,
+): string[] {
+  if (!graph) return [];
+  return [
+    ...new Set(
+      Object.values(graph.nodes)
+        .filter((node) => node.status === "ready")
+        .flatMap(getMissionGraphNodeFrontierToolNames)
+        .map((name) => name.trim())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 export function findExactGraphBoundToolCallIndex(

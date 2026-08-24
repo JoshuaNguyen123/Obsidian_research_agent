@@ -478,6 +478,7 @@ function requiresCreatedCodeWorkspace(toolName: string): boolean {
 export function filterSetLooseToolNamesByMissionGraphAuthority(
   toolNames: readonly string[],
   graph: MissionGraphV3 | null | undefined,
+  options: { allowDynamicReadContinuation?: boolean } = {},
 ): string[] {
   const uniqueNames = [
     ...new Set(toolNames.map((name) => name.trim()).filter(Boolean)),
@@ -531,7 +532,14 @@ export function filterSetLooseToolNamesByMissionGraphAuthority(
       effectClassForTool(toolName) === "soft" ||
       CODE_WORKFLOW_OBSERVATION_TOOL_NAMES.has(toolName)
     ) {
-      return true;
+      // An unplanned Soft companion is callable only because
+      // MissionGraphSession will materialize a bounded dynamic read node for
+      // it. On an exact planned frontier it will not: beginToolExecution
+      // refuses with "not ready in the exact authoritative mission graph".
+      // Offering it anyway advertises a menu on which nothing is callable, and
+      // a model with no other way to discover that enumerates the whole list
+      // one refused call at a time.
+      return options.allowDynamicReadContinuation !== false;
     }
     return false;
   });
@@ -615,6 +623,12 @@ export function constrainToolsToMissionGraphFrontier(
   graph: MissionGraphV3 | null | undefined,
   options: {
     includeCapabilityReads?: boolean;
+    /**
+     * Mirrors AgentRunner's `beginMissionGraphTool` gate. The offered menu and
+     * the authority that admits calls from it must read one answer, or the run
+     * advertises tools every one of which is refused.
+     */
+    allowDynamicReadContinuation?: boolean;
     route?: string;
     maxEffectClassWithoutGrant?: AutonomyEffectClass;
     /**
@@ -676,7 +690,9 @@ export function constrainToolsToMissionGraphFrontier(
       }
     }
     const setLooseCallable =
-      filterSetLooseToolNamesByMissionGraphAuthority(setLooseNames, graph);
+      filterSetLooseToolNamesByMissionGraphAuthority(setLooseNames, graph, {
+      allowDynamicReadContinuation: options.allowDynamicReadContinuation,
+    });
     const setLooseConstrained = schemasForLifecycleStage({
       callableToolNames: setLooseCallable,
       allSchemas: tools,

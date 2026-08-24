@@ -377,6 +377,7 @@ import {
 } from "./agent/wordCountCorrectionPolicy";
 import {
   countReadyMissionGraphToolSlots,
+  readyMissionGraphFrontierToolNamesV1,
   findExactGraphBoundToolCallIndex,
   findReadyMissionGraphToolNodes,
   getMissionGraphFrontierDestinationSelector,
@@ -4777,6 +4778,18 @@ export async function runAgentMission({
     }
   }
 
+  /**
+   * The base answer to "will MissionGraphSession materialize a bounded dynamic
+   * node for a tool that has no ready node?". An exact planned frontier says
+   * no. The offered menu must be built from this same answer: when it is not,
+   * the run advertises capability reads and then refuses every one of them,
+   * and a model whose only way to discover that is to call them enumerates the
+   * whole list. `allowExactBootstrapRead` is a deliberate per-call exception
+   * the offer cannot anticipate, so it stays at the call site.
+   */
+  const dynamicReadContinuationAllowed = (): boolean =>
+    !missionGraphUsesExactPlannedFrontier;
+
   const beginMissionGraphTool = async (
     toolName: string,
     options: {
@@ -4787,7 +4800,7 @@ export async function runAgentMission({
   ): Promise<MissionGraphToolExecution | null> => {
     if (!missionGraphSession) return null;
     const allowDynamicReadContinuation =
-      !missionGraphUsesExactPlannedFrontier ||
+      dynamicReadContinuationAllowed() ||
       options.allowExactBootstrapRead === true;
     const started = await missionGraphSession.beginToolExecution(toolName, {
       allowDynamicReadContinuation,
@@ -12178,7 +12191,22 @@ export async function runAgentMission({
       if (isMissionGraphCapacityError(error)) {
         missionGraphCapacityExhausted = true;
       }
-      const message = `Rejected ${toolCall.name}: ${getUnknownErrorMessage(error)}`;
+      // A refusal that names only what was refused teaches nothing, so the
+      // model rationally tries the next name on its list. The off-frontier
+      // path has always answered "call this instead"; authority refusals said
+      // only "not ready" and were re-issued for 45 straight steps. Same
+      // builder, and the frontier is read from the graph the refusal came
+      // from rather than from the offered schema that disagreed with it.
+      const authorityReadyFrontier = readyMissionGraphFrontierToolNamesV1(
+        missionGraphSession?.graph ?? missionGraph,
+      ).filter((name) => name !== toolCall.name);
+      const message = [
+        `Rejected ${toolCall.name}: ${getUnknownErrorMessage(error)}`,
+        buildOffFrontierToolRejectionMessageImpl({
+          toolName: toolCall.name,
+          readyFrontierToolNames: authorityReadyFrontier,
+        }),
+      ].join(" ");
       const blockedResult: ToolExecutionResult = {
         ok: false,
         toolName: toolCall.name,
@@ -17155,7 +17183,9 @@ export async function runAgentMission({
                 // node. Explicit ordered workflows expose the exact ready node only.
                 // Set-loose compound expands to the stage Soft-union instead.
                 includeCapabilityReads:
-                  setLooseCompoundEnabled || !missionGraphUsesExactPlannedFrontier,
+                  setLooseCompoundEnabled || dynamicReadContinuationAllowed(),
+                allowDynamicReadContinuation:
+                  dynamicReadContinuationAllowed(),
                 // Shrink schemas for cloud tool-calling models by route bucket.
                 route: runPlan.route,
                 maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
@@ -20786,6 +20816,29 @@ export async function runAgentMission({
     });
     const pendingStreamingWriteback =
       hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
+    /**
+     * Order the model to stop calling tools AND make the offered frontier say
+     * the same thing. Telling it to answer in prose while the frontier still
+     * demands a tool is a contradiction it cannot satisfy: it burns one
+     * corrective retry and then dies at the two-strike no-tool breaker as
+     * `model_tool_noncompliance`, blaming the model for obeying us. Both
+     * callers route through here so the instruction and the frontier are
+     * decided in one place.
+     */
+    const forceFinalAnswerWithoutTools = (guidance: string): void => {
+      const preserveToolsForStreamingWriteback =
+        pendingStreamingWriteback && streamingWritebackKind !== null;
+      if (!preserveToolsForStreamingWriteback) {
+        tools = [];
+        allowedToolNames = new Set();
+      }
+      messages.push({
+        role: "system" as const,
+        content: preserveToolsForStreamingWriteback
+          ? "Required context has been gathered. Continue to the requested note writeback now from the gathered tool results. Prefer final markdown content for streaming; if you request a tool, use only an available current-note write tool."
+          : guidance,
+      });
+    };
     const plannedStreamingWriteTool =
       streamingWritebackKind === "append"
         ? "append_to_current_file"
@@ -21448,22 +21501,12 @@ export async function runAgentMission({
         await stopRepeatedToolBudget();
         return;
       }
-      const preserveToolsForStreamingWriteback =
-        pendingStreamingWriteback && streamingWritebackKind !== null;
       events.onStatus?.(
         `Tool context is sufficient; drafting final output (${loopDecision.reason})...`,
       );
-      if (!preserveToolsForStreamingWriteback) {
-        tools = [];
-        allowedToolNames = new Set();
-      }
-      messages.push({
-        role: "system" as const,
-        content:
-          preserveToolsForStreamingWriteback
-            ? "Required context has been gathered. Continue to the requested note writeback now from the gathered tool results. Prefer final markdown content for streaming; if you request a tool, use only an available current-note write tool."
-            : "Required context has been gathered. Do not request more tools. Draft the final answer now from the gathered tool results.",
-      });
+      forceFinalAnswerWithoutTools(
+        "Required context has been gathered. Do not request more tools. Draft the final answer now from the gathered tool results.",
+      );
       continue;
     }
     if (
@@ -21488,6 +21531,12 @@ export async function runAgentMission({
           ? `research_phase_gate:${researchPhaseDescriptor.phase}`
           : null,
         repeatedToolCalls: loopLedger.repeatedToolCalls,
+        // The reviewer must not propose a directive this run cannot carry out.
+        // `ask_user` is never blanket-offered (see isToolWithinAutonomyScope);
+        // the offered frontier is the only truthful answer to "can the agent
+        // actually ask?".
+        interactiveClarificationAvailable:
+          allowedToolNames.has(ASK_USER_TOOL_NAME),
         modelClient: specialistClientForRecovery,
         ...(specialistModel ? { model: specialistModel } : {}),
         abortSignal: runToolContext.abortSignal,
@@ -21505,15 +21554,27 @@ export async function runAgentMission({
       // Every other verdict is advice injected into the primary agent's own
       // transcript. The primary agent still acts, so every write gate stays on
       // exactly one path.
-      messages.push({
-        role: "system" as const,
-        content:
-          verdict.action === "replan"
-            ? `A reviewing agent observed you repeating the same step without progress. Change approach: ${verdict.revisedApproach}`
-            : verdict.action === "ask_user"
-              ? `A reviewing agent observed you repeating the same step without progress. Ask the user exactly this, using the ask_user tool if it is available, otherwise as your final answer: ${verdict.question}`
-              : "A reviewing agent observed you repeating the same step without progress. Do not request more tools. Draft the best final answer you can from what you already have, and state plainly what remains unresolved.",
-      });
+      if (verdict.action === "replan") {
+        messages.push({
+          role: "system" as const,
+          content: `A reviewing agent observed you repeating the same step without progress. Change approach: ${verdict.revisedApproach}`,
+        });
+        continue;
+      }
+      if (verdict.action === "ask_user") {
+        // Reachable only when ask_user is genuinely on the frontier: the
+        // verifier degrades this verdict otherwise. Keep the tools, and name
+        // the tool without the "otherwise answer in prose" escape hatch that
+        // used to send the model at an unchanged frontier with no tool call.
+        messages.push({
+          role: "system" as const,
+          content: `A reviewing agent observed you repeating the same step without progress. Call the ask_user tool with exactly this question, then continue from the answer or from the stated assumption if none comes: ${verdict.question}`,
+        });
+        continue;
+      }
+      forceFinalAnswerWithoutTools(
+        "A reviewing agent observed you repeating the same step without progress. Do not request more tools. Draft the best final answer you can from what you already have, and state plainly what remains unresolved.",
+      );
       continue;
     }
     if (
