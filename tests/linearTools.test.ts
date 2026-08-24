@@ -1416,6 +1416,7 @@ function issueRecord(
     priority?: number;
     projectId?: string;
     snapshotHash?: string;
+    trashed?: boolean;
   } = {},
 ): LinearIssueRecord {
   return {
@@ -1428,7 +1429,7 @@ function issueRecord(
       ? { description: overrides.description }
       : {}),
     priority: overrides.priority ?? 0,
-    trashed: false,
+    trashed: overrides.trashed ?? false,
     team: { id: overrides.teamId ?? "team-1", name: "Platform", key: "PLAT" },
     ...(overrides.projectId
       ? { project: { id: overrides.projectId, name: "Queue project" } }
