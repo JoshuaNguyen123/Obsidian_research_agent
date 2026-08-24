@@ -1307,17 +1307,20 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     ).toBe(createdWorkspaceId);
     expect(handoff?.workspaceId).toBe(createdWorkspaceId);
     // File creation, not a specific tool name. `0b95a9c` deliberately made
-    // `code_workspace_append` create an absent file (its receipt then reads
-    // `operation: "create"`), so the model may legitimately author every file
-    // through append and never call `code_workspace_create_file` at all. The
-    // contract is that at least one workspace file was created with a receipt,
-    // whichever sanctioned tool did it.
+    // `code_workspace_append` create an absent file, so the model may author
+    // every file through append and never call `code_workspace_create_file`.
+    // Note the vocabulary trap: the ActionReceipt operation is the DESCRIPTOR
+    // action, which is statically "append" (receipts.ts requires them equal),
+    // while the workspace-domain receipt inside the output says "create". The
+    // observable that says "this append created its file" is the prepared
+    // action's `mutationMode`, stamped "create" only when the target was
+    // absent at prepare time.
     const successfulCreateFileEvents = phaseBObservedTools.filter(
       (event) =>
         event.ok &&
         (event.name === "code_workspace_create_file" ||
           (event.name === "code_workspace_append" &&
-            event.receipt?.operation === "create")),
+            event.preparedAction?.mutationMode === "create")),
     );
     expect(
       successfulCreateFileEvents.length,
@@ -3530,6 +3533,13 @@ interface ObservedPreparedAction {
   ownerRunId?: string;
   workspaceId?: string;
   normalizedWorkspaceId?: string;
+  /**
+   * `code_workspace_append` onto an absent path prepares with
+   * `normalizedArgs.mutationMode = "create"`; the descriptor action (and so
+   * the receipt operation) stays "append" either way, so this is the only
+   * observable that says the call created its file.
+   */
+  mutationMode?: string;
 }
 
 interface ObservedAuthorization {
@@ -3687,6 +3697,10 @@ async function installToolExecutionObserver(
         action?.normalizedArgs?.workspaceId,
         240,
       );
+      const mutationMode = boundedString(
+        action?.normalizedArgs?.mutationMode,
+        40,
+      );
       return {
         id: String(action?.id ?? ""),
         payloadFingerprint: String(action?.payloadFingerprint ?? ""),
@@ -3697,6 +3711,7 @@ async function installToolExecutionObserver(
         ...(normalizedWorkspaceId
           ? { normalizedWorkspaceId }
           : {}),
+        ...(mutationMode ? { mutationMode } : {}),
       };
     };
     const observeAuthorization = (
