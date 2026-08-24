@@ -15,10 +15,12 @@ import {
   notebookExecutionArtifactsForCommandV1,
   notebookExecutionDegradationV1,
   notebookOwnedPhasesV1,
+  notebookRunnerArgvBudgetV1,
   notebookRunnerFingerprintV1,
   notebookRuntimeAvailabilityFromProbeV1,
   notebookRuntimeProbeContentV1,
   notebookRuntimeUpgradeAdviceV1,
+  parseNotebookRunSummaryV1,
   planNotebookValidationV1,
   readNotebookExecutionEvidenceV1,
   unprovedNotebookRuntimeV1,
@@ -557,4 +559,268 @@ test("the capability probe profile is a valid closed profile running the same ru
   const probe = notebookRuntimeProbeContentV1();
   assert.equal(probe, notebookRuntimeProbeContentV1());
   assert.equal(readNotebookExecutionEvidenceV1(probe).codeCells, 2);
+});
+
+/** A probe summary exactly as the host runner writes one for a green probe. */
+function probeSummary(overrides: Record<string, unknown> = {}): string {
+  return `${JSON.stringify({
+    version: 1,
+    runner: "agentic_notebook_runner",
+    contract: 1,
+    mode: "probe",
+    python: "3.12.3",
+    optionalModules: { numpy: false },
+    notebooks: [
+      {
+        path: NOTEBOOK_RUNTIME_PROBE_PATH_V1,
+        status: "executed",
+        reason: null,
+        codeCells: 2,
+        executedCells: 2,
+        failure: null,
+      },
+    ],
+    executedCellCount: NOTEBOOK_RUNTIME_PROBE_EXECUTED_CELLS_V1,
+    failedNotebook: null,
+    status: "executed",
+    ...overrides,
+  })}\n`;
+}
+
+/** Probe notebook bytes that show a real, healthy run of both probe cells. */
+function executedProbeNotebook(): string {
+  return `${JSON.stringify(
+    {
+      cells: [
+        {
+          cell_type: "code",
+          execution_count: 1,
+          metadata: {},
+          outputs: [{ output_type: "stream", name: "stdout", text: ["answer=42\n"] }],
+          source: ["answer = 6 * 7\n"],
+        },
+        {
+          cell_type: "code",
+          execution_count: 2,
+          metadata: {},
+          outputs: [
+            {
+              output_type: "execute_result",
+              execution_count: 2,
+              data: { "text/plain": ["42"] },
+              metadata: {},
+            },
+          ],
+          source: ["answer\n"],
+        },
+      ],
+      metadata: {},
+      nbformat: 4,
+      nbformat_minor: 5,
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+test("the runner program still fits the immutable argv contract at full notebook capacity", () => {
+  const budget = notebookRunnerArgvBudgetV1();
+  const args = buildNotebookRunnerArgsV1({
+    mode: "execute",
+    notebookPaths: Array.from(
+      { length: NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1 },
+      (_unused, index) => `notebook-${index}.ipynb`,
+    ),
+  });
+  assert.equal(
+    args.length,
+    budget.worstCaseEntries,
+    "the published budget must describe the argv the builder actually emits",
+  );
+  assert.equal(budget.limit, NOTEBOOK_RUNNER_MAX_ARGS_V1);
+  assert.ok(
+    budget.headroomEntries > 0,
+    `the runner program grew past the immutable command contract: a full-capacity command needs ${budget.worstCaseEntries} of ${budget.limit} argv entries. Shrink the runner, raise NOTEBOOK_RUNNER_CHUNK_CHARS_V1, or lower NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1 - never raise NOTEBOOK_RUNNER_MAX_ARGS_V1, which the sandbox entrypoint enforces at 65 entries including the executable.`,
+  );
+  // The overflow guard inside the builder is unreachable while this holds, so
+  // this arithmetic - not a runtime path - is what keeps the bound honest.
+  assert.ok(
+    budget.headroomSourceChars > 0,
+    "headroom must be expressible as runner-source characters",
+  );
+});
+
+test("a notebook payload too large for one immutable command degrades and never throws", () => {
+  const overflowing = planNotebookValidationV1({
+    projectId: "scratch",
+    projectRoot: ".",
+    stagingManifest: Array.from(
+      { length: NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1 + 1 },
+      (_unused, index) => ({ path: `notebook-${index}.ipynb` }),
+    ),
+    hasOtherSources: false,
+    availability: provedRuntime(),
+  });
+  assert.equal(
+    overflowing.degradation?.code,
+    "notebook_runtime_payload_overflow",
+    "a payload that does not fit is not a probe failure and must not be reported as one",
+  );
+  assert.match(
+    overflowing.degradation!.message,
+    /authoring, reading, and export are unaffected/u,
+  );
+  assert.deepEqual(overflowing.commands, []);
+  assert.deepEqual(overflowing.generatedOutputs, []);
+  assert.deepEqual(overflowing.expectedArtifacts, []);
+});
+
+test("a probe summary that is not this runner's own contract-matching output proves nothing", () => {
+  const healthy = notebookRuntimeAvailabilityFromProbeV1({
+    checkedAt: CHECKED_AT,
+    exitCode: 0,
+    stdout: probeSummary(),
+    executedNotebook: executedProbeNotebook(),
+    expectedExecutedCells: NOTEBOOK_RUNTIME_PROBE_EXECUTED_CELLS_V1,
+  });
+  assert.equal(healthy.available, true, "the honest summary must still prove the runtime");
+
+  const forged: Array<[string, string, RegExp]> = [
+    ["truncated JSON", '{"version":1,"runner":"agentic_notebook_run', /not valid JSON/u],
+    ["empty stdout", "", /bounded text/u],
+    ["a newer runner contract", probeSummary({ contract: 2 }), /this host speaks 1/u],
+    ["a foreign runner name", probeSummary({ runner: "papermill" }), /host runner contract/u],
+    [
+      "an execute-mode summary",
+      probeSummary({ mode: "execute" }),
+      /mode execute rather than probe/u,
+    ],
+    [
+      "a summary whose own status disagrees with its notebooks",
+      probeSummary({ status: "failed" }),
+      /disagrees with its own per-notebook results/u,
+    ],
+    [
+      "a summary counting cells the probe never had",
+      probeSummary({ executedCellCount: 99 }),
+      /counted 99 executed cells/u,
+    ],
+  ];
+  for (const [label, stdout, expected] of forged) {
+    const record = notebookRuntimeAvailabilityFromProbeV1({
+      checkedAt: CHECKED_AT,
+      exitCode: 0,
+      stdout,
+      // The executed artifact is impeccable; only the runner's own report is
+      // forged. Availability must still be refused.
+      executedNotebook: executedProbeNotebook(),
+      expectedExecutedCells: NOTEBOOK_RUNTIME_PROBE_EXECUTED_CELLS_V1,
+    });
+    assert.equal(record.available, false, label);
+    assert.match(record.diagnostic!, expected, label);
+    assert.equal(
+      notebookExecutionDegradationV1(record)?.code,
+      "notebook_runtime_probe_failed",
+      label,
+    );
+  }
+});
+
+test("the runner fingerprint on a probe record is the host's own, never the payload's", () => {
+  const record = notebookRuntimeAvailabilityFromProbeV1({
+    checkedAt: CHECKED_AT,
+    exitCode: 0,
+    stdout: probeSummary({
+      runnerFingerprint: `sha256:${"e".repeat(64)}`,
+      engine: "papermill",
+      available: true,
+    }),
+    executedNotebook: executedProbeNotebook(),
+    expectedExecutedCells: NOTEBOOK_RUNTIME_PROBE_EXECUTED_CELLS_V1,
+  });
+  assert.equal(record.runnerFingerprint, notebookRunnerFingerprintV1());
+  assert.equal(record.engine, "stdlib_cell_runner_v1");
+  assert.equal(
+    notebookExecutionDegradationV1({
+      ...record,
+      runnerFingerprint: `sha256:${"e".repeat(64)}`,
+    })?.code,
+    "notebook_runtime_contract_mismatch",
+    "a stored record proving another runner must never contribute a command",
+  );
+});
+
+test("the run summary parser rejects every partial or self-contradicting document", () => {
+  assert.equal(parseNotebookRunSummaryV1(probeSummary()).executedCellCount, 2);
+  const rejected: Array<[string, unknown, string]> = [
+    ["not text", 42, "notebook_run_summary_invalid"],
+    ["truncated JSON", '{"version":1', "notebook_run_summary_invalid"],
+    ["a JSON array", "[]", "notebook_run_summary_invalid"],
+    ["a newer contract", probeSummary({ contract: 7 }), "notebook_runtime_contract_mismatch"],
+    ["no notebooks", probeSummary({ notebooks: [] }), "notebook_run_summary_invalid"],
+    [
+      "more notebooks than one command can carry",
+      probeSummary({
+        notebooks: Array.from({ length: NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1 + 1 }, () => ({
+          path: "n.ipynb",
+          status: "executed",
+          reason: null,
+          codeCells: 1,
+          executedCells: 1,
+          failure: null,
+        })),
+      }),
+      "notebook_run_summary_invalid",
+    ],
+    [
+      "a failed notebook with no failing cell",
+      probeSummary({
+        notebooks: [
+          {
+            path: NOTEBOOK_RUNTIME_PROBE_PATH_V1,
+            status: "failed",
+            reason: null,
+            codeCells: 2,
+            executedCells: 2,
+            failure: null,
+          },
+        ],
+        failedNotebook: NOTEBOOK_RUNTIME_PROBE_PATH_V1,
+        status: "failed",
+      }),
+      "notebook_run_summary_invalid",
+    ],
+    [
+      "more executed cells than the notebook holds",
+      probeSummary({
+        notebooks: [
+          {
+            path: NOTEBOOK_RUNTIME_PROBE_PATH_V1,
+            status: "executed",
+            reason: null,
+            codeCells: 1,
+            executedCells: 9,
+            failure: null,
+          },
+        ],
+      }),
+      "notebook_run_summary_invalid",
+    ],
+  ];
+  for (const [label, stdout, code] of rejected) {
+    assert.throws(
+      () => parseNotebookRunSummaryV1(stdout),
+      (error: unknown) =>
+        error instanceof NotebookExecutionErrorV1 && error.code === code,
+      label,
+    );
+  }
+  // Optional-module claims are never trusted as reported: anything that is not
+  // an exact `true` reads as absent, so a forged inventory cannot silence the
+  // upgrade advice a scientist needs.
+  const forgedModules = parseNotebookRunSummaryV1(
+    probeSummary({ optionalModules: { numpy: "yes", pandas: 1 } }),
+  );
+  assert.equal(forgedModules.optionalModules.numpy, false);
+  assert.equal(forgedModules.optionalModules.pandas, false);
 });

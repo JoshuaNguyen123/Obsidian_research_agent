@@ -115,7 +115,13 @@ export interface NotebookExecutionDegradationV1 {
   code:
     | "notebook_runtime_unprobed"
     | "notebook_runtime_probe_failed"
-    | "notebook_runtime_contract_mismatch";
+    | "notebook_runtime_contract_mismatch"
+    /**
+     * The runtime is fine; this workspace's notebooks do not fit the one
+     * immutable command that may carry them. It is a property of the payload,
+     * never of the model's request, so it must not read as a probe failure.
+     */
+    | "notebook_runtime_payload_overflow";
   message: string;
   requiredAction: string;
 }
@@ -390,6 +396,56 @@ function encodeRunnerChunksV1(): string[] {
   return chunks;
 }
 
+export interface NotebookRunnerArgvBudgetV1 {
+  /** `-c` plus the fixed driver program. */
+  driverEntries: number;
+  /** Base64 chunks the runner program currently costs. */
+  runnerChunks: number;
+  /** The `--` separator plus the mode word. */
+  separatorEntries: number;
+  /** Notebook paths the count bound allows in one command. */
+  maxNotebookPaths: number;
+  /** Entries a full-capacity execute command uses. */
+  worstCaseEntries: number;
+  /** Entries the immutable command contract allows. */
+  limit: number;
+  /** Entries still free at full notebook capacity. */
+  headroomEntries: number;
+  /** Runner-source characters that headroom is still worth. */
+  headroomSourceChars: number;
+}
+
+/**
+ * What a full-capacity notebook command costs against the immutable argv
+ * contract.
+ *
+ * The overflow guard inside `buildNotebookRunnerArgsV1` is unreachable while
+ * this budget stays positive, which is exactly why it needs a test rather than
+ * a runtime path: growing the runner program is the only way to spend the
+ * headroom, and that happens at edit time, not at run time. Production and the
+ * budget test read this one function so neither restates the other's
+ * arithmetic.
+ */
+export function notebookRunnerArgvBudgetV1(): NotebookRunnerArgvBudgetV1 {
+  const runnerChunks = encodeRunnerChunksV1().length;
+  const worstCaseEntries =
+    2 + runnerChunks + 2 + NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1;
+  const headroomEntries = NOTEBOOK_RUNNER_MAX_ARGS_V1 - worstCaseEntries;
+  return {
+    driverEntries: 2,
+    runnerChunks,
+    separatorEntries: 2,
+    maxNotebookPaths: NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1,
+    worstCaseEntries,
+    limit: NOTEBOOK_RUNNER_MAX_ARGS_V1,
+    headroomEntries,
+    // Base64 costs four characters per three source bytes.
+    headroomSourceChars: Math.floor(
+      (headroomEntries * NOTEBOOK_RUNNER_CHUNK_CHARS_V1 * 3) / 4,
+    ),
+  };
+}
+
 /**
  * Build the exact host-owned argv. The model contributes nothing to it: the
  * caller supplies only notebook paths already proven present in the trusted
@@ -652,12 +708,14 @@ export function unprovedNotebookRuntimeV1(input: {
 /**
  * Turn one real probe execution into an availability record.
  *
- * The authority is the executed notebook that came back through the
- * hash-checked artifact importer, not the exit code and not the stdout
- * excerpt: it must show every probe cell executed, no error output, real
- * captured stdout, and a returned trailing-expression result. The runner's
- * stdout summary only supplies the interpreter version and the optional-module
- * inventory, which the notebook bytes cannot carry.
+ * The authority on whether cells ran is the executed notebook that came back
+ * through the hash-checked artifact importer, not the exit code and not the
+ * stdout excerpt: it must show every probe cell executed, no error output,
+ * real captured stdout, and a returned trailing-expression result. The
+ * runner's stdout summary supplies the interpreter version and the
+ * optional-module inventory, which the notebook bytes cannot carry, and it
+ * must additionally parse as this runner's own contract-matching probe summary
+ * before availability is recorded - see `probeSummaryProblemV1`.
  */
 export function notebookRuntimeAvailabilityFromProbeV1(input: {
   checkedAt: string;
@@ -705,7 +763,13 @@ export function notebookRuntimeAvailabilityFromProbeV1(input: {
       }`,
     };
   }
+  const summaryProblem = probeSummaryProblemV1(
+    summary,
+    summaryDiagnostic,
+    input.expectedExecutedCells,
+  );
   const healthy =
+    summaryProblem === null &&
     input.exitCode === 0 &&
     evidence.executedCells === input.expectedExecutedCells &&
     evidence.erroredCells === 0 &&
@@ -718,8 +782,44 @@ export function notebookRuntimeAvailabilityFromProbeV1(input: {
     optionalModules: summary?.optionalModules ?? parseOptionalModulesV1(null),
     diagnostic: healthy
       ? null
-      : `Notebook runtime probe exited ${input.exitCode}; the returned notebook shows ${evidence.executedCells} of ${input.expectedExecutedCells} cells executed, ${evidence.erroredCells} errored, ${evidence.streamCharacters} captured stdout characters, and ${evidence.resultCells} returned results.`,
+      : `Notebook runtime probe exited ${input.exitCode}; the returned notebook shows ${evidence.executedCells} of ${input.expectedExecutedCells} cells executed, ${evidence.erroredCells} errored, ${evidence.streamCharacters} captured stdout characters, and ${evidence.resultCells} returned results${
+          summaryProblem ? `; ${summaryProblem}` : ""
+        }.`,
   };
+}
+
+/**
+ * Why this stdout is not the summary a real probe run of *this* runner emits.
+ *
+ * The executed notebook remains the authority on whether cells ran, but a
+ * runtime may only be recorded as available when the runner also identified
+ * itself through its own contract-matching summary. Without this, an empty,
+ * truncated, redacted, or contract-mismatched stdout was silently discarded
+ * and the runtime was still recorded as proved - so a probe could be believed
+ * on evidence nobody had actually parsed, which is precisely what this module
+ * promises never to do. A parse failure now surfaces as a named diagnostic
+ * instead of vanishing.
+ */
+function probeSummaryProblemV1(
+  summary: NotebookRunSummaryV1 | null,
+  summaryDiagnostic: string | null,
+  expectedExecutedCells: number,
+): string | null {
+  if (summary === null) {
+    return `the runner produced no readable summary (${
+      summaryDiagnostic ?? "no diagnostic"
+    })`;
+  }
+  if (summary.mode !== "probe") {
+    return `the runner summary reports mode ${summary.mode} rather than probe`;
+  }
+  if (summary.status !== "executed") {
+    return `the runner summary reports status ${summary.status}`;
+  }
+  if (summary.executedCellCount !== expectedExecutedCells) {
+    return `the runner summary counted ${summary.executedCellCount} executed cells rather than ${expectedExecutedCells}`;
+  }
+  return null;
 }
 
 export const NOTEBOOK_RUNTIME_PROBE_PROJECT_ID_V1 = "probe";
@@ -1092,13 +1192,36 @@ export function planNotebookValidationV1(input: {
     return {
       ...empty,
       degradation: {
-        code: "notebook_runtime_probe_failed",
+        code: "notebook_runtime_payload_overflow",
         message: `Notebook cell execution is unavailable because this workspace holds ${notebookPaths.length} notebooks and one immutable command can execute at most ${NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1}. Notebook authoring, reading, and export are unaffected.`,
         requiredAction: `Split the workspace so no more than ${NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1} notebooks validate together.`,
       },
     };
   }
-  const args = buildNotebookRunnerArgsV1({ mode: "execute", notebookPaths });
+  /**
+   * The argv bound is a second, independent limit: the runner program itself
+   * spends argv entries, so a future larger runner shrinks how many notebooks
+   * fit even below the count bound above. `notebookRunnerArgvBudgetV1` keeps
+   * that arithmetic visible to the test suite, but a plan must never throw
+   * here - notebooks failing to fit is a degradation of this workspace, and
+   * throwing would surface it as a red validation the model would be blamed
+   * for.
+   */
+  let args: string[];
+  try {
+    args = buildNotebookRunnerArgsV1({ mode: "execute", notebookPaths });
+  } catch (error) {
+    return {
+      ...empty,
+      degradation: {
+        code: "notebook_runtime_payload_overflow",
+        message: `Notebook cell execution is unavailable because this workspace's notebooks do not fit the one immutable command that carries them: ${
+          error instanceof Error ? error.message : String(error)
+        } Notebook authoring, reading, and export are unaffected.`,
+        requiredAction: `Split the workspace so fewer notebooks validate together; at most ${NOTEBOOK_RUNNER_MAX_NOTEBOOKS_V1} may share one command and the runner program itself spends part of the same argv budget.`,
+      },
+    };
+  }
   const phases = notebookOwnedPhasesV1({ hasOtherSources: input.hasOtherSources });
   return {
     notebookPaths,
