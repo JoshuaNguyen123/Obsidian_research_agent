@@ -784,6 +784,7 @@ import type {
   ReflexRecoveryOutcomeV1,
 } from "./agent/reflex/types";
 import {
+  MISSION_PLAN_PROMPT_MARKER,
   formatMissionPlanForPrompt,
   formatMissionPlanNextActionPrompt,
 } from "./agent/missionPlanPrompts";
@@ -17700,6 +17701,7 @@ export async function runAgentMission({
           ? `EXACT GITHUB PUBLICATION BINDING: profileKey=${JSON.stringify(verifiedLinearRepositoryBindingSnapshot.repositoryProfileKey)}; visibility=${resolvedRepositoryVisibility}; call github_create_repository with these exact values.`
           : null;
       pruneStaleFrontierCorrections(messages);
+      refreshMissionPlanPromptMessage(messages, missionPlan);
       const stepMessages =
         stepTools.length > 0 && (missionGraph || setLooseCompoundEnabled)
           ? insertMissionGraphFrontierTurnContext(
@@ -27976,6 +27978,33 @@ const FRONTIER_CORRECTION_SENTINEL =
  * every observed accepted-research contract.
  */
 const MAX_VERIFIED_LINEAR_SPEC_ANCHOR_CHARS = 8_000;
+
+/**
+ * Re-render the mission-plan system message from the live plan. It was built
+ * once at run start and never updated while missionPlan was reassigned
+ * throughout the run, leaving a step-0 snapshot ("Active task:
+ * tool-01-read_template") contradicting the per-step stage prompt
+ * ("stage=code_validation") for the entire mission. Content is replaced in
+ * place — never spliced — so message indices stay stable.
+ */
+function refreshMissionPlanPromptMessage(
+  messages: ModelChatMessage[],
+  plan: Parameters<typeof formatMissionPlanForPrompt>[0],
+): void {
+  const index = messages.findIndex(
+    (message) =>
+      message.role === "system" &&
+      message.content.startsWith(MISSION_PLAN_PROMPT_MARKER),
+  );
+  if (index < 0) return;
+  const content = plan
+    ? [
+        formatMissionPlanForPrompt(plan),
+        formatMissionPlanNextActionPrompt(plan),
+      ].join("\n\n")
+    : `${MISSION_PLAN_PROMPT_MARKER} is retired for this run; follow the stage prompt.`;
+  messages[index] = { ...messages[index]!, content };
+}
 
 function pruneStaleFrontierCorrections(messages: ModelChatMessage[]): void {
   let newestIndex = -1;

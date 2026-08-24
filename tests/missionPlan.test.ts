@@ -933,3 +933,25 @@ function okResult(toolName: string, output: unknown): ToolExecutionResult {
     output,
   };
 }
+
+test("mission-plan prompt starts with the marker the runner re-renders by", async () => {
+  const { MISSION_PLAN_PROMPT_MARKER, formatMissionPlanForPrompt } =
+    await import("../src/agent/missionPlanPrompts");
+  const plan = createMissionPlan({
+    runId: "run:marker",
+    prompt: "Rename the current note and append the completed research summary.",
+    missionIntent: createIntent(true),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_model_planning",
+      allowedToolNames: ["read_file"],
+    },
+    requiredTools: ["append_to_current_file"],
+    now: new Date("2026-07-07T12:00:00.000Z"),
+  });
+  const rendered = formatMissionPlanForPrompt(plan);
+  // The runner finds this message by prefix each step to re-render it from
+  // the live plan; a drifted first line silently restores the frozen
+  // step-0 snapshot bug.
+  assert.ok(rendered.startsWith(MISSION_PLAN_PROMPT_MARKER));
+});
