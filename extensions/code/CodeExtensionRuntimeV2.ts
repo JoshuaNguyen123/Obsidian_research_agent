@@ -1733,8 +1733,22 @@ export class CodeExtensionRuntimeV2 {
         updatedAt: this.isoNow(),
       }));
       this.sandboxManager = this.createConfiguredSandboxManager();
+      this.forgetNotebookExecutionRuntimeV1();
     });
     return this.readState();
+  }
+
+  /**
+   * Drop the notebook capability proof along with the boundary probe it was
+   * measured under. The proof names a runner, not a runtime root: a record
+   * taken against the previous immutable binding would otherwise keep
+   * contributing a notebook command after the binding it was proved on is
+   * gone, and claim in Code health that notebooks execute in a sandbox nobody
+   * has asked that question of.
+   */
+  private forgetNotebookExecutionRuntimeV1(): void {
+    this.notebookRuntime = null;
+    this.notebookRuntimeProbeInFlight = null;
   }
 
   /** Local settings operation. Removing configuration cannot start a process. */
@@ -1754,6 +1768,7 @@ export class CodeExtensionRuntimeV2 {
         updatedAt: this.isoNow(),
       }));
       this.sandboxManager = this.createConfiguredSandboxManager();
+      this.forgetNotebookExecutionRuntimeV1();
     });
     return this.readState();
   }

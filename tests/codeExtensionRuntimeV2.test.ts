@@ -2644,6 +2644,23 @@ test("CodeExtensionRuntimeV2 executes notebook cells in the sandbox and imports 
       2,
       "one capability probe run and one notebook validation run",
     );
+
+    // The proof names a runner, not a runtime root. Rebinding the sandbox to a
+    // different immutable digest must retire it with the boundary probe it was
+    // measured under, or Code health would keep claiming notebooks execute in
+    // a sandbox nothing has proved.
+    await runtime.configureSandboxProvider({
+      ...NOTEBOOK_FIXTURE_PROVIDER,
+      runtimeDigest: SHA("a"),
+    });
+    assert.equal(
+      runtime.readNotebookExecutionRuntimeV1(),
+      null,
+      "a notebook capability proof must not survive a provider rebinding",
+    );
+    const rebound = await status.readStatus(extensionContext());
+    assert.equal(rebound.status, "degraded");
+    assert.equal(rebound.details.degradationCode, "notebook_runtime_unprobed");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
