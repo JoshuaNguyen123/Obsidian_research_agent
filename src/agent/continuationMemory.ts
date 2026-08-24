@@ -1,4 +1,5 @@
 import type { AgentTraceEvent } from "../AgentRunner";
+import { sanitizeHandoffQuotes } from "./handoffQuoteSanitizer";
 import type { MissionLedger } from "./missionLedger";
 import {
   countRemainingMissionPlanTasks,
@@ -590,7 +591,17 @@ export function buildContinuationMemoryBundle({
     remainingActions,
     evidenceSummaries: (ledger?.evidence ?? []).slice(0, 12).map((item) => {
       const locator = item.path ?? item.url ?? item.id;
-      return `${item.title} (${locator}): ${item.summary}`;
+      // Evidence summaries can carry model prose merged from earlier
+      // segments. A quoted span attributed to a passage is verified against
+      // the ledger's cached passage bytes with the same predicate the
+      // write-time claim ledger enforces; anything the store cannot back is
+      // downgraded before the continuation prompt presents it as quotable.
+      const summary = sanitizeHandoffQuotes({
+        text: item.summary,
+        passages: ledger?.claimPassages ?? [],
+        evidence: ledger?.evidence,
+      }).text;
+      return `${item.title} (${locator}): ${summary}`;
     }),
     loadedAt: now.toISOString(),
   };

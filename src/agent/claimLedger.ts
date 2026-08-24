@@ -1,7 +1,11 @@
 import type { MissionEvidence } from "./missionLedger";
 import { getEvidencePassageIdentifiers } from "./missionPlan";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
-import { findQuoteRawOffset, quoteAppearsVerbatim } from "./quoteMatch";
+import {
+  createQuotedSpanPattern,
+  findQuoteRawOffset,
+  quoteAppearsVerbatim,
+} from "./quoteMatch";
 
 /** Bounded so a draft full of bad quotes cannot flood the correction prompt. */
 const MAX_QUOTE_CORRECTIONS = 4;
@@ -122,7 +126,7 @@ const PASSAGE_ID_PATTERN =
 /** Legacy/simple passage markers that are not nested inside source-scoped ids. */
 const SIMPLE_PASSAGE_ID_PATTERN =
   /(?<!source:[a-z0-9]+:)\bpassage:[a-z0-9][a-z0-9:_-]*\b/gi;
-const QUOTE_PATTERN = /[“"]([^”"]{8,400})[”"]/g;
+const QUOTE_PATTERN = createQuotedSpanPattern();
 
 const CLAIM_STOP_TERMS = new Set([
   "about",

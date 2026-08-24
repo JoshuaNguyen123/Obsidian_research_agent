@@ -50,6 +50,7 @@ export function findQuoteOffset(quote: string, source: string): number {
 }
 
 /**
+/**
  * First index of `quote` within `source`, in the ORIGINAL text's coordinates,
  * or -1.
  *
@@ -176,4 +177,72 @@ export function findPinpointLocator(
       right.offset - left.offset ||
       specificity[right.kind] - specificity[left.kind],
   )[0]!;
+}
+
+/**
+ * Raw `[start, end)` offsets in `source` of the span that matches `quote`
+ * under {@link normalizeForMatch}, or null. This is how a caller that
+ * verified a quote in normalized space recovers the source's actual bytes —
+ * e.g. to present the true text of a span instead of a model's cosmetically
+ * different transcription.
+ *
+ * Returns null rather than guessing whenever the raw↔normalized index mapping
+ * cannot be built exactly (a Unicode case fold that changes string length),
+ * and re-verifies the extracted slice before returning so a mapping bug can
+ * never hand back bytes that do not normalize to the quote.
+ */
+export function findQuoteRawSpan(
+  quote: string,
+  source: string,
+): { start: number; end: number } | null {
+  const needle = normalizeForMatch(quote);
+  if (!needle) return null;
+  // Whole-string lowercasing keeps context-sensitive folds (e.g. Greek final
+  // sigma) identical to normalizeForMatch; a fold that changes the string
+  // length breaks index alignment, so bail instead of approximating.
+  const lower = source.toLowerCase();
+  if (lower.length !== source.length) return null;
+
+  let normalized = "";
+  const rawIndexByNormalizedIndex: number[] = [];
+  let pendingSpaceRawIndex = -1;
+  for (let index = 0; index < lower.length; index += 1) {
+    let char = lower[index];
+    if (/\s/u.test(char)) {
+      // Collapse a whitespace run to one space, emitted lazily so leading and
+      // trailing runs vanish exactly as normalizeForMatch's trim does.
+      if (normalized.length > 0 && pendingSpaceRawIndex < 0) {
+        pendingSpaceRawIndex = index;
+      }
+      continue;
+    }
+    if (pendingSpaceRawIndex >= 0) {
+      normalized += " ";
+      rawIndexByNormalizedIndex.push(pendingSpaceRawIndex);
+      pendingSpaceRawIndex = -1;
+    }
+    if (char === "‘" || char === "’") char = "'";
+    else if (char === "“" || char === "”") char = '"';
+    normalized += char;
+    rawIndexByNormalizedIndex.push(index);
+  }
+
+  const matchIndex = normalized.indexOf(needle);
+  if (matchIndex < 0) return null;
+  const start = rawIndexByNormalizedIndex[matchIndex];
+  const end = rawIndexByNormalizedIndex[matchIndex + needle.length - 1] + 1;
+  if (normalizeForMatch(source.slice(start, end)) !== needle) return null;
+  return { start, end };
+}
+
+/**
+ * Quoted spans presented as verbatim text: 8–400 chars inside straight or
+ * smart double quotes. One definition shared by the write-time claim ledger
+ * (which extracts spans to enforce) and the capture-time handoff sanitizer
+ * (which extracts spans to verify), so the announcing and enforcing sides can
+ * never disagree about what counts as a quotation. Fresh instance per call:
+ * the /g flag makes a shared RegExp stateful across `exec` loops.
+ */
+export function createQuotedSpanPattern(): RegExp {
+  return /[“"]([^”"]{8,400})[”"]/g;
 }
