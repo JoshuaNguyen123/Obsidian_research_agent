@@ -36,6 +36,17 @@ function parseCsv(text) {
 }
 
 try {
+  try { execFileSync(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "eval-tool-events.mjs"), "--quiet"], { timeout: 120_000 }); } catch {}
+  let toolEvents = [];
+  try {
+    const teRows = parseCsv(readFileSync(path.join(EVAL_DIR, "tool-events.csv"), "utf8"));
+    const teHeader = teRows[0];
+    const teCol = (name) => teHeader.indexOf(name);
+    toolEvents = teRows.slice(1).map((c) => ({
+      model: c[teCol("model")] ?? "", tool: c[teCol("tool")] ?? "",
+      status: c[teCol("status")] ?? "", runGreen: c[teCol("run_green")] ?? "", missionId: c[teCol("mission_id")] ?? "",
+    })).filter((e) => e.tool);
+  } catch {}
   const rows = parseCsv(readFileSync(CSV, "utf8"));
   const header = rows[0];
   const col = (name) => header.indexOf(name);
@@ -92,7 +103,41 @@ try {
     ...byDay.map((d) => `| ${d.day} | ${d.runs} | ${d.green} | ${pct(d.green, d.runs)}% |`),
     "",
   ].join("\n");
-  writeFileSync(path.join(EVAL_DIR, "kpi-dashboard.md"), md);
+  const attemptedEvents = toolEvents.filter((e) => !["cancelled", "queued", "ready"].includes(e.status));
+  const toolTable = [...group(attemptedEvents, (e) => e.tool)]
+    .map(([tool, list]) => ({ tool, n: list.length, ok: list.filter((e) => e.status === "complete").length }))
+    .sort((a, b) => b.n - a.n);
+  const modelToolTable = [...group(attemptedEvents, (e) => `${e.model} | ${e.tool}`)]
+    .map(([key, list]) => ({ key, n: list.length, ok: list.filter((e) => e.status === "complete").length }))
+    .sort((a, b) => b.n - a.n).slice(0, 16);
+  const effectiveness = [...group(attemptedEvents.filter((e) => e.status === "complete" && e.runGreen !== ""), (e) => e.tool)]
+    .map(([tool, list]) => {
+      const runs = group(list, (e) => e.missionId);
+      const green = [...runs.values()].filter((nodes) => nodes[0].runGreen === "true").length;
+      return { tool, runs: runs.size, green };
+    }).sort((a, b) => b.runs - a.runs);
+  const mdFull = md + [
+    "",
+    "## Per tool (attempted graph nodes)",
+    "",
+    "| Tool | Attempted | Complete | Success % |",
+    "|---|---|---|---|",
+    ...toolTable.map((t) => `| ${t.tool} | ${t.n} | ${t.ok} | ${pct(t.ok, t.n)}% |`),
+    "",
+    "## Per model x tool",
+    "",
+    "| Model \| Tool | Complete / Attempted | Success % |",
+    "|---|---|---|",
+    ...modelToolTable.map((r) => `| ${r.key} | ${r.ok}/${r.n} | ${pct(r.ok, r.n)}% |`),
+    "",
+    "## Tool effectiveness — P(run green | tool completed in run)",
+    "",
+    "| Tool | Runs with completion | Green | Rate |",
+    "|---|---|---|---|",
+    ...effectiveness.map((t) => `| ${t.tool} | ${t.runs} | ${t.green} | ${pct(t.green, t.runs)}% |`),
+    "",
+  ].join(String.fromCharCode(10));
+  writeFileSync(path.join(EVAL_DIR, "kpi-dashboard.md"), mdFull);
 
   const W = 900, H = 640;
   const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
@@ -175,6 +220,17 @@ try {
       "        days[d][1] += 1 if green(r) else 0",
       "for d, (n, g) in sorted(days.items()):",
       "    print(f'{d}: {n} runs, {g} green ({100*g/n:.1f}%)')",
+    ],
+    [
+      "te = list(csv.DictReader(open('tool-events.csv', encoding='utf-8')))",
+      "attempted = [e for e in te if e['status'] not in ('cancelled', 'queued', 'ready')]",
+      "per_tool = collections.defaultdict(lambda: [0, 0])",
+      "for e in attempted:",
+      "    per_tool[e['tool']][0] += 1",
+      "    per_tool[e['tool']][1] += 1 if e['status'] == 'complete' else 0",
+      "print('tool call success rates (attempted graph nodes):')",
+      "for t, (n, ok) in sorted(per_tool.items(), key=lambda kv: -kv[1][0]):",
+      "    print(f'  {t}: {ok}/{n} ({100*ok/n:.1f}%)')",
     ],
   ];
   const NL = String.fromCharCode(10);
