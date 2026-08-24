@@ -1,7 +1,35 @@
 import type { MissionEvidence } from "./missionLedger";
 import { getEvidencePassageIdentifiers } from "./missionPlan";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
-import { quoteAppearsVerbatim } from "./quoteMatch";
+import { findQuoteRawOffset, quoteAppearsVerbatim } from "./quoteMatch";
+
+/** Bounded so a draft full of bad quotes cannot flood the correction prompt. */
+const MAX_QUOTE_CORRECTIONS = 4;
+const QUOTE_CORRECTION_EXCERPT_CHARS = 480;
+
+/**
+ * The passage text nearest the attempted quote, located with the same
+ * normalization the verbatim check uses. Progressively shorter word-prefixes
+ * of the attempt anchor the excerpt — a quote is usually wrong in its tail
+ * (modernized spellings, trimmed clauses) while its opening words still match.
+ * When nothing anchors, the passage head is still better than no bytes.
+ */
+function locateQuoteCorrectionExcerpt(
+  attempted: string,
+  passageText: string,
+): string {
+  const words = attempted.split(/\s+/u).filter(Boolean);
+  for (const take of [8, 5, 3, 2]) {
+    if (words.length < take) continue;
+    const probe = words.slice(0, take).join(" ");
+    const offset = findQuoteRawOffset(probe, passageText);
+    if (offset >= 0) {
+      const start = Math.max(0, offset - 80);
+      return passageText.slice(start, start + QUOTE_CORRECTION_EXCERPT_CHARS);
+    }
+  }
+  return passageText.slice(0, QUOTE_CORRECTION_EXCERPT_CHARS);
+}
 
 export const MAX_RESEARCH_CLAIMS = 40;
 
@@ -37,6 +65,23 @@ export interface ClaimPassageRef {
 
 export type ClaimLedgerStatus = "pass" | "fail" | "skipped" | "needs_more_work";
 
+/**
+ * The verifier's own answer to a quote_mismatch: the cited passage's actual
+ * text near where the attempted quote should have been. A bare mismatch flag
+ * sent the model back to re-fetch sources it could only see truncated — live
+ * theology missions burned whole windows guessing bytes the verifier already
+ * held (2026-08-24). Carrying the excerpt lets the correction copy instead of
+ * guess.
+ */
+export interface ClaimQuoteCorrection {
+  claimId: string;
+  passageId: string;
+  /** The quote the draft attempted, bounded. */
+  attempted: string;
+  /** The cited passage's actual text near the closest match, bounded. */
+  passageExcerpt: string;
+}
+
 export interface ClaimLedger {
   version: 1;
   status: ClaimLedgerStatus;
@@ -53,6 +98,8 @@ export interface ClaimLedger {
    * quotes nothing at all.
    */
   verifyQuoteSpans?: boolean;
+  /** Present only when quote mismatches were found; see ClaimQuoteCorrection. */
+  quoteCorrections?: ClaimQuoteCorrection[];
 }
 
 export interface BuildClaimLedgerInput {
@@ -351,6 +398,7 @@ export function validateClaimGrounding(
   reasons: string[];
   nextAction?: string;
   claims: ResearchClaim[];
+  quoteCorrections: ClaimQuoteCorrection[];
 } {
   const known = new Set(options.knownPassageIds.filter(Boolean));
   const passageById = new Map(
@@ -358,6 +406,7 @@ export function validateClaimGrounding(
   );
   const missing: string[] = [];
   const reasons: string[] = [];
+  const quoteCorrections: ClaimQuoteCorrection[] = [];
   let validQuoteSpanCount = 0;
   let materialClaimCount = 0;
   const draftIds = options.draft
@@ -411,6 +460,17 @@ export function validateClaimGrounding(
         if (!quoteAppearsVerbatim(span.quote, passage.text)) {
           missing.push(`claim_grounding:quote_mismatch:${claim.id}`);
           reasons.push("quote_span_not_in_passage");
+          if (quoteCorrections.length < MAX_QUOTE_CORRECTIONS) {
+            quoteCorrections.push({
+              claimId: claim.id,
+              passageId: span.passageId,
+              attempted: span.quote.slice(0, 240),
+              passageExcerpt: locateQuoteCorrectionExcerpt(
+                span.quote,
+                passage.text,
+              ),
+            });
+          }
         } else {
           validQuoteSpanCount += 1;
         }
@@ -435,6 +495,7 @@ export function validateClaimGrounding(
     status: ok ? "pass" : "needs_more_work",
     missing: uniqueMissing,
     reasons: uniqueReasons,
+    quoteCorrections,
     nextAction: ok
       ? undefined
       : uniqueReasons.includes("fabricated_passage_id")
@@ -502,6 +563,9 @@ export function buildClaimLedger(input: BuildClaimLedgerInput): ClaimLedger {
     ...(validated.nextAction ? { nextAction: validated.nextAction } : {}),
     requireQuoteSpans,
     verifyQuoteSpans,
+    ...(validated.quoteCorrections.length > 0
+      ? { quoteCorrections: validated.quoteCorrections }
+      : {}),
   };
 }
 

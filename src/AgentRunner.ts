@@ -712,6 +712,7 @@ import {
 import {
   type ClaimLedger,
   type ClaimPassageRef,
+  type ClaimQuoteCorrection,
   shouldRequireClaimGrounding,
   shouldVerifyQuoteSpansV1,
 } from "./agent/claimLedger";
@@ -10059,6 +10060,7 @@ export async function runAgentMission({
             missionPlan,
             missionEvidenceRecords,
             researchPlan,
+            lastClaimLedger?.quoteCorrections ?? [],
           ),
         });
         let correctedCandidate: string;
@@ -18868,6 +18870,7 @@ export async function runAgentMission({
               missionPlan,
               missionEvidenceRecords,
               researchPlan,
+              lastClaimLedger?.quoteCorrections ?? [],
             ),
           });
           continue;
@@ -19683,6 +19686,7 @@ export async function runAgentMission({
                 missionPlan,
                 missionEvidenceRecords,
                 researchPlan,
+                lastClaimLedger?.quoteCorrections ?? [],
               ),
             });
             continue;
@@ -20492,7 +20496,14 @@ export async function runAgentMission({
               proposedWriteAcceptance?.missing.length
                 ? ` (${proposedWriteAcceptance.missing.join(", ")})`
                 : ""
-            }. Return the complete corrected note content as the final answer without another write tool call; read tools such as web_search or read_source_section may still be used first to verify exact quotations. The runner will verify and commit the final content exactly once.`;
+            }. Return the complete corrected note content as the final answer without another write tool call; read tools such as web_search or read_source_section may still be used first to verify exact quotations. The runner will verify and commit the final content exactly once.${
+              (lastClaimLedger?.quoteCorrections ?? [])
+                .map(
+                  (correction) =>
+                    ` Quote correction for ${correction.passageId}: your draft quoted "${correction.attempted}" but the cited passage actually reads: "${correction.passageExcerpt}".`,
+                )
+                .join("")
+            }`;
         events.onStatus?.(message);
         events.onTrace?.({
           id: `${toolEventBase.id}:proof-gated-writeback-rejected`,
@@ -34528,6 +34539,7 @@ function buildFinalOutputVerificationCorrectionPrompt(
   plan: MissionPlan | null = null,
   evidence: MissionEvidence[] = [],
   researchPlan: ResearchPlan | null = null,
+  quoteCorrections: ClaimQuoteCorrection[] = [],
 ): string {
   const requirePassageIds = shouldRequireClaimGrounding(missionPrompt);
   const requiredLiteralAnchors = extractRequiredLiteralAnchors(missionPrompt);
@@ -34628,6 +34640,13 @@ function buildFinalOutputVerificationCorrectionPrompt(
     )
       ? "For explicitly requested quotation work, include at least one direct quote copied character-for-character from the cited passage. Every other quoted span must also appear verbatim in its cited passage; remove or paraphrase unsupported quotation marks. Paraphrased material claims still need persisted passage ids."
       : "",
+    // The verifier compared the failed quote against the passage bytes it
+    // holds; without them the model re-fetched sources it could only see
+    // truncated and guessed — whole live mission windows went to that loop.
+    ...quoteCorrections.map(
+      (correction) =>
+        `Quote correction for ${correction.passageId}: your draft quoted "${correction.attempted}" but the cited passage actually reads: "${correction.passageExcerpt}". Copy the needed span character-for-character from that text, or cite the passage that truly contains your wording.`,
+    ),
     "Return only the corrected final answer. Do not request tools or repeat this instruction.",
     `Rejected draft for revision:\n${truncateForTrace(rejectedCandidate, 6000)}`,
   ].filter(Boolean).join("\n\n");

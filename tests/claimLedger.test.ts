@@ -419,3 +419,55 @@ function intent(requireWriteCompletion: boolean): MissionIntent {
 function okResult(toolName: string, output: unknown): ToolExecutionResult {
   return { ok: true, toolName, output };
 }
+
+test("a quote mismatch carries the passage's actual bytes for the correction", () => {
+  // The verifier holds the true source text at the moment it refuses; a bare
+  // mismatch flag sent the model back to guess or re-fetch sources it could
+  // only see truncated. The correction must let it copy instead.
+  const source = fetchedSource();
+  const passageText =
+    "And in the Holy Ghost, the Lord and Giver-of-Life, who proceedeth from the Father, who spake by the prophets.";
+  const draft = [
+    "The creed's clause reads:",
+    `> "And in the Holy Ghost, the Lord and Giver-of-Life, who proceeds from the Father, who spoke by the prophets." [${source.passageId}]`,
+  ].join("\n");
+  const ledger = buildClaimLedger({
+    draft,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: passageText }],
+    prompt: "Research the creed and quote the clause exactly. Cite passages.",
+    mode: "deep_web",
+  });
+
+  assert.ok(
+    ledger.missing.some((item) => item.includes("quote_mismatch")),
+    ledger.missing.join(", "),
+  );
+  const corrections = ledger.quoteCorrections ?? [];
+  assert.ok(corrections.length > 0, "mismatch produced no correction bytes");
+  assert.equal(corrections[0].passageId, source.passageId);
+  assert.ok(
+    corrections[0].passageExcerpt.includes("proceedeth from the Father"),
+    corrections[0].passageExcerpt,
+  );
+  assert.ok(corrections[0].attempted.includes("who proceeds from the Father"));
+});
+
+test("a verbatim quote produces no correction payload", () => {
+  const source = fetchedSource();
+  const passageText =
+    "And in the Holy Ghost, the Lord and Giver-of-Life, who proceedeth from the Father, who spake by the prophets.";
+  const draft = [
+    "The creed's clause reads:",
+    `> "the Lord and Giver-of-Life, who proceedeth from the Father" [${source.passageId}]`,
+  ].join("\n");
+  const ledger = buildClaimLedger({
+    draft,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: passageText }],
+    prompt: "Research the creed and quote the clause exactly. Cite passages.",
+    mode: "deep_web",
+  });
+
+  assert.equal(ledger.quoteCorrections, undefined, JSON.stringify(ledger.quoteCorrections));
+});
