@@ -1,3 +1,5 @@
+import { shouldRequireQuoteSpans } from "./claimLedger";
+
 export const RESEARCH_EFFORT_TIER_ORDER = [
   "quick",
   "standard",
@@ -518,10 +520,25 @@ function classifyTier(
     reasons.push("The user requested a concise research pass.");
   }
 
-  return {
-    tier: score >= 4 ? "deep" : score >= 2 ? "standard" : "quick",
-    reasons,
-  };
+  let tier: ResearchEffortTier =
+    score >= 4 ? "deep" : score >= 2 ? "standard" : "quick";
+  // Quote-span verification is triggered by the same predicate the claim
+  // ledger uses, and it has a mechanical floor the score cannot express: the
+  // primary text must be fetched and its passages re-read until every quoted
+  // span matches verbatim. Two live missions died at standard's 12 tool calls
+  // with the graph refusing the verification reads mid-repair (2026-08-24),
+  // so the verifier was demanding work this budget never funded. A brevity
+  // request shortens the note, not the verification.
+  // Extended/durable routes return before this scorer, so the floor can only
+  // ever raise quick or standard.
+  if (shouldRequireQuoteSpans(prompt)) {
+    tier = "deep";
+    reasons.push(
+      "Verbatim quotation was requested: quote-span verification needs primary-text fetches and passage reads, so the deep budget is the floor.",
+    );
+  }
+
+  return { tier, reasons };
 }
 
 function escalationDecision(

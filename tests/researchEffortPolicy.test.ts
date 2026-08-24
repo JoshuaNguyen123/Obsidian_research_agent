@@ -393,3 +393,46 @@ function progressInput(
     ...patch,
   };
 }
+
+test("verbatim quotation missions get the deep floor that funds quote-span verification", () => {
+  // Same predicate as the claim ledger: a prompt that triggers quote-span
+  // verification must also fund the primary-text fetches and passage reads
+  // that verification demands. Two live missions died at standard's budget
+  // with the graph refusing the verification reads (2026-08-24).
+  const quoted = selectInitialResearchEffort({
+    prompt:
+      "Research what the Nicene Creed (381) says about the Holy Spirit and write a brief note that includes the relevant clause as a direct quotation. Use current sources and citations.",
+    route: "grounded_research",
+    subquestions: 1,
+    freshness: "required",
+    risk: "low",
+  });
+  assert.equal(quoted.tier, "deep");
+  assert.ok(
+    quoted.reasons.some((reason) => /quote-span verification/i.test(reason)),
+    quoted.reasons.join(" | "),
+  );
+
+  // The identical mission without the quotation demand keeps its scored tier;
+  // the floor is quotation-specific, not a general research raise.
+  const unquoted = selectInitialResearchEffort({
+    prompt:
+      "Research what the Nicene Creed (381) says about the Holy Spirit and write a brief note on it. Use current sources and citations.",
+    route: "grounded_research",
+    subquestions: 1,
+    freshness: "required",
+    risk: "low",
+  });
+  assert.notEqual(unquoted.tier, "deep");
+
+  // An explicitly durable mission is never demoted by the floor.
+  const durable = selectInitialResearchEffort({
+    prompt:
+      "Run overnight extended research quoting primary texts across the corpus.",
+    route: "extended_overnight_research",
+    subquestions: 6,
+    freshness: "required",
+    risk: "high",
+  });
+  assert.equal(durable.tier, "extended");
+});
