@@ -13,6 +13,16 @@ import type { ProjectLifecycleStageV1 } from "./projectLifecycle";
 export const STAGE_PROMPT_MAX_EVIDENCE_CHARS = 1_200;
 export const STAGE_PROMPT_MAX_EVIDENCE_LINES = 8;
 export const STAGE_PROMPT_MAX_TOTAL_CHARS = 2_400;
+/**
+ * Host-authoritative binding lines ("EXACT GRAPH-BOUND WORKSPACE READ: …")
+ * are single joined lines around 600 chars. The 280-char evidence filter
+ * silently deleted every one of them, so the model was told to call a
+ * path-bound tool without ever being shown the path. They get their own cap.
+ */
+export const STAGE_PROMPT_MAX_EXACT_LINE_CHARS = 700;
+const EXACT_HOST_BINDING_LINE = /^EXACT [A-Z][A-Z -]*:/u;
+/** Single load-bearing lines worth salvaging from excluded bulky cards. */
+const BULKY_CARD_SALVAGE_LINE = /^(?:preferredNext=|route=|currentStage=)/u;
 
 const BULKY_CARD_MARKERS = [
   "HOST ROUTING CARD",
@@ -92,27 +102,52 @@ export function extractCompactStageEvidence(
   if (!raw) return [];
   const maxChars = options.maxChars ?? STAGE_PROMPT_MAX_EVIDENCE_CHARS;
   const maxLines = options.maxLines ?? STAGE_PROMPT_MAX_EVIDENCE_LINES;
-  const sections = raw
+  const allSections = raw
     .split(/\n{2,}/u)
     .map((section) => section.trim())
-    .filter(Boolean)
-    .filter(
-      (section) =>
-        !BULKY_CARD_MARKERS.some((marker) =>
-          section.toUpperCase().includes(marker),
-        ),
+    .filter(Boolean);
+  const isBulky = (section: string) =>
+    BULKY_CARD_MARKERS.some((marker) =>
+      section.toUpperCase().includes(marker),
     );
   const lines: string[] = [];
   let used = 0;
-  for (const section of sections) {
+  const push = (trimmed: string): boolean => {
+    if (used + trimmed.length > maxChars) return false;
+    lines.push(trimmed);
+    used += trimmed.length;
+    return lines.length < maxLines;
+  };
+  // Host-authoritative EXACT bindings first: they carry the exact path, hash,
+  // or id the frontier tool must be called with, and losing them to the
+  // generic 280-char filter left the model guessing values the host knew.
+  for (const section of allSections) {
+    if (isBulky(section)) continue;
+    for (const line of section.split(/\n/u)) {
+      const trimmed = line.replace(/\s+/gu, " ").trim();
+      if (!trimmed || !EXACT_HOST_BINDING_LINE.test(trimmed)) continue;
+      if (trimmed.length > STAGE_PROMPT_MAX_EXACT_LINE_CHARS) continue;
+      if (!push(trimmed)) return lines;
+    }
+  }
+  // Excluded bulky cards may still hold one load-bearing routing line.
+  for (const section of allSections) {
+    if (!isBulky(section)) continue;
     for (const line of section.split(/\n/u)) {
       const trimmed = line.replace(/\s+/gu, " ").trim();
       if (!trimmed || trimmed.length > 280) continue;
+      if (!BULKY_CARD_SALVAGE_LINE.test(trimmed)) continue;
+      if (!push(trimmed)) return lines;
+    }
+  }
+  for (const section of allSections) {
+    if (isBulky(section)) continue;
+    for (const line of section.split(/\n/u)) {
+      const trimmed = line.replace(/\s+/gu, " ").trim();
+      if (!trimmed || trimmed.length > 280) continue;
+      if (EXACT_HOST_BINDING_LINE.test(trimmed)) continue;
       if (!looksLikeStageEvidenceLine(trimmed)) continue;
-      if (used + trimmed.length > maxChars) return lines;
-      lines.push(trimmed);
-      used += trimmed.length;
-      if (lines.length >= maxLines) return lines;
+      if (!push(trimmed)) return lines;
     }
   }
   return lines;
@@ -169,27 +204,66 @@ export function formatStagePromptProjection(
     projection.callableTools.length > 0
       ? projection.callableTools.join(", ")
       : "none";
+  // The tool list is the one part of this prompt the model cannot recover
+  // from anywhere else, and it is consumed name-by-name. The old formatter
+  // rendered it near the end and then blind-sliced the whole block at the
+  // total cap, so a long objective plus full evidence chopped the list
+  // mid-name — observed as "callableTools: code_sandbox_status" while eight
+  // schemas were live. Build the skeleton first; evidence gets only the
+  // remaining budget and is dropped whole-line, never mid-line.
+  const buildSkeleton = (objective: string): string[] =>
+    [
+      projection.setLoose
+        ? "STAGE PROMPT (set-loose; objective + evidence + callable tools only):"
+        : "STAGE PROMPT (exact frontier; objective + evidence + callable tools only):",
+      `stage=${projection.stage ?? "none"}`,
+      `objective=${objective}`,
+      projection.budgetLine ? `budget=${projection.budgetLine}` : "",
+      "callableTools:",
+      tools,
+      projection.setLoose
+        ? "Soft tools may batch. Call at most one Bound stage mutation per turn. Prefer unpaid proof."
+        : "Call one of the callable tool names now. Do not invent off-frontier tools.",
+      "Use the provided JSON schema exactly.",
+    ].filter(Boolean);
+  let objective = projection.objective;
+  let skeleton = buildSkeleton(objective);
+  let skeletonLength = skeleton.join("\n").length;
+  const overflow = skeletonLength - STAGE_PROMPT_MAX_TOTAL_CHARS;
+  if (overflow > 0 && objective.length > 24) {
+    objective = `${objective
+      .slice(0, Math.max(24, objective.length - overflow - 1))
+      .trimEnd()}…`;
+    skeleton = buildSkeleton(objective);
+    skeletonLength = skeleton.join("\n").length;
+  }
+  const evidenceHeaderCost = "\nevidence:".length;
+  const evidenceLines: string[] = [];
+  let evidenceUsed = 0;
+  for (const line of projection.evidenceLines) {
+    const rendered = `- ${line}`;
+    const cost = rendered.length + 1;
+    if (
+      skeletonLength + evidenceHeaderCost + evidenceUsed + cost >
+      STAGE_PROMPT_MAX_TOTAL_CHARS
+    ) {
+      break;
+    }
+    evidenceLines.push(rendered);
+    evidenceUsed += cost;
+  }
   const evidence =
-    projection.evidenceLines.length > 0
-      ? projection.evidenceLines.map((line) => `- ${line}`).join("\n")
-      : "- (none beyond prior tool results already in this turn)";
+    evidenceLines.length > 0
+      ? evidenceLines
+      : ["- (none beyond prior tool results already in this turn)"];
+  // Evidence renders between the budget line and the tool list so the
+  // closing instructions still directly precede the model's tool choice.
+  const toolsIndex = skeleton.indexOf("callableTools:");
   const lines = [
-    projection.setLoose
-      ? "STAGE PROMPT (set-loose; objective + evidence + callable tools only):"
-      : "STAGE PROMPT (exact frontier; objective + evidence + callable tools only):",
-    `stage=${projection.stage ?? "none"}`,
-    `objective=${projection.objective}`,
-    projection.budgetLine ? `budget=${projection.budgetLine}` : "",
+    ...skeleton.slice(0, toolsIndex),
     "evidence:",
-    evidence,
-    "callableTools:",
-    tools,
-    projection.setLoose
-      ? "Soft tools may batch. Call at most one Bound stage mutation per turn. Prefer unpaid proof."
-      : "Call one of the callable tool names now. Do not invent off-frontier tools.",
-    "Use the provided JSON schema exactly.",
-  ].filter(Boolean);
-  const text = lines.join("\n");
-  if (text.length <= STAGE_PROMPT_MAX_TOTAL_CHARS) return text;
-  return `${text.slice(0, STAGE_PROMPT_MAX_TOTAL_CHARS - 1).trimEnd()}…`;
+    ...evidence,
+    ...skeleton.slice(toolsIndex),
+  ];
+  return lines.join("\n");
 }

@@ -163,3 +163,88 @@ test("schemasForLifecycleStage keeps only callable stage tools", () => {
     ["code_validate_fast", "append_to_current_file"],
   );
 });
+
+test("callableTools survive a long objective plus full evidence", () => {
+  // Regression: the old formatter rendered the tool list near the end and
+  // blind-sliced the whole block at the total cap, so a long objective plus
+  // eight evidence lines chopped the list mid-name -- observed as
+  // "callableTools: code_sandbox_status" while eight schemas were live.
+  const toolNames = [
+    "code_workspace_status",
+    "code_workspace_stat",
+    "code_workspace_list",
+    "code_workspace_read",
+    "code_workspace_search",
+    "code_workspace_append",
+    "code_sandbox_status",
+    "code_repair_status",
+  ];
+  const projection = projectStagePrompt({
+    stage: "code_validation",
+    setLoose: true,
+    callableTools: toolNames,
+    budgetLine: "b".repeat(400),
+    evidenceLines: Array.from({ length: 8 }, (_, index) =>
+      `readback proof line ${index} path=src/file${index}.py sha256=${"e".repeat(64)}`,
+    ),
+    objective: "o".repeat(1_600),
+  });
+  const formatted = formatStagePromptProjection(projection);
+  for (const name of toolNames) {
+    assert.ok(
+      formatted.includes(name),
+      `${name} must survive formatting untruncated`,
+    );
+  }
+  assert.match(formatted, /Use the provided JSON schema exactly\./u);
+});
+
+test("EXACT host binding lines survive the evidence filter and formatting", () => {
+  const exactLine =
+    `EXACT GRAPH-BOUND WORKSPACE READ: path=src/very/deep/module/implementation.py workspaceId=run-2026-08-24t05-48-15.303z sha256=${"a".repeat(64)} ` +
+    "Call code_workspace_read with this exact path now and do not substitute another file. " +
+    "x".repeat(300);
+  assert.ok(exactLine.length > 280, "the fixture must exceed the generic cap");
+  const lines = extractCompactStageEvidence(
+    [
+      exactLine,
+      "ordinary readback proof sha256=abc",
+    ].join("\n\n"),
+  );
+  assert.ok(
+    lines.some((line) => line.startsWith("EXACT GRAPH-BOUND WORKSPACE READ:")),
+    "the exact binding line must not be dropped by the 280-char filter",
+  );
+  const formatted = formatStagePromptProjection(
+    projectStagePrompt({
+      stage: "code_execution",
+      setLoose: true,
+      callableTools: ["code_workspace_read"],
+      observedBinding: exactLine,
+    }),
+  );
+  assert.match(formatted, /EXACT GRAPH-BOUND WORKSPACE READ:/u);
+  assert.match(formatted, /implementation\.py/u);
+});
+
+test("bulky cards stay excluded but their load-bearing routing line is salvaged", () => {
+  const lines = extractCompactStageEvidence(
+    [
+      [
+        "HOST ROUTING CARD (authoritative; call only listed tools):",
+        "route=grounded_workflow",
+        "currentStage=code_validation",
+        "preferredNext=code_validate_fast",
+        "offered:",
+        "- code_validate_fast — sandbox smoke tests",
+      ].join("\n"),
+      "evidence readback sha256=abc",
+    ].join("\n\n"),
+  );
+  assert.ok(lines.some((line) => line === "preferredNext=code_validate_fast"));
+  assert.ok(lines.some((line) => line === "currentStage=code_validation"));
+  assert.ok(
+    !lines.some((line) => /HOST ROUTING CARD|offered:/u.test(line)),
+    "the card itself stays out; only the routing line is salvaged",
+  );
+});
