@@ -2392,13 +2392,22 @@ async function assertPreparedTargetState(
  */
 function assertRequestedFingerprint(requested: unknown, observed: string): void {
   if (requested === undefined || requested === null) return;
-  if (!isSha256FingerprintV2(requested)) {
+  // Models routinely echo the digest without its "sha256:" prefix even though
+  // every read/stat readback reports the prefixed form; each rejection was one
+  // wasted paid call per hash-bound write. A bare 64-hex value is unambiguous,
+  // so canonicalize it instead of failing. Host-prepared values still go
+  // through the strict requiredFingerprint path untouched.
+  const canonical =
+    typeof requested === "string" && /^[0-9a-fA-F]{64}$/u.test(requested.trim())
+      ? `sha256:${requested.trim().toLowerCase()}`
+      : requested;
+  if (!isSha256FingerprintV2(canonical)) {
     throw new WorkspaceManagerErrorV2(
       "invalid_arguments",
       "expectedSha256 is optional and must be sha256:<64 lowercase hex> when supplied. Omit it and the host binds the target's current fingerprint.",
     );
   }
-  if (requested !== observed) {
+  if (canonical !== observed) {
     throw new WorkspaceManagerErrorV2(
       "precondition_failed",
       `Requested expected SHA-256 is stale; the target is now ${observed}. Omit expectedSha256 to bind the current fingerprint, or read the file again before retrying.`,
@@ -2526,12 +2535,15 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
     );
   }
   // expectedSha256 binds an append to an existing file's observed hash; it is
-  // optional because appending to an absent path creates the file.
-  if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content"]);
-  if (name === "code_workspace_write_expected" || name === "write_workspace_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content"]);
-  if (name === "code_workspace_patch") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: stringSchema(), replacements: { type: "array", items: objectSchema({ oldText: stringSchema(), newText: stringSchema(), expectedOccurrences: { type: "integer", enum: [1] } }, ["oldText", "newText"]) } }, ["path", "replacements"]);
-  if (name === "code_workspace_move" || name === "code_workspace_copy") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), destinationPath: stringSchema(), expectedSha256: stringSchema() }, ["path", "destinationPath"]);
-  if (name === "code_workspace_trash") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: stringSchema() }, ["path"]);
+  // optional because appending to an absent path creates the file. The schema
+  // states the prefixed fingerprint form: a bare stringSchema() here left the
+  // model to guess, and a raw-hex guess cost one rejected call per hash-bound
+  // write before the instructive error taught the format.
+  if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "content"]);
+  if (name === "code_workspace_write_expected" || name === "write_workspace_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "content"]);
+  if (name === "code_workspace_patch") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: sha256FingerprintSchema(), replacements: { type: "array", items: objectSchema({ oldText: stringSchema(), newText: stringSchema(), expectedOccurrences: { type: "integer", enum: [1] } }, ["oldText", "newText"]) } }, ["path", "replacements"]);
+  if (name === "code_workspace_move" || name === "code_workspace_copy") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), destinationPath: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "destinationPath"]);
+  if (name === "code_workspace_trash") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path"]);
   if (name === "code_workspace_restore") return objectSchema({ workspaceId: stringSchema(), trashId: stringSchema() }, ["trashId"]);
   if (name === "replace_workspace_text") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), find: stringSchema(), replace: stringSchema(), replaceAll: { type: "boolean" } }, ["path", "find", "replace"]);
   if (name === "preview_workspace_html") return objectSchema({ workspaceId: stringSchema(), htmlPath: stringSchema(), cssPath: stringSchema() }, ["htmlPath"]);
@@ -2540,6 +2552,14 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
 
 function objectSchema(properties: Record<string, JsonSchemaObjectV1>, required: string[] = []): JsonSchemaObjectV1 { return { type: "object", properties, required, additionalProperties: false }; }
 function stringSchema(): JsonSchemaObjectV1 { return { type: "string" }; }
+function sha256FingerprintSchema(): JsonSchemaObjectV1 {
+  return {
+    type: "string",
+    pattern: "^(?:sha256:)?[0-9a-fA-F]{64}$",
+    description:
+      "Optional. The prefixed fingerprint exactly as code_workspace_read/stat reports it: sha256:<64 lowercase hex>. Omit it to let the host bind the target's current fingerprint.",
+  };
+}
 function jupyterNotebookInputSchema(): JsonSchemaObjectV1 {
   return objectSchema({
     cells: {
@@ -2572,7 +2592,7 @@ function description(name: string): string {
     text = `Purpose: Create a new file in the real local filesystem workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for vault-sibling delivery unless another destination was explicit. Side effects: bound local write. ${base} Retrying is safe only when the existing file is byte-identical: that case returns a verified no-op. Different content is never overwritten by create; the error reports its SHA-256 and requires code_workspace_read followed by code_workspace_write_expected. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
     text += " Missing parent directories are created automatically, so paths such as src/game/ui/checkers.py are valid in one call.";
   } else if (name === "code_workspace_append") {
-    text = `Purpose: Append content to a workspace file, creating the file when the path does not exist yet. Use when: writing a planned implementation file or adding to one you have read. Required: path + content; expectedSha256 only when appending to an existing file you have read (it must match the observed SHA-256). Next: code_validate_fast. Side effects: bound local write. ${base}`;
+    text = `Purpose: Append content to a workspace file, creating the file when the path does not exist yet. Use when: writing a planned implementation file or adding to one you have read. Required: path + content; expectedSha256 only when appending to an existing file you have read, passed in the prefixed form the read reported (sha256:<64 lowercase hex>). Next: code_validate_fast. Side effects: bound local write. ${base}`;
   } else if (name === "code_workspace_patch") {
     text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
   } else if (

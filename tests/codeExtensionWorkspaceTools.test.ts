@@ -699,6 +699,54 @@ test("workspace tools prepare every mutation and return exact readback receipts"
       "the host binds the observed fingerprint when the caller omits one",
     );
 
+    // A bare 64-hex digest is the observed model transcription of the
+    // prefixed fingerprint every read reports; rejecting it cost one paid
+    // call per hash-bound write. It is unambiguous, so it canonicalizes.
+    const rawHexObserved = (
+      await fixture.manager.stat("tool-space", "src/crdt_sync.py")
+    ).sha256;
+    const appendWithRawHex = await requirePrepared(
+      appendTool,
+      {
+        workspaceId: "tool-space",
+        path: "src/crdt_sync.py",
+        content: "\n",
+        expectedSha256: rawHexObserved.replace("sha256:", "").toUpperCase(),
+      },
+      context,
+    );
+    assert.equal(
+      appendWithRawHex.normalizedArgs.expectedSha256,
+      rawHexObserved,
+      "a bare 64-hex expectedSha256 canonicalizes to the prefixed observed fingerprint",
+    );
+
+    // The schema itself must teach the fingerprint format; a bare string
+    // schema left the model to guess raw hex and pay for the rejection.
+    for (const fingerprintToolName of [
+      "code_workspace_append",
+      "code_workspace_write_expected",
+      "code_workspace_patch",
+      "code_workspace_move",
+      "code_workspace_copy",
+      "code_workspace_trash",
+    ]) {
+      const fingerprintTool = tools.get(fingerprintToolName)!;
+      const property = (fingerprintTool.parameters as {
+        properties: Record<string, { pattern?: string; description?: string }>;
+      }).properties.expectedSha256;
+      assert.match(
+        String(property.pattern),
+        /sha256/u,
+        `${fingerprintToolName} schema states the fingerprint pattern`,
+      );
+      assert.match(
+        String(property.description),
+        /sha256:<64 lowercase hex>/u,
+        `${fingerprintToolName} schema describes the prefixed form`,
+      );
+    }
+
     // A malformed optional value used to report "A SHA-256 fingerprint is
     // required." -- the opposite of the truth. A model that believes it needs
     // a fingerprint goes looking for one, and on an implementation frontier
