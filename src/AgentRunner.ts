@@ -17411,6 +17411,7 @@ export async function runAgentMission({
         role: "system" as const,
         content: buildPassageGroundedWritebackContract(
           acceptedWritebackPassageIds,
+          activeIntentPrompt,
         ),
       });
       events.onTrace?.({
@@ -20491,7 +20492,7 @@ export async function runAgentMission({
               proposedWriteAcceptance?.missing.length
                 ? ` (${proposedWriteAcceptance.missing.join(", ")})`
                 : ""
-            }. Return the complete corrected note content as the final answer without a tool call; the runner will verify and commit it exactly once.`;
+            }. Return the complete corrected note content as the final answer without another write tool call; read tools such as web_search or read_source_section may still be used first to verify exact quotations. The runner will verify and commit the final content exactly once.`;
         events.onStatus?.(message);
         events.onTrace?.({
           id: `${toolEventBase.id}:proof-gated-writeback-rejected`,
@@ -36513,14 +36514,27 @@ export function constrainPassageCitationScope(
   return { content, removedPassageIds };
 }
 
-function buildPassageGroundedWritebackContract(passageIds: string[]): string {
+function buildPassageGroundedWritebackContract(
+  passageIds: string[],
+  missionPrompt: string,
+): string {
+  // The enforcer (getMissingAcceptedPassageCitationIds) demands every accepted
+  // passage id only when the user's own prompt carries an explicit passage
+  // contract. The prose must make the same demand in the same case — stated
+  // unconditionally, a 15-passage acceptance forced website meta-commentary
+  // into a brief creed note as the model dutifully found a claim for every
+  // identifier (observed live 2026-08-24), and every filler claim was fresh
+  // grounding surface for the verifier to refuse.
+  const strictCoverage = hasExplicitPassageCitationContract(missionPrompt);
   return [
     "Passage-grounded writeback contract:",
     `Accepted passage identifiers: ${passageIds.join(", ")}.`,
     "Return only the requested note markdown or one current-note write call.",
     "Put an accepted identifier on every supported material-claim sentence, not only in a Sources footer.",
     passageIds.length > 1
-      ? "Use every listed fetched-source identifier at least once."
+      ? strictCoverage
+        ? "Use every listed fetched-source identifier at least once."
+        : "Cite every fetched source at least once, using whichever of its accepted passage identifiers supports the claim; identifiers that support no claim may be left uncited."
       : "Use the listed identifier exactly as written.",
     "Reuse fetched-passage terms. Do not invent identifiers, URLs, facts, or quotations.",
   ].join("\n");
