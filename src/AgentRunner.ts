@@ -19369,6 +19369,30 @@ export async function runAgentMission({
         await stopRepeatedToolBudget();
         return;
       }
+      // The last budgeted step returned neither a tool call nor any renderable
+      // content while acceptance still wants a final answer. That is the
+      // empty-terminal-completion shape that forfeited two fully paid stage-8
+      // runs; grant the one reserved retry step so the correction below gets
+      // an actual turn to be answered in.
+      if (
+        !emptyForcedFinalRetryUsed &&
+        step >= stepLimit &&
+        responseToolCalls.length === 0 &&
+        !hasRenderableAssistantContent(response.message.content ?? "") &&
+        acceptanceBeforeFinal.status !== "pass"
+      ) {
+        emptyForcedFinalRetryUsed = true;
+        finalRetryExtraSteps = 1;
+        events.onStatus?.(
+          "Final answer came back empty; granting one reserved retry...",
+        );
+        events.onTrace?.({
+          id: `empty-forced-final-retry-${step}`,
+          kind: "status",
+          step,
+          message: "empty_forced_final_retry_granted",
+        });
+      }
       if (
           shouldContinueForMissionAcceptance(
             acceptanceBeforeFinal,
@@ -19378,7 +19402,7 @@ export async function runAgentMission({
             codeWorkflowMission,
           )
       ) {
-        if (step < stepLimit) {
+        if (step < stepLimit + finalRetryExtraSteps) {
           events.onStatus?.(
             formatAcceptanceFailureCopy(acceptanceBeforeFinal.missing),
           );
