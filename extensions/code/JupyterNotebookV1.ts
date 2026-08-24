@@ -11,6 +11,15 @@ const MAX_NOTEBOOK_SOURCE_CHARS_V1 = 1_000_000;
 
 export type JupyterNotebookCellTypeV1 = "markdown" | "code";
 
+/**
+ * Authoring always emits `not_executed`. `executed` exists only so that a
+ * notebook proved by a real sandbox execution receipt can say so; see
+ * `buildNotebookExecutionProofV1` in `notebooks/NotebookExecutionV1.ts`, which
+ * is the only producer of the executed state and refuses to emit it without
+ * hash-bound artifact evidence.
+ */
+export type JupyterNotebookExecutionStateV1 = "not_executed" | "executed";
+
 export interface JupyterNotebookCellInputV1 {
   type: JupyterNotebookCellTypeV1;
   source: string;
@@ -30,7 +39,7 @@ export interface JupyterNotebookBuildResultV1 {
   markdownCellCount: number;
   kernelName: string;
   language: string;
-  executionState: "not_executed";
+  executionState: JupyterNotebookExecutionStateV1;
 }
 
 export interface JupyterReflectionTargetV1 {
