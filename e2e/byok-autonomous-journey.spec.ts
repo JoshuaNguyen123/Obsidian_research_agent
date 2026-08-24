@@ -1306,10 +1306,23 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       workspaceCreateEvent.preparedAction?.normalizedWorkspaceId,
     ).toBe(createdWorkspaceId);
     expect(handoff?.workspaceId).toBe(createdWorkspaceId);
+    // File creation, not a specific tool name. `0b95a9c` deliberately made
+    // `code_workspace_append` create an absent file (its receipt then reads
+    // `operation: "create"`), so the model may legitimately author every file
+    // through append and never call `code_workspace_create_file` at all. The
+    // contract is that at least one workspace file was created with a receipt,
+    // whichever sanctioned tool did it.
     const successfulCreateFileEvents = phaseBObservedTools.filter(
-      (event) => event.ok && event.name === "code_workspace_create_file",
+      (event) =>
+        event.ok &&
+        (event.name === "code_workspace_create_file" ||
+          (event.name === "code_workspace_append" &&
+            event.receipt?.operation === "create")),
     );
-    expect(successfulCreateFileEvents.length).toBeGreaterThan(0);
+    expect(
+      successfulCreateFileEvents.length,
+      "Phase B created no workspace file through any sanctioned creation path",
+    ).toBeGreaterThan(0);
     for (const event of phaseBObservedTools.filter(
       (candidate) =>
         candidate.sequence > workspaceCreateEvent.sequence &&
