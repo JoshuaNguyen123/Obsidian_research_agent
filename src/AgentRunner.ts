@@ -617,6 +617,7 @@ import {
   isCompletedAcceptedResearchPublicationReceipt,
   isSetLooseEnabled,
   isSetLooseGithubPublishHealableBlock,
+  preparedApprovalMayAutoWithoutCardV1,
   lifecycleStagePaidBySuccessfulTool,
   missionRequestsGithubMerge,
   resolveNumCtxForCompoundRun,
@@ -849,6 +850,7 @@ import {
   type RoutedMissionIntent,
 } from "./agent/missionRouter";
 import {
+  descriptorAllowsWriteAutonomyPromptGrantV1,
   deriveRoutedIntentFallback,
   evaluateToolPolicy,
   resolvePolicyRoutedIntent,
@@ -866,6 +868,7 @@ import {
 import {
   consumeAuthorityGrant,
   createOneShotGrant,
+  descriptorAllowsPromptIssuedGrantV1,
   evaluateAuthorityGrant,
   type AuthorityGrantV1,
 } from "./agent/authority";
@@ -10163,7 +10166,18 @@ export async function runAgentMission({
     // Central Bound gate: early bundled stage grant OR set-loose. Catalog
     // mutations retain exact approval/grant authority. Hard never auto.
     const setLooseLive = resolveSetLooseCompoundEnabled();
+    // Without this the auto branch below resolves an approval on a node that
+    // never entered waiting_approval, which surfaces as the opaque "is
+    // running; expected waiting_approval" rather than a policy refusal.
+    const approvalDescriptorAllowsPromptIssuedGrant =
+      preparedApprovalMayAutoWithoutCardV1({
+        hasPreparedAction: Boolean(preparedAction),
+        descriptors: [toolCall.name, approvalToolName].map(
+          (name) => toolRegistry.getDescriptor?.(name) ?? null,
+        ),
+      });
     const mayAutoBound =
+      approvalDescriptorAllowsPromptIssuedGrant &&
       !isGeneralGitHubCatalogMutationToolName(toolCall.name) &&
       !isGeneralGitHubCatalogMutationToolName(approvalToolName) &&
       (runnerBoundMayAutoWithoutChatGrant({
@@ -11006,13 +11020,16 @@ export async function runAgentMission({
       // still requires a real fingerprint-bound grant, so materialize that
       // already-authorized policy decision as a one-use grant. Never apply this
       // bridge to external providers, destructive/high-risk actions, or a
-      // generic allow decision.
+      // generic allow decision. The descriptor predicate is the same function
+      // the policy engine used to reach that decision, so the two subsystems
+      // cannot disagree about whether this grant may be minted.
       if (
         !matchingGrant &&
         preparedPolicyDecision.action === "allow" &&
         preparedPolicyDecision.tags.includes("write_autonomy") &&
         preparedPolicyDecision.tags.includes("prepared_fingerprint") &&
-        descriptor.effect === "reversible_mutation"
+        descriptor.effect === "reversible_mutation" &&
+        descriptorAllowsWriteAutonomyPromptGrantV1(descriptor)
       ) {
         try {
           const grant = await createOneShotGrant({
@@ -11077,7 +11094,11 @@ export async function runAgentMission({
         return buildPolicyBlockedResult(preparedPolicyDecision);
       }
       if (preparedPolicyDecision.action === "require_approval") {
+        // Set-loose derives authority from the mission prompt plus the autonomy
+        // profile, which is exactly the authority `allowPromptGrant: false`
+        // withholds. Such a descriptor keeps its approval card instead.
         const setLooseBoundAuto =
+          descriptorAllowsPromptIssuedGrantV1(descriptor) &&
           resolveSetLooseCompoundEnabled() &&
           runnerBoundMayAutoWithoutGrant({
             toolName: toolCall.name,

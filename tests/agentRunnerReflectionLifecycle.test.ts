@@ -133,6 +133,16 @@ test("canonical reflection persistence commits durable proof before best-effort 
   assert.ok(receipt >= 0);
   assert.ok(lineage > receipt);
   assert.ok(projection > lineage);
+  // A reflection receipt is a vault write. Offering it unconditionally to the
+  // Linear/GitHub proof ledger threw on the vault path's own characters and
+  // killed the run right after the user had approved the write.
+  const guard = block.indexOf("if (receiptMayEnterExternalProofLedgerV1(receipt)) {");
+  assert.ok(guard >= 0, "the external ledger append must stay guarded");
+  assert.ok(guard < receipt, "the guard must precede the ledger append");
+  assert.ok(
+    guard < lineage,
+    "reflection lineage must remain reachable for a vault receipt",
+  );
   assert.match(block, /try\s*\{[\s\S]*projectAndDispatchLinearProgress\([\s\S]*false,[\s\S]*\);[\s\S]*\}\s*catch \(error\)/u);
   assert.match(
     block,

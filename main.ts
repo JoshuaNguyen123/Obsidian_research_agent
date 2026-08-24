@@ -409,6 +409,7 @@ import {
   normalizeLinearOAuthCallbackPortV1,
   normalizeLinearOAuthRuntimeStateV1,
   parseLinearCapabilitySnapshot,
+  receiptMayEnterExternalProofLedgerV1,
   reconcileLinearSelections,
   parseLinearIntegrationState,
   parseRenderedCompatibleWorkItemSpec,
@@ -15312,7 +15313,15 @@ export default class AgenticResearcherPlugin extends Plugin {
       persistProjectStageReceipt: (receipt, executionContext) =>
         this.persistProjectStageReceipt(receipt, executionContext),
       persistProjectReflectionReceipt: async (receipt, executionContext) => {
-        await this.appendExternalActionReceipt(receipt);
+        // Reflection receipts come from write_project_results and
+        // append_jupyter_reflection, which are vault writes. The external proof
+        // ledger is the Linear/GitHub surface and refuses them — on the vault
+        // path's own characters, before its own system check can say so. The
+        // reflection's durable proof is the lineage commit below plus the
+        // tool's verified readback, not this ledger.
+        if (receiptMayEnterExternalProofLedgerV1(receipt)) {
+          await this.appendExternalActionReceipt(receipt);
+        }
         const lineage = await this.persistReflectionProjectLineage(receipt);
         if (lineage) {
           try {

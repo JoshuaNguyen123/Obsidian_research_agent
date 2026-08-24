@@ -188,14 +188,30 @@ test("broad external mutation grants are rejected at creation", async () => {
 test("one-shot grants respect the tool descriptor approval contract", async () => {
   const descriptor = descriptorFixture();
   descriptor.approval.allowPromptGrant = false;
+
+  // `allowPromptGrant: false` withholds authority the prompt would manufacture
+  // on its own, so the write-autonomy and set-loose bridges cannot mint here.
   await assert.rejects(
     createOneShotGrant({
       id: "grant-disallowed",
       action: await actionFixture(),
       descriptor,
+      issuer: "user_prompt",
     }),
-    /does not permit one-shot/,
+    /does not permit prompt-issued one-shot grants/,
   );
+
+  // It does not withhold the grant that an actual approval gesture produces.
+  // Refusing that one left every such descriptor with no reachable authority
+  // path at all, so its declared `fallback: "exact"` could never be honoured.
+  const approved = await createOneShotGrant({
+    id: "grant-approved",
+    action: await actionFixture(),
+    descriptor,
+    issuedAt: new Date("2026-07-11T12:00:00.000Z"),
+  });
+  assert.equal(approved.issuer, "user_approval");
+  assert.equal(approved.kind, "one_shot");
 });
 
 async function actionFixture(
