@@ -726,3 +726,149 @@ test("ToolRegistry run_mismatch guard still rejects a Results action from a prio
   assert.notEqual(prepared.action.runId, staleContextRunId,
     "A prepared action from segment-001 must not match segment-002's runId — ToolRegistry would fire run_mismatch");
 })
+
+const RESULTS_PHASE_A_RUN_ID = "run-results-phase-a";
+const RESULTS_PHASE_A_ISSUE_ID = "linear-issue-results-phase-a";
+
+function resultsPhaseALineage(): ProjectLineageV1 {
+  const artifact = createAcceptedResearchArtifactV1({
+    schemaVersion: 1,
+    artifactId: "accepted-results-phase-a-1",
+    originRunId: RESULTS_PHASE_A_RUN_ID,
+    vaultBindingKey: "vault-results-phase-a-1",
+    notePath: "Research/Results Phase A.md",
+    noteSha256: SHA("1"),
+    noteReceiptId: "note-results-phase-a-receipt-1",
+    evidence: [{
+      id: "evidence-results-phase-a-1",
+      kind: "web",
+      reference: "https://example.com/results-phase-a",
+      contentSha256: SHA("2"),
+    }],
+    acceptanceCriteria: [{
+      id: "AC-1",
+      text: "The delivery mission inherits this accepted research.",
+    }],
+    riskClass: "medium",
+    acceptedAt: "2026-08-18T09:00:00.000Z",
+    acceptedBy: "host",
+  });
+  const handoff = createResearcherHandoffV1({
+    artifact,
+    runId: RESULTS_PHASE_A_RUN_ID,
+    taskId: "results-phase-a-task-1",
+    evidenceIds: ["evidence-results-phase-a-1"],
+    summary: "Accepted research produced by the originating run.",
+    unresolvedQuestions: [],
+    acceptedAt: "2026-08-18T09:00:00.000Z",
+  });
+  const lineage = createProjectLineageV1({
+    lineageId: "lineage-results-phase-a-1",
+    runId: RESULTS_PHASE_A_RUN_ID,
+    vaultBindingKey: "vault-results-phase-a-1",
+    handoff,
+    updatedAt: "2026-08-18T09:00:00.000Z",
+  });
+  return advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-08-18T09:05:00.000Z",
+    proof: {
+      stage: "linear_hierarchy",
+      planFingerprint: SHA("3"),
+      workspaceId: "linear-workspace-results-phase-a-1",
+      teamId: "linear-team-results-phase-a-1",
+      initiativeId: "linear-initiative-results-phase-a-1",
+      projectId: "linear-project-results-phase-a-1",
+      issueIds: [RESULTS_PHASE_A_ISSUE_ID],
+      workItemFingerprints: [SHA("4")],
+      providerReadbackFingerprints: [SHA("5"), SHA("6"), SHA("7")],
+    },
+  });
+}
+
+/** This run's own work: implementation only, exactly as a Phase B run starts. */
+function resultsPhaseBImplementEvents(): ProjectStageEventV1[] {
+  return (["workspace_mutation", "diff_readback"] as const).map((kind, index) =>
+    createProjectStageEventV1({
+      schemaVersion: 1,
+      runId: RUN_ID,
+      phase: "implement",
+      evidenceKind: kind,
+      disposition: "verified",
+      occurredAt: `2026-08-19T15:3${index}:00.000Z`,
+      sourceReceiptId: `receipt-results-phase-b-${kind}`,
+      evidenceFingerprint: SHA(index === 0 ? "b" : "c"),
+      resource: {
+        system: "workspace",
+        resourceType: "verified_workspace",
+        id: "workspace-results-phase-b-1",
+        url: null,
+        path: null,
+        revision: SHA("d"),
+      },
+      workUnits: [],
+    }),
+  );
+}
+
+test("Markdown Results recovers the originating run's phases through the same durable join", async () => {
+  const lineage = resultsPhaseALineage();
+  const research = lineage.commits[0]!.proof;
+  if (research.stage !== "accepted_research") throw new Error("fixture");
+  const bound = await createProjectResultsTool().prepare!(
+    {},
+    toolContext(new MemoryVault(), {
+      getProjectStageEvents: () => resultsPhaseBImplementEvents(),
+      getProjectLineages: () => [lineage],
+      getVerifiedLinearCodeRepositoryBinding: () => ({
+        version: 1,
+        repositoryProfileKey: "results-fixture",
+        issueId: RESULTS_PHASE_A_ISSUE_ID,
+        issueIdentifier: "ENG-88",
+        publicationId: "publication-results-phase-a-1",
+        workItemFingerprint: SHA("4"),
+        acceptedResearchArtifactFingerprint: research.artifactFingerprint,
+        originRunId: RESULTS_PHASE_A_RUN_ID,
+      }),
+    }),
+  );
+  assert.equal(bound.ok, true, bound.ok ? "" : JSON.stringify(bound.error));
+  if (!bound.ok) return;
+  const report = parseProjectRunReportV1(bound.action.normalizedArgs.report);
+  assert.deepEqual(
+    report.phases.map((phase) => phase.status),
+    [
+      "verified_prior_run",
+      "verified_prior_run",
+      "verified",
+      "pending",
+      "pending",
+      "verified",
+    ],
+  );
+  const markdown = bound.action.normalizedArgs.proposedMarkdown as string;
+  assert.match(markdown, /- Research: \*\*Verified prior run\*\*/u);
+  assert.doesNotMatch(markdown, /Next experiment: Resume at Research/u);
+  assert.match(markdown, /Next experiment: Resume at Test/u);
+
+  // Same lineage, no host-verified binding: the join is refused and the report
+  // goes back to reporting an honest gap.
+  const unbound = await createProjectResultsTool().prepare!(
+    {},
+    toolContext(new MemoryVault(), {
+      getProjectStageEvents: () => resultsPhaseBImplementEvents(),
+      getProjectLineages: () => [lineage],
+    }),
+  );
+  assert.equal(unbound.ok, true);
+  if (!unbound.ok) return;
+  const unboundReport = parseProjectRunReportV1(
+    unbound.action.normalizedArgs.report,
+  );
+  assert.equal("priorPhaseAttestations" in unboundReport, false);
+  assert.equal(unboundReport.phases[0]?.status, "pending");
+  assert.match(
+    unbound.action.normalizedArgs.proposedMarkdown as string,
+    /Next experiment: Resume at Research/u,
+  );
+});

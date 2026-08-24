@@ -101,7 +101,14 @@ export type ProjectPhaseStatusV1 =
   | "pending"
   | "in_progress"
   | "blocked"
-  | "verified";
+  | "verified"
+  /**
+   * Resolved from durable prior-run lineage rather than this run's ledger.
+   * Deliberately a distinct status: a reader, a UI, and a downstream gate must
+   * all be able to tell "this run proved it" from "an earlier run proved it and
+   * this run re-read the binding". Never collapse it into "verified".
+   */
+  | "verified_prior_run";
 
 export interface ProjectPhaseOutcomeV1 {
   phase: ProjectPhaseV1;
@@ -111,6 +118,12 @@ export interface ProjectPhaseOutcomeV1 {
   completedAt: string | null;
   evidenceEventIds: string[];
   blockerEventIds: string[];
+  /**
+   * Present only on a `verified_prior_run` phase, naming the exact attestation
+   * that resolved it. Absent otherwise, so a report without cross-run lineage
+   * keeps its historical canonical bytes.
+   */
+  priorRunAttestationId?: string;
 }
 
 export interface ProjectPhaseSnapshotV1 {
@@ -118,6 +131,50 @@ export interface ProjectPhaseSnapshotV1 {
   phases: ProjectPhaseOutcomeV1[];
   complete: boolean;
 }
+
+export const PROJECT_PRIOR_PHASE_ATTESTATION_SCHEMA_VERSION = 1 as const;
+
+/**
+ * The only phases a cross-run join may speak for. Both are paid by durable
+ * `ProjectLineageV1` commits (`accepted_research`, `linear_hierarchy`) that the
+ * originating run fingerprinted, and both are reachable from the Linear issue
+ * this run read back. Implementation, validation, publication, and reflection
+ * are the current run's own work: an attestation there would be a fabrication
+ * channel, not a recovered fact.
+ */
+export const PROJECT_PRIOR_RUN_RESOLVABLE_PHASES_V1 = [
+  "research",
+  "linear_plan",
+] as const;
+
+export type ProjectPriorRunResolvablePhaseV1 =
+  (typeof PROJECT_PRIOR_RUN_RESOLVABLE_PHASES_V1)[number];
+
+/**
+ * One host-verified fact recovered from a previous run of the same project.
+ * It is minted only from a parsed, fingerprint-verified lineage commit that is
+ * joined to this run through the Linear issue the run read back — never from
+ * model prose, and never from a phase this run merely failed to observe.
+ */
+export interface ProjectPriorPhaseAttestationV1 {
+  schemaVersion: typeof PROJECT_PRIOR_PHASE_ATTESTATION_SCHEMA_VERSION;
+  attestationId: string;
+  phase: ProjectPriorRunResolvablePhaseV1;
+  /** The originating run that actually paid this phase. */
+  originRunId: string;
+  /** The durable join key: the issue this run verified by provider readback. */
+  linearIssueId: string;
+  linearIssueIdentifier: string;
+  evidenceKind: ProjectEvidenceKindV1;
+  verifiedAt: string;
+  proofFingerprint: string;
+  resource: ProjectEvidenceResourceV1;
+}
+
+export type ProjectPriorPhaseAttestationV1Unsigned = Omit<
+  ProjectPriorPhaseAttestationV1,
+  "attestationId"
+>;
 
 export type ProjectResultsDestinationKindV1 = "markdown" | "jupyter";
 
@@ -172,6 +229,12 @@ export interface ProjectRunReportV1 {
   evidence: ProjectStageEventV1[];
   /** Optional for byte-for-byte compatibility with legacy phase-only reports. */
   workUnitOutcomes?: ProjectWorkUnitOutcomeV1[];
+  /**
+   * Optional cross-run facts. Carried in the payload (not resolved at render
+   * time) so the report's phases stay a pure function of its own bytes and
+   * `parseProjectRunReportV1` can re-derive and re-check them.
+   */
+  priorPhaseAttestations?: ProjectPriorPhaseAttestationV1[];
   limitations: string[];
   codeExamples: ProjectCodeExampleV1[];
   complete: boolean;
@@ -255,11 +318,83 @@ export function parseProjectStageEventV1(value: unknown): ProjectStageEventV1 {
   return { ...unsigned, eventId };
 }
 
+export function createProjectPriorPhaseAttestationV1(
+  value: ProjectPriorPhaseAttestationV1Unsigned,
+): ProjectPriorPhaseAttestationV1 {
+  const unsigned = parseProjectPriorPhaseAttestationUnsignedV1(value);
+  return { ...unsigned, attestationId: fingerprintContract(unsigned) };
+}
+
+export function parseProjectPriorPhaseAttestationV1(
+  value: unknown,
+): ProjectPriorPhaseAttestationV1 {
+  const record = expectPlainRecord(value, "project prior phase attestation");
+  assertExactKeys(
+    record,
+    [
+      "schemaVersion",
+      "attestationId",
+      "phase",
+      "originRunId",
+      "linearIssueId",
+      "linearIssueIdentifier",
+      "evidenceKind",
+      "verifiedAt",
+      "proofFingerprint",
+      "resource",
+    ],
+    [],
+    "project prior phase attestation",
+  );
+  const { attestationId: rawAttestationId, ...rawUnsigned } = record;
+  const unsigned = parseProjectPriorPhaseAttestationUnsignedV1(rawUnsigned);
+  assertCanonicalContract(
+    rawUnsigned,
+    unsigned,
+    "Project prior phase attestation",
+  );
+  const attestationId = expectSha256(
+    rawAttestationId,
+    "project prior phase attestation id",
+  );
+  if (!constantTimeFingerprintEqual(attestationId, fingerprintContract(unsigned))) {
+    throw new DurableLinearContractError(
+      "Project prior phase attestation id does not match its canonical payload.",
+    );
+  }
+  return { ...unsigned, attestationId };
+}
+
+/**
+ * Shared completion predicate. The reducer, the attestation contract, and any
+ * caller deciding whether one prior-run proof would have paid a phase all read
+ * this single expression — a second copy is how a report starts disagreeing
+ * with the ledger it claims to summarize.
+ */
+export function projectPhaseCompletionSatisfiedV1(
+  phase: ProjectPhaseV1,
+  evidence: readonly ProjectStageEventV1[],
+): boolean {
+  return completionSatisfied(
+    phase,
+    evidence.filter((event) => event.disposition === "verified"),
+  );
+}
+
 export function reduceProjectStageEventsV1(input: {
   runId: string;
   events: readonly ProjectStageEventV1[];
+  /**
+   * Optional host-verified facts recovered from the originating run. They
+   * resolve a phase only when this run recorded no evidence of its own for it.
+   */
+  priorPhaseAttestations?: readonly ProjectPriorPhaseAttestationV1[];
 }): ProjectPhaseSnapshotV1 {
   const runId = expectOpaqueId(input.runId, "project run id");
+  const attestationByPhase = indexPriorPhaseAttestationsV1(
+    input.priorPhaseAttestations ?? [],
+    runId,
+  );
   const unique = new Map<string, ProjectStageEventV1>();
   for (const rawEvent of input.events) {
     const event = parseProjectStageEventV1(rawEvent);
@@ -290,13 +425,20 @@ export function reduceProjectStageEventsV1(input: {
       latestBlocker &&
         (!latestProof || compareProjectEvents(latestBlocker, latestProof) > 0),
     );
+    // A prior-run fact may only fill a phase this run said nothing about. Any
+    // current-run evidence — proof, partial proof, or blocker — outranks it, so
+    // durable lineage can never overwrite a live blocker or a live gap.
+    const attestation =
+      phaseEvents.length === 0 ? attestationByPhase.get(phase) ?? null : null;
     const status: ProjectPhaseStatusV1 = activeBlocker
       ? "blocked"
       : completed
         ? "verified"
         : proofEvents.length > 0
           ? "in_progress"
-          : "pending";
+          : attestation
+            ? "verified_prior_run"
+            : "pending";
     let completionEvent: ProjectStageEventV1 | null = null;
     if (completed) {
       for (let index = 0; index < proofEvents.length; index += 1) {
@@ -310,17 +452,47 @@ export function reduceProjectStageEventsV1(input: {
       phase,
       label: PROJECT_PHASE_LABELS_V1[phase],
       status,
-      startedAt: phaseEvents[0]?.occurredAt ?? null,
-      completedAt: status === "verified" ? completionEvent?.occurredAt ?? null : null,
+      startedAt: phaseEvents[0]?.occurredAt ?? attestation?.verifiedAt ?? null,
+      completedAt:
+        status === "verified"
+          ? completionEvent?.occurredAt ?? null
+          : status === "verified_prior_run"
+            ? attestation?.verifiedAt ?? null
+            : null,
       evidenceEventIds: proofEvents.map((event) => event.eventId),
       blockerEventIds: blockerEvents.map((event) => event.eventId),
+      ...(status === "verified_prior_run" && attestation
+        ? { priorRunAttestationId: attestation.attestationId }
+        : {}),
     } satisfies ProjectPhaseOutcomeV1;
   });
   return {
     runId,
     phases,
-    complete: phases.every((phase) => phase.status === "verified"),
+    complete: phases.every(
+      (phase) =>
+        phase.status === "verified" || phase.status === "verified_prior_run",
+    ),
   };
+}
+
+/**
+ * Derive the honest caveat list for a phase snapshot. A prior-run phase is not
+ * a gap, but it is also not something this run re-proved: it stays on the
+ * record as an explicit limitation rather than disappearing.
+ */
+export function deriveProjectPhaseLimitationsV1(
+  phases: readonly ProjectPhaseOutcomeV1[],
+): string[] {
+  return phases
+    .filter((phase) => phase.status !== "verified")
+    .map((phase) =>
+      phase.status === "blocked"
+        ? `${phase.label} remains blocked; see its recorded blocker evidence.`
+        : phase.status === "verified_prior_run"
+          ? `${phase.label} was verified in the originating run of this project, not re-verified by this run's own receipts.`
+          : `${phase.label} has no verified completion evidence yet.`,
+    );
 }
 
 export function resolveProjectResultsDestinationV1(input: {
@@ -369,6 +541,7 @@ export function createProjectRunReportV1(input: {
   destination: ProjectResultsDestinationV1;
   events: readonly ProjectStageEventV1[];
   workUnitOutcomes?: readonly ProjectWorkUnitOutcomeV1[];
+  priorPhaseAttestations?: readonly ProjectPriorPhaseAttestationV1[];
   limitations?: readonly string[];
   codeExamples?: readonly ProjectCodeExampleV1[];
 }): ProjectRunReportV1 {
@@ -379,7 +552,17 @@ export function createProjectRunReportV1(input: {
   const evidence = input.events
     .map(parseProjectStageEventV1)
     .sort(compareProjectEvents);
-  const snapshot = reduceProjectStageEventsV1({ runId, events: evidence });
+  const hasPriorPhaseAttestations = input.priorPhaseAttestations !== undefined;
+  const priorPhaseAttestations = hasPriorPhaseAttestations
+    ? parseProjectPriorPhaseAttestationsV1(input.priorPhaseAttestations, runId)
+    : undefined;
+  const snapshot = reduceProjectStageEventsV1({
+    runId,
+    events: evidence,
+    ...(priorPhaseAttestations === undefined
+      ? {}
+      : { priorPhaseAttestations }),
+  });
   const hasWorkUnitOutcomes = input.workUnitOutcomes !== undefined;
   const workUnitOutcomes = hasWorkUnitOutcomes
     ? parseProjectWorkUnitOutcomesV1(input.workUnitOutcomes, evidence)
@@ -396,6 +579,9 @@ export function createProjectRunReportV1(input: {
     phases: snapshot.phases,
     evidence,
     ...(workUnitOutcomes === undefined ? {} : { workUnitOutcomes }),
+    ...(priorPhaseAttestations === undefined
+      ? {}
+      : { priorPhaseAttestations }),
     limitations,
     codeExamples,
     complete:
@@ -424,7 +610,7 @@ export function parseProjectRunReportV1(value: unknown): ProjectRunReportV1 {
       "complete",
       "reportFingerprint",
     ],
-    ["workUnitOutcomes"],
+    ["workUnitOutcomes", "priorPhaseAttestations"],
     "project run report",
   );
   if (record.schemaVersion !== PROJECT_RUN_REPORT_SCHEMA_VERSION) {
@@ -438,8 +624,13 @@ export function parseProjectRunReportV1(value: unknown): ProjectRunReportV1 {
     record,
     "workUnitOutcomes",
   );
+  const hasPriorPhaseAttestations = Object.prototype.hasOwnProperty.call(
+    record,
+    "priorPhaseAttestations",
+  );
+  const reportRunId = expectOpaqueId(record.runId, "project run id");
   const parsed = createProjectRunReportV1({
-    runId: expectOpaqueId(record.runId, "project run id"),
+    runId: reportRunId,
     projectName: expectString(record.projectName, "project name", 1, 160),
     generatedAt: expectIsoTimestamp(record.generatedAt, "report generation time"),
     destination: parseProjectResultsDestinationV1(record.destination),
@@ -449,6 +640,14 @@ export function parseProjectRunReportV1(value: unknown): ProjectRunReportV1 {
           workUnitOutcomes: parseProjectWorkUnitOutcomesV1(
             record.workUnitOutcomes,
             evidence,
+          ),
+        }
+      : {}),
+    ...(hasPriorPhaseAttestations
+      ? {
+          priorPhaseAttestations: parseProjectPriorPhaseAttestationsV1(
+            record.priorPhaseAttestations,
+            reportRunId,
           ),
         }
       : {}),
@@ -551,7 +750,14 @@ export function renderProjectRunReportMarkdownV1(
       (event) => event.phase === phase.phase,
     );
     lines.push(`### ${phase.label}`, "");
-    lines.push(...renderPhaseReflectionV1(phase.phase, phase.status, phaseEvidence));
+    lines.push(
+      ...renderPhaseReflectionV1(
+        phase.phase,
+        phase.status,
+        phaseEvidence,
+        findPriorPhaseAttestation(report, phase),
+      ),
+    );
     lines.push("");
   }
 
@@ -569,6 +775,13 @@ export function renderProjectRunReportMarkdownV1(
           `\`${event.sourceReceiptId}\` / \`${event.evidenceFingerprint}\`${resource}`,
       );
     }
+  }
+  for (const attestation of report.priorPhaseAttestations ?? []) {
+    lines.push(
+      `- ${PROJECT_PHASE_LABELS_V1[attestation.phase]} — ${attestation.evidenceKind} (prior run \`${attestation.originRunId}\`, ` +
+        `Linear issue ${escapeMarkdownText(attestation.linearIssueIdentifier)}): ` +
+        `\`${attestation.proofFingerprint}\`${renderResourceReference(attestation.resource)}`,
+    );
   }
 
   const validation = report.evidence.filter((event) =>
@@ -643,6 +856,31 @@ export function renderProjectRunReportMarkdownV1(
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+function findPriorPhaseAttestation(
+  report: ProjectRunReportV1,
+  outcome: ProjectPhaseOutcomeV1,
+): ProjectPriorPhaseAttestationV1 | null {
+  if (!outcome.priorRunAttestationId) return null;
+  return (
+    (report.priorPhaseAttestations ?? []).find(
+      (attestation) =>
+        attestation.attestationId === outcome.priorRunAttestationId,
+    ) ?? null
+  );
+}
+
+function renderPriorRunPhaseReflectionV1(
+  phase: ProjectPhaseV1,
+  attestation: ProjectPriorPhaseAttestationV1,
+): string {
+  const origin = `the originating run \`${attestation.originRunId}\`, cited by this run's readback of Linear issue ${escapeMarkdownText(attestation.linearIssueIdentifier)} and bound to${renderResourceReference(attestation.resource, true)}`;
+  const subject =
+    phase === "research"
+      ? "The research and high-level design were"
+      : "The Linear plan was";
+  return `- ${subject} completed and verified in ${origin}. This run inherited that result rather than repeating it.`;
+}
+
 function renderScientificReflectionV1(report: ProjectRunReportV1): string[] {
   const verifiedEvidence = report.evidence.filter(
     (event) => event.disposition === "verified",
@@ -650,13 +888,35 @@ function renderScientificReflectionV1(report: ProjectRunReportV1): string[] {
   const blockerEvidence = report.evidence.filter(
     (event) => event.disposition === "blocked",
   );
+  // A phase resolved from durable prior-run lineage is not open. Counting it
+  // as open is exactly the defect that told a scientist their completed
+  // research had never happened and advised them to redo it.
   const openPhases = report.phases.filter(
-    (phase) => phase.status !== "verified",
+    (phase) =>
+      phase.status !== "verified" && phase.status !== "verified_prior_run",
+  );
+  const priorRunPhases = report.phases.filter(
+    (phase) => phase.status === "verified_prior_run",
   );
   const unpaidWorkUnits = (report.workUnitOutcomes ?? []).filter(
     (outcome) => outcome.status !== "paid",
   );
   const firstOpenPhase = openPhases[0];
+  const priorRunOrigins = [...new Set(
+    (report.priorPhaseAttestations ?? []).map(
+      (attestation) => attestation.originRunId,
+    ),
+  )].sort();
+  const priorRunDisclosure =
+    priorRunPhases.length === 0
+      ? ""
+      : ` ${priorRunPhases.map((phase) => phase.label).join(", ")} ${
+          priorRunPhases.length === 1 ? "was" : "were"
+        } verified in ${
+          priorRunOrigins.length === 1
+            ? `the originating run \`${priorRunOrigins[0]}\``
+            : "an originating run"
+        } and recovered here through the durable Linear issue binding, not re-proved by this run.`;
   const draftPullRequest = findLastEventMatching(
     verifiedEvidence,
     (event) => event.evidenceKind === "github_draft_pr_readback",
@@ -674,6 +934,12 @@ function renderScientificReflectionV1(report: ProjectRunReportV1): string[] {
         ? ` across ${observedSystems.join(", ")}`
         : ""
     }; ${report.phases.filter((phase) => phase.status === "verified").length} of ${report.phases.length} phases are verified${
+      priorRunPhases.length === 0
+        ? ""
+        : ` in this run and ${priorRunPhases.length} more ${
+            priorRunPhases.length === 1 ? "is" : "are"
+          } verified by durable prior-run lineage`
+    }${
       report.workUnitOutcomes === undefined
         ? ""
         : `; ${report.workUnitOutcomes.length - unpaidWorkUnits.length} of ${report.workUnitOutcomes.length} supplied work-unit outcomes are paid`
@@ -684,14 +950,14 @@ function renderScientificReflectionV1(report: ProjectRunReportV1): string[] {
         } recorded. The evidence appendix identifies where the expected path diverged.`
       : "- Deviations and surprises: No host-verified blocker is recorded. This means the durable evidence chain contains no blocker; it does not claim that every attempt was frictionless.",
     report.complete
-      ? "- Conclusion: The six-phase delivery hypothesis is supported by the recorded evidence. The result is reviewable, but a draft pull request is not proof of merge, deployment, or production impact."
+      ? `- Conclusion: The six-phase delivery hypothesis is supported by the recorded evidence.${priorRunDisclosure} The result is reviewable, but a draft pull request is not proof of merge, deployment, or production impact.`
       : unpaidWorkUnits.length > 0
         ? `- Conclusion: All project phases may be verified, but the delivery hypothesis is not complete because ${unpaidWorkUnits.length} supplied work-unit outcome${
             unpaidWorkUnits.length === 1 ? " remains" : "s remain"
           } unpaid or blocked.`
         : `- Conclusion: The delivery hypothesis is not fully supported yet; ${
             openPhases.map((phase) => phase.label).join(", ") || "one or more phases"
-          } remain open.`,
+          } remain open.${priorRunDisclosure}`,
     report.complete && draftPullRequest
       ? "- Next experiment: Complete human review, then separately verify merge, deployment, and observed production behavior before treating the change as product learning."
       : unpaidWorkUnits.length > 0
@@ -700,9 +966,15 @@ function renderScientificReflectionV1(report: ProjectRunReportV1): string[] {
             unpaidWorkUnits[0]?.workUnitId ??
             "with the earliest unpaid outcome"
           }, then regenerate a new immutable Results artifact rather than overwriting this record.`
-        : `- Next experiment: Resume at ${
-            firstOpenPhase?.label ?? "the first unverified phase"
-          }, collect its missing receipt or readback, and regenerate a new immutable Results artifact rather than overwriting this record.`,
+        : // Resume advice is earned by an actually unresolved phase, never
+          // issued as the default ending. Recommending that a scientist redo
+          // work that durable lineage proves was already done is worse than
+          // saying nothing.
+          firstOpenPhase
+          ? `- Next experiment: Resume at ${
+              firstOpenPhase.label
+            }, collect its missing receipt or readback, and regenerate a new immutable Results artifact rather than overwriting this record.`
+          : "- Next experiment: Every project phase is resolved; separately verify review, merge, and deployment before treating this record as product learning.",
   ];
 }
 
@@ -710,6 +982,7 @@ function renderPhaseReflectionV1(
   phase: ProjectPhaseV1,
   status: ProjectPhaseOutcomeV1["status"],
   evidence: readonly ProjectStageEventV1[],
+  priorRunAttestation: ProjectPriorPhaseAttestationV1 | null,
 ): string[] {
   if (status === "pending") {
     return ["- No verified phase outcome is available yet."];
@@ -718,6 +991,14 @@ function renderPhaseReflectionV1(
     return [
       "- The phase is blocked by host-verified evidence; inspect the evidence appendix before continuing.",
     ];
+  }
+  if (status === "verified_prior_run") {
+    if (!priorRunAttestation) {
+      return [
+        "- This phase was resolved from a prior run, but its attestation is missing from this report.",
+      ];
+    }
+    return [renderPriorRunPhaseReflectionV1(phase, priorRunAttestation)];
   }
 
   const verified = evidence.filter((event) => event.disposition === "verified");
@@ -950,10 +1231,129 @@ function completionSatisfied(
   phase: ProjectPhaseV1,
   proofEvents: readonly ProjectStageEventV1[],
 ): boolean {
-  const kinds = new Set(proofEvents.map((event) => event.evidenceKind));
+  return completionSatisfiedForKinds(
+    phase,
+    new Set(proofEvents.map((event) => event.evidenceKind)),
+  );
+}
+
+function completionSatisfiedForKinds(
+  phase: ProjectPhaseV1,
+  kinds: ReadonlySet<ProjectEvidenceKindV1>,
+): boolean {
   return PHASE_COMPLETION_REQUIREMENTS[phase].some((requirement) =>
     requirement.every((kind) => kinds.has(kind)),
   );
+}
+
+function parseProjectPriorPhaseAttestationUnsignedV1(
+  value: unknown,
+): ProjectPriorPhaseAttestationV1Unsigned {
+  const record = expectPlainRecord(value, "project prior phase attestation");
+  assertExactKeys(
+    record,
+    [
+      "schemaVersion",
+      "phase",
+      "originRunId",
+      "linearIssueId",
+      "linearIssueIdentifier",
+      "evidenceKind",
+      "verifiedAt",
+      "proofFingerprint",
+      "resource",
+    ],
+    [],
+    "project prior phase attestation",
+  );
+  if (record.schemaVersion !== PROJECT_PRIOR_PHASE_ATTESTATION_SCHEMA_VERSION) {
+    throw new DurableLinearContractError(
+      "Unsupported project prior phase attestation version.",
+    );
+  }
+  const phase = expectEnum(
+    record.phase,
+    "project prior phase",
+    PROJECT_PRIOR_RUN_RESOLVABLE_PHASES_V1,
+  );
+  const evidenceKind = expectEnum(
+    record.evidenceKind,
+    "project prior phase evidence kind",
+    PROJECT_EVIDENCE_KINDS_V1,
+  );
+  if (EXPECTED_PHASE_BY_EVIDENCE[evidenceKind] !== phase) {
+    throw new DurableLinearContractError(
+      `${evidenceKind} evidence cannot attest the ${phase} phase.`,
+    );
+  }
+  // The one proof kind carried here must be enough to have completed the phase
+  // on its own. Anything weaker would let an attestation claim a phase that the
+  // reducer would never have called verified in the originating run.
+  if (!completionSatisfiedForKinds(phase, new Set([evidenceKind]))) {
+    throw new DurableLinearContractError(
+      `${evidenceKind} evidence does not complete the ${phase} phase on its own.`,
+    );
+  }
+  return {
+    schemaVersion: PROJECT_PRIOR_PHASE_ATTESTATION_SCHEMA_VERSION,
+    phase,
+    originRunId: expectOpaqueId(record.originRunId, "project origin run id"),
+    linearIssueId: expectOpaqueId(
+      record.linearIssueId,
+      "project prior phase Linear issue id",
+    ),
+    linearIssueIdentifier: parseLinearIssueIdentifierV1(
+      record.linearIssueIdentifier,
+      "project prior phase Linear issue identifier",
+    ),
+    evidenceKind,
+    verifiedAt: expectIsoTimestamp(
+      record.verifiedAt,
+      "project prior phase verification time",
+    ),
+    proofFingerprint: expectSha256(
+      record.proofFingerprint,
+      "project prior phase proof fingerprint",
+    ),
+    resource: parseEvidenceResource(record.resource),
+  };
+}
+
+function parseProjectPriorPhaseAttestationsV1(
+  value: unknown,
+  runId: string,
+): ProjectPriorPhaseAttestationV1[] {
+  if (
+    !Array.isArray(value) ||
+    value.length > PROJECT_PRIOR_RUN_RESOLVABLE_PHASES_V1.length
+  ) {
+    throw new DurableLinearContractError(
+      "Project prior phase attestations must be a list of no more than one entry per resolvable phase.",
+    );
+  }
+  const attestations = value.map(parseProjectPriorPhaseAttestationV1);
+  for (const attestation of attestations) {
+    if (attestation.originRunId === runId) {
+      throw new DurableLinearContractError(
+        "A prior phase attestation cannot name the current run as its origin.",
+      );
+    }
+  }
+  const phases = attestations.map((attestation) => attestation.phase);
+  if (new Set(phases).size !== phases.length) {
+    throw new DurableLinearContractError(
+      "Project prior phase attestations must not name a phase twice.",
+    );
+  }
+  return attestations.sort((left, right) => left.phase.localeCompare(right.phase));
+}
+
+function indexPriorPhaseAttestationsV1(
+  attestations: readonly ProjectPriorPhaseAttestationV1[],
+  runId: string,
+): Map<ProjectPhaseV1, ProjectPriorPhaseAttestationV1> {
+  const parsed = parseProjectPriorPhaseAttestationsV1([...attestations], runId);
+  return new Map(parsed.map((attestation) => [attestation.phase, attestation]));
 }
 
 function compareProjectEvents(

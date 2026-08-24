@@ -22,6 +22,7 @@ import {
   mergeProjectStageEventsPreferExactWorkUnitScopeV1,
   projectLinearBindingsFromProjectLineageV1,
   projectStageEventsFromProjectLineageV1,
+  resolveProjectPriorPhaseAttestationsV1,
 } from "../agent/projectStageLineageMapper";
 import {
   projectWorkUnitOutcomesV1,
@@ -30,12 +31,14 @@ import {
 import {
   createProjectRunReportV1,
   createProjectStageEventV1,
+  deriveProjectPhaseLimitationsV1,
   parseProjectRunReportV1,
   parseProjectStageEventV1,
   reduceProjectStageEventsV1,
   resolveProjectResultsDestinationV1,
   renderProjectRunReportMarkdownV1,
   type ProjectCodeExampleV1,
+  type ProjectPriorPhaseAttestationV1,
   type ProjectRunReportV1,
   type ProjectStageEventV1,
 } from "../agent/projectRunReport";
@@ -148,6 +151,13 @@ async function prepareJupyterReflection(
       mode === "create" ? ABSENT_REVISION : expectedBeforeSha256;
     const events = resolveHostProjectEvents(context, runId);
     const workUnitBindings = resolveProjectWorkUnitBindings(context, runId);
+    // A second-phase mission carries only a Linear issue id across the relaunch
+    // boundary. Recover the phases the originating run already paid, so this
+    // report stops reporting completed research as never started.
+    const priorPhaseAttestations = resolveProjectPriorPhaseAttestationsV1(
+      context,
+      runId,
+    );
     const code = await resolveCurrentRunCodeExamples(context, runId, events);
     const markerId = await buildMarkerId({ runId, toolCallId, path });
     const preReflectionWorkUnitOutcomes = workUnitBindings.length > 0
@@ -167,7 +177,10 @@ async function prepareJupyterReflection(
       ...(preReflectionWorkUnitOutcomes === undefined
         ? {}
         : { workUnitOutcomes: preReflectionWorkUnitOutcomes }),
-      limitations: deriveLimitations(runId, events),
+      ...(priorPhaseAttestations.length === 0
+        ? {}
+        : { priorPhaseAttestations }),
+      limitations: deriveLimitations(runId, events, priorPhaseAttestations),
       codeExamples: code.reportExamples,
     });
     const reflectionBinding = await sha256Fingerprint({
@@ -222,7 +235,10 @@ async function prepareJupyterReflection(
       destination,
       events: finalEvents,
       ...(workUnitOutcomes === undefined ? {} : { workUnitOutcomes }),
-      limitations: deriveLimitations(runId, finalEvents),
+      ...(priorPhaseAttestations.length === 0
+        ? {}
+        : { priorPhaseAttestations }),
+      limitations: deriveLimitations(runId, finalEvents, priorPhaseAttestations),
       codeExamples: code.reportExamples,
     });
     const markdown = composeNotebookReportMarkdown(report, assistantMarkdown);
@@ -603,15 +619,14 @@ function resolveProjectWorkUnitBindings(
 function deriveLimitations(
   runId: string,
   events: readonly ProjectStageEventV1[],
+  priorPhaseAttestations: readonly ProjectPriorPhaseAttestationV1[],
 ): string[] {
-  const snapshot = reduceProjectStageEventsV1({ runId, events: [...events] });
-  return snapshot.phases
-    .filter((phase) => phase.status !== "verified")
-    .map((phase) =>
-      phase.status === "blocked"
-        ? `${phase.label} remains blocked; see its recorded blocker evidence.`
-        : `${phase.label} has no verified completion evidence yet.`,
-    );
+  const snapshot = reduceProjectStageEventsV1({
+    runId,
+    events: [...events],
+    priorPhaseAttestations,
+  });
+  return deriveProjectPhaseLimitationsV1(snapshot.phases);
 }
 
 function resolveProjectName(

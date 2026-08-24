@@ -7,12 +7,14 @@ import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
 import {
   createProjectRunReportV1,
   createProjectStageEventV1,
+  deriveProjectPhaseLimitationsV1,
   parseProjectRunReportV1,
   parseProjectStageEventV1,
   reduceProjectStageEventsV1,
   renderProjectRunReportMarkdownV1,
   resolveProjectResultsDestinationV1,
   type ProjectCodeExampleV1,
+  type ProjectPriorPhaseAttestationV1,
   type ProjectStageEventV1,
 } from "../agent/projectRunReport";
 import {
@@ -22,6 +24,7 @@ import {
   mergeProjectStageEventsPreferExactWorkUnitScopeV1,
   projectLinearBindingsFromProjectLineageV1,
   projectStageEventsFromProjectLineageV1,
+  resolveProjectPriorPhaseAttestationsV1,
 } from "../agent/projectStageLineageMapper";
 import {
   projectWorkUnitOutcomesV1,
@@ -99,6 +102,12 @@ async function prepareProjectResults(
     const generatedAt = canonicalNow(context);
     const events = resolveHostProjectEvents(context, runId);
     const workUnitBindings = resolveProjectWorkUnitBindings(context, runId);
+    // Recover the phases the originating run already paid when this run is
+    // joined to it through the host-verified Linear issue binding.
+    const priorPhaseAttestations = resolveProjectPriorPhaseAttestationsV1(
+      context,
+      runId,
+    );
     const projectName = resolveProjectName(context, runId);
     const explicitPath = resolveExplicitResultsMarkdownPath(
       context.originalPrompt,
@@ -135,7 +144,10 @@ async function prepareProjectResults(
       ...(preReflectionWorkUnitOutcomes === undefined
         ? {}
         : { workUnitOutcomes: preReflectionWorkUnitOutcomes }),
-      limitations: deriveLimitations(runId, events),
+      ...(priorPhaseAttestations.length === 0
+        ? {}
+        : { priorPhaseAttestations }),
+      limitations: deriveLimitations(runId, events, priorPhaseAttestations),
       codeExamples: code.reportExamples,
     });
     const reflectionBinding = await sha256Fingerprint({
@@ -186,7 +198,10 @@ async function prepareProjectResults(
       destination,
       events: finalEvents,
       ...(workUnitOutcomes === undefined ? {} : { workUnitOutcomes }),
-      limitations: deriveLimitations(runId, finalEvents),
+      ...(priorPhaseAttestations.length === 0
+        ? {}
+        : { priorPhaseAttestations }),
+      limitations: deriveLimitations(runId, finalEvents, priorPhaseAttestations),
       codeExamples: code.reportExamples,
     });
     const proposedMarkdown = renderProjectRunReportMarkdownV1(report);
@@ -531,15 +546,14 @@ async function resolveExactCodeExamples(
 function deriveLimitations(
   runId: string,
   events: readonly ProjectStageEventV1[],
+  priorPhaseAttestations: readonly ProjectPriorPhaseAttestationV1[],
 ): string[] {
-  const snapshot = reduceProjectStageEventsV1({ runId, events: [...events] });
-  return snapshot.phases
-    .filter((phase) => phase.status !== "verified")
-    .map((phase) =>
-      phase.status === "blocked"
-        ? `${phase.label} remains blocked; see its recorded blocker evidence.`
-        : `${phase.label} has no verified completion evidence yet.`,
-    );
+  const snapshot = reduceProjectStageEventsV1({
+    runId,
+    events: [...events],
+    priorPhaseAttestations,
+  });
+  return deriveProjectPhaseLimitationsV1(snapshot.phases);
 }
 
 function resolveProjectName(

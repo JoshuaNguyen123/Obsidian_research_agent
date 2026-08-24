@@ -18,7 +18,10 @@ import {
   APPEND_JUPYTER_REFLECTION_TOOL_NAME,
   createJupyterReflectionTool,
 } from "../src/tools/jupyterReflectionTool";
-import type { ToolExecutionContext } from "../src/tools/types";
+import type {
+  ToolExecutionContext,
+  VerifiedLinearCodeRepositoryBindingV1,
+} from "../src/tools/types";
 import { verifiedCodeReflectionFixture } from "./fixtures/verifiedCodeReflection";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import { getRequiredWriteToolNamesForTests } from "../src/AgentRunner";
@@ -1206,3 +1209,243 @@ function commitReadbackEvent(commitSha: string): ProjectStageEventV1 {
     workUnits: [],
   });
 }
+
+const PHASE_A_RUN_ID = "run-phase-a-research";
+const PHASE_A_ISSUE_ID = "linear-issue-phase-a-1";
+
+/**
+ * The originating run's durable lineage: accepted research plus the Linear
+ * hierarchy that produced the issue a later implementation mission is handed.
+ * Its runId is deliberately not this run's, which is exactly why the current
+ * run's own evidence ledger cannot see it.
+ */
+function phaseAResearchLineage(): ProjectLineageV1 {
+  const artifact = createAcceptedResearchArtifactV1({
+    schemaVersion: 1,
+    artifactId: "accepted-phase-a-research-1",
+    originRunId: PHASE_A_RUN_ID,
+    vaultBindingKey: "vault-phase-a-1",
+    notePath: "Research/Phase A Accepted.md",
+    noteSha256: SHA("1"),
+    noteReceiptId: "note-phase-a-receipt-1",
+    evidence: [{
+      id: "evidence-phase-a-web-1",
+      kind: "web",
+      reference: "https://example.com/phase-a-research",
+      contentSha256: SHA("2"),
+    }],
+    acceptanceCriteria: [{
+      id: "AC-1",
+      text: "The delivery mission inherits this accepted research.",
+    }],
+    riskClass: "medium",
+    acceptedAt: "2026-08-18T09:00:00.000Z",
+    acceptedBy: "host",
+  });
+  const handoff = createResearcherHandoffV1({
+    artifact,
+    runId: PHASE_A_RUN_ID,
+    taskId: "phase-a-research-task-1",
+    evidenceIds: ["evidence-phase-a-web-1"],
+    summary: "Accepted research produced by the originating run.",
+    unresolvedQuestions: [],
+    acceptedAt: "2026-08-18T09:00:00.000Z",
+  });
+  const lineage = createProjectLineageV1({
+    lineageId: "lineage-phase-a-1",
+    runId: PHASE_A_RUN_ID,
+    vaultBindingKey: "vault-phase-a-1",
+    handoff,
+    updatedAt: "2026-08-18T09:00:00.000Z",
+  });
+  return advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-08-18T09:05:00.000Z",
+    proof: {
+      stage: "linear_hierarchy",
+      planFingerprint: SHA("3"),
+      workspaceId: "linear-workspace-phase-a-1",
+      teamId: "linear-team-phase-a-1",
+      initiativeId: "linear-initiative-phase-a-1",
+      projectId: "linear-project-phase-a-1",
+      issueIds: [PHASE_A_ISSUE_ID],
+      workItemFingerprints: [SHA("4")],
+      providerReadbackFingerprints: [SHA("5"), SHA("6"), SHA("7")],
+    },
+  });
+}
+
+function phaseALinearCodeBinding(
+  lineage: ProjectLineageV1,
+  overrides: Partial<VerifiedLinearCodeRepositoryBindingV1> = {},
+): VerifiedLinearCodeRepositoryBindingV1 {
+  const research = lineage.commits[0]!.proof;
+  if (research.stage !== "accepted_research") throw new Error("fixture");
+  return {
+    version: 1,
+    repositoryProfileKey: "reflection-fixture",
+    issueId: PHASE_A_ISSUE_ID,
+    issueIdentifier: "ENG-77",
+    publicationId: "publication-phase-a-1",
+    workItemFingerprint: SHA("4"),
+    acceptedResearchArtifactFingerprint: research.artifactFingerprint,
+    originRunId: PHASE_A_RUN_ID,
+    ...overrides,
+  };
+}
+
+function phaseBImplementationEvents(): ProjectStageEventV1[] {
+  return (["workspace_mutation", "diff_readback"] as const).map((kind, index) =>
+    createProjectStageEventV1({
+      schemaVersion: 1,
+      runId: RUN_ID,
+      phase: "implement",
+      evidenceKind: kind,
+      disposition: "verified",
+      occurredAt: `2026-08-19T13:4${index}:00.000Z`,
+      sourceReceiptId: `receipt-phase-b-${kind}`,
+      evidenceFingerprint: SHA(index === 0 ? "b" : "c"),
+      resource: {
+        system: "workspace",
+        resourceType: "verified_workspace",
+        id: "workspace-phase-b-1",
+        url: null,
+        path: null,
+        revision: SHA("d"),
+      },
+      workUnits: [],
+    }),
+  );
+}
+
+test("a second-phase notebook report recovers the originating run's phases instead of calling them pending", async () => {
+  const lineage = phaseAResearchLineage();
+  const vault = new MemoryVault();
+  vault.files.set(PATH, notebook());
+  const prepared = await createJupyterReflectionTool().prepare!(
+    { path: PATH, markdown: MARKDOWN },
+    toolContext(vault, {
+      getProjectLineages: () => [lineage],
+      getProjectStageEvents: () => phaseBImplementationEvents(),
+      getVerifiedLinearCodeRepositoryBinding: () =>
+        phaseALinearCodeBinding(lineage),
+    }),
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const report = parseProjectRunReportV1(prepared.action.normalizedArgs.report);
+  assert.deepEqual(
+    report.phases.map((phase) => [phase.phase, phase.status]),
+    [
+      ["research", "verified_prior_run"],
+      ["linear_plan", "verified_prior_run"],
+      ["implement", "verified"],
+      ["test", "pending"],
+      ["github", "pending"],
+      ["reflect", "verified"],
+    ],
+  );
+  // The recovered phases carry the exact durable proof they came from, and
+  // never masquerade as this run's own verified evidence.
+  assert.deepEqual(
+    (report.priorPhaseAttestations ?? []).map((attestation) => [
+      attestation.phase,
+      attestation.originRunId,
+      attestation.linearIssueIdentifier,
+    ]),
+    [
+      ["linear_plan", PHASE_A_RUN_ID, "ENG-77"],
+      ["research", PHASE_A_RUN_ID, "ENG-77"],
+    ],
+  );
+  assert.equal(
+    report.evidence.some(
+      (evidence) =>
+        evidence.phase === "research" || evidence.phase === "linear_plan",
+    ),
+    false,
+  );
+
+  const proposed = JSON.parse(
+    prepared.action.normalizedArgs.proposedNotebook as string,
+  ) as { cells: Array<{ source: string[] }> };
+  const reportText = proposed.cells.at(-1)!.source.join("");
+  assert.match(reportText, /- Research: \*\*Verified prior run\*\*/u);
+  assert.match(reportText, /- Linear plan: \*\*Verified prior run\*\*/u);
+  assert.match(reportText, /completed and verified in the originating run/u);
+  // The observed defect verbatim: it told a scientist to redo finished work.
+  assert.doesNotMatch(reportText, /Next experiment: Resume at Research/u);
+  assert.doesNotMatch(reportText, /Research, Linear plan remain open/u);
+  // Resume advice must point at what is actually unresolved.
+  assert.match(reportText, /Next experiment: Resume at Test/u);
+  assert.match(reportText, /Test, GitHub remain open/u);
+});
+
+test("the cross-run join is refused without a verified binding to the originating issue", async () => {
+  const lineage = phaseAResearchLineage();
+  const unbound = async (
+    overrides: Partial<ToolExecutionContext>,
+  ): Promise<string> => {
+    const vault = new MemoryVault();
+    vault.files.set(PATH, notebook());
+    const prepared = await createJupyterReflectionTool().prepare!(
+      { path: PATH, markdown: MARKDOWN },
+      toolContext(vault, {
+        getProjectLineages: () => [lineage],
+        getProjectStageEvents: () => phaseBImplementationEvents(),
+        ...overrides,
+      }),
+    );
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) throw new Error("prepare failed");
+    const report = parseProjectRunReportV1(
+      prepared.action.normalizedArgs.report,
+    );
+    assert.equal("priorPhaseAttestations" in report, false);
+    assert.deepEqual(
+      report.phases.map((phase) => phase.status),
+      ["pending", "pending", "verified", "pending", "pending", "verified"],
+    );
+    const proposed = JSON.parse(
+      prepared.action.normalizedArgs.proposedNotebook as string,
+    ) as { cells: Array<{ source: string[] }> };
+    return proposed.cells.at(-1)!.source.join("");
+  };
+
+  // No host-verified Linear binding at all: nothing joins the two runs, so the
+  // honest answer really is pending.
+  assert.match(await unbound({}), /Next experiment: Resume at Research/u);
+  // A binding to an issue the originating lineage never produced.
+  assert.match(
+    await unbound({
+      getVerifiedLinearCodeRepositoryBinding: () =>
+        phaseALinearCodeBinding(lineage, { issueId: "linear-issue-unrelated" }),
+    }),
+    /Next experiment: Resume at Research/u,
+  );
+  // A binding whose accepted-research fingerprint does not match the durable
+  // lineage: the Linear plan is still recoverable, research is not.
+  const driftVault = new MemoryVault();
+  driftVault.files.set(PATH, notebook());
+  const drifted = await createJupyterReflectionTool().prepare!(
+    { path: PATH, markdown: MARKDOWN },
+    toolContext(driftVault, {
+      getProjectLineages: () => [lineage],
+      getProjectStageEvents: () => phaseBImplementationEvents(),
+      getVerifiedLinearCodeRepositoryBinding: () =>
+        phaseALinearCodeBinding(lineage, {
+          acceptedResearchArtifactFingerprint: SHA("f"),
+        }),
+    }),
+  );
+  assert.equal(drifted.ok, true);
+  if (!drifted.ok) return;
+  const driftedReport = parseProjectRunReportV1(
+    drifted.action.normalizedArgs.report,
+  );
+  assert.deepEqual(
+    driftedReport.phases.map((phase) => phase.status),
+    ["pending", "verified_prior_run", "verified", "pending", "pending", "verified"],
+  );
+});

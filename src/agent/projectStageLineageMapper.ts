@@ -4,17 +4,26 @@ import {
   type ProjectLineageV1,
 } from "./projectLifecycle";
 import {
+  createProjectPriorPhaseAttestationV1,
   createProjectStageEventV1,
+  projectPhaseCompletionSatisfiedV1,
+  PROJECT_PRIOR_RUN_RESOLVABLE_PHASES_V1,
   type ProjectEvidenceKindV1,
   type ProjectEvidenceResourceV1,
   type ProjectEventWorkUnitBindingV1,
   type ProjectPhaseV1,
+  type ProjectPriorPhaseAttestationV1,
+  type ProjectPriorRunResolvablePhaseV1,
   type ProjectStageEventV1,
 } from "./projectRunReport";
 import {
   createProjectWorkUnitLinearBindingV1,
   type ProjectWorkUnitLinearBindingV1,
 } from "./projectProgressProjection";
+import type {
+  ToolExecutionContext,
+  VerifiedLinearCodeRepositoryBindingV1,
+} from "../tools/types";
 
 /**
  * Project durable lifecycle lineage into the evidence vocabulary used by the
@@ -113,6 +122,169 @@ export function bindAggregateProjectEventsToOnlyWorkUnitV1(input: {
       }],
     });
   });
+}
+
+/**
+ * The narrow, host-verified cross-run join.
+ *
+ * A second-phase mission is handed only a Linear issue id. It reads that issue
+ * back, and the host verifies the readback against a durable accepted-research
+ * publication checkpoint, producing a `VerifiedLinearCodeRepositoryBindingV1`
+ * that names the originating run and its accepted-research artifact
+ * fingerprint. This function follows that binding to the originating run's
+ * persisted `ProjectLineageV1` and recovers the phases it actually paid.
+ *
+ * Every recovered phase is anchored twice: the origin lineage must carry a
+ * `linear_hierarchy` commit naming the exact issue this run read back, and a
+ * research phase additionally requires the origin's `accepted_research` proof
+ * to match the binding's artifact fingerprint. Anything short of both anchors
+ * resolves nothing, so the report falls back to an honest `pending`.
+ */
+export function projectPriorPhaseAttestationsFromDurableLineageV1(input: {
+  binding: {
+    issueId: string;
+    issueIdentifier: string;
+    originRunId: string;
+    acceptedResearchArtifactFingerprint: string;
+  } | null | undefined;
+  lineages: readonly unknown[];
+  /** The run being reported on. Its own lineage can never attest itself. */
+  currentRunId: string;
+}): ProjectPriorPhaseAttestationV1[] {
+  const binding = input.binding;
+  if (!binding) return [];
+  const originRunId = binding.originRunId.trim();
+  const issueId = binding.issueId.trim();
+  const currentRunId = input.currentRunId.trim();
+  if (!originRunId || !issueId || originRunId === currentRunId) return [];
+
+  const originLineages: ProjectLineageV1[] = [];
+  for (const raw of input.lineages) {
+    let lineage: ProjectLineageV1;
+    try {
+      lineage = parseProjectLineageV1(raw);
+    } catch {
+      // A malformed or stale lineage is not evidence. Fail closed and let the
+      // phase stay pending rather than attest from an unparsed record.
+      continue;
+    }
+    if (lineage.runId !== originRunId) continue;
+    if (!lineageBindsLinearIssueV1(lineage, issueId)) continue;
+    originLineages.push(lineage);
+  }
+  if (originLineages.length === 0) return [];
+
+  const candidates = new Map<
+    ProjectPriorRunResolvablePhaseV1,
+    ProjectPriorPhaseAttestationV1
+  >();
+  const conflicted = new Set<ProjectPriorRunResolvablePhaseV1>();
+  for (const lineage of originLineages) {
+    const events = projectStageEventsFromProjectLineageV1({
+      lineage,
+      runId: originRunId,
+    });
+    for (const phase of PROJECT_PRIOR_RUN_RESOLVABLE_PHASES_V1) {
+      if (
+        phase === "research" &&
+        !lineageProvesAcceptedResearchArtifactV1(
+          lineage,
+          binding.acceptedResearchArtifactFingerprint,
+        )
+      ) {
+        continue;
+      }
+      const phaseEvents = events.filter((event) => event.phase === phase);
+      // Reuse the report's own completion predicate: an attestation may only
+      // claim what the originating run's evidence would itself have completed.
+      if (!projectPhaseCompletionSatisfiedV1(phase, phaseEvents)) continue;
+      const proof = phaseEvents.at(-1);
+      if (!proof) continue;
+      let attestation: ProjectPriorPhaseAttestationV1;
+      try {
+        attestation = createProjectPriorPhaseAttestationV1({
+          schemaVersion: 1,
+          phase,
+          originRunId,
+          linearIssueId: issueId,
+          linearIssueIdentifier: binding.issueIdentifier,
+          evidenceKind: proof.evidenceKind,
+          verifiedAt: proof.occurredAt,
+          proofFingerprint: proof.evidenceFingerprint,
+          resource: proof.resource,
+        });
+      } catch {
+        continue;
+      }
+      const prior = candidates.get(phase);
+      if (prior && prior.attestationId !== attestation.attestationId) {
+        // Two durable records disagree about the same prior phase. Neither is
+        // trustworthy enough to print as fact.
+        conflicted.add(phase);
+        continue;
+      }
+      candidates.set(phase, attestation);
+    }
+  }
+  for (const phase of conflicted) candidates.delete(phase);
+  return [...candidates.values()].sort((left, right) =>
+    left.phase.localeCompare(right.phase),
+  );
+}
+
+/**
+ * Host-context adapter for the join above. Both Results writers read the same
+ * two callbacks, so neither can drift into a different notion of "bound".
+ */
+export function resolveProjectPriorPhaseAttestationsV1(
+  context: Pick<
+    ToolExecutionContext,
+    "getProjectLineages" | "getVerifiedLinearCodeRepositoryBinding"
+  >,
+  currentRunId: string,
+): ProjectPriorPhaseAttestationV1[] {
+  let binding: VerifiedLinearCodeRepositoryBindingV1 | null = null;
+  try {
+    binding = context.getVerifiedLinearCodeRepositoryBinding?.() ?? null;
+  } catch {
+    return [];
+  }
+  if (!binding) return [];
+  let lineages: readonly unknown[];
+  try {
+    lineages = context.getProjectLineages?.() ?? [];
+  } catch {
+    return [];
+  }
+  return projectPriorPhaseAttestationsFromDurableLineageV1({
+    binding,
+    lineages,
+    currentRunId,
+  });
+}
+
+function lineageBindsLinearIssueV1(
+  lineage: ProjectLineageV1,
+  issueId: string,
+): boolean {
+  return lineage.commits.some(
+    (commit) =>
+      commit.proof.stage === "linear_hierarchy" &&
+      commit.proof.issueIds.includes(issueId),
+  );
+}
+
+function lineageProvesAcceptedResearchArtifactV1(
+  lineage: ProjectLineageV1,
+  artifactFingerprint: string,
+): boolean {
+  const fingerprint = artifactFingerprint.trim();
+  if (!fingerprint) return false;
+  return lineage.commits.some(
+    (commit) =>
+      commit.proof.stage === "accepted_research" &&
+      commit.proof.artifactFingerprint === fingerprint,
+  );
 }
 
 /**
