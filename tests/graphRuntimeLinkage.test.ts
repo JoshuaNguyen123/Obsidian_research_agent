@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   findUnbackedGraphClaimsV1,
+  hasBackedGraphClaimV1,
   isGraphClaimBackedV1,
   type GraphClaimV1,
   type ObservedExecutionLinkageV1,
@@ -138,4 +139,42 @@ test("an empty observed journal cannot discharge any claim", () => {
     findUnbackedGraphClaimsV1([evidenceClaim(), receiptClaim()], []).length,
     2,
   );
+});
+
+test("a tool whose claims none of the executions produced has no backed claim", () => {
+  // The fabrication this must catch: the graph says the tool ran, nothing did.
+  const claims = [
+    { nodeId: "tool-09", toolName: "publish_research_to_linear", claimKind: "evidence" as const,
+      id: "evidence:1", fingerprint: `sha256:${"a".repeat(64)}` },
+    { nodeId: "tool-09", toolName: "publish_research_to_linear", claimKind: "evidence" as const,
+      id: "evidence:2", fingerprint: `sha256:${"b".repeat(64)}` },
+  ];
+  const observed = [
+    { name: "web_fetch", evidenceId: null, evidenceFingerprint: `sha256:${"c".repeat(64)}` },
+  ];
+  assert.equal(hasBackedGraphClaimV1(claims, observed), false);
+});
+
+test("a restored claim beside a produced one still counts as backed", () => {
+  // 23f584b re-emits restored evidence whose execution ran in an earlier
+  // segment. That claim is unbacked here and must not fail the requirement.
+  const produced = `sha256:${"d".repeat(64)}`;
+  const claims = [
+    { nodeId: "tool-09", toolName: "publish_research_to_linear", claimKind: "evidence" as const,
+      id: "evidence:28", fingerprint: `sha256:${"e".repeat(64)}` },
+    { nodeId: "tool-09", toolName: "publish_research_to_linear", claimKind: "evidence" as const,
+      id: "evidence:29", fingerprint: produced },
+  ];
+  const observed = [
+    { name: "publish_research_to_linear", evidenceId: null, evidenceFingerprint: produced },
+  ];
+  assert.equal(hasBackedGraphClaimV1(claims, observed), true);
+  // The restored one is still reported as unbacked, for diagnostics.
+  assert.equal(findUnbackedGraphClaimsV1(claims, observed).length, 1);
+});
+
+test("no claims at all cannot be backed", () => {
+  assert.equal(hasBackedGraphClaimV1([], [
+    { name: "publish_research_to_linear", evidenceId: null, evidenceFingerprint: `sha256:${"f".repeat(64)}` },
+  ]), false);
 });

@@ -83,3 +83,31 @@ export function findUnbackedGraphClaimsV1(
 ): GraphClaimV1[] {
   return claims.filter((claim) => !isGraphClaimBackedV1(claim, observed));
 }
+
+/**
+ * At least one claim per requirement must be backed, not all of them.
+ *
+ * `23f584b` deliberately re-emits RESTORED evidence onto continuation
+ * segments, so a multi-segment phase legitimately carries claims whose
+ * producing execution ran in an earlier segment and is absent from this
+ * phase's observed journal. `MissionEvidenceRefV1` is `{id, kind,
+ * fingerprint, observedAt}` -- it has no origin field, so restored evidence
+ * is indistinguishable from fabricated evidence here, and demanding that
+ * every claim be backed fails on honest work.
+ *
+ * One backed claim is still a real anti-theatre property: a tool the graph
+ * claims ran but which never executed has NO backed claim, because nothing
+ * produced any of its fingerprints. What this tolerates, and what the caller
+ * must not read it as excluding, is a fabricated claim sitting beside a
+ * genuine one on the same node.
+ *
+ * The observed-execution floor (`minimumEvents`) and the verified-receipt
+ * requirement are asserted separately and are what stop a zero-execution
+ * tool passing at all. Do not remove either and lean on this alone.
+ */
+export function hasBackedGraphClaimV1(
+  claims: readonly GraphClaimV1[],
+  observed: readonly ObservedExecutionLinkageV1[],
+): boolean {
+  return claims.some((claim) => isGraphClaimBackedV1(claim, observed));
+}
