@@ -177,3 +177,101 @@ test("read_current_file model payload keeps full note content for edit missions"
   assert.equal(payload.output.contentEvidence, undefined);
   assert.match(payload.output.content, /TAIL_MARKER_END/);
 });
+
+test("sandbox status payload preserves the execution answer the model asked for", () => {
+  // The generic whitelist matched none of this tool's keys, so a successful
+  // status check reached the model as bare success with no output -- and the
+  // model re-called it in a loop hoping for the state.
+  const serialized = serializeToolResultForModel({
+    ok: true,
+    toolName: "code_sandbox_status",
+    output: {
+      version: 1,
+      mode: "sandbox_verified",
+      executionAvailable: true,
+      editingAvailable: true,
+      selectedProvider: "wsl2",
+      providers: [
+        {
+          provider: "wsl2",
+          state: "verified",
+          diagnostic: "Boundary probe passed.",
+          probeFingerprint: `sha256:${"5".repeat(64)}`,
+          checkedAt: "2026-08-24T00:00:00.000Z",
+        },
+        {
+          provider: "docker",
+          state: "unprobed",
+          diagnostic: "Boundary probe has not run.",
+          probeFingerprint: null,
+          checkedAt: null,
+        },
+      ],
+      blocker: null,
+    },
+  });
+  const payload = JSON.parse(serialized) as Record<string, any>;
+  assert.equal(payload.output.mode, "sandbox_verified");
+  assert.equal(payload.output.executionAvailable, true);
+  assert.equal(payload.output.selectedProvider, "wsl2");
+  assert.equal(payload.output.blocker, null);
+  assert.equal(payload.output.providers.length, 2);
+  assert.equal(payload.output.providers[0].provider, "wsl2");
+  assert.equal(payload.output.providers[0].state, "verified");
+  // Nothing was withheld, so the payload must not claim truncation: the old
+  // length-comparison heuristic flagged every slimmed result as truncated
+  // and the model could not tell "re-read" from "that is everything".
+  assert.equal(payload.truncated, false);
+  assert.doesNotMatch(serialized, /probeFingerprint/u);
+});
+
+test("linear issue payload survives the host issue-binding round trip", async () => {
+  const { findNestedLinearIssueRecord } = await import(
+    "../src/agent/linearIssueBinding"
+  );
+  const description = `## Contract\n${"specification line\n".repeat(30)}`;
+  const serialized = serializeToolResultForModel({
+    ok: true,
+    toolName: "linear_get_issue",
+    output: {
+      id: "dc62477e-19bf-48ec-8331-16648e6c747f",
+      identifier: "APP-410",
+      title: "Dependency-Free Python CRDT Library",
+      url: "https://linear.app/example/issue/APP-410/crdt",
+      state: { name: "Todo", type: "unstarted", internalOrder: 3 },
+      description,
+      internalTeamPayload: "must-not-cross",
+    },
+  });
+  const payload = JSON.parse(serialized) as Record<string, any>;
+  // The description is the mission's product specification; losing it left
+  // the model implementing from a title alone.
+  assert.equal(payload.output.description, description);
+  assert.equal(payload.output.state.name, "Todo");
+  assert.equal(payload.output.state.internalOrder, undefined);
+  assert.ok(payload.omittedKeys.includes("internalTeamPayload"));
+  // The host re-parses this very message to bind the issue identity; the
+  // slimmed payload must still satisfy the agent-side record contract.
+  const record = findNestedLinearIssueRecord(payload.output, 0);
+  assert.ok(record);
+  assert.equal(record!.identifier, "APP-410");
+  assert.equal(record!.id, "dc62477e-19bf-48ec-8331-16648e6c747f");
+});
+
+test("oversized linear description truncates honestly instead of vanishing", () => {
+  const serialized = serializeToolResultForModel({
+    ok: true,
+    toolName: "linear_get_issue",
+    output: {
+      id: "dc62477e-19bf-48ec-8331-16648e6c747f",
+      identifier: "APP-410",
+      title: "Dependency-Free Python CRDT Library",
+      url: "https://linear.app/example/issue/APP-410/crdt",
+      description: "x".repeat(6000),
+    },
+  });
+  const payload = JSON.parse(serialized) as Record<string, any>;
+  assert.ok(payload.output.description.length <= 4100);
+  assert.equal(payload.output.descriptionTruncated, true);
+  assert.equal(payload.truncated, true);
+});

@@ -11,6 +11,12 @@ const MAX_REF_COUNT = 20;
 const MAX_REPOSITORY_SCOPE_PROJECTS = 16;
 const MAX_REPOSITORY_SCOPE_PATHS = 96;
 const MAX_REPOSITORY_SCOPE_STRING_CHARS = 512;
+const MAX_OMITTED_KEYS = 16;
+/** The issue description is the mission's product specification; 4000 chars
+ * carries every observed accepted-research contract while bounding the turn. */
+const MAX_LINEAR_DESCRIPTION_CHARS = 4_000;
+const MAX_SANDBOX_PROVIDER_ITEMS = 6;
+const MAX_SANDBOX_MESSAGE_CHARS = 600;
 
 const FULL_CONTENT_NOTE_READ_TOOLS = new Set([
   "read_current_file",
@@ -24,6 +30,13 @@ export interface ToolPayloadSummary {
   receiptRefs?: string[];
   coverage?: Record<string, unknown>;
   truncated?: boolean;
+  /**
+   * Top-level output keys the host withheld from the model. Present so the
+   * model can tell "the host dropped providers/description" apart from "the
+   * tool returned nothing" — without it, a slimmed success read as an empty
+   * result and the model re-called the same tool hoping for more.
+   */
+  omittedKeys?: string[];
   output?: unknown;
 }
 
@@ -32,13 +45,15 @@ export function serializeToolResultForModel(result: ToolExecutionResult): string
   const budget = FULL_CONTENT_NOTE_READ_TOOLS.has(result.toolName)
     ? MAX_CURRENT_NOTE_SUMMARY_CHARS
     : MAX_SUMMARY_CHARS;
-  const serialized = JSON.stringify(summary, null, 2);
+  // Compact JSON: pretty-printing spent 30-40% of the payload budget on
+  // indentation, and the budget must measure what is actually sent.
+  const serialized = JSON.stringify(summary);
   if (serialized.length <= budget) {
     return serialized;
   }
 
   const compact = compactOversizedSummary(summary);
-  const compactSerialized = JSON.stringify(compact, null, 2);
+  const compactSerialized = JSON.stringify(compact);
   if (compactSerialized.length <= budget) {
     return compactSerialized;
   }
@@ -70,8 +85,6 @@ export function serializeToolResultForModel(result: ToolExecutionResult): string
           content: truncateText(summary.output.content, contentBudget),
         },
       },
-      null,
-      2,
     );
   }
 
@@ -83,7 +96,7 @@ export function serializeToolResultForModel(result: ToolExecutionResult): string
     receiptRefs: summary.receiptRefs?.slice(0, 8),
     coverage: summary.coverage,
     truncated: true,
-  }, null, 2);
+  });
 }
 
 export function summarizeToolOutput(
@@ -115,11 +128,18 @@ export function summarizeToolOutput(
   if (coverage) {
     summary.coverage = coverage;
   }
-  const slimOutput = slimOutputForModel(toolName, output);
-  if (slimOutput !== undefined) {
-    summary.output = slimOutput;
+  const slimmed = slimOutputForModel(toolName, output);
+  if (slimmed.value !== undefined) {
+    summary.output = slimmed.value;
   }
-  summary.truncated = JSON.stringify(value ?? "").length > JSON.stringify(summary).length;
+  if (slimmed.omittedKeys.length > 0) {
+    summary.omittedKeys = slimmed.omittedKeys.slice(0, MAX_OMITTED_KEYS);
+  }
+  // "truncated" used to mean "the slim summary serializes shorter than the
+  // raw result" — true whenever any key was dropped, even for a 200-byte
+  // payload, so it never told the model whether a re-read could help. It now
+  // means content was actually cut or keys were actually withheld.
+  summary.truncated = slimmed.lossy || slimmed.omittedKeys.length > 0;
   return summary;
 }
 
@@ -158,13 +178,29 @@ function summarizeOutput(toolName: string, output: unknown): string {
   return `${toolName} completed.`;
 }
 
-function slimOutputForModel(toolName: string, output: unknown): unknown {
+type SlimmedToolOutputV1 = {
+  value: unknown;
+  /** Top-level output keys withheld from the model. */
+  omittedKeys: string[];
+  /** True when kept content was actually cut (sliced, truncated, extracted). */
+  lossy: boolean;
+};
+
+function slimOutputForModel(
+  toolName: string,
+  output: unknown,
+): SlimmedToolOutputV1 {
   if (Array.isArray(output)) {
-    return output.slice(0, 40).map((item) => summarizeResultItem(item));
+    return {
+      value: output.slice(0, 40).map((item) => summarizeResultItem(item)),
+      omittedKeys: [],
+      lossy: output.length > 40,
+    };
   }
   if (!isRecord(output)) {
-    return output;
+    return { value: output, omittedKeys: [], lossy: false };
   }
+  let lossy = false;
   const keep: Record<string, unknown> = {};
   for (const key of [
     "operation",
@@ -274,6 +310,81 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
       if (output[key] !== undefined) keep[key] = output[key];
     }
   }
+  if (toolName === "code_sandbox_status") {
+    // The generic whitelist matched none of this tool's seven keys, so a
+    // successful status check reached the model as bare success with no
+    // output — and the model re-called it in a loop hoping for the state.
+    for (const key of [
+      "version",
+      "mode",
+      "executionAvailable",
+      "editingAvailable",
+      "selectedProvider",
+    ]) {
+      if (output[key] !== undefined) keep[key] = output[key];
+    }
+    if (isRecord(output.blocker)) {
+      const blocker = selectFields(output.blocker, ["code", "remedy"]);
+      if (typeof output.blocker.message === "string") {
+        blocker.message = truncateText(
+          output.blocker.message,
+          MAX_SANDBOX_MESSAGE_CHARS,
+        );
+        lossy ||= output.blocker.message.length > MAX_SANDBOX_MESSAGE_CHARS;
+      }
+      keep.blocker = blocker;
+    } else if (output.blocker === null) {
+      // A null blocker is the "nothing is blocking execution" answer.
+      keep.blocker = null;
+    }
+    if (Array.isArray(output.providers)) {
+      keep.providers = output.providers
+        .slice(0, MAX_SANDBOX_PROVIDER_ITEMS)
+        .map((provider) =>
+          isRecord(provider)
+            ? {
+                ...selectFields(provider, ["provider", "state"]),
+                ...(typeof provider.diagnostic === "string"
+                  ? { diagnostic: truncateText(provider.diagnostic, 300) }
+                  : {}),
+              }
+            : provider,
+        );
+      lossy ||= output.providers.length > MAX_SANDBOX_PROVIDER_ITEMS;
+    }
+  }
+  if (toolName === "linear_get_issue" || toolName === "linear_create_issue") {
+    // The generic whitelist kept only title+url, dropping the id/identifier
+    // the host's issue binding re-parses from this very message and the
+    // description that carries the mission's product specification. The
+    // model called the read and received nothing it could implement from.
+    const record = findLinearIssueRecordForModel(output, 0);
+    if (record) {
+      const target: Record<string, unknown> =
+        record === output ? keep : {};
+      for (const key of ["id", "identifier", "title", "url"]) {
+        if (typeof record[key] === "string") target[key] = record[key];
+      }
+      if (typeof record.state === "string") {
+        target.state = record.state;
+      } else if (isRecord(record.state)) {
+        target.state = selectFields(record.state, ["name", "type"]);
+      }
+      if (typeof record.description === "string") {
+        target.description = truncateText(
+          record.description,
+          MAX_LINEAR_DESCRIPTION_CHARS,
+        );
+        if (record.description.length > MAX_LINEAR_DESCRIPTION_CHARS) {
+          target.descriptionTruncated = true;
+          lossy = true;
+        }
+      }
+      if (target !== keep && Object.keys(target).length > 0) {
+        keep.issue = target;
+      }
+    }
+  }
   if (
     toolName === "code_workspace_create" &&
     isRecord(output.repositoryWriteScope)
@@ -289,12 +400,14 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
     keep.results = output.results
       .slice(0, MAX_RESULT_ITEMS)
       .map((item) => summarizeResultItem(item));
+    lossy ||= output.results.length > MAX_RESULT_ITEMS;
   }
   if (Array.isArray(output.files)) {
     const query = getEvidenceQuery(output);
     keep.files = output.files
       .slice(0, MAX_RESULT_ITEMS)
       .map((item) => summarizeFileItem(item, query));
+    lossy ||= output.files.length > MAX_RESULT_ITEMS;
   }
   if (isRecord(output.receipt)) {
     const receipt = slimReceiptForModel(output.receipt);
@@ -326,9 +439,57 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
         sourceLocator: getEvidenceSourceLocator(output),
         baseOffset: getEvidenceBaseOffset(output),
       });
+      // Passage extraction is inherently a cut of the raw content.
+      lossy = true;
     }
   }
-  return Object.keys(keep).length > 0 ? keep : undefined;
+  const omittedKeys = Object.keys(output).filter(
+    (key) =>
+      output[key] !== undefined &&
+      !(key in keep) &&
+      // coverage is surfaced on the envelope, and raw content is represented
+      // by the kept contentEvidence passages rather than silently missing.
+      key !== "coverage" &&
+      !(key === "content" && "contentEvidence" in keep),
+  );
+  return {
+    value: Object.keys(keep).length > 0 ? keep : undefined,
+    omittedKeys,
+    lossy,
+  };
+}
+
+/**
+ * Mirrors the shape contract of findNestedLinearIssueRecord
+ * (src/agent/linearIssueBinding.ts): an issue record is any nested record with
+ * (identifier || id) and (title || url). Duplicated here because the model
+ * layer must not import the agent layer; the toolResultPayload tests
+ * round-trip a slimmed payload through the real agent-side finder so the two
+ * cannot drift apart silently.
+ */
+function findLinearIssueRecordForModel(
+  value: unknown,
+  depth: number,
+): Record<string, unknown> | null {
+  if (depth > 6 || !isRecord(value)) return null;
+  if (
+    (typeof value.identifier === "string" || typeof value.id === "string") &&
+    (typeof value.title === "string" || typeof value.url === "string")
+  ) {
+    return value;
+  }
+  for (const child of Object.values(value)) {
+    if (Array.isArray(child)) {
+      for (const entry of child) {
+        const found = findLinearIssueRecordForModel(entry, depth + 1);
+        if (found) return found;
+      }
+      continue;
+    }
+    const found = findLinearIssueRecordForModel(child, depth + 1);
+    if (found) return found;
+  }
+  return null;
 }
 
 /**
