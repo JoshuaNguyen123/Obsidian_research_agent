@@ -3069,6 +3069,14 @@ export async function runAgentMission({
   let wroteToNote = false;
   let unavailableToolCorrectionUsed = false;
   let proofGatedWriteToolCorrectionUsed = false;
+  /**
+   * The write tool most recently held for final passage verification. While
+   * the hold stands, the off-frontier rejection composer must not advise this
+   * exact name: the hold told the model to return the corrected content as
+   * its final answer, and a "call that exact name" directive for the same
+   * tool commands the call the proof gate will hold again.
+   */
+  let lastProofGatedHoldToolName: string | null = null;
   let literalWriteCorrectionUsed = false;
   let passageGroundedWriteContractInjected = false;
   let vaultTraversalCorrectionUsed = false;
@@ -10124,6 +10132,10 @@ export async function runAgentMission({
         return null;
       }
       acceptedCandidateAcceptance = candidateAcceptance;
+      // The staged final answer just passed verification; the hold it
+      // announced is satisfied, so frontier rejections may advise write
+      // tools again.
+      lastProofGatedHoldToolName = null;
     } else {
       events.onTrace?.({
         id: `replacement-writeback-${step}:candidate-held`,
@@ -12264,6 +12276,9 @@ export async function runAgentMission({
         buildOffFrontierToolRejectionMessageImpl({
           toolName: toolCall.name,
           readyFrontierToolNames: authorityReadyFrontier,
+          heldWriteToolNames: lastProofGatedHoldToolName
+            ? [lastProofGatedHoldToolName]
+            : [],
         }),
       ].join(" ");
       const blockedResult: ToolExecutionResult = {
@@ -20143,6 +20158,9 @@ export async function runAgentMission({
           readyFrontierToolNames: [...stepAllowedToolNames],
           preferredNextTool: preferredNextOnReject,
           category: rejectCategory,
+          heldWriteToolNames: lastProofGatedHoldToolName
+            ? [lastProofGatedHoldToolName]
+            : [],
         });
         const rejectEval = buildToolRejectEvalV1({
           userIntentExcerpt: activeIntentPrompt,
@@ -20512,6 +20530,13 @@ export async function runAgentMission({
                 )
                 .join("")
             }`;
+        if (durablePreWriteProofSatisfied) {
+          // Only the verification-required arm promised "return the content
+          // as the final answer". Remember which write tool that promise
+          // held so frontier rejections stop advising the same name while
+          // the hold stands.
+          lastProofGatedHoldToolName = toolCall.name;
+        }
         events.onStatus?.(message);
         events.onTrace?.({
           id: `${toolEventBase.id}:proof-gated-writeback-rejected`,
@@ -20563,6 +20588,13 @@ export async function runAgentMission({
         shouldReplanAfterProofGatedWriteTool = true;
         toolIndex += 1;
         continue;
+      }
+      if (proofGatedCurrentNoteTool) {
+        // The same gate just declined to hold this write, so the write
+        // proceeds and any earlier verification hold is spent. A stale name
+        // would keep telling the model its write tool is held after it no
+        // longer is.
+        lastProofGatedHoldToolName = null;
       }
 
       if (
@@ -35646,6 +35678,7 @@ export function buildOffFrontierToolRejectionMessage(input: {
   readyFrontierToolNames: readonly string[];
   preferredNextTool?: string | null;
   category?: string | null;
+  heldWriteToolNames?: readonly string[];
 }): string {
   return buildOffFrontierToolRejectionMessageImpl(input);
 }

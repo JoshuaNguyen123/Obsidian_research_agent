@@ -238,6 +238,13 @@ export function buildOffFrontierToolRejectionMessage(input: {
   readyFrontierToolNames: readonly string[];
   preferredNextTool?: string | null;
   category?: ToolRejectCategoryV1 | string | null;
+  /**
+   * Write tools currently held by proof verification. A held tool may sit on
+   * the ready frontier (the graph considers it ready), but the proof gate
+   * will hold it again on the very next call -- so this message must never
+   * advise it, or the rejection commands the call another subsystem forbids.
+   */
+  heldWriteToolNames?: readonly string[];
 }): string {
   const frontier =
     input.readyFrontierToolNames.length > 0
@@ -256,9 +263,16 @@ export function buildOffFrontierToolRejectionMessage(input: {
         ? "off-frontier"
         : "not available for this prompt",
     });
+  const heldWriteTools = new Set(
+    (input.heldWriteToolNames ?? []).filter(Boolean),
+  );
   const preferred =
     input.preferredNextTool?.trim() ||
-    input.readyFrontierToolNames.slice(0, 3).filter(Boolean).join(", ") ||
+    input.readyFrontierToolNames
+      .filter((name) => !heldWriteTools.has(name))
+      .slice(0, 3)
+      .filter(Boolean)
+      .join(", ") ||
     "none";
   const base = input.pendingGraphNodeId
     ? `Deferred ${input.toolName}: authoritative mission node ${input.pendingGraphNodeId} is not on the ready frontier.`
@@ -272,11 +286,28 @@ export function buildOffFrontierToolRejectionMessage(input: {
   const deferredNote = input.pendingGraphNodeId
     ? `${input.toolName} stays refused until its own node is ready; calling the preferred tool does not by itself open it.`
     : "";
+  // A verification hold has already told the model to return the corrected
+  // content as its final answer; "call that exact name" for the held tool
+  // would command the very call the gate holds again, and the model burns
+  // turns reconciling the two. When the frontier offers nothing but held
+  // tools, the frontier listing stays (it is factual) but no call directive
+  // may appear -- there is nothing safe to call.
+  const heldFrontierTools = input.readyFrontierToolNames.filter((name) =>
+    heldWriteTools.has(name),
+  );
+  const heldPreferred = heldWriteTools.has(preferred)
+    ? preferred
+    : preferred === "none" && heldFrontierTools.length > 0
+      ? heldFrontierTools.join(", ")
+      : null;
+  const preferredLine = heldPreferred
+    ? `${heldPreferred} is currently held by proof verification — return the corrected note content as your final answer instead of calling it.`
+    : `Preferred next: ${preferred}. Call that exact name.`;
   return [
     base,
     `category=${category}`,
     `Ready frontier tool(s) now: ${frontier}.`,
-    `Preferred next: ${preferred}. Call that exact name.`,
+    preferredLine,
     deferredNote,
     nearMiss ?? "",
     "Correct only that issue; do not repeat this exact call.",
