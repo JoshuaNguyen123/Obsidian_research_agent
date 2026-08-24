@@ -1,4 +1,7 @@
-import { hasDesignIntent } from "./codeDesignIntent";
+import {
+  hasDesignIntent,
+  isResearchTopicDesignProse,
+} from "./codeDesignIntent";
 import {
   isCurrentNoteEditOrganizeIntent,
   isNamedSectionEditIntent,
@@ -265,6 +268,13 @@ function shouldPreferWholeNoteReplace(prompt: string): boolean {
 }
 
 function hasDiagramIntent(prompt: string): boolean {
+  // Design-flavored research topic prose ("the transformer architecture ...
+  // write a short note") must classify as narrative output; a diagram kind
+  // here plans a create_design_* node the research write gate then refuses
+  // forever, terminally blocking the mission graph.
+  if (isResearchTopicDesignProse(prompt)) {
+    return false;
+  }
   return hasDesignIntent(prompt) ||
     /\b(draw|diagram|flowchart|canvas|blocks?|nodes?|map|wireframe|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map|design\s*package)\b/i.test(
       prompt,

@@ -31,6 +31,27 @@ const HTML_PREVIEW_INTENT =
 const REVISE_DESIGN_INTENT =
   /\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b[\s\S]{0,80}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|block)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|block)\b[\s\S]{0,80}\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b/i;
 
+// A grounded research-note mission frequently NAMES design-flavored subject
+// matter ("the transformer architecture", "distributed systems") within reach
+// of its note-writing verb, which satisfies DESIGN_INTENT even though the
+// only requested deliverable is prose. Planting design capability for that
+// prose schedules a write the research phase gate refuses, and the mission
+// graph blocks terminally on the deferred create_design_* node (live lead
+// continuations, 2026-08-24). The regexes and predicate below are the single
+// shared authority for telling a design deliverable apart from design-flavored
+// research topic prose; planner, loop budget, required-write selection, and
+// continuation replans must all consult it so no two of them disagree.
+const GROUNDED_RESEARCH_TASK = /\b(?:research|investigate)\b/i;
+
+const NARRATIVE_NOTE_DELIVERABLE =
+  /\b(?:write|draft|compose|summari[sz]e)\b[\s\S]{0,120}\b(?:notes?|essay|summary|article|paragraphs?|report|write[-\s]?up)\b/i;
+
+// Vocabulary that names a visual artifact as the requested deliverable. Topic
+// nouns that merely say what a mission is ABOUT (architecture, system design,
+// distributed systems, business process, ...) are deliberately absent.
+const EXPLICIT_DESIGN_ARTIFACT_REQUEST =
+  /\b(?:canvas|diagrams?|flowcharts?|wireframes?|mockups?|svg|mermaid|sketch(?:es)?|storyboards?|design\s*packages?|service\s*blueprints?|bpmn|sipoc|c4\s+(?:model|diagram)|(?:mind|concept|process|dependency|visual|research)[-\s]*maps?|(?:user|ui)[-\s]*flows?|draw|design\s+(?:a|an|the)\s+\w+)\b/i;
+
 const CODE_TEAM_MAGIC =
   /\b(code\s+team|coding\s+team|orchestrate\s+code|git\s+worktree)\b/i;
 
@@ -62,6 +83,55 @@ export function hasHtmlPreviewIntent(prompt: string): boolean {
 
 export function hasReviseDesignIntent(prompt: string): boolean {
   return REVISE_DESIGN_INTENT.test(prompt);
+}
+
+/**
+ * True when a mission's design vocabulary is research subject matter rather
+ * than a requested deliverable: the mission asks to research a topic and
+ * write a narrative note about it, and never names a concrete visual
+ * artifact. Such a mission must not acquire design capability — not on a
+ * fresh plan and not on a continuation replan of the persisted original
+ * mission.
+ */
+export function isResearchTopicDesignProse(prompt: string): boolean {
+  return (
+    hasDesignIntent(prompt) &&
+    GROUNDED_RESEARCH_TASK.test(prompt) &&
+    NARRATIVE_NOTE_DELIVERABLE.test(prompt) &&
+    !EXPLICIT_DESIGN_ARTIFACT_REQUEST.test(prompt)
+  );
+}
+
+// Design-capability tool names a research-topic-prose mission must never
+// plan. Continuation replans filter persisted expected tools through this set
+// so a mis-planned prior segment cannot re-plant the refused design node.
+const DESIGN_CAPABILITY_TOOL_NAMES = new Set([
+  "create_design_canvas",
+  "create_svg_design",
+  "create_design_package",
+  "update_design_canvas",
+  "update_svg_design",
+  "read_design_canvas",
+  "read_svg_design",
+  "read_mermaid_block",
+  "upsert_mermaid_block",
+]);
+
+/**
+ * Filters planned/inherited tool names for a mission whose design vocabulary
+ * is topic prose. Non-design tools always pass; a mission that genuinely
+ * requests a visual artifact passes unchanged. The mission prompt here must
+ * be the ORIGINAL user mission (persisted as ledger mission / runtime
+ * originalMission), never researcher handoff or summary prose.
+ */
+export function filterResearchTopicDesignProseTools(
+  toolNames: readonly string[],
+  missionPrompt: string,
+): string[] {
+  if (!isResearchTopicDesignProse(missionPrompt)) {
+    return [...toolNames];
+  }
+  return toolNames.filter((name) => !DESIGN_CAPABILITY_TOOL_NAMES.has(name));
 }
 
 export function hasExplicitCodeTeamMagicPhrase(prompt: string): boolean {

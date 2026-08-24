@@ -842,9 +842,11 @@ import {
   type MarkdownHeadingV1,
 } from "./agent/sectionTarget";
 import {
+  filterResearchTopicDesignProseTools,
   hasDesignIntent as hasSharedDesignIntent,
   hasExplicitCanvasDestinationIntent,
   hasReviseDesignIntent,
+  isResearchTopicDesignProse,
 } from "./agent/codeDesignIntent";
 import {
   classifyMissionWithModelDetailed,
@@ -3976,12 +3978,18 @@ export async function runAgentMission({
           toolSteps: resumeToolSteps,
           finalizationReserve: resumeFinalizationReserve,
           reason: "resume_inherited_segment_budget",
-          expectedTools: [
-            ...new Set([
-              ...runPlan.budgetProfile.expectedTools,
-              ...resumeLedger.loopBudget.expectedTools,
-            ]),
-          ],
+          // Filtered against the restored original mission: a continuation
+          // must not re-acquire design capability from a mis-planned prior
+          // segment's persisted expected tools.
+          expectedTools: filterResearchTopicDesignProseTools(
+            [
+              ...new Set([
+                ...runPlan.budgetProfile.expectedTools,
+                ...resumeLedger.loopBudget.expectedTools,
+              ]),
+            ],
+            activeIntentPrompt,
+          ),
         },
       };
     }
@@ -4402,7 +4410,13 @@ export async function runAgentMission({
           ) ||
           seededResearchHandoffSatisfiesReads;
         const promptOnPageBootstrap = isPromptOnCurrentPageIntent(prompt);
-        const plannedToolNames = dedupeSingletonMissionGraphPrerequisites([
+        // The design-prose filter runs over the complete candidate list: the
+        // restored original mission is the authority for whether design
+        // capability belongs in this graph, so neither a recomputed budget
+        // nor a mis-planned prior segment's persisted expected tools can
+        // plant a create_design_* node for research topic prose.
+        const plannedToolNames = dedupeSingletonMissionGraphPrerequisites(
+          filterResearchTopicDesignProseTools([
           ...(shouldReadCurrentNote &&
           explicitGraphWorkflowToolNames.length === 0 &&
           graphAllowedToolNames.includes("read_current_file")
@@ -4472,6 +4486,8 @@ export async function runAgentMission({
           (name) =>
             currentlyRunnableGraphToolNames.has(name) &&
             !resumeReceiptToolNames.has(name),
+        ),
+        activeIntentPrompt,
         ));
         const graphMissionId = canonicalResumeGraphId ?? canonicalMissionGraphId(runId);
         let missionBindingOverrides:
@@ -5454,12 +5470,18 @@ export async function runAgentMission({
       Math.max(0, inheritedHardCap - inheritedFinalizationReserve),
       Math.max(0, resumeLedger.loopBudget.toolStepBudget),
     );
-    const inheritedExpectedTools = [
-      ...new Set([
-        ...resumeLedger.loopBudget.expectedTools,
-        ...loopBudgetPlan.expectedTools,
-      ]),
-    ];
+    // Filtered against the restored original mission: a continuation must not
+    // re-acquire design capability from a mis-planned prior segment's
+    // persisted expected tools.
+    const inheritedExpectedTools = filterResearchTopicDesignProseTools(
+      [
+        ...new Set([
+          ...resumeLedger.loopBudget.expectedTools,
+          ...loopBudgetPlan.expectedTools,
+        ]),
+      ],
+      activeIntentPrompt,
+    );
     loopBudgetPlan = {
       ...loopBudgetPlan,
       hardCap: inheritedHardCap,
@@ -27347,9 +27369,14 @@ function getRequiredWriteToolNames(
   const requiredToolNames: string[] = [...lifecycleRequiredToolNames];
   const wholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
   const noteOutputIntent = missionIntent.noteOutput;
+  // Research topic prose ("distributed systems and write a short note") must
+  // keep its narrative write requirement; a specialized design workflow here
+  // would drop the append and plant a design node the research write gate
+  // refuses forever.
   const specializedDesignWorkflow =
     (hasDesignIntent(prompt) || hasReviseDesignIntent(prompt)) &&
-    !hasNarrativeDesignOutputIntent(prompt);
+    !hasNarrativeDesignOutputIntent(prompt) &&
+    !isResearchTopicDesignProse(prompt);
 
   const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
   const hasCurrentMutationTarget =
@@ -27446,7 +27473,10 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("create_research_pack");
   }
 
-  if (hasDesignIntent(prompt) || hasReviseDesignIntent(prompt)) {
+  if (
+    (hasDesignIntent(prompt) && !isResearchTopicDesignProse(prompt)) ||
+    hasReviseDesignIntent(prompt)
+  ) {
     if (hasExplicitCanvasDestinationIntent(prompt)) {
       requiredToolNames.push("create_design_canvas");
     } else if (hasReviseDesignIntent(prompt) && hasMermaidDesignIntent(prompt)) {
