@@ -1749,6 +1749,13 @@ export class CodeExtensionRuntimeV2 {
   private forgetNotebookExecutionRuntimeV1(): void {
     this.notebookRuntime = null;
     this.notebookRuntimeProbeInFlight = null;
+    // Same hazard, older field: the generated-artifact health proof records
+    // the provider it was measured under, and a proof taken against the
+    // previous binding would keep reporting "execution and readback verified"
+    // for a sandbox nobody has asked. Health honestly degrades to "no
+    // generated artifact has completed execution in this session" until the
+    // new binding earns its own proof.
+    this.generatedArtifactHealth = null;
   }
 
   /** Local settings operation. Removing configuration cannot start a process. */
