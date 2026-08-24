@@ -91,6 +91,41 @@ test("objectiveForLifecycleStage covers every durable stage", () => {
   assert.match(objectiveForLifecycleStage(null), /callable tools/i);
 });
 
+test("publication objective echoes an already-made visibility choice instead of asking again", () => {
+  // The generic objective told the model to ask public-or-private even when
+  // the mission prompt had already chosen; on frontiers without an ask tool
+  // that instruction was unfollowable and the turn was wasted.
+  assert.match(
+    objectiveForLifecycleStage("private_github_publication"),
+    /Ask whether/u,
+  );
+  assert.match(
+    objectiveForLifecycleStage("private_github_publication", "private"),
+    /already chose a private repository/u,
+  );
+  assert.match(
+    objectiveForLifecycleStage("private_github_publication", "private"),
+    /visibility="private"/u,
+  );
+  // Other stages ignore the visibility.
+  assert.match(
+    objectiveForLifecycleStage("code_validation", "private"),
+    /validation/iu,
+  );
+
+  const text = buildMissionGraphFrontierTurnContext(
+    [tool("github_create_repository")],
+    null,
+    {
+      setLoose: true,
+      currentStage: "private_github_publication",
+      resolvedRepositoryVisibility: "private",
+    },
+  );
+  assert.match(text, /already chose a private repository/u);
+  assert.doesNotMatch(text, /Ask whether/u);
+});
+
 test("frontier turn context uses stage projection instead of echoing host cards", () => {
   const text = buildMissionGraphFrontierTurnContext(
     [tool("linear_create_issue"), tool("linear_get_issue")],

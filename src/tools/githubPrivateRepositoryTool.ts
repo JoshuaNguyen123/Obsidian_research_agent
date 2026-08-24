@@ -1012,12 +1012,16 @@ const REPOSITORY_PARAMETERS: JsonSchemaObject = {
   type: "object",
   additionalProperties: false,
   properties: {
-    profileKey: { type: "string" },
+    profileKey: {
+      type: "string",
+      description:
+        "The exact repositoryProfileKey the host bound for this mission, as shown in the workspace's repositoryWriteScope or the mission's binding context. Never invent, guess, or abbreviate it.",
+    },
     visibility: {
       type: "string",
       enum: ["public", "private"],
       description:
-        "The user's explicit public/private choice. Omit when unanswered so the host can pause without mutation.",
+        "Echo the user's explicit public/private choice from the mission prompt exactly. When the mission states the choice, pass it; omit only when the user has not chosen, so the host can pause without mutation.",
     },
     description: { type: "string" },
   },

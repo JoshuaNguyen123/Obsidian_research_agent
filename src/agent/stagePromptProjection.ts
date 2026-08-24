@@ -53,8 +53,21 @@ export type StagePromptProjectionV1 = {
 
 export function objectiveForLifecycleStage(
   stage: string | null | undefined,
+  resolvedRepositoryVisibility: "public" | "private" | null = null,
 ): string {
   const key = String(stage ?? "").trim() as ProjectLifecycleStageV1;
+  // The generic publication objective says "Ask whether public or private"
+  // even when the mission prompt already made the choice; a model obeying it
+  // went looking for an ask tool that was not callable instead of calling
+  // github_create_repository. The visibility here is resolved by the same
+  // resolveExplicitRepositoryVisibilityChoiceV1 the executor gate reads, so
+  // the objective and the gate cannot disagree.
+  if (
+    key === "private_github_publication" &&
+    resolvedRepositoryVisibility !== null
+  ) {
+    return `The user already chose a ${resolvedRepositoryVisibility} repository. Call github_create_repository with visibility="${resolvedRepositoryVisibility}" and the bound profileKey, then publish the verified workspace as a draft PR.`;
+  }
   if (key && key in STAGE_OBJECTIVES) {
     return STAGE_OBJECTIVES[key];
   }
@@ -121,6 +134,7 @@ export function projectStagePrompt(input: {
   evidenceLines?: readonly string[];
   budgetLine?: string | null;
   objective?: string | null;
+  resolvedRepositoryVisibility?: "public" | "private" | null;
 }): StagePromptProjectionV1 {
   const stage = input.stage?.trim() || null;
   const callableTools = [
@@ -137,7 +151,11 @@ export function projectStagePrompt(input: {
     stage,
     setLoose: input.setLoose === true,
     objective:
-      input.objective?.trim() || objectiveForLifecycleStage(stage),
+      input.objective?.trim() ||
+      objectiveForLifecycleStage(
+        stage,
+        input.resolvedRepositoryVisibility ?? null,
+      ),
     evidenceLines,
     callableTools,
     budgetLine: input.budgetLine?.trim() || null,

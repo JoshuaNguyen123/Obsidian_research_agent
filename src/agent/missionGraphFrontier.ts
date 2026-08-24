@@ -876,6 +876,7 @@ export function buildMissionGraphFrontierTurnContext(
     setLoose?: boolean;
     currentStage?: string | null;
     stageBudgetBlock?: string | null;
+    resolvedRepositoryVisibility?: "public" | "private" | null;
   } = {},
 ): string {
   const names = stepTools.map((tool) => tool.function.name);
@@ -886,6 +887,8 @@ export function buildMissionGraphFrontierTurnContext(
       callableTools: names,
       observedBinding,
       budgetLine: options.stageBudgetBlock ?? null,
+      resolvedRepositoryVisibility:
+        options.resolvedRepositoryVisibility ?? null,
     }),
   );
   const codeCapabilityBoundary = names.some((name) => name.startsWith("code_"))

@@ -17673,6 +17673,32 @@ export async function runAgentMission({
             `Use the existing verified evidence to request exactly ${PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME}. This composite tool writes the accepted Obsidian package and performs the exact Linear publication handoff.`,
           ].join("\n")
         : null;
+      // The same prompt authority the repository-creation gate reads
+      // (resolveExplicitRepositoryVisibilityChoiceV1), so the steering here
+      // can never contradict the executor's waiting_for_repository_visibility
+      // check.
+      const stepVisibilityChoice = resolveExplicitRepositoryVisibilityChoiceV1(
+        activeIntentPrompt,
+      );
+      const resolvedRepositoryVisibility =
+        stepVisibilityChoice.status === "chosen"
+          ? stepVisibilityChoice.visibility
+          : null;
+      // The exact profileKey/visibility pair github_create_repository needs.
+      // Without this line the model guessed the profile key, because the card
+      // that carried it was gated to the code_execution stage and gone by
+      // publication time.
+      const githubPublicationBinding =
+        stepTools.some(
+          (tool) =>
+            tool.function.name === CREATE_GITHUB_REPOSITORY_TOOL_NAME ||
+            tool.function.name ===
+              LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+        ) &&
+        verifiedLinearRepositoryBindingSnapshot &&
+        resolvedRepositoryVisibility
+          ? `EXACT GITHUB PUBLICATION BINDING: profileKey=${JSON.stringify(verifiedLinearRepositoryBindingSnapshot.repositoryProfileKey)}; visibility=${resolvedRepositoryVisibility}; call github_create_repository with these exact values.`
+          : null;
       const stepMessages =
         stepTools.length > 0 && (missionGraph || setLooseCompoundEnabled)
           ? insertMissionGraphFrontierTurnContext(
@@ -17691,6 +17717,7 @@ export async function runAgentMission({
                   getLatestFastValidationDiagnostic(runtimeCache),
                   runtimeCache.verifiedMermaidRead ?? null,
                 ),
+                githubPublicationBinding,
                 codeSpecCard,
                 verifiedLinearRepositoryCard,
                 verifiedGitPathCard,
@@ -17706,6 +17733,7 @@ export async function runAgentMission({
                   compoundLifecycleStages[0] ??
                   null,
                 stageBudgetBlock,
+                resolvedRepositoryVisibility,
               },
             )
           : messages;
@@ -31336,6 +31364,7 @@ function insertMissionGraphFrontierTurnContext(
     setLoose?: boolean;
     currentStage?: string | null;
     stageBudgetBlock?: string | null;
+    resolvedRepositoryVisibility?: "public" | "private" | null;
   } = {},
 ): ModelChatMessage[] {
   const insertAt = Math.max(0, messages.length - 1);
