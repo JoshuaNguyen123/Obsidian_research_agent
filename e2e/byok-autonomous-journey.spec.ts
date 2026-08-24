@@ -2672,12 +2672,36 @@ async function assertGraphRuntimeLinkage(
       ).toBeGreaterThanOrEqual(requirement.minimumEvents);
     }
 
-    for (const event of events) {
+    for (const [eventIndex, event] of events.entries()) {
       if (event.descriptorEffect === "read") {
         expect(
           event.evidenceFingerprint,
           `${phase} observed read fingerprint for ${requirement.toolName}`,
         ).toMatch(/^sha256:[a-f0-9]{64}$/u);
+        // Name which execution failed and what the graph actually holds. The
+        // bare boolean cannot distinguish the two mechanisms that produce it:
+        // (a) a later duplicate call that ran through the set-loose graph-start
+        // bypass, which records no graph evidence by design, or (b) an early
+        // call whose node is absent because this snapshot is one segment's
+        // graph while these events span every Phase B segment.
+        const linkageDiagnostic = JSON.stringify({
+          eventIndex,
+          eventCount: events.length,
+          eventSequence: event.sequence,
+          eventStartedAt: event.startedAt,
+          eventEvidenceId: event.evidenceId ?? null,
+          eventEvidenceFingerprint: event.evidenceFingerprint ?? null,
+          witnessNodeIds: matchingWitnesses.map((witness) => witness.node.id),
+          witnessEvidence: matchingWitnesses.flatMap((witness) =>
+            witness.node.evidence.map((evidence) => ({
+              nodeId: witness.node.id,
+              evidenceId: evidence.id,
+              fingerprint: evidence.fingerprint,
+            })),
+          ),
+          graphMissionId: graph.missionId,
+          graphRevision: graph.revision,
+        });
         expect(
           matchingWitnesses.some((witness) =>
             witness.node.evidence.some(
@@ -2686,7 +2710,7 @@ async function assertGraphRuntimeLinkage(
                 (!event.evidenceId || evidence.id === event.evidenceId),
             ),
           ),
-          `${phase} exact graph read evidence for ${requirement.toolName}`,
+          `${phase} exact graph read evidence for ${requirement.toolName} ${linkageDiagnostic}`,
         ).toBe(true);
         continue;
       }
