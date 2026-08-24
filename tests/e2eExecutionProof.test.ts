@@ -263,7 +263,7 @@ test("the BYOK autonomous journey proves every handoff through production bounda
     "assertGraphRuntimeLinkage",
     "parseMissionGraphV3",
     "evidenceFingerprint",
-    "evidence.fingerprint === event.evidenceFingerprint",
+    "findUnbackedGraphClaimsV1",
     "cleanupExactOwnedLinearIssueToTrash",
     "byok-linear-cleanup-v1",
     "addOwnedLinearIssueIdsFromReceipts",
@@ -293,6 +293,19 @@ test("the BYOK autonomous journey proves every handoff through production bounda
     "acceptanceRecorded",
   ]) {
     assert.match(spec, new RegExp(escapeRegExp(required), "u"), required);
+  }
+  // The graph-linkage cross-check is inverted: every graph claim must be
+  // backed by an observed execution. The fingerprint and verified-receipt
+  // comparisons live in the shared predicate now, so pin them there rather
+  // than letting the relocation quietly drop the guard.
+  const graphLinkage = readFileText("../e2e/fixtures/graphRuntimeLinkage.ts");
+  for (const required of [
+    "execution.evidenceFingerprint === claim.fingerprint",
+    "execution.receiptId === claim.id",
+    "VERIFIED_RECEIPT_READBACK_STATUS_V1",
+    "execution.evidenceId === claim.id",
+  ]) {
+    assert.match(graphLinkage, new RegExp(escapeRegExp(required), "u"), required);
   }
   assert.doesNotMatch(spec, /completeObservedAcceptance/u);
   assert.doesNotMatch(

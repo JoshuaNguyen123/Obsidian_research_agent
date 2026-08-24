@@ -79,6 +79,11 @@ import {
   startRealAiHarness,
   type RealAiHarness,
 } from "./fixtures/realAiHarness";
+import {
+  findUnbackedGraphClaimsV1,
+  type GraphClaimV1,
+  type ObservedExecutionLinkageV1,
+} from "./fixtures/graphRuntimeLinkage";
 import { hasExplicitResearchPublicationIntent } from "../src/tools/researchPublicationTool";
 
 const LANE = "byok-autonomous-journey";
@@ -2600,6 +2605,17 @@ async function assertGraphRuntimeLinkage(
 ): Promise<void> {
   const graph = await parseMissionGraphV3(snapshot?.lastMissionGraph);
   const wanted = new Set(requirements.map((item) => item.toolName));
+  const observedLinkage: ObservedExecutionLinkageV1[] = observedEvents
+    .filter((event) => event.ok)
+    .map((event) => ({
+      name: event.name,
+      sequence: event.sequence,
+      descriptorEffect: event.descriptorEffect,
+      evidenceId: event.evidenceId ?? null,
+      evidenceFingerprint: event.evidenceFingerprint ?? null,
+      receiptId: event.receipt?.id ?? null,
+      receiptReadbackStatus: event.receipt?.readbackStatus ?? null,
+    }));
   const witnesses: GraphToolWitnessV1[] = [];
 
   for (const node of Object.values(graph.nodes)) {
@@ -2672,62 +2688,66 @@ async function assertGraphRuntimeLinkage(
       ).toBeGreaterThanOrEqual(requirement.minimumEvents);
     }
 
-    for (const [eventIndex, event] of events.entries()) {
+    // Observed-side invariants stay forward: they are properties of the
+    // execution itself, not linkage claims, so the graph bypass cannot excuse
+    // them. A read must carry a real content fingerprint; a mutation must carry
+    // a receipt that read back verified.
+    for (const event of events) {
       if (event.descriptorEffect === "read") {
         expect(
           event.evidenceFingerprint,
           `${phase} observed read fingerprint for ${requirement.toolName}`,
         ).toMatch(/^sha256:[a-f0-9]{64}$/u);
-        // Name which execution failed and what the graph actually holds. The
-        // bare boolean cannot distinguish the two mechanisms that produce it:
-        // (a) a later duplicate call that ran through the set-loose graph-start
-        // bypass, which records no graph evidence by design, or (b) an early
-        // call whose node is absent because this snapshot is one segment's
-        // graph while these events span every Phase B segment.
-        const linkageDiagnostic = JSON.stringify({
-          eventIndex,
-          eventCount: events.length,
-          eventSequence: event.sequence,
-          eventStartedAt: event.startedAt,
-          eventEvidenceId: event.evidenceId ?? null,
-          eventEvidenceFingerprint: event.evidenceFingerprint ?? null,
-          witnessNodeIds: matchingWitnesses.map((witness) => witness.node.id),
-          witnessEvidence: matchingWitnesses.flatMap((witness) =>
-            witness.node.evidence.map((evidence) => ({
-              nodeId: witness.node.id,
-              evidenceId: evidence.id,
-              fingerprint: evidence.fingerprint,
-            })),
-          ),
-          graphMissionId: graph.missionId,
-          graphRevision: graph.revision,
-        });
-        expect(
-          matchingWitnesses.some((witness) =>
-            witness.node.evidence.some(
-              (evidence) =>
-                evidence.fingerprint === event.evidenceFingerprint &&
-                (!event.evidenceId || evidence.id === event.evidenceId),
-            ),
-          ),
-          `${phase} exact graph read evidence for ${requirement.toolName} ${linkageDiagnostic}`,
-        ).toBe(true);
         continue;
       }
       expect(
         event.receipt?.id,
         `${phase} mutation receipt for ${requirement.toolName}`,
       ).toBeTruthy();
-      expect(event.receipt?.readbackStatus).toBe("verified");
       expect(
-        matchingWitnesses.some((witness) =>
-          witness.node.receipts.some(
-            (receipt) => receipt.id === event.receipt?.id,
-          ),
-        ),
-        `${phase} graph receipt linkage for ${requirement.toolName}`,
-      ).toBe(true);
+        event.receipt?.readbackStatus,
+        `${phase} mutation receipt readback for ${requirement.toolName}`,
+      ).toBe("verified");
     }
+
+    // Graph-side invariant, inverted: every claim the graph makes for this
+    // tool must be backed by an execution that actually happened. This is the
+    // anti-theatre property. See graphRuntimeLinkage.ts for why the converse
+    // is deliberately not asserted -- a green here is graph honesty, not graph
+    // completeness.
+    const claims: GraphClaimV1[] = matchingWitnesses.flatMap((witness) => [
+      ...witness.node.evidence.map((evidence) => ({
+        nodeId: witness.node.id,
+        toolName: requirement.toolName,
+        claimKind: "evidence" as const,
+        id: evidence.id,
+        fingerprint: evidence.fingerprint,
+      })),
+      ...witness.node.receipts.map((receipt) => ({
+        nodeId: witness.node.id,
+        toolName: requirement.toolName,
+        claimKind: "receipt" as const,
+        id: receipt.id,
+        fingerprint: receipt.fingerprint,
+      })),
+    ]);
+    // Claims are checked against every observed execution in the phase, not
+    // just this tool's. A composite lifecycle node pools evidence for all of
+    // its actions, so attributing the pool to one action's tool would reject
+    // honest claims that another action in the same node produced.
+    const unbacked = findUnbackedGraphClaimsV1(claims, observedLinkage);
+    expect(
+      unbacked,
+      `${phase} graph claims without an observed execution for ${requirement.toolName} ${JSON.stringify(
+        {
+          unbacked,
+          claimCount: claims.length,
+          observedCount: observedLinkage.length,
+          graphMissionId: graph.missionId,
+          graphRevision: graph.revision,
+        },
+      )}`,
+    ).toEqual([]);
   }
 }
 
