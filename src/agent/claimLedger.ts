@@ -226,8 +226,19 @@ export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
 
 export function shouldRequireQuoteSpans(promptOrMode: string): boolean {
   const value = promptOrMode.replace(/\s+/g, " ").trim();
+  // Negation is invisible to a keyword trigger: "in your own words (no
+  // verbatim quotations)" both switched quote-span REQUIREMENT on via the
+  // word "quotations" and instructed the model not to quote — a guaranteed
+  // missing_quote_span refusal, reproduced across four live missions
+  // (2026-08-24). Strip negated quote phrases first so only an affirmative
+  // request arms the requirement; a prompt that also asks positively
+  // ("quote the clause exactly ... do not quote anything else") keeps it.
+  const withoutNegatedQuotes = value.replace(
+    /\b(?:no|not|without|avoid(?:ing)?|don'?t|do not|never)\s+(?:using\s+|any\s+)?(?:verbatim\s+|direct\s+)?quot(?:es?|ed|ations?|ation\s+marks?)\b/gi,
+    "",
+  );
   return /\b(?:quote|quoted|quotations?|text[-\s]?level\s+quotation)\b/i.test(
-    value,
+    withoutNegatedQuotes,
   );
 }
 

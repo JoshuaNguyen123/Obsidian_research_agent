@@ -471,3 +471,31 @@ test("a verbatim quote produces no correction payload", () => {
 
   assert.equal(ledger.quoteCorrections, undefined, JSON.stringify(ledger.quoteCorrections));
 });
+
+test("negated quote phrases do not arm the quote-span requirement", () => {
+  // "no verbatim quotations" simultaneously armed requireQuoteSpans via the
+  // keyword and forbade quoting — a guaranteed missing_quote_span refusal,
+  // live-reproduced four times before this guard existed.
+  assert.equal(
+    shouldRequireQuoteSpans(
+      "Write a short note in your own words (paraphrase, no verbatim quotations). Use current sources and citations.",
+    ),
+    false,
+  );
+  assert.equal(
+    shouldRequireQuoteSpans("Summarize this without quoting anything."),
+    false,
+  );
+  // An affirmative request still arms it.
+  assert.equal(
+    shouldRequireQuoteSpans("Quote the relevant clause exactly as it appears."),
+    true,
+  );
+  // Mixed: the positive request survives the negated-phrase strip.
+  assert.equal(
+    shouldRequireQuoteSpans(
+      "Quote the relevant clause exactly, and do not quote anything else.",
+    ),
+    true,
+  );
+});
