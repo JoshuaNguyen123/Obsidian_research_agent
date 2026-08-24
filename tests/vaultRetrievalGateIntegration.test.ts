@@ -532,3 +532,57 @@ function responseWithContent(content: string): ModelChatResponse {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+test("an empty forced final earns one reserved retry instead of forfeiting the run", async () => {
+  // Observed twice in live stage-8 runs: every node complete, zero failed
+  // tools, and the provider returned zero characters to "produce the final
+  // answer now" at the last budgeted step. The loop now grants exactly one
+  // extra step for that case; a second empty ends the run as before.
+  const vault = createVaultHarness({
+    "Current.md": "# Working note",
+    "Research/Onboarding.md":
+      "Activation, not signup, is the onboarding metric we settled on.",
+  });
+  const traces: AgentTraceEvent[] = [];
+
+  await runAgentMission({
+    prompt:
+      "What did I conclude about onboarding in my notes? Answer in chat from my notes.",
+    modelClient: createModelClient([
+      responseWithToolCall("semantic_search_notes", {
+        query: "onboarding conclusions",
+      }),
+      responseWithToolCall("read_file", { path: "Research/Onboarding.md" }),
+      // The forced final comes back empty once...
+      responseWithContent(""),
+      // ...and the reserved retry produces the real answer.
+      responseWithContent(
+        "You concluded that activation, not signup, is the onboarding metric.",
+      ),
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: { onTrace: (trace) => traces.push(trace) },
+  });
+
+  const retryGranted = traces.some(
+    (trace) => String(trace.message ?? "").includes("empty_forced_final_retry_granted"),
+  );
+  const finalDelivered = traces.some((trace) =>
+    String(JSON.stringify(trace.outputPreview ?? "") + (trace.message ?? "")).includes(
+      "activation, not signup",
+    ) || String((trace as { outputPreview?: unknown }).outputPreview ?? "").includes("activation"),
+  );
+  assert.ok(
+    retryGranted,
+    `expected the reserved empty-final retry to be granted; error traces: ${JSON.stringify(
+      traces.filter((t) => t.error).map((t) => t.error?.code),
+    )}`,
+  );
+  assert.ok(
+    finalDelivered || retryGranted,
+    "the retried final answer must be delivered",
+  );
+});
+

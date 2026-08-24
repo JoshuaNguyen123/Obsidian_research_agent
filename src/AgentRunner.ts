@@ -3112,6 +3112,19 @@ export async function runAgentMission({
   let explanatoryToolRouteReclassified = false;
   let lastStep = 0;
   let lastFinalOutput = "";
+  /**
+   * One reserved retry for a forced final answer that came back empty.
+   *
+   * Twice in live stage-8 runs a fully-satisfied mission -- every graph node
+   * complete, zero failed tools, reflection approved -- died at its very last
+   * step because the provider returned zero characters to "produce the final
+   * answer now", and the step budget had no slack left to ask again. A
+   * 30-minute paid run must not be forfeit to one empty completion: the loop
+   * grants exactly one extra step, once, only for this case.
+   */
+  let awaitingForcedFinalAnswer = false;
+  let emptyForcedFinalRetryUsed = false;
+  let finalRetryExtraSteps = 0;
   let committedProofGatedWrite: {
     payloadFingerprint: string;
     acceptance: MissionAcceptanceResult;
@@ -16606,7 +16619,7 @@ export async function runAgentMission({
   // would spend the shared budget looking busy instead of making progress.
   let specialistRecoveryConsulted = false;
 
-  for (let step = 1; step <= stepLimit; step += 1) {
+  for (let step = 1; step <= stepLimit + finalRetryExtraSteps; step += 1) {
     if (await stopIfRequested(step)) {
       return;
     }
@@ -18049,6 +18062,31 @@ export async function runAgentMission({
           true,
         );
       } catch (error) {
+        if (
+          !emptyForcedFinalRetryUsed &&
+          !hasRenderableAssistantContent(response.message.content ?? "")
+        ) {
+          // Same reserved retry as the forced-final path: an empty completion
+          // at the terminal turn gets exactly one more ask before the run is
+          // forfeit. The flag is shared, so the two sites can never grant two.
+          emptyForcedFinalRetryUsed = true;
+          finalRetryExtraSteps = 1;
+          events.onStatus?.(
+            "Final answer came back empty; granting one reserved retry...",
+          );
+          events.onTrace?.({
+            id: `empty-forced-final-retry-${step}`,
+            kind: "status",
+            step,
+            message: "empty_forced_final_retry_granted",
+          });
+          messages.push({
+            role: "system" as const,
+            content:
+              "Your previous reply was empty. Produce the final answer text now: plain prose grounded in the gathered evidence. Do not return an empty message.",
+          });
+          continue;
+        }
         const message =
           "The model returned no usable answer for this direct-chat request. No tools or writes were performed.";
         lastFinalOutput = "";
@@ -18085,6 +18123,35 @@ export async function runAgentMission({
           progressReason: "model_returned_no_tool_call",
         },
       });
+      if (
+        awaitingForcedFinalAnswer &&
+        !emptyForcedFinalRetryUsed &&
+        !hasRenderableAssistantContent(response.message.content ?? "")
+      ) {
+        // The forced final came back empty. One corrective retry, on a step
+        // reserved exclusively for it -- never a second, and never for a turn
+        // that produced content or a tool call.
+        emptyForcedFinalRetryUsed = true;
+        finalRetryExtraSteps = 1;
+        events.onStatus?.(
+          "Final answer came back empty; granting one reserved retry...",
+        );
+        events.onTrace?.({
+          id: `empty-forced-final-retry-${step}`,
+          kind: "status",
+          step,
+          message: "empty_forced_final_retry_granted",
+        });
+        messages.push({
+          role: "system" as const,
+          content:
+            "Your previous reply was empty. Produce the final answer text now: plain prose grounded in the gathered evidence and receipts. Do not call tools and do not return an empty message.",
+        });
+        continue;
+      }
+      if (hasRenderableAssistantContent(response.message.content ?? "")) {
+        awaitingForcedFinalAnswer = false;
+      }
       if (
         !explanatoryToolRouteReclassified &&
         (runPlan.speechAct === "explain" || runPlan.speechAct === "evaluate") &&
@@ -20901,6 +20968,7 @@ export async function runAgentMission({
      * decided in one place.
      */
     const forceFinalAnswerWithoutTools = (guidance: string): void => {
+      awaitingForcedFinalAnswer = true;
       const preserveToolsForStreamingWriteback =
         pendingStreamingWriteback && streamingWritebackKind !== null;
       if (!preserveToolsForStreamingWriteback) {
@@ -21544,6 +21612,7 @@ export async function runAgentMission({
           content:
             "The mission plan is complete. Do not request more tools. Provide the final answer now using the gathered evidence and receipts.",
         });
+        awaitingForcedFinalAnswer = true;
         continue;
       }
     }
