@@ -50,8 +50,28 @@ import {
   type SandboxCommandRunnerV2,
   type SandboxArtifactImporterV2,
   type SandboxProviderConfigV2,
+  type SandboxExecutionReceiptV2,
   type SandboxStagedFileBytesV2,
 } from "./sandbox";
+import {
+  NOTEBOOK_OPTIONAL_MODULES_V1,
+  NOTEBOOK_RUNTIME_PROBE_EXECUTED_CELLS_V1,
+  NOTEBOOK_RUNTIME_PROBE_PATH_V1,
+  NOTEBOOK_RUNTIME_PROBE_WORKSPACE_ID_V1,
+  buildNotebookExecutionProofV1,
+  createNotebookRuntimeProbeProfileV2,
+  isSafeNotebookPathV1,
+  notebookExecutionArtifactsForCommandV1,
+  notebookExecutionDegradationV1,
+  notebookRuntimeAvailabilityFromProbeV1,
+  notebookRuntimeProbeContentV1,
+  notebookRuntimeUpgradeAdviceV1,
+  notebookStagingPathsV1,
+  planNotebookValidationV1,
+  unprovedNotebookRuntimeV1,
+  type NotebookExecutionProofV1,
+  type NotebookRuntimeAvailabilityV1,
+} from "./notebooks/NotebookExecutionV1";
 import {
   createRepositoryProfileV2,
   defaultRepositoryMergePolicyV2,
@@ -392,6 +412,16 @@ export class CodeExtensionRuntimeV2 {
     promise: Promise<SandboxCapabilityStatusV2>;
   } | null = null;
   private generatedArtifactHealth: GeneratedArtifactHealthProofV1 | null = null;
+  /**
+   * In-memory only, exactly like the generated-artifact proof above: a probe
+   * from a previous session says nothing about the runtime this session
+   * verified, and a stale "available" would contribute a command that cannot
+   * run.
+   */
+  private notebookRuntime: NotebookRuntimeAvailabilityV1 | null = null;
+  private notebookRuntimeProbeInFlight: Promise<NotebookRuntimeAvailabilityV1> | null =
+    null;
+  private lastNotebookExecution: NotebookExecutionProofV1 | null = null;
 
   constructor(options: CodeExtensionRuntimeOptionsV2) {
     if (options.sandboxManager && options.sandboxRunner) {
@@ -474,7 +504,7 @@ export class CodeExtensionRuntimeV2 {
       observeValidationReceipt: this.validationReceiptRegistry
         ? async ({ runId, requestId, action, receipt, diagnostics, context }) => {
             const manifest = await this.workspaceManager.loadManifest(action.workspaceId);
-            return await this.validationReceiptRegistry!.capture({
+            const captured = await this.validationReceiptRegistry!.capture({
               scope: {
                 runId: context.rootMissionId?.trim() || runId,
                 workspaceId: action.workspaceId,
@@ -485,7 +515,9 @@ export class CodeExtensionRuntimeV2 {
               diagnostics,
               validatedWorkspaceManifestFingerprint: manifest.hashes.indexFingerprint,
               workspaceChangedPaths: manifest.budget.changedPaths,
-            }) as unknown as import("@agentic-researcher/core-api").JsonValueV1;
+            });
+            await this.recordNotebookExecutionProof(action.workspaceId, receipt);
+            return captured as unknown as import("@agentic-researcher/core-api").JsonValueV1;
           }
         : undefined,
     });
@@ -498,6 +530,7 @@ export class CodeExtensionRuntimeV2 {
       }),
       this.createSandboxIsolationStatusContribution(),
       this.createGeneratedArtifactStatusContribution(),
+      this.createNotebookExecutionStatusContribution(),
       this.createSettingsContribution(),
       ...(this.repairContributions.length > 0
         ? this.repairContributions
@@ -784,6 +817,11 @@ export class CodeExtensionRuntimeV2 {
         canonicalRoot: manifest.canonicalRoot,
         stagingManifest: sandboxAction.stagingManifest,
         runtimeDigest,
+        // Read the recorded proof; never probe here. Preparation already
+        // decided which command this action is bound to, and a probe that
+        // flipped between the two halves would silently regenerate a
+        // different catalog instead of failing the binding check below.
+        notebookRuntime: this.notebookRuntime,
       });
       const expectedCommand = selectForegroundValidationCommand(
         profile,
@@ -1016,6 +1054,12 @@ export class CodeExtensionRuntimeV2 {
     repairRequestId?: string | null;
     workspaceManifestFingerprint: string;
     stagingManifest: Array<{ path: string; sha256: string; bytes: number }>;
+    expectedArtifacts?: Array<{
+      path: string;
+      expectedSha256: string | null;
+      maxBytes: number;
+      required: boolean;
+    }>;
   }> {
     this.assertInitialized();
     const foregroundScope = purpose.startsWith("validation_")
@@ -1052,6 +1096,13 @@ export class CodeExtensionRuntimeV2 {
         canonicalRoot: manifest.canonicalRoot,
         stagingManifest,
         runtimeDigest,
+        // Only pay for the capability probe when this workspace actually holds
+        // a notebook. A pure Python scratch workspace keeps exactly its old
+        // preparation cost and its old catalog.
+        notebookRuntime:
+          notebookStagingPathsV1(stagingManifest).length > 0
+            ? await this.ensureNotebookExecutionRuntimeV1()
+            : null,
       });
       projectId = SCRATCH_SANDBOX_PROJECT_ID;
       stagingRoots = ["."];
@@ -1137,6 +1188,14 @@ export class CodeExtensionRuntimeV2 {
         );
       }
     }
+    // Executed notebooks are the only host-declared generated artifact of a
+    // validation run. Declaring them here, from the selected command's own
+    // argv, keeps the declaration profile-owned: the model's optional
+    // `expectedArtifacts` argument never reaches a notebook command.
+    const expectedArtifacts = notebookExecutionArtifactsForCommandV1({
+      generatedOutputs: profile.generatedOutputs,
+      command,
+    });
     return {
       profile,
       projectId: project.id,
@@ -1145,6 +1204,7 @@ export class CodeExtensionRuntimeV2 {
       ...(foregroundScope === null ? {} : { repairRequestId: foregroundScope.requestId }),
       workspaceManifestFingerprint: manifest.hashes.indexFingerprint,
       stagingManifest,
+      ...(expectedArtifacts.length > 0 ? { expectedArtifacts } : {}),
     };
   }
 
@@ -1453,6 +1513,193 @@ export class CodeExtensionRuntimeV2 {
   ): GeneratedArtifactHealthProofV1 {
     this.generatedArtifactHealth = { ...proof };
     return { ...proof };
+  }
+
+  /** Cached notebook capability proof for this session; never a durable claim. */
+  readNotebookExecutionRuntimeV1(): NotebookRuntimeAvailabilityV1 | null {
+    return this.notebookRuntime ? { ...this.notebookRuntime } : null;
+  }
+
+  /**
+   * Prove that this sandbox can execute notebook cells, once per session.
+   *
+   * Concurrent callers share one probe: a notebook mission that validates
+   * three times must not start three sandbox processes, and the prepare and
+   * execute halves of a single validation must see the same answer or their
+   * generated profiles would disagree.
+   */
+  async ensureNotebookExecutionRuntimeV1(
+    signal?: AbortSignal,
+  ): Promise<NotebookRuntimeAvailabilityV1> {
+    if (this.notebookRuntime) return { ...this.notebookRuntime };
+    const existing = this.notebookRuntimeProbeInFlight;
+    if (existing) return { ...(await existing) };
+    const flight = this.probeNotebookExecutionRuntimeV1(signal).finally(() => {
+      if (this.notebookRuntimeProbeInFlight === flight) {
+        this.notebookRuntimeProbeInFlight = null;
+      }
+    });
+    this.notebookRuntimeProbeInFlight = flight;
+    return { ...(await flight) };
+  }
+
+  /**
+   * Explicit notebook-execution capability proof.
+   *
+   * It stages one fixed probe notebook the host wrote itself and runs the
+   * host-owned notebook runner over it inside the verified sandbox, under the
+   * same prepared-action, authorization, and artifact-import contract a real
+   * notebook mission uses. Availability is decided by the executed notebook
+   * that returns through the hash-checked importer - not by the exit code and
+   * not by stdout - so "notebooks execute here" is a fact about artifacts.
+   */
+  async probeNotebookExecutionRuntimeV1(
+    signal?: AbortSignal,
+  ): Promise<NotebookRuntimeAvailabilityV1> {
+    this.assertInitialized();
+    const checkedAt = this.isoNow();
+    const unproved = (diagnostic: string) =>
+      this.recordNotebookRuntime(
+        unprovedNotebookRuntimeV1({ checkedAt, diagnostic }),
+      );
+    try {
+      // The same host-controlled probe the scratch validation path uses. It
+      // never adopts a new provider binding and never receives a
+      // model-supplied command.
+      const status = await this.probeConfiguredSandboxProviders(signal);
+      if (!status.executionAvailable || !status.selectedProvider) {
+        return unproved(
+          status.blocker?.message ??
+            "Notebook execution requires a verified sandbox provider.",
+        );
+      }
+      const provider = this.requireState().sandbox.providerConfigs.find(
+        (candidate) => candidate.kind === status.selectedProvider,
+      );
+      if (!provider) {
+        return unproved(
+          "The verified sandbox provider is not bound to durable Code state.",
+        );
+      }
+      const notebookBytes = new TextEncoder().encode(notebookRuntimeProbeContentV1());
+      const stagingManifest = [
+        {
+          path: NOTEBOOK_RUNTIME_PROBE_PATH_V1,
+          bytes: notebookBytes.byteLength,
+          sha256: sha256Bytes(notebookBytes),
+        },
+      ];
+      const profile = createNotebookRuntimeProbeProfileV2({
+        runtimeDigest: provider.runtimeDigest,
+      });
+      const command = profile.validationCatalog[0]!;
+      const preparation = await this.requireSandboxManager().prepareExecution({
+        profile,
+        purpose: "validation_fast",
+        projectId: command.projectId,
+        commandId: command.id,
+        workspaceId: NOTEBOOK_RUNTIME_PROBE_WORKSPACE_ID_V1,
+        repairRequestId: NOTEBOOK_RUNTIME_PROBE_WORKSPACE_ID_V1,
+        workspaceManifestFingerprint: sha256Canonical(stagingManifest),
+        stagingManifest,
+        expectedArtifacts: [
+          {
+            path: NOTEBOOK_RUNTIME_PROBE_PATH_V1,
+            expectedSha256: null,
+            maxBytes: 1_000_000,
+            required: true,
+          },
+        ],
+        environment: { CI: "true" },
+        resources: { timeoutMs: command.timeoutMs },
+      });
+      if (preparation.status !== "prepared") {
+        return unproved(preparation.blocker.message);
+      }
+      let executedNotebook: string | null = null;
+      const result = await this.requireSandboxManager().executePrepared(
+        preparation.action,
+        {
+          authorization: {
+            preparedActionId: preparation.action.id,
+            payloadFingerprint: preparation.action.payloadFingerprint,
+            grantId: "host-explicit-notebook-runtime-probe",
+          },
+          stagedFiles: [
+            { path: NOTEBOOK_RUNTIME_PROBE_PATH_V1, bytes: notebookBytes },
+          ],
+          artifactImporter: {
+            async importArtifacts(artifacts) {
+              return artifacts.map((artifact) => {
+                if (artifact.path === NOTEBOOK_RUNTIME_PROBE_PATH_V1) {
+                  executedNotebook = new TextDecoder().decode(artifact.bytes);
+                }
+                return {
+                  path: artifact.path,
+                  readbackSha256: sha256Bytes(artifact.bytes),
+                };
+              });
+            },
+          },
+          signal,
+        },
+      );
+      if (result.status === "blocked") return unproved(result.blocker.message);
+      return this.recordNotebookRuntime(
+        notebookRuntimeAvailabilityFromProbeV1({
+          checkedAt,
+          exitCode: result.receipt.exitCode,
+          stdout: result.diagnosticExcerpt.stdout,
+          executedNotebook,
+          expectedExecutedCells: NOTEBOOK_RUNTIME_PROBE_EXECUTED_CELLS_V1,
+        }),
+      );
+    } catch (error) {
+      return unproved(
+        `Notebook runtime probe did not complete: ${safeCodeHealthError(error)}`,
+      );
+    }
+  }
+
+  private recordNotebookRuntime(
+    availability: NotebookRuntimeAvailabilityV1,
+  ): NotebookRuntimeAvailabilityV1 {
+    this.notebookRuntime = { ...availability };
+    return { ...availability };
+  }
+
+  /** The last notebook this session actually executed, with its receipt binding. */
+  readLastNotebookExecutionV1(): NotebookExecutionProofV1 | null {
+    return this.lastNotebookExecution ? { ...this.lastNotebookExecution } : null;
+  }
+
+  /**
+   * Turn a completed validation receipt into a notebook execution proof.
+   *
+   * Only artifacts the receipt itself imported are considered, and the proof
+   * builder re-checks that the workspace bytes still hash to what the sandbox
+   * returned - so "executed" is never a claim about a notebook that merely sat
+   * next to an execution. A notebook that cannot be proved simply leaves the
+   * previous proof standing; this is evidence, and a validation that already
+   * produced a durable receipt must not fail because of it.
+   */
+  private async recordNotebookExecutionProof(
+    workspaceId: string,
+    receipt: SandboxExecutionReceiptV2,
+  ): Promise<void> {
+    for (const artifact of receipt.importedArtifacts) {
+      if (!isSafeNotebookPathV1(artifact.path)) continue;
+      try {
+        const readback = await this.workspaceManager.read(workspaceId, artifact.path);
+        this.lastNotebookExecution = buildNotebookExecutionProofV1({
+          notebookPath: artifact.path,
+          content: readback.content,
+          receipt,
+        });
+      } catch {
+        // Unprovable: leave the previous proof in place rather than claim one.
+      }
+    }
   }
 
   /**
@@ -2406,6 +2653,59 @@ export class CodeExtensionRuntimeV2 {
               PREPARED_BACKGROUND_CODE_TOOL_NAME_V1,
           },
           checkedAt: proof?.checkedAt ?? context.now().toISOString(),
+        };
+      },
+    };
+  }
+
+  /**
+   * Say out loud what notebook missions can and cannot do right now. A missing
+   * capability must never be silent: either this reports the exact reason cell
+   * execution is unavailable, or it reports which scientific packages the
+   * pinned runtime lacks, which is the next thing a notebook will hit.
+   */
+  private createNotebookExecutionStatusContribution(): StatusContributionV1 {
+    return {
+      descriptor: {
+        version: 1,
+        kind: "status",
+        id: `${EXTENSION_ID}:notebook-execution-health`,
+        displayName: "Jupyter notebook cell execution",
+      },
+      readStatus: async (context) => {
+        const availability = this.notebookRuntime;
+        const degradation = notebookExecutionDegradationV1(availability);
+        const upgradeAdvice = notebookRuntimeUpgradeAdviceV1(availability);
+        return {
+          status: degradation ? "degraded" : "healthy",
+          summary: degradation
+            ? `${degradation.message} ${degradation.requiredAction}`
+            : `Notebook cells execute in the verified sandbox through the host runner on Python ${
+                availability?.python ?? "unknown"
+              }.${upgradeAdvice ? ` ${upgradeAdvice}` : ""}`,
+          details: {
+            engine: availability?.engine ?? null,
+            available: availability?.available ?? false,
+            degradationCode: degradation?.code ?? null,
+            python: availability?.python ?? null,
+            runnerFingerprint: availability?.runnerFingerprint ?? null,
+            lastExecutedNotebook: this.lastNotebookExecution
+              ? {
+                  path: this.lastNotebookExecution.notebookPath,
+                  executionState: this.lastNotebookExecution.executionState,
+                  executedCells: this.lastNotebookExecution.executedCells,
+                  erroredCells: this.lastNotebookExecution.erroredCells,
+                  receiptFingerprint: this.lastNotebookExecution.receiptFingerprint,
+                  artifactSha256: this.lastNotebookExecution.artifactSha256,
+                }
+              : null,
+            missingOptionalModules: availability
+              ? NOTEBOOK_OPTIONAL_MODULES_V1.filter(
+                  (name) => availability.optionalModules[name] !== true,
+                )
+              : [...NOTEBOOK_OPTIONAL_MODULES_V1],
+          },
+          checkedAt: availability?.checkedAt ?? context.now().toISOString(),
         };
       },
     };
@@ -3413,15 +3713,39 @@ function createScratchPythonSandboxProfileV2(input: {
   canonicalRoot: string;
   stagingManifest: readonly { path: string; sha256: string; bytes: number }[];
   runtimeDigest: string;
+  /**
+   * Proof from a real probe run that this sandbox executes notebook cells.
+   * Absent or unproved means notebooks contribute no command at all, which is
+   * exactly today's author-only behaviour rather than a red validation.
+   */
+  notebookRuntime?: NotebookRuntimeAvailabilityV1 | null;
 }): RepositoryProfileV2 {
   const pythonPaths = input.stagingManifest
     .map((entry) => assertWorkspaceRelativePathV2(entry.path))
     .filter((entryPath) => entryPath.toLowerCase().endsWith(".py"));
+  const notebookPlan = planNotebookValidationV1({
+    projectId: SCRATCH_SANDBOX_PROJECT_ID,
+    projectRoot: ".",
+    stagingManifest: input.stagingManifest,
+    hasOtherSources: pythonPaths.length > 0,
+    availability: input.notebookRuntime ?? null,
+  });
   if (pythonPaths.length === 0) {
-    throw new CodeSandboxContributionErrorV2(
-      "scratch_validation_unsupported",
-      "Scratch validation currently requires at least one Python .py file. The workspace remains editable and exportable.",
-    );
+    if (notebookPlan.notebookPaths.length === 0) {
+      throw new CodeSandboxContributionErrorV2(
+        "scratch_validation_unsupported",
+        "Scratch validation currently requires at least one Python .py file or one .ipynb notebook. The workspace remains editable and exportable.",
+      );
+    }
+    if (notebookPlan.degradation) {
+      // Notebooks are the only source here, so there is nothing else to
+      // validate. Fail with the exact notebook reason instead of the generic
+      // "needs a .py file", which was actively misleading for this workspace.
+      throw new CodeSandboxContributionErrorV2(
+        notebookPlan.degradation.code,
+        `${notebookPlan.degradation.message} ${notebookPlan.degradation.requiredAction}`,
+      );
+    }
   }
   const profileKey = `scratch-${sha256Canonical({
     version: 1,
@@ -3440,31 +3764,35 @@ function createScratchPythonSandboxProfileV2(input: {
   ];
   const unittestStartDirectory =
     pythonTestDirectories.length === 1 ? pythonTestDirectories[0]! : ".";
-  const validationCatalog: RepositoryValidationCommandV2[] = (
-    ["fast", "targeted", "full"] as const
-  ).map((phase) => ({
-    id: `scratch-python-${phase}`,
-    phase,
-    projectId: SCRATCH_SANDBOX_PROJECT_ID,
-    executable: "python",
-    args:
-      phase === "fast" || pythonTestPaths.length === 0
-        ? ["-m", "compileall", "-q", "."]
-        : [
-            "-m",
-            "unittest",
-            "discover",
-            "-s",
-            unittestStartDirectory,
-            "-p",
-            "test*.py",
-          ],
-    cwd: ".",
-    timeoutMs: 60_000,
-    network: "disabled",
-    credentialPolicy: "none",
-    lockfile: null,
-  }));
+  const notebookOwned = new Set(notebookPlan.phases);
+  const validationCatalog: RepositoryValidationCommandV2[] = [
+    ...(["fast", "targeted", "full"] as const)
+      .filter((phase) => !notebookOwned.has(phase))
+      .map((phase) => ({
+        id: `scratch-python-${phase}`,
+        phase,
+        projectId: SCRATCH_SANDBOX_PROJECT_ID,
+        executable: "python",
+        args:
+          phase === "fast" || pythonTestPaths.length === 0
+            ? ["-m", "compileall", "-q", "."]
+            : [
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                unittestStartDirectory,
+                "-p",
+                "test*.py",
+              ],
+        cwd: ".",
+        timeoutMs: 60_000,
+        network: "disabled" as const,
+        credentialPolicy: "none" as const,
+        lockfile: null,
+      })),
+    ...notebookPlan.commands,
+  ];
   return createRepositoryProfileV2({
     key: profileKey,
     displayName: `Scratch workspace ${input.workspaceId}`,
@@ -3489,7 +3817,10 @@ function createScratchPythonSandboxProfileV2(input: {
       approval: "one_time_exact_digest",
     }],
     validationCatalog,
-    generatedOutputs: [],
+    // Executed notebooks come back through the ordinary generated-artifact
+    // importer, so the exact bytes a cell produced are hash-checked on the way
+    // in. Nothing else about a scratch workspace is a generated output.
+    generatedOutputs: notebookPlan.generatedOutputs,
     requiredGitHubChecks: [],
     mergePolicy: defaultRepositoryMergePolicyV2(),
   });

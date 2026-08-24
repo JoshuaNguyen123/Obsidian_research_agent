@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -43,6 +43,12 @@ import {
   CODE_REPAIR_STATUS_TOOL,
 } from "../extensions/code/repair";
 import { WorkspaceManagerV2 } from "../extensions/code/workspaces";
+import { buildJupyterNotebookV1 } from "../extensions/code/JupyterNotebookV1";
+import {
+  buildNotebookExecutionProofV1,
+  decodeNotebookRunnerArgsV1,
+  readNotebookExecutionEvidenceV1,
+} from "../extensions/code/notebooks/NotebookExecutionV1";
 
 const NOW = "2026-07-12T18:00:00.000Z";
 const SHA = (character: string) => `sha256:${character.repeat(64)}`;
@@ -2374,3 +2380,353 @@ function sha256Bytes(value: Uint8Array): string {
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
+
+/**
+ * Emulate the sandbox entrypoint's artifact contract closely enough to be
+ * evidence: stage the exact bytes, run the exact guest argv, and return every
+ * file whose content changed. Anything the host did not declare is dropped by
+ * the production importer, not by this fixture.
+ */
+async function runGuestCommandWithArtifacts(input: {
+  root: string;
+  spec: { args: string[] };
+  stagedFiles: readonly { path: string; bytes: Uint8Array }[];
+}): Promise<{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  artifacts: Record<string, Uint8Array>;
+}> {
+  const executionRoot = await mkdtemp(path.join(input.root, "guest-"));
+  for (const staged of input.stagedFiles) {
+    const target = path.join(executionRoot, ...staged.path.split("/"));
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, staged.bytes);
+  }
+  const snapshot = async (): Promise<Map<string, string>> => {
+    const seen = new Map<string, string>();
+    const walk = async (relative: string): Promise<void> => {
+      const absolute = path.join(executionRoot, relative);
+      for (const entry of await readdir(absolute, { withFileTypes: true })) {
+        const next = relative ? `${relative}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await walk(next);
+          continue;
+        }
+        seen.set(
+          next,
+          sha256Bytes(await readFile(path.join(executionRoot, ...next.split("/")))),
+        );
+      }
+    };
+    await walk("");
+    return seen;
+  };
+  const before = await snapshot();
+  const delimiter = input.spec.args.indexOf("--");
+  assert.ok(delimiter >= 0, "sandbox command must delimit the exact guest argv");
+  const executable = input.spec.args[delimiter + 1]!;
+  const guestArgs = input.spec.args.slice(delimiter + 2);
+  let exitCode = 0;
+  let stdout = "";
+  let stderr = "";
+  try {
+    const completed = await execFileAsync(executable, guestArgs, {
+      cwd: executionRoot,
+      windowsHide: true,
+      timeout: 60_000,
+      encoding: "utf8",
+    });
+    stdout = completed.stdout;
+    stderr = completed.stderr;
+  } catch (error) {
+    const failed = error as Error & {
+      code?: number | string;
+      stdout?: string;
+      stderr?: string;
+    };
+    exitCode = typeof failed.code === "number" ? failed.code : 1;
+    stdout = failed.stdout ?? "";
+    stderr = failed.stderr ?? failed.message;
+  }
+  const after = await snapshot();
+  const artifacts: Record<string, Uint8Array> = {};
+  for (const [relative, digest] of after) {
+    if (before.get(relative) === digest) continue;
+    artifacts[relative] = new Uint8Array(
+      await readFile(path.join(executionRoot, ...relative.split("/"))),
+    );
+  }
+  return { exitCode, stdout, stderr, artifacts };
+}
+
+function verifiedBoundaryProbeStdout(): string {
+  return JSON.stringify({
+    version: 1,
+    uid: 65532,
+    networkBlocked: true,
+    rootReadOnly: true,
+    hostRootAbsent: true,
+    containerSocketAbsent: true,
+    runtimeReadOnly: true,
+    runtimeDigest: SHA("f"),
+    stagingIsolated: true,
+    resourceLimitsEnforced: true,
+  });
+}
+
+const NOTEBOOK_FIXTURE_PROVIDER: SandboxProviderConfigV2 = {
+  version: 1,
+  kind: "docker",
+  executable: "docker",
+  priority: 10,
+  runtimeReference: "registry.example/agentic-sandbox",
+  runtimeDigest: SHA("f"),
+  wslDistribution: null,
+  runtimeRoot: null,
+};
+
+test("CodeExtensionRuntimeV2 executes notebook cells in the sandbox and imports the executed notebook", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-scratch-notebook-"));
+  try {
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(root, "app-data"),
+      now: () => new Date(NOW),
+      randomId: incrementingId(),
+    });
+    const guestCommands: string[][] = [];
+    const sandboxRunner: SandboxCommandRunnerV2 = {
+      async run(spec, input) {
+        if (spec.purpose === "boundary_probe") {
+          return { exitCode: 0, stdout: verifiedBoundaryProbeStdout(), stderr: "" };
+        }
+        const delimiter = spec.args.indexOf("--");
+        guestCommands.push(spec.args.slice(delimiter + 1));
+        return await runGuestCommandWithArtifacts({
+          root,
+          spec: { args: [...spec.args] },
+          stagedFiles: input?.stagedFiles ?? [],
+        });
+      },
+    };
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: manager,
+      sandboxRunner,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await runtime.configureSandboxProvider(NOTEBOOK_FIXTURE_PROVIDER);
+    const manifest = await manager.createScratchWorkspace({
+      workspaceId: "scratch-notebook",
+      ownerRunId: "fixture-run",
+    });
+    const leased = await manager.acquireLease(
+      manifest.workspaceId,
+      "extension:fixture-run",
+    );
+    const authored = buildJupyterNotebookV1({
+      cells: [
+        { type: "markdown", source: "# Growth rate\n" },
+        { type: "code", source: "rate = 0.12\nprint('rate=' + str(rate))\n" },
+        { type: "code", source: "round(rate * 100, 1)\n" },
+      ],
+    });
+    assert.equal(
+      authored.executionState,
+      "not_executed",
+      "authoring must never claim execution",
+    );
+    await manager.createFile(
+      manifest.workspaceId,
+      leased.lease!.id,
+      "analysis.ipynb",
+      authored.content,
+    );
+
+    assert.equal(
+      runtime.readNotebookExecutionRuntimeV1(),
+      null,
+      "notebook execution must be unproved until a probe actually runs one",
+    );
+
+    const targeted = await runtime.resolveSandboxPreparationInput(
+      "validation_targeted",
+      manifest.workspaceId,
+    );
+    assert.equal(targeted.commandId, "scratch-notebook-targeted");
+    assert.deepEqual(
+      targeted.expectedArtifacts?.map((artifact) => artifact.path),
+      ["analysis.ipynb"],
+      "the host, not the model, declares the executed notebook artifact",
+    );
+    const availability = runtime.readNotebookExecutionRuntimeV1();
+    assert.equal(availability?.available, true);
+    assert.equal(availability?.engine, "stdlib_cell_runner_v1");
+    assert.deepEqual(
+      decodeNotebookRunnerArgsV1(
+        targeted.profile.validationCatalog.find(
+          (command) => command.id === targeted.commandId,
+        )!.args,
+      ).notebookPaths,
+      ["analysis.ipynb"],
+    );
+
+    const contribution = runtime.getContributions().find(
+      (candidate: any) =>
+        candidate?.descriptor?.kind === "tool" &&
+        candidate?.tool?.name === "code_validate_targeted",
+    ) as any;
+    const prepared = await contribution.tool.prepare(
+      { workspaceId: manifest.workspaceId, repairRequestId: "notebook-iteration" },
+      extensionContext(),
+    );
+    assert.equal(prepared.ok, true);
+    const executed = await contribution.tool.executePrepared(prepared.action, {
+      ...extensionContext(),
+      authorizedAction: {
+        preparedActionId: prepared.action.id,
+        payloadFingerprint: prepared.action.payloadFingerprint,
+        grantId: "notebook-iteration-grant",
+      },
+    });
+    assert.equal(executed.output.status, "verified");
+    const receipt = executed.output.sandboxReceipt;
+    assert.deepEqual(
+      receipt.importedArtifacts.map((artifact: { path: string }) => artifact.path),
+      ["analysis.ipynb"],
+    );
+
+    const readback = await manager.read(manifest.workspaceId, "analysis.ipynb");
+    const evidence = readNotebookExecutionEvidenceV1(readback.content);
+    assert.equal(evidence.codeCells, 2);
+    assert.equal(evidence.executedCells, 2);
+    assert.equal(evidence.erroredCells, 0);
+    assert.equal(evidence.resultCells, 1, "a trailing expression must return a result");
+    assert.ok(
+      evidence.streamCharacters > 0,
+      "a printing cell must return captured stdout",
+    );
+    assert.match(readback.content, /rate=0\.12/u);
+    assert.match(readback.content, /12\.0/u);
+
+    const proof = buildNotebookExecutionProofV1({
+      notebookPath: "analysis.ipynb",
+      content: readback.content,
+      receipt,
+    });
+    assert.equal(proof.executionState, "executed");
+    assert.equal(proof.executedCells, 2);
+    assert.equal(proof.receiptFingerprint, receipt.fingerprint);
+
+    const status = runtime.getContributions().find(
+      (candidate: any) =>
+        candidate?.descriptor?.kind === "status" &&
+        candidate?.descriptor?.id ===
+          "agentic-researcher-code:notebook-execution-health",
+    ) as any;
+    const health = await status.readStatus(extensionContext());
+    assert.equal(health.status, "healthy");
+    assert.match(health.summary, /Notebook cells execute in the verified sandbox/u);
+    assert.deepEqual(health.details.lastExecutedNotebook, {
+      path: "analysis.ipynb",
+      executionState: "executed",
+      executedCells: 2,
+      erroredCells: 0,
+      receiptFingerprint: receipt.fingerprint,
+      artifactSha256: proof.artifactSha256,
+    });
+    assert.deepEqual(runtime.readLastNotebookExecutionV1(), proof);
+
+    assert.equal(
+      guestCommands.filter((command) => command[1] === "-c").length,
+      2,
+      "one capability probe run and one notebook validation run",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 keeps a notebook mission author-only when the sandbox cannot run cells", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-notebook-degraded-"));
+  try {
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(root, "app-data"),
+      now: () => new Date(NOW),
+      randomId: incrementingId(),
+    });
+    const sandboxRunner: SandboxCommandRunnerV2 = {
+      async run(spec) {
+        if (spec.purpose === "boundary_probe") {
+          return { exitCode: 0, stdout: verifiedBoundaryProbeStdout(), stderr: "" };
+        }
+        // A pinned runtime whose Python cannot host the runner at all.
+        return {
+          exitCode: 70,
+          stdout: "",
+          stderr: "sandbox_protocol_error=runtime manifest does not bind this command",
+        };
+      },
+    };
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: manager,
+      sandboxRunner,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await runtime.configureSandboxProvider(NOTEBOOK_FIXTURE_PROVIDER);
+    const manifest = await manager.createScratchWorkspace({
+      workspaceId: "scratch-notebook-degraded",
+      ownerRunId: "fixture-run",
+    });
+    const leased = await manager.acquireLease(
+      manifest.workspaceId,
+      "extension:fixture-run",
+    );
+    const authored = buildJupyterNotebookV1({
+      cells: [{ type: "code", source: "print('hello')\n" }],
+    });
+    await manager.createFile(
+      manifest.workspaceId,
+      leased.lease!.id,
+      "analysis.ipynb",
+      authored.content,
+    );
+
+    await assert.rejects(
+      runtime.resolveSandboxPreparationInput(
+        "validation_targeted",
+        manifest.workspaceId,
+      ),
+      (error: unknown) =>
+        error instanceof CodeSandboxContributionErrorV2 &&
+        error.code === "notebook_runtime_probe_failed" &&
+        /authoring, reading, and export are unaffected/u.test(error.message) &&
+        /Reprovision the sandbox runtime/u.test(error.message),
+      "a notebook-only workspace must fail with the exact notebook reason, not the old .py message",
+    );
+
+    const status = runtime.getContributions().find(
+      (candidate: any) =>
+        candidate?.descriptor?.kind === "status" &&
+        candidate?.descriptor?.id ===
+          "agentic-researcher-code:notebook-execution-health",
+    ) as any;
+    const health = await status.readStatus(extensionContext());
+    assert.equal(health.status, "degraded");
+    assert.equal(health.details.degradationCode, "notebook_runtime_probe_failed");
+
+    const readback = await manager.read(manifest.workspaceId, "analysis.ipynb");
+    assert.equal(
+      readback.content,
+      authored.content,
+      "a degraded notebook runtime must leave the authored notebook byte-identical",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

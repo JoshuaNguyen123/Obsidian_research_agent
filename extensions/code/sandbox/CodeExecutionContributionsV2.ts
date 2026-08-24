@@ -63,6 +63,13 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
     repairRequestId?: string | null;
     workspaceManifestFingerprint: string;
     stagingManifest: SandboxPrepareInputV2["stagingManifest"];
+    /**
+     * Host-declared generated artifacts for this exact command. When present
+     * they replace the model's optional `expectedArtifacts` argument outright,
+     * so a command whose outputs the profile owns can never have that set
+     * widened, narrowed, or renamed from a tool call.
+     */
+    expectedArtifacts?: SandboxPrepareInputV2["expectedArtifacts"];
   }>;
   resolveExecutionInput?(
     action: PreparedActionV1,
@@ -264,7 +271,8 @@ function preparedSandboxContribution(
           workspaceManifestFingerprint:
             hostProof?.workspaceManifestFingerprint ?? normalized.workspaceManifestFingerprint!,
           stagingManifest: hostProof?.stagingManifest ?? normalized.stagingManifest!,
-          expectedArtifacts: normalized.expectedArtifacts,
+          expectedArtifacts:
+            hostProof?.expectedArtifacts ?? normalized.expectedArtifacts,
           environment: normalized.environment,
         });
         if (prepared.status === "blocked") {
