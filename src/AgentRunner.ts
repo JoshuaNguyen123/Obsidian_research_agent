@@ -7462,6 +7462,26 @@ export async function runAgentMission({
   const hostAutoFollowupsAllowed = (): boolean =>
     getRunBudgetProfile(runPlan.route).allowsAutoFollowups;
   /**
+   * One predicate for "could the host actually run this follow-up tool now" --
+   * shared by follow-up scheduling and the vault body-read debt, because they
+   * diverged once and the divergence stranded a finished mission: the debt was
+   * levied off the run-level allowlist while the follow-up that pays it also
+   * required a ready mission-graph slot. On an exact planned code frontier
+   * `read_file` has no node, so a BYOK run completed all fourteen ladder nodes
+   * and was then held at acceptance by a vault debt nothing was permitted to
+   * pay, while `force_final_no_tools` simultaneously forbade the tool call the
+   * debt demanded. Levy and payment must read the same answer.
+   */
+  const isHostFollowupToolExecutable = (toolName: string): boolean => {
+    if (!allowedToolNames.has(toolName)) return false;
+    const graph = missionGraphSession?.graph ?? missionGraph;
+    return (
+      !missionGraphUsesExactPlannedFrontier ||
+      !graph ||
+      countReadyMissionGraphToolSlots(graph, toolName) > 0
+    );
+  };
+  /**
    * The vault body-read debt as it stands right now.
    *
    * Owed only when a read tool is on the frontier and the host is permitted to
@@ -7477,8 +7497,8 @@ export async function runAgentMission({
       attemptedPaths: vaultNoteBodyReadAttemptedPaths,
       requiresBodyRead:
         hostAutoFollowupsAllowed() &&
-        (allowedToolNames.has("read_file") ||
-          allowedToolNames.has("read_markdown_files")) &&
+        (isHostFollowupToolExecutable("read_file") ||
+          isHostFollowupToolExecutable("read_markdown_files")) &&
         vaultSearchSurfacedPaths.length > 0,
     });
   const evaluateCurrentAcceptance = (
@@ -11606,15 +11626,9 @@ export async function runAgentMission({
     // graph hands `read_markdown_files` to the model as its only legal next
     // step, so the host taking it consumes a node the model was meant to use.
     // The graph is already enforcing that read.
-    const isFollowupExecutable = (toolName: string): boolean => {
-      if (!allowedToolNames.has(toolName)) return false;
-      const graph = missionGraphSession?.graph ?? missionGraph;
-      return (
-        !missionGraphUsesExactPlannedFrontier ||
-        !graph ||
-        countReadyMissionGraphToolSlots(graph, toolName) > 0
-      );
-    };
+    // Delegates to the shared predicate so the debt levy and the follow-up
+    // scheduler can never disagree about payability again.
+    const isFollowupExecutable = isHostFollowupToolExecutable;
     const corroborationQuery =
       toolName === "semantic_search_notes" && !keywordCorroborationUsed
         ? pendingKeywordCorroborationQuery
