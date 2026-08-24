@@ -17643,7 +17643,7 @@ export async function runAgentMission({
               truncateForPromptAnchor(
                 getString(verifiedLinearCodeIssueRecordSnapshot.description) ??
                   "",
-                24_000,
+                MAX_VERIFIED_LINEAR_SPEC_ANCHOR_CHARS,
               ),
               "END VERIFIED LINEAR PRODUCT SPECIFICATION",
             ].join("\n")
@@ -17699,6 +17699,7 @@ export async function runAgentMission({
         resolvedRepositoryVisibility
           ? `EXACT GITHUB PUBLICATION BINDING: profileKey=${JSON.stringify(verifiedLinearRepositoryBindingSnapshot.repositoryProfileKey)}; visibility=${resolvedRepositoryVisibility}; call github_create_repository with these exact values.`
           : null;
+      pruneStaleFrontierCorrections(messages);
       const stepMessages =
         stepTools.length > 0 && (missionGraph || setLooseCompoundEnabled)
           ? insertMissionGraphFrontierTurnContext(
@@ -17719,10 +17720,8 @@ export async function runAgentMission({
                 ),
                 githubPublicationBinding,
                 codeSpecCard,
-                verifiedLinearRepositoryCard,
                 verifiedGitPathCard,
                 routingCard,
-                researchClosureCard,
               ]
                 .filter(Boolean)
                 .join("\n\n") || null,
@@ -17734,6 +17733,17 @@ export async function runAgentMission({
                   null,
                 stageBudgetBlock,
                 resolvedRepositoryVisibility,
+                // These two cards must reach the model verbatim: the Linear
+                // card carries the product specification and the closure card
+                // carries the only legal next call. Concatenated into
+                // observedBinding they were shredded by the evidence filter
+                // (BEGIN…END spec bodies are single giant lines, and the
+                // closure marker is in BULKY_CARD_MARKERS), so the host
+                // computed them every turn and the model never saw either.
+                verbatimCards: [
+                  verifiedLinearRepositoryCard,
+                  researchClosureCard,
+                ].filter((card): card is string => Boolean(card)),
               },
             )
           : messages;
@@ -27948,6 +27958,49 @@ function shouldExpandVaultRetrievalCoverage(
   );
 }
 
+/**
+ * Marks step-scoped correction prompts so stale ones can be pruned. Each
+ * correction embeds a snapshot of that step's tool list; left in history they
+ * outlive their step and contradict the live STAGE PROMPT, which is the one
+ * callable-tool authority. Only the newest correction survives into the next
+ * turn.
+ */
+const FRONTIER_CORRECTION_SENTINEL =
+  "FRONTIER CORRECTION (valid only for the step it was issued):";
+
+/**
+ * The Linear spec anchor was capped at 24k, but the card it lived in was
+ * destroyed by the evidence filter before reaching any model — so the cap was
+ * never exercised. Now that the card is delivered verbatim, 24k of spec on a
+ * 48k-assumed-context run would crowd out the working history; 8k carries
+ * every observed accepted-research contract.
+ */
+const MAX_VERIFIED_LINEAR_SPEC_ANCHOR_CHARS = 8_000;
+
+function pruneStaleFrontierCorrections(messages: ModelChatMessage[]): void {
+  let newestIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (
+      message.role === "system" &&
+      message.content.startsWith(FRONTIER_CORRECTION_SENTINEL)
+    ) {
+      newestIndex = index;
+      break;
+    }
+  }
+  if (newestIndex < 0) return;
+  for (let index = newestIndex - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (
+      message.role === "system" &&
+      message.content.startsWith(FRONTIER_CORRECTION_SENTINEL)
+    ) {
+      messages.splice(index, 1);
+    }
+  }
+}
+
 function buildUnavailableToolCorrectionPrompt(
   tools: ModelChatRequest["tools"],
   priorToolName: string | null = null,
@@ -27958,6 +28011,7 @@ function buildUnavailableToolCorrectionPrompt(
     : null;
 
   return [
+    FRONTIER_CORRECTION_SENTINEL,
     "Your prior tool call is not available at the current authoritative MissionGraph frontier.",
     priorToolName ? `Prior unavailable tool: ${priorToolName}.` : "",
     `The only available tools for this step are: ${toolNames.join(", ") || "none"}.`,
@@ -27978,6 +28032,7 @@ function buildReadyFrontierNoToolCorrection(
       ? `Call ${readyToolNames[0]} now using its offered schema.`
       : `Call exactly one ready tool now: ${readyToolNames.join(", ")}.`;
   return [
+    FRONTIER_CORRECTION_SENTINEL,
     formatMissionAcceptanceCorrection(acceptance, [...readyToolNames]),
     "Your prior response contained prose but no tool call, so it did not advance the executable MissionGraph.",
     exactInstruction,
@@ -27993,6 +28048,7 @@ function buildExactFrontierNoToolCorrection(
       ? `Call ${readyToolNames[0]} now using its offered schema.`
       : `Call exactly one ready tool now: ${readyToolNames.join(", ")}.`;
   return [
+    FRONTIER_CORRECTION_SENTINEL,
     "Your prior response contained prose but no tool call, so it did not advance the executable MissionGraph.",
     `The only ready frontier tools are: ${readyToolNames.join(", ")}.`,
     exactInstruction,
@@ -28005,6 +28061,7 @@ function buildGenericNoToolCorrection(
   readyToolNames: readonly string[],
 ): string {
   return [
+    FRONTIER_CORRECTION_SENTINEL,
     "Your prior response contained prose but no tool call, so the mission did not advance.",
     `The tools available this step are: ${readyToolNames.join(", ")}.`,
     "Call the single most relevant tool now using its offered schema, or the run will stop as blocked.",
@@ -31365,11 +31422,22 @@ function insertMissionGraphFrontierTurnContext(
     currentStage?: string | null;
     stageBudgetBlock?: string | null;
     resolvedRepositoryVisibility?: "public" | "private" | null;
+    /**
+     * Cards delivered as their own system message, bypassing the stage
+     * prompt's evidence filter entirely. Reserved for content the model must
+     * see whole (the Linear product specification, the research-closure
+     * instruction) — never for routing chatter the filter exists to strip.
+     */
+    verbatimCards?: readonly string[];
   } = {},
 ): ModelChatMessage[] {
   const insertAt = Math.max(0, messages.length - 1);
+  const verbatim = (options.verbatimCards ?? []).filter(Boolean);
   return [
     ...messages.slice(0, insertAt),
+    ...(verbatim.length > 0
+      ? [{ role: "system" as const, content: verbatim.join("\n\n") }]
+      : []),
     {
       role: "system",
       content: buildMissionGraphFrontierTurnContext(
