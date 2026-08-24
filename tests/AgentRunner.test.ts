@@ -13131,6 +13131,9 @@ test("streamed final answers strip special tokens split across chunks", async ()
           url: "https://example.com/source",
         }),
       () => responseWithContent(""),
+      // The reserved empty-final retry asks once more; the retry answers
+      // empty again, so the run proceeds to the streamed fallback.
+      () => responseWithContent(""),
     ],
     streamResponders: [
       () =>
@@ -13156,7 +13159,7 @@ test("streamed final answers strip special tokens split across chunks", async ()
     },
   });
 
-  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests.length, 4);
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
@@ -13238,6 +13241,9 @@ test("empty direct model content falls back to streamed final answer", async () 
           url: "https://example.com/grapes-of-wrath",
         }),
       () => responseWithContent("", "thinking without final prose"),
+      // The reserved empty-final retry asks once more; the retry answers
+      // empty again, so the run proceeds to the streamed fallback.
+      () => responseWithContent("", "thinking without final prose"),
     ],
     streamResponders: [
       () =>
@@ -13260,7 +13266,7 @@ test("empty direct model content falls back to streamed final answer", async () 
     },
   });
 
-  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests.length, 4);
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
@@ -13309,6 +13315,9 @@ test("off-topic streamed final answer is stopped before display", async () => {
           url: "https://example.com/grapes-of-wrath",
         }),
       () => responseWithContent("", "thinking without final prose"),
+      // The reserved empty-final retry asks once more; the retry answers
+      // empty again, so the run proceeds to the streamed fallback.
+      () => responseWithContent("", "thinking without final prose"),
     ],
     streamResponders: [
       () =>
@@ -13339,7 +13348,7 @@ test("off-topic streamed final answer is stopped before display", async () => {
     /drifted off topic/,
   );
 
-  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests.length, 4);
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(finalDeltas, []);
   assert.deepEqual(assistantDeltas, []);
@@ -14384,6 +14393,9 @@ test("empty tool-result final content falls back to streamed synthesis", async (
           url: "https://example.com/source",
         }),
       () => responseWithContent(""),
+      // The reserved empty-final retry asks once more; the retry answers
+      // empty again, so the run proceeds to the streamed fallback.
+      () => responseWithContent(""),
     ],
     streamResponders: [
       () =>
@@ -14405,7 +14417,7 @@ test("empty tool-result final content falls back to streamed synthesis", async (
     },
   });
 
-  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests.length, 4);
   assert.equal(streamRequests.length, 1);
   assert.equal(streamRequests[0].think, undefined);
   assert.deepEqual(
@@ -14432,6 +14444,9 @@ test("metrics are emitted for model, tool, stream fallback, and run timing", asy
         responseWithToolCall("web_fetch", {
           url: "https://example.com/source",
         }),
+      () => responseWithContent(""),
+      // The reserved empty-final retry asks once more; the retry answers
+      // empty again, so the run proceeds to the streamed fallback.
       () => responseWithContent(""),
     ],
     streamResponders: [
@@ -14461,7 +14476,7 @@ test("metrics are emitted for model, tool, stream fallback, and run timing", asy
         event.name === "agent_step" &&
         (event.kind === "model_chat" || event.kind === "model_stream"),
     ).length,
-    3,
+    4,
   );
   assert.equal(metrics.some((event) => event.kind === "tool" && event.name === "web_search"), true);
   assert.equal(metrics.some((event) => event.kind === "tool" && event.name === "web_fetch"), true);

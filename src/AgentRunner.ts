@@ -32264,6 +32264,13 @@ async function streamCurrentNoteWriteback({
       events.onAssistantDelta?.(stagedContent);
       writer.replaceContent(stagedContent);
       await writer.finish({ force: true });
+      // A conflict found at the final flush surfaces as a silent stop, not a
+      // push() throw — there is no next push. A success receipt here would
+      // claim a write that never happened; the catch below reports the stop.
+      const stagedStop = writer.getExternalEditStop();
+      if (stagedStop) {
+        throw new Error(stagedStop.message);
+      }
       events.onFinalDone?.();
       events.onAssistantMessageDone?.();
       events.onStatus?.("Verified writeback complete.");
@@ -32397,6 +32404,14 @@ async function streamCurrentNoteWriteback({
     });
 
     await writer.finish({ force: true });
+
+    // Same silent-stop shape as the staged path: a conflict at the last flush
+    // sets the stop without throwing, and the receipt below would report a
+    // completed write over a note the writer refused to touch.
+    const finalFlushStop = writer.getExternalEditStop();
+    if (finalFlushStop) {
+      throw new Error(finalFlushStop.message);
+    }
 
     events.onFinalDone?.();
     events.onAssistantMessageDone?.();
@@ -33075,11 +33090,14 @@ async function createStreamingNoteWriter({
   // between two of our flushes belongs to a concurrent writer, so we stop
   // instead of overwriting it.
   //
-  // Null until the first flush lands, and deliberately not seeded at setup: an
-  // edit that arrives before any byte of ours is on disk overwrites nothing,
-  // and `makeTitleMetadataAppendBase` already rebases the append base off the
-  // live note for exactly that window. Failing there would break a behaviour
-  // that is correct and pinned.
+  // Null until the first flush lands. For append that window needs no gate:
+  // `makeTitleMetadataAppendBase` rebases the append base off the live note,
+  // so a pre-first-flush edit is preserved, and failing there would break a
+  // behaviour that is correct and pinned. For replace and section edits the
+  // first write is a whole-document overwrite — `writeContent` therefore
+  // falls back to the creation snapshot (`current`) as the reference until
+  // this is non-null, closing the window the staged single-commit replace
+  // otherwise leaves open for the entire stream.
   let expectedLiveContent: string | null = null;
   let externalEditStop: { message: string; appliedChars: number } | null = null;
   /** Live editor buffer for the target, or null when no editor has it open. */
@@ -33215,10 +33233,20 @@ async function createStreamingNoteWriter({
     // concurrent edit must be caught before it, not after. `expectedLiveContent`
     // is what this writer last put in the buffer; anything else came from
     // someone else and the write below would destroy it.
+    //
+    // Before the first flush the reference is the creation snapshot instead:
+    // the staged replace commits everything in one forced first write, so a
+    // null-until-first-flush gate would leave the reader's keystrokes
+    // unprotected for the entire stream (proven live: a marker typed while
+    // the model composed was destroyed by the single staged commit). Append
+    // stays exempt — its base rebases off the live note for exactly that
+    // window, which is pinned behavior.
     const observed = readLiveEditorSource();
-    if (expectedLiveContent !== null && observed !== null) {
+    const expectedReference =
+      expectedLiveContent ?? (kind === "append" ? null : current);
+    if (expectedReference !== null && observed !== null) {
       const conflict = detectExternalStreamEdit({
-        expected: expectedLiveContent,
+        expected: expectedReference,
         observed,
       });
       if (conflict) {
