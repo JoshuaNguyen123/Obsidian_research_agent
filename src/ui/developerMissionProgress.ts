@@ -378,15 +378,26 @@ export function developerMissionCompletionFromProjectRunReportV1(
     });
   }
 
-  const verified = report.phases.filter((phase) => phase.status === "verified").length;
+  const verified = report.phases.filter(
+    (phase) => phase.status === "verified",
+  ).length;
+  const priorRunVerified = report.phases.filter(
+    (phase) => phase.status === "verified_prior_run",
+  ).length;
   const blocked = report.phases.some((phase) => phase.status === "blocked");
+  const priorRunNote =
+    priorRunVerified === 0
+      ? ""
+      : ` ${priorRunVerified} of them ${
+          priorRunVerified === 1 ? "was" : "were"
+        } verified in the originating run.`;
   return normalizeDeveloperMissionCompletionV1({
     version: 1,
     kind: "developer_mission_completion",
     status: report.complete ? "complete" : blocked ? "blocked" : "paused",
     summary: report.complete
-      ? `All ${report.phases.length} project phases are verified.`
-      : `${verified} of ${report.phases.length} project phases are verified.`,
+      ? `All ${report.phases.length} project phases are verified.${priorRunNote}`
+      : `${verified + priorRunVerified} of ${report.phases.length} project phases are verified.${priorRunNote}`,
     artifacts,
     progress,
   });
@@ -421,6 +432,10 @@ function viewStatusFromReportStatus(
 ): DeveloperMissionPhaseStatusV1 {
   switch (status) {
     case "verified":
+    // A phase paid by the originating run is done, not pending. The report's
+    // own status keeps the two distinguishable; this coarse progress rail has
+    // no third state and must not show finished work as unstarted.
+    case "verified_prior_run":
       return "complete";
     case "in_progress":
       return "active";
