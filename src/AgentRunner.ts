@@ -10036,12 +10036,20 @@ export async function runAgentMission({
         outputPreview: candidateAcceptance,
       });
 
-      if (
+      // A loop, not a single retry: canRequestFinalOutputCorrection already
+      // budgets the passes (two, and only while the missing set shrinks), but
+      // this flow used to ask exactly once — a rewritten candidate that fixed
+      // the flagged quotes while surfacing one new mismatch was refused
+      // terminally with an unspent correction still authorized (live theology
+      // runs, 2026-08-24).
+      let correctionAttempt = 1;
+      while (
         candidateAcceptance.status !== "pass" &&
         canRequestFinalOutputCorrection(candidateAcceptance.missing) &&
         candidateAcceptance.missing.length > 0 &&
         candidateAcceptance.missing.every(isRepairableFinalOutputProof)
       ) {
+        correctionAttempt += 1;
         recordFinalOutputCorrection(candidateAcceptance.missing);
         events.onStatus?.(
           `Writeback draft held for verification: ${candidateAcceptance.missing.join(", ")}. Requesting one correction...`,
@@ -10078,7 +10086,7 @@ export async function runAgentMission({
         }
         candidate = constrainCandidatePassageScope(
           correctedCandidate,
-          "candidate-2",
+          `candidate-${correctionAttempt}`,
         );
         candidateAcceptance = requireAcceptedPassageCitationCoverage(
           getProofGatedWritebackCandidateAcceptance(
@@ -10091,7 +10099,7 @@ export async function runAgentMission({
           activeIntentPrompt,
         );
         events.onTrace?.({
-          id: `proof-gated-writeback-${step}:candidate-2`,
+          id: `proof-gated-writeback-${step}:candidate-${correctionAttempt}`,
           kind: "verification",
           step,
           message: `Corrected writeback candidate verification: ${candidateAcceptance.status}.`,
