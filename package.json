@@ -52,7 +52,10 @@
     "record:demo:researcher": "node scripts/record-e2e-demo.mjs --label=researcher-demo --model=glm-5.2 --showcase-vault -- --real-ai --project=demo-journey-recording",
     "record:demo:builder": "node scripts/record-e2e-demo.mjs --label=builder-demo --model=glm-5.2 --showcase-vault -- --real-ai --project=demo-recording",
     "e2e:preflight": "node scripts/e2e-preflight.mjs",
-    "setup:sandbox:wsl2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-wsl2-sandbox.ps1 -PersistUserEnvironment"
+    "setup:sandbox:wsl2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-wsl2-sandbox.ps1 -PersistUserEnvironment",
+    "posttest": "node scripts/eval-dashboard.mjs --quiet",
+    "eval:dashboard": "node scripts/eval-dashboard.mjs",
+    "eval:kpis": "node scripts/eval-kpis.mjs"
   },
   "keywords": [
     "obsidian",
