@@ -629,3 +629,90 @@ test("run context rejects a compaction candidate that would increase the estimat
   assert.deepEqual(compacted.messages, messages);
   assert.equal(compacted.missionStateMessage, null);
 });
+
+test("compacted linear and sandbox tool messages stay host-parseable", async () => {
+  const { findNestedLinearIssueRecord } = await import(
+    "../src/agent/linearIssueBinding"
+  );
+  const linearBulky = JSON.stringify({
+    toolName: "linear_get_issue",
+    status: "success",
+    summary: "linear_get_issue completed.",
+    output: {
+      id: "dc62477e-19bf-48ec-8331-16648e6c747f",
+      identifier: "APP-410",
+      title: "Dependency-Free Python CRDT Library",
+      url: "https://linear.app/example/issue/APP-410/crdt",
+      description: "z".repeat(3_000),
+    },
+  });
+  const sandboxBulky = JSON.stringify({
+    toolName: "code_sandbox_status",
+    status: "success",
+    summary: "code_sandbox_status completed.",
+    output: {
+      mode: "sandbox_verified",
+      executionAvailable: true,
+      selectedProvider: "wsl2",
+      providers: [{ provider: "wsl2", state: "verified", diagnostic: "x".repeat(1_500) }],
+    },
+  });
+  const messages: ModelChatMessage[] = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "implement the linear issue" },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ name: "linear_get_issue", arguments: { id: "dc62477e" } }],
+    },
+    { role: "tool", toolName: "linear_get_issue", content: linearBulky },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ name: "code_sandbox_status", arguments: {} }],
+    },
+    { role: "tool", toolName: "code_sandbox_status", content: sandboxBulky },
+  ];
+  const ledger = createMissionLedger({
+    runId: "run-host-parseable-shrink",
+    mission: "Keep compacted bindings readable",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["linear_get_issue"],
+      stopWhenSatisfied: true,
+    },
+  });
+  const compacted = compactLoopMessages({
+    messages,
+    ledger,
+    keepRecentSteps: 6,
+    maxPromptChars: estimatePromptChars(messages) - 100,
+  });
+  assert.equal(compacted.applied, true);
+  const linearMessage = compacted.messages.find(
+    (message) => message.role === "tool" && message.toolName === "linear_get_issue",
+  );
+  assert.ok(linearMessage);
+  const linearParsed = JSON.parse(linearMessage.content) as Record<string, any>;
+  // The host re-parses this exact message to bind the issue identity; a
+  // compaction rewrite that drops identifier/title breaks the binding and
+  // strands the code stage on a guessed issue.
+  const record = findNestedLinearIssueRecord(linearParsed.output, 0);
+  assert.ok(record);
+  assert.equal(record!.identifier, "APP-410");
+  assert.equal(
+    linearParsed.truncated,
+    true,
+    "the rewrite marks the message as cut so the model knows to re-read",
+  );
+  const sandboxMessage = compacted.messages.find(
+    (message) => message.role === "tool" && message.toolName === "code_sandbox_status",
+  );
+  assert.ok(sandboxMessage);
+  const sandboxParsed = JSON.parse(sandboxMessage.content) as Record<string, any>;
+  assert.equal(sandboxParsed.output.executionAvailable, true);
+  assert.equal(sandboxParsed.output.mode, "sandbox_verified");
+});

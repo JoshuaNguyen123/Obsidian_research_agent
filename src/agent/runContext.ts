@@ -41,6 +41,18 @@ const TOOL_CHAINING_KEYS = [
   "passageId",
   "sourceId",
   "truncated",
+  // Compacted history must stay re-parseable by the host: the Linear issue
+  // binding needs (identifier || id) + (title || url) from this very message,
+  // and a compacted sandbox status must still answer "can I execute". The
+  // omittedKeys signal from serialization survives so the model keeps knowing
+  // what was withheld.
+  "identifier",
+  "title",
+  "state",
+  "selectedProvider",
+  "mode",
+  "executionAvailable",
+  "omittedKeys",
 ] as const;
 
 export interface RunContextBudget {
@@ -493,6 +505,11 @@ function shrinkToolMessageForCompaction(
         if (Object.keys(outputSlim).length > 0) {
           slim.output = outputSlim;
         }
+        // Only the serializer-computed omittedKeys survive (via the chaining
+        // list); this rewrite never names the keys it drops itself, because
+        // echoing arbitrary key names back would resurrect names the
+        // serializer's privacy whitelist deliberately hid. truncated:true
+        // already tells the model the message was cut.
       }
       const contentEvidence = compactContentEvidenceForCompaction(parsed);
       if (contentEvidence) {
