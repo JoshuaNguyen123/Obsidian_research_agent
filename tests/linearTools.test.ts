@@ -1449,3 +1449,53 @@ function commentRecord(): LinearCommentRecord {
     snapshotHash: HASH_A,
   };
 }
+
+test("a lagging trash readback fails as readback, not as caller arguments", async () => {
+  // issues.trash carries only an id -- no `input` object. When the post-trash
+  // readback still showed trashed:false (Linear readback lag), the
+  // postcondition-mismatch DESCRIBER demanded `variables.input` and threw
+  // `linear_invalid_arguments: "Prepared Linear mutation input must be an
+  // object."` -- a caller-blaming crash masking a retryable provider wobble.
+  // Observed live in the 2026-08-24 workflow audit at stage 4.
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      if (key === "issues.get") {
+        return issueRecord({
+          id: "11111111-2222-4333-8444-555555555555",
+          title: "Disposable",
+          teamId: "team-1",
+          // Never flips: the mutation applied server-side, the readback lags.
+          trashed: false,
+          snapshotHash: HASH_A,
+        });
+      }
+      if (key === "issues.trash") return mutationAck(key, "issue");
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 3 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_trash_issue",
+      arguments: { id: "11111111-2222-4333-8444-555555555555" },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-trash-lagging-readback",
+  });
+  assert.equal(result.ok, false);
+  assert.notEqual(
+    result.error?.code,
+    "linear_invalid_arguments",
+    "a lagging readback must never be reported as caller arguments",
+  );
+  assert.equal(result.error?.code, "linear_readback_failed");
+  assert.deepEqual(result.error?.details?.mismatchFields, ["trashed"]);
+});
+

@@ -1373,6 +1373,19 @@ function describePostconditionMismatch(
   if (observation.record.resourceType !== config.resourceType) {
     return ["resource_type"];
   }
+  // Id-only mutations (trash/archive/unarchive/delete and their generic
+  // variants) carry no `input` object, and this function only ever runs when a
+  // readback postcondition failed -- which is exactly when Linear's readback
+  // may simply be lagging the mutation it just applied. Demanding an input
+  // record here made the error DESCRIBER throw `invalid_arguments` ("Prepared
+  // Linear mutation input must be an object"), converting a retryable
+  // provider-consistency wobble into a caller-blaming crash that masked the
+  // real postcondition mismatch. Name the fields the mutation was expected to
+  // change instead -- the same per-kind mapping the change detector uses.
+  if (!isJsonRecord(variables.input)) {
+    const expected = mutationChangedFields(config, variables);
+    return expected.length > 0 ? expected : ["postcondition"];
+  }
   const input = recordValue(variables.input);
   if (config.resourceType === "issue") {
     const fields = issueInputMismatchFields(
