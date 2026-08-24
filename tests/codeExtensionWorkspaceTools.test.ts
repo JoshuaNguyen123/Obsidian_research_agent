@@ -682,6 +682,46 @@ test("workspace tools prepare every mutation and return exact readback receipts"
       ),
       /stale/u,
     );
+    // expectedSha256 is optional: the host has already observed the target and
+    // binds the real fingerprint. Omitting it must prepare cleanly.
+    const writeWithoutFingerprint = await requirePrepared(
+      writeTool,
+      {
+        workspaceId: "tool-space",
+        path: "src/crdt_sync.py",
+        content: "def merge(a, b):\n    return a | b\n\n",
+      },
+      context,
+    );
+    assert.equal(
+      writeWithoutFingerprint.normalizedArgs.expectedSha256,
+      (await fixture.manager.stat("tool-space", "src/crdt_sync.py")).sha256,
+      "the host binds the observed fingerprint when the caller omits one",
+    );
+
+    // A malformed optional value used to report "A SHA-256 fingerprint is
+    // required." -- the opposite of the truth. A model that believes it needs
+    // a fingerprint goes looking for one, and on an implementation frontier
+    // that search is exactly the loop this message caused.
+    await assert.rejects(
+      requirePrepared(
+        writeTool,
+        {
+          workspaceId: "tool-space",
+          path: "src/crdt_sync.py",
+          content: "x\n",
+          expectedSha256: "unknown",
+        },
+        context,
+      ),
+      (error: Error) => {
+        assert.match(error.message, /optional/iu);
+        assert.match(error.message, /omit it/iu);
+        assert.doesNotMatch(error.message, /fingerprint is required/iu);
+        return true;
+      },
+    );
+
     const preview = await tools.get("preview_workspace_html")!.execute(
       { workspaceId: "tool-space", htmlPath: "index.html" },
       context,

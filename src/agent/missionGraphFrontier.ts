@@ -528,11 +528,18 @@ export function filterSetLooseToolNamesByMissionGraphAuthority(
     ) {
       return false;
     }
-    if (
-      effectClassForTool(toolName) === "soft" ||
-      CODE_WORKFLOW_OBSERVATION_TOOL_NAMES.has(toolName)
-    ) {
-      // An unplanned Soft companion is callable only because
+    if (CODE_WORKFLOW_OBSERVATION_TOOL_NAMES.has(toolName)) {
+      // These do not need a dynamic read node. They are named explicitly in
+      // mayBypassMissionGraphStartForSetLooseSoftCompanion, which grants them
+      // a graph-start bypass — but only when they are offered, so dropping
+      // them from the menu silently disables their own authority path. They
+      // are also the read half of every hash-bound mutation and the only
+      // escape from a collision, so an implementation frontier without them
+      // offers writes whose preconditions cannot be inspected.
+      return true;
+    }
+    if (effectClassForTool(toolName) === "soft") {
+      // A genuinely unplanned Soft companion is callable only because
       // MissionGraphSession will materialize a bounded dynamic read node for
       // it. On an exact planned frontier it will not: beginToolExecution
       // refuses with "not ready in the exact authoritative mission graph".

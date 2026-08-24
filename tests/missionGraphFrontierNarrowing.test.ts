@@ -290,3 +290,64 @@ test("slot counting and frontier naming are one readiness answer", () => {
     );
   }
 });
+
+test("an implementation frontier keeps the reads its hash-bound writes depend on", () => {
+  // Regression I caused. Narrowing the offer to match authority, I gated the
+  // whole "soft or observation" branch on dynamic read continuation. But the
+  // observation tools are not unplanned companions needing a dynamic node:
+  // mayBypassMissionGraphStartForSetLooseSoftCompanion names them explicitly
+  // and grants them a graph-start bypass -- gated on their being offered. So
+  // dropping them from the menu silently disabled their own authority path,
+  // and a frontier offering code_workspace_write_expected had no tool left
+  // that could inspect the target it writes to.
+  const menu = [
+    "code_workspace_read",
+    "code_workspace_list",
+    "code_workspace_stat",
+    "code_workspace_write_expected",
+    "code_workspace_patch",
+    "github_get_repository",
+    "github_get_commit",
+    "web_search",
+  ];
+  const definitions = menu.map(tool);
+  const graph = {
+    nodes: {
+      write: {
+        id: "write",
+        status: "ready",
+        allowedTools: ["code_workspace_write_expected"],
+        inputs: {},
+        outputs: {},
+      },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+
+  const offered = constrainToolsToMissionGraphFrontier(definitions, graph, {
+    setLooseOfferedToolNames: menu,
+    allowDynamicReadContinuation: false,
+  }).map((definition) => definition.function.name);
+
+  for (const readTool of [
+    "code_workspace_read",
+    "code_workspace_list",
+    "code_workspace_stat",
+  ]) {
+    assert.ok(
+      offered.includes(readTool),
+      `${readTool} must stay callable beside a hash-bound write`,
+    );
+  }
+  assert.ok(offered.includes("code_workspace_write_expected"));
+
+  // The enumeration surface that caused 45 refusals must stay closed: those
+  // are ordinary Soft companions with no bypass and no ready node.
+  for (const enumerated of ["github_get_repository", "github_get_commit", "web_search"]) {
+    assert.equal(
+      offered.includes(enumerated),
+      false,
+      `${enumerated} has no graph-start bypass and must stay off an exact frontier`,
+    );
+  }
+});

@@ -2377,12 +2377,31 @@ async function assertPreparedTargetState(
   }
 }
 
+/**
+ * `expectedSha256` is optional on every prepared mutation: the host has
+ * already observed the target and binds the real fingerprint itself. Supplying
+ * one is an optional extra assertion, not a precondition the model must go and
+ * satisfy.
+ *
+ * The generic `requiredFingerprint` message said "A SHA-256 fingerprint is
+ * required." for a malformed optional value, which is the opposite of the
+ * truth. A model that reads it does the rational thing — goes looking for a
+ * fingerprint — and on an implementation frontier the tools that produce one
+ * may not be callable, so it retries the write, reads the same message, and
+ * loops. Say what is actually wrong and what to do instead.
+ */
 function assertRequestedFingerprint(requested: unknown, observed: string): void {
   if (requested === undefined || requested === null) return;
-  if (requiredFingerprint(requested) !== observed) {
+  if (!isSha256FingerprintV2(requested)) {
+    throw new WorkspaceManagerErrorV2(
+      "invalid_arguments",
+      "expectedSha256 is optional and must be sha256:<64 lowercase hex> when supplied. Omit it and the host binds the target's current fingerprint.",
+    );
+  }
+  if (requested !== observed) {
     throw new WorkspaceManagerErrorV2(
       "precondition_failed",
-      "Requested expected SHA-256 is stale.",
+      `Requested expected SHA-256 is stale; the target is now ${observed}. Omit expectedSha256 to bind the current fingerprint, or read the file again before retrying.`,
     );
   }
 }
