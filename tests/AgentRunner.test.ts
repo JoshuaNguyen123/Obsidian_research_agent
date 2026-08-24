@@ -5007,6 +5007,114 @@ test("continue after under-target partial essay expands in place instead of appe
   );
 });
 
+test("an expand-in-place replace over a just-edited note preserves the edit in the backup", async () => {
+  // Replace never live-streams its first flush: the commit is the prepared
+  // replace_current_file tool, whose contentRevision is fingerprinted at
+  // prepare time. Keystrokes typed while the model composes land before
+  // prepare, so the replacement legally covers them - but only because the
+  // pre-replacement note, keystrokes included, is preserved in the backup
+  // tree. This pins that no reader byte is ever lost on this route.
+  const statuses: string[] = [];
+  const broker = new ApprovalBroker();
+  const partialEssay = [
+    "# Catcher Partial",
+    "",
+    Array.from({ length: 60 }, (_, i) => `keep${i + 1}`).join(" "),
+  ].join(String.fromCharCode(10));
+  const expandedEssay = [
+    "# Catcher Partial",
+    "",
+    Array.from({ length: 98 }, (_, i) => `exp${i + 1}`).join(" "),
+  ].join(String.fromCharCode(10));
+  const readerKeystrokes = " reader typed before the first flush";
+  const mission = "Write a 100 word essay about the catcher in the rye.";
+  const vault = createRunnerVaultContext({
+    prompt: mission,
+    content: partialEssay,
+    now: new Date(6161),
+  });
+  vault.context.settings.modelRouterMode = "off";
+
+  const runId = "run-partial-essay-first-flush-1";
+  const { writeMissionLedger, createMissionLedger } = await import(
+    "../src/agent/missionLedger"
+  );
+  const ledger = createMissionLedger({
+    runId,
+    mission,
+    route: "direct_writeback",
+    loopBudget: {
+      hardCap: 12,
+      toolStepBudget: 4,
+      finalizationReserve: 2,
+      expectedTools: [],
+      stopWhenSatisfied: true,
+    },
+    now: new Date(6161),
+  });
+  ledger.status = "blocked";
+  ledger.nextActions = [
+    "Streamed writeback cannot safely retry after partial note apply (partial_write_no_safe_retry). Partial draft was kept.",
+  ];
+  ledger.continuationCommand = `continue run ${runId}`;
+  ledger.blockers = ["partial_write_no_safe_retry"];
+  await writeMissionLedger(vault.context, ledger);
+
+  let typed = false;
+  const outcome = await runAgentMission({
+    prompt: `continue run ${runId}`,
+    modelClient: {
+      chat: async () =>
+        ({ message: { role: "assistant", content: expandedEssay }, toolCalls: [] }) as never,
+      streamChat: async (_request, events = {}) => {
+        if (!typed) {
+          // The writer snapshotted the note before this model call; these
+          // bytes land in the window before its first flush.
+          typed = true;
+          vault.content.set(
+            "Current.md",
+            `${vault.content.get("Current.md") ?? ""}${readerKeystrokes}`,
+          );
+        }
+        events.onContentDelta?.(expandedEssay);
+        return {
+          message: { role: "assistant", content: expandedEssay },
+          raw: {},
+        } as never;
+      },
+    },
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onStatus: (message) => statuses.push(message),
+    },
+  }).then(
+    () => "resolved",
+    (error) => `rejected: ${String(error)}`,
+  );
+
+  const note = vault.content.get("Current.md") ?? "";
+  assert.ok(
+    note.includes("exp1"),
+    `the approved replacement did not commit (${outcome}); statuses: ${statuses.join(" | ")}`,
+  );
+  assert.ok(
+    statuses.some((line) => line.includes("Approved replacement writeback complete.")),
+    statuses.join(" | "),
+  );
+  const backupEntries = [...vault.content.entries()].filter(
+    ([path]) => path !== "Current.md",
+  );
+  assert.ok(
+    backupEntries.some(([, content]) => content.includes(readerKeystrokes.trim())),
+    `no backup preserved the reader keystrokes; files: ${[...vault.content.keys()].join(", ")}`,
+  );
+});
 test("word-count shortfall follow-up replaces the draft instead of appending", async () => {
   const statuses: string[] = [];
   const chatRequests: ModelChatRequest[] = [];
