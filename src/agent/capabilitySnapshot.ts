@@ -136,7 +136,7 @@ export function formatCapabilitySnapshotForModel(
     `installed: ${formatNames(snapshot.installedTools)}`,
     `authorized: ${formatNames(snapshot.authorizedTools)}`,
     `ready: ${formatNames(snapshot.readyTools)}`,
-    `offered_now: ${formatNames(snapshot.offeredTools)}`,
+    `offered_at_run_start: ${formatNames(snapshot.offeredTools)}`,
     `withheld: ${
       snapshot.withheldTools.length > 0
         ? snapshot.withheldTools
@@ -147,7 +147,14 @@ export function formatCapabilitySnapshotForModel(
     `current_note: authorized=${snapshot.currentNote.authorized}; context_injected=${snapshot.currentNote.contextInjected}; callable_tool=${snapshot.currentNote.callableTool ?? "none"}`,
     `provider: ${snapshot.provider.provider}; model=${snapshot.provider.model}`,
     "The current frontier is a temporary callable subset, not the platform catalog.",
-    "Authorization does not guarantee current exposure. Only offered_now tools may be called.",
+    // This snapshot is built once, before the loop, from the run catalogue. The
+    // callable set is recomputed every turn and is usually much smaller. Naming
+    // this list "offered_now" and calling it the authority made the model treat
+    // a ~50-name catalogue as the frontier, then invent parameters for tools it
+    // was never given a schema for. The request's own tool schemas are the only
+    // list that is both current and complete.
+    "This list is from run start and is not the current turn's frontier.",
+    "Only the tools whose JSON schemas are supplied in this request may be called; a name listed here without a schema this turn is not callable, and its parameters must never be guessed.",
     "`read_current_note` is an authority label mapped to `read_current_file`, not a missing tool.",
   ];
   return lines.join("\n");

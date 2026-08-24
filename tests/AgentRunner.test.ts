@@ -22678,7 +22678,7 @@ test("bare Python Desktop delivery plans only the scratch validation and export 
     chatRequests[0]?.messages
       .map((message) => String(message.content ?? ""))
       .join("\n"),
-    /CAPABILITY_SNAPSHOT_V1[\s\S]*installed:[\s\S]*offered_now:/u,
+    /CAPABILITY_SNAPSHOT_V1[\s\S]*installed:[\s\S]*offered_at_run_start:/u,
   );
 });
 
@@ -26225,4 +26225,50 @@ test("resolveHasMatchingGrantForAutoContinuation requires unused Bound grant", a
     }),
     true,
   );
+});
+
+test("a joined developer lifecycle commits the verified tree before delivering it", () => {
+  // The mission prose says "create one verified local commit. Deliver the final
+  // verified working directory..." while the planned ladder put export first.
+  // The graph enforces its order, so the model faced two authorities that
+  // disagreed and could satisfy neither. Exporting first also delivers a tree
+  // that is not yet committed.
+  const ladder = getRequiredCodeWorkflowToolNames(
+    [
+      "Implement the requested Python library in its bound trusted repository,",
+      "validate against the issue contract before committing, and create one",
+      "verified local commit. Deliver the final verified working directory to a",
+      "new absolute Desktop folder that a normal IDE can open.",
+    ].join(" "),
+  );
+  const commitIndex = ladder.indexOf("code_commit_verified");
+  const exportIndex = ladder.indexOf("code_workspace_export_directory");
+  assert.ok(commitIndex >= 0, `ladder must plan the commit: ${ladder.join(", ")}`);
+  assert.ok(exportIndex >= 0, `ladder must plan the export: ${ladder.join(", ")}`);
+  assert.ok(
+    commitIndex < exportIndex,
+    `commit must precede delivery: ${ladder.join(", ")}`,
+  );
+});
+
+test("a deferred graph node does not promise that the preferred tool unblocks it", () => {
+  // pickPreferredNextTool is pure ordering with no dependency reasoning, so the
+  // hint can name a ready tool that does nothing for the deferred node. Read as
+  // a promise, it produced call-hint / retry-deferred / identical-refusal loops.
+  const deferred = buildOffFrontierToolRejectionMessage({
+    toolName: "code_commit_verified",
+    pendingGraphNodeId: "tool-11-code_commit_verified",
+    readyFrontierToolNames: ["code_sandbox_status"],
+    preferredNextTool: "code_sandbox_status",
+  });
+  assert.match(deferred, /stays refused until its own node is ready/u);
+  assert.match(deferred, /does not by itself open it/u);
+
+  // An unavailable tool is a different case: there the frontier really is the
+  // whole advice, and the extra caveat would be noise.
+  const unavailable = buildOffFrontierToolRejectionMessage({
+    toolName: "linear_get_issue",
+    readyFrontierToolNames: ["code_workspace_write_expected"],
+  });
+  assert.doesNotMatch(unavailable, /stays refused until its own node is ready/u);
 });

@@ -27725,12 +27725,6 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
     tools.push("code_validate_targeted", "code_validate_full");
   }
   if (
-    codeDeliverable &&
-    (!repositoryMutation || hasKnownHostDirectoryExportIntent(prompt))
-  ) {
-    tools.push("code_workspace_export_directory");
-  }
-  if (
     hasRepositoryCodeEditIntent(prompt) ||
     /\bcommit\b/i.test(prompt) ||
     joinedDeveloperLifecycle
@@ -27744,6 +27738,20 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
       tools.push("code_workspace_init_repository");
     }
     tools.push("code_commit_verified");
+  }
+  // Deliver AFTER the commit, matching the contract the mission prose states:
+  // "create one verified local commit. Deliver the final verified working
+  // directory...". Planning export first put tool-10-export ahead of
+  // tool-11-commit while the prose said the opposite, and the graph enforces
+  // its order -- so the model was handed two authorities that disagreed and
+  // could satisfy neither. Exporting first also ships a tree that is not yet
+  // committed, so a failing commit leaves an unverified delivered folder.
+  // Only the joined lifecycle plans both; a scratch delivery plans no commit.
+  if (
+    codeDeliverable &&
+    (!repositoryMutation || hasKnownHostDirectoryExportIntent(prompt))
+  ) {
+    tools.push("code_workspace_export_directory");
   }
   return [...new Set(tools)];
 }

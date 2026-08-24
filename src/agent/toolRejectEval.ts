@@ -263,11 +263,21 @@ export function buildOffFrontierToolRejectionMessage(input: {
   const base = input.pendingGraphNodeId
     ? `Deferred ${input.toolName}: authoritative mission node ${input.pendingGraphNodeId} is not on the ready frontier.`
     : `Tool is not available for this prompt: ${input.toolName}`;
+  // "Preferred next" is ordering, not dependency reasoning: pickPreferredNextTool
+  // returns the first unpaid delivery tool that happens to be ready, otherwise
+  // the first ready name. It has never known what unblocks the deferred node.
+  // Read as "call this and the deferred tool opens", it produces a loop -- call
+  // the hint, retry the deferred tool, get the identical refusal. Say what is
+  // actually true so the model stops re-attempting the deferred call.
+  const deferredNote = input.pendingGraphNodeId
+    ? `${input.toolName} stays refused until its own node is ready; calling the preferred tool does not by itself open it.`
+    : "";
   return [
     base,
     `category=${category}`,
     `Ready frontier tool(s) now: ${frontier}.`,
     `Preferred next: ${preferred}. Call that exact name.`,
+    deferredNote,
     nearMiss ?? "",
     "Correct only that issue; do not repeat this exact call.",
   ]
