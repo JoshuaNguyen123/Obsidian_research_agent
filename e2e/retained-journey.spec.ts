@@ -165,7 +165,7 @@ test("DU-06 RETAINED-JOURNEY research to Linear to code to private GitHub, with 
       },
     );
 
-    await assertProductionAdoptedSandboxV1(harness.page, startedAt);
+    await assertProductionAdoptedSandboxV1(harness.page);
 
     // The compound readiness gate requires a Linear snapshot younger than 15
     // minutes, and a fresh Obsidian start does not rediscover on its own.

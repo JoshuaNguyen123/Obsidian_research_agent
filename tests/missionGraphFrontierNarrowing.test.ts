@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { narrowAdaptiveCodeMutationsToPlannedWritesV1 } from "../src/agent/missionGraphFrontier";
+import {
+  constrainToolsToMissionGraphFrontier,
+  narrowAdaptiveCodeMutationsToPlannedWritesV1,
+} from "../src/agent/missionGraphFrontier";
+import {
+  countReadyMissionGraphToolSlots,
+  readyMissionGraphFrontierToolNamesV1,
+} from "../src/agent/missionGraphSelectors";
 import type { ModelToolDefinition } from "../src/model/types";
 
 const tool = (name: string): ModelToolDefinition => ({
@@ -166,4 +173,120 @@ test("an active validation recovery window is never narrowed", () => {
     },
   });
   assert.deepEqual(narrowed, CODE_MENU);
+});
+
+test("an exact planned frontier never advertises a tool its own authority will refuse", () => {
+  // Stage 8, 45 consecutive refusals. The offered menu carried the whole
+  // GitHub read surface while MissionGraphSession refused every one of them
+  // with "not ready in the exact authoritative mission graph". The model had
+  // no way to learn which entries were callable except by calling them, so it
+  // enumerated the list one refused call at a time.
+  //
+  // The two computations disagreed on one term. The offer read
+  // `setLooseCompoundEnabled || !missionGraphUsesExactPlannedFrontier`; the
+  // authority read `!missionGraphUsesExactPlannedFrontier`. On a set-loose
+  // compound mission with an exact planned frontier the first is true and the
+  // second is false, so everything unplanned was advertised and nothing
+  // unplanned was admitted.
+  const menu = [
+    "read_template",
+    "web_search",
+    "github_get_repository",
+    "github_get_commit",
+    "github_get_reference",
+    "github_list_branches",
+    "github_get_tree",
+    "append_jupyter_reflection",
+  ];
+  const definitions = menu.map(tool);
+  // The terminal shape: the reflection node has paid and nothing is ready.
+  const graph = {
+    nodes: {
+      reflect: {
+        id: "reflect",
+        status: "complete",
+        allowedTools: ["append_jupyter_reflection"],
+        inputs: {},
+        outputs: {},
+      },
+      final: { id: "final", status: "queued", allowedTools: [], inputs: {}, outputs: {} },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+
+  assert.deepEqual(
+    readyMissionGraphFrontierToolNamesV1(graph),
+    [],
+    "nothing is ready in this graph",
+  );
+
+  const offeredUnderExactFrontier = constrainToolsToMissionGraphFrontier(
+    definitions,
+    graph,
+    {
+      setLooseOfferedToolNames: menu,
+      allowDynamicReadContinuation: false,
+    },
+  ).map((definition) => definition.function.name);
+
+  for (const name of [
+    "github_get_repository",
+    "github_get_commit",
+    "github_get_reference",
+    "github_list_branches",
+    "github_get_tree",
+  ]) {
+    assert.equal(
+      offeredUnderExactFrontier.includes(name),
+      false,
+      `${name} has no ready node and no dynamic continuation; offering it advertises a refusal`,
+    );
+  }
+
+  // Without an exact planned frontier the same unplanned reads stay available,
+  // because there authority really will materialize a bounded dynamic node.
+  const offeredUnderDynamicFrontier = constrainToolsToMissionGraphFrontier(
+    definitions,
+    graph,
+    {
+      setLooseOfferedToolNames: menu,
+      allowDynamicReadContinuation: true,
+    },
+  ).map((definition) => definition.function.name);
+  assert.ok(
+    offeredUnderDynamicFrontier.includes("github_get_commit"),
+    "dynamic read continuation must keep unplanned companions callable",
+  );
+});
+
+test("slot counting and frontier naming are one readiness answer", () => {
+  // Three predicates for "may this tool run now?" is how the offer and the
+  // authority drifted apart. Anything that decides what to offer, what to
+  // schedule, or what to name as the next call must agree with the node-level
+  // rule MissionGraphSession admits calls from.
+  const graph = {
+    nodes: {
+      a: { id: "a", status: "ready", allowedTools: ["code_workspace_append"], inputs: {}, outputs: {} },
+      b: { id: "b", status: "ready", allowedTools: ["code_validate_fast"], inputs: {}, outputs: {} },
+      c: { id: "c", status: "running", allowedTools: ["github_create_repository"], inputs: {}, outputs: {} },
+      d: { id: "d", status: "queued", allowedTools: ["github_get_commit"], inputs: {}, outputs: {} },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+
+  const named = readyMissionGraphFrontierToolNamesV1(graph);
+  assert.deepEqual(named.sort(), ["code_validate_fast", "code_workspace_append"]);
+  for (const name of [
+    "code_workspace_append",
+    "code_validate_fast",
+    "github_create_repository",
+    "github_get_commit",
+    "never_planned_tool",
+  ]) {
+    assert.equal(
+      countReadyMissionGraphToolSlots(graph, name) > 0,
+      named.includes(name),
+      `${name}: slot count and frontier naming must give the same answer`,
+    );
+  }
 });

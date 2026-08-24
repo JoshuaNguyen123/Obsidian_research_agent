@@ -1031,6 +1031,138 @@ test("research worker runs parallel-safe reads concurrently", async () => {
   assert.ok(statuses.some((item) => /parallel/i.test(item)));
 });
 
+test("research worker reserves a tool call so the host can close the usable-source floor", async () => {
+  // A search only nominates candidates; a fetch is what promotes one to
+  // usable. A model that spends the whole tool budget on searches used to
+  // leave the ledger with candidates nothing was allowed to promote, and the
+  // handoff was graded "rejected" for missing proof the worker could no
+  // longer gather. The reserve comes out of the configured ceiling, so the
+  // team budget still clamps at maxToolCalls.
+  const urls = [
+    "https://alpha.example/guide",
+    "https://beta.example/guide",
+  ];
+  const searchCalls: ModelToolCall[] = Array.from({ length: 6 }, (_value, index) => ({
+    name: "web_search",
+    arguments: { query: `orchestration ${index}` },
+    id: `call-search-${index}`,
+  }));
+  const model = sequenceModel([
+    { message: { role: "assistant", content: "", toolCalls: searchCalls }, toolCalls: searchCalls },
+    finalResponse("Evidence gathered for the Lead."),
+  ]);
+  const executed: string[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () => ["web_search", "web_fetch"].map((name) => ({
+      type: "function" as const,
+      function: { name, parameters: { type: "object" } },
+    })),
+    async execute(call) {
+      executed.push(call.name);
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: urls.map((url, index) => ({
+              title: `Source ${index}`,
+              url,
+              snippet: "Stubbed result.",
+            })),
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: "Source",
+          url: call.arguments.url,
+          content:
+            "This source explains the assigned topic in enough passage-backed detail for the Lead to cite it directly without another fetch.",
+          parserStatus: "parsed",
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-proof-reserve",
+    participantId: "specialist",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Explain the assigned topic with a cited source.",
+    originalMission: "Create a note explaining the assigned topic.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 6,
+    maxToolCalls: 6,
+  });
+
+  assert.ok(
+    executed.includes("web_fetch"),
+    "the host must retain a call to promote a nominated candidate",
+  );
+  assert.ok(
+    result.toolCalls <= 6,
+    `the configured ceiling must still clamp, got ${result.toolCalls}`,
+  );
+  assert.equal(
+    Object.values(result.sourceLedger.candidates).filter(
+      (candidate) => candidate.status === "usable",
+    ).length,
+    1,
+  );
+  assert.equal(result.handoff.status, "ready");
+});
+
+test("research worker rejects its own handoff when it never calls a tool", async () => {
+  // The other half of the same grading rule, pinned so the failure mode stays
+  // legible: no tool call means no source, and the worker says so itself with
+  // stopReason no_usable_evidence. The host must read that as a result, not
+  // as a rejected proof.
+  const model: ModelClient = {
+    async chat() {
+      return finalResponse("Answering from prior knowledge without sources.");
+    },
+    async streamChat() {
+      return finalResponse("Answering from prior knowledge without sources.");
+    },
+  };
+  const registry: ToolRegistry = {
+    getDefinitions: () => ["web_search", "web_fetch"].map((name) => ({
+      type: "function" as const,
+      function: { name, parameters: { type: "object" } },
+    })),
+    async execute(call) {
+      return { ok: true, toolName: call.name, output: {} };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-no-tool-call",
+    participantId: "specialist",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Explain the assigned topic with a cited source.",
+    originalMission: "Create a note explaining the assigned topic.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 6,
+    maxToolCalls: 6,
+  });
+
+  assert.equal(result.toolCalls, 0);
+  assert.equal(result.evidence.length, 0);
+  assert.equal(result.handoff.status, "rejected");
+  assert.equal(result.handoff.stopReason, "no_usable_evidence");
+  // Every nudged step is a real model call. On a step-capped lane this is the
+  // whole worker allocation spent without gathering anything.
+  assert.equal(result.modelSteps, 6);
+});
+
 function sequenceModel(responses: ModelChatResponse[]): ModelClient {
   let index = 0;
   return {

@@ -113,10 +113,7 @@ test("VAULT-SIBLING-CODE-REAL delivers a tested standalone project beside the ac
       siblingEntriesBefore = new Set(await readdir(siblingContainer));
     }
 
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      startedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
 
     let missionFailure: unknown = null;

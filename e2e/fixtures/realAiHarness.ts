@@ -12,6 +12,7 @@ import {
   type NativeObsidianHarness,
 } from "./nativeObsidianHarness";
 import { clearChatInline } from "./chatCleanup";
+import { sandboxProbeProvenInSessionV1 } from "./sandboxProbeSessionFreshness";
 import {
   HOST_PROVISIONED_SANDBOX_READINESS_TIMEOUT_MS_V1,
   readHostProvisionedSandboxBindingV1,
@@ -184,10 +185,16 @@ export function hostProvisionedSandboxRuntimeDigestV1(): string {
  * my desktop" mission at code_validate_fast. Nothing here supplies provider
  * configuration: the plugin must adopt the host-provisioned binding and pass
  * its own boundary probe, so a regression in that path fails the lane.
+ *
+ * The session bound is read inside the renderer instead of being passed in.
+ * A lane cannot know when the plugin proved its boundary — the product does it
+ * once, off the plugin-load critical path, before `startRealAiHarness` even
+ * returns — so any caller-supplied instant is either redundant or, if recorded
+ * after startup, permanently unsatisfiable. See
+ * `sandboxProbeProvenInSessionV1`.
  */
 export async function assertProductionAdoptedSandboxV1(
   page: Page,
-  notBeforeMs: number,
 ): Promise<{
   selectedProvider: string;
   providerConfigCount: number;
@@ -210,6 +217,11 @@ export async function assertProductionAdoptedSandboxV1(
         ? state.sandbox.providerConfigs.length
         : 0,
       observedAt: state?.sandbox?.lastProbe?.observedAt ?? null,
+      // This renderer's own origin, on the same wall clock that stamps
+      // observedAt. Every probe from an earlier Obsidian process predates it.
+      sessionStartedAtMs: Number.isFinite(performance.timeOrigin)
+        ? performance.timeOrigin
+        : Date.now() - performance.now(),
     };
   }, CODE_CAPABILITY_ID_V1);
 
@@ -222,10 +234,12 @@ export async function assertProductionAdoptedSandboxV1(
     executionAvailable: true,
   });
   expect(typeof observed.status.selectedProvider).toBe("string");
-  const observedAtMs = Date.parse(String(observed.observedAt ?? ""));
   expect(
-    Number.isFinite(observedAtMs) && observedAtMs >= notBeforeMs,
-    "the boundary probe must be proven fresh in this session, not replayed from durable history",
+    sandboxProbeProvenInSessionV1({
+      observedAt: observed.observedAt,
+      sessionStartedAtMs: observed.sessionStartedAtMs,
+    }),
+    "the boundary probe must be proven inside this Obsidian session, not replayed from durable history",
   ).toBe(true);
   return {
     selectedProvider: String(observed.status.selectedProvider),

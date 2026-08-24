@@ -508,10 +508,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     // be seeded or mutated. Cleanup later targets only exact post-baseline
     // backups for this note, preserving concurrent Claude/user backups.
     vaultBackupBaseline = await listVaultBackupPaths(harness.page);
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      sandboxReadinessStartedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     observations.observe("proofs", "sandbox:production_boundary");
 

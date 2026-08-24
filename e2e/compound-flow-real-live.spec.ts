@@ -104,7 +104,6 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
   // workspace that id belonged to after a credential change. Membership in the
   // connected workspace is asserted against the live snapshot below.
   const teamId = requiredEnvironment("LINEAR_LIVE_TEST_TEAM_ID");
-  const sandboxReadinessStartedAt = Date.now();
   const fixture = await createFlowRealTypeScriptFixture(marker);
   const requestId = `flow-real-request-${suffix}`;
 
@@ -296,10 +295,7 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
 
     // No injected provider configuration: the plugin must adopt the
     // host-provisioned binding and pass its own boundary probe.
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      sandboxReadinessStartedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
 
     // The env var names a team; this proves the connected workspace actually

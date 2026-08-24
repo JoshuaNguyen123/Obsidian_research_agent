@@ -137,10 +137,7 @@ test("DESKTOP-01 a bare desktop prompt adopts the host sandbox and delivers a pl
 
     // The product must recover from that state on its own, with no test-built
     // provider configuration and no operator visiting the settings modal.
-    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
-      harness.page,
-      startedAt,
-    );
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     observed.proofs.add("sandbox:host_adopted");
     await testInfo.attach("checkers-adopted-sandbox", {

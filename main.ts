@@ -329,6 +329,7 @@ import { createAdaptiveTeamScaffoldV2 } from "./src/orchestrator/adaptiveTeam";
 import {
   createSpecialistHandoffV2,
   fingerprintSpecialistWorkspaceDiff,
+  isDeliverableWorkerHandoffStatusV2,
 } from "./src/orchestrator/specialistHandoff";
 import { resolveAdaptiveTeamDispatchV2 } from "./src/agent/researchTeamDispatch";
 import { runExtensionVerifiers } from "./src/agent/extensionVerifiers";
@@ -9468,6 +9469,20 @@ export default class AgenticResearcherPlugin extends Plugin {
       );
       for (const evidence of workerResult.evidence) {
         await runtime.addEvidence(researchNodeId, evidence.id);
+      }
+      // The worker grades its own outcome before the host ever sees a proof.
+      // "No usable evidence" is a result, not a proof-integrity failure, so
+      // stop here instead of completing the node, claiming a ready handoff,
+      // and letting specialistHandoffReady refuse what we just asserted. That
+      // sequence left the graph completed-then-blocked and reported a bounded
+      // search as "Specialist handoff proof rejected", which is the wrong
+      // thing to go looking for.
+      if (!isDeliverableWorkerHandoffStatusV2(workerResult.handoff.status)) {
+        throw new Error(
+          `Adaptive Specialist found no usable evidence (${
+            workerResult.handoff.stopReason ?? "no_usable_evidence"
+          }).`,
+        );
       }
       await runtime.completeNode(
         researchNodeId,

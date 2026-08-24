@@ -105,7 +105,7 @@ test("DEMO recording mission completes with a verified Desktop export", async (
       },
     );
 
-    await assertProductionAdoptedSandboxV1(harness.page, startedAt);
+    await assertProductionAdoptedSandboxV1(harness.page);
     await harness.seedNote(
       DEMO_NOTE_PATH,
       [

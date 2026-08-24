@@ -3,6 +3,7 @@ import { RESEARCH_TEAM_KEYWORD_FLOOR } from "../agent/researchTeamDispatch";
 import { OrchestratorStore, type OrchestratorSnapshotRepository } from "./orchestratorStore";
 import { SharedBudget, type BudgetResource } from "./sharedBudget";
 import {
+  isDeliverableWorkerHandoffStatusV2,
   validateSpecialistHandoffV2,
   type SpecialistHandoffAuthorityV2,
 } from "./specialistHandoff";
@@ -152,7 +153,7 @@ export class OrchestratorRuntime {
     handoff: SpecialistHandoffV2,
     authority: SpecialistHandoffAuthorityV2,
   ): Promise<OrchestratorSnapshotV1> {
-    if (handoff.status !== "ready" && handoff.status !== "accepted") {
+    if (!isDeliverableWorkerHandoffStatusV2(handoff.status)) {
       throw new Error(
         `Specialist handoff proof rejected (status:${handoff.status}).`,
       );
