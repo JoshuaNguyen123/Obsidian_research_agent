@@ -256,10 +256,27 @@ export async function createAutonomousJourneyPythonFixture(
         commitCount,
         status: await git(verified, ["status", "--short"]),
         changedPaths: changed.split(/\r?\n/gu).filter(Boolean).sort(),
-        moduleSource: await readFile(
-          path.join(verified, "crdt_sync.py"),
-          "utf8",
-        ),
+        // The effective module source, not one file's bytes. The write scope
+        // grants `src` and the mission says "choosing the internal design
+        // yourself", so the root crdt_sync.py may be a re-export shim with the
+        // implementation under src/crdt_sync/ -- the behavioral tests import
+        // `crdt_sync` either way. Marker/class assertions must see the union.
+        moduleSource: [
+          await readFile(path.join(verified, "crdt_sync.py"), "utf8"),
+          ...(await Promise.all(
+            (await readdir(path.join(verified, "src", "crdt_sync")).catch(
+              () => [] as string[],
+            ))
+              .filter((entry) => entry.endsWith(".py"))
+              .sort()
+              .map((entry) =>
+                readFile(
+                  path.join(verified, "src", "crdt_sync", entry),
+                  "utf8",
+                ),
+              ),
+          )),
+        ].join("\n"),
         readme: await readFile(path.join(verified, "README.md"), "utf8"),
       };
     },
