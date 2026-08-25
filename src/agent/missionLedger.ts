@@ -441,15 +441,16 @@ export function createPrePlanningAnchorLedger({
 }
 
 /**
- * Best-effort removal of an anchor artifact for a run that terminated
- * GRACEFULLY before its full mission ledger ever superseded the anchor
- * (direct-chat downgrades, pre-planning refusals, early errors). Those runs
- * create no Agent Runs note today, and the anchor must not change that: it is
- * pure crash insurance, and a graceful completion has already delivered its
- * outcome through the normal channels. Deletion is double-guarded: it only
- * ever touches a file whose persisted ledger both matches the exact runId and
- * satisfies isPrePlanningAnchorLedger, so an evolved ledger can never be
- * removed even if the caller's supersession tracking is wrong.
+ * Best-effort removal of an anchor artifact for the one run shape whose
+ * terminal ledger persist deliberately writes nothing: a mission that the
+ * router downgraded to direct chat after the anchor was written. Direct-chat
+ * runs create no Agent Runs note today, and the anchor must not change that.
+ * Every other termination keeps the anchor, mirroring how a post-planning
+ * ledger stays resumable through stops, errors, and shutdown aborts.
+ * Deletion is double-guarded: it only ever touches a file whose persisted
+ * ledger both matches the exact runId and satisfies
+ * isPrePlanningAnchorLedger, so an evolved ledger can never be removed even
+ * if the caller's supersession tracking is wrong.
  */
 export async function removePrePlanningAnchorArtifact(
   context: ToolExecutionContext,

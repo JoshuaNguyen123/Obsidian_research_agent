@@ -2003,13 +2003,29 @@ export async function runAgentMission({
           // the next run starts with what this one learned. Fire-and-forget:
           // persistence is an optimization and must not delay completion.
           void persistToolOutcomeMemory();
-          // A GRACEFUL completion that never superseded the pre-planning
-          // anchor (direct-chat downgrade, pre-planning refusal or error)
-          // creates no Agent Runs note today; remove the crash-insurance
-          // anchor so that stays true. A hard kill never reaches this
-          // handler, which is exactly when the anchor must survive.
-          if (prePlanningAnchorPersisted && !prePlanningAnchorSuperseded) {
-            void removePrePlanningAnchorArtifact(toolContext, runId);
+          // The anchor mirrors the full ledger's terminal behavior. A
+          // direct-chat downgrade is the one case whose terminal persist
+          // deliberately writes NOTHING (persistMissionLedger's direct_chat
+          // early return) — remove the crash-insurance anchor so those runs
+          // keep creating no Agent Runs note. Every other unevolved
+          // completion (a coordinator-shutdown abort, a pre-planning
+          // provider error, a user stop) KEEPS the anchor, exactly as a
+          // post-planning ledger stays resumable through the same
+          // terminations — deleting on those would erase the durable state
+          // the interrupted-continuation resume depends on, because a
+          // plugin-disable "kill" reaches the runner as a graceful abort.
+          try {
+            if (
+              prePlanningAnchorPersisted &&
+              !prePlanningAnchorSuperseded &&
+              missionLedger !== null &&
+              runPlan.executionTier === "direct_chat"
+            ) {
+              void removePrePlanningAnchorArtifact(toolContext, runId);
+            }
+          } catch {
+            // Completion must never fail on anchor cleanup; a stale anchor
+            // is honest last-persisted state.
           }
           const autonomyStats = finalizeAutonomyRunStats(autonomyRunStats, {
             elapsedMs: Date.now() - runStartedMs,

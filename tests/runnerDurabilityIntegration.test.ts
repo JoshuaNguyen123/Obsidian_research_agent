@@ -2589,6 +2589,86 @@ test("continue run of an anchor-only interrupted run restarts the mission from i
   assert.notEqual(completions[0].stopReason, "error");
 });
 
+test("a graceful pre-planning abort keeps the anchor and continue completes the mission", async () => {
+  const vault = createVaultHarness();
+  const prompt = "Append the abort survivor line to the current note.";
+  const controller = new AbortController();
+  let identityRunId: string | null = null;
+  const completions: AgentRunCompleteEvent[] = [];
+
+  await runAgentMission({
+    prompt,
+    modelClient: createModelClient([
+      responseWithToolCall("append_to_current_file", {
+        text: "Abort survivor",
+      }),
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    abortSignal: controller.signal,
+    events: {
+      onRunIdentity: (event) => {
+        identityRunId = event.runId;
+      },
+      onTrace: (event) => {
+        if (event.id === "durable-run-anchor") {
+          // A plugin-disable "kill" reaches the runner as a graceful abort
+          // (RunCoordinator.shutdown -> requestStop). Fire it the moment the
+          // anchor is durable, before planning produced anything.
+          controller.abort("coordinator_shutdown");
+        }
+      },
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.ok(identityRunId, "run identity must be published at run start");
+  assert.equal(
+    completions.length,
+    1,
+    "the aborted run must complete gracefully through onRunComplete",
+  );
+  assert.equal(vault.files.get("Current.md"), "Initial note");
+  const survivingMarkdown = vault.files.get(`Agent Runs/${identityRunId}.md`);
+  assert.ok(
+    survivingMarkdown,
+    "the durable anchor must SURVIVE a graceful pre-planning abort — " +
+      "deleting it would re-open the exact interrupted-continuation hole",
+  );
+  const survivingAnchor = parseMissionLedgerFromMarkdown(survivingMarkdown);
+  assert.ok(survivingAnchor);
+  assert.equal(isPrePlanningAnchorLedger(survivingAnchor), true);
+  assert.equal(survivingAnchor.mission, prompt);
+
+  // The real interrupted-continuation shape end-to-end: the same vault,
+  // `continue run <id>`, and the recorded mission finishes its work.
+  const traces: AgentTraceEvent[] = [];
+  await runAgentMission({
+    prompt: `continue run ${identityRunId}`,
+    modelClient: createModelClient([
+      responseWithToolCall("append_to_current_file", {
+        text: "Abort survivor",
+      }),
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onTrace: (event) => traces.push(event),
+    },
+  });
+  assert.ok(
+    traces.some(
+      (event) => event.id === "mission-ledger-resume:pre-planning-anchor",
+    ),
+  );
+  assert.equal(
+    vault.files.get("Current.md"),
+    "Initial note\nAbort survivor",
+  );
+});
+
 test("anchor artifact removal deletes only a pre-planning anchor, never an evolved ledger", async () => {
   const vault = createVaultHarness();
   const anchorRunId = "run-anchor-cleanup";
