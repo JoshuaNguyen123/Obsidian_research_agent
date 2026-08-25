@@ -226,7 +226,7 @@
             "id": "acceptance_coverage",
             "score": 1,
             "weight": 0.3,
-            "detail": "12/12 criteria met",
+            "detail": "13/13 criteria met",
             "applicable": true
           },
           {
@@ -252,9 +252,9 @@
           },
           {
             "id": "research_depth",
-            "score": 0.5,
+            "score": 0.5625,
             "weight": 0.05,
-            "detail": "2 cited passages, 2 domains, 0 quotes, 2 sections",
+            "detail": "2 cited passages, 2 domains, 0 quotes, 3 sections",
             "applicable": true
           },
           {
@@ -268,18 +268,18 @@
             "id": "model_call_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "4/47 model calls",
+            "detail": "8/24 model calls",
             "applicable": true
           },
           {
             "id": "wall_clock_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "33s/840s",
+            "detail": "190s/840s",
             "applicable": true
           }
         ],
-        "total": 0.975
+        "total": 0.9781
       }
     },
     {
