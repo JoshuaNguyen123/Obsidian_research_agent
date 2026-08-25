@@ -17816,7 +17816,9 @@ export async function runAgentMission({
           ? `EXACT GITHUB PUBLICATION BINDING: profileKey=${JSON.stringify(verifiedLinearRepositoryBindingSnapshot.repositoryProfileKey)}; visibility=${resolvedRepositoryVisibility}; call github_create_repository with these exact values.`
           : null;
       pruneStaleFrontierCorrections(messages);
-      refreshMissionPlanPromptMessage(messages, missionPlan);
+      // stepTools is the same array the schemas below are built from, so the
+      // plan header cannot name a tool this step will refuse.
+      refreshMissionPlanPromptMessage(messages, missionPlan, stepTools);
       const stepMessages =
         stepTools.length > 0 && (missionGraph || setLooseCompoundEnabled)
           ? insertMissionGraphFrontierTurnContext(
@@ -28216,6 +28218,12 @@ const MAX_VERIFIED_LINEAR_SPEC_ANCHOR_CHARS = 8_000;
 function refreshMissionPlanPromptMessage(
   messages: ModelChatMessage[],
   plan: Parameters<typeof formatMissionPlanForPrompt>[0],
+  /**
+   * The exact tools whose schemas this step emits. Passing them keeps the
+   * plan header from naming a next tool the frontier will not accept — the
+   * two are projected by different code, and mid-stage they disagree.
+   */
+  stepTools: readonly ModelToolDefinition[] = [],
 ): void {
   const index = messages.findIndex(
     (message) =>
@@ -28223,10 +28231,13 @@ function refreshMissionPlanPromptMessage(
       message.content.startsWith(MISSION_PLAN_PROMPT_MARKER),
   );
   if (index < 0) return;
+  const callableToolNames = new Set(
+    stepTools.map((tool) => tool.function.name),
+  );
   const content = plan
     ? [
-        formatMissionPlanForPrompt(plan),
-        formatMissionPlanNextActionPrompt(plan),
+        formatMissionPlanForPrompt(plan, callableToolNames),
+        formatMissionPlanNextActionPrompt(plan, callableToolNames),
       ].join("\n\n")
     : `${MISSION_PLAN_PROMPT_MARKER} is retired for this run; follow the stage prompt.`;
   messages[index] = { ...messages[index]!, content };
