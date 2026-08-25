@@ -22,8 +22,6 @@ import {
   isWholeNoteEditIntent,
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
-import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
-import { canonicalizeKeywordTypos } from "./promptNormalization";
 import type { RoutedMissionIntent } from "./missionRouter";
 import type { MissionSpeechActClassificationV1 } from "./missionSpeechAct";
 import type { AutonomyEffectClass } from "./autonomyEffectClass";
@@ -48,6 +46,7 @@ import {
   hasAppendIntent,
   hasBrowserAutomationIntent,
   hasClearPageAndWriteIntent,
+  hasCodeExecutionIntent,
   hasCurrentNoteSectionTarget,
   hasCurrentPageWritebackIntent,
   hasCurrentWebFactIntent,
@@ -75,6 +74,7 @@ import {
   hasSpecificFileReadIntent,
   hasStaticGenerationIntent,
   hasTemplateIntent,
+  hasTitleIntent,
   hasTitleOnlyIntent,
   hasVaultBrowseIntent,
   hasVaultContextQuestionIntent,
@@ -743,36 +743,6 @@ function hasTopicSearchVaultQuestionIntent(prompt: string): boolean {
   );
 }
 
-function hasCodeExecutionIntent(prompt: string): boolean {
-  if (hasCodeExecutionIntentExact(prompt)) return true;
-  // Fuzzy rescue, widen-only: a bounded keyword-typo correction ("crate a …
-  // game in Python") may propose the route the corrected spelling would take;
-  // it can never suppress an exact-match positive.
-  const canonical = canonicalizeKeywordTypos(prompt);
-  return (
-    canonical.corrections.length > 0 &&
-    hasCodeExecutionIntentExact(canonical.text)
-  );
-}
-
-function hasCodeExecutionIntentExact(prompt: string): boolean {
-  return (
-    /\b(run|execute|eval|evaluate|test|compile)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile)\b/i.test(
-      prompt,
-    ) ||
-    /\b(?:code_workspace_[a-z0-9_]+|code_validate_(?:fast|targeted|full)|code_repair_(?:status|record_cycle)|code_commit_verified|install_code_dependency)\b/i.test(
-      prompt,
-    ) ||
-    /\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b[\s\S]{0,180}\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b|\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b[\s\S]{0,180}\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b/i.test(
-      prompt,
-    ) ||
-    // Keep runPlan routing aligned with AgentRunner code-deliverable intent so
-    // "build a checkers game in Python" takes grounded_workflow, not a chat-only
-    // path. One shared gate replaces the previously drifting private copy.
-    hasCodeDeliverableIntent(prompt)
-  );
-}
-
 /** Bound Linear/GitHub mutations named in the mission (tool-token e2e prompts). */
 function hasExplicitExternalMutationToolMission(prompt: string): boolean {
   const normalized = prompt.toLowerCase();
@@ -811,30 +781,6 @@ function countExplicitCodeToolNames(prompt: string): number {
       /\b(?:code_workspace_[a-z0-9_]+|code_validate_(?:fast|targeted|full)|code_repair_(?:status|record_cycle)|code_commit_verified|install_code_dependency|run_code_block|render_html_preview)\b/gu,
     ) ?? [],
   ).size;
-}
-
-function hasTitleIntent(prompt: string): boolean {
-  if (/\b(retitle|rename|title|h1)\b|\bcall\s+(?:this|the)\s+note\b/i.test(prompt)) {
-    return true;
-  }
-
-  // Bare "heading" is title intent only when not a named section edit.
-  if (/\bheading\b/i.test(prompt) && !isNamedSectionEditIntent(prompt)) {
-    return true;
-  }
-
-  // Content organize/edit owns the route; do not force rename-only tools.
-  if (
-    isCurrentNoteEditOrganizeIntent(prompt) ||
-    isVaultWideOrganizeIntent(prompt) ||
-    isWholeNoteEditIntent(prompt)
-  ) {
-    return false;
-  }
-
-  return /\b(note|file)\b[\s\S]{0,80}\b(organize|restructure|improve)\b|\b(organize|restructure|improve)\b[\s\S]{0,80}\b(note|file)\b/i.test(
-    prompt,
-  );
 }
 
 /**

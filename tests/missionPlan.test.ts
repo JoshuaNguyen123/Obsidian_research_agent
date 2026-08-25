@@ -955,3 +955,55 @@ test("mission-plan prompt starts with the marker the runner re-renders by", asyn
   // step-0 snapshot bug.
   assert.ok(rendered.startsWith(MISSION_PLAN_PROMPT_MARKER));
 });
+
+test("the plan header never names a next tool the current frontier refuses", async () => {
+  const {
+    formatMissionPlanForPrompt,
+    formatMissionPlanNextActionPrompt,
+  } = await import("../src/agent/missionPlanPrompts");
+  const plan = createMissionPlan({
+    runId: "run:frontier-agreement",
+    prompt: "Validate the workspace and append the results to the note.",
+    missionIntent: createIntent(true),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_model_planning",
+      allowedToolNames: ["code_validate_fast", "append_to_current_file"],
+    },
+    requiredTools: ["code_validate_fast", "append_to_current_file"],
+    now: new Date("2026-07-07T12:00:00.000Z"),
+  });
+
+  const preferred = getNextMissionPlanAction(plan)?.toolName;
+  assert.ok(preferred, "fixture must plan a preferred next tool");
+
+  // While the frontier can honour the plan, the header states it plainly.
+  const agreeing = formatMissionPlanForPrompt(plan, new Set([preferred!]));
+  assert.match(agreeing, new RegExp(`Next action:.*\\b${preferred}\\b`));
+
+  // Mid-stage the graph frontier can offer something else entirely. The
+  // header must not keep advertising a tool this step will refuse: that is a
+  // contradiction the model cannot resolve, and it spends reasoning turns
+  // reconciling plan-says-write against a frontier offering only a read.
+  const refusingFrontier = new Set(["read_file"]);
+  assert.equal(refusingFrontier.has(preferred!), false, "fixture sanity");
+
+  const disagreeing = formatMissionPlanForPrompt(plan, refusingFrontier);
+  assert.doesNotMatch(
+    disagreeing,
+    new RegExp(`Next action: \\w+ ${preferred}\\b`),
+    `header advertised ${preferred} while the frontier refused it`,
+  );
+  assert.match(disagreeing, /not on the current frontier/i);
+
+  const nextAction = formatMissionPlanNextActionPrompt(plan, refusingFrontier);
+  assert.doesNotMatch(nextAction, new RegExp(`Preferred tool: ${preferred}`));
+  assert.match(nextAction, /offered tools are authoritative/i);
+
+  // With no frontier supplied the rendering is unchanged, so callers that
+  // legitimately have no step frontier keep their existing text.
+  assert.match(
+    formatMissionPlanForPrompt(plan),
+    new RegExp(`Next action:.*\\b${preferred}\\b`),
+  );
+});

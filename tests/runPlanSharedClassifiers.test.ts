@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import * as sharedClassifiers from "../src/agent/promptIntentClassifiers";
+import * as titleIntent from "../src/agent/titleIntent";
 
 const RUN_PLAN_SOURCE = readFileSync(
   new URL("../src/agent/runPlan.ts", import.meta.url),
@@ -37,17 +38,14 @@ test("runPlan defines no private copy of a shared prompt classifier", () => {
 
   assert.deepEqual(
     redefined,
-    // hasCodeExecutionIntent is a deliberate exception, not a stale copy: the
-    // route composes an exact match with a bounded typo rescue and explicit
-    // code tool-name tokens, while the shared predicate composes standalone /
-    // repository / deliverable intent. Reconciling them changes what the tool
-    // frontier admits, so it needs a decision rather than a mechanical merge.
-    // hasTitleIntent is excepted for the same reason: the route models
-    // organize/restructure phrasing the shared title predicates do not.
-    ["hasCodeExecutionIntent", "hasTitleIntent"],
+    [],
     `runPlan.ts re-declares shared classifiers: ${redefined.join(", ")}. ` +
       "Import them from ./promptIntentClassifiers instead, or extend the " +
-      "shared definition so both consumers gain the change.",
+      "shared definition so both consumers gain the change. The deadlock " +
+      "direction is always route-promises-what-authority-refuses, so a " +
+      "predicate the route uses to promise a capability must be a subset of " +
+      "the one the authority path consumes: unify by promoting the richer " +
+      "matcher into the shared module, never by keeping the route wider.",
   );
 });
 
@@ -100,4 +98,118 @@ test("the reconciled predicates answer the prompts that used to split them", () 
     ),
     true,
   );
+});
+
+/**
+ * The deadlock this repo keeps re-fixing runs in one direction: the route
+ * promises a capability, the authority path refuses it, and the mission burns
+ * its budget between the two. These assert the promoted matchers on the
+ * predicate the FRONTIER consumes, which is the side that has to say yes.
+ */
+test("a typo-rescued code prompt is admitted by the predicate the frontier consumes", () => {
+  // The rescue is widen-only: it can only add what the corrected spelling
+  // would already have produced. Before promotion this lived privately in the
+  // route, so a typo'd prompt routed as code work and then met a frontier
+  // offering no code tools.
+  assert.equal(
+    sharedClassifiers.hasCodeExecutionIntent(
+      "crate a number guessing game in pythn",
+    ),
+    true,
+  );
+  assert.equal(
+    sharedClassifiers.hasCodeExecutionIntent(
+      "create a number guessing game in python",
+    ),
+    true,
+  );
+
+  // Naming a code tool outright is the most explicit possible request; the
+  // snake_case token cannot match the prose patterns, so it needs its own arm.
+  assert.equal(
+    sharedClassifiers.hasCodeExecutionIntent(
+      "run code_workspace_create_file for app.py",
+    ),
+    true,
+  );
+
+  // Promotion must not drag the route's unguarded repository regex along: a
+  // negated clause stays negative, so the route narrows rather than widens.
+  assert.equal(
+    sharedClassifiers.hasCodeExecutionIntent(
+      "Do not touch the repository; just summarize it",
+    ),
+    false,
+  );
+  assert.equal(
+    sharedClassifiers.hasCodeExecutionIntent(
+      "Research the CAP theorem and write a note.",
+    ),
+    false,
+  );
+});
+
+test("title intent covers organize phrasing without widening any capability offer", () => {
+  // Restructuring repositions the heading, so the route kept these on the tool
+  // loop. The shared predicate now agrees. The clause is a narrow residue on
+  // purpose: anything editOrganizeIntent already recognizes is excluded just
+  // below, so it only catches phrasings that module does not classify.
+  assert.equal(sharedClassifiers.hasTitleIntent("restructure my file"), true);
+  assert.equal(sharedClassifiers.hasTitleIntent("organize file contents"), true);
+
+  // A genuine content-organize mission owns its own route and is excluded.
+  for (const organizeMission of [
+    "Reorganize this note and improve the file structure",
+    "organize the note by topic",
+    "Use these sources to improve the note",
+  ]) {
+    assert.equal(
+      sharedClassifiers.hasTitleIntent(organizeMission),
+      false,
+      `content-organize mission must not become title work: ${organizeMission}`,
+    );
+  }
+
+  // The verb must govern the note itself. Matching on proximity alone read
+  // "write on this note ... find and organize information about the market"
+  // as title work, which made a web-research mission read the current note
+  // before it searched.
+  assert.equal(
+    sharedClassifiers.hasTitleIntent(
+      [
+        "I want you to write on this note.",
+        "Start by titling it Software project.",
+        "I want you to find and organize information about the current online dating market.",
+      ].join("\n"),
+    ),
+    false,
+  );
+
+  // Instance #2 was an OFFER one term wider than its AUTHORITY twin, which
+  // livelocked for 45 calls. hasTitleIntent only ever withholds a fast path;
+  // the rename/retitle capabilities are promised by these predicates, and
+  // getAllowedToolDefinitions and getRequiredWriteToolNames must keep reading
+  // them identically.
+  for (const prompt of [
+    "restructure my file",
+    "organize file contents",
+    "Retitle this note to Quarterly Planning",
+    "Set the h1 heading",
+    "Improve my notes",
+  ]) {
+    const renamePair =
+      titleIntent.isExplicitVisibleFileRenameIntent(prompt) ||
+      (titleIntent.isVisibleTitleRenameIntent(prompt) &&
+        titleIntent.isTitleOnlyIntent(prompt));
+    assert.equal(
+      sharedClassifiers.hasMarkdownTitleContentIntent(prompt),
+      titleIntent.isMarkdownTitleContentIntent(prompt),
+      `retitle offer and authority must read ${prompt} identically`,
+    );
+    assert.equal(
+      typeof renamePair,
+      "boolean",
+      `rename offer and authority must resolve for ${prompt}`,
+    );
+  }
 });

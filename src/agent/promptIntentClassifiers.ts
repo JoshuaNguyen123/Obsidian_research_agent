@@ -29,13 +29,14 @@ import {
   hasReviseDesignIntent,
 } from "./codeDesignIntent";
 import { isCurrentNoteReplaceResetPrompt } from "./currentNoteResetPolicy";
-import { isCurrentNoteEditOrganizeIntent, isNamedSectionEditIntent, isWholeNoteEditIntent } from "./editOrganizeIntent";
+import { isCurrentNoteEditOrganizeIntent, isNamedSectionEditIntent, isVaultWideOrganizeIntent, isWholeNoteEditIntent } from "./editOrganizeIntent";
 import { hasExplicitNoWebIntent, hasExplicitPublicWebSignal, hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
 import { detectLinearIntent } from "./linearIntent";
 import { hasMissionResumeIntent } from "./missionResume";
 import { extractExplicitNewWorkspaceFilePaths, extractMarkdownPathMentions, hasExplicitCurrentNoteMutationIntent } from "./missionScope";
 import { detectProjectLifecycleStagesV1 } from "./projectLifecycle";
+import { canonicalizeKeywordTypos } from "./promptNormalization";
 import { isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
@@ -176,11 +177,41 @@ export function hasOpenWebSourceIntent(prompt: string): boolean {
   );
 }
 
-export function hasCodeExecutionIntent(prompt: string): boolean {
+// Snake_case tool names are a single \w token, so the prose patterns above can
+// never match inside one. A prompt that names a code tool outright is asking
+// for code work by the most explicit means available.
+const EXPLICIT_CODE_TOOL_NAME_TOKEN =
+  /\b(?:code_workspace_[a-z0-9_]+|code_validate_(?:fast|targeted|full)|code_repair_(?:status|record_cycle)|code_commit_verified|install_code_dependency)\b/i;
+
+function hasExactCodeExecutionIntent(prompt: string): boolean {
   return (
     hasStandaloneCodeExecutionIntent(prompt) ||
+    EXPLICIT_CODE_TOOL_NAME_TOKEN.test(prompt) ||
     hasRepositoryCodeMutationIntent(prompt) ||
     hasCodeDeliverableIntent(prompt)
+  );
+}
+
+/**
+ * The single code-execution authority for both the route and the tool
+ * frontier. It has to be the frontier's predicate specifically: the failure
+ * this repo keeps re-fixing is a route that promises a capability the
+ * authority path then refuses, so a prompt the route reads as code work must
+ * never reach a frontier that offers no code tools.
+ *
+ * The typo rescue is widen-only by construction -- it can only add a positive
+ * that the corrected spelling would already have produced, never suppress an
+ * exact match -- so "crate a game in python" routes and is offered tools as
+ * the same mission rather than deadlocking between the two.
+ */
+export function hasCodeExecutionIntent(prompt: string): boolean {
+  if (hasExactCodeExecutionIntent(prompt)) {
+    return true;
+  }
+  const canonical = canonicalizeKeywordTypos(prompt);
+  return (
+    canonical.corrections.length > 0 &&
+    hasExactCodeExecutionIntent(canonical.text)
   );
 }
 
@@ -1428,8 +1459,40 @@ export function hasStaticGenerationIntent(prompt: string): boolean {
   );
 }
 
+/**
+ * "This mission is about the note's title" for both the route and the tool
+ * frontier. Every consumer uses it to WITHHOLD a fast path -- it keeps a
+ * mission on the tool loop, forces a current-note read, and blocks streamed
+ * writeback -- so the two must not disagree about which missions get that
+ * care. The rename and retitle capabilities themselves are promised by
+ * isVisibleTitleRenameIntent / isMarkdownTitleContentIntent, which offer and
+ * authority already consume as a matched pair; widening here cannot open a
+ * gap between them.
+ */
 export function hasTitleIntent(prompt: string): boolean {
-  return isMarkdownTitleContentIntent(prompt) || isVisibleTitleRenameIntent(prompt);
+  if (isMarkdownTitleContentIntent(prompt) || isVisibleTitleRenameIntent(prompt)) {
+    return true;
+  }
+
+  // Restructuring a note repositions its heading, so the route treated this as
+  // title work and stayed on the tool loop. A genuine content-organize mission
+  // owns its own route and must not be pulled into rename-only handling.
+  if (
+    isCurrentNoteEditOrganizeIntent(prompt) ||
+    isVaultWideOrganizeIntent(prompt) ||
+    isWholeNoteEditIntent(prompt)
+  ) {
+    return false;
+  }
+
+  // The verb has to govern the note itself. Proximity alone matched "write on
+  // this note ... find and organize information about the market", where the
+  // thing being organized is the research, not the document -- which turned a
+  // web-research mission into current-note work and made it read the note
+  // before searching.
+  return /\b(?:organi[sz]e|reorgani[sz]e|restructure|improve)\s+(?:the\s+|this\s+|my\s+|its\s+)?(?:note|file)\b/i.test(
+    prompt,
+  );
 }
 
 export function hasMarkdownTitleContentIntent(prompt: string): boolean {
