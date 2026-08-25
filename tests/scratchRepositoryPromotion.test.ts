@@ -168,11 +168,20 @@ test("promotion is idempotent and refuses a second, different binding", async ()
     const reconciled = await tool.reconcile!(action, context);
     assert.equal(reconciled.outcome, "committed");
 
-    // And preparing a fresh promotion refuses outright, so a second repository
-    // can never be created over the first.
-    await assert.rejects(
-      () => requirePrepared(tool, {}, context),
-      /Only a scratch workspace can be promoted/u,
+    // Preparing a fresh promotion over the bound workspace yields a verified
+    // no-op that records the existing binding — never a second repository.
+    // (It used to refuse outright, which deadlocked planner-planted promotion
+    // nodes whose workspace turned out to be already bound, 2026-08-25.)
+    const reAction = await requirePrepared(tool, {}, context);
+    assert.match(reAction.preview.summary, /already carries the trusted repository binding/u);
+    const reResult = await tool.executePrepared!(
+      reAction,
+      authorize(context, reAction),
+    );
+    assert.equal((reResult.output as WorkspaceManifestV2).baseSha, firstSha);
+    assert.match(
+      reResult.receipt.message,
+      /Recorded the existing repository binding/u,
     );
     assert.equal((await fixture.manager.loadManifest("idem-space")).kind, "repository");
   } finally {

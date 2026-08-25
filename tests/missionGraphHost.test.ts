@@ -1876,3 +1876,148 @@ function backgroundCodeDescriptor(): ToolDescriptor {
     receiptKind: "code_change",
   };
 }
+
+test("a scratch ladder reaching repair or commit gains the repository promotion node", async () => {
+  // Instance #13 (2026-08-25 live scratch-to-PR proof): the executors refuse
+  // repair records and verified commits without a repository binding, but the
+  // planner never planted code_workspace_init_repository, so the frontier
+  // demanded tools the workspace could not satisfy and segments burned.
+  const planned = [
+    "code_workspace_create",
+    "code_workspace_append",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+    "publish_verified_code_to_github",
+  ];
+  const allowed = [...planned, "code_workspace_init_repository"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-scratch-promotion",
+    objective:
+      "Create a brand-new scratch code workspace with a small Python library, validate it, create a verified commit, and publish it to a new private GitHub repo as one draft pull request.",
+    toolRegistry: registryForDescriptors(
+      allowed.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: allowed,
+    modelVisibleToolNames: allowed,
+    plannedToolNames: planned,
+    maxToolCalls: Number.POSITIVE_INFINITY,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  const order = Object.values(host.deterministicProposal.nodes)
+    .filter((node) => node.id !== "final")
+    .flatMap((node) => node.allowedTools);
+  const initIndex = order.indexOf("code_workspace_init_repository");
+  const firstRepairIndex = order.indexOf("code_repair_record_cycle");
+  assert.ok(initIndex >= 0, "promotion node missing: " + order.join(","));
+  assert.ok(
+    initIndex < firstRepairIndex,
+    "promotion must precede the first repair record: " + order.join(","),
+  );
+  assert.equal(
+    order.filter((name) => name === "code_workspace_init_repository").length,
+    1,
+  );
+});
+
+test("a composite issue-bound lifecycle is never given the promotion node", async () => {
+  // The discriminator is plan structure, not phrasing: an issue-bound
+  // lifecycle adopts its trusted repository from the signed contract.
+  const workspaceNames = [
+    "code_workspace_create",
+    "code_workspace_append",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_commit_verified",
+    "code_workspace_init_repository",
+  ];
+  const descriptors = [
+    ...workspaceNames.map((name) => workspaceLifecycleDescriptor(name)),
+    lifecycleDescriptor("linear_get_issue", "linear", "read"),
+  ];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-composite-no-promotion",
+    objective:
+      "Review and implement Linear issue 71aa708b-70a1-4b26-9e6f-fb8a9c31a4d2. Begin with an independent linear_get_issue read of that exact identity. Implement the requested Python library in its bound trusted repository and create one verified local commit.",
+    toolRegistry: registryForDescriptors(descriptors),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names.filter(
+      (name) => name !== "code_workspace_init_repository",
+    ),
+    maxToolCalls: 24,
+    maxWallClockMs: 60 * 60_000,
+    now: NOW,
+  });
+  const order = Object.values(host.deterministicProposal.nodes)
+    .filter((node) => node.id !== "final")
+    .flatMap((node) => node.allowedTools);
+  assert.equal(
+    order.includes("code_workspace_init_repository"),
+    false,
+    "composite lifecycle must not plant a promotion node: " + order.join(","),
+  );
+});
+
+test("an explicitly planned promotion node is not duplicated", async () => {
+  const planned = [
+    "code_workspace_create",
+    "code_workspace_append",
+    "code_validate_fast",
+    "code_workspace_init_repository",
+    "code_repair_record_cycle",
+    "code_commit_verified",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-promotion-already-planned",
+    objective:
+      "Create a brand-new scratch code workspace with a small Python library, validate it, initialize the repository, and create a verified commit.",
+    toolRegistry: registryForDescriptors(
+      planned.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: planned,
+    modelVisibleToolNames: planned,
+    plannedToolNames: planned,
+    maxToolCalls: Number.POSITIVE_INFINITY,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  const order = Object.values(host.deterministicProposal.nodes)
+    .filter((node) => node.id !== "final")
+    .flatMap((node) => node.allowedTools);
+  assert.equal(
+    order.filter((name) => name === "code_workspace_init_repository").length,
+    1,
+    "order: " + order.join(","),
+  );
+});
+
+test("a scratch ladder with no binding-requiring tools plans no promotion", async () => {
+  const planned = [
+    "code_workspace_create",
+    "code_workspace_append",
+    "code_validate_fast",
+  ];
+  const allowed = [...planned, "code_workspace_init_repository"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-scratch-no-binding-tools",
+    objective: "Create a scratch workspace with one Python file and validate it.",
+    toolRegistry: registryForDescriptors(
+      allowed.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: allowed,
+    modelVisibleToolNames: allowed,
+    plannedToolNames: planned,
+    maxToolCalls: Number.POSITIVE_INFINITY,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  const order = Object.values(host.deterministicProposal.nodes)
+    .filter((node) => node.id !== "final")
+    .flatMap((node) => node.allowedTools);
+  assert.equal(order.includes("code_workspace_init_repository"), false);
+});

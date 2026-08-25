@@ -1571,6 +1571,57 @@ class WorkspaceToolRuntimeV2 {
       leaseId,
       leaseOwnerId,
     );
+    if (manifest.kind === "repository" && manifest.repositoryBinding) {
+      // The promotion goal is already satisfied: the workspace carries a
+      // trusted binding. Refusing here deadlocked planned ladders whose
+      // workspace turned out to be repository-bound (the planner cannot know
+      // the kind before code_workspace_create executes), so the promotion is
+      // recorded as a verified no-op over the exact existing binding instead.
+      const binding = manifest.repositoryBinding;
+      const expected = sha256Json({
+        workspaceId,
+        ownerRunId,
+        kind: "repository",
+        profileKey: binding.profileKey,
+        branch: binding.branch,
+        bindingFingerprint: binding.bindingFingerprint,
+      });
+      return preparedAction({
+        name: "code_workspace_init_repository",
+        context,
+        workspaceId,
+        targetPath: workspaceId,
+        normalizedArgs: {
+          workspaceId,
+          ownerRunId,
+          leaseId,
+          leaseOwnerId,
+          profileKey: binding.profileKey,
+          branch: binding.branch,
+          bindingFingerprint: binding.bindingFingerprint,
+          expectedWorkspaceState: "repository",
+          payloadBytes: 0,
+        },
+        expected,
+        summary:
+          `Workspace ${workspaceId} already carries the trusted repository binding ` +
+          `${binding.profileKey}; record the promotion as a verified no-op.`,
+        action: "create",
+        outboundBytes: 0,
+        targetType: "code_workspace",
+        previewDestination: manifest.canonicalRoot,
+        relatedResources: [{
+          system: "git",
+          resourceType: "repository",
+          id: `repository:${manifest.canonicalRoot}`,
+          path: manifest.canonicalRoot,
+        }],
+        repositoryProfileId: binding.profileKey,
+        warnings: [
+          "No repository will be created: this workspace is already bound; approving records the existing binding.",
+        ],
+      });
+    }
     if (manifest.kind !== "scratch") {
       throw new WorkspaceManagerErrorV2(
         "scratch_promotion_kind_invalid",
@@ -1657,13 +1708,12 @@ class WorkspaceToolRuntimeV2 {
     const leaseOwnerId = requiredString(args.leaseOwnerId, "leaseOwnerId");
     const profileKey = requiredString(args.profileKey, "profileKey");
     const branch = requiredString(args.branch, "branch");
-    const commitMessage = requiredString(args.commitMessage, "commitMessage");
-    const trackedPaths = requiredStringArray(args.trackedPaths, "trackedPaths");
     if (
       ownerRunId !== runId(context) ||
       action.target.workspaceId !== workspaceId ||
       action.target.path !== workspaceId ||
-      args.expectedWorkspaceState !== "scratch"
+      (args.expectedWorkspaceState !== "scratch" &&
+        args.expectedWorkspaceState !== "repository")
     ) {
       throw new WorkspaceManagerErrorV2(
         "prepared_binding_drift",
@@ -1677,6 +1727,43 @@ class WorkspaceToolRuntimeV2 {
       leaseId,
       leaseOwnerId,
     );
+    if (args.expectedWorkspaceState === "repository") {
+      // A no-op promotion prepared over an already-bound workspace: the
+      // execute must observe the exact binding the approval described.
+      const binding =
+        manifest.kind === "repository" ? manifest.repositoryBinding : null;
+      if (
+        !binding ||
+        binding.profileKey !== profileKey ||
+        binding.branch !== branch ||
+        binding.bindingFingerprint !==
+          requiredFingerprint(args.bindingFingerprint)
+      ) {
+        throw new WorkspaceManagerErrorV2(
+          "precondition_failed",
+          "The workspace binding changed between approval and the no-op promotion.",
+        );
+      }
+      return {
+        output: {
+          ...manifest,
+          repositoryWriteScope: await this.resolveRepositoryWriteScopeOutput(
+            profileKey,
+            context,
+          ),
+        },
+        receipt: workspaceCreationReceipt(
+          action,
+          context,
+          manifest,
+          binding.bindingFingerprint,
+          `Recorded the existing repository binding for ${workspaceId}; no repository was created.`,
+        ),
+        mutationState: "applied" as const,
+      };
+    }
+    const commitMessage = requiredString(args.commitMessage, "commitMessage");
+    const trackedPaths = requiredStringArray(args.trackedPaths, "trackedPaths");
     if (manifest.kind === "repository") {
       // Idempotent retry over an already-applied promotion.
       const binding = manifest.repositoryBinding;

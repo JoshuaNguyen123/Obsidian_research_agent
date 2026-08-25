@@ -30,6 +30,7 @@ import {
 } from "./missionScope";
 import {
   hasExplicitNoHostDirectoryExportIntent,
+  hasRepositoryCodeEditIntent,
 } from "./promptIntentClassifiers";
 import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTool";
 import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
@@ -279,10 +280,13 @@ export async function buildHostMissionGraphPlanV1(
     seenEffectfulPlannedNames.add(name);
     basePlannedSteps.push({ name });
   }
-  const plannedSteps = expandBoundedWorkspaceRepairReview({
-    steps: basePlannedSteps,
-    explicitNewWorkspaceFilePaths,
-    explicitWorkspaceReadFilePaths,
+  const plannedSteps = insertScratchRepositoryPromotionV1({
+    steps: expandBoundedWorkspaceRepairReview({
+      steps: basePlannedSteps,
+      explicitNewWorkspaceFilePaths,
+      explicitWorkspaceReadFilePaths,
+      descriptorByName,
+    }),
     descriptorByName,
   });
   const compositeLifecyclePlan = buildCompositeLifecyclePlanV1({
@@ -677,6 +681,68 @@ function addPostAcceptanceNodes(input: {
       },
     };
   });
+}
+
+/**
+ * Tools whose EXECUTORS refuse a workspace without a repository binding
+ * (extensions/code repair proof adapters and the verified-commit path bail on
+ * a missing manifest.repositoryBinding). A planned ladder that reaches any of
+ * them from a scratch workspace deadlocks: the frontier demands the tool, the
+ * executor refuses it, and segments burn without the graph advancing — three
+ * provider segments were spent exactly this way on the 2026-08-25 live
+ * scratch-to-PR proof (blocker "Code repair and verified commits require a
+ * trusted repository worktree workspace", instance #13 of the announce-vs-
+ * enforce pattern).
+ */
+const REPOSITORY_BINDING_REQUIRED_TOOLS = new Set([
+  "code_repair_record_cycle",
+  "code_commit_verified",
+  "publish_verified_code_to_github",
+]);
+
+export function codeToolRequiresRepositoryBindingV1(name: string): boolean {
+  return REPOSITORY_BINDING_REQUIRED_TOOLS.has(name);
+}
+
+/**
+ * A ladder whose steps reach a binding-requiring tool without adopting a
+ * trusted repository from a signed contract is a scratch delivery and must
+ * plant `code_workspace_init_repository` before the first such tool. The
+ * discriminator is the planned `linear_get_issue` read: contract-bound
+ * missions always read their issue (the binding's repositoryKey lives in
+ * it), scratch deliveries never do. Prompt intent deliberately plays no
+ * part — a scratch mission that names its target GitHub repository reads as
+ * "repository" to every prompt classifier, which is exactly how the live
+ * proof burned three segments. Over-planting is additionally harmless: the
+ * executor records a verified no-op when the workspace turns out to carry a
+ * binding already.
+ */
+function insertScratchRepositoryPromotionV1(input: {
+  steps: PlannedToolStepV1[];
+  descriptorByName: Map<string, ToolDescriptor>;
+}): PlannedToolStepV1[] {
+  const steps = [...input.steps];
+  const names = new Set(steps.map((step) => step.name));
+  if (
+    names.has("code_workspace_init_repository") ||
+    names.has("linear_get_issue") ||
+    !names.has("code_workspace_create") ||
+    !input.descriptorByName.has("code_workspace_init_repository")
+  ) {
+    return steps;
+  }
+  const firstBindingIndex = steps.findIndex((step) =>
+    codeToolRequiresRepositoryBindingV1(step.name),
+  );
+  if (firstBindingIndex < 0) {
+    return steps;
+  }
+  steps.splice(firstBindingIndex, 0, {
+    name: "code_workspace_init_repository",
+    objective:
+      "Promote the scratch workspace into a trusted repository worktree before repair records and verified commits.",
+  });
+  return steps;
 }
 
 function expandBoundedWorkspaceRepairReview(input: {
