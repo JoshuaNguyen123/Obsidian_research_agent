@@ -24,6 +24,15 @@ import { createAcceptedResearchArtifactV1 } from "../src/integrations/linear/Acc
 import { appendAgentRunCheckpoint } from "../src/agent/checkpoints";
 import { seedDurableChildRun } from "../src/agent/durableChildSeed";
 import {
+  buildMissionCapabilityEnvelopeV1,
+  type MissionGraphV3,
+} from "../packages/headless-runtime/src/missionGraphV3";
+import {
+  persistInitialMissionGraph,
+  type MissionGraphStoreWriteResult,
+} from "../src/agent/missionGraphStore";
+import type { OrchestratorSnapshotV1 } from "../src/orchestrator/types";
+import {
   flattenMissionPlanTasks,
   type MissionPlan,
 } from "../src/agent/missionPlan";
@@ -1985,6 +1994,147 @@ test("explicit missing run id fails closed instead of loading the latest unrelat
   assert.doesNotMatch(assistant.join(""), /unrelated checkpoint/i);
 });
 
+test("crash orphan with only durable graph and worker records resumes with crash_recovered provenance", async () => {
+  const vault = createVaultHarness();
+  const rootRunId = "run-crash-orphan-root";
+  const leadRunId = "run-crash-orphan-root-lead";
+  // A hard renderer crash before the root run's Agent Runs note exists: only
+  // the orchestrator-linked worker note and the canonical mission graph store
+  // are durable. No checkpoint, ledger, or handoff exists for the root id.
+  const graph = await seedCrashOrphanMissionGraph(vault.context, leadRunId);
+  const leadLedger = createMissionLedger({
+    runId: leadRunId,
+    mission: "Research the crashed overnight topic.",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 12,
+      toolStepBudget: 8,
+      finalizationReserve: 4,
+      expectedTools: ["web_search"],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-07-10T12:00:00.000Z"),
+  });
+  leadLedger.status = "running";
+  leadLedger.orchestrator = {
+    runId: rootRunId,
+  } as unknown as OrchestratorSnapshotV1;
+  await writeMissionLedger(vault.context, leadLedger);
+  await writeMissionRuntimeSnapshot(
+    vault.context,
+    createMissionRuntimeSnapshot({
+      runId: leadRunId,
+      originalMission: leadLedger.mission,
+      currentNotePath: "Current.md",
+      missionGraphRef: {
+        version: 1,
+        missionId: graph.record.missionId,
+        path: graph.path,
+        storeRevision: graph.record.storeRevision,
+        graphRevision: graph.record.graph.revision,
+        recordFingerprint: graph.record.recordFingerprint,
+        journalHeadFingerprint: graph.record.graph.journalHeadFingerprint,
+      },
+      createdAt: new Date("2026-07-10T12:00:01.000Z"),
+      updatedAt: new Date("2026-07-10T12:00:02.000Z"),
+    }),
+  );
+
+  let modelCalls = 0;
+  const assistant: string[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const missionGraphIds: string[] = [];
+
+  await runAgentMission({
+    prompt: `continue run ${rootRunId}`,
+    modelClient: createModelClient(
+      [responseWithContent("The crash-recovered segment is complete.")],
+      [],
+      () => {
+        modelCalls += 1;
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onAssistantDelta: (delta) => assistant.push(delta),
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => completions.push(event),
+      onMissionGraphUpdate: (missionGraph) => {
+        missionGraphIds.push(missionGraph.missionId);
+      },
+    },
+  });
+
+  const refusalTraces = traces.filter((event) =>
+    event.id.startsWith("checkpoint-resume:"),
+  );
+  assert.doesNotMatch(
+    assistant.join(""),
+    /exact durable checkpoint is unavailable/i,
+    JSON.stringify(refusalTraces, null, 2),
+  );
+  assert.ok(modelCalls >= 1, "the crash-recovered continuation must run");
+  const crashTrace = traces.find(
+    (event) => event.id === "checkpoint-resume:crash-recovered",
+  );
+  assert.ok(crashTrace, "expected a crash-recovered continuation trace");
+  const preview = crashTrace.outputPreview as {
+    provenance: string;
+    resume: { runId: string; viaOrchestratorLink: boolean };
+    graph: { missionId: string };
+  };
+  assert.equal(preview.provenance, "crash_recovered");
+  assert.equal(preview.resume.runId, leadRunId);
+  assert.equal(preview.resume.viaOrchestratorLink, true);
+  assert.equal(preview.graph.missionId, leadRunId);
+  // The persisted graph resumed verbatim under its original mission identity
+  // instead of a freshly planned graph for the new segment run id.
+  assert.equal(missionGraphIds[0], leadRunId);
+  assert.equal(completions.length, 1);
+});
+
+test("crash recovery stays fail-closed when the only durable graph store is tampered", async () => {
+  const vault = createVaultHarness();
+  const runId = "run-crash-orphan-tampered";
+  const graph = await seedCrashOrphanMissionGraph(vault.context, runId);
+  vault.files.set(
+    graph.path,
+    (vault.files.get(graph.path) ?? "").replace(
+      '"objective": "Read the trusted source."',
+      '"objective": "Tampered objective."',
+    ),
+  );
+
+  let modelCalls = 0;
+  const assistant: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+
+  await runAgentMission({
+    prompt: `continue run ${runId}`,
+    modelClient: createModelClient(
+      [responseWithContent("MODEL MUST NOT RUN")],
+      [],
+      () => {
+        modelCalls += 1;
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onAssistantDelta: (delta) => assistant.push(delta),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.equal(modelCalls, 0);
+  assert.equal(completions.at(-1)?.stopReason, "error");
+  assert.match(assistant.join(""), /exact durable checkpoint is unavailable/i);
+});
+
 test("durable child is seeded with an exact ledger and runtime snapshot before activation", async () => {
   const vault = createVaultHarness();
   await seedDurableChildRun(vault.context, {
@@ -2271,6 +2421,105 @@ function createVaultHarness(options: {
   };
 
   return { context, files };
+}
+
+/** Only the canonical mission graph store survives a crash-orphaned mission. */
+async function seedCrashOrphanMissionGraph(
+  context: ToolExecutionContext,
+  missionId: string,
+): Promise<MissionGraphStoreWriteResult> {
+  const createdAt = "2026-07-10T12:00:00.000Z";
+  const capabilityEnvelope = await buildMissionCapabilityEnvelopeV1({
+    missionId,
+    issuedAt: createdAt,
+    expiresAt: null,
+    capabilities: ["web.read"],
+    executionHosts: ["obsidian_core"],
+    executors: {
+      core: {
+        id: "core",
+        executionHosts: ["obsidian_core"],
+        allowedEffects: ["read"],
+      },
+    },
+    verifiers: ["artifact-verifier"],
+    tools: {
+      web_search: {
+        name: "web_search",
+        effect: "read",
+        capabilityIds: ["web.read"],
+        executionHosts: ["obsidian_core"],
+        bindingKinds: [],
+      },
+    },
+    bindings: {},
+    budgets: {
+      maxNodes: 16,
+      maxDepth: 4,
+      maxConcurrentReadNodes: 3,
+      maxTotalToolCalls: 24,
+      maxExternalActions: 0,
+      maxWallClockMs: 120_000,
+      maxAttemptsPerNode: 3,
+    },
+  });
+  const graph: MissionGraphV3 = {
+    schemaVersion: 3,
+    missionId,
+    objective: "Read the trusted source.",
+    revision: 0,
+    journalHeadFingerprint: null,
+    createdAt,
+    updatedAt: createdAt,
+    routing: {
+      source: "deterministic",
+      fallbackFrom: null,
+      fallbackReason: null,
+      confidence: 1,
+      decidedAt: createdAt,
+      decisionFingerprint: `sha256:${"1".repeat(64)}`,
+    },
+    continuationCheckpoint: null,
+    capabilityEnvelope,
+    nodes: {
+      read: {
+        id: "read",
+        dependencyIds: [],
+        objective: "Read one trusted source.",
+        executorId: "core",
+        executionHost: "obsidian_core",
+        effect: "read",
+        inputs: {},
+        outputs: {},
+        requiredCapabilities: ["web.read"],
+        allowedTools: ["web_search"],
+        destination: null,
+        resourceLocks: [],
+        budget: { toolCalls: 1, externalActions: 0, wallClockMs: 5_000 },
+        retries: {
+          maxAttempts: 3,
+          attempts: 0,
+          failureFingerprints: [],
+          consecutiveFailureFingerprint: null,
+          consecutiveFailureCount: 0,
+        },
+        status: "ready",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        completionContract: {
+          criteria: ["One source is recorded."],
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["web-source"],
+          minimumReceipts: 0,
+          requiredReceiptKinds: [],
+          verifierId: "artifact-verifier",
+        },
+        blocker: null,
+      },
+    },
+  };
+  return persistInitialMissionGraph(context, graph);
 }
 
 /** A paused web-research run whose next segment must resume via `continue run`. */

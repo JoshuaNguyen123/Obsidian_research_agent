@@ -895,11 +895,13 @@ export async function readMissionLedgerByRunId(
   // plugin restart. Read the exact adapter path as a bounded fallback, but
   // accept it only when the embedded ledger identity matches the requested
   // run. This also fails closed on sanitized filename collisions.
-  const adapter = context.app.vault.adapter as unknown as {
-    exists?: (path: string) => Promise<boolean>;
-    read?: (path: string) => Promise<string>;
-  };
-  if (typeof adapter.read === "function") {
+  const adapter = context.app.vault.adapter as unknown as
+    | {
+        exists?: (path: string) => Promise<boolean>;
+        read?: (path: string) => Promise<string>;
+      }
+    | undefined;
+  if (typeof adapter?.read === "function") {
     try {
       if (
         typeof adapter.exists !== "function" ||
