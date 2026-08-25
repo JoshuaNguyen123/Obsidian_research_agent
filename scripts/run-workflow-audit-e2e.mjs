@@ -169,6 +169,7 @@ export async function runWorkflowAuditE2eV1(options = {}) {
   let auditError = null;
   try {
     for (const stage of WORKFLOW_AUDIT_STAGES) {
+      await sweepTestVaultObsidianZombiesV1(stage.id);
       const boundary = await gitState();
       assertExactCleanHeadV1(boundary, expectedHead, `before ${stage.id}`);
       const startedAt = now().toISOString();
@@ -450,6 +451,44 @@ function boundedEvidenceCount(value, label) {
     throw new Error(`Workflow audit ${label} is invalid.`);
   }
   return value;
+}
+
+/**
+ * A finished stage's Obsidian process tree does not always reap on Windows:
+ * renderer/GPU children survive the parent, and the next stage's preflight
+ * then refuses with "Obsidian.exe is already running" (observed 2026-08-25,
+ * stage boundary linear -> github-askpass, four surviving processes). Only
+ * processes whose command line names the e2e test vault are swept — an
+ * Obsidian the user has open on a real vault is never touched, which is also
+ * why this sweep cannot replace the preflight assertion.
+ */
+async function sweepTestVaultObsidianZombiesV1(stageId) {
+  if (process.platform !== "win32") {
+    return;
+  }
+  const psScript =
+    "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Obsidian.exe'\" | " +
+    "Where-Object { $_.CommandLine -match 'test_vault_obsidian_ai' }); " +
+    "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; " +
+    "Write-Output $procs.Count";
+  try {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", psScript],
+      { windowsHide: true, timeout: 30_000, encoding: "utf8" },
+    );
+    const sweptCount = Number.parseInt(stdout.trim(), 10) || 0;
+    if (sweptCount > 0) {
+      console.log(
+        `Swept ${sweptCount} test-vault Obsidian zombie process(es) before ${stageId}.`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+  } catch (error) {
+    console.warn(
+      `Test-vault Obsidian zombie sweep before ${stageId} failed (preflight will still refuse if one survives): ${error?.message ?? error}`,
+    );
+  }
 }
 
 function assertExactCleanHeadV1(state, expectedHead, boundary) {
