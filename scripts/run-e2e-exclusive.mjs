@@ -281,6 +281,7 @@ async function main() {
       try {
         await assertMissionScorecardSummaryFile({
           selectedProjects: projects,
+          requireSummary: true,
           // A targeted grep may intentionally run an unscored settings/guard
           // test inside a scored project. In that case compare only baselined
           // tests that actually ran. Full project lanes remain fail-closed and

@@ -226,7 +226,7 @@ test("E2E cleanup refuses a linked recursive cleanup target", async () => {
   const outside = await mkdtemp(path.join(os.tmpdir(), "owned-e2e-outside-"));
   try {
     const snapshot = await snapshotOwnedE2EArtifacts(root);
-    await symlink(outside, path.join(root, "E2E Agent Tests"), "junction");
+    await symlink(outside, path.join(root, "E2E Agent Tests"), process.platform === "win32" ? "junction" : "dir");
     await assert.rejects(restoreOwnedE2EArtifacts(snapshot), /linked/u);
   } finally {
     await rm(path.join(root, "E2E Agent Tests"), { force: true }).catch(() => undefined);
@@ -241,7 +241,7 @@ test("E2E cleanup refuses a linked Mission Graphs target", async () => {
   try {
     await mkdir(path.join(root, "Agent Runs"), { recursive: true });
     const snapshot = await snapshotOwnedE2EArtifacts(root);
-    await symlink(outside, path.join(root, "Agent Runs", "Mission Graphs"), "junction");
+    await symlink(outside, path.join(root, "Agent Runs", "Mission Graphs"), process.platform === "win32" ? "junction" : "dir");
     await assert.rejects(restoreOwnedE2EArtifacts(snapshot), /linked/u);
   } finally {
     await rm(path.join(root, "Agent Runs", "Mission Graphs"), { force: true }).catch(

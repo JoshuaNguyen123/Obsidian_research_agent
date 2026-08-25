@@ -9,8 +9,10 @@ import {
   MAX_EXTERNAL_ACTION_RECEIPTS,
   MAX_PENDING_LINEAR_RECONCILIATIONS,
   appendVerifiedExternalActionReceipt,
+  canSupersedeIncompleteGithubPublicationReceipt,
   createExternalActionReceiptLedgerState,
   createPendingLinearReconciliationState,
+  isIncompleteGithubPublicationReceipt,
   normalizeExternalActionReceiptLedgerState,
   normalizePendingLinearReconciliationState,
   parseExternalActionReceiptLedgerState,
@@ -328,6 +330,54 @@ test("external receipt append rolls off the oldest item at the fixed 256-entry b
   assert.equal(rolled.entries.at(-1)?.receipt.id, "linear-receipt-new");
 });
 
+test("incomplete GitHub publish receipts can be superseded by a later complete receipt", () => {
+  const branch = githubReceiptFixture({
+    resourceType: "repository_branch",
+    url: "https://github.com/acme/repo/tree/codex/fix",
+  });
+  const draftPr = githubReceiptFixture({
+    resourceType: "pull_request",
+    url: "https://github.com/acme/repo/pull/12",
+    id: "github-receipt-2",
+  });
+  const otherWork = githubReceiptFixture({
+    resourceType: "pull_request",
+    url: "https://github.com/acme/repo/pull/99",
+    id: "github-receipt-3",
+    idempotencyKey: "github:other-work",
+  });
+  assert.equal(
+    isIncompleteGithubPublicationReceipt(branch),
+    true,
+    "a branch-only GitHub receipt is incomplete until a draft PR exists",
+  );
+  assert.equal(
+    isIncompleteGithubPublicationReceipt(draftPr),
+    false,
+    "a GitHub receipt whose URL contains /pull/<n> is complete",
+  );
+  assert.equal(
+    isIncompleteGithubPublicationReceipt(receiptFixture()),
+    false,
+    "Linear receipts are not GitHub publication receipts",
+  );
+  assert.equal(
+    canSupersedeIncompleteGithubPublicationReceipt(branch, draftPr),
+    true,
+    "an incomplete GitHub receipt may be replaced by a later receipt for the same work",
+  );
+  assert.equal(
+    canSupersedeIncompleteGithubPublicationReceipt(branch, otherWork),
+    false,
+    "a different idempotency key is a different publication and must not supersede",
+  );
+  assert.equal(
+    canSupersedeIncompleteGithubPublicationReceipt(draftPr, branch),
+    false,
+    "a complete GitHub receipt must not be superseded by an incomplete retry",
+  );
+});
+
 async function uncertainState(action: PreparedAction) {
   return upsertUncertainLinearReconciliation(
     createPendingLinearReconciliationState(new Date("2026-07-11T12:00:00.000Z")),
@@ -420,5 +470,28 @@ function receiptFixture(): ActionReceipt {
       affectedCount: 1,
       changedFields: ["title"],
     },
+  };
+}
+
+function githubReceiptFixture(overrides: {
+  resourceType: string;
+  url: string;
+  id?: string;
+  idempotencyKey?: string;
+}): ActionReceipt {
+  return {
+    ...receiptFixture(),
+    id: overrides.id ?? "github-receipt-1",
+    actionId: "github-action-1",
+    toolName: "publish_to_github",
+    operation: "publish",
+    resource: {
+      system: "github",
+      resourceType: overrides.resourceType,
+      id: overrides.resourceType === "pull_request" ? "pr-12" : "branch-codex-fix",
+      url: overrides.url,
+    },
+    message: "GitHub publication receipt.",
+    idempotencyKey: overrides.idempotencyKey ?? "github:publish:run-1",
   };
 }

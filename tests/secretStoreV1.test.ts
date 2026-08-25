@@ -8,7 +8,7 @@ import {
   SecretStoreBoundaryErrorV1,
   requireBackgroundSecretStoreV1,
 } from "../packages/headless-runtime/src/secretStoreV1";
-import { ObsidianSecretStoreV1 } from "../src/integrations/ObsidianSecretStoreV1";
+import { ObsidianSecretStoreV1, isObsidianSecretReferenceV1 } from "../src/integrations/ObsidianSecretStoreV1";
 
 test("Obsidian SecretStorage adapter persists opaque foreground credentials", async () => {
   const values = new Map<string, string>();
@@ -257,6 +257,32 @@ test("companion adapter rejects cacheable secret responses", async () => {
     hasCode("invalid_secret_response"),
   );
   credential.dispose();
+});
+
+test("Obsidian secret references are opaque host ids, not plaintext handles", () => {
+  const cases: Array<{ value: unknown; ok: boolean; rule: string }> = [
+    {
+      value: "secret-obsidian-12345678-abcd-1234-abcd-123456789abc",
+      ok: true,
+      rule: "a well-formed secret-obsidian reference is accepted",
+    },
+    {
+      value: "secret_12345678-abcd-1234-abcd-123456789abc",
+      ok: false,
+      rule: "companion keyring ids are not Obsidian SecretStorage references",
+    },
+    {
+      value: "ghp_abcdefghijklmnopqrstuvwxyz012345",
+      ok: false,
+      rule: "a raw credential is not a secret reference",
+    },
+    { value: "", ok: false, rule: "an empty string is not a secret reference" },
+    { value: 12, ok: false, rule: "non-strings are not secret references" },
+    { value: null, ok: false, rule: "null is not a secret reference" },
+  ];
+  for (const { value, ok, rule } of cases) {
+    assert.equal(isObsidianSecretReferenceV1(value), ok, rule);
+  }
 });
 
 function deterministicBytes(length: number): Uint8Array {

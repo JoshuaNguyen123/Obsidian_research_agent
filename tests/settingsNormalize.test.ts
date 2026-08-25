@@ -35,8 +35,51 @@ describe("settingsNormalize", () => {
     assert.equal(settings.specialistEnabled, true);
     assert.equal(settings.specialistConnectionMode, "shared_primary");
     assert.equal(settings.specialistModel, "");
-    assert.equal(settings.showUnfinishedRunBannerOnOpen, false);
+    assert.equal(settings.showUnfinishedRunBannerOnOpen, true);
+    assert.equal(settings.runRetentionDays, 30);
+    assert.equal(settings.runRetentionMaxRuns, 200);
+    assert.equal(settings.modelFallbackEnabled, false);
     assert.equal(settings.settingsSchemaVersion, SETTINGS_SCHEMA_VERSION);
+  });
+
+  it("unfinished-run banner defaults on; explicit false survives", () => {
+    assert.equal(
+      normalizeAgentSettings({}, "new_install").showUnfinishedRunBannerOnOpen,
+      true,
+    );
+    assert.equal(
+      normalizeAgentSettings(
+        { model: "deepseek-v4-pro" },
+        "existing_install",
+      ).showUnfinishedRunBannerOnOpen,
+      true,
+    );
+    assert.equal(
+      normalizeAgentSettings(
+        { showUnfinishedRunBannerOnOpen: false },
+        "existing_install",
+      ).showUnfinishedRunBannerOnOpen,
+      false,
+    );
+  });
+
+  it("run retention and model fallback handshake defaults persist explicit 0/true", () => {
+    const defaults = normalizeAgentSettings({}, "new_install");
+    assert.equal(defaults.runRetentionDays, 30);
+    assert.equal(defaults.runRetentionMaxRuns, 200);
+    assert.equal(defaults.modelFallbackEnabled, false);
+
+    const explicit = normalizeAgentSettings(
+      {
+        runRetentionDays: 0,
+        runRetentionMaxRuns: 0,
+        modelFallbackEnabled: true,
+      },
+      "existing_install",
+    );
+    assert.equal(explicit.runRetentionDays, 0);
+    assert.equal(explicit.runRetentionMaxRuns, 0);
+    assert.equal(explicit.modelFallbackEnabled, true);
   });
 
   it("legacy explicit false values resolve to Custom and remain false", () => {

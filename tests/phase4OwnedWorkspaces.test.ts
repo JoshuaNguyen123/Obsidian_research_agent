@@ -41,7 +41,7 @@ test("Phase 4 workspace cleanup refuses a new linked owned container", async () 
   try {
     const snapshot = await snapshotPhase4OwnedWorkspaces(root);
     const linked = path.join(root, "phase4-crud-e2e_phase4_123-456");
-    await symlink(outside, linked, "junction");
+    await symlink(outside, linked, process.platform === "win32" ? "junction" : "dir");
     await assert.rejects(
       removeNewPhase4OwnedWorkspaces(snapshot, "E2E_PHASE4_123-456"),
       /non-directory/iu,

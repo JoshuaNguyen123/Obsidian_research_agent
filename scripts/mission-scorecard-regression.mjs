@@ -107,6 +107,23 @@ export function missionScorecardExecutionKey(record) {
   ].join("|");
 }
 
+export const NO_RUN_SUMMARY_SKIP_MESSAGE =
+  "mission-scorecards: NO RUN SUMMARY — regression comparison skipped (baseline structure validated only)";
+
+export function parseMissionScorecardCliArgs(argv = process.argv.slice(2)) {
+  return { requireSummary: argv.includes("--require-summary") };
+}
+
+export function formatMissionScorecardCliResult(result) {
+  if (result?.reason === "no_run_summary") {
+    return NO_RUN_SUMMARY_SKIP_MESSAGE;
+  }
+  if (result?.skipped) {
+    return "Mission scorecard regression gate skipped: no baselined records were selected.";
+  }
+  return `Mission scorecard regression gate passed for ${result.checkedRecords} record(s).`;
+}
+
 export async function assertMissionScorecardSummaryFile(options = {}) {
   const baselinePath = path.resolve(
     options.baselinePath ?? DEFAULT_MISSION_SCORECARD_BASELINE_PATH,
@@ -169,6 +186,11 @@ export async function assertMissionScorecardSummaryFile(options = {}) {
             `${[...selectedProjects].join(", ")}. This gate compares a real ` +
             "run against the harvested baseline, so the lane has to run " +
             "first, then be harvested with: npm run scorecards:harvest",
+        );
+      }
+      if (options.requireSummary) {
+        throw new Error(
+          "mission-scorecards: NO RUN SUMMARY — --require-summary requires a daily-use run summary to compare.",
         );
       }
       return {
@@ -496,17 +518,10 @@ if (
   process.argv[1] &&
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 ) {
-  void assertMissionScorecardSummaryFile()
+  const { requireSummary } = parseMissionScorecardCliArgs();
+  void assertMissionScorecardSummaryFile({ requireSummary })
     .then((result) => {
-      console.log(
-        result.reason === "no_run_summary"
-          ? `Mission scorecard baseline validated (${result.validatedBaselineRecords} record(s)); ` +
-            "no daily-use run summary on this machine, so no run was compared. " +
-            "Run a scored lane (npm run test:e2e:research) and harvest it to compare one."
-          : result.skipped
-            ? "Mission scorecard regression gate skipped: no baselined records were selected."
-            : `Mission scorecard regression gate passed for ${result.checkedRecords} record(s).`,
-      );
+      console.log(formatMissionScorecardCliResult(result));
     })
     .catch((error) => {
       console.error(error instanceof Error ? error.message : String(error));

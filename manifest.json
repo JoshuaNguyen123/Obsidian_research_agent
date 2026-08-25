@@ -5,6 +5,6 @@
   "minAppVersion": "1.5.0",
   "description": "Single-install native Obsidian agent: research, approved code work, background companion, Linear/GitHub, note writeback, and receipts.",
   "author": "Josh",
-  "authorUrl": "",
+  "authorUrl": "https://github.com/JoshuaNguyen123/Obsidian_research_agent",
   "isDesktopOnly": true
 }

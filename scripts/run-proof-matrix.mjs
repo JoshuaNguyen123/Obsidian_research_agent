@@ -27,8 +27,10 @@
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   statSync,
@@ -41,6 +43,7 @@ const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
 const RUN_CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
 const MANIFEST_PATH = path.join(REPO_ROOT, "test-results", "proof-matrix-manifest.json");
+const ATTEMPT_LOG_DIR = path.join(REPO_ROOT, "test-results", "proof-matrix-logs");
 const RUN_SUMMARY_PATH = path.join(REPO_ROOT, "test-results", "daily-use-run-summary.json");
 const SCORECARD_BASELINE_PATH = path.join(REPO_ROOT, "e2e", "baselines", "mission-scorecards.v1.json");
 const GRAPH_DIR = path.join(
@@ -137,13 +140,35 @@ function git(args) {
   return result.stdout.trim();
 }
 
+export const SCORECARD_BASELINE_RELATIVE_PATH =
+  "e2e/baselines/mission-scorecards.v1.json";
+
+/**
+ * First-green harvest rewrites the tracked baseline. That must not fail the
+ * exact-HEAD pin: the SHA names the plugin source, and harvest is an allowed
+ * working-tree update of this one file.
+ */
+export function porcelainWithoutAllowedHarvest(status) {
+  const text = typeof status === "string" ? status : "";
+  return text
+    .split(/\r?\n/u)
+    .filter((line) => line.trim() !== "")
+    .filter((line) => {
+      const path = line.slice(3).replaceAll("\\", "/");
+      return path !== SCORECARD_BASELINE_RELATIVE_PATH;
+    })
+    .join("\n");
+}
+
 /** Exact-HEAD invariant, before and after every attempt (audit precedent). */
 function assertExactCleanHead(expectedHead, stage) {
   const head = git(["rev-parse", "HEAD"]);
   if (head !== expectedHead) {
     fail(`${stage}: HEAD ${head} != pinned ${expectedHead}; the campaign's evidence would be unattributable.`);
   }
-  const status = git(["status", "--porcelain=v1", "--untracked-files=all"]);
+  const status = porcelainWithoutAllowedHarvest(
+    git(["status", "--porcelain=v1", "--untracked-files=all"]),
+  );
   if (status !== "") {
     fail(`${stage}: working tree not clean:\n${status}`);
   }
@@ -277,14 +302,79 @@ function readJsonFile(file) {
   }
 }
 
-/** Failure class for a red attempt: prefer the lane's own proof-class annotation. */
-function classifyAttempt(summary, exitCode) {
-  const records = Array.isArray(summary?.records) ? summary.records : Array.isArray(summary) ? summary : [];
-  for (const record of records) {
-    const cls = record?.proofClass ?? record?.failureClass ?? null;
-    if (typeof cls === "string" && cls.includes(":")) return cls;
+/**
+ * Harness-stage signatures printed by run-e2e-exclusive.mjs before Playwright
+ * ever starts. An attempt that dies on one of these is a harness refusal, not
+ * a product failure, and must be classified as such — four attempts died at
+ * "process:matrix_unclassified" on 2026-08-25 because a tsc failure in the
+ * build stage (exit 2) was indistinguishable from a mission failure.
+ */
+const HARNESS_LOG_SIGNATURES = [
+  [/Timed out after \d+ ms waiting for the exclusive Obsidian e2e lock/u, "harness:e2e_lock_timeout"],
+  [/^build exited with code \d+\.$/mu, "harness:build_failed"],
+  [/^test-vault sync exited with code \d+\.$/mu, "harness:vault_sync_failed"],
+  [/^e2e preflight exited with code \d+\.$/mu, "harness:preflight_refused"],
+];
+
+/**
+ * Failure class for a red attempt: prefer the lane's own proof-class
+ * annotation, but only when the run summary was written during THIS attempt —
+ * a summary left behind by an earlier run must not label a later failure.
+ * Otherwise scan the attempt's captured output for harness-stage signatures.
+ */
+export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logText }) {
+  if (exitCode === 0) return { failureClass: "none", detail: "" };
+  if (summaryFresh) {
+    const records = Array.isArray(summary?.records)
+      ? summary.records
+      : Array.isArray(summary)
+        ? summary
+        : [];
+    for (const record of records) {
+      const cls = record?.proofClass ?? record?.failureClass ?? null;
+      if (typeof cls === "string" && cls.includes(":")) {
+        return { failureClass: cls, detail: "" };
+      }
+    }
   }
-  return exitCode === 0 ? "none" : "process:matrix_unclassified";
+  const text = typeof logText === "string" ? logText : "";
+  for (const [pattern, failureClass] of HARNESS_LOG_SIGNATURES) {
+    const match = pattern.exec(text);
+    if (match) {
+      return { failureClass, detail: attemptLogExcerpt(text, match.index) };
+    }
+  }
+  return { failureClass: "process:matrix_unclassified", detail: attemptLogExcerpt(text) };
+}
+
+/**
+ * A short excerpt of the attempt log for the manifest: the lines just before
+ * the matched harness signature (where the actual compiler/preflight error
+ * lives), or the tail of the log when nothing matched.
+ */
+export function attemptLogExcerpt(logText, endIndex = null) {
+  const text = typeof logText === "string" ? logText : "";
+  if (text.trim() === "") return "";
+  let upTo = text.length;
+  if (endIndex !== null) {
+    const lineEnd = text.indexOf("\n", endIndex);
+    upTo = lineEnd === -1 ? text.length : lineEnd;
+  }
+  const lines = text
+    .slice(0, upTo)
+    .split(/\r?\n/u)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "");
+  return lines.slice(-8).join("\n").slice(-1_000);
+}
+
+/** True when the run summary file was (re)written during the attempt window. */
+function summaryWrittenDuring(file, windowStartMs) {
+  try {
+    return statSync(file).mtimeMs >= windowStartMs - 5_000;
+  } catch {
+    return false;
+  }
 }
 
 function csvField(value) {
@@ -300,10 +390,31 @@ function appendRunCsvRow(row) {
   appendFileSync(RUN_CSV, row.map(csvField).join(",") + "\n");
 }
 
+export function laneHasScorecardBaselineFrom(baseline, project) {
+  const records = baseline?.records;
+  if (Array.isArray(records)) {
+    return records.some((record) => record?.project === project);
+  }
+  if (records && typeof records === "object") {
+    return Object.keys(records).some(
+      (key) =>
+        key === project ||
+        key.startsWith(`${project}/`) ||
+        key.startsWith(`${project}|`),
+    );
+  }
+  return false;
+}
+
 function laneHasScorecardBaseline(project) {
-  const baseline = readJsonFile(SCORECARD_BASELINE_PATH);
-  const records = baseline?.records ?? baseline ?? {};
-  return Object.keys(records).some((key) => key.startsWith(`${project}/`) || key === project);
+  return laneHasScorecardBaselineFrom(readJsonFile(SCORECARD_BASELINE_PATH), project);
+}
+
+export const EMPTY_SCORECARD_HARVEST_MESSAGE =
+  "No passing, fully-scored mission records to harvest";
+
+export function isEmptyScorecardHarvestOutput(output) {
+  return String(output ?? "").includes(EMPTY_SCORECARD_HARVEST_MESSAGE);
 }
 
 function runNpm(args, env) {
@@ -315,6 +426,20 @@ function runNpm(args, env) {
     windowsHide: true,
   });
   return result.status ?? 1;
+}
+
+function runNpmCaptured(args, env) {
+  const result = spawnSync("npm", args, {
+    cwd: REPO_ROOT,
+    env,
+    encoding: "utf8",
+    shell: process.platform === "win32",
+    windowsHide: true,
+  });
+  return {
+    status: result.status ?? 1,
+    output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
 }
 
 function loadManifest() {
@@ -413,6 +538,12 @@ async function main() {
         ...process.env,
         E2E_AI_MODEL: PROOF_MATRIX_MODEL,
         E2E_MODEL_PROVIDER: process.env.E2E_MODEL_PROVIDER ?? "ollama",
+        // A campaign attempt must outwait a stray exclusive run, not burn an
+        // attempt every 30 seconds against a held lock (the 2026-08-25 03:06
+        // crash loop exhausted a cell in 90 seconds this way). Explicit
+        // caller values still win.
+        OBSIDIAN_E2E_LOCK_WAIT_MS:
+          process.env.OBSIDIAN_E2E_LOCK_WAIT_MS ?? String(20 * 60 * 1000),
       };
       const runnerArgs = [
         path.join(REPO_ROOT, "scripts", "run-e2e-exclusive.mjs"),
@@ -422,23 +553,54 @@ async function main() {
       if (cell.grep) runnerArgs.push(`--grep=${cell.grep}`);
 
       const startedAt = Date.now();
-      console.log(`proof-matrix[${stage}]: node ${runnerArgs.map((a) => path.basename(a)).join(" ")}`);
-      const result = spawnSync(process.execPath, runnerArgs, {
-        cwd: REPO_ROOT,
-        env,
-        stdio: "inherit",
-        windowsHide: true,
-      });
+      // Attempt output goes to a per-attempt file, not the launcher console:
+      // detached campaigns have no console, and a red attempt whose stderr is
+      // gone is undiagnosable (the 2026-08-25 02:37 crash loop left nothing).
+      mkdirSync(ATTEMPT_LOG_DIR, { recursive: true });
+      const attemptLogPath = path.join(ATTEMPT_LOG_DIR, `${cell.id}-attempt-${attemptIndex}.log`);
+      console.log(
+        `proof-matrix[${stage}]: node ${runnerArgs.map((a) => path.basename(a)).join(" ")}` +
+        ` (output: ${path.relative(REPO_ROOT, attemptLogPath)})`,
+      );
+      const attemptLogFd = openSync(attemptLogPath, "w");
+      let result;
+      try {
+        result = spawnSync(process.execPath, runnerArgs, {
+          cwd: REPO_ROOT,
+          env,
+          stdio: ["ignore", attemptLogFd, attemptLogFd],
+          windowsHide: true,
+        });
+      } finally {
+        closeSync(attemptLogFd);
+      }
       const endedAt = Date.now();
       const exitCode = result.status ?? 1;
       const green = exitCode === 0;
+      let attemptLogText = "";
+      try {
+        attemptLogText = readFileSync(attemptLogPath, "utf8");
+      } catch {
+        // The excerpt is best-effort; classification falls back to the tail rule.
+      }
 
       sweepTestVaultObsidianZombies(`${stage} post`);
       removeCampaignWorkspaceDebris(workspacesBefore, stage);
       assertExactCleanHead(expectedHead, `${stage} post`);
 
       const summary = readJsonFile(RUN_SUMMARY_PATH);
-      const failureClass = green ? "none" : classifyAttempt(summary, exitCode);
+      const { failureClass, detail: failureDetail } = classifyAttemptOutcome({
+        exitCode,
+        summary,
+        summaryFresh: summaryWrittenDuring(RUN_SUMMARY_PATH, startedAt),
+        logText: attemptLogText,
+      });
+      if (!green) {
+        console.error(
+          `proof-matrix[${stage}]: red (exit ${exitCode}, ${failureClass}). Attempt log tail:\n` +
+          attemptLogExcerpt(attemptLogText),
+        );
+      }
       const toolEvents = mineToolEvents(startedAt, endedAt);
       const pctFailed = toolEvents.observed
         ? ((100 * toolEvents.failed) / toolEvents.observed).toFixed(1) + "%"
@@ -452,7 +614,10 @@ async function main() {
         Math.round((endedAt - startedAt) / 1000),
         green ? "green" : "red",
         failureClass,
-        green ? "" : `matrix ${stage} exit ${exitCode}`,
+        green
+          ? ""
+          : `matrix ${stage} exit ${exitCode}` +
+            (failureDetail ? `: ${failureDetail.split(/\r?\n/u).at(-1).slice(0, 160)}` : ""),
         toolEvents.observed || "",
         toolEvents.observed ? toolEvents.failed : "",
         pctFailed,
@@ -475,6 +640,12 @@ async function main() {
         green,
         exitCode,
         failureClass,
+        ...(green
+          ? {}
+          : {
+              failureDetail,
+              attemptLog: path.relative(REPO_ROOT, attemptLogPath),
+            }),
         toolEvents,
       });
 
@@ -493,10 +664,17 @@ async function main() {
 
       if (green && !laneHasScorecardBaseline(cell.project)) {
         console.log(`proof-matrix[${stage}]: first green for unbaselined lane — harvesting scorecards.`);
-        if (runNpm(["run", "scorecards:harvest"], env) !== 0) {
-          fail(`${stage}: scorecards:harvest failed after a green run.`);
-        }
-        if (runNpm(["run", "check:mission-scorecards"], env) !== 0) {
+        const harvest = runNpmCaptured(["run", "scorecards:harvest"], env);
+        if (harvest.output) process.stdout.write(harvest.output);
+        if (harvest.status !== 0) {
+          if (isEmptyScorecardHarvestOutput(harvest.output)) {
+            console.log(
+              `proof-matrix[${stage}]: lane has no harvestable scorecard; continuing without a baseline record.`,
+            );
+          } else {
+            fail(`${stage}: scorecards:harvest failed after a green run.`);
+          }
+        } else if (runNpm(["run", "check:mission-scorecards"], env) !== 0) {
           fail(`${stage}: check:mission-scorecards failed right after harvest.`);
         }
       }
@@ -518,4 +696,9 @@ async function main() {
   console.log("proof-matrix: run `npm run eval:dashboard` to refresh the KPI dashboard, and finish the campaign with the 8-stage workflow audit bookend.");
 }
 
-main().catch((error) => fail(String(error?.stack ?? error)));
+if (
+  process.argv[1] &&
+  path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1])
+) {
+  main().catch((error) => fail(String(error?.stack ?? error)));
+}

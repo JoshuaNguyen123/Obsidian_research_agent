@@ -190,9 +190,26 @@ export interface AgentSettings {
   autoResumeOvernightRuns?: boolean;
   /**
    * When true, Chat shows an unfinished-run banner on panel open.
-   * Default off — Continue Latest Run remains available without nagging on every Obsidian launch.
+   * Default on when a resumable run exists. Persisted explicit false stays off.
+   * Dismissal is per-run via the mission ledger; the banner does not nag again
+   * for a dismissed run.
    */
   showUnfinishedRunBannerOnOpen?: boolean;
+  /**
+   * Days to keep finished Agent Runs notes. 0 disables the time sweep.
+   * Resumable missions are never pruned.
+   */
+  runRetentionDays?: number;
+  /**
+   * Maximum Agent Runs notes to keep. 0 disables the cap.
+   * Resumable missions are never pruned.
+   */
+  runRetentionMaxRuns?: number;
+  /**
+   * When true, fall back to another model if the primary provider fails.
+   * Default off — may reduce quality; keeps long missions alive through outages.
+   */
+  modelFallbackEnabled?: boolean;
   keepAwakeDuringOvernightRuns?: boolean;
   /** Opt-in Lead + Worker orchestration and Orchestrator tab. */
   orchestratorPreviewEnabled?: boolean;
@@ -322,7 +339,10 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   defaultMinFetchedSources: 3,
   overnightRunsEnabled: true,
   autoResumeOvernightRuns: true,
-  showUnfinishedRunBannerOnOpen: false,
+  showUnfinishedRunBannerOnOpen: true,
+  runRetentionDays: 30,
+  runRetentionMaxRuns: 200,
+  modelFallbackEnabled: false,
   keepAwakeDuringOvernightRuns: false,
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,
@@ -827,6 +847,20 @@ export class AgentSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           this.display();
         }),
+      );
+
+    new Setting(containerEl)
+      .setName("Fall back to another model on provider outage")
+      .setDesc(
+        "May reduce quality; keeps long missions alive through provider outages.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(settings.modelFallbackEnabled === true)
+          .onChange(async (value) => {
+            settings.modelFallbackEnabled = value;
+            await this.plugin.saveSettings();
+          }),
       );
 
     if (!enabled) return;
@@ -1803,13 +1837,61 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Show unfinished-run banner on open")
       .setDesc(
-        "Off by default. When on, Chat shows an unfinished-run reminder when you open the panel. Continue Latest Run stays available either way.",
+        "On by default. Chat shows an unfinished-run reminder when you open the panel and a resumable run exists. Dismiss hides that run permanently; Continue Latest Run stays available either way.",
       )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.showUnfinishedRunBannerOnOpen === true)
+          .setValue(this.plugin.settings.showUnfinishedRunBannerOnOpen !== false)
           .onChange(async (value) => {
             this.plugin.settings.showUnfinishedRunBannerOnOpen = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Run retention days")
+      .setDesc(
+        "Days to keep finished Agent Runs notes. 0 disables the time sweep. Resumable missions are never pruned.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.runRetentionDays ?? 30))
+          .setValue(
+            String(
+              this.plugin.settings.runRetentionDays ??
+                DEFAULT_SETTINGS.runRetentionDays ??
+                30,
+            ),
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.runRetentionDays =
+              parseOptionalInteger(value, { min: 0, max: 3650 }) ??
+              DEFAULT_SETTINGS.runRetentionDays ??
+              30;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Run retention cap")
+      .setDesc(
+        "Maximum finished Agent Runs notes to keep. 0 disables the cap. Resumable missions are never pruned.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.runRetentionMaxRuns ?? 200))
+          .setValue(
+            String(
+              this.plugin.settings.runRetentionMaxRuns ??
+                DEFAULT_SETTINGS.runRetentionMaxRuns ??
+                200,
+            ),
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.runRetentionMaxRuns =
+              parseOptionalInteger(value, { min: 0, max: 10000 }) ??
+              DEFAULT_SETTINGS.runRetentionMaxRuns ??
+              200;
             await this.plugin.saveSettings();
           }),
       );

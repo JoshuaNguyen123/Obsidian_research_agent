@@ -49,6 +49,10 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Node.js and npm.
 - An Ollama Cloud API key for the default BYOK experience. Local Ollama and compatible Ollama endpoints are optional alternatives.
 
+## Model requirements and reliability status
+
+The recommended model is `deepseek-v4-pro`. Cheaper models (`minimax-m3`, `deepseek-v4-flash`) complete individual stages but fail composed journeys on quality variance. Research is the mature path; complex multi-stage code work is still being hardened.
+
 ## Install For Development
 
 ```bash

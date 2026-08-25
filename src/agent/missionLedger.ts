@@ -1633,7 +1633,7 @@ function getContinuationCommand(runId: string): string {
   return `continue run ${runId}`;
 }
 
-function isTerminalCompleteLedger(ledger: MissionLedger): boolean {
+export function isTerminalCompleteLedger(ledger: MissionLedger): boolean {
   return ledger.status === "complete" && ledger.acceptance?.status === "pass";
 }
 

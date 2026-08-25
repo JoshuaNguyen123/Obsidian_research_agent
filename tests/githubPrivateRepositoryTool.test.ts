@@ -17,7 +17,7 @@ import {
 } from "../src/tools/githubPrivateRepositoryTool";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import type { ToolExecutionContext } from "../src/tools/types";
-import { resolveExplicitRepositoryVisibilityChoiceV1 } from "../src/integrations/github/RepositoryVisibility";
+import { resolveExplicitRepositoryVisibilityChoiceV1, isRepositoryVisibility } from "../src/integrations/github/RepositoryVisibility";
 
 const NOW = new Date("2026-07-16T16:00:00.000Z");
 
@@ -499,6 +499,20 @@ test("an unrelated visibility word near the repository noun is not a choice", ()
     ),
     { status: "chosen", visibility: "public" },
   );
+});
+
+test("repository visibility is only the public or private literals", () => {
+  const cases: Array<{ value: unknown; ok: boolean; rule: string }> = [
+    { value: "public", ok: true, rule: "public is an explicit visibility choice" },
+    { value: "private", ok: true, rule: "private is an explicit visibility choice" },
+    { value: "internal", ok: false, rule: "GitHub internal visibility is not a publication choice" },
+    { value: "PUBLIC", ok: false, rule: "visibility matching is exact, not case-folded" },
+    { value: "", ok: false, rule: "blank is not a visibility choice" },
+    { value: null, ok: false, rule: "null is not a visibility choice" },
+  ];
+  for (const { value, ok, rule } of cases) {
+    assert.equal(isRepositoryVisibility(value), ok, rule);
+  }
 });
 
 function destination(): GitHubPrivateRepositoryDestinationV1 {
