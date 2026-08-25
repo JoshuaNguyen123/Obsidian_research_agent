@@ -298,6 +298,15 @@ export type MissionGraphPatchOperationV1 =
   | { op: "add_node"; node: MissionNodeV3 }
   | { op: "update_node"; nodeId: string; changes: MissionNodeChangesV1 }
   | { op: "remove_node"; nodeId: string }
+  /**
+   * Removes a never-executed node and re-links every dependent to the removed
+   * node's own dependencies, preserving the surviving partial order. This is
+   * the only sanctioned way to drop an interior planned node: `update_node`
+   * deliberately refuses dependency removal (authority widening) and
+   * `remove_node` leaves dependents dangling. The reducer refuses to splice a
+   * node that has run: any evidence, any receipt, or an in-flight status.
+   */
+  | { op: "splice_node"; nodeId: string }
   | {
       op: "set_status";
       nodeId: string;
@@ -2024,6 +2033,9 @@ function normalizePatchOperation(
     case "remove_node":
       exactKeys(source, ["op", "nodeId"], path);
       return { op, nodeId: stableId(source.nodeId, `${path}.nodeId`) };
+    case "splice_node":
+      exactKeys(source, ["op", "nodeId"], path);
+      return { op, nodeId: stableId(source.nodeId, `${path}.nodeId`) };
     case "set_status":
       exactKeys(source, ["op", "nodeId", "expectedStatus", "status", "blocker"], path);
       return {
@@ -2198,6 +2210,45 @@ function applyPatchOperation(
     case "remove_node":
       delete graph.nodes[node.id];
       return;
+    case "splice_node": {
+      if (
+        node.status !== "queued" &&
+        node.status !== "ready" &&
+        node.status !== "blocked"
+      ) {
+        fail(
+          "invalid_transition",
+          `Mission node ${node.id} cannot be spliced from status ${node.status}.`,
+        );
+      }
+      if (node.evidence.length > 0 || node.receipts.length > 0) {
+        fail(
+          "invalid_transition",
+          `Mission node ${node.id} has executed and cannot be spliced.`,
+        );
+      }
+      for (const dependent of Object.values(graph.nodes)) {
+        if (
+          dependent.id === node.id ||
+          !dependent.dependencyIds.includes(node.id)
+        ) {
+          continue;
+        }
+        dependent.dependencyIds = [
+          ...new Set(
+            dependent.dependencyIds.flatMap((dependencyId) =>
+              dependencyId === node.id
+                ? node.dependencyIds.filter(
+                    (inherited) => inherited !== dependent.id,
+                  )
+                : [dependencyId],
+            ),
+          ),
+        ];
+      }
+      delete graph.nodes[node.id];
+      return;
+    }
     case "set_status":
       if (node.status !== operation.expectedStatus) {
         fail(

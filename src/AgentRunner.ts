@@ -842,11 +842,13 @@ import {
   type MarkdownHeadingV1,
 } from "./agent/sectionTarget";
 import {
-  filterResearchTopicDesignProseTools,
+  filterMissionDesignCapabilityTools,
   hasDesignIntent as hasSharedDesignIntent,
   hasExplicitCanvasDestinationIntent,
   hasReviseDesignIntent,
+  isDesignCapabilityToolName,
   isResearchTopicDesignProse,
+  missionGrantsDesignCapability,
 } from "./agent/codeDesignIntent";
 import {
   classifyMissionWithModelDetailed,
@@ -3979,9 +3981,11 @@ export async function runAgentMission({
           finalizationReserve: resumeFinalizationReserve,
           reason: "resume_inherited_segment_budget",
           // Filtered against the restored original mission: a continuation
-          // must not re-acquire design capability from a mis-planned prior
-          // segment's persisted expected tools.
-          expectedTools: filterResearchTopicDesignProseTools(
+          // must not re-acquire design capability the original mission never
+          // planned, whether from a mis-planned prior segment's persisted
+          // expected tools or from design vocabulary that exists only in
+          // handoff prose.
+          expectedTools: filterMissionDesignCapabilityTools(
             [
               ...new Set([
                 ...runPlan.budgetProfile.expectedTools,
@@ -4410,13 +4414,14 @@ export async function runAgentMission({
           ) ||
           seededResearchHandoffSatisfiesReads;
         const promptOnPageBootstrap = isPromptOnCurrentPageIntent(prompt);
-        // The design-prose filter runs over the complete candidate list: the
-        // restored original mission is the authority for whether design
-        // capability belongs in this graph, so neither a recomputed budget
-        // nor a mis-planned prior segment's persisted expected tools can
-        // plant a create_design_* node for research topic prose.
+        // The design-capability filter runs over the complete candidate list:
+        // the restored original mission is the sole authority for whether
+        // design capability belongs in this graph, so neither a recomputed
+        // budget nor a mis-planned prior segment's persisted expected tools
+        // can plant a create_design_* node — for research topic prose or for
+        // a mission that never had design vocabulary at all.
         const plannedToolNames = dedupeSingletonMissionGraphPrerequisites(
-          filterResearchTopicDesignProseTools([
+          filterMissionDesignCapabilityTools([
           ...(shouldReadCurrentNote &&
           explicitGraphWorkflowToolNames.length === 0 &&
           graphAllowedToolNames.includes("read_current_file")
@@ -4604,6 +4609,34 @@ export async function runAgentMission({
           events: { onGraphUpdate: emitMissionGraph },
           resume: Boolean(exactResumeRunId),
         });
+        // A continuation adopts the persisted graph verbatim, so the merge
+        // filters above cannot reach a design node a mis-planned prior
+        // segment already persisted. Prune such never-executed nodes here,
+        // keyed on the restored original mission (never handoff prose):
+        // resumed, they only re-block on the research phase gate as terminal
+        // policy_deferral_repeated.
+        if (
+          exactResumeRunId &&
+          !missionGrantsDesignCapability(activeIntentPrompt)
+        ) {
+          const designPrune =
+            await missionGraphSession.pruneNeverExecutedToolNodes(
+              isDesignCapabilityToolName,
+              "Prune inherited design-capability nodes the restored original mission never planned.",
+            );
+          if (designPrune.prunedNodeIds.length > 0) {
+            events.onTrace?.({
+              id: "mission-graph-design-capability-prune",
+              kind: "status",
+              message:
+                "Removed inherited design-capability nodes the restored original mission never planned.",
+              outputPreview: {
+                missionId: graphPlan.graph.missionId,
+                prunedNodeIds: designPrune.prunedNodeIds,
+              },
+            });
+          }
+        }
         events.onTrace?.({
           id: "mission-graph-authority",
           kind: "status",
@@ -5471,9 +5504,10 @@ export async function runAgentMission({
       Math.max(0, resumeLedger.loopBudget.toolStepBudget),
     );
     // Filtered against the restored original mission: a continuation must not
-    // re-acquire design capability from a mis-planned prior segment's
-    // persisted expected tools.
-    const inheritedExpectedTools = filterResearchTopicDesignProseTools(
+    // re-acquire design capability the original mission never planned, whether
+    // from a mis-planned prior segment's persisted expected tools or from
+    // design vocabulary that exists only in handoff prose.
+    const inheritedExpectedTools = filterMissionDesignCapabilityTools(
       [
         ...new Set([
           ...resumeLedger.loopBudget.expectedTools,
@@ -27473,10 +27507,7 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("create_research_pack");
   }
 
-  if (
-    (hasDesignIntent(prompt) && !isResearchTopicDesignProse(prompt)) ||
-    hasReviseDesignIntent(prompt)
-  ) {
+  if (missionGrantsDesignCapability(prompt)) {
     if (hasExplicitCanvasDestinationIntent(prompt)) {
       requiredToolNames.push("create_design_canvas");
     } else if (hasReviseDesignIntent(prompt) && hasMermaidDesignIntent(prompt)) {
