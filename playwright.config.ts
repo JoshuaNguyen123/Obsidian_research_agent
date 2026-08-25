@@ -210,6 +210,22 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
+      name: "interrupted-continuation-live",
+      testMatch: /interrupted-continuation-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 1_800_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "notebook-execution-live",
+      testMatch: /notebook-execution-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 2_700_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
       name: "provider-canary",
       testMatch: /provider-canary\.spec\.ts/u,
       retries: 0,
