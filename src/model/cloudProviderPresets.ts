@@ -48,7 +48,7 @@ export const CLOUD_PROVIDER_PRESETS: readonly CloudProviderPreset[] = [
     provider: "ollama",
     // Must include /api — chat hits `${baseUrl}/chat` → https://ollama.com/api/chat.
     baseUrl: "https://ollama.com/api",
-    suggestedModel: "glm-5.2",
+    suggestedModel: "deepseek-v4-pro",
     description: "Ollama Cloud BYOK (ollama.com).",
   },
 ];

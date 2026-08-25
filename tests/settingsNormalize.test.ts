@@ -31,7 +31,7 @@ describe("settingsNormalize", () => {
     assert.equal(settings.speechActSemanticRescueMode, "off");
     assert.equal(settings.modelRouterMode, "authority");
     assert.equal(settings.modelRouterEnabled, true);
-    assert.equal(settings.model, "glm-5.2");
+    assert.equal(settings.model, "deepseek-v4-pro");
     assert.equal(settings.specialistEnabled, true);
     assert.equal(settings.specialistConnectionMode, "shared_primary");
     assert.equal(settings.specialistModel, "");

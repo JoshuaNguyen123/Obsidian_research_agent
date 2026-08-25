@@ -805,7 +805,7 @@ test("runner mode exports explicit child-process environment without secrets", (
   assert.deepEqual(env, {
     E2E_AI_MODE: "real",
     E2E_REAL_AI: "1",
-    E2E_AI_MODEL: "glm-5.2",
+    E2E_AI_MODEL: "deepseek-v4-pro",
     E2E_MODEL_PROVIDER: "ollama",
     E2E_PLAYWRIGHT_LANE: "real-ai-contract",
     E2E_LIVE_EXTERNAL: "0",
