@@ -137,13 +137,35 @@ function git(args) {
   return result.stdout.trim();
 }
 
+export const SCORECARD_BASELINE_RELATIVE_PATH =
+  "e2e/baselines/mission-scorecards.v1.json";
+
+/**
+ * First-green harvest rewrites the tracked baseline. That must not fail the
+ * exact-HEAD pin: the SHA names the plugin source, and harvest is an allowed
+ * working-tree update of this one file.
+ */
+export function porcelainWithoutAllowedHarvest(status) {
+  const text = typeof status === "string" ? status : "";
+  return text
+    .split(/\r?\n/u)
+    .filter((line) => line.trim() !== "")
+    .filter((line) => {
+      const path = line.slice(3).replaceAll("\\", "/");
+      return path !== SCORECARD_BASELINE_RELATIVE_PATH;
+    })
+    .join("\n");
+}
+
 /** Exact-HEAD invariant, before and after every attempt (audit precedent). */
 function assertExactCleanHead(expectedHead, stage) {
   const head = git(["rev-parse", "HEAD"]);
   if (head !== expectedHead) {
     fail(`${stage}: HEAD ${head} != pinned ${expectedHead}; the campaign's evidence would be unattributable.`);
   }
-  const status = git(["status", "--porcelain=v1", "--untracked-files=all"]);
+  const status = porcelainWithoutAllowedHarvest(
+    git(["status", "--porcelain=v1", "--untracked-files=all"]),
+  );
   if (status !== "") {
     fail(`${stage}: working tree not clean:\n${status}`);
   }
@@ -300,10 +322,24 @@ function appendRunCsvRow(row) {
   appendFileSync(RUN_CSV, row.map(csvField).join(",") + "\n");
 }
 
+export function laneHasScorecardBaselineFrom(baseline, project) {
+  const records = baseline?.records;
+  if (Array.isArray(records)) {
+    return records.some((record) => record?.project === project);
+  }
+  if (records && typeof records === "object") {
+    return Object.keys(records).some(
+      (key) =>
+        key === project ||
+        key.startsWith(`${project}/`) ||
+        key.startsWith(`${project}|`),
+    );
+  }
+  return false;
+}
+
 function laneHasScorecardBaseline(project) {
-  const baseline = readJsonFile(SCORECARD_BASELINE_PATH);
-  const records = baseline?.records ?? baseline ?? {};
-  return Object.keys(records).some((key) => key.startsWith(`${project}/`) || key === project);
+  return laneHasScorecardBaselineFrom(readJsonFile(SCORECARD_BASELINE_PATH), project);
 }
 
 function runNpm(args, env) {
@@ -518,4 +554,9 @@ async function main() {
   console.log("proof-matrix: run `npm run eval:dashboard` to refresh the KPI dashboard, and finish the campaign with the 8-stage workflow audit bookend.");
 }
 
-main().catch((error) => fail(String(error?.stack ?? error)));
+if (
+  process.argv[1] &&
+  path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1])
+) {
+  main().catch((error) => fail(String(error?.stack ?? error)));
+}
