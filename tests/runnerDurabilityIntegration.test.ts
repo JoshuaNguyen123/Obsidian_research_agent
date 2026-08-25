@@ -9,12 +9,23 @@ import {
 } from "../src/AgentRunner";
 import {
   createMissionLedger,
+  createPrePlanningAnchorLedger,
   getMissionLedgerPath,
+  isPrePlanningAnchorLedger,
   parseMissionLedgerFromMarkdown,
+  removePrePlanningAnchorArtifact,
   setLedgerMissionPlan,
+  summarizeMissionLedger,
   writeMissionLedger,
   type MissionEvidence,
 } from "../src/agent/missionLedger";
+import {
+  buildMissionResumePlan,
+  formatLedgerForModel,
+} from "../src/agent/missionResume";
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { buildContinuationHandoffV1 } from "../src/agent/continuationMemory";
 import {
   createProjectLineageV1,
@@ -2400,6 +2411,352 @@ test("explicit missing run id fails closed instead of loading the latest unrelat
   assert.doesNotMatch(assistant.join(""), /unrelated checkpoint/i);
 });
 
+test("durable run anchor exists before the first model call and evolves into the run's single ledger", async () => {
+  const vault = createVaultHarness();
+  const prompt = "Append anchored mutation proof to the current note.";
+  let identityRunId: string | null = null;
+  let anchorMarkdownAtPersist: string | undefined;
+  let sequence = 0;
+  let anchorPersistedAtSequence = -1;
+  let firstModelCallAtSequence = -1;
+  let durableStateAtFirstModelCall: string | undefined;
+  const completions: AgentRunCompleteEvent[] = [];
+
+  await runAgentMission({
+    prompt,
+    modelClient: createModelClient(
+      [
+        responseWithToolCall("append_to_current_file", {
+          text: "Anchored mutation proof",
+        }),
+      ],
+      [],
+      () => {
+        if (firstModelCallAtSequence !== -1) {
+          return;
+        }
+        sequence += 1;
+        firstModelCallAtSequence = sequence;
+        // A hard kill at ANY point up to and including the first model call
+        // must leave durable state: snapshot the vault the moment the model
+        // is first consulted.
+        durableStateAtFirstModelCall = identityRunId
+          ? vault.files.get(`Agent Runs/${identityRunId}.md`)
+          : undefined;
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onRunIdentity: (event) => {
+        identityRunId = event.runId;
+      },
+      onTrace: (event) => {
+        if (event.id === "durable-run-anchor" && identityRunId) {
+          sequence += 1;
+          anchorPersistedAtSequence = sequence;
+          anchorMarkdownAtPersist = vault.files.get(
+            `Agent Runs/${identityRunId}.md`,
+          );
+        }
+      },
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.ok(identityRunId, "run identity must be published at run start");
+  assert.ok(
+    firstModelCallAtSequence !== -1,
+    "the mission must reach the model",
+  );
+  assert.ok(
+    anchorPersistedAtSequence !== -1 &&
+      anchorPersistedAtSequence < firstModelCallAtSequence,
+    "the durable run anchor must be persisted before the first model call",
+  );
+  assert.ok(
+    durableStateAtFirstModelCall,
+    "durable run state must exist on disk at the first model call",
+  );
+  const anchor = parseMissionLedgerFromMarkdown(anchorMarkdownAtPersist ?? "");
+  assert.ok(anchor, "the anchor must round-trip through the ledger parser");
+  assert.equal(anchor.runId, identityRunId);
+  assert.equal(isPrePlanningAnchorLedger(anchor), true);
+  assert.equal(anchor.mission, prompt);
+  assert.equal(anchor.status, "running");
+  // The SAME record the resume gate consumes says the run is resumable.
+  assert.equal(summarizeMissionLedger(anchor).canResume, true);
+  const anchorPlan = buildMissionResumePlan(anchor);
+  assert.equal(anchorPlan.canResume, true);
+  assert.equal(anchorPlan.reason, "pre_planning_anchor_restart");
+  assert.match(
+    formatLedgerForModel(anchor),
+    /interrupted before planning began/i,
+  );
+
+  // mission-ledger-start evolved the anchor IN PLACE: one artifact, one
+  // ledger block, a real run route, and a strictly higher revision.
+  assert.equal(completions.length, 1);
+  const finalMarkdown = vault.files.get(`Agent Runs/${identityRunId}.md`);
+  assert.ok(finalMarkdown);
+  const finalLedger = parseMissionLedgerFromMarkdown(finalMarkdown);
+  assert.ok(finalLedger);
+  assert.equal(finalLedger.runId, identityRunId);
+  assert.equal(
+    isPrePlanningAnchorLedger(finalLedger),
+    false,
+    "the full mission ledger must supersede the pre-planning anchor route",
+  );
+  assert.ok(finalLedger.revision > anchor.revision);
+  const runArtifacts = [...vault.files.keys()].filter(
+    (path) => path.startsWith("Agent Runs/") && path.includes(identityRunId!),
+  );
+  assert.equal(
+    runArtifacts.length,
+    1,
+    `expected one Agent Runs artifact, got: ${runArtifacts.join(", ")}`,
+  );
+  assert.equal(finalMarkdown.match(/## Mission Ledger/g)?.length, 1);
+});
+
+test("continue run of an anchor-only interrupted run restarts the mission from its recorded prompt", async () => {
+  const vault = createVaultHarness();
+  const interruptedRunId = "run-anchor-preplanning-kill";
+  const recordedMission =
+    "Append the anchored haiku about rivers to the current note.";
+  // A mission killed before planning leaves ONLY the durable run anchor: no
+  // checkpoint, no runtime snapshot, no mission graph store.
+  await writeMissionLedger(
+    vault.context,
+    createPrePlanningAnchorLedger({
+      runId: interruptedRunId,
+      mission: recordedMission,
+      targetNotePath: "Current.md",
+      now: new Date("2026-07-10T12:10:00.000Z"),
+    }),
+  );
+
+  let modelCalls = 0;
+  const assistant: string[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+
+  await runAgentMission({
+    prompt: `continue run ${interruptedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithToolCall("append_to_current_file", {
+          text: "Anchored haiku restart",
+        }),
+      ],
+      [],
+      () => {
+        modelCalls += 1;
+      },
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onAssistantDelta: (delta) => assistant.push(delta),
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.doesNotMatch(
+    assistant.join(""),
+    /exact durable checkpoint is unavailable/i,
+  );
+  assert.ok(modelCalls >= 1, "the anchor-only continuation must run");
+  assert.ok(
+    traces.some((event) => event.id === "mission-ledger-resume"),
+    "the primary mission-ledger resume path must own the continuation",
+  );
+  assert.ok(
+    traces.some(
+      (event) => event.id === "mission-ledger-resume:pre-planning-anchor",
+    ),
+    "the shared anchor predicate must drive restart-from-prompt semantics",
+  );
+  // The restarted segment did the recorded mission's real work.
+  assert.equal(
+    vault.files.get("Current.md"),
+    "Initial note\nAnchored haiku restart",
+  );
+  assert.equal(completions.length, 1);
+  assert.notEqual(completions[0].stopReason, "error");
+});
+
+test("a graceful pre-planning abort keeps the anchor and continue completes the mission", async () => {
+  const vault = createVaultHarness();
+  const prompt = "Append the abort survivor line to the current note.";
+  const controller = new AbortController();
+  let identityRunId: string | null = null;
+  const completions: AgentRunCompleteEvent[] = [];
+
+  await runAgentMission({
+    prompt,
+    modelClient: createModelClient([
+      responseWithToolCall("append_to_current_file", {
+        text: "Abort survivor",
+      }),
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    abortSignal: controller.signal,
+    events: {
+      onRunIdentity: (event) => {
+        identityRunId = event.runId;
+      },
+      onTrace: (event) => {
+        if (event.id === "durable-run-anchor") {
+          // A plugin-disable "kill" reaches the runner as a graceful abort
+          // (RunCoordinator.shutdown -> requestStop). Fire it the moment the
+          // anchor is durable, before planning produced anything.
+          controller.abort("coordinator_shutdown");
+        }
+      },
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.ok(identityRunId, "run identity must be published at run start");
+  assert.equal(
+    completions.length,
+    1,
+    "the aborted run must complete gracefully through onRunComplete",
+  );
+  assert.equal(vault.files.get("Current.md"), "Initial note");
+  const survivingMarkdown = vault.files.get(`Agent Runs/${identityRunId}.md`);
+  assert.ok(
+    survivingMarkdown,
+    "the durable anchor must SURVIVE a graceful pre-planning abort — " +
+      "deleting it would re-open the exact interrupted-continuation hole",
+  );
+  const survivingAnchor = parseMissionLedgerFromMarkdown(survivingMarkdown);
+  assert.ok(survivingAnchor);
+  assert.equal(isPrePlanningAnchorLedger(survivingAnchor), true);
+  assert.equal(survivingAnchor.mission, prompt);
+
+  // The real interrupted-continuation shape end-to-end: the same vault,
+  // `continue run <id>`, and the recorded mission finishes its work.
+  const traces: AgentTraceEvent[] = [];
+  await runAgentMission({
+    prompt: `continue run ${identityRunId}`,
+    modelClient: createModelClient([
+      responseWithToolCall("append_to_current_file", {
+        text: "Abort survivor",
+      }),
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onTrace: (event) => traces.push(event),
+    },
+  });
+  assert.ok(
+    traces.some(
+      (event) => event.id === "mission-ledger-resume:pre-planning-anchor",
+    ),
+  );
+  assert.equal(
+    vault.files.get("Current.md"),
+    "Initial note\nAbort survivor",
+  );
+});
+
+test("anchor artifact removal deletes only a pre-planning anchor, never an evolved ledger", async () => {
+  const vault = createVaultHarness();
+  const anchorRunId = "run-anchor-cleanup";
+  await writeMissionLedger(
+    vault.context,
+    createPrePlanningAnchorLedger({
+      runId: anchorRunId,
+      mission: "Anchored mission that terminated gracefully pre-planning.",
+      now: new Date("2026-07-10T12:11:00.000Z"),
+    }),
+  );
+  assert.ok(vault.files.has(`Agent Runs/${anchorRunId}.md`));
+  assert.equal(
+    await removePrePlanningAnchorArtifact(vault.context, anchorRunId),
+    true,
+  );
+  assert.equal(vault.files.has(`Agent Runs/${anchorRunId}.md`), false);
+
+  const evolvedRunId = "run-anchor-evolved";
+  const evolved = createMissionLedger({
+    runId: evolvedRunId,
+    mission: "Mission whose ledger already superseded its anchor.",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 8,
+      toolStepBudget: 6,
+      finalizationReserve: 2,
+      expectedTools: ["web_search"],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-07-10T12:12:00.000Z"),
+  });
+  await writeMissionLedger(vault.context, evolved);
+  assert.equal(
+    await removePrePlanningAnchorArtifact(vault.context, evolvedRunId),
+    false,
+    "an evolved ledger must never be removable as an anchor",
+  );
+  assert.ok(vault.files.has(`Agent Runs/${evolvedRunId}.md`));
+});
+
+/**
+ * The writer ("what makes a run resumable from its first moment") and the
+ * resume gate ("what do I accept, and how do I continue it") must consume ONE
+ * predicate. A second private copy of the anchor marker is a second authority
+ * that will drift — the exact two-subsystems failure the anchor exists to
+ * close. Source-level on purpose: drift is only observable once the copies
+ * disagree, which is exactly too late.
+ */
+test("the pre-planning anchor marker has a single authority consumed by writer and resume gate", () => {
+  const srcRoot = fileURLToPath(new URL("../src/", import.meta.url));
+  const offenders: string[] = [];
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const absolute = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(absolute);
+        continue;
+      }
+      if (!/\.tsx?$/u.test(entry.name)) {
+        continue;
+      }
+      if (readFileSync(absolute, "utf8").includes("accepted_pre_planning")) {
+        offenders.push(
+          absolute.slice(srcRoot.length).replace(/\\/g, "/"),
+        );
+      }
+    }
+  };
+  walk(srcRoot);
+  assert.deepEqual(
+    offenders,
+    ["agent/missionLedger.ts"],
+    "the anchor route literal must exist only in missionLedger.ts; " +
+      "every other module must consume isPrePlanningAnchorLedger",
+  );
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const resumeSource = readFileSync(
+    new URL("../src/agent/missionResume.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(runnerSource, /isPrePlanningAnchorLedger/);
+  assert.match(resumeSource, /isPrePlanningAnchorLedger/);
+});
+
 test("crash orphan with only durable graph and worker records resumes with crash_recovered provenance", async () => {
   const vault = createVaultHarness();
   const rootRunId = "run-crash-orphan-root";
@@ -2806,6 +3163,13 @@ function createVaultHarness(options: {
         if (activeFile.path === file.path) {
           activeFile = createFile(toPath);
         }
+      },
+      delete: async (file: { path: string }) => {
+        if (!files.has(file.path)) {
+          throw new Error(`Path not found: ${file.path}`);
+        }
+        files.delete(file.path);
+        mtimes.delete(file.path);
       },
     },
   };
