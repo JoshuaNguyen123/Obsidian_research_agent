@@ -815,6 +815,7 @@ import {
   createResearchPlanWithAssist,
   formatResearchPlanForPrompt,
   parseExplicitResearchSourceCount,
+  promptForbidsFetchedSourceWriteback,
   type ResearchEffortAssessment,
   type ResearchEffortAssist,
   type ResearchModeAssessment,
@@ -3887,6 +3888,13 @@ export async function runAgentMission({
     ) {
       streamingWritebackKind = null;
     }
+    // Continue of a streamed current-note append must not re-stream the original
+    // prompt (duplicate first append, or gated prose that never hits the note).
+    // Drop host-owned streaming so append_to_current_file becomes a required
+    // tool (proof-matrix interrupted-continuation, 2026-08-25).
+    if (streamingWritebackKind === "append") {
+      streamingWritebackKind = null;
+    }
     tools = getAllowedToolDefinitions(
       toolRegistry,
       activeIntentPrompt,
@@ -3966,7 +3974,14 @@ export async function runAgentMission({
       reflex: reflexOutput.intent,
       outputTarget: noteOutputPlan.destination,
     });
-    if (isRunRouteValue(resumeLedger?.route)) {
+    if (
+      isRunRouteValue(resumeLedger?.route) &&
+      !(
+        streamingWritebackKind === null &&
+        (resumeLedger.route === "single_model_writeback" ||
+          resumeLedger.route === "direct_writeback")
+      )
+    ) {
       runPlan = { ...runPlan, route: resumeLedger.route };
     }
     runPlan.traceReasons = [
@@ -34811,13 +34826,23 @@ export function requiresVerifiedFinalOutput(
   researchPlan: ResearchPlan | null,
   missionPrompt: string,
 ): boolean {
-  return Boolean(
-    shouldRequireClaimGrounding(missionPrompt) ||
-      researchPlan ||
-      missionPlan?.tasks.some((task) =>
-        task.completionContract.citationMode !== undefined,
-      ),
-  );
+  if (shouldRequireClaimGrounding(missionPrompt)) {
+    return true;
+  }
+  if (
+    missionPlan?.tasks.some(
+      (task) => task.completionContract.citationMode !== undefined,
+    )
+  ) {
+    return true;
+  }
+  if (!researchPlan) {
+    return false;
+  }
+  // A research plan is not itself a fetched-source writeback contract. Vault-only
+  // soak prompts ("Do not use web") were held at append because a researchPlan
+  // existed, then stalled on two empty tool turns (proof-matrix vault-recall).
+  return !promptForbidsFetchedSourceWriteback(missionPrompt);
 }
 
 function isProofGatedCurrentNoteContentTool(toolName: string): boolean {

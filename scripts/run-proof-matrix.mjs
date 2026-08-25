@@ -31,10 +31,9 @@
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
-  closeSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readdirSync,
   statSync,
@@ -47,7 +46,14 @@ const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
 const RUN_CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
 const MANIFEST_PATH = path.join(REPO_ROOT, "test-results", "proof-matrix-manifest.json");
-const ATTEMPT_LOG_DIR = path.join(REPO_ROOT, "test-results", "proof-matrix-logs");
+// Playwright wipes `test-results/` as its outputDir. Logs have to live outside
+// that tree or every attempt truncates the file we just opened.
+export const ATTEMPT_LOG_DIR = path.join(EVAL_DIR, "proof-matrix-logs");
+const PLAYWRIGHT_EXECUTION_REPORT_PATH = path.join(
+  REPO_ROOT,
+  "test-results",
+  "playwright-execution-report.json",
+);
 const RUN_SUMMARY_PATH = path.join(REPO_ROOT, "test-results", "daily-use-run-summary.json");
 const SCORECARD_BASELINE_PATH = path.join(REPO_ROOT, "e2e", "baselines", "mission-scorecards.v1.json");
 const GRAPH_DIR = path.join(
@@ -81,7 +87,7 @@ const RUN_CSV_HEADER =
  * bounds total spend per cell. Grep filters follow the audit's stage-6
  * precedent of pinning one scenario inside a larger spec.
  */
-const CELLS = [
+export const CELLS = [
   {
     id: "research-current-note",
     project: "daily-use-research",
@@ -318,6 +324,7 @@ const HARNESS_LOG_SIGNATURES = [
   [/^build exited with code \d+\.$/mu, "harness:build_failed"],
   [/^test-vault sync exited with code \d+\.$/mu, "harness:vault_sync_failed"],
   [/^e2e preflight exited with code \d+\.$/mu, "harness:preflight_refused"],
+  [/Unknown E2E project /u, "harness:unknown_project"],
 ];
 
 /**
@@ -634,17 +641,24 @@ async function main() {
         `proof-matrix[${stage}]: node ${runnerArgs.map((a) => path.basename(a)).join(" ")}` +
         ` (output: ${path.relative(REPO_ROOT, attemptLogPath)})`,
       );
-      const attemptLogFd = openSync(attemptLogPath, "w");
-      let result;
+      const result = spawnSync(process.execPath, runnerArgs, {
+        cwd: REPO_ROOT,
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      writeFileSync(
+        attemptLogPath,
+        `${result.stdout ?? ""}${result.stderr ?? ""}`,
+      );
       try {
-        result = spawnSync(process.execPath, runnerArgs, {
-          cwd: REPO_ROOT,
-          env,
-          stdio: ["ignore", attemptLogFd, attemptLogFd],
-          windowsHide: true,
-        });
-      } finally {
-        closeSync(attemptLogFd);
+        copyFileSync(
+          PLAYWRIGHT_EXECUTION_REPORT_PATH,
+          `${attemptLogPath}.playwright-report.json`,
+        );
+      } catch {
+        // Report is best-effort; Playwright only writes it after a real run.
       }
       const endedAt = Date.now();
       const exitCode = result.status ?? 1;

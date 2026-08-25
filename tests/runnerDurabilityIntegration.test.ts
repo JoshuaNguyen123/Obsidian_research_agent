@@ -896,6 +896,96 @@ test("current-note rename and move receipts repin continuation to the relocated 
   );
 });
 
+test("continue run of an interrupted streamed append requires append_to_current_file", async () => {
+  const vault = createVaultHarness();
+  vault.context.settings.streamWritebackMode = "all_current_note_content_writes";
+  vault.context.settings.enableStreaming = true;
+  const seedRunId = "run-interrupted-stream-append";
+  const originalMission =
+    "Perform exactly two ordered durable appends to the current note, then finish. " +
+    "First append exactly one line containing MARKER_A1. " +
+    "Then append exactly one separate line containing MARKER_B2. " +
+    "Two appends total, in that order.";
+  const ledger = createMissionLedger({
+    runId: seedRunId,
+    mission: originalMission,
+    route: "single_model_writeback",
+    loopBudget: {
+      hardCap: 9,
+      toolStepBudget: 6,
+      finalizationReserve: 2,
+      expectedTools: [],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-08-25T13:00:00.000Z"),
+  });
+  ledger.status = "blocked";
+  ledger.continuationCommand = `continue run ${seedRunId}`;
+  await writeMissionLedger(vault.context, ledger);
+  await writeMissionRuntimeSnapshot(
+    vault.context,
+    createMissionRuntimeSnapshot({
+      runId: seedRunId,
+      originalMission,
+      currentNotePath: "Current.md",
+      status: "paused",
+      operationGoals: { current_note_content: "pending" },
+      lastSafeStep: 1,
+      createdAt: new Date("2026-08-25T13:00:00.000Z"),
+      updatedAt: new Date("2026-08-25T13:01:00.000Z"),
+    }),
+  );
+
+  const requests: ModelChatRequest[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const assistant: string[] = [];
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithToolCall("append_to_current_file", {
+          text: "MARKER_A1",
+        }),
+        responseWithToolCall("append_to_current_file", {
+          text: "MARKER_B2",
+        }),
+      ],
+      requests,
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onRunComplete: (event) => completions.push(event),
+      onAssistantDelta: (content) => assistant.push(content),
+    },
+  });
+
+  const firstTools = requests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(
+    requests.length > 0,
+    JSON.stringify({
+      files: [...vault.files.keys()],
+      completions,
+      assistant: assistant.join("").slice(0, 400),
+    }),
+  );
+  assert.ok(
+    firstTools.includes("append_to_current_file"),
+    JSON.stringify(
+      requests.map((request) => ({
+        tools: request.tools?.map((tool) => tool.function.name) ?? [],
+        last: String(request.messages?.at(-1)?.content ?? "").slice(0, 120),
+      })),
+    ),
+  );
+  assert.match(
+    String(completions.at(-1)?.stopDetail ?? ""),
+    /append_to_current_file/u,
+    JSON.stringify(completions.at(-1)),
+  );
+});
+
 test("coordinator-backed runner preserves config tool and completion events", async () => {
   const vault = createVaultHarness();
   const coordinator = new RunCoordinator();

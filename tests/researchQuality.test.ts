@@ -598,6 +598,21 @@ test("hybrid web citation coverage does not expose opaque vault-context passage 
     ),
     JSON.stringify(vaultOnlyResult),
   );
+
+  const noWebVault = evaluateResearchAcceptance({
+    plan: vaultOnly,
+    evidence: evidence.filter((item) => item.kind === "vault_note"),
+    conflicts: [],
+    finalOutput: "Local finding without its passage marker.\n\nLimitations: bounded.\n\nConfidence: medium.",
+    missionPrompt:
+      "Investigate my vault with semantic retrieval and append a grounded synthesis. Do not use web or memory tools.",
+  });
+  assert.ok(
+    !noWebVault.missing.some((item) =>
+      item.startsWith("subquestion_citation_coverage:"),
+    ),
+    JSON.stringify(noWebVault),
+  );
 });
 
 const HASH_A = `sha256:${"a".repeat(64)}`;

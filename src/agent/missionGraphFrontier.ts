@@ -467,6 +467,37 @@ function getMissionGraphNodeRemainingToolNames(
     .map((action) => action.toolName);
 }
 
+const RESUME_EMPTY_FRONTIER_WRITE_TOOLS = new Set([
+  "append_to_current_file",
+  "replace_current_file",
+  "edit_current_section",
+  "append_to_current_section",
+  "read_current_file",
+  "count_words",
+]);
+
+/**
+ * True when a required (non-optional, non-final) node already paid a tool.
+ * A streaming writeback stub is only `final` (and maybe a tool-less dispatch),
+ * so this stays false and resume can still offer current-note writes.
+ */
+function graphHasCompletedRequiredMutation(
+  graph: MissionGraphV3,
+): boolean {
+  return Object.entries(graph.nodes).some(([nodeId, node]) => {
+    if (nodeId === "final" || isOptionalMissionGraphNode(nodeId, node)) {
+      return false;
+    }
+    if (node.status !== "complete") {
+      return false;
+    }
+    return (
+      node.allowedTools.length > 0 ||
+      getMissionGraphNodeFrontierToolNames(node).length > 0
+    );
+  });
+}
+
 function graphHasCompletedCodeWorkspaceCreation(
   graph: MissionGraphV3 | null | undefined,
 ): boolean {
@@ -900,6 +931,27 @@ export function constrainToolsToMissionGraphFrontier(
   const frontierConstrained = tools.filter((tool) =>
     frontierNames.has(tool.function.name),
   );
+  // A ready tool-less `final` node is the streaming-writeback stub. Resume
+  // cannot re-stream blindly, and filtering the catalog down to that empty
+  // frontier before schemasForStep makes route-base writes unreachable — the
+  // model is offered nothing and the two-append continuation dies in two
+  // empty turns (proof-matrix interrupted-continuation, 2026-08-25).
+  if (
+    frontierConstrained.length === 0 &&
+    !graphHasCompletedRequiredMutation(graph)
+  ) {
+    const fallback = schemasForStep({
+      route: options.route ?? "single_model_writeback",
+      frontier: tools
+        .map((tool) => tool.function.name)
+        .filter((name) => RESUME_EMPTY_FRONTIER_WRITE_TOOLS.has(name)),
+      graphRequired: [],
+      allSchemas: tools,
+    }) as ModelToolDefinition[];
+    if (fallback.length > 0) {
+      return applyEffectClass(fallback, { respectMaxEffectClass: false });
+    }
+  }
   if (!options.route) {
     return applyEffectClass(frontierConstrained, {
       respectMaxEffectClass: false,
