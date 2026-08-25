@@ -156,3 +156,18 @@ test("a frontier of only held tools keeps the listing but drops the directive", 
     /append_to_current_file is currently held by proof verification/,
   );
 });
+
+test("an empty ready frontier never instructs the model to call a tool named none", () => {
+  // Observed live: "Preferred next: none. Call that exact name." — the model
+  // dutifully tried to call `none`, which is not a tool, and looped.
+  const message = buildOffFrontierToolRejectionMessage({
+    toolName: "read_current_file",
+    readyFrontierToolNames: [],
+  });
+  assert.doesNotMatch(message, /Preferred next: none/u);
+  assert.doesNotMatch(message, /Call that exact name/u);
+  assert.match(
+    message,
+    /No tool is ready to call; return your best final answer instead\./u,
+  );
+});

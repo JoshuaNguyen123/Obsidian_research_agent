@@ -1388,6 +1388,15 @@ export interface MissionEvidenceAttestationV1 {
   confidence: MissionEvidence["confidence"];
 }
 
+/**
+ * Identity-only run announcement. Carries no authority: it never adopts a
+ * config, never accepts a mission graph or ledger, and never replaces an
+ * identity a resumed run already established.
+ */
+export interface AgentRunIdentityEvent {
+  runId: string;
+}
+
 export interface AgentRunEvents {
   onStatus?: (message: string) => void;
   onPhaseChange?: (phase: AgentRunPhase, message: string) => void;
@@ -1416,6 +1425,15 @@ export interface AgentRunEvents {
   onMissionEvidence?: (event: MissionEvidenceAttestationV1) => void;
   /** Graded run-quality projection; acceptance remains the independent gate. */
   onMissionScorecard?: (scorecard: MissionScorecardV1) => void;
+  /**
+   * The run's durable identity, published the instant the runner owns it and
+   * before any pre-planning model work. `onRunConfig` still owns the full
+   * configuration and the durable ledger identity; this event exists only so
+   * a live mission is never addressable-by-nothing while the structured
+   * router, the reflex pass, and the planner spend their (bounded, but
+   * minutes-long on a slow model) budgets before the first config event.
+   */
+  onRunIdentity?: (event: AgentRunIdentityEvent) => void;
   onRunConfig?: (event: AgentRunConfigEvent) => void;
   onRunComplete?: (event: AgentRunCompleteEvent) => void;
   onApprovalRequest?: (request: ApprovalRequest) => void | Promise<void>;
@@ -1980,6 +1998,18 @@ export async function runAgentMission({
       return Reflect.get(target, property, receiver);
     },
   });
+  // Publish the run identity NOW — before the structured router, the reflex
+  // pass, the planner, and the mission-graph open, every one of which may
+  // spend a bounded-but-long model budget (the router alone is capped at
+  // MAX_STRUCTURED_PLANNING_TIMEOUT_MS) before the first `onRunConfig`.
+  // Two subsystems otherwise disagree about the same live run: the
+  // RunCoordinator reports `running` the moment start() is called, while its
+  // `runId` stayed null until config landed, so anything that addresses a
+  // mission by id (Run Details, `continue run <id>`, crash-resume ownership,
+  // the interrupted-continuation proof lane) had an unbounded blind window on
+  // a mission the host was already showing as live. Identity is knowable at
+  // this line, so it is published at this line.
+  events.onRunIdentity?.({ runId });
   const configuredStepBudget = Math.max(
     1,
     Math.min(
@@ -12225,6 +12255,17 @@ export async function runAgentMission({
         }
       }
       const durablePreWriteProofSatisfied = hasSatisfiedDurablePreWriteProof();
+      // Same vacuous-gate rule as the step-loop hold above: an unsatisfied flag
+      // with no outstanding blocking proof means this mission never carried
+      // pre-write proof debt, so this boundary does not govern the write.
+      // Without this the step-loop fix would only move the deadlock here.
+      const boundaryBlockingPreWriteMissing = durablePreWriteProofSatisfied
+        ? []
+        : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
+      const preWriteProofGateApplies = preWriteProofGateAppliesV1({
+        durablePreWriteProofSatisfied,
+        blockingPreWriteMissing: boundaryBlockingPreWriteMissing,
+      });
       const finalPayloadAcceptance =
         durablePreWriteProofSatisfied && finalPayload.trim()
           ? requireAcceptedPassageCitationCoverage(
@@ -12239,8 +12280,9 @@ export async function runAgentMission({
             )
           : null;
       if (
-        !durablePreWriteProofSatisfied ||
-        finalPayloadAcceptance?.status !== "pass"
+        preWriteProofGateApplies &&
+        (!durablePreWriteProofSatisfied ||
+          finalPayloadAcceptance?.status !== "pass")
       ) {
         const missingDetail = finalPayloadAcceptance?.missing.length
           ? ` (${finalPayloadAcceptance.missing.join(", ")})`
@@ -20838,6 +20880,20 @@ export async function runAgentMission({
       const blockingPreWriteMissing = durablePreWriteProofSatisfied
         ? []
         : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
+      // The gate must decide from the same data its receipt reports. An unsatisfied
+      // flag with an EMPTY blocking list is not "evidence is incomplete" — it is
+      // "this mission declared no blocking pre-write proof at all", because
+      // hasSatisfiedDurablePreWriteProof() returns false both when proofs are
+      // outstanding and when none were ever required. That vacuous arm held the
+      // write of a mission whose own prompt says it needs no web, memory, or vault
+      // research, and then advised research tools the frontier could not offer —
+      // an unsatisfiable remedy (proof-matrix interrupted-continuation, 2026-08-25).
+      // Nothing outstanding means nothing to wait for: the gate does not govern
+      // this write. Missions that DO carry pre-write proof debt are untouched.
+      const preWriteProofGateApplies = preWriteProofGateAppliesV1({
+        durablePreWriteProofSatisfied,
+        blockingPreWriteMissing,
+      });
       const proposedWriteAcceptance =
         proofGatedCurrentNoteTool &&
         requiresVerifiedFinalOutput(
@@ -20875,6 +20931,7 @@ export async function runAgentMission({
           : null;
       if (
         proofGatedCurrentNoteTool &&
+        preWriteProofGateApplies &&
         requiresVerifiedFinalOutput(
           missionPlan,
           researchPlan,
@@ -23551,6 +23608,30 @@ export const PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD = 2;
  * the full menu returns the moment the blocking proofs are satisfied
  * (`blockingProofsOutstanding` false) — the "restore" half of the rule.
  */
+/**
+ * Does the durable pre-write proof gate govern this write at all?
+ *
+ * `hasSatisfiedDurablePreWriteProof()` returns false for TWO different
+ * situations: proofs are required and still outstanding, and no proof was ever
+ * required. Only the first is a reason to hold a write. The second produced a
+ * hold whose own receipt reported an EMPTY blocking list — a gate with an empty
+ * contract — on a mission whose prompt says it needs no web, memory, or vault
+ * research, and then advised research tools the frontier could not offer.
+ *
+ * This is the ONE shared answer for both proof-gate seats (the step-loop hold
+ * and the mutation-boundary hold), so they cannot disagree about whether a
+ * write is governed.
+ */
+export function preWriteProofGateAppliesV1(input: {
+  durablePreWriteProofSatisfied: boolean;
+  blockingPreWriteMissing: readonly string[];
+}): boolean {
+  return (
+    input.durablePreWriteProofSatisfied ||
+    input.blockingPreWriteMissing.length > 0
+  );
+}
+
 export function containProofGateRejectedWriteToolsV1<
   T extends { function: { name: string } },
 >(
@@ -34469,13 +34550,29 @@ export function validateRequiredLiteralWriteArguments(
     return null;
   }
   const normalizedContent = content.toLowerCase();
-  const missing = anchors.filter(
-    (anchor) => !normalizedContent.includes(anchor.toLowerCase()),
+  const present = anchors.filter((anchor) =>
+    normalizedContent.includes(anchor.toLowerCase()),
   );
-  if (missing.length === 0) {
+  // Step-scoped, not mission-scoped. A mission may order SEVERAL writes, each
+  // owning one literal ("append a line containing A and verify, then append a
+  // separate line containing B"). Validating every call against every mission
+  // literal made the first append of any such mission structurally impossible:
+  // the call that correctly carries A alone was rejected for "missing" B, and
+  // the only way to satisfy the checker — putting both markers in one call —
+  // violates the mission's own "two appends, in that order" instruction
+  // (proof-matrix interrupted-continuation, 2026-08-25).
+  //
+  // Per call the contract is therefore progress, not completeness: a write
+  // must carry at least one of the literals the mission demanded, and a write
+  // that drops them all is still rejected. Single-literal missions are
+  // unchanged — one anchor means "present at least one" is exactly "present".
+  if (present.length > 0) {
     return null;
   }
-  return `The ${toolCall.name} content is missing ${missing.length} literal value(s) explicitly required by the mission. Return one corrected call whose content preserves every requested literal exactly.`;
+  // Sentence one is unchanged (every anchor is absent whenever this rejects).
+  // Sentence two no longer demands EVERY literal in one call: that instruction
+  // is what pushed the model to merge two ordered appends into a single write.
+  return `The ${toolCall.name} content is missing ${anchors.length} literal value(s) explicitly required by the mission. Return one corrected call whose content preserves this step's required literal exactly.`;
 }
 
 export function sanitizeAssistantContent(content: string): string {

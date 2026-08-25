@@ -519,7 +519,17 @@ export class RunCoordinator {
 
   private emit(key: keyof AgentRunEvents, args: unknown[]): void {
     this.lastActivityAtMs = Date.now();
-    if (key === "onRunConfig") {
+    if (key === "onRunIdentity") {
+      const identity = args[0] as { runId?: string } | undefined;
+      const runId = identity?.runId?.trim();
+      // Identity only: no authority acceptance, and never a replacement. A
+      // preserved continuation identity (start() keeps the ledger run id) and
+      // an established config identity both outrank this announcement, so the
+      // early publication can only fill the null that start() just wrote.
+      if (runId && this.runId === null) {
+        this.runId = runId;
+      }
+    } else if (key === "onRunConfig") {
       const config = args[0] as AgentRunConfigEvent | undefined;
       const configLedger = config?.missionLedger ?? null;
       const carriesLedger = configLedger !== null;

@@ -67,6 +67,8 @@ import {
   restrictCompoundResearchClosureToolsV1,
   containProofGateRejectedWriteToolsV1,
   PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
+  validateRequiredLiteralWriteArguments,
+  preWriteProofGateAppliesV1,
   resolveThinkingMode,
   canonicalLifecycleReflectionReceiptPaysV1,
   shouldPlanGenericInitiatingNoteReflectionV1,
@@ -26549,6 +26551,94 @@ test("hasConcreteWriteReceipt rejects affirmative zero-delta vault receipts but 
       vaultReceipt({ effects: { changed: false } }),
       vaultReceipt({ bytesWritten: 42 }),
     ]),
+    true,
+  );
+});
+
+test("the required-literal write contract is step-scoped, not mission-scoped", () => {
+  // Regression: proof-matrix interrupted-continuation. The mission orders TWO
+  // appends, each owning one marker. Validating every call against every
+  // mission literal made the first append structurally impossible: the call
+  // that correctly carried A1 alone was rejected for "missing" B2, and the
+  // only content that satisfied the checker (both markers in one call)
+  // violated the mission's own "two appends, in that order" instruction.
+  const markerA = "E2E_MARKER_1787685662535_651586A1";
+  const markerB = "E2E_MARKER_1787685662535_651586B2";
+  const prompt =
+    `Perform exactly two ordered durable appends to the current note, then finish. ` +
+    `First append exactly one line containing ${markerA} and verify that write. ` +
+    `Then append exactly one separate line containing ${markerB} and verify that write.`;
+
+  // Step one: the first append carries its own literal and must pass.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(prompt, {
+      name: "append_to_current_file",
+      arguments: { text: `${markerA}` },
+    }),
+    null,
+  );
+  // Step two: the second append carries the other literal and must pass.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(prompt, {
+      name: "append_to_current_file",
+      arguments: { text: `${markerB}` },
+    }),
+    null,
+  );
+  // A write that drops every required literal is still rejected.
+  const rejection = validateRequiredLiteralWriteArguments(prompt, {
+    name: "append_to_current_file",
+    arguments: { text: "Some prose that carries no required marker at all." },
+  });
+  assert.match(String(rejection), /missing 2 literal value\(s\) explicitly required by the mission/u);
+
+  // Single-literal missions keep the exact previous behavior: present passes,
+  // absent fails.
+  const singlePrompt = `Append one line containing ${markerA} to the current note.`;
+  assert.equal(
+    validateRequiredLiteralWriteArguments(singlePrompt, {
+      name: "append_to_current_file",
+      arguments: { text: `line with ${markerA}` },
+    }),
+    null,
+  );
+  assert.match(
+    String(
+      validateRequiredLiteralWriteArguments(singlePrompt, {
+        name: "append_to_current_file",
+        arguments: { text: "line without the marker" },
+      }),
+    ),
+    /missing 1 literal value\(s\) explicitly required by the mission/u,
+  );
+});
+
+test("the pre-write proof gate does not govern a mission that declared no pre-write proof", () => {
+  // Observed live: the hold fired with {durablePreWriteProofSatisfied:false,
+  // blockingPreWriteMissing:[]} — an empty contract holding a write, then
+  // advising research tools on a no-research mission. An unsatisfied flag with
+  // nothing outstanding means the mission never carried pre-write proof debt.
+  assert.equal(
+    preWriteProofGateAppliesV1({
+      durablePreWriteProofSatisfied: false,
+      blockingPreWriteMissing: [],
+    }),
+    false,
+  );
+  // Real outstanding proof debt still gates the write.
+  assert.equal(
+    preWriteProofGateAppliesV1({
+      durablePreWriteProofSatisfied: false,
+      blockingPreWriteMissing: ["web_evidence"],
+    }),
+    true,
+  );
+  // Satisfied proofs keep the gate live so the verification arm can run.
+  assert.equal(
+    preWriteProofGateAppliesV1({
+      durablePreWriteProofSatisfied: true,
+      blockingPreWriteMissing: [],
+    }),
     true,
   );
 });
