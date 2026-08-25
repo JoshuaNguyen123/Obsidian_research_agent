@@ -12,7 +12,6 @@ import {
   type RouteBudgetProfile,
 } from "./runBudget";
 import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
-import { isCurrentNoteReplaceResetPrompt } from "./currentNoteResetPolicy";
 import { planLoopBudget } from "./loopPlanner";
 import type { ReflexDecision } from "./reflex/types";
 import { isTitleOnlyIntent } from "./titleIntent";
@@ -23,15 +22,10 @@ import {
   isWholeNoteEditIntent,
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
-import { hasDesignIntent as hasSharedDesignIntent } from "./codeDesignIntent";
 import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
 import { canonicalizeKeywordTypos } from "./promptNormalization";
 import type { RoutedMissionIntent } from "./missionRouter";
 import type { MissionSpeechActClassificationV1 } from "./missionSpeechAct";
-import {
-  hasExplicitNoWebIntent,
-  hasPrimaryTextCitationIntent,
-} from "./evidenceIntent";
 import type { AutonomyEffectClass } from "./autonomyEffectClass";
 import { detectLinearIntent } from "./linearIntent";
 import {
@@ -51,15 +45,21 @@ import {
 // reintroduce exactly the split this module already paid for: the route and the
 // tool frontier silently deciding the same question two different ways.
 import {
+  hasAppendIntent,
   hasBrowserAutomationIntent,
   hasClearPageAndWriteIntent,
   hasCurrentNoteSectionTarget,
+  hasCurrentPageWritebackIntent,
   hasCurrentWebFactIntent,
   hasDeepResearchIntent,
+  hasDeleteIntent,
+  hasDeletePathIntent,
+  hasDesignIntent as hasSharedDesignIntent,
   hasEditIntent,
   hasExplicitWebSearchIntent,
   hasFetchedWebSourceIntent,
   hasFolderContentQuestionIntent,
+  hasGraphConnectionIntent,
   hasHtmlPreviewIntent,
   hasLongResearchIntent,
   hasNamedFolderTraversalIntent,
@@ -68,14 +68,19 @@ import {
   hasOwnPriorThinkingRecallIntent,
   hasPathTargetIntent,
   hasPriorAssistantResponseWritebackIntent,
+  hasReplaceIntent,
   hasResearchMemoryReadIntent,
   hasSectionAppendIntent,
   hasSimpleDateTimePrompt,
   hasSpecificFileReadIntent,
   hasStaticGenerationIntent,
+  hasTemplateIntent,
   hasTitleOnlyIntent,
   hasVaultBrowseIntent,
   hasVaultContextQuestionIntent,
+  hasWebSearchIntent,
+  hasWholeNoteRevisionIntent,
+  hasWordCountIntent,
   isPromptOnCurrentPageIntent,
   isRecentAssistantWritebackFollowup,
 } from "./promptIntentClassifiers";
@@ -346,7 +351,7 @@ export function createRunPlan({
   if (
     hasExplicitExternalMutationToolMission(prompt) &&
     !hasCodeExecutionIntent(prompt) &&
-    !hasDesignIntent(prompt) &&
+    !hasSharedDesignIntent(prompt) &&
     detectProjectLifecycleStagesV1(prompt).length <= 1
   ) {
     return plan({
@@ -423,7 +428,7 @@ export function createRunPlan({
   // Research→code (and other code-shaped) missions must take this path before
   // the pure web-search route so the step budget includes the code ladder.
   if (
-    hasDesignIntent(prompt) ||
+    hasSharedDesignIntent(prompt) ||
     hasCodeExecutionIntent(prompt) ||
     routedCodeExecutionProposal ||
     hasHtmlPreviewIntent(prompt) ||
@@ -461,7 +466,7 @@ export function createRunPlan({
       slowPathReason: "needs_model_planning",
       expectedTimeClass: "normal",
       traceReasons: [
-        hasDesignIntent(prompt)
+        hasSharedDesignIntent(prompt)
           ? "design_intent"
           : hasCodeExecutionIntent(prompt)
             ? hasWebSearchIntent(prompt)
@@ -738,29 +743,6 @@ function hasTopicSearchVaultQuestionIntent(prompt: string): boolean {
   );
 }
 
-function hasWordCountIntent(prompt: string): boolean {
-  return /\b(word\s*count|count\s+(?:the\s+)?words?|how\s+many\s+words?|length\s+check|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(
-    prompt,
-  );
-}
-
-function hasGraphConnectionIntent(prompt: string): boolean {
-  // Vault paths are opaque resource identifiers, not natural-language intent.
-  // A path such as `Mission Graph Guard/restart.md` must not silently route an
-  // append mission through graph retrieval merely because its folder name
-  // contains "graph" and the path itself ends in a Markdown file.
-  const intentText = prompt.replace(
-    /[A-Za-z0-9 .@()[\]_-]+(?:\/[A-Za-z0-9 .@()[\]_-]+)+\.md\b/giu,
-    " [markdown-path] ",
-  ).replace(
-    /\bpreserve\b[^.\n]{0,100}\b(?:note\s+)?backlinks?\b/giu,
-    " ",
-  );
-  return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
-    intentText,
-  ) && /\b(note|notes|file|files|vault|current|this|active|markdown)\b/i.test(intentText);
-}
-
 function hasCodeExecutionIntent(prompt: string): boolean {
   if (hasCodeExecutionIntentExact(prompt)) return true;
   // Fuzzy rescue, widen-only: a bounded keyword-typo correction ("crate a …
@@ -829,155 +811,6 @@ function countExplicitCodeToolNames(prompt: string): number {
       /\b(?:code_workspace_[a-z0-9_]+|code_validate_(?:fast|targeted|full)|code_repair_(?:status|record_cycle)|code_commit_verified|install_code_dependency|run_code_block|render_html_preview)\b/gu,
     ) ?? [],
   ).size;
-}
-
-function hasDesignIntent(prompt: string): boolean {
-  return hasSharedDesignIntent(prompt);
-}
-
-function hasTemplateIntent(prompt: string): boolean {
-  // Do not match bare "form" ("in the form of", "form a plan").
-  return /\b(template|templates|templated|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i.test(
-    prompt,
-  );
-}
-
-function hasCurrentPageWritebackIntent(prompt: string): boolean {
-  return (
-    /\b(stream|write|append|save|add|insert|put|record)\b[\s\S]{0,120}\b(?:onto|to|into|in|on)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
-      prompt,
-    ) ||
-    /\b(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,120}\b(stream|write|append|save|add|insert|put|record)\b/i.test(
-      prompt,
-    )
-  );
-}
-
-function hasAppendIntent(prompt: string): boolean {
-  if (/\bappend_to_current_file\b/i.test(prompt)) {
-    return true;
-  }
-  return /\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,80}\b(note|file|markdown|vault|page|document)\b|\b(note|file|markdown|vault|page|document)\b[\s\S]{0,80}\b(append|save|write|update|add|insert|copy|paste|put)\b|\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,120}\.md\b/i.test(
-    prompt,
-  );
-}
-
-function hasReplaceIntent(prompt: string): boolean {
-  return (
-    isCurrentNoteReplaceResetPrompt(prompt) ||
-    hasWholeNoteRevisionIntent(prompt) ||
-    /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\breplace\s+(?:the\s+)?existing\s+contents?\b/i.test(
-      prompt,
-    ) || hasClearPageAndWriteIntent(prompt)
-  );
-}
-
-function hasWholeNoteRevisionIntent(prompt: string): boolean {
-  if (isNamedSectionEditIntent(prompt)) {
-    return false;
-  }
-
-  if (
-    isWholeNoteEditIntent(prompt) ||
-    isCurrentNoteEditOrganizeIntent(prompt)
-  ) {
-    return true;
-  }
-
-  const sectionTarget =
-    /\b(section|heading)\b/i.test(prompt) &&
-    !/\b(essay|draft|article|paragraphs?|body|content|document)\b/i.test(
-      prompt,
-    );
-  if (sectionTarget) {
-    return false;
-  }
-
-  const revisionVerb =
-    /\b(edit(?:ing)?|revise|revising|revision|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b/i;
-  const wholeTextTarget =
-    /\b(essay|draft|article|paragraphs?|body|content|document)\b|\b(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown)\b|\b(?:note|page|file|markdown)\b[\s\S]{0,40}\b(?:whole|entire|current|this|active)\b/i;
-  const updateVerb = /\b(update|updating)\b/i;
-
-  return (
-    revisionVerb.test(prompt) && wholeTextTarget.test(prompt)
-  ) || (
-    updateVerb.test(prompt) &&
-    /\b(essay|draft|article|paragraphs?|body|content|document)\b|\b(?:whole|entire)\s+(?:note|page|file|markdown)\b/i.test(
-      prompt,
-    )
-  );
-}
-
-function hasDeleteIntent(prompt: string): boolean {
-  if (isCurrentNoteReplaceResetPrompt(prompt)) {
-    return false;
-  }
-
-  return prompt
-    .split(/(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu)
-    .some(
-      (clause) =>
-        /\b(?:delete|remove|trash)\b/iu.test(clause) &&
-        !hasNegatedDeleteClause(clause) &&
-        /\b(?:current|this|active|whole|entire)\s+(?:note|file)\b|\b(?:note|file)\b[\s\S]{0,40}\b(?:current|this|active|whole|entire)\b/iu.test(
-          clause,
-        ),
-    );
-}
-
-function hasDeletePathIntent(prompt: string): boolean {
-  if (isCurrentNoteReplaceResetPrompt(prompt)) {
-    return false;
-  }
-
-  return prompt
-    .split(/(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu)
-    .some(
-      (clause) =>
-        /\b(?:delete|remove|trash)\b/iu.test(clause) &&
-        !hasNegatedDeleteClause(clause) &&
-        hasPathTargetIntent(clause),
-    );
-}
-
-function hasWebSearchIntent(prompt: string): boolean {
-  if (hasExplicitNoWebIntent(prompt)) {
-    return false;
-  }
-  if (hasSimpleDateTimePrompt(prompt)) {
-    return false;
-  }
-
-  if (hasPriorAssistantResponseWritebackIntent(prompt)) {
-    return false;
-  }
-
-  if (hasTitleOnlyIntent(prompt)) {
-    return false;
-  }
-
-  if (/\b(search|use|check|consult)\s+(?:the\s+)?web\b/i.test(prompt)) {
-    return true;
-  }
-
-  if (hasCurrentWebFactIntent(prompt)) {
-    return true;
-  }
-
-  if (hasStaticGenerationIntent(prompt) && !hasFetchedWebSourceIntent(prompt)) {
-    return false;
-  }
-
-  if (hasFolderContentQuestionIntent(prompt)) {
-    return false;
-  }
-
-  if (hasExplicitWebSearchIntent(prompt) || hasDeepResearchIntent(prompt)) {
-    return true;
-  }
-
-  return /\b(research|investigate|find|gather)\b/i.test(prompt);
 }
 
 function hasTitleIntent(prompt: string): boolean {

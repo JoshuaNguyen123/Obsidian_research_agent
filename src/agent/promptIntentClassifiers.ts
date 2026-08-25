@@ -123,7 +123,14 @@ export function hasWordCountIntent(prompt: string): boolean {
 }
 
 export function hasGraphConnectionIntent(prompt: string): boolean {
+  // Vault paths are opaque resource identifiers, not natural-language intent.
+  // A path such as `Mission Graph Guard/restart.md` must not silently route an
+  // append mission through graph retrieval merely because its folder name
+  // contains "graph" and the path itself ends in a Markdown file.
   const intentText = prompt.replace(
+    /[A-Za-z0-9 .@()[\]_-]+(?:\/[A-Za-z0-9 .@()[\]_-]+)+\.md\b/giu,
+    " [markdown-path] ",
+  ).replace(
     /\bpreserve\b[^.\n]{0,100}\b(?:note\s+)?backlinks?\b/giu,
     " ",
   );
