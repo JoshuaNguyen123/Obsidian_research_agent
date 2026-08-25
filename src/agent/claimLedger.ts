@@ -4,8 +4,11 @@ import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import {
   createQuotedSpanPattern,
   findQuoteRawOffset,
+  findQuoteRawSpan,
+  normalizeForMatch,
   quoteAppearsVerbatim,
 } from "./quoteMatch";
+import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
 
 /** Bounded so a draft full of bad quotes cannot flood the correction prompt. */
 const MAX_QUOTE_CORRECTIONS = 4;
@@ -253,6 +256,14 @@ export function extractClaimsFromDraft(
   );
   const sentences = splitClaimSentences(draft);
   const claims: ResearchClaim[] = [];
+  // Content-derived identity: ordinal ids renumbered on every regeneration,
+  // which turned the correction loop's "missing set must shrink" test into
+  // noise and made per-claim repair impossible. A sentence keeps its id for
+  // as long as its normalized text is unchanged; duplicates get an occurrence
+  // suffix. Persisted ledgers with legacy ordinal ids still normalize —
+  // missing-token sets and ledgers are always regenerated together per
+  // candidate, so the two schemes never meet in one comparison.
+  const seenClaimIdCounts = new Map<string, number>();
   for (const sentence of sentences) {
     const { text } = sentence;
     if (claims.length >= maxClaims) {
@@ -261,8 +272,11 @@ export function extractClaimsFromDraft(
     if (!isCandidateClaimSentence(text)) {
       continue;
     }
+    const baseId = `claim:s-${portableSha256Text(normalizeForMatch(text)).slice(0, 10)}`;
+    const occurrence = (seenClaimIdCounts.get(baseId) ?? 0) + 1;
+    seenClaimIdCounts.set(baseId, occurrence);
     claims.push({
-      id: `claim:${claims.length + 1}`,
+      id: occurrence === 1 ? baseId : `${baseId}-${occurrence}`,
       text,
       status:
         sentence.epistemicSection || isExemptLimitationSentence(text)
@@ -344,19 +358,23 @@ export function bindClaimsToPassages(
     const quoteSpans = extractQuoteSpans(
       claim.text,
       boundIds.length > 0 ? boundIds : citedInClaim,
+      passageById,
     ).map((span) => {
       const passage = passageById.get(span.passageId);
       if (!passage) {
         return span;
       }
-      const index = passage.text.indexOf(span.quote);
-      if (index < 0) {
+      // Raw-offset recovery must tolerate the same smart-quote/whitespace
+      // variance the verbatim check tolerates — a plain indexOf missed spans
+      // the verifier accepts, silently dropping their offsets.
+      const raw = findQuoteRawSpan(span.quote, passage.text);
+      if (!raw) {
         return span;
       }
       return {
         ...span,
-        startChar: index,
-        endChar: index + span.quote.length,
+        startChar: raw.start,
+        endChar: raw.end,
       };
     });
 
@@ -618,6 +636,50 @@ export function serializeClaimLedger(ledger: ClaimLedger): Record<string, unknow
     reasons: [...ledger.reasons],
     ...(ledger.nextAction ? { nextAction: ledger.nextAction } : {}),
     requireQuoteSpans: ledger.requireQuoteSpans === true,
+    // The verification-state fields must survive a resume: correction prompts
+    // rehydrate quoteCorrections for their passage bytes, and dropping them
+    // made every post-resume correction run blind. Absent-tolerant both ways —
+    // old records simply lack the keys.
+    ...(ledger.verifyQuoteSpans !== undefined
+      ? { verifyQuoteSpans: ledger.verifyQuoteSpans === true }
+      : {}),
+    ...(ledger.quoteCorrections && ledger.quoteCorrections.length > 0
+      ? {
+          quoteCorrections: ledger.quoteCorrections
+            .slice(0, MAX_QUOTE_CORRECTIONS)
+            .map((correction) => ({
+              claimId: correction.claimId.slice(0, 64),
+              passageId: correction.passageId.slice(0, 200),
+              attempted: correction.attempted.slice(0, 240),
+              passageExcerpt: correction.passageExcerpt.slice(
+                0,
+                QUOTE_CORRECTION_EXCERPT_CHARS,
+              ),
+            })),
+        }
+      : {}),
+  };
+}
+
+function normalizeQuoteCorrection(value: unknown): ClaimQuoteCorrection | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const claimId = typeof value.claimId === "string" ? value.claimId.trim() : "";
+  const passageId =
+    typeof value.passageId === "string" ? value.passageId.trim() : "";
+  const attempted =
+    typeof value.attempted === "string" ? value.attempted.trim() : "";
+  const passageExcerpt =
+    typeof value.passageExcerpt === "string" ? value.passageExcerpt.trim() : "";
+  if (!claimId || !passageId || !attempted || !passageExcerpt) {
+    return null;
+  }
+  return {
+    claimId: claimId.slice(0, 64),
+    passageId: passageId.slice(0, 200),
+    attempted: attempted.slice(0, 240),
+    passageExcerpt: passageExcerpt.slice(0, QUOTE_CORRECTION_EXCERPT_CHARS),
   };
 }
 
@@ -649,6 +711,19 @@ export function normalizeClaimLedger(value: unknown): ClaimLedger | null {
       ? { nextAction: value.nextAction.trim().slice(0, 300) }
       : {}),
     requireQuoteSpans: value.requireQuoteSpans === true,
+    ...(value.verifyQuoteSpans === true ? { verifyQuoteSpans: true } : {}),
+    ...(() => {
+      const corrections = Array.isArray(value.quoteCorrections)
+        ? value.quoteCorrections
+            .map(normalizeQuoteCorrection)
+            .filter(
+              (correction): correction is ClaimQuoteCorrection =>
+                correction !== null,
+            )
+            .slice(0, MAX_QUOTE_CORRECTIONS)
+        : [];
+      return corrections.length > 0 ? { quoteCorrections: corrections } : {};
+    })(),
   };
 }
 
@@ -765,6 +840,7 @@ function isExemptLimitationSentence(text: string): boolean {
 function extractQuoteSpans(
   claimText: string,
   passageIds: string[],
+  passageById?: ReadonlyMap<string, ClaimPassageRef>,
 ): ClaimQuoteSpan[] {
   if (passageIds.length === 0) {
     return [];
@@ -781,11 +857,26 @@ function extractQuoteSpans(
   if (quotes.length === 0) {
     return [];
   }
+  // Pin each quote to the first bound passage that actually CONTAINS it —
+  // pinning everything to passageIds[0] made a correct quote from the second
+  // cited passage fail as quote_mismatch. When no bound passage contains the
+  // quote, keep the primary pin so the mismatch still reports against the
+  // passage the claim cites (standards unchanged; only the pin is corrected).
   const primaryPassage = passageIds[0];
-  return quotes.slice(0, 3).map((quote) => ({
-    passageId: primaryPassage,
-    quote,
-  }));
+  return quotes.slice(0, 3).map((quote) => {
+    const containingId = passageById
+      ? passageIds.find((id) => {
+          const passage = passageById.get(id);
+          return Boolean(
+            passage?.text && quoteAppearsVerbatim(quote, passage.text),
+          );
+        })
+      : undefined;
+    return {
+      passageId: containingId ?? primaryPassage,
+      quote,
+    };
+  });
 }
 
 function lexicalOverlapScore(left: string, right: string): number {
