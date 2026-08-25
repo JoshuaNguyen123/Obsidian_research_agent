@@ -14,3 +14,4 @@ export function attemptLogExcerpt(
   logText: string,
   endIndex?: number | null,
 ): string;
+export function isEmptyScorecardHarvestOutput(output: string): boolean;

@@ -410,6 +410,13 @@ function laneHasScorecardBaseline(project) {
   return laneHasScorecardBaselineFrom(readJsonFile(SCORECARD_BASELINE_PATH), project);
 }
 
+export const EMPTY_SCORECARD_HARVEST_MESSAGE =
+  "No passing, fully-scored mission records to harvest";
+
+export function isEmptyScorecardHarvestOutput(output) {
+  return String(output ?? "").includes(EMPTY_SCORECARD_HARVEST_MESSAGE);
+}
+
 function runNpm(args, env) {
   const result = spawnSync("npm", args, {
     cwd: REPO_ROOT,
@@ -419,6 +426,20 @@ function runNpm(args, env) {
     windowsHide: true,
   });
   return result.status ?? 1;
+}
+
+function runNpmCaptured(args, env) {
+  const result = spawnSync("npm", args, {
+    cwd: REPO_ROOT,
+    env,
+    encoding: "utf8",
+    shell: process.platform === "win32",
+    windowsHide: true,
+  });
+  return {
+    status: result.status ?? 1,
+    output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
 }
 
 function loadManifest() {
@@ -643,10 +664,17 @@ async function main() {
 
       if (green && !laneHasScorecardBaseline(cell.project)) {
         console.log(`proof-matrix[${stage}]: first green for unbaselined lane — harvesting scorecards.`);
-        if (runNpm(["run", "scorecards:harvest"], env) !== 0) {
-          fail(`${stage}: scorecards:harvest failed after a green run.`);
-        }
-        if (runNpm(["run", "check:mission-scorecards"], env) !== 0) {
+        const harvest = runNpmCaptured(["run", "scorecards:harvest"], env);
+        if (harvest.output) process.stdout.write(harvest.output);
+        if (harvest.status !== 0) {
+          if (isEmptyScorecardHarvestOutput(harvest.output)) {
+            console.log(
+              `proof-matrix[${stage}]: lane has no harvestable scorecard; continuing without a baseline record.`,
+            );
+          } else {
+            fail(`${stage}: scorecards:harvest failed after a green run.`);
+          }
+        } else if (runNpm(["run", "check:mission-scorecards"], env) !== 0) {
           fail(`${stage}: check:mission-scorecards failed right after harvest.`);
         }
       }

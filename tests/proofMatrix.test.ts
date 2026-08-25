@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   attemptLogExcerpt,
   classifyAttemptOutcome,
+  isEmptyScorecardHarvestOutput,
   laneHasScorecardBaselineFrom,
   porcelainWithoutAllowedHarvest,
 } from "../scripts/run-proof-matrix.mjs";
@@ -131,4 +132,17 @@ test("attempt log excerpt keeps the lines around the failure and stays bounded",
   assert.ok(excerpt.length <= 1_000);
   assert.doesNotMatch(excerpt, /trailing noise after/u);
   assert.equal(attemptLogExcerpt(""), "");
+});
+
+test("an empty scorecard harvest is not a matrix-stopping failure", () => {
+  assert.equal(
+    isEmptyScorecardHarvestOutput(
+      "No passing, fully-scored mission records to harvest. A baseline built from a red or partial run would lower the bar it exists to hold.\n",
+    ),
+    true,
+  );
+  assert.equal(
+    isEmptyScorecardHarvestOutput("updated  daily-use-research|DU-02|spec|title\n"),
+    false,
+  );
 });
