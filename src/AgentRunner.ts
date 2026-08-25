@@ -17343,6 +17343,9 @@ export async function runAgentMission({
             // from the broad route catalog (non-explicit plans pass a null
             // graph into the frontier constraint and rely on authority alone).
             missionGraphSession?.graph ?? stepGraph,
+            // Durable receipts prove whether the workspace was created over a
+            // seeded repository; a pinned append then keeps patch beside it.
+            writeReceipts,
           ),
           missionGraphUsesExactPlannedFrontier && !setLooseCompoundEnabled
             ? stepGraph

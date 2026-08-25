@@ -159,6 +159,74 @@ export function isAdaptiveCodeWorkspaceMutationToolNameV1(
 }
 
 /**
+ * Structural slice of a durable run receipt sufficient to prove one verified
+ * workspace creation. Declared structurally so the frontier does not import
+ * the runner's receipt type (AgentRunner already imports this module).
+ */
+export interface WorkspaceCreateReceiptShapeV1 {
+  toolName: string;
+  commitKind?: string | null;
+  readback?: { status?: string | null } | null;
+  resource?: { system?: string | null } | null;
+  output?: unknown;
+}
+
+/**
+ * True when a durable receipt proves the mission's workspace was created over
+ * an adopted repository — and therefore already contained seeded files at
+ * creation time. The planner cannot know this (the graph is planned before
+ * code_workspace_create runs), so the creation receipt's repositoryWriteScope
+ * is the earliest host-verified proof that planned write targets may already
+ * exist. A scratch workspace is empty at creation and never satisfies this.
+ */
+export function workspaceCreateReceiptProvesSeededFilesV1(
+  receipt: WorkspaceCreateReceiptShapeV1,
+): boolean {
+  if (
+    receipt.toolName !== "code_workspace_create" ||
+    (receipt.commitKind !== "committed" &&
+      receipt.commitKind !== "reconciled") ||
+    receipt.readback?.status !== "verified" ||
+    receipt.resource?.system !== "workspace"
+  ) {
+    return false;
+  }
+  const output = isRecord(receipt.output) ? receipt.output : null;
+  const scope =
+    output && isRecord(output.repositoryWriteScope)
+      ? output.repositoryWriteScope
+      : null;
+  return Boolean(
+    scope && Array.isArray(scope.projects) && scope.projects.length > 0,
+  );
+}
+
+/**
+ * Shared seeded-file widening predicate (production and tests must consume
+ * this one function; never re-derive the expression). When the planned write
+ * frontier pins code_workspace_append over a workspace that verifiably held
+ * seeded files at creation time, code_workspace_patch must stay on the menu
+ * alongside the append: replacing seeded placeholder content is not
+ * expressible with append, and withholding patch sent a live model into a
+ * thinking spiral over an unsatisfiable instruction. This widens only the
+ * node-level menu — mirroring how the collision repair pair is offered — and
+ * grants no new Bound/Hard authority (code_workspace_patch is already inside
+ * CODE_IMPLEMENTATION_TOOL_ALLOW and the prepared-mutation path still governs
+ * the call). A pinned write over a not-yet-existing file (scratch workspace,
+ * no repository adoption) is unchanged.
+ */
+export function pinnedAppendFrontierRequiresSeededFilePatchV1(
+  pinnedWriteToolNames: ReadonlySet<string>,
+  durableReceipts: readonly WorkspaceCreateReceiptShapeV1[],
+): boolean {
+  return (
+    pinnedWriteToolNames.has("code_workspace_append") &&
+    !pinnedWriteToolNames.has("code_workspace_patch") &&
+    durableReceipts.some(workspaceCreateReceiptProvesSeededFilesV1)
+  );
+}
+
+/**
  * While a ready/running node pins one exact workspace mutation (a planned
  * code_workspace_append, for example), sibling adaptive mutations are noise
  * rather than freedom: a model that writes the same file through
@@ -187,6 +255,7 @@ export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
       }
     | null
     | undefined,
+  durableReceipts: readonly WorkspaceCreateReceiptShapeV1[] = [],
 ): ModelToolDefinition[] {
   if (!graph) return tools;
   // A red validation deliberately opens the diagnostic + mutation recovery
@@ -221,6 +290,11 @@ export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
     for (const toolName of names) pinned.add(toolName);
   }
   if (pinned.size === 0) return tools;
+  // Seeded-file widening: a pinned append over a repository-seeded workspace
+  // keeps patch as its companion (see the shared predicate's contract).
+  if (pinnedAppendFrontierRequiresSeededFilePatchV1(pinned, durableReceipts)) {
+    pinned.add("code_workspace_patch");
+  }
   return tools.filter(
     (tool) =>
       !CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(tool.function.name) ||
