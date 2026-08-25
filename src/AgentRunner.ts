@@ -329,6 +329,8 @@ import {
   deriveAutonomyScope,
   extractExplicitNewWorkspaceFilePaths,
   extractExplicitVaultReadFilePaths,
+  currentNoteAppendCatalogEligible,
+  currentNoteReplaceCatalogEligible,
   extractExplicitWorkspaceReadFilePaths,
   extractExplicitWorkspaceWriteExpectedFilePaths,
   extractMarkdownPathMentions,
@@ -26340,10 +26342,12 @@ export function constrainSetLooseCompanionsToAutonomyScope(
       return vaultReadAuthorized;
     }
     if (toolName === "append_to_current_file") {
-      return scope.write.currentNote;
+      // Shared catalog predicate — both AgentRunner sites must agree, or a
+      // blocked append can point at a replace that was never offered.
+      return currentNoteAppendCatalogEligible(scope);
     }
     if (toolName === "replace_current_file") {
-      return scope.destructive.replaceCurrentNote;
+      return currentNoteReplaceCatalogEligible(scope);
     }
     return true;
   });
@@ -27184,7 +27188,9 @@ function isToolWithinAutonomyScope(
   }
 
   if (name === "replace_current_file") {
-    return scope.destructive.replaceCurrentNote;
+    // Shared catalog predicate — both AgentRunner sites must agree, or a
+    // blocked append can point at a replace that was never offered.
+    return currentNoteReplaceCatalogEligible(scope);
   }
 
   if (name === "delete_current_file") {
@@ -27206,11 +27212,7 @@ function isToolWithinAutonomyScope(
     name === "retitle_current_file" ||
     name === "link_related_notes_in_current_file"
   ) {
-    return (
-      scope.write.currentNote ||
-      scope.destructive.replaceCurrentNote ||
-      scope.destructive.deleteCurrentNote
-    );
+    return currentNoteAppendCatalogEligible(scope);
   }
 
   return true;

@@ -27,6 +27,7 @@ import {
   type ToolExecutionContext,
 } from "./types";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "../agent/replaceIntent";
+import { currentNoteReplaceCatalogEligible } from "../agent/missionScope";
 import {
   assertSafeCurrentNoteWritePayload,
   stripRepeatedCurrentNotePrefixFromAppend,
@@ -2272,10 +2273,18 @@ export const appendToCurrentFileTool: AgentTool = {
     });
     // Revision missions must not "append" process talk or a second draft when
     // whole-note replace is the authorized path — fail closed instead of
-    // polluting / appearing to wipe the page.
+    // polluting / appearing to wipe the page. The gate may only defer to
+    // replace when replace is actually catalog-eligible under the SAME scope
+    // predicate the catalog consults (currentNoteReplaceCatalogEligible);
+    // otherwise blocking append here leaves the mission with ZERO write
+    // paths. When no mission scope is attached (legacy hosts), the historic
+    // block is preserved.
+    const appendCrossGateScope = context.missionIntent?.autonomyScope;
     if (
       hasAuthorizedCurrentNoteReplaceIntent(context.originalPrompt) &&
-      current.trim().length >= 400
+      current.trim().length >= 400 &&
+      (!appendCrossGateScope ||
+        currentNoteReplaceCatalogEligible(appendCrossGateScope))
     ) {
       throw new Error(
         "append_to_current_file is blocked for this revise/replace mission. Use replace_current_file with the full revised note body.",
