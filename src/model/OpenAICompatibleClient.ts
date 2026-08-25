@@ -18,6 +18,10 @@ import type {
 import { ModelClientError } from "./types";
 import { parseRetryAfterMs } from "./retry";
 import { parseProviderToolArguments } from "./toolArgumentNormalization";
+import {
+  createDegenerateStreamDetector,
+  formatDegenerateStreamMessage,
+} from "./degenerateStreamGuard";
 
 interface OpenAICompatibleClientOptions {
   baseUrl: string;
@@ -259,6 +263,7 @@ export async function parseOpenAIChatStream(
 ): Promise<ModelChatResponse> {
   const chunks: unknown[] = [];
   const toolCallAccumulators = new Map<number, OpenAIToolCallAccumulator>();
+  const degenerateDetector = createDegenerateStreamDetector();
   let content = "";
   let doneReason: string | undefined;
 
@@ -289,6 +294,14 @@ export async function parseOpenAIChatStream(
       if (text) {
         content += text;
         events.onContentDelta?.(text);
+        const degenerate = degenerateDetector.feed(text);
+        if (degenerate) {
+          throw new ModelClientError(
+            "invalid_response",
+            formatDegenerateStreamMessage(degenerate),
+            { details: { unit: degenerate.unit, windowChars: degenerate.windowChars } },
+          );
+        }
       }
       accumulateOpenAIStreamToolCalls(delta.tool_calls, toolCallAccumulators);
     }

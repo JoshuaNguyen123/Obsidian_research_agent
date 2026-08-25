@@ -15,6 +15,10 @@ import {
 } from "./types";
 import { parseRetryAfterMs } from "./retry";
 import { parseProviderToolArguments } from "./toolArgumentNormalization";
+import {
+  createDegenerateStreamDetector,
+  formatDegenerateStreamMessage,
+} from "./degenerateStreamGuard";
 
 interface OllamaClientOptions {
   baseUrl: string;
@@ -277,6 +281,7 @@ export async function parseOllamaChatStream(
   events: ModelChatStreamEvents = {},
 ): Promise<ModelChatResponse> {
   const chunks: unknown[] = [];
+  const degenerateDetector = createDegenerateStreamDetector();
   const toolCallsByIndex = new Map<number, ModelToolCall>();
   const toolCallsUnordered: ModelToolCall[] = [];
   let buffer = "";
@@ -332,11 +337,27 @@ export async function parseOllamaChatStream(
       if (typeof rawMessage.thinking === "string" && rawMessage.thinking) {
         thinking += rawMessage.thinking;
         events.onThinkingDelta?.(rawMessage.thinking);
+        const degenerate = degenerateDetector.feed(rawMessage.thinking);
+        if (degenerate) {
+          throw new ModelClientError(
+            "invalid_response",
+            formatDegenerateStreamMessage(degenerate),
+            { details: { unit: degenerate.unit, windowChars: degenerate.windowChars } },
+          );
+        }
       }
 
       if (typeof rawMessage.content === "string" && rawMessage.content) {
         content += rawMessage.content;
         events.onContentDelta?.(rawMessage.content);
+        const degenerate = degenerateDetector.feed(rawMessage.content);
+        if (degenerate) {
+          throw new ModelClientError(
+            "invalid_response",
+            formatDegenerateStreamMessage(degenerate),
+            { details: { unit: degenerate.unit, windowChars: degenerate.windowChars } },
+          );
+        }
       }
 
       mergeOllamaToolCallDeltas(
