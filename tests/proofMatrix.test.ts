@@ -2,12 +2,34 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_CONSECUTIVE_HARNESS_FAILURES,
+  attemptConsumesBudget,
   attemptLogExcerpt,
   classifyAttemptOutcome,
+  consecutiveGreens,
+  consecutiveHarnessFailures,
+  consumedAttemptCount,
+  harnessFailureCount,
   isEmptyScorecardHarvestOutput,
+  isInfrastructureFailureClass,
   laneHasScorecardBaselineFrom,
   porcelainWithoutAllowedHarvest,
+  registerProductFailure,
+  type ProofMatrixAttempt,
+  type ProofMatrixManifest,
 } from "../scripts/run-proof-matrix.mjs";
+
+function manifestWith(attempts: ProofMatrixAttempt[]): ProofMatrixManifest {
+  return { attempts, productClassCounts: {} };
+}
+
+function green(cell: string): ProofMatrixAttempt {
+  return { cell, green: true, failureClass: "none" };
+}
+
+function red(cell: string, failureClass: string): ProofMatrixAttempt {
+  return { cell, green: false, failureClass };
+}
 
 test("scorecard baseline detection reads records[].project, not array indices", () => {
   const baseline = {
@@ -132,6 +154,97 @@ test("attempt log excerpt keeps the lines around the failure and stays bounded",
   assert.ok(excerpt.length <= 1_000);
   assert.doesNotMatch(excerpt, /trailing noise after/u);
   assert.equal(attemptLogExcerpt(""), "");
+});
+
+test("harness and process deaths are infrastructure; real reds are not", () => {
+  assert.equal(isInfrastructureFailureClass("harness:build_failed"), true);
+  assert.equal(isInfrastructureFailureClass("harness:e2e_lock_timeout"), true);
+  assert.equal(isInfrastructureFailureClass("process:matrix_unclassified"), true);
+  assert.equal(isInfrastructureFailureClass("product:writeback_unproven"), false);
+  assert.equal(isInfrastructureFailureClass("model:refusal"), false);
+  assert.equal(isInfrastructureFailureClass("external:linear_api_down"), false);
+  assert.equal(isInfrastructureFailureClass("none"), false);
+  assert.equal(isInfrastructureFailureClass(undefined), false);
+  // A green attempt always consumes budget, whatever its class says.
+  assert.equal(attemptConsumesBudget(green("cell")), true);
+  assert.equal(attemptConsumesBudget(red("cell", "harness:build_failed")), false);
+  assert.equal(attemptConsumesBudget(red("cell", "product:x")), true);
+});
+
+test("a harness failure spends no attempt, preserves the streak, and is counted separately", () => {
+  // The 2026-08-25 10:33-10:35Z pattern: one bad commit produced four
+  // harness:build_failed reds in 3 minutes and exhausted the cell's budget
+  // without ever measuring the product.
+  const manifest = manifestWith([
+    green("research-current-note"),
+    red("research-current-note", "harness:build_failed"),
+    red("research-current-note", "process:matrix_unclassified"),
+    green("research-current-note"),
+  ]);
+  assert.equal(consecutiveGreens(manifest, "research-current-note"), 2);
+  assert.equal(consumedAttemptCount(manifest, "research-current-note"), 2);
+  assert.equal(harnessFailureCount(manifest, "research-current-note"), 2);
+  // Other cells are untouched.
+  assert.equal(consumedAttemptCount(manifest, "vault-recall"), 0);
+  assert.equal(harnessFailureCount(manifest, "vault-recall"), 0);
+});
+
+test("a real red still consumes an attempt and resets the streak", () => {
+  const manifest = manifestWith([
+    green("vault-recall"),
+    red("vault-recall", "product:writeback_unproven"),
+    red("vault-recall", "model:refusal"),
+  ]);
+  assert.equal(consecutiveGreens(manifest, "vault-recall"), 0);
+  assert.equal(consumedAttemptCount(manifest, "vault-recall"), 3);
+  assert.equal(harnessFailureCount(manifest, "vault-recall"), 0);
+});
+
+test("more than six consecutive harness failures aborts; recovery resets the run", () => {
+  assert.equal(MAX_CONSECUTIVE_HARNESS_FAILURES, 6);
+  const sixDeaths = Array.from({ length: 6 }, () =>
+    red("code-delivery", "harness:build_failed"),
+  );
+  const atLimit = manifestWith(sixDeaths);
+  assert.equal(consecutiveHarnessFailures(atLimit, "code-delivery"), 6);
+  assert.ok(
+    consecutiveHarnessFailures(atLimit, "code-delivery") <=
+      MAX_CONSECUTIVE_HARNESS_FAILURES,
+    "six consecutive harness failures must not abort yet",
+  );
+  const seventh = manifestWith([
+    ...sixDeaths,
+    red("code-delivery", "harness:e2e_lock_timeout"),
+  ]);
+  assert.ok(
+    consecutiveHarnessFailures(seventh, "code-delivery") >
+      MAX_CONSECUTIVE_HARNESS_FAILURES,
+    "the seventh consecutive harness failure must trip the safety valve",
+  );
+  // A green (or real red) in between proves the harness recovered.
+  const recovered = manifestWith([
+    ...sixDeaths,
+    green("code-delivery"),
+    red("code-delivery", "harness:build_failed"),
+  ]);
+  assert.equal(consecutiveHarnessFailures(recovered, "code-delivery"), 1);
+  // Consecutive is per cell: another cell's runs do not extend the streak.
+  assert.equal(consecutiveHarnessFailures(seventh, "vault-recall"), 0);
+});
+
+test("two product sightings of the same class still abort the campaign", () => {
+  const manifest = manifestWith([]);
+  assert.equal(registerProductFailure(manifest, "product:writeback_unproven"), false);
+  assert.equal(registerProductFailure(manifest, "product:tool_menu_drift"), false);
+  assert.equal(registerProductFailure(manifest, "product:writeback_unproven"), true);
+  assert.deepEqual(manifest.productClassCounts, {
+    "product:writeback_unproven": 2,
+    "product:tool_menu_drift": 1,
+  });
+  // Harness and model classes never feed the product alarm.
+  assert.equal(registerProductFailure(manifest, "harness:build_failed"), false);
+  assert.equal(registerProductFailure(manifest, "model:refusal"), false);
+  assert.equal(Object.keys(manifest.productClassCounts).length, 2);
 });
 
 test("an empty scorecard harvest is not a matrix-stopping failure", () => {

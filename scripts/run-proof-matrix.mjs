@@ -3,7 +3,11 @@
 // Purpose: replace "one successful specimen" with consecutive-green evidence at
 // one exact HEAD. Each cell is one lane run through the sanctioned exclusive
 // runner (scripts/run-e2e-exclusive.mjs); a cell is DONE when it has recorded
-// the required number of CONSECUTIVE greens (a red resets the streak). The
+// the required number of CONSECUTIVE greens (a real red resets the streak).
+// Harness/process deaths (harness:*, process:*) are recorded for visibility
+// but neither spend attempt budget nor reset the streak — they measure the
+// harness, not the product; more than MAX_CONSECUTIVE_HARNESS_FAILURES of
+// them in a row for one cell aborts the campaign instead of looping. The
 // campaign fails fast when any `product:` failure class is seen twice — that is
 // a regression alarm, not a statistic.
 //
@@ -450,6 +454,7 @@ function loadManifest() {
       expectedHead: null,
       attempts: [],
       productClassCounts: {},
+      harnessFailureCounts: {},
     }
   );
 }
@@ -459,16 +464,75 @@ function saveManifest(manifest) {
   writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + "\n");
 }
 
-function consecutiveGreens(manifest, cellId) {
+/**
+ * Attempts exist to measure the PRODUCT. A death in the harness or the matrix
+ * process itself (harness:*, process:*) is not evidence about the product, so
+ * it must neither spend the cell's attempt budget nor reset its
+ * consecutive-green streak — on 2026-08-25 one bad commit burned a whole cell
+ * in 3 minutes as four harness:build_failed reds. Real reds (model:*,
+ * product:*, external:*) keep their full cost.
+ */
+export function isInfrastructureFailureClass(failureClass) {
+  return /^(?:harness|process):/u.test(String(failureClass ?? ""));
+}
+
+/** True when the attempt spends budget and can move the streak. */
+export function attemptConsumesBudget(attempt) {
+  return Boolean(attempt?.green) || !isInfrastructureFailureClass(attempt?.failureClass);
+}
+
+export function consecutiveGreens(manifest, cellId) {
   let streak = 0;
   for (const attempt of manifest.attempts) {
     if (attempt.cell !== cellId) continue;
-    streak = attempt.green ? streak + 1 : 0;
+    if (attempt.green) streak += 1;
+    else if (attemptConsumesBudget(attempt)) streak = 0;
+    // Infrastructure deaths leave the streak exactly where it was.
   }
   return streak;
 }
 
-function attemptCount(manifest, cellId) {
+export function consumedAttemptCount(manifest, cellId) {
+  return manifest.attempts.filter(
+    (attempt) => attempt.cell === cellId && attemptConsumesBudget(attempt),
+  ).length;
+}
+
+export function harnessFailureCount(manifest, cellId) {
+  return manifest.attempts.filter(
+    (attempt) => attempt.cell === cellId && !attemptConsumesBudget(attempt),
+  ).length;
+}
+
+/**
+ * Safety valve: budget-exempt harness failures must not let a persistently
+ * broken build loop forever. More than this many CONSECUTIVE harness/process
+ * failures for one cell aborts the campaign. A green or a real red resets the
+ * run — the harness demonstrably recovered.
+ */
+export const MAX_CONSECUTIVE_HARNESS_FAILURES = 6;
+
+export function consecutiveHarnessFailures(manifest, cellId) {
+  let run = 0;
+  for (const attempt of manifest.attempts) {
+    if (attempt.cell !== cellId) continue;
+    run = attemptConsumesBudget(attempt) ? 0 : run + 1;
+  }
+  return run;
+}
+
+/**
+ * Counts a product-class sighting and reports whether the campaign must stop
+ * (the same class seen twice is a regression alarm, not a statistic).
+ */
+export function registerProductFailure(manifest, failureClass) {
+  if (!String(failureClass ?? "").startsWith("product:")) return false;
+  manifest.productClassCounts[failureClass] =
+    (manifest.productClassCounts[failureClass] ?? 0) + 1;
+  return manifest.productClassCounts[failureClass] >= 2;
+}
+
+function totalAttemptCount(manifest, cellId) {
   return manifest.attempts.filter((attempt) => attempt.cell === cellId).length;
 }
 
@@ -517,7 +581,13 @@ async function main() {
   // HEAD must never satisfy this campaign's consecutive-green bar.
   const manifest = flag("--resume")
     ? loadManifest()
-    : { ...loadManifest(), startedAt: new Date().toISOString(), attempts: [], productClassCounts: {} };
+    : {
+        ...loadManifest(),
+        startedAt: new Date().toISOString(),
+        attempts: [],
+        productClassCounts: {},
+        harnessFailureCounts: {},
+      };
   if (flag("--resume") && manifest.expectedHead && manifest.expectedHead !== expectedHead) {
     fail(`manifest pins ${manifest.expectedHead}; refusing to resume at ${expectedHead}.`);
   }
@@ -526,9 +596,11 @@ async function main() {
   for (const cell of cells) {
     while (
       consecutiveGreens(manifest, cell.id) < cell.requiredGreens &&
-      attemptCount(manifest, cell.id) < cell.maxAttempts
+      consumedAttemptCount(manifest, cell.id) < cell.maxAttempts
     ) {
-      const attemptIndex = attemptCount(manifest, cell.id) + 1;
+      // Ordinal over ALL runs of this cell (harness deaths included) so stage
+      // labels and per-attempt log files never collide or overwrite.
+      const attemptIndex = totalAttemptCount(manifest, cell.id) + 1;
       const stage = `${cell.id}#${attemptIndex}`;
       assertExactCleanHead(expectedHead, `${stage} pre`);
       sweepTestVaultObsidianZombies(stage);
@@ -605,6 +677,12 @@ async function main() {
       const pctFailed = toolEvents.observed
         ? ((100 * toolEvents.failed) / toolEvents.observed).toFixed(1) + "%"
         : "";
+      const consumesBudget = green || !isInfrastructureFailureClass(failureClass);
+      const csvNotes = consumesBudget
+        ? `attempt ${consumedAttemptCount(manifest, cell.id) + 1}/${cell.maxAttempts}; ` +
+          `streak target ${cell.requiredGreens}`
+        : `harness failure ${harnessFailureCount(manifest, cell.id) + 1}; ` +
+          `attempt budget ${consumedAttemptCount(manifest, cell.id)}/${cell.maxAttempts} unspent; streak preserved`;
 
       appendRunCsvRow([
         new Date(startedAt).toISOString(),
@@ -628,7 +706,7 @@ async function main() {
         toolEvents.buckets.authority_grant_invalid || "",
         toolEvents.buckets.tool_failure_terminal || "",
         "proof-matrix",
-        `attempt ${attemptIndex}/${cell.maxAttempts}; streak target ${cell.requiredGreens}`,
+        csvNotes,
       ]);
 
       manifest.attempts.push({
@@ -649,16 +727,30 @@ async function main() {
         toolEvents,
       });
 
-      if (!green && failureClass.startsWith("product:")) {
-        manifest.productClassCounts[failureClass] =
-          (manifest.productClassCounts[failureClass] ?? 0) + 1;
-        if (manifest.productClassCounts[failureClass] >= 2) {
+      if (!consumesBudget) {
+        manifest.harnessFailureCounts = manifest.harnessFailureCounts ?? {};
+        manifest.harnessFailureCounts[cell.id] =
+          (manifest.harnessFailureCounts[cell.id] ?? 0) + 1;
+        console.log(
+          `proof-matrix[${stage}]: ${failureClass} is a harness death, not product evidence — ` +
+          `attempt budget stays ${consumedAttemptCount(manifest, cell.id)}/${cell.maxAttempts}, streak preserved.`,
+        );
+        if (consecutiveHarnessFailures(manifest, cell.id) > MAX_CONSECUTIVE_HARNESS_FAILURES) {
           saveManifest(manifest);
           fail(
-            `product failure class '${failureClass}' seen twice — regression alarm. ` +
-            "The matrix stops here; fix the product before resuming (--resume).",
+            `cell '${cell.id}' hit ${consecutiveHarnessFailures(manifest, cell.id)} consecutive ` +
+            `harness/process failures (> ${MAX_CONSECUTIVE_HARNESS_FAILURES}) — the build or harness is ` +
+            "persistently broken and budget-exempt retries would loop forever. Fix the harness at the pinned " +
+            "HEAD, then resume (--resume); no attempt budget was spent on these deaths.",
           );
         }
+      }
+      if (!green && registerProductFailure(manifest, failureClass)) {
+        saveManifest(manifest);
+        fail(
+          `product failure class '${failureClass}' seen twice — regression alarm. ` +
+          "The matrix stops here; fix the product before resuming (--resume).",
+        );
       }
       saveManifest(manifest);
 
