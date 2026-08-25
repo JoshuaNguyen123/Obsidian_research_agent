@@ -17,6 +17,10 @@ import {
   resolveAgentModelSlotV2,
 } from "./model/createModelClient";
 import {
+  isModelFallbackEnabled,
+  runModelFallbackOnce,
+} from "./model/modelFallback";
+import {
   runSpecialistRecoveryVerifier,
   summarizeTranscriptForWatchdog,
 } from "./orchestrator/watchdogWorker";
@@ -58,6 +62,10 @@ import {
   semanticCoverageSecondPassCopy,
   walReconcileFailureCopy,
 } from "./agent/failureCopy";
+import {
+  formatSegmentBudgetExhaustedCopy,
+  formatSegmentBudgetPrompt,
+} from "./agent/segmentBudgetPrompt";
 import type {
   AgentMissionMode,
   AgentRuntimeCache,
@@ -72,6 +80,7 @@ import type {
   VerifiedMermaidReadObservation,
   VerifiedWorkspaceReadObservation,
 } from "./tools/types";
+import { applyDiscriminativeToolDefinition } from "./tools/discriminativeToolDescriptions";
 import {
   FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
   resolveNestedApprovalBindingV1,
@@ -12198,16 +12207,17 @@ export async function runAgentMission({
           outputPreview: { maxToolCalls, observedToolCallCount },
         });
       }
+      const exhaustedCopy = formatSegmentBudgetExhaustedCopy();
       return {
         ok: false,
         toolName: toolCall.name,
         output: {
           status: "blocked",
-          reason: "Per-segment tool-call budget exhausted.",
+          reason: exhaustedCopy,
         },
         error: {
           code: "tool_call_budget_exhausted",
-          message: "Per-segment tool-call budget exhausted.",
+          message: exhaustedCopy,
         },
       };
     }
@@ -16776,6 +16786,7 @@ export async function runAgentMission({
     }
 
     lastStep = step;
+    let modelFallbackUsedThisStep = false;
     events.onStatus?.(`Agent step ${step} of max ${stepLimit}...`);
     events.onPhaseChange?.(
       "planning",
@@ -17711,6 +17722,7 @@ export async function runAgentMission({
       }
     }
     let response: ModelChatResponse;
+    let stepChatRequest: ModelChatRequest | undefined;
     try {
       const stageBudgetBlock =
         setLooseCompoundEnabled && compoundRunBudgetPlan
@@ -17894,8 +17906,15 @@ export async function runAgentMission({
           missionGraphSession?.graph ?? missionGraph,
         );
       noToolEscalationActive = false;
-      const stepChatRequest = buildChatRequest(
-        stepMessages,
+      const segmentBudgetPrompt = formatSegmentBudgetPrompt({
+        remainingToolCalls: Math.max(0, maxToolCalls - observedToolCallCount),
+        remainingModelCalls: Math.max(0, stepLimit - step + 1),
+      });
+      const stepChatRequestBuilt = buildChatRequest(
+        [
+          ...stepMessages,
+          { role: "system" as const, content: segmentBudgetPrompt },
+        ],
         stepTools,
         escalateThisStep ? false : activeThink,
         modelOptions,
@@ -17906,11 +17925,12 @@ export async function runAgentMission({
         exactRepairReceiptFrontier ||
         validationRecoveryFrontier
       ) {
-        stepChatRequest.toolChoice = "required";
+        stepChatRequestBuilt.toolChoice = "required";
       }
+      stepChatRequest = stepChatRequestBuilt;
       response = await chatForAgentStep(
         modelClient,
-        stepChatRequest,
+        stepChatRequestBuilt,
         events,
         step,
         disableThinkingForRun,
@@ -17920,8 +17940,85 @@ export async function runAgentMission({
       if (await stopIfRequested(step)) {
         return;
       }
-      await finishErroredRunFromException(error, step, stepLimit, "model");
-      return;
+      const fallbackSettings = runToolContext.settings;
+      const fallbackLead =
+        fallbackSettings
+          ? resolveAgentModelSlotV2(fallbackSettings, "lead")
+          : null;
+      const fallbackSpecialist =
+        fallbackSettings
+          ? resolveAgentModelSlotV2(fallbackSettings, "specialist")
+          : null;
+      const fallbackClient = specialistClientForRecovery;
+      const fallback =
+        fallbackLead &&
+        fallbackSpecialist &&
+        fallbackClient &&
+        stepChatRequest
+          ? await runModelFallbackOnce({
+              enabled: isModelFallbackEnabled(fallbackSettings),
+              alreadyUsed: modelFallbackUsedThisStep,
+              specialistAvailable: fallbackSpecialist.available,
+              primary: {
+                model: fallbackLead.slot.model,
+                provider: fallbackLead.slot.provider,
+                baseUrl: fallbackLead.slot.baseUrl,
+              },
+              specialist: {
+                model: fallbackSpecialist.slot.model,
+                provider: fallbackSpecialist.slot.provider,
+                baseUrl: fallbackSpecialist.slot.baseUrl,
+              },
+              error,
+              reissue: () => fallbackClient.chat(stepChatRequest!),
+            })
+          : { status: "skipped" as const, reason: "specialist_unavailable" as const };
+      if (fallback.status === "used") {
+        modelFallbackUsedThisStep = true;
+        response = fallback.value;
+        const fallbackNow = runToolContext.now?.() ?? new Date();
+        upsertMissionEvidenceRecord(missionEvidenceRecords, fallback.evidence);
+        events.onMissionEvidence?.(
+          toMissionEvidenceAttestation(fallback.evidence),
+        );
+        if (missionLedger) {
+          upsertLedgerEvidence(
+            missionLedger,
+            fallback.evidence,
+            fallbackNow,
+          );
+        }
+        if (missionPlan) {
+          missionPlan = {
+            ...missionPlan,
+            updatedAt: fallbackNow.toISOString(),
+            progress: {
+              ...missionPlan.progress,
+              lastMeaningfulAction: "model_fallback_used",
+            },
+          };
+          if (missionLedger) {
+            setLedgerMissionPlan(missionLedger, missionPlan, fallbackNow);
+          }
+        }
+        await persistMissionLedger(`model-fallback-${step}`);
+        events.onStatus?.(
+          "Primary model failed after retries; reissued once on the specialist model.",
+        );
+        events.onTrace?.({
+          id: `model-fallback-${step}`,
+          kind: "tool_result",
+          step,
+          message: "model_fallback_used",
+          outputPreview: {
+            primaryModel: fallbackLead?.slot.model,
+            specialistModel: fallbackSpecialist?.slot.model,
+          },
+        });
+      } else {
+        await finishErroredRunFromException(error, step, stepLimit, "model");
+        return;
+      }
     }
     if (compoundResearchClosureTurn && researchPlan) {
       researchPlan = {
@@ -20008,7 +20105,7 @@ export async function runAgentMission({
           "budget",
           lastStep,
           stepLimit,
-          "Per-segment tool-call budget exhausted; continue from the saved ledger.",
+          formatSegmentBudgetExhaustedCopy(),
         );
         return;
       }
@@ -22619,7 +22716,10 @@ function buildChatRequest(
 ): ModelChatRequest {
   return {
     messages,
-    tools: tools && tools.length > 0 ? tools : undefined,
+    tools:
+      tools && tools.length > 0
+        ? tools.map(applyDiscriminativeToolDefinition)
+        : undefined,
     think,
     options,
     abortSignal,
