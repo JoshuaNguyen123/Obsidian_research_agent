@@ -356,6 +356,148 @@ export function createMissionLedger({
   };
 }
 
+/**
+ * Route marker for a durable run anchor persisted at run start, BEFORE the
+ * structured router, reflex pass, planner, or mission-graph open produced any
+ * plan state. It is deliberately NOT a member of RunRoute: every
+ * resume-inheritance seat is gated on isRunRouteValue, so an anchor-only run
+ * inherits nothing and replans from its recorded mission prompt.
+ *
+ * This literal must exist in exactly one module. Both the writer (AgentRunner
+ * decides "what makes a run resumable from its first moment") and the resume
+ * path (missionResume decides "what do I accept, and how do I continue it")
+ * consume it through isPrePlanningAnchorLedger below; a second private copy is
+ * a second authority that will drift (guarded at source level by
+ * tests/runnerDurabilityIntegration.test.ts).
+ */
+export const PRE_PLANNING_ANCHOR_ROUTE = "accepted_pre_planning" as const;
+
+const PRE_PLANNING_ANCHOR_NEXT_ACTION =
+  "Planning had not begun when this run last persisted; continue by restarting the mission from its recorded prompt.";
+
+/**
+ * The one shared predicate for anchor-only runs. True only for a ledger whose
+ * durable state honestly records that planning never began: there is nothing
+ * to preserve besides the mission prompt, so `continue run <id>` restarts the
+ * mission from that prompt instead of refusing.
+ */
+export function isPrePlanningAnchorLedger(ledger: MissionLedger): boolean {
+  return ledger.route === PRE_PLANNING_ANCHOR_ROUTE;
+}
+
+/**
+ * Minimal durable anchor persisted the moment a run's identity is minted.
+ * Everything a resume gate needs is honest and knowable at run start: the run
+ * id, the verbatim mission prompt, the target note binding when already known,
+ * and an explicit marker (the anchor route + next action) that planning had
+ * not begun. Nothing is faked: the loop budget is all zeros because no budget
+ * was planned, and there are no tasks/evidence/receipts beyond the default
+ * placeholder task. The full mission ledger later evolves this SAME record in
+ * place (same runId, same Agent Runs file, monotonic revision) so the run's
+ * durable identity stays singular.
+ */
+export function createPrePlanningAnchorLedger({
+  runId,
+  mission,
+  targetNotePath,
+  now = new Date(),
+}: {
+  runId: string;
+  mission: string;
+  targetNotePath?: string | null;
+  now?: Date;
+}): MissionLedger {
+  const ledger = createMissionLedger({
+    runId,
+    mission,
+    route: PRE_PLANNING_ANCHOR_ROUTE,
+    loopBudget: {
+      hardCap: 0,
+      toolStepBudget: 0,
+      finalizationReserve: 0,
+      expectedTools: [],
+      stopWhenSatisfied: false,
+    },
+    now,
+  });
+  ledger.milestones = [
+    {
+      id: "milestone-1",
+      missionId: runId,
+      step: 0,
+      stage: "plan",
+      summary:
+        "Mission accepted; durable run anchor persisted before planning began.",
+      decision: PRE_PLANNING_ANCHOR_ROUTE,
+      toolCalls: [],
+      evidenceIds: [],
+      artifacts: targetNotePath ? [targetNotePath] : [],
+      nextAction: PRE_PLANNING_ANCHOR_NEXT_ACTION,
+      createdAt: now.toISOString(),
+    },
+  ];
+  ledger.nextActions = [PRE_PLANNING_ANCHOR_NEXT_ACTION];
+  return ledger;
+}
+
+/**
+ * Best-effort removal of an anchor artifact for a run that terminated
+ * GRACEFULLY before its full mission ledger ever superseded the anchor
+ * (direct-chat downgrades, pre-planning refusals, early errors). Those runs
+ * create no Agent Runs note today, and the anchor must not change that: it is
+ * pure crash insurance, and a graceful completion has already delivered its
+ * outcome through the normal channels. Deletion is double-guarded: it only
+ * ever touches a file whose persisted ledger both matches the exact runId and
+ * satisfies isPrePlanningAnchorLedger, so an evolved ledger can never be
+ * removed even if the caller's supersession tracking is wrong.
+ */
+export async function removePrePlanningAnchorArtifact(
+  context: ToolExecutionContext,
+  runId: string,
+): Promise<boolean> {
+  if (!hasLedgerVaultApi(context)) {
+    return false;
+  }
+  const vault = context.app.vault;
+  return withSerializedRunWrite(vault, runId, async () => {
+    const path = getMissionLedgerPath(runId);
+    const file = vault.getFileByPath(path);
+    if (!file) {
+      return false;
+    }
+    let ledger: MissionLedger | null = null;
+    try {
+      ledger = parseMissionLedgerFromMarkdown(await vault.read(file as TFile));
+    } catch {
+      return false;
+    }
+    if (
+      !ledger ||
+      ledger.runId !== runId ||
+      !isPrePlanningAnchorLedger(ledger)
+    ) {
+      return false;
+    }
+    const deletableVault = vault as unknown as {
+      delete?: (file: TFile, force?: boolean) => Promise<void>;
+      adapter?: { remove?: (path: string) => Promise<void> };
+    };
+    try {
+      if (typeof deletableVault.delete === "function") {
+        await deletableVault.delete(file as TFile, true);
+        return true;
+      }
+      if (typeof deletableVault.adapter?.remove === "function") {
+        await deletableVault.adapter.remove(path);
+        return true;
+      }
+    } catch {
+      // Best-effort: a stale anchor is preferable to a thrown completion.
+    }
+    return false;
+  });
+}
+
 export function addMissionMilestone(
   ledger: MissionLedger,
   input: Omit<MissionMilestone, "id" | "missionId" | "createdAt">,

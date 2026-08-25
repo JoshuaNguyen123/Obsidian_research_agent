@@ -309,7 +309,10 @@ import {
   escalateMissionEffortDecisionForResearchV1,
   type MissionEffortDecisionV1,
 } from "./agent/missionEffortDecision";
-import { classifyMissionSpeechAct } from "./agent/missionSpeechAct";
+import {
+  classifyMissionSpeechAct,
+  type ExecutionTier,
+} from "./agent/missionSpeechAct";
 import { canonicalizeKeywordTypos } from "./agent/promptNormalization";
 import {
   hasCodeDeliverableIntent,
@@ -540,7 +543,10 @@ import {
   addLedgerReceipt,
   addMissionMilestone,
   createMissionLedger,
+  createPrePlanningAnchorLedger,
+  isPrePlanningAnchorLedger,
   markLedgerResumeLoaded,
+  removePrePlanningAnchorArtifact,
   markLedgerToolUsed,
   addLedgerApproval,
   setLedgerDependencyStatus,
@@ -1966,6 +1972,23 @@ export async function runAgentMission({
     providedRunId?.trim() ||
     createAgentRunId(toolContext.now?.() ?? new Date());
   let missionLedger: MissionLedger | null = null;
+  // Durable pre-planning anchor lifecycle. `persisted` flips when the anchor
+  // write was initiated (a timed-out settle may still land, so it stays true);
+  // `superseded` flips the moment persistMissionLedger initiates the full
+  // ledger write into the same Agent Runs file. Declared before the events
+  // proxy below because onRunComplete consults them on every terminal path,
+  // including stops that fire before the anchor site executes.
+  let prePlanningAnchorPersisted = false;
+  let prePlanningAnchorSuperseded = false;
+  // Once a runtime-snapshot write has an ambiguous outcome, no later ledger or
+  // snapshot write may touch the same Agent Runs artifact in this process. A
+  // retry could race the original unresolved vault operation and overwrite a
+  // newer WAL state. Keep the first typed error so required callers fail with
+  // the original reconciliation evidence while terminal UI state can still be
+  // emitted without another persistence attempt. The synchronous stop path
+  // shares this circuit so cancellation cannot bypass it. Declared with the
+  // anchor flags above because the pre-router anchor seam consults it.
+  let runtimeSnapshotPersistenceBlockedError: unknown = null;
   const metricEvents: AgentRunMetricEvent[] = [];
   const autonomyRunStats = createAutonomyRunStats();
   const runStartedMs = Date.now();
@@ -1980,6 +2003,14 @@ export async function runAgentMission({
           // the next run starts with what this one learned. Fire-and-forget:
           // persistence is an optimization and must not delay completion.
           void persistToolOutcomeMemory();
+          // A GRACEFUL completion that never superseded the pre-planning
+          // anchor (direct-chat downgrade, pre-planning refusal or error)
+          // creates no Agent Runs note today; remove the crash-insurance
+          // anchor so that stays true. A hard kill never reaches this
+          // handler, which is exactly when the anchor must survive.
+          if (prePlanningAnchorPersisted && !prePlanningAnchorSuperseded) {
+            void removePrePlanningAnchorArtifact(toolContext, runId);
+          }
           const autonomyStats = finalizeAutonomyRunStats(autonomyRunStats, {
             elapsedMs: Date.now() - runStartedMs,
           });
@@ -2240,6 +2271,94 @@ export async function runAgentMission({
     hasActiveRoutedCodeExecution()
       ? getRoutedCodeWorkflowToolNames(activeIntentPrompt)
       : [];
+  // ---- Durable run anchor writer, shared by the two seams below: the
+  // symmetric half of the run-identity publication above. The anchor is the
+  // SAME Agent Runs record the full mission ledger evolves in place from
+  // mission-ledger-start onward, so the run's durable identity stays
+  // singular; until then it is the durable state that makes `continue run
+  // <id>` restart an interrupted mission from its recorded prompt instead of
+  // failing closed on an id the host was already showing as live.
+  const persistPrePlanningAnchor = async (
+    anchorMission: string,
+    anchorExecutionTier: ExecutionTier,
+    anchorContext: ToolExecutionContext,
+  ) => {
+    if (
+      prePlanningAnchorPersisted ||
+      forceChatOnly ||
+      anchorExecutionTier === "direct_chat" ||
+      runtimeSnapshotPersistenceBlockedError !== null
+    ) {
+      return;
+    }
+    let anchorTargetNotePath: string | null = null;
+    try {
+      const anchorNoteFile =
+        anchorContext.getCurrentMarkdownFile?.() ??
+        anchorContext.app.workspace.getActiveFile();
+      anchorTargetNotePath =
+        anchorNoteFile && typeof anchorNoteFile.path === "string"
+          ? anchorNoteFile.path
+          : null;
+    } catch {
+      anchorTargetNotePath = null;
+    }
+    prePlanningAnchorPersisted = true;
+    const anchorSettlement = await settleBounded(
+      writeMissionLedger(
+        anchorContext,
+        createPrePlanningAnchorLedger({
+          runId,
+          mission: anchorMission,
+          targetNotePath: anchorTargetNotePath,
+          now: anchorContext.now?.() ?? new Date(),
+        }),
+      ),
+      BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
+    );
+    if (anchorSettlement.kind === "rejected") {
+      prePlanningAnchorPersisted = false;
+      events.onTrace?.({
+        id: "durable-run-anchor:error",
+        kind: "error",
+        message: `Could not persist the durable run anchor: ${getUnknownErrorMessage(anchorSettlement.value)}`,
+        error: {
+          code: "durable_run_anchor_save_failed",
+          message: getUnknownErrorMessage(anchorSettlement.value),
+        },
+      });
+    } else if (
+      anchorSettlement.kind === "resolved" &&
+      anchorSettlement.value
+    ) {
+      events.onTrace?.({
+        id: "durable-run-anchor",
+        kind: "status",
+        path: anchorSettlement.value.path,
+        message: `Persisted durable run anchor to ${anchorSettlement.value.path}; run ${runId} is resumable before planning begins.`,
+      });
+    }
+  };
+  // Seam 1 — every non-continuation mission, BEFORE the structured router
+  // (capped at MAX_STRUCTURED_PLANNING_TIMEOUT_MS), the reflex pass, the
+  // planner, and the mission-graph open spend their bounded-but-long model
+  // budgets: a mission killed inside its first ~90 seconds must already be
+  // durable. The awaited write is one small vault file, so the first model
+  // call is not delayed materially. Continuation prompts wait for seam 2:
+  // their anchor must record the RESTORED mission (not the raw continue
+  // command), the refusal paths must exit artifact-free, and an id-less
+  // "continue" scans for the LATEST non-terminal ledger — which a pre-router
+  // anchor write would satisfy with this very segment's own record.
+  if (
+    !hasCheckpointResumeIntent(prompt) &&
+    !hasCheckpointResumeIntent(activeIntentPrompt)
+  ) {
+    await persistPrePlanningAnchor(
+      activeIntentPrompt,
+      speechActClassification.executionTier,
+      toolContext,
+    );
+  }
   if (
     modelRouterMode !== "off" &&
     (speechActClassification.executionTier !== "direct_chat" ||
@@ -3294,14 +3413,6 @@ export async function runAgentMission({
   let missionGraphSession: MissionGraphSession | null = null;
   let legacyCompositeAppendReconciled = false;
   let backgroundDispatchSummary: BackgroundMissionDispatchSummaryV1 | null = null;
-  // Once a runtime-snapshot write has an ambiguous outcome, no later ledger or
-  // snapshot write may touch the same Agent Runs artifact in this process. A
-  // retry could race the original unresolved vault operation and overwrite a
-  // newer WAL state. Keep the first typed error so required callers fail with
-  // the original reconciliation evidence while terminal UI state can still be
-  // emitted without another persistence attempt. The synchronous stop path
-  // shares this circuit so cancellation cannot bypass it.
-  let runtimeSnapshotPersistenceBlockedError: unknown = null;
   let currentNoteContext: unknown = null;
   let researchPlan: ResearchPlan | null = null;
   // Research plan built during mission-graph bootstrap, reused by the main
@@ -3539,6 +3650,20 @@ export async function runAgentMission({
   }
   const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
   const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
+  if (resumeLedger && isPrePlanningAnchorLedger(resumeLedger)) {
+    // Anchor-only continuation: the interrupted run persisted its durable
+    // anchor but planning never began, so there is nothing to preserve
+    // besides the recorded mission prompt. The shared predicate (not a
+    // second route comparison) decides this; the route-inheritance seats
+    // below already skip the anchor because its route is not a RunRoute.
+    events.onTrace?.({
+      id: "mission-ledger-resume:pre-planning-anchor",
+      kind: "status",
+      message:
+        `Run ${resumeLedger.runId} was interrupted before planning began; ` +
+        "restarting the mission from its recorded prompt.",
+    });
+  }
   let receiptBackedResumeOutputTargetPath: string | null = null;
   runToolContext = {
     ...runToolContext,
@@ -3789,6 +3914,21 @@ export async function runAgentMission({
   }
   const resumedOriginalMission =
     resumeSnapshot?.originalMission ?? resumeLedger?.mission;
+  // Seam 2 — continuation segments only (seam 1, before the structured
+  // router, already anchored every non-continuation mission and the
+  // persisted-flag guard makes this a no-op for them). It sits after the
+  // resume-context block on purpose: the refusals above must exit
+  // artifact-free, an id-less "continue" scans for the LATEST non-terminal
+  // ledger — which an earlier anchor write would satisfy with this very
+  // segment's own record — and the anchor must record the RESTORED mission,
+  // not the raw continue command.
+  await persistPrePlanningAnchor(
+    resumedOriginalMission ?? activeIntentPrompt,
+    resumedOriginalMission
+      ? classifyMissionSpeechAct(resumedOriginalMission).executionTier
+      : speechActClassification.executionTier,
+    runToolContext,
+  );
   if (resumedOriginalMission) {
     activeIntentPrompt = resumedOriginalMission;
     speechActClassification = classifyMissionSpeechAct(activeIntentPrompt);
@@ -4039,7 +4179,11 @@ export async function runAgentMission({
         `resume_original_route:${resumeLedger?.route ?? runPlan.route}`,
       ]),
     ];
-    if (resumeLedger) {
+    // A pre-planning anchor honestly records that NO loop budget was ever
+    // planned (all zeros); inheriting it would strand the restarted mission
+    // at maxToolCalls=0. The shared predicate skips inheritance so the
+    // segment replans its budget from the recorded mission prompt.
+    if (resumeLedger && !isPrePlanningAnchorLedger(resumeLedger)) {
       const resumeHardCap = Math.max(
         1,
         Math.min(
@@ -5651,7 +5795,11 @@ export async function runAgentMission({
       stopWhenSatisfied: true,
     };
   }
-  if (resumeLedger) {
+  // A pre-planning anchor honestly records that NO loop budget was ever
+  // planned (all zeros); inheriting it would strand the restarted mission at
+  // a zero tool-step budget. The shared predicate skips inheritance so the
+  // segment replans its budget from the recorded mission prompt.
+  if (resumeLedger && !isPrePlanningAnchorLedger(resumeLedger)) {
     const configuredCap = getConfiguredMaxAgentSteps(runToolContext.settings);
     const inheritedHardCap = Math.max(
       1,
@@ -7387,6 +7535,11 @@ export async function runAgentMission({
     if (latestOrchestrator) {
       missionLedger.orchestrator = latestOrchestrator;
     }
+    // The full mission ledger evolves the pre-planning anchor's Agent Runs
+    // record in place (same runId, same file). From the moment this write is
+    // initiated the anchor is no longer removable state — even a timed-out
+    // settle may still land, so the flag flips before the attempt.
+    prePlanningAnchorSuperseded = true;
     try {
       const ledgerSettlement = await settleBounded(
         writeMissionLedger(runToolContext, missionLedger),

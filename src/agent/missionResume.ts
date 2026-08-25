@@ -1,4 +1,5 @@
 import {
+  isPrePlanningAnchorLedger,
   isUserDismissedMissionLedger,
   readLatestMissionLedger,
   readMissionLedgerByRunId,
@@ -137,6 +138,11 @@ export function buildMissionResumePlan(ledger: MissionLedger): MissionResumePlan
         ? "user_dismissed"
       : proofDebt.resumeBlocked
         ? "proof_debt_blocked"
+      : isPrePlanningAnchorLedger(ledger)
+        // The run persisted its durable anchor but was interrupted before
+        // planning began: nothing exists to preserve besides the recorded
+        // mission prompt, so the continuation restarts the mission from it.
+        ? "pre_planning_anchor_restart"
       : !proofDebt.empty
         ? "proof_debt_has_remaining_work"
       : ledger.blockers.length > 0
@@ -272,6 +278,11 @@ export function formatLedgerForModel(
     "Use this ledger only if it matches the user's requested continuation.",
     "Do not persist this ledger text into chat history.",
     "Resume only unpaid proof debt; do not reopen completed research subquestions.",
+    ...(isPrePlanningAnchorLedger(ledger)
+      ? [
+          "This run was interrupted before planning began: the ledger is a durable pre-planning anchor. Restart the mission from the recorded mission prompt below; there is no partial work to preserve or replay.",
+        ]
+      : []),
     `Ledger path: ${path}`,
     `Run id: ${ledger.runId}`,
     `Mission: ${ledger.mission}`,
