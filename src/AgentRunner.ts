@@ -329,6 +329,8 @@ import {
   deriveAutonomyScope,
   extractExplicitNewWorkspaceFilePaths,
   extractExplicitVaultReadFilePaths,
+  currentNoteAppendCatalogEligible,
+  currentNoteReplaceCatalogEligible,
   extractExplicitWorkspaceReadFilePaths,
   extractExplicitWorkspaceWriteExpectedFilePaths,
   extractMarkdownPathMentions,
@@ -713,6 +715,7 @@ import {
   isWholeNoteEditIntent,
   missingIncludesWriteReceipt,
   prefersStreamedReplaceForEditOrganize,
+  receiptReportsAffirmativeZeroDelta,
 } from "./agent/editOrganizeIntent";
 
 import {
@@ -26339,10 +26342,12 @@ export function constrainSetLooseCompanionsToAutonomyScope(
       return vaultReadAuthorized;
     }
     if (toolName === "append_to_current_file") {
-      return scope.write.currentNote;
+      // Shared catalog predicate — both AgentRunner sites must agree, or a
+      // blocked append can point at a replace that was never offered.
+      return currentNoteAppendCatalogEligible(scope);
     }
     if (toolName === "replace_current_file") {
-      return scope.destructive.replaceCurrentNote;
+      return currentNoteReplaceCatalogEligible(scope);
     }
     return true;
   });
@@ -27183,7 +27188,9 @@ function isToolWithinAutonomyScope(
   }
 
   if (name === "replace_current_file") {
-    return scope.destructive.replaceCurrentNote;
+    // Shared catalog predicate — both AgentRunner sites must agree, or a
+    // blocked append can point at a replace that was never offered.
+    return currentNoteReplaceCatalogEligible(scope);
   }
 
   if (name === "delete_current_file") {
@@ -27205,11 +27212,7 @@ function isToolWithinAutonomyScope(
     name === "retitle_current_file" ||
     name === "link_related_notes_in_current_file"
   ) {
-    return (
-      scope.write.currentNote ||
-      scope.destructive.replaceCurrentNote ||
-      scope.destructive.deleteCurrentNote
-    );
+    return currentNoteAppendCatalogEligible(scope);
   }
 
   return true;
@@ -31346,7 +31349,7 @@ function buildDescriptorResourceRef(
   };
 }
 
-function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
+export function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
   return receipts.some((receipt) => {
     if (
       ["read", "list", "search", "validate"].includes(receipt.operation)
@@ -31354,7 +31357,13 @@ function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
       return false;
     }
     if (!receipt.resource) return Boolean(receipt.path);
-    if (receipt.resource.system === "vault") return true;
+    if (receipt.resource.system === "vault") {
+      // A vault receipt only proves real work when it does not AFFIRMATIVELY
+      // report a zero delta (effects.changed === false, commitKind "no_op",
+      // or all carried delta fields zero/false). Legacy receipts without any
+      // delta fields still pass. Shared predicate — do not re-inline.
+      return !receiptReportsAffirmativeZeroDelta(receipt);
+    }
     if (
       receipt.resource.system === "workspace" ||
       receipt.resource.system === "git"
@@ -31680,6 +31689,9 @@ function buildReceipt(
     messageParts.push(`matches: ${matchCount}`);
   }
 
+  const changed =
+    typeof output.changed === "boolean" ? output.changed : undefined;
+
   return {
     toolName,
     operation,
@@ -31691,6 +31703,12 @@ function buildReceipt(
     bytesDeleted,
     affectedCount: affectedCount ?? matchCount,
     readback,
+    // Tools that verify their own delta report it; an unchanged outcome is
+    // an honest no-op receipt, not proof of work.
+    ...(changed !== undefined
+      ? { effects: { bytesWritten, bytesDeleted, affectedCount, changed } }
+      : {}),
+    ...(changed === false ? { commitKind: "no_op" as const } : {}),
     output,
     message: messageParts.join("; "),
   };
@@ -32122,11 +32140,13 @@ function parseLegacyReceiptReadback(
   }
   const observedRevision = getString(value.observedRevision);
   const observedFingerprint = getString(value.observedFingerprint);
+  const priorRevision = getString(value.priorRevision);
   return {
     status,
     checkedAt,
     ...(observedRevision ? { observedRevision } : {}),
     ...(observedFingerprint ? { observedFingerprint } : {}),
+    ...(priorRevision ? { priorRevision } : {}),
   };
 }
 
@@ -33695,6 +33715,9 @@ async function createStreamingNoteWriter({
     );
   };
   let baseContent = kind === "append" ? makeAppendBase(current) : "";
+  // Prior note content at writer creation, so the final receipt can carry a
+  // priorRevision fingerprint distinguishing overwrites from fresh notes.
+  const initialContentSnapshot = current;
   let baseContentChanged = false;
   let leadingTitleBuffer: string | null = kind === "edit" ? null : "";
   let extractedLeadingTitle: string | null = null;
@@ -34010,8 +34033,20 @@ async function createStreamingNoteWriter({
       const resolvedPath = file?.path ?? lazyCreatePath ?? "unknown";
       const operation =
         kind === "append" ? "append" : kind === "replace" ? "replace" : "edit";
+      // For a section edit the delta is the streamed section body, not the
+      // rendered whole document — a whole-document byte count would make a
+      // one-line section edit look like a full-note rewrite.
       const bytesWritten =
-        kind === "append" ? getByteLength(streamedContent) : getByteLength(render());
+        kind === "append"
+          ? getByteLength(streamedContent)
+          : kind === "edit"
+            ? getByteLength(
+                formatStreamingSectionBody(
+                  streamedContent,
+                  section?.suffix ?? "",
+                ),
+              )
+            : getByteLength(render());
       const target = await ensureFile();
       const expectedContent = render();
       const observedContent = await toolContext.app.vault.read(target);
@@ -34029,6 +34064,9 @@ async function createStreamingNoteWriter({
           content: observedContent,
         }),
         observedFingerprint: hashOperationInput(observedContent),
+        // Prior note fingerprint beside the observed one: overwrite vs
+        // fresh-note vs no-op stays reconstructable from the receipt alone.
+        priorRevision: hashOperationInput(initialContentSnapshot),
       };
       const output = {
         path: resolvedPath,

@@ -168,18 +168,22 @@ export interface ActionReceipt {
   providerRequestId?: string;
   startedAt: string;
   committedAt: string;
-  commitKind: "committed" | "reconciled";
+  commitKind: "committed" | "reconciled" | "no_op";
   readback: {
     status: "verified" | "not_required";
     checkedAt: string;
     observedRevision?: string;
     observedFingerprint?: string;
+    /** Revision/fingerprint of the resource BEFORE the write, so no-ops and overwrites are distinguishable. */
+    priorRevision?: string;
   };
   effects?: {
     bytesWritten?: number;
     bytesDeleted?: number;
     affectedCount?: number;
     changedFields?: string[];
+    /** Affirmative delta signal: false means the tool verified it changed nothing. */
+    changed?: boolean;
   };
 }
 

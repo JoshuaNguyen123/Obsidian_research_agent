@@ -78,6 +78,39 @@ test("assertSafe rejects catastrophic short replace", () => {
   );
 });
 
+test("assertSafe rejects an empty replace as a wipe, even with destructive intent", () => {
+  // An empty replacement destroys the whole note while reporting a
+  // successful write; it must fail closed regardless of intent flags.
+  assert.throws(
+    () =>
+      assertSafeCurrentNoteWritePayload({
+        kind: "replace",
+        text: "",
+        currentContent: "A real note body.",
+      }),
+    /wipe/i,
+  );
+  assert.throws(
+    () =>
+      assertSafeCurrentNoteWritePayload({
+        kind: "replace",
+        text: "   \n\t",
+        currentContent: "A real note body.",
+        allowDestructiveShortReplace: true,
+      }),
+    /wipe/i,
+  );
+});
+
+test("assertSafe still allows an intentional short destructive replace with content", () => {
+  assertSafeCurrentNoteWritePayload({
+    kind: "replace",
+    text: "Cleared. Fresh start below.",
+    currentContent: "y".repeat(3000),
+    allowDestructiveShortReplace: true,
+  });
+});
+
 test("append guard strips an exact repeated current-note prefix", () => {
   const current = [
     "Project brief",

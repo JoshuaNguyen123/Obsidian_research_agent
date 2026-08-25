@@ -6,6 +6,7 @@ import {
   requiresVaultEvidenceProof,
   requiresWebEvidenceProof,
 } from "./evidenceIntent";
+import { receiptReportsAffirmativeZeroDelta } from "./editOrganizeIntent";
 import type { RunPlanDecision } from "./runPlan";
 
 export type MissionPlanStatus =
@@ -98,12 +99,22 @@ export interface MissionReceiptProofLike {
   toolName?: string;
   operation?: string;
   affectedCount?: number;
+  bytesWritten?: number;
+  bytesDeleted?: number;
+  commitKind?: string;
   path?: string;
   resource?: {
     system?: string;
     resourceType?: string;
     id?: string;
   };
+  effects?: {
+    bytesWritten?: number;
+    bytesDeleted?: number;
+    affectedCount?: number;
+    changed?: boolean;
+  };
+  output?: unknown;
 }
 
 export interface MissionPlanProgress {
@@ -879,7 +890,11 @@ export function receiptSatisfiesProof(
         !isRenameTool(toolName) &&
         !isHighlightTool(toolName) &&
         !isArtifactTool(toolName) &&
-        (isGenericWriteTool(toolName) || isGenericWriteOperation(operation))
+        (isGenericWriteTool(toolName) || isGenericWriteOperation(operation)) &&
+        // A vault receipt that affirmatively reports a zero delta is a
+        // vacuous success, not write proof. Shared predicate — do not
+        // re-inline the delta rule.
+        !receiptReportsAffirmativeZeroDelta(receipt)
       );
     default:
       return false;

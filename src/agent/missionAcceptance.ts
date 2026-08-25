@@ -19,6 +19,7 @@ import {
   WRITE_RECEIPT_MISSING,
   isCurrentNoteEditOrganizeIntent,
   isVaultWideOrganizeIntent,
+  receiptReportsAffirmativeZeroDelta,
   receiptsSatisfyWriteProof,
 } from "./editOrganizeIntent";
 import { receiptSatisfiesProof } from "./missionPlan";
@@ -61,6 +62,12 @@ export interface MissionAcceptanceReceiptLike {
   };
   readback?: {
     status?: string;
+  };
+  effects?: {
+    bytesWritten?: number;
+    bytesDeleted?: number;
+    affectedCount?: number;
+    changed?: boolean;
   };
   output?: unknown;
 }
@@ -202,9 +209,24 @@ export function evaluateMissionAcceptance(
     };
   }
 
+  // A vault write receipt that AFFIRMATIVELY reports a zero delta (the tool
+  // ran but changed nothing) is a retryable dead-end, not a terminal failure:
+  // write_receipt stays listed as missing — the vacuous success is detectable
+  // — but the run gets another attempt instead of hard-failing like the
+  // no-receipt-at-all case does.
+  const writeProofFailedOnVacuousReceiptOnly =
+    missing.has(WRITE_RECEIPT_MISSING) &&
+    input.receipts.some(
+      (receipt) =>
+        (!receipt.resource || receipt.resource.system === "vault") &&
+        typeof receipt.path === "string" &&
+        receipt.path.trim().length > 0 &&
+        receiptReportsAffirmativeZeroDelta(receipt),
+    );
   const hardFailure = missingList.some(
     (item) =>
-      item === WRITE_RECEIPT_MISSING ||
+      (item === WRITE_RECEIPT_MISSING &&
+        !writeProofFailedOnVacuousReceiptOnly) ||
       item.startsWith("failed_goal:") ||
       item === "final_output",
   );

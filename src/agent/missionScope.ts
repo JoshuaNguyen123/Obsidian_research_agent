@@ -209,6 +209,43 @@ export function hasExplicitNoVaultReadIntent(prompt: string): boolean {
     );
 }
 
+/**
+ * THE catalog-eligibility predicate for `replace_current_file`.
+ *
+ * Governing rule: every subsystem that decides whether replace is offered —
+ * the set-loose companion filter, the autonomy-scope tool filter, and the
+ * append cross-gate that defers to replace — must call THIS predicate. Two
+ * private approximations of "is replace available" is the empty-contract
+ * dead-end: append fails closed telling the model to use replace while
+ * replace was never cataloged, leaving zero write paths.
+ */
+export function currentNoteReplaceCatalogEligible(
+  scope: AutonomyScope,
+): boolean {
+  return scope.destructive.replaceCurrentNote;
+}
+
+/**
+ * THE catalog-eligibility predicate for `append_to_current_file` (and its
+ * current-note companions). Destructive replace/delete authority subsumes
+ * append authority: a mission allowed to overwrite or delete the note may
+ * also append to it, so append survives as the non-destructive fallback and
+ * a replace-authorized run can never end up with zero write paths.
+ *
+ * Governing rule: both AgentRunner catalog sites must consume this one
+ * predicate — see currentNoteReplaceCatalogEligible for why re-inlining it
+ * is forbidden.
+ */
+export function currentNoteAppendCatalogEligible(
+  scope: AutonomyScope,
+): boolean {
+  return (
+    scope.write.currentNote ||
+    scope.destructive.replaceCurrentNote ||
+    scope.destructive.deleteCurrentNote
+  );
+}
+
 export function isBroadUnscopedVaultMutation(scope: AutonomyScope): boolean {
   const hasWriteTarget =
     scope.write.currentNote ||

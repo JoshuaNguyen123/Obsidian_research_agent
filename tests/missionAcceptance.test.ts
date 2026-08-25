@@ -6,6 +6,7 @@ import {
   type MissionAcceptanceReceiptLike,
 } from "../src/agent/missionAcceptance";
 import type { SetLooseDeliveryReceiptLikeV1 } from "../src/agent/setLooseCompoundAutonomy";
+import { WRITE_RECEIPT_MISSING } from "../src/agent/editOrganizeIntent";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
 import type { MissionIntent } from "../src/tools/types";
 import type { ResearchPlan } from "../src/agent/researchPlan";
@@ -657,7 +658,57 @@ test("highlight missions require a highlight receipt with matches", () => {
 
   assert.equal(result.status, "needs_more_work");
   assert.ok(result.missing.includes("highlight_receipt"));
+  // The zero-match receipt is an affirmative zero delta: it no longer counts
+  // as write proof, so write_receipt is detectably missing — but because the
+  // tool ran (vacuous success, not absence), the run stays retryable instead
+  // of hard-failing.
+  assert.ok(result.missing.includes(WRITE_RECEIPT_MISSING));
   assert.equal(result.nextAction, "Highlight the requested phrase in the current note and produce a receipt.");
+});
+
+test("write-required missions distinguish vacuous zero-delta receipts (retry) from absent receipts (fail)", () => {
+  const base = {
+    prompt: "Fix the typo in this note.",
+    missionIntent: { ...baseIntent, requireWriteCompletion: true },
+    requiredTools: ["edit_current_section"],
+    successfulTools: ["edit_current_section"],
+    failedTools: [],
+    evidence: [],
+    operationGoals: {},
+    finalOutput: "Done.",
+  };
+
+  const vacuous = evaluateMissionAcceptance({
+    ...base,
+    receipts: [
+      {
+        toolName: "edit_current_section",
+        operation: "edit",
+        path: "Note.md",
+        effects: { changed: false },
+      },
+    ],
+  });
+  assert.equal(vacuous.status, "needs_more_work");
+  assert.ok(vacuous.missing.includes(WRITE_RECEIPT_MISSING));
+
+  const absent = evaluateMissionAcceptance({ ...base, receipts: [] });
+  assert.equal(absent.status, "fail");
+  assert.ok(absent.missing.includes(WRITE_RECEIPT_MISSING));
+
+  const real = evaluateMissionAcceptance({
+    ...base,
+    receipts: [
+      {
+        toolName: "edit_current_section",
+        operation: "edit",
+        path: "Note.md",
+        bytesWritten: 24,
+        effects: { changed: true },
+      },
+    ],
+  });
+  assert.equal(real.status, "pass");
 });
 
 test("mission acceptance correction names missing tools that are still available", () => {

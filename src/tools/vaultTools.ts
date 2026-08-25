@@ -27,6 +27,7 @@ import {
   type ToolExecutionContext,
 } from "./types";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "../agent/replaceIntent";
+import { currentNoteReplaceCatalogEligible } from "../agent/missionScope";
 import {
   assertSafeCurrentNoteWritePayload,
   stripRepeatedCurrentNotePrefixFromAppend,
@@ -1504,7 +1505,9 @@ export const seedDefaultTemplatesTool: AgentTool = {
 
     return {
       path: templateFolder,
-      operation: "create",
+      // Seeding into an already-seeded folder creates nothing; say so
+      // instead of reporting a "create" that wrote zero templates.
+      operation: createdTemplates.length ? "create" : "no_op",
       templateFolder,
       createdTemplates,
       skippedExisting,
@@ -2270,10 +2273,18 @@ export const appendToCurrentFileTool: AgentTool = {
     });
     // Revision missions must not "append" process talk or a second draft when
     // whole-note replace is the authorized path — fail closed instead of
-    // polluting / appearing to wipe the page.
+    // polluting / appearing to wipe the page. The gate may only defer to
+    // replace when replace is actually catalog-eligible under the SAME scope
+    // predicate the catalog consults (currentNoteReplaceCatalogEligible);
+    // otherwise blocking append here leaves the mission with ZERO write
+    // paths. When no mission scope is attached (legacy hosts), the historic
+    // block is preserved.
+    const appendCrossGateScope = context.missionIntent?.autonomyScope;
     if (
       hasAuthorizedCurrentNoteReplaceIntent(context.originalPrompt) &&
-      current.trim().length >= 400
+      current.trim().length >= 400 &&
+      (!appendCrossGateScope ||
+        currentNoteReplaceCatalogEligible(appendCrossGateScope))
     ) {
       throw new Error(
         "append_to_current_file is blocked for this revise/replace mission. Use replace_current_file with the full revised note body.",
@@ -2564,17 +2575,41 @@ export const editCurrentSectionTool: AgentTool = {
     const file = getActiveMarkdownFile(context);
     const current = await context.app.vault.read(file);
     const edit = replaceMarkdownSection(current, { heading, level, content });
+    const changed = edit.updated !== current;
+    const priorRevision = await sha256Fingerprint(current);
     const backupPath = await backupCurrentFile(context, file, current);
 
-    await context.app.vault.modify(file, edit.updated);
+    if (changed) {
+      await context.app.vault.modify(file, edit.updated);
+    }
+    const observed = await context.app.vault.read(file);
+    if (observed !== edit.updated) {
+      throw new ToolExecutionError(
+        "vault_readback_failed",
+        `Vault section edit acknowledged, but exact readback did not match: ${file.path}.`,
+        { mutationState: "may_have_applied" },
+      );
+    }
+    const checkedAt = (context.now?.() ?? new Date()).toISOString();
+    const observedFingerprint = await sha256Fingerprint(observed);
 
     return {
       path: file.path,
       backupPath,
       heading,
       level: edit.level,
-      bytesWritten: getByteLength(edit.updated),
+      // The delta is the new section body, not the rendered whole document:
+      // a receipt claiming the full note length would overstate the write.
+      bytesWritten: changed ? getByteLength(content) : 0,
       replacedChars: edit.replacedChars,
+      changed,
+      readback: {
+        status: "verified",
+        checkedAt,
+        observedRevision: observedFingerprint,
+        observedFingerprint,
+        priorRevision,
+      },
     };
   },
 };
@@ -2605,6 +2640,21 @@ export const restoreCurrentFileFromBackupTool: AgentTool = {
       context.getCurrentMarkdownContent?.(file) ??
       (await context.app.vault.read(file));
     const restored = await readBackupMarkdown(context, backupPath);
+    const changed = restored !== current;
+
+    if (!changed) {
+      // The note already matches the backup: writing would only churn the
+      // vault and leave a pre-restore backup identical to the note. Report
+      // an honest no-op instead of a vacuous restore.
+      return {
+        path: file.path,
+        operation: "restore",
+        restoredFromBackupPath: backupPath,
+        bytesWritten: 0,
+        changed: false,
+      };
+    }
+
     const preRestoreBackupPath = await backupCurrentFile(context, file, current);
     context.setCurrentMarkdownContent?.(file, restored);
     await context.app.vault.modify(file, restored);
@@ -2615,6 +2665,7 @@ export const restoreCurrentFileFromBackupTool: AgentTool = {
       restoredFromBackupPath: backupPath,
       backupPath: preRestoreBackupPath,
       bytesWritten: getByteLength(restored),
+      changed: true,
     };
   },
 };
@@ -5148,11 +5199,15 @@ async function executePreparedReplaceCurrentFile(
   }
   const committedAt = vaultNow(context).toISOString();
   const bytesWritten = getByteLength(text);
+  // A replace destroys the prior content in full; carrying its byte length
+  // keeps wipes distinguishable from no-ops in the durable record.
+  const bytesDeleted = getByteLength(current);
   return {
     output: {
       path: file.path,
       backupPath,
       bytesWritten,
+      bytesDeleted,
     },
     mutationState: "applied",
     receipt: await createVaultActionReceipt({
@@ -5162,7 +5217,7 @@ async function executePreparedReplaceCurrentFile(
       message: `Replaced ${file.path} after backup.`,
       startedAt,
       committedAt,
-      effects: { bytesWritten },
+      effects: { bytesWritten, bytesDeleted },
       observedRevision: await sha256Fingerprint(observed),
     }),
   };
@@ -5180,6 +5235,15 @@ async function prepareReplaceFile(
     const text = getString(args, "text");
     const file = getMarkdownFileByPath(context, path);
     const current = await context.app.vault.read(file);
+    assertSafeCurrentNoteWritePayload({
+      kind: "replace",
+      text,
+      currentContent: current,
+      allowDestructiveShortReplace:
+        /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
+          context.originalPrompt,
+        ),
+    });
     const contentRevision = await sha256Fingerprint(current);
     const outboundBytes = getByteLength(text);
     const action = await buildPreparedVaultAction({
@@ -5230,6 +5294,15 @@ async function executePreparedReplaceFile(
   const file = getMarkdownFileByPath(context, path);
   const current = await context.app.vault.read(file);
   await assertVaultContentRevision(current, action, contentRevision);
+  assertSafeCurrentNoteWritePayload({
+    kind: "replace",
+    text,
+    currentContent: current,
+    allowDestructiveShortReplace:
+      /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
+        context.originalPrompt,
+      ),
+  });
   const startedAt = vaultNow(context).toISOString();
   const backupPath = await backupCurrentFile(context, file, current);
   await context.app.vault.modify(file, text);
@@ -5243,12 +5316,16 @@ async function executePreparedReplaceFile(
   }
   const committedAt = vaultNow(context).toISOString();
   const bytesWritten = getByteLength(text);
+  // A replace destroys the prior content in full; carrying its byte length
+  // keeps wipes distinguishable from no-ops in the durable record.
+  const bytesDeleted = getByteLength(current);
   return {
     output: {
       path: file.path,
       operation: "replace",
       backupPath,
       bytesWritten,
+      bytesDeleted,
     },
     mutationState: "applied",
     receipt: await createVaultActionReceipt({
@@ -5258,7 +5335,7 @@ async function executePreparedReplaceFile(
       message: `Replaced ${file.path} after backup.`,
       startedAt,
       committedAt,
-      effects: { bytesWritten },
+      effects: { bytesWritten, bytesDeleted },
       observedRevision: await sha256Fingerprint(observed),
     }),
   };

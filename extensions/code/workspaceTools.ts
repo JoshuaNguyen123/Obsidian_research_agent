@@ -630,6 +630,7 @@ class WorkspaceToolRuntimeV2 {
       await assertMissing(this.manager, workspaceId, destinationPath);
     }
     let result: WorkspaceMutationReceiptV2;
+    let commitKind: ActionReceiptV1["commitKind"] = "committed";
     if (name === "code_workspace_mkdir") {
       assertPayloadBytes(args, 0);
       result = await this.manager.mkdir(workspaceId, leaseId, targetPath);
@@ -648,7 +649,8 @@ class WorkspaceToolRuntimeV2 {
           );
         }
         assertPayloadBytes(args, 0);
-        result = await reconciliationMutationReceipt(this.manager, manifest, name, targetPath, undefined, expectedAfter);
+        result = await reconciliationMutationReceipt(this.manager, manifest, name, targetPath, undefined, expectedAfter, expectedBefore);
+        commitKind = "reconciled";
       } else {
         const content = requiredString(args.content, "content", true);
         assertPayloadBytes(args, byteLength(content));
@@ -701,7 +703,7 @@ class WorkspaceToolRuntimeV2 {
     }
     return {
       output: mutationOutput(result),
-      receipt: actionReceipt(action, context, result),
+      receipt: actionReceipt(action, context, result, commitKind),
       mutationState: "applied",
     };
   }
@@ -741,6 +743,7 @@ class WorkspaceToolRuntimeV2 {
               promoted,
               binding.bindingFingerprint,
               `Reconciled scratch repository promotion for ${workspaceId}.`,
+              "reconciled",
             ),
           };
         }
@@ -763,7 +766,7 @@ class WorkspaceToolRuntimeV2 {
         return {
           outcome: "committed" as const,
           message: `Workspace ${workspaceId} exists with its exact durable owner and binding.`,
-          receipt: workspaceCreationReceipt(action, reconcileContext(context, action), manifest, fingerprint, `Reconciled workspace creation for ${workspaceId}.`),
+          receipt: workspaceCreationReceipt(action, reconcileContext(context, action), manifest, fingerprint, `Reconciled workspace creation for ${workspaceId}.`, "reconciled"),
         };
       }
       const targetPath = requiredString(action.target.path, "target path");
@@ -783,11 +786,11 @@ class WorkspaceToolRuntimeV2 {
         committed = target !== null && target.sha256 === expectedAfter;
       }
       if (committed) {
-        const synthetic = await reconciliationMutationReceipt(this.manager, manifest, name, targetPath, destinationPath ?? undefined, expectedAfter);
+        const synthetic = await reconciliationMutationReceipt(this.manager, manifest, name, targetPath, destinationPath ?? undefined, expectedAfter, optionalString(args.expectedSha256) ?? null);
         return {
           outcome: "committed" as const,
           message: `Workspace action ${action.id} was verified by durable manifest and exact artifact readback.`,
-          receipt: actionReceipt(action, reconcileContext(context, action), synthetic),
+          receipt: actionReceipt(action, reconcileContext(context, action), synthetic, "reconciled"),
         };
       }
       const before = await statOrMissing(this.manager, workspaceId, targetPath);
@@ -1238,6 +1241,7 @@ class WorkspaceToolRuntimeV2 {
             leaseId,
           }),
           `Reused durable scratch workspace ${workspaceId} for continue segment.`,
+          "reconciled",
         ),
         // Segment ownership/lease was applied even though the worktree already existed.
         mutationState: "applied" as const,
@@ -1474,6 +1478,7 @@ class WorkspaceToolRuntimeV2 {
           readback,
           requiredFingerprint(args.bindingFingerprint),
           `Reused durable repository workspace ${workspaceId} for continue segment.`,
+          "reconciled",
         ),
         // Segment ownership/lease was applied even though the worktree already existed.
         mutationState: "applied" as const,
@@ -1758,6 +1763,7 @@ class WorkspaceToolRuntimeV2 {
           manifest,
           binding.bindingFingerprint,
           `Recorded the existing repository binding for ${workspaceId}; no repository was created.`,
+          "reconciled",
         ),
         mutationState: "applied" as const,
       };
@@ -1791,6 +1797,7 @@ class WorkspaceToolRuntimeV2 {
           manifest,
           binding.bindingFingerprint,
           `Reused the promoted repository binding for ${workspaceId}.`,
+          "reconciled",
         ),
         mutationState: "applied" as const,
       };
@@ -2245,7 +2252,12 @@ function validatePreparedAction(name: CodeWorkspaceToolNameV2, action: PreparedA
   ) throw new WorkspaceManagerErrorV2("prepared_authority_missing", "Prepared workspace action lacks exact host authorization.");
 }
 
-function actionReceipt(action: PreparedActionV1, context: ScopedExtensionContextV1, result: WorkspaceMutationReceiptV2): ActionReceiptV1 {
+function actionReceipt(
+  action: PreparedActionV1,
+  context: ScopedExtensionContextV1,
+  result: WorkspaceMutationReceiptV2,
+  commitKind: ActionReceiptV1["commitKind"] = "committed",
+): ActionReceiptV1 {
   return {
     version: 1,
     id: result.id,
@@ -2255,18 +2267,19 @@ function actionReceipt(action: PreparedActionV1, context: ScopedExtensionContext
     operation: toolDescriptor(action.toolName as CodeWorkspaceToolNameV2, "required")
       .capability.action,
     resource: action.target,
-    message: `Workspace ${result.operation} committed for ${result.path}.`,
+    message: `Workspace ${result.operation} ${commitKind === "committed" ? "committed" : commitKind === "reconciled" ? "reconciled" : "was a no-op"} for ${result.path}.`,
     payloadFingerprint: action.payloadFingerprint,
     grantId: context.authorizedAction!.grantId,
     idempotencyKey: action.idempotencyKey,
     startedAt: action.preparedAt,
     committedAt: result.committedAt,
-    commitKind: "committed",
+    commitKind,
     readback: {
       status: "verified",
       checkedAt: result.committedAt,
       observedRevision: result.afterSha256 ?? result.beforeSha256 ?? undefined,
       observedFingerprint: result.fingerprint,
+      ...(result.beforeSha256 ? { priorRevision: result.beforeSha256 } : {}),
     },
     effects: {
       bytesWritten: result.bytesWritten,
@@ -2283,6 +2296,11 @@ function workspaceCreationReceipt(
   manifest: WorkspaceManifestV2,
   observedFingerprint: string,
   message: string,
+  // Only a path that actually created the workspace may claim "committed"
+  // with a positive delta. Reuse, idempotent-retry, and reconcile paths must
+  // say "reconciled" with affectedCount 0 so a vacuous "create" is
+  // structurally distinguishable from real provisioning work.
+  commitKind: ActionReceiptV1["commitKind"] = "committed",
 ): ActionReceiptV1 {
   const committedAt = context.now().toISOString();
   return {
@@ -2300,14 +2318,14 @@ function workspaceCreationReceipt(
     idempotencyKey: action.idempotencyKey,
     startedAt: action.preparedAt,
     committedAt,
-    commitKind: "committed",
+    commitKind,
     readback: {
       status: "verified",
       checkedAt: committedAt,
       observedRevision: manifest.baseSha ?? manifest.hashes.indexFingerprint,
       observedFingerprint,
     },
-    effects: { affectedCount: 1 },
+    effects: { affectedCount: commitKind === "committed" ? 1 : 0 },
   };
 }
 
@@ -2332,6 +2350,7 @@ async function reconciliationMutationReceipt(
   targetPath: string,
   destinationPath: string | undefined,
   expectedAfter: string | null,
+  beforeSha256: string | null = null,
 ): Promise<WorkspaceMutationReceiptV2> {
   const committedAt = new Date().toISOString();
   const operation: WorkspaceMutationReceiptV2["operation"] = name === "code_workspace_mkdir" ? "mkdir"
@@ -2349,11 +2368,15 @@ async function reconciliationMutationReceipt(
     operation,
     path: targetPath,
     relatedPath: destinationPath ?? null,
-    beforeSha256: null,
+    // Preserve the known prior fingerprint instead of discarding it: it is
+    // the only evidence distinguishing "was already in the target state"
+    // from "was overwritten".
+    beforeSha256,
     afterSha256: expectedAfter,
     bytesWritten: 0,
     bytesDeleted: 0,
-    affectedCount: 1,
+    // A reconciliation verified existing state; it mutated nothing.
+    affectedCount: 0,
     trashId: null,
     committedAt,
     manifestSha256: sha256Text(JSON.stringify(manifest)),

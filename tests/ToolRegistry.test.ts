@@ -1634,6 +1634,7 @@ test("path CRUD tools create, append, replace with backup, move, and trash markd
     operation: "replace",
     backupPath: ".agent-backups/123-Brief.md",
     bytesWritten: new TextEncoder().encode("# Replacement").length,
+    bytesDeleted: new TextEncoder().encode("# Brief\nNext").length,
   });
   assert.equal(mock.content.get(".agent-backups/123-Brief.md"), "# Brief\nNext");
 
@@ -2000,6 +2001,9 @@ test("seed_default_templates creates starter templates without overwriting exist
     (repeated.output as { skippedExisting: unknown[] }).skippedExisting.length,
     Object.keys(DEFAULT_TEMPLATE_SEEDS).length,
   );
+  // A repeat seed creates nothing and says so instead of claiming "create".
+  assert.equal((repeated.output as { operation: string }).operation, "no_op");
+  assert.equal((repeated.output as { affectedCount: number }).affectedCount, 0);
 });
 
 test("fill_template supports ad hoc template text and default output folders", async () => {
@@ -2334,13 +2338,25 @@ test("reads, appends, and replaces the active markdown file with backup", async 
     "verified",
   );
 
-  const replace = await executeAuthorizedPrepared(
+  // An empty replacement payload is a whole-note wipe masquerading as a
+  // write. It now fails closed at prepare time, leaving the note untouched.
+  const wiped = await executeAuthorizedPrepared(
     registry,
     { name: "replace_current_file", arguments: { text: "" } },
     mock.context,
   );
+  assert.equal(wiped.ok, false);
+  assert.match(wiped.error?.message ?? "", /wipe/i);
+  assert.equal(mock.content.get("Current.md"), "Initial note\nAppended");
+  assert.equal(mock.content.has(".agent-backups/123-Current.md"), false);
+
+  const replace = await executeAuthorizedPrepared(
+    registry,
+    { name: "replace_current_file", arguments: { text: "A clean brief." } },
+    mock.context,
+  );
   assert.equal(replace.ok, true);
-  assert.equal(mock.content.get("Current.md"), "");
+  assert.equal(mock.content.get("Current.md"), "A clean brief.");
   assert.equal(mock.content.get(".agent-backups/123-Current.md"), "Initial note\nAppended");
 });
 
@@ -2363,6 +2379,7 @@ test("replace_current_file uses a collision-safe backup path", async () => {
     path: "Current.md",
     backupPath: ".agent-backups/123-Current-1.md",
     bytesWritten: new TextEncoder().encode("Replacement").length,
+    bytesDeleted: new TextEncoder().encode("Initial note").length,
   });
   assert.equal(mock.content.get(".agent-backups/123-Current.md"), "Existing backup");
   assert.equal(mock.content.get(".agent-backups/123-Current-1.md"), "Initial note");
@@ -2735,9 +2752,29 @@ test("restore_current_file_from_backup restores latest current-note backup after
     restoredFromBackupPath: ".agent-backups/150-Current.md",
     backupPath: ".agent-backups/200-Current.md",
     bytesWritten: new TextEncoder().encode("Restored note").length,
+    changed: true,
   });
   assert.equal(mock.content.get("Current.md"), "Restored note");
   assert.equal(mock.content.get(".agent-backups/200-Current.md"), "Broken note");
+
+  // Restoring a backup the note already matches is a no-op: no pre-restore
+  // backup churn, no modify, and an honest zero-delta receipt.
+  const repeat = await registry.execute(
+    {
+      name: "restore_current_file_from_backup",
+      arguments: { backupPath: ".agent-backups/150-Current.md" },
+    },
+    mock.context,
+  );
+  assert.equal(repeat.ok, true);
+  assert.deepEqual(repeat.output, {
+    path: "Current.md",
+    operation: "restore",
+    restoredFromBackupPath: ".agent-backups/150-Current.md",
+    bytesWritten: 0,
+    changed: false,
+  });
+  assert.equal(mock.content.get("Current.md"), "Restored note");
 
   const hiddenBackupMock = createMockContext({
     prompt: "Undo the last agent edit in the current note from backup.",
@@ -2768,6 +2805,7 @@ test("restore_current_file_from_backup restores latest current-note backup after
     restoredFromBackupPath: ".agent-backups/175-Current.md",
     backupPath: ".agent-backups/201-Current.md",
     bytesWritten: new TextEncoder().encode("Adapter restored note").length,
+    changed: true,
   });
   assert.equal(hiddenBackupMock.content.get("Current.md"), "Adapter restored note");
   assert.equal(
@@ -3579,18 +3617,77 @@ test("edit_current_section replaces one heading section after backup", async () 
       "Keep scope.",
     ].join("\n"),
   );
-  assert.deepEqual(result.output, {
-    path: "Current.md",
-    backupPath: ".agent-backups/456-Current.md",
-    heading: "Goals",
-    level: 2,
-    bytesWritten: new TextEncoder().encode(expected).length,
-    replacedChars: "Old goals.\n\n".length,
-  });
+  const sectionOutput = result.output as {
+    path: string;
+    backupPath: string;
+    heading: string;
+    level: number;
+    bytesWritten: number;
+    replacedChars: number;
+    changed: boolean;
+    readback?: {
+      status: string;
+      checkedAt: string;
+      observedRevision: string;
+      observedFingerprint: string;
+      priorRevision: string;
+    };
+  };
+  assert.equal(sectionOutput.path, "Current.md");
+  assert.equal(sectionOutput.backupPath, ".agent-backups/456-Current.md");
+  assert.equal(sectionOutput.heading, "Goals");
+  assert.equal(sectionOutput.level, 2);
+  // The delta is the new section body, not the rendered whole document.
+  assert.equal(
+    sectionOutput.bytesWritten,
+    new TextEncoder().encode("New goals.").length,
+  );
+  assert.equal(sectionOutput.replacedChars, "Old goals.\n\n".length);
+  assert.equal(sectionOutput.changed, true);
+  assert.equal(sectionOutput.readback?.status, "verified");
+  assert.match(
+    sectionOutput.readback?.observedRevision ?? "",
+    /^sha256:[a-f0-9]{64}$/u,
+  );
+  assert.equal(
+    sectionOutput.readback?.observedFingerprint,
+    sectionOutput.readback?.observedRevision,
+  );
+  assert.match(
+    sectionOutput.readback?.priorRevision ?? "",
+    /^sha256:[a-f0-9]{64}$/u,
+  );
+  assert.notEqual(
+    sectionOutput.readback?.priorRevision,
+    sectionOutput.readback?.observedRevision,
+  );
   assert.ok(
     mock.operations.indexOf("create:.agent-backups/456-Current.md") <
       mock.operations.indexOf("modify:Current.md"),
   );
+
+  // Re-applying the identical section body is an honest no-op: no modify,
+  // zero delta, unchanged fingerprints.
+  const unchanged = await registry.execute(
+    {
+      name: "edit_current_section",
+      arguments: {
+        heading: "Goals",
+        level: 2,
+        content: "New goals.",
+      },
+    },
+    mock.context,
+  );
+  assert.equal(unchanged.ok, true);
+  const unchangedOutput = unchanged.output as typeof sectionOutput;
+  assert.equal(unchangedOutput.changed, false);
+  assert.equal(unchangedOutput.bytesWritten, 0);
+  assert.equal(
+    unchangedOutput.readback?.priorRevision,
+    unchangedOutput.readback?.observedRevision,
+  );
+  assert.equal(mock.content.get("Current.md"), expected);
 });
 
 test("edit_current_section ignores headings inside fenced code blocks", async () => {
