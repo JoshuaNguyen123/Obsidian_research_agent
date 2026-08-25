@@ -3777,12 +3777,15 @@ function normalizeActionReadback(
   if ((status !== "verified" && status !== "not_required") || !checkedAt) {
     return null;
   }
+  const priorRevision = getNonEmptyString(value.priorRevision);
   return {
     status,
     checkedAt,
     observedRevision: getNonEmptyString(value.observedRevision),
     observedFingerprint: getNonEmptyString(value.observedFingerprint),
-    priorRevision: getNonEmptyString(value.priorRevision),
+    // canonicalJson drops undefined keys on persist; the in-memory shape must
+    // match the serialized one, so an absent prior revision stays absent.
+    ...(priorRevision ? { priorRevision } : {}),
   };
 }
 
