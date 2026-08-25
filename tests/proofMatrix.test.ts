@@ -1,11 +1,24 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
+  IN_FLIGHT_FAILURE_CLASS,
+  LANE_ASSERTION_FAILURE_CLASS,
+  LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
+  PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR,
+  PROOF_MATRIX_MANIFEST_RELATIVE_PATH,
+  PROOF_MATRIX_STATE_RELATIVE_DIR,
+  RENDERER_DEATH_FAILURE_CLASS,
   attemptConsumesBudget,
   attemptLogExcerpt,
+  attemptLogExcerptFrom,
   classifyAttemptOutcome,
+  clearAttemptInFlight,
   consecutiveGreens,
   consecutiveHarnessFailures,
   consumedAttemptCount,
@@ -13,8 +26,12 @@ import {
   isEmptyScorecardHarvestOutput,
   isInfrastructureFailureClass,
   laneHasScorecardBaselineFrom,
+  markAttemptInFlight,
+  migrateLegacyManifestFile,
   porcelainWithoutAllowedHarvest,
+  reconcileInFlightAttempt,
   registerProductFailure,
+  writeJsonAtomic,
   type ProofMatrixAttempt,
   type ProofMatrixManifest,
 } from "../scripts/run-proof-matrix.mjs";
@@ -258,4 +275,241 @@ test("an empty scorecard harvest is not a matrix-stopping failure", () => {
     isEmptyScorecardHarvestOutput("updated  daily-use-research|DU-02|spec|title\n"),
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Durable campaign state (2026-08-25 defect A): the manifest and attempt logs
+// must live OUTSIDE test-results/, which Playwright wipes at attempt start.
+// ---------------------------------------------------------------------------
+
+test("durable state lives outside the Playwright-wiped tree", () => {
+  assert.equal(PROOF_MATRIX_STATE_RELATIVE_DIR, "proof-matrix-state");
+  assert.ok(
+    PROOF_MATRIX_MANIFEST_RELATIVE_PATH.startsWith(`${PROOF_MATRIX_STATE_RELATIVE_DIR}/`),
+    "manifest must live inside the durable state dir",
+  );
+  assert.ok(
+    PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR.startsWith(`${PROOF_MATRIX_STATE_RELATIVE_DIR}/`),
+    "attempt logs must live inside the durable state dir",
+  );
+  assert.doesNotMatch(PROOF_MATRIX_MANIFEST_RELATIVE_PATH, /test-results/u);
+  assert.doesNotMatch(PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR, /test-results/u);
+  // Backward compat: the migration source is exactly the old wiped location.
+  assert.equal(LEGACY_MANIFEST_RELATIVE_PATH, "test-results/proof-matrix-manifest.json");
+});
+
+test("the durable state dir is gitignored (exact-HEAD clean checks must not see it)", () => {
+  const gitignore = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".gitignore"),
+    "utf8",
+  );
+  assert.match(gitignore, /^\/proof-matrix-state\/$/mu);
+});
+
+function tempDir(): string {
+  return mkdtempSync(path.join(tmpdir(), "proof-matrix-test-"));
+}
+
+test("writeJsonAtomic uses temp-then-rename and leaves no torn or temp files", () => {
+  const dir = tempDir();
+  try {
+    const target = path.join(dir, "nested", "manifest.json");
+    writeJsonAtomic(target, { attempts: [1, 2, 3] });
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { attempts: [1, 2, 3] });
+    // Overwrite must succeed via rename (Windows MOVEFILE_REPLACE_EXISTING).
+    writeJsonAtomic(target, { attempts: [] });
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { attempts: [] });
+    const residue = readdirSync(path.dirname(target)).filter((name) => name.includes(".tmp"));
+    assert.deepEqual(residue, [], "no temp file may remain after a completed write");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy manifest in test-results/ migrates once and never clobbers durable state", () => {
+  const dir = tempDir();
+  try {
+    const legacyPath = path.join(dir, "test-results", "proof-matrix-manifest.json");
+    const newPath = path.join(dir, "proof-matrix-state", "proof-matrix-manifest.json");
+    // Nothing anywhere: no migration.
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), false);
+    // Legacy exists, durable does not: migrate (copy) and report it.
+    writeJsonAtomic(legacyPath, { expectedHead: "abc", attempts: [{ cell: "vault-recall" }] });
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), true);
+    assert.deepEqual(JSON.parse(readFileSync(newPath, "utf8")), {
+      expectedHead: "abc",
+      attempts: [{ cell: "vault-recall" }],
+    });
+    // Durable now exists: a second call must not re-migrate or overwrite.
+    writeFileSync(legacyPath, JSON.stringify({ expectedHead: "SHOULD-NOT-WIN" }));
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), false);
+    assert.equal(JSON.parse(readFileSync(newPath, "utf8")).expectedHead, "abc");
+    // A torn/unparseable legacy file migrates nothing.
+    rmSync(newPath);
+    writeFileSync(legacyPath, '{"expectedHead": "torn-mid-wri');
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), false);
+    assert.equal(existsSync(newPath), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// In-flight attempt marker: persisted BEFORE launch so a mid-attempt runner
+// death is visible and resumable instead of silently restarting from zero.
+// ---------------------------------------------------------------------------
+
+test("a mid-attempt death reconciles as a budget-exempt harness attempt on resume", () => {
+  const manifest = manifestWith([
+    green("vault-recall"),
+    green("vault-recall"),
+  ]);
+  markAttemptInFlight(manifest, {
+    cell: "vault-recall",
+    project: "real-ai-soak",
+    attempt: 3,
+    startedAt: "2026-08-25T04:00:00.000Z",
+  });
+  assert.deepEqual(manifest.inFlight, {
+    cell: "vault-recall",
+    project: "real-ai-soak",
+    attempt: 3,
+    startedAt: "2026-08-25T04:00:00.000Z",
+  });
+  const reconciled = reconcileInFlightAttempt(manifest);
+  assert.ok(reconciled);
+  assert.equal(reconciled.cell, "vault-recall");
+  assert.equal(reconciled.attempt, 3);
+  assert.equal(reconciled.green, false);
+  assert.equal(reconciled.failureClass, IN_FLIGHT_FAILURE_CLASS);
+  assert.equal(reconciled.interrupted, true);
+  assert.equal(manifest.inFlight, undefined, "marker must be cleared after reconciliation");
+  // The death is infrastructure: it spends no budget and preserves the streak.
+  assert.equal(isInfrastructureFailureClass(IN_FLIGHT_FAILURE_CLASS), true);
+  assert.equal(attemptConsumesBudget(reconciled), false);
+  assert.equal(consecutiveGreens(manifest, "vault-recall"), 2);
+  assert.equal(consumedAttemptCount(manifest, "vault-recall"), 2);
+  assert.equal(harnessFailureCount(manifest, "vault-recall"), 1);
+  assert.deepEqual(manifest.harnessFailureCounts, { "vault-recall": 1 });
+  // But it does feed the consecutive-harness safety valve.
+  assert.equal(consecutiveHarnessFailures(manifest, "vault-recall"), 1);
+});
+
+test("reconciliation is a no-op without a marker and tolerates a malformed one", () => {
+  const clean = manifestWith([green("code-delivery")]);
+  assert.equal(reconcileInFlightAttempt(clean), null);
+  assert.equal(clean.attempts.length, 1);
+  const malformed = manifestWith([]);
+  malformed.inFlight = { notACell: true };
+  assert.equal(reconcileInFlightAttempt(malformed), null);
+  assert.equal(malformed.inFlight, undefined, "malformed marker must still be cleared");
+  assert.equal(malformed.attempts.length, 0);
+  // clearAttemptInFlight is what a completed attempt calls.
+  const finished = manifestWith([]);
+  markAttemptInFlight(finished, { cell: "x", project: "p", attempt: 1, startedAt: null });
+  clearAttemptInFlight(finished);
+  assert.equal(finished.inFlight, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Exit-1-without-summary classification (2026-08-25 defect B): parse the
+// captured attempt log instead of giving up as process:matrix_unclassified.
+// ---------------------------------------------------------------------------
+
+test("a renderer/target-closed death classifies as harness:renderer_death", () => {
+  const logText = [
+    "Running 1 test using 1 worker",
+    "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts:41:5 › deep vault retrieval ─────",
+    "    Error: page.waitForSelector: Target page, context or browser has been closed",
+    "        at e2e/real-ai-soak.spec.ts:58:20",
+    "  1 failed",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 1, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, RENDERER_DEATH_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, "harness:renderer_death");
+  assert.match(outcome.detail, /Target page, context or browser has been closed/u);
+  // Renderer deaths are infrastructure — budget-exempt like other harness:*.
+  assert.equal(isInfrastructureFailureClass(outcome.failureClass), true);
+});
+
+test("a lane assertion in the log classifies as lane_assertion_failed with the excerpt", () => {
+  const logText = [
+    "Running 1 test using 1 worker",
+    "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts:41:5 › deep vault retrieval ─────",
+    "    Error: expect(received).toContain(expected)",
+    '    Expected substring: "semantic expansion"',
+    '    Received string: "Mission stopped before acceptance"',
+    "  1 failed",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 1, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, "lane_assertion_failed");
+  assert.match(outcome.detail, /expect\(received\)\.toContain/u);
+  assert.match(outcome.detail, /Mission stopped before acceptance/u);
+  // Deliberately NOT model:/product: (cannot be decided mechanically) and NOT
+  // infrastructure: it consumes budget and resets the streak like a real red.
+  assert.equal(isInfrastructureFailureClass(outcome.failureClass), false);
+  assert.equal(
+    attemptConsumesBudget(red("vault-recall", outcome.failureClass)),
+    true,
+  );
+  assert.equal(registerProductFailure(manifestWith([]), outcome.failureClass), false);
+});
+
+test("test timeouts and bare failing-test headers also classify as lane_assertion_failed", () => {
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summaryFresh: false,
+      logText: "  Test timeout of 600000ms exceeded.\n  1 failed\n",
+    }).failureClass,
+    LANE_ASSERTION_FAILURE_CLASS,
+  );
+  const headerOnly = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText:
+      "  1) [interrupted-continuation-live] › e2e/interrupted-continuation-live.spec.ts:92:3 › resumes ─\n" +
+      "    Mission stopped before acceptance\n",
+  });
+  assert.equal(headerOnly.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.match(headerOnly.detail, /Mission stopped before acceptance/u);
+});
+
+test("pre-Playwright harness deaths keep their exact classification, whatever else the log holds", () => {
+  // A build-stage death whose log ALSO happens to contain assertion-looking
+  // text must still classify as the harness stage that actually died.
+  const logText = [
+    "tests/example.test.ts(1,1): error TS2345: Error: expect( mention in a compiler string",
+    "build exited with code 2.",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 2, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, "harness:build_failed");
+  // And a fresh run-summary proof class still outranks all log parsing.
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summary: { records: [{ proofClass: "product:writeback_unproven" }] },
+      summaryFresh: true,
+      logText: "Error: expect(received).toBe(expected)\nTarget closed\n",
+    }).failureClass,
+    "product:writeback_unproven",
+  );
+});
+
+test("attemptLogExcerptFrom reads forward from the match and stays bounded", () => {
+  const lines = [
+    "noise before",
+    "    Error: expect(received).toBe(expected)",
+    "    Expected: 2",
+    "    Received: 1",
+    ...Array.from({ length: 30 }, (_, i) => `    trailing ${i}`),
+  ];
+  const text = lines.join("\n");
+  const excerpt = attemptLogExcerptFrom(text, text.indexOf("Error: expect"));
+  assert.match(excerpt, /Error: expect/u);
+  assert.match(excerpt, /Received: 1/u);
+  assert.doesNotMatch(excerpt, /noise before/u);
+  assert.ok(excerpt.length <= 1_000);
+  assert.equal(attemptLogExcerptFrom(""), "");
 });

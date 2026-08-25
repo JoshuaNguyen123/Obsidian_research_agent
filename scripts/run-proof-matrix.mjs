@@ -27,7 +27,14 @@
 //   - one row appended to docs/eval/playwright-run-metrics.csv
 //   - per-attempt tool-event counts mined from the vault's persisted mission
 //     graphs (same node vocabulary as scripts/eval-tool-events.mjs)
-//   - manifest accumulated at test-results/proof-matrix-manifest.json
+//   - manifest accumulated at proof-matrix-state/proof-matrix-manifest.json
+//
+// Durable state lives OUTSIDE test-results/ on purpose: Playwright wipes
+// test-results/ at the start of every attempt, which on 2026-08-25 deleted
+// attempt logs mid-write and made --resume silently restart a campaign from
+// zero after a mid-attempt runner death (the manifest was only rewritten
+// after each attempt). proof-matrix-state/ is gitignored, survives Playwright,
+// and every manifest write is temp-then-rename so a kill never tears it.
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -37,6 +44,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -46,8 +54,18 @@ import path from "node:path";
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
 const RUN_CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
-const MANIFEST_PATH = path.join(REPO_ROOT, "test-results", "proof-matrix-manifest.json");
-const ATTEMPT_LOG_DIR = path.join(REPO_ROOT, "test-results", "proof-matrix-logs");
+/**
+ * Repo-root state dir (gitignored) for everything the campaign must not lose
+ * when Playwright wipes test-results/: the manifest and per-attempt logs.
+ */
+export const PROOF_MATRIX_STATE_RELATIVE_DIR = "proof-matrix-state";
+export const PROOF_MATRIX_MANIFEST_RELATIVE_PATH = `${PROOF_MATRIX_STATE_RELATIVE_DIR}/proof-matrix-manifest.json`;
+export const PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR = `${PROOF_MATRIX_STATE_RELATIVE_DIR}/logs`;
+/** Pre-2026-08-25 manifest location, inside the wiped tree; migrated on load. */
+export const LEGACY_MANIFEST_RELATIVE_PATH = "test-results/proof-matrix-manifest.json";
+const MANIFEST_PATH = path.join(REPO_ROOT, ...PROOF_MATRIX_MANIFEST_RELATIVE_PATH.split("/"));
+const ATTEMPT_LOG_DIR = path.join(REPO_ROOT, ...PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR.split("/"));
+const LEGACY_MANIFEST_PATH = path.join(REPO_ROOT, ...LEGACY_MANIFEST_RELATIVE_PATH.split("/"));
 const RUN_SUMMARY_PATH = path.join(REPO_ROOT, "test-results", "daily-use-run-summary.json");
 const SCORECARD_BASELINE_PATH = path.join(REPO_ROOT, "e2e", "baselines", "mission-scorecards.v1.json");
 const GRAPH_DIR = path.join(
@@ -321,10 +339,58 @@ const HARNESS_LOG_SIGNATURES = [
 ];
 
 /**
+ * Driver/renderer deaths Playwright reports when the app process goes away
+ * under the test: the lane never got to assert anything, so this is harness
+ * evidence, not product evidence (budget-exempt like the other harness:*).
+ */
+const RENDERER_DEATH_PATTERNS = [
+  /Target page, context or browser has been closed/u,
+  /Target closed/u,
+  /Target crashed/u,
+  /Renderer process crashed/iu,
+  /page crashed/iu,
+  /browser has (?:been )?disconnected/iu,
+];
+
+/**
+ * Signs that Playwright ran the lane and the TEST ITSELF failed: an assertion
+ * error, an expect() diff, a test timeout, or a numbered failing-test header
+ * ("  1) [project] › file › title"). Whether that red is model: or product:
+ * cannot be decided mechanically from the log, so these classify as the
+ * prefix-less `lane_assertion_failed` — it consumes attempt budget and resets
+ * the streak like any real red, and the assertion excerpt rides along in
+ * failureDetail for a human to attribute (visibility, not fake precision).
+ */
+const LANE_ASSERTION_PATTERNS = [
+  /^\s*Error: expect\(/mu,
+  /^\s*AssertionError\b/mu,
+  /expect\(received\)/u,
+  /Test timeout of \d+\s*ms exceeded/u,
+  /^\s*\d+\)\s+\[[^\]\n]+\]\s+›\s/mu,
+];
+
+export const LANE_ASSERTION_FAILURE_CLASS = "lane_assertion_failed";
+export const RENDERER_DEATH_FAILURE_CLASS = "harness:renderer_death";
+
+/** Earliest match of any pattern in the text, or null. */
+function firstPatternMatch(text, patterns) {
+  let best = null;
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (match && (best === null || match.index < best.index)) best = match;
+  }
+  return best;
+}
+
+/**
  * Failure class for a red attempt: prefer the lane's own proof-class
  * annotation, but only when the run summary was written during THIS attempt —
  * a summary left behind by an earlier run must not label a later failure.
- * Otherwise scan the attempt's captured output for harness-stage signatures.
+ * Otherwise scan the attempt's captured output: harness-stage signatures
+ * (pre-Playwright deaths) first — their classification must never change —
+ * then renderer/target-closed driver deaths, then the failing lane's own
+ * assertion text. Only a log with none of those stays matrix_unclassified,
+ * and even then the log tail rides along in failureDetail.
  */
 export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logText }) {
   if (exitCode === 0) return { failureClass: "none", detail: "" };
@@ -348,6 +414,20 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
       return { failureClass, detail: attemptLogExcerpt(text, match.index) };
     }
   }
+  const rendererDeath = firstPatternMatch(text, RENDERER_DEATH_PATTERNS);
+  if (rendererDeath) {
+    return {
+      failureClass: RENDERER_DEATH_FAILURE_CLASS,
+      detail: attemptLogExcerptFrom(text, rendererDeath.index),
+    };
+  }
+  const laneAssertion = firstPatternMatch(text, LANE_ASSERTION_PATTERNS);
+  if (laneAssertion) {
+    return {
+      failureClass: LANE_ASSERTION_FAILURE_CLASS,
+      detail: attemptLogExcerptFrom(text, laneAssertion.index),
+    };
+  }
   return { failureClass: "process:matrix_unclassified", detail: attemptLogExcerpt(text) };
 }
 
@@ -370,6 +450,24 @@ export function attemptLogExcerpt(logText, endIndex = null) {
     .map((line) => line.trimEnd())
     .filter((line) => line.trim() !== "");
   return lines.slice(-8).join("\n").slice(-1_000);
+}
+
+/**
+ * Excerpt starting AT the matched line and reading forward — for failures
+ * whose useful context follows the trigger line (an assertion's
+ * expected/received diff, the stack under a driver error), unlike
+ * attemptLogExcerpt which reads backward from a harness-stage signature.
+ */
+export function attemptLogExcerptFrom(logText, startIndex = 0) {
+  const text = typeof logText === "string" ? logText : "";
+  if (text.trim() === "") return "";
+  const lineStart = text.lastIndexOf("\n", Math.max(0, startIndex - 1)) + 1;
+  const lines = text
+    .slice(lineStart)
+    .split(/\r?\n/u)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "");
+  return lines.slice(0, 12).join("\n").slice(0, 1_000);
 }
 
 /** True when the run summary file was (re)written during the attempt window. */
@@ -446,7 +544,38 @@ function runNpmCaptured(args, env) {
   };
 }
 
+/**
+ * Write JSON durably: temp file in the same directory, then rename. A rename
+ * is atomic on the same volume, so a runner killed mid-write leaves either
+ * the previous manifest or the new one — never a torn, unparseable file.
+ */
+export function writeJsonAtomic(filePath, value) {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp-${process.pid}`;
+  writeFileSync(tempPath, JSON.stringify(value, null, 2) + "\n");
+  renameSync(tempPath, filePath);
+}
+
+/**
+ * One-time migration from the pre-2026-08-25 manifest location inside
+ * test-results/ (which Playwright wipes). Copies the legacy manifest to the
+ * durable location only when no durable manifest exists yet; the legacy file
+ * is left in place for Playwright to wipe. Returns true when it migrated.
+ */
+export function migrateLegacyManifestFile(legacyPath, newPath) {
+  if (existsSync(newPath) || !existsSync(legacyPath)) return false;
+  const legacy = readJsonFile(legacyPath);
+  if (!legacy || typeof legacy !== "object") return false;
+  writeJsonAtomic(newPath, legacy);
+  return true;
+}
+
 function loadManifest() {
+  if (migrateLegacyManifestFile(LEGACY_MANIFEST_PATH, MANIFEST_PATH)) {
+    console.log(
+      `proof-matrix: migrated legacy manifest ${LEGACY_MANIFEST_RELATIVE_PATH} -> ${PROOF_MATRIX_MANIFEST_RELATIVE_PATH}.`,
+    );
+  }
   return (
     readJsonFile(MANIFEST_PATH) ?? {
       startedAt: new Date().toISOString(),
@@ -460,8 +589,58 @@ function loadManifest() {
 }
 
 function saveManifest(manifest) {
-  mkdirSync(path.dirname(MANIFEST_PATH), { recursive: true });
-  writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + "\n");
+  writeJsonAtomic(MANIFEST_PATH, manifest);
+}
+
+/**
+ * A runner death mid-attempt is a harness/process fact, not product evidence:
+ * budget-exempt and streak-preserving, like every other harness:* class.
+ */
+export const IN_FLIGHT_FAILURE_CLASS = "harness:runner_died_mid_attempt";
+
+/**
+ * Persisted BEFORE the attempt's child process is spawned, so the on-disk
+ * manifest always says which attempt was running when the runner died.
+ * Cleared (and replaced by the real attempt record) when the attempt ends.
+ */
+export function markAttemptInFlight(manifest, { cell, project, attempt, startedAt }) {
+  manifest.inFlight = { cell, project, attempt, startedAt };
+}
+
+export function clearAttemptInFlight(manifest) {
+  delete manifest.inFlight;
+}
+
+/**
+ * On load: if the manifest still carries an inFlight marker, the previous
+ * runner died mid-attempt. Materialize that death as a budget-exempt
+ * harness attempt so it is visible in the record, then clear the marker.
+ * Returns the reconciled attempt, or null when there was nothing in flight.
+ */
+export function reconcileInFlightAttempt(manifest) {
+  const pending = manifest.inFlight;
+  clearAttemptInFlight(manifest);
+  if (!pending || typeof pending !== "object" || typeof pending.cell !== "string") {
+    return null;
+  }
+  const reconciled = {
+    cell: pending.cell,
+    project: pending.project ?? "",
+    attempt: pending.attempt ?? totalAttemptCount(manifest, pending.cell) + 1,
+    startedAt: pending.startedAt ?? null,
+    durationS: null,
+    green: false,
+    exitCode: null,
+    failureClass: IN_FLIGHT_FAILURE_CLASS,
+    failureDetail:
+      "runner process died mid-attempt; reconciled from the persisted in-flight marker on the next load",
+    interrupted: true,
+  };
+  manifest.attempts.push(reconciled);
+  manifest.harnessFailureCounts = manifest.harnessFailureCounts ?? {};
+  manifest.harnessFailureCounts[reconciled.cell] =
+    (manifest.harnessFailureCounts[reconciled.cell] ?? 0) + 1;
+  return reconciled;
 }
 
 /**
@@ -592,6 +771,18 @@ async function main() {
     fail(`manifest pins ${manifest.expectedHead}; refusing to resume at ${expectedHead}.`);
   }
   manifest.expectedHead = expectedHead;
+  if (flag("--resume")) {
+    const reconciled = reconcileInFlightAttempt(manifest);
+    if (reconciled) {
+      console.log(
+        `proof-matrix: previous runner died mid-attempt (${reconciled.cell}#${reconciled.attempt}); ` +
+        `recorded as ${IN_FLIGHT_FAILURE_CLASS} — budget unspent, streak preserved.`,
+      );
+    }
+  } else {
+    clearAttemptInFlight(manifest);
+  }
+  saveManifest(manifest);
 
   for (const cell of cells) {
     while (
@@ -625,9 +816,21 @@ async function main() {
       if (cell.grep) runnerArgs.push(`--grep=${cell.grep}`);
 
       const startedAt = Date.now();
+      // Persist the manifest BEFORE launching: if the runner dies mid-attempt
+      // the marker survives (outside the wiped tree), and the next --resume
+      // reconciles it instead of silently restarting the campaign from zero.
+      markAttemptInFlight(manifest, {
+        cell: cell.id,
+        project: cell.project,
+        attempt: attemptIndex,
+        startedAt: new Date(startedAt).toISOString(),
+      });
+      saveManifest(manifest);
       // Attempt output goes to a per-attempt file, not the launcher console:
       // detached campaigns have no console, and a red attempt whose stderr is
       // gone is undiagnosable (the 2026-08-25 02:37 crash loop left nothing).
+      // The log dir lives in proof-matrix-state/ so Playwright's test-results
+      // wipe can never delete a log mid-write again.
       mkdirSync(ATTEMPT_LOG_DIR, { recursive: true });
       const attemptLogPath = path.join(ATTEMPT_LOG_DIR, `${cell.id}-attempt-${attemptIndex}.log`);
       console.log(
@@ -709,6 +912,9 @@ async function main() {
         csvNotes,
       ]);
 
+      // The attempt finished (green or red) — the in-flight marker is now
+      // superseded by the real record below.
+      clearAttemptInFlight(manifest);
       manifest.attempts.push({
         cell: cell.id,
         project: cell.project,
