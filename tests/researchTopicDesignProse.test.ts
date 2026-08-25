@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  filterResearchTopicDesignProseTools,
+  filterMissionDesignCapabilityTools,
   hasDesignIntent,
   isResearchTopicDesignProse,
+  missionGrantsDesignCapability,
 } from "../src/agent/codeDesignIntent";
 import { analyzeGeneratedOutputPrompt } from "../src/agent/generatedOutputPolicy";
 import { planLoopBudget } from "../src/agent/loopPlanner";
@@ -119,7 +120,7 @@ test("a research-note continuation with a design-flavored handoff plans no creat
     // A mis-planned prior segment persisted design capability into its loop
     // budget. The continuation merge must drop only that capability and keep
     // the mission's research and write tools.
-    const inherited = filterResearchTopicDesignProseTools(
+    const inherited = filterMissionDesignCapabilityTools(
       [
         "create_design_canvas",
         "web_search",
@@ -158,7 +159,7 @@ test("a mission that genuinely requests a design canvas keeps its design node on
   );
 
   // The continuation merge keeps the persisted design capability untouched.
-  const inherited = filterResearchTopicDesignProseTools(
+  const inherited = filterMissionDesignCapabilityTools(
     ["create_design_canvas", "web_search", "web_fetch"],
     CANVAS_MISSION,
   );
@@ -167,4 +168,68 @@ test("a mission that genuinely requests a design canvas keeps its design node on
     "web_search",
     "web_fetch",
   ]);
+});
+
+// A research mission with NO design vocabulary at all. The design-prose
+// predicate is false for it (it requires broad design intent), so a
+// continuation filter keyed on that predicate alone is a no-op — and a
+// mis-planned prior segment's persisted create_design_* expected tools sail
+// through the continuation merges and replant the design node the research
+// phase gate refuses (live lead continuations, 2026-08-24). Only the original
+// mission's own design capability may admit design tools into a continuation
+// replan.
+const PLAIN_RESEARCH_MISSION =
+  "Research the self-attention mechanism from the paper Attention Is All You Need and write a short note on how it works. Use current sources and citations.";
+
+// Verbatim from the poisoned live lead ledger
+// (run-2026-08-24t21-45-56.339z-8c700b473b14-lead loopBudget.expectedTools).
+const POISONED_LEDGER_EXPECTED_TOOLS = [
+  "create_design_canvas",
+  "web_search",
+  "web_fetch",
+  "create_design_package",
+  "append_to_current_file",
+];
+
+test("a lead continuation cannot re-acquire design tools its original mission never planned", () => {
+  // The hole shape: no design vocabulary anywhere in the original mission.
+  assert.equal(hasDesignIntent(PLAIN_RESEARCH_MISSION), false);
+  assert.equal(isResearchTopicDesignProse(PLAIN_RESEARCH_MISSION), false);
+  assert.equal(missionGrantsDesignCapability(PLAIN_RESEARCH_MISSION), false);
+
+  // Every research-note mission — with or without design-flavored topic
+  // nouns — must shed inherited design capability on the continuation merge.
+  for (const mission of [
+    PLAIN_RESEARCH_MISSION,
+    TRANSFORMER_MISSION,
+    CAP_MISSION,
+  ]) {
+    assert.equal(
+      missionGrantsDesignCapability(mission),
+      false,
+      `research-note mission must not grant design capability: ${mission}`,
+    );
+    assert.deepEqual(
+      filterMissionDesignCapabilityTools(
+        POISONED_LEDGER_EXPECTED_TOOLS,
+        mission,
+      ),
+      ["web_search", "web_fetch", "append_to_current_file"],
+      `poisoned design tools must be dropped for ${mission}`,
+    );
+  }
+
+  // Missions whose own prompt grants design capability keep it, fresh and on
+  // continuation: an explicit visual deliverable and a design revision.
+  assert.equal(missionGrantsDesignCapability(CANVAS_MISSION), true);
+  const reviseMission =
+    "Update the flowchart canvas to add a caching layer between the API and the database.";
+  assert.equal(missionGrantsDesignCapability(reviseMission), true);
+  assert.deepEqual(
+    filterMissionDesignCapabilityTools(
+      ["read_design_canvas", "update_design_canvas", "read_current_file"],
+      reviseMission,
+    ),
+    ["read_design_canvas", "update_design_canvas", "read_current_file"],
+  );
 });

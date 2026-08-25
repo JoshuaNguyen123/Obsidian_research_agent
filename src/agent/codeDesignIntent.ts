@@ -102,9 +102,25 @@ export function isResearchTopicDesignProse(prompt: string): boolean {
   );
 }
 
-// Design-capability tool names a research-topic-prose mission must never
-// plan. Continuation replans filter persisted expected tools through this set
-// so a mis-planned prior segment cannot re-plant the refused design node.
+/**
+ * Single authority for whether a mission's OWN prompt grants design
+ * capability: it either names a design deliverable that is not research topic
+ * prose, or it revises an existing design artifact. Required-write selection
+ * and every continuation-replan merge must consult this same predicate so no
+ * two of them disagree about whether create_design_* belongs in a plan.
+ */
+export function missionGrantsDesignCapability(prompt: string): boolean {
+  return (
+    (hasDesignIntent(prompt) && !isResearchTopicDesignProse(prompt)) ||
+    hasReviseDesignIntent(prompt)
+  );
+}
+
+// Design-capability tool names a mission may plan only when its own prompt
+// grants design capability. Continuation replans filter persisted expected
+// tools through this set so a mis-planned prior segment — or design
+// vocabulary that exists only in researcher handoff/summary prose — cannot
+// re-plant the refused design node.
 const DESIGN_CAPABILITY_TOOL_NAMES = new Set([
   "create_design_canvas",
   "create_svg_design",
@@ -117,21 +133,30 @@ const DESIGN_CAPABILITY_TOOL_NAMES = new Set([
   "upsert_mermaid_block",
 ]);
 
+/** The same authority as the filter below, exposed for per-name callers such
+ * as the resume-time mission graph prune. */
+export function isDesignCapabilityToolName(toolName: string): boolean {
+  return DESIGN_CAPABILITY_TOOL_NAMES.has(toolName);
+}
+
 /**
- * Filters planned/inherited tool names for a mission whose design vocabulary
- * is topic prose. Non-design tools always pass; a mission that genuinely
- * requests a visual artifact passes unchanged. The mission prompt here must
- * be the ORIGINAL user mission (persisted as ledger mission / runtime
- * originalMission), never researcher handoff or summary prose.
+ * Filters planned/inherited tool names against the mission's own design
+ * authority. Non-design tools always pass; a mission that genuinely requests
+ * or revises a visual artifact passes unchanged. Design tools are dropped
+ * both for research-topic design prose AND for missions with no design
+ * vocabulary at all — inherited design capability the original mission never
+ * planned can only be pollution. The mission prompt here must be the ORIGINAL
+ * user mission (persisted as ledger mission / runtime originalMission), never
+ * researcher handoff or summary prose.
  */
-export function filterResearchTopicDesignProseTools(
+export function filterMissionDesignCapabilityTools(
   toolNames: readonly string[],
   missionPrompt: string,
 ): string[] {
-  if (!isResearchTopicDesignProse(missionPrompt)) {
+  if (missionGrantsDesignCapability(missionPrompt)) {
     return [...toolNames];
   }
-  return toolNames.filter((name) => !DESIGN_CAPABILITY_TOOL_NAMES.has(name));
+  return toolNames.filter((name) => !isDesignCapabilityToolName(name));
 }
 
 export function hasExplicitCodeTeamMagicPhrase(prompt: string): boolean {

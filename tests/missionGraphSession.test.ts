@@ -2541,6 +2541,111 @@ async function publicationReconciliationFixture(
   };
 }
 
+test("resume prunes never-executed design nodes the original mission never planned", async () => {
+  const harness = createVaultHarness();
+  // The poisoned shape from the 2026-08-24 live lead continuations: a prior
+  // segment persisted a create_design_canvas node between the research read
+  // and the narrative write, and the research phase gate refuses that write
+  // on every resumed frontier visit.
+  const graph = await graphFor({
+    missionId: "session-prune-inherited-design-node",
+    allowedTools: [
+      "web_search",
+      "create_design_canvas",
+      "append_to_current_file",
+    ],
+    plannedTools: [
+      "web_search",
+      "create_design_canvas",
+      "append_to_current_file",
+    ],
+  });
+  const designNodeId = toolNode(graph, "create_design_canvas").id;
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  // Execute the research read for real so the prune must tell an executed
+  // node (evidence attached) apart from the never-executed design node.
+  const readExecution = requireExecution(
+    await session.beginToolExecution("web_search"),
+  );
+  const readNode = session.graph.nodes[readExecution.nodeId]!;
+  await session.finishToolExecution(readExecution, {
+    ok: true,
+    evidence: evidenceFor(readNode, "1", harness.nextTimestamp()),
+  });
+  assert.equal(session.graph.nodes[readNode.id]?.status, "complete");
+
+  // The continuation adopts the persisted record verbatim — including the
+  // design node a correctly filtered fresh plan would no longer contain.
+  const resumed = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+    resume: true,
+  });
+  const before = resumed.graph;
+  assert.ok(before.nodes[designNodeId], "fixture: design node persisted");
+  const formerDependents = Object.values(before.nodes).filter((node) =>
+    node.dependencyIds.includes(designNodeId),
+  );
+  assert.ok(
+    formerDependents.length > 0,
+    "fixture: downstream work depends on the design node",
+  );
+
+  const pruned = await resumed.pruneNeverExecutedToolNodes(
+    (toolName) => toolName === "create_design_canvas",
+    "Prune inherited design-capability nodes the restored original mission never planned.",
+  );
+  assert.deepEqual(pruned.prunedNodeIds, [designNodeId]);
+  assert.equal(pruned.graph.nodes[designNodeId], undefined);
+  // The executed read survives with its proof intact.
+  assert.equal(pruned.graph.nodes[readNode.id]?.status, "complete");
+  // Dependents are rewired past the pruned node, never orphaned.
+  const designDependencyIds = before.nodes[designNodeId]!.dependencyIds;
+  for (const dependent of formerDependents) {
+    const rewired = pruned.graph.nodes[dependent.id]!;
+    assert.equal(rewired.dependencyIds.includes(designNodeId), false);
+    for (const dependencyId of designDependencyIds) {
+      assert.ok(
+        rewired.dependencyIds.includes(dependencyId),
+        `${dependent.id} must inherit ${dependencyId}`,
+      );
+    }
+  }
+  // The surviving graph still satisfies every structural invariant.
+  validateMissionGraphV3(pruned.graph);
+
+  // A completed node never matches the never-executed guard.
+  const completedProbe = await resumed.pruneNeverExecutedToolNodes(
+    (toolName) => toolName === "web_search",
+    "Probe: executed nodes are not prunable.",
+  );
+  assert.deepEqual(completedProbe.prunedNodeIds, []);
+
+  // Idempotent: a second prune finds nothing left to remove.
+  const again = await resumed.pruneNeverExecutedToolNodes(
+    (toolName) => toolName === "create_design_canvas",
+    "Prune inherited design-capability nodes the restored original mission never planned.",
+  );
+  assert.deepEqual(again.prunedNodeIds, []);
+
+  // The narrative write proceeds on the healed frontier: the mission that
+  // was terminally deferred can now reach its note writeback.
+  await resumed.promoteReadyNodes();
+  const writeExecution = requireExecution(
+    await resumed.beginToolExecution("append_to_current_file"),
+  );
+  const writeNode = resumed.graph.nodes[writeExecution.nodeId]!;
+  await resumed.finishToolExecution(writeExecution, {
+    ok: true,
+    evidence: evidenceFor(writeNode, "2", harness.nextTimestamp()),
+    receipt: receiptFor(writeNode, "3", harness.nextTimestamp()),
+  });
+  assert.equal(resumed.graph.nodes[writeNode.id]?.status, "complete");
+});
+
 async function publicationAppendGraphFor(
   missionId: string,
 ): Promise<MissionGraphV3> {

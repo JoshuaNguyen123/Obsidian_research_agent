@@ -2898,6 +2898,50 @@ export class MissionGraphSession {
     });
   }
 
+  /**
+   * Prunes planned tool nodes the restored original mission's own intent
+   * refuses (for example inherited design-capability nodes on a research-note
+   * continuation) when they have never executed: a pre-execution status with
+   * no evidence and no receipts. A persisted graph from a mis-planned prior
+   * segment otherwise resumes such a node verbatim, and the phase gate that
+   * refuses its write turns every continuation into a terminal
+   * policy_deferral_repeated blocker. Dependents are rewired past each pruned
+   * node so the surviving frontier keeps its partial order; the caller decides
+   * WHICH tools are refused (from the persisted original mission, never
+   * handoff prose) and this method stays mechanical.
+   */
+  async pruneNeverExecutedToolNodes(
+    shouldPrune: (toolName: string) => boolean,
+    reason: string,
+  ): Promise<{ graph: MissionGraphV3; prunedNodeIds: string[] }> {
+    return this.enqueueMutation(async () => {
+      const graph = this.record.graph;
+      const prunable = Object.values(graph.nodes).filter(
+        (node) =>
+          (node.status === "queued" ||
+            node.status === "ready" ||
+            node.status === "blocked") &&
+          node.allowedTools.length > 0 &&
+          node.allowedTools.every((toolName) => shouldPrune(toolName)) &&
+          node.evidence.length === 0 &&
+          node.receipts.length === 0,
+      );
+      if (prunable.length === 0) {
+        return { graph: this.graph, prunedNodeIds: [] };
+      }
+      const operations: MissionGraphPatchOperationV1[] = [];
+      for (const node of prunable) {
+        await this.releaseOrphanedNodeLocksUnlocked(node.id);
+        // splice_node re-links every dependent to the removed node's own
+        // dependencies inside the authority reducer, which also re-checks
+        // the never-executed guard.
+        operations.push({ op: "splice_node", nodeId: node.id });
+      }
+      const applied = await this.applyUnlocked(reason, operations);
+      return { graph: applied, prunedNodeIds: prunable.map((node) => node.id) };
+    });
+  }
+
   async apply(
     reason: string,
     operations: MissionGraphPatchOperationV1[],
