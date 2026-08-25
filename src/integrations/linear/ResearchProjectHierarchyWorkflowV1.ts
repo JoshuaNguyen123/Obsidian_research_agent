@@ -20,7 +20,12 @@ import {
   renderLinearIssueBodyV1,
 } from "./LinearIssueFormatV1";
 import type { LinearToolClient } from "./LinearTools";
-import { listAllLinearPages } from "./linearPagination";
+import {
+  LINEAR_SWEEP_MAX_PAGES,
+  LINEAR_SWEEP_PAGE_SIZE,
+  LINEAR_SWEEP_ROW_BOUND,
+  listAllLinearPages,
+} from "./linearPagination";
 import {
   assertExactKeys,
   DurableLinearContractError,
@@ -1198,13 +1203,13 @@ export class ResearchProjectHierarchyWorkflowV1 {
     const sweep = await listAllLinearPages(
       this.options.readClient,
       operationKey,
-      { first: 50 },
+      { first: LINEAR_SWEEP_PAGE_SIZE },
       requestOptions(context),
-      { maxPages: 5 },
+      { maxPages: LINEAR_SWEEP_MAX_PAGES },
     );
     if (sweep.truncated) {
       throw new Error(
-        `Linear ${operationKey} lookup exceeded the bounded 250-record sweep; absence cannot be verified safely.`,
+        `Linear ${operationKey} lookup exceeded the bounded ${LINEAR_SWEEP_ROW_BOUND}-record sweep; absence cannot be verified safely.`,
       );
     }
     return sweep.items;
