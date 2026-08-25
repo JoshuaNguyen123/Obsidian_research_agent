@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ATTEMPT_LOG_DIR,
   attemptLogExcerpt,
   classifyAttemptOutcome,
   isEmptyScorecardHarvestOutput,
@@ -145,4 +146,10 @@ test("an empty scorecard harvest is not a matrix-stopping failure", () => {
     isEmptyScorecardHarvestOutput("updated  daily-use-research|DU-02|spec|title\n"),
     false,
   );
+});
+
+test("attempt logs live outside Playwright's wiped test-results directory", () => {
+  const normalized = ATTEMPT_LOG_DIR.replaceAll("\\", "/");
+  assert.match(normalized, /\/docs\/eval\/proof-matrix-logs$/u);
+  assert.equal(normalized.includes("/test-results/"), false);
 });
