@@ -200,6 +200,141 @@ export function schemasForStep(input: {
 }
 
 /**
+ * Phase-scoped offered-menu ceilings (cheap-model WS3).
+ *
+ * Wide menus measurably degrade weak tool-calling models (observed live:
+ * 20 wasted steps against an 18-tool menu while the right tool sat ready).
+ * Gather/analyze keep a broader read menu; write/publish turns get a tight
+ * action menu. `verify` and `publish` share the write ceiling.
+ */
+export type ToolMenuPhaseV1 = "gather" | "analyze" | "write" | "verify";
+
+export const PHASE_TOOL_MENU_CEILINGS_V1: Readonly<
+  Record<ToolMenuPhaseV1, number>
+> = {
+  gather: 10,
+  analyze: 10,
+  write: 6,
+  verify: 6,
+};
+
+/** Accepts runner phase strings; unknown phases apply no ceiling (fail-open). */
+export function normalizeToolMenuPhaseV1(
+  phase: string | null | undefined,
+): ToolMenuPhaseV1 | null {
+  const key = String(phase ?? "").trim();
+  if (key === "gather" || key === "analyze" || key === "write" || key === "verify") {
+    return key;
+  }
+  // The plan speaks of "write/publish"; treat a publish-shaped phase as write.
+  if (key === "publish") {
+    return "write";
+  }
+  return null;
+}
+
+/**
+ * Enforce the per-phase offered-tool-menu ceiling on an already-assembled
+ * step menu. This is the ONE shared predicate for both the schema list and
+ * the stage-prompt prose projection: cap the finalized `stepTools` before
+ * either consumer reads it, and the two cannot disagree.
+ *
+ * Priority when the menu exceeds the ceiling (kept first, original order
+ * preserved in the output):
+ *   0. graph-required tools (ready/running MissionGraph node tools) — these
+ *      are NEVER dropped, even when they alone exceed the ceiling;
+ *   1. the plan's preferred next tool;
+ *   2. route-base tools for the run's route bucket;
+ *   3. everything else (dropped first).
+ *
+ * Menus at or under the ceiling — and turns with no recognizable phase —
+ * pass through unchanged.
+ */
+export function enforcePhaseToolMenuCeilingV1<T extends ToolSchemaLike>(input: {
+  phase: string | null | undefined;
+  schemas: readonly T[];
+  /** Ready/running MissionGraph node tool names. Never dropped. */
+  graphRequired?: readonly string[];
+  /** The plan's preferred next tool name, if the host computed one. */
+  preferredNextTool?: string | null;
+  /** Runner RunRoute; route-base tools outrank misc catalog extras. */
+  route?: string | null;
+  /**
+   * Phase ceilings only apply to research-bearing runs — the WS3 evidence
+   * base. Non-research runs derive phase "write" immediately, so a blanket
+   * write ceiling would let route-base reads crowd out the very mutation or
+   * inspection tools the mission exists for (observed: a CRUD mission lost
+   * create_file; a repository-inspection turn lost
+   * code_repository_detect_profile). Pass `false` to disable capping; omit
+   * for pure/unit usage where the caller already knows the run qualifies.
+   */
+  researchBearing?: boolean;
+  /**
+   * Phase ceilings also require a governing MissionGraph. In graphless
+   * intent-gated runs the assembled menu IS the intent gate's answer — every
+   * name was individually admitted for this prompt — and re-ranking it by
+   * route-base priority evicts deliberately admitted tools (observed:
+   * get_note_graph_context dropped from an explicit "inspect the note graph"
+   * mission). With a graph, protected names are precise and the extras are
+   * catalog noise, so capping is safe. Pass `false` to disable capping; omit
+   * for pure/unit usage.
+   */
+  graphGoverned?: boolean;
+}): T[] {
+  const phase = normalizeToolMenuPhaseV1(input.phase);
+  if (
+    !phase ||
+    input.researchBearing === false ||
+    input.graphGoverned === false
+  ) {
+    return [...input.schemas];
+  }
+  const ceiling = PHASE_TOOL_MENU_CEILINGS_V1[phase];
+  if (input.schemas.length <= ceiling) {
+    return [...input.schemas];
+  }
+  const graphRequired = new Set(
+    (input.graphRequired ?? []).map((name) => name.trim()).filter(Boolean),
+  );
+  const preferredNextTool = input.preferredNextTool?.trim() || null;
+  const routeBase = new Set<string>(
+    input.route
+      ? ROUTE_BASE_TOOLS[mapRunRouteToSchemaRoute(input.route)] ??
+          ROUTE_BASE_TOOLS.default
+      : [],
+  );
+  const priorityFor = (name: string): number => {
+    if (graphRequired.has(name)) return 0;
+    if (preferredNextTool !== null && name === preferredNextTool) return 1;
+    if (routeBase.has(name)) return 2;
+    return 3;
+  };
+  const ranked = input.schemas.map((schema, index) => ({
+    schema,
+    index,
+    priority: priorityFor(schema.function.name),
+  }));
+  const keptIndexes = new Set<number>();
+  // Graph-required tools are kept unconditionally, ceiling or not: dropping a
+  // tool the current graph node requires would advertise an unfinishable step.
+  for (const entry of ranked) {
+    if (entry.priority === 0) {
+      keptIndexes.add(entry.index);
+    }
+  }
+  const byPriority = [...ranked].sort(
+    (a, b) => a.priority - b.priority || a.index - b.index,
+  );
+  for (const entry of byPriority) {
+    if (keptIndexes.size >= ceiling) break;
+    keptIndexes.add(entry.index);
+  }
+  return ranked
+    .filter((entry) => keptIndexes.has(entry.index))
+    .map((entry) => entry.schema);
+}
+
+/**
  * Durable-stage schema shrink: keep only schemas whose names are in the
  * stage/callable allowlist. Used when a lifecycle stage already owns the
  * offered frontier so cloud catalogs do not re-expand unrelated tools.

@@ -9,7 +9,10 @@ import {
   projectStagePrompt,
   STAGE_PROMPT_MAX_TOTAL_CHARS,
 } from "../src/agent/stagePromptProjection";
-import { schemasForLifecycleStage } from "../src/agent/toolSchemaPolicy";
+import {
+  enforcePhaseToolMenuCeilingV1,
+  schemasForLifecycleStage,
+} from "../src/agent/toolSchemaPolicy";
 import type { ModelToolDefinition } from "../src/model/types";
 
 function tool(name: string): ModelToolDefinition {
@@ -59,6 +62,47 @@ test("stage prompt projection keeps only objective evidence and callable tools",
   assert.match(formatted, /code_validate_fast, code_commit_verified, read_current_file/u);
   assert.doesNotMatch(formatted, /HOST ROUTING CARD/u);
   assert.ok(formatted.length <= STAGE_PROMPT_MAX_TOTAL_CHARS);
+});
+
+test("stage prompt projection lists exactly the phase-capped schema names", () => {
+  // WS3 agreement check: after the phase menu ceiling caps the schema list,
+  // the prose projection must advertise exactly the same names — the master
+  // failure shape here is two subsystems answering "what can I call?"
+  // differently.
+  const wideMenu = [
+    tool("web_search"),
+    tool("web_fetch"),
+    tool("read_current_file"),
+    tool("noise_a"),
+    tool("noise_b"),
+    tool("noise_c"),
+    tool("noise_d"),
+    tool("append_to_current_file"),
+    tool("count_words"),
+  ];
+  const capped = enforcePhaseToolMenuCeilingV1({
+    phase: "write",
+    schemas: wideMenu,
+    graphRequired: ["append_to_current_file"],
+    route: "grounded_workflow",
+  });
+  assert.ok(capped.length <= 6);
+  const cappedNames = capped.map((item) => item.function.name);
+  const projection = projectStagePrompt({
+    stage: null,
+    callableTools: cappedNames,
+  });
+  assert.deepEqual([...projection.callableTools], cappedNames);
+  const formatted = formatStagePromptProjection(projection);
+  for (const name of cappedNames) {
+    assert.ok(formatted.includes(name), `projection lists ${name}`);
+  }
+  for (const dropped of wideMenu
+    .map((item) => item.function.name)
+    .filter((name) => !cappedNames.includes(name))) {
+    assert.ok(!formatted.includes(dropped), `projection omits ${dropped}`);
+  }
+  assert.ok(cappedNames.includes("append_to_current_file"));
 });
 
 test("extractCompactStageEvidence drops bulky cards and caps lines", () => {

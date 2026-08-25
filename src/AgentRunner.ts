@@ -281,10 +281,12 @@ import {
   filterSetLooseToolNamesByMissionGraphAuthority,
   getActiveValidationRecoveryFrontierV1,
   getPendingMissionGraphWriteToolNames,
+  getPhaseCeilingProtectedToolNamesV1,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
 } from "./agent/missionGraphFrontier";
+import { enforcePhaseToolMenuCeilingV1 } from "./agent/toolSchemaPolicy";
 import { proofDebtSeedsFromOrchestratorHandoff } from "./agent/leadHandoffProof";
 import {
   createAutonomyRunStats,
@@ -17438,6 +17440,42 @@ export async function runAgentMission({
         });
       }
     }
+    {
+      // Cheap-model WS3: phase-scoped offered-menu ceiling. This is the last
+      // transform before the schema list, the stage-prompt projection, and
+      // autonomyStats.toolsOffered all read stepTools, so every consumer sees
+      // one capped answer. Graph-required tools are never dropped.
+      const beforeCeiling = stepTools;
+      const ceilingGraph = missionGraphSession?.graph ?? stepGraph;
+      stepTools = enforcePhaseToolMenuCeilingV1({
+        phase: researchPhaseDescriptor?.phase ?? null,
+        schemas: stepTools,
+        graphRequired: getPhaseCeilingProtectedToolNamesV1(
+          ceilingGraph,
+          missionPlan,
+        ),
+        preferredNextTool: researchPlan?.nextAction?.toolName ?? null,
+        route: runPlan.route,
+        researchBearing: researchPhaseDescriptor?.researchBearing === true,
+        graphGoverned: Boolean(ceilingGraph),
+      });
+      if (stepTools.length !== beforeCeiling.length) {
+        const dropped = beforeCeiling
+          .map((tool) => tool.function.name)
+          .filter(
+            (name) => !stepTools.some((tool) => tool.function.name === name),
+          );
+        events.onTrace?.({
+          id: `phase-tool-menu-ceiling-${step}`,
+          kind: "allowed_tools",
+          step,
+          message:
+            `Phase ${researchPhaseDescriptor?.phase ?? "unknown"} tool-menu ceiling ` +
+            `kept ${stepTools.length} of ${beforeCeiling.length} offered tools; dropped: ${dropped.join(", ")}.`,
+          outputPreview: dropped,
+        });
+      }
+    }
     const stepAllowedToolNames = new Set(
       stepTools.map((tool) => tool.function.name),
     );
@@ -20127,9 +20165,22 @@ export async function runAgentMission({
           }),
           writeReceipts,
         );
-        liveStepTools = refreshedStepTools;
+        // Same phase ceiling as the step-start menu: the mid-response refresh
+        // must not silently re-widen what the model was offered this step.
+        liveStepTools = enforcePhaseToolMenuCeilingV1({
+          phase: researchPhaseDescriptor?.phase ?? null,
+          schemas: refreshedStepTools,
+          graphRequired: getPhaseCeilingProtectedToolNamesV1(
+            refreshedGraph,
+            missionPlan,
+          ),
+          preferredNextTool: researchPlan?.nextAction?.toolName ?? null,
+          route: runPlan.route,
+          researchBearing: researchPhaseDescriptor?.researchBearing === true,
+          graphGoverned: Boolean(refreshedGraph),
+        });
         stepAllowedToolNames.clear();
-        for (const refreshedTool of refreshedStepTools) {
+        for (const refreshedTool of liveStepTools) {
           stepAllowedToolNames.add(refreshedTool.function.name);
         }
       }

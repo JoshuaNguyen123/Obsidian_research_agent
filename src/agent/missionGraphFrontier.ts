@@ -25,6 +25,10 @@ import {
   findFinalMissionGraphNode,
   isOptionalMissionGraphNode,
 } from "./missionGraphAuthority";
+import {
+  flattenMissionPlanTasks,
+  type MissionPlanLike,
+} from "./missionPlan";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -922,6 +926,46 @@ export function constrainToolsToMissionGraphFrontier(
     }) as ModelToolDefinition[],
     { respectMaxEffectClass: false },
   );
+}
+
+/**
+ * Tool names the current mission still requires: allowedTools plus frontier
+ * tool names of every ready/running MissionGraph node, plus the allowedTools
+ * of every incomplete mission-plan task. Shared input for
+ * `enforcePhaseToolMenuCeilingV1` — the phase menu ceiling must never drop
+ * one of these, or the offered menu could not finish the mission's own next
+ * step (observed: rename_current_file capped out of a rename-then-research
+ * mission whose plan demanded it on turn one).
+ */
+export function getPhaseCeilingProtectedToolNamesV1(
+  graph: MissionGraphV3 | null | undefined,
+  missionPlan?: MissionPlanLike | null,
+): string[] {
+  const names = new Set<string>();
+  const add = (toolName: string) => {
+    const trimmed = toolName.trim();
+    if (trimmed) names.add(trimmed);
+  };
+  if (graph) {
+    for (const node of Object.values(graph.nodes)) {
+      // Every incomplete node's tools are mission-authored requirements, not
+      // catalog noise: pending read nodes (e.g. get_note_graph_context) enter
+      // the offered menu through capability reads before their node is ready,
+      // and the ceiling must not evict what the graph will demand next.
+      if (node.status === "complete" || node.status === "cancelled") continue;
+      for (const toolName of node.allowedTools) add(toolName);
+      for (const toolName of getMissionGraphNodeFrontierToolNames(node)) {
+        add(toolName);
+      }
+    }
+  }
+  if (missionPlan) {
+    for (const task of flattenMissionPlanTasks(missionPlan)) {
+      if (task.status === "complete" || task.status === "blocked") continue;
+      for (const toolName of task.allowedTools) add(toolName);
+    }
+  }
+  return [...names];
 }
 
 export function getPendingMissionGraphWriteToolNames(
