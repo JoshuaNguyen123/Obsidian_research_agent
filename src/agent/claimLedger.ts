@@ -61,6 +61,14 @@ export interface ResearchClaim {
   quoteSpans?: ClaimQuoteSpan[];
   subquestionId?: string;
   conflictIds?: string[];
+  /**
+   * [start, end) of this claim's sentence in the exact draft it was extracted
+   * from. Runtime-only and deliberately never serialized: a resumed ledger has
+   * no matching draft, so persisted offsets would be lies. Per-claim repair
+   * refuses to splice without them.
+   */
+  draftStart?: number;
+  draftEnd?: number;
 }
 
 export interface ClaimPassageRef {
@@ -284,9 +292,37 @@ export function extractClaimsFromDraft(
           : "ungrounded",
       passageIds: [],
       conflictIds: [],
+      draftStart: sentence.start,
+      draftEnd: sentence.end,
     });
   }
   return claims;
+}
+
+/**
+ * The claim id inside a claim-scoped grounding token, or null for
+ * document-scoped tokens (`claim_grounding:missing_quote_span`,
+ * `claim_grounding:fabricated_passage_id`, section/verifier tokens, …).
+ *
+ * This predicate lives beside `validateClaimGrounding` — the only minter of
+ * these strings — so the repair loop that partitions claim-scoped from
+ * document-scoped failures can never drift from the vocabulary. Extend BOTH
+ * the minter and this list together; the table-driven test enumerates every
+ * mintable shape and fails on an unclassified newcomer.
+ */
+export function claimIdFromGroundingToken(token: string): string | null {
+  const match =
+    /^claim_grounding:(?:ungrounded|fabricated|quote_mismatch|quote_passage):(.+)$/u.exec(
+      token,
+    );
+  const id = match?.[1]?.trim();
+  if (!id) {
+    return null;
+  }
+  // The two document-scoped tokens carry no id segment and never reach here
+  // (`missing_quote_span`, `fabricated_passage_id` are full literals), but a
+  // defensive guard keeps a future bare variant from minting an empty id.
+  return id;
 }
 
 export function collectPassageIdsFromText(text: string): string[] {
@@ -772,34 +808,67 @@ function resolvePassageRefs(
   });
 }
 
-function splitClaimSentences(
-  draft: string,
-): Array<{ text: string; epistemicSection: boolean }> {
-  const normalized = draft.replace(/\r\n/g, "\n").trim();
-  if (!normalized) {
-    return [];
-  }
-  const chunks: Array<{ text: string; epistemicSection: boolean }> = [];
+interface ClaimSentenceChunk {
+  text: string;
+  epistemicSection: boolean;
+  /** [start, end) of the chunk in the ORIGINAL draft string. */
+  start: number;
+  end: number;
+}
+
+function splitClaimSentences(draft: string): ClaimSentenceChunk[] {
+  // Walk physical lines of the ORIGINAL string so every chunk carries real
+  // [start, end) offsets into the draft — the splice-based per-claim repair
+  // needs them. `text` stays whitespace-collapsed exactly as before (claim
+  // ids and statuses derive from it); only the offsets index the raw bytes.
+  const chunks: ClaimSentenceChunk[] = [];
   let epistemicSection = false;
-  for (const line of normalized.split(/\n+/)) {
-    const cleaned = line.replace(/^\s*[-*•]\s+/, "").trim();
-    if (!cleaned) {
+  const linePattern = /[^\n\r]+/gu;
+  let lineMatch: RegExpExecArray | null;
+  while ((lineMatch = linePattern.exec(draft)) !== null) {
+    const lineStart = lineMatch.index;
+    const rawLine = lineMatch[0];
+    const bulletMatch = /^\s*[-*•]\s+/u.exec(rawLine);
+    const leadTrim =
+      bulletMatch?.[0].length ?? /^\s*/u.exec(rawLine)![0].length;
+    const trailTrim = /\s*$/u.exec(rawLine)![0].length;
+    const cleanedStart = lineStart + leadTrim;
+    const cleanedEnd = lineStart + rawLine.length - trailTrim;
+    if (cleanedEnd <= cleanedStart) {
       continue;
     }
+    const cleaned = draft.slice(cleanedStart, cleanedEnd);
     const heading = /^#{1,6}\s+(.+)$/u.exec(cleaned);
     if (heading?.[1]) {
       epistemicSection =
         /^(?:limitations?|confidence|uncertainty|unanswered questions?|open questions?)\b/iu.test(
           heading[1].trim(),
         );
-      chunks.push({ text: cleaned, epistemicSection: false });
+      chunks.push({
+        text: cleaned,
+        epistemicSection: false,
+        start: cleanedStart,
+        end: cleanedEnd,
+      });
       continue;
     }
+    let cursor = 0;
     for (const part of cleaned.split(/(?<=[.!?])\s+(?=[A-Z0-9“"([])/)) {
+      const found = cleaned.indexOf(part, cursor);
+      const partStart = found >= 0 ? found : cursor;
+      cursor = partStart + part.length;
       const text = part.replace(/\s+/g, " ").trim();
-      if (text) {
-        chunks.push({ text, epistemicSection });
+      if (!text) {
+        continue;
       }
+      const innerLead = /^\s*/u.exec(part)![0].length;
+      const innerTrail = /\s*$/u.exec(part)![0].length;
+      chunks.push({
+        text,
+        epistemicSection,
+        start: cleanedStart + partStart + innerLead,
+        end: cleanedStart + partStart + part.length - innerTrail,
+      });
     }
   }
   return chunks;

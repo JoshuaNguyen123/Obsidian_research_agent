@@ -722,9 +722,16 @@ import {
   type ClaimLedger,
   type ClaimPassageRef,
   type ClaimQuoteCorrection,
+  type ResearchClaim,
+  claimIdFromGroundingToken,
+  collectPassageIdsFromText,
   shouldRequireClaimGrounding,
   shouldVerifyQuoteSpansV1,
 } from "./agent/claimLedger";
+import {
+  createQuotedSpanPattern,
+  quoteAppearsVerbatim,
+} from "./agent/quoteMatch";
 import {
   acknowledgeEvidenceConflict,
   detectEvidenceConflicts,
@@ -10173,43 +10180,112 @@ export async function runAgentMission({
       ) {
         correctionAttempt += 1;
         recordFinalOutputCorrection(candidateAcceptance.missing);
-        events.onStatus?.(
-          `Writeback draft held for verification: ${candidateAcceptance.missing.join(", ")}. Requesting one correction...`,
+        // When every failure names a specific claim whose offsets still slice
+        // this exact candidate, repair those sentences in place: the model
+        // returns one line per claim id, each verified before splicing, and
+        // every untouched sentence survives byte-identical. Any other shape
+        // (document-scoped tokens, missing/stale offsets) keeps the
+        // pre-existing whole-draft regeneration.
+        const claimRepairPlan = collectClaimScopedRepairPlan(
+          candidateAcceptance.missing,
+          lastClaimLedger,
+          candidate,
         );
-        input.messages.push({
-          role: "system" as const,
-          content: buildFinalOutputVerificationCorrectionPrompt(
-            candidateAcceptance,
-            candidate,
-            activeIntentPrompt,
-            getCorrectionPassageIds(
-              acceptedWritebackPassageIds,
-              researchPlan,
-              lastClaimLedger,
-            ),
-            missionPlan,
-            missionEvidenceRecords,
-            researchPlan,
-            lastClaimLedger?.quoteCorrections ?? [],
-          ),
-        });
-        let correctedCandidate: string;
-        try {
-          correctedCandidate = await stageCandidate(true);
-        } catch (error) {
-          if (!isProviderBudgetExhaustedError(error)) throw error;
-          await finishErroredRunFromException(
-            error,
-            step,
-            maxSteps,
-            "model",
+        if (claimRepairPlan) {
+          events.onStatus?.(
+            `Writeback draft held for verification: repairing ${claimRepairPlan.repairs.length} failing claim(s) in place...`,
           );
-          return null;
+          let repairResponseText: string;
+          try {
+            const repairResponse = await emitFinalAnswer({
+              modelClient: input.modelClient,
+              messages: input.messages,
+              events: input.events,
+              enableStreaming: true,
+              fallbackContent: "",
+              finalInstruction: buildClaimScopedRepairPrompt(
+                claimRepairPlan,
+                lastClaimLedger?.quoteCorrections ?? [],
+              ),
+              metricName: "claim_scoped_repair_lines",
+              relevancePrompt: input.relevancePrompt,
+              think: input.think,
+              options: input.options,
+              abortSignal: input.abortSignal,
+              onThinkingUnsupported: input.onThinkingUnsupported,
+              deferVisibleOutput: true,
+            });
+            repairResponseText = repairResponse?.message.content ?? "";
+          } catch (error) {
+            if (!isProviderBudgetExhaustedError(error)) throw error;
+            await finishErroredRunFromException(
+              error,
+              step,
+              maxSteps,
+              "model",
+            );
+            return null;
+          }
+          const splice = spliceClaimRepairs({
+            candidate,
+            plan: claimRepairPlan,
+            responseText: repairResponseText,
+            passages: claimPassageRefs,
+            knownPassageIds: lastClaimLedger?.knownPassageIds ?? [],
+          });
+          events.onTrace?.({
+            id: `proof-gated-writeback-${step}:claim-repair-${correctionAttempt}`,
+            kind: "verification",
+            step,
+            message: `Claim-scoped repair: ${splice.applied.length} sentence(s) spliced, ${splice.dropped.length} dropped unverified.`,
+            outputPreview: {
+              applied: splice.applied,
+              dropped: splice.dropped,
+            },
+          });
+          candidate = constrainCandidatePassageScope(
+            splice.text,
+            `candidate-${correctionAttempt}`,
+          );
+        } else {
+          events.onStatus?.(
+            `Writeback draft held for verification: ${candidateAcceptance.missing.join(", ")}. Requesting one correction...`,
+          );
+          input.messages.push({
+            role: "system" as const,
+            content: buildFinalOutputVerificationCorrectionPrompt(
+              candidateAcceptance,
+              candidate,
+              activeIntentPrompt,
+              getCorrectionPassageIds(
+                acceptedWritebackPassageIds,
+                researchPlan,
+                lastClaimLedger,
+              ),
+              missionPlan,
+              missionEvidenceRecords,
+              researchPlan,
+              lastClaimLedger?.quoteCorrections ?? [],
+            ),
+          });
+          let correctedCandidate: string;
+          try {
+            correctedCandidate = await stageCandidate(true);
+          } catch (error) {
+            if (!isProviderBudgetExhaustedError(error)) throw error;
+            await finishErroredRunFromException(
+              error,
+              step,
+              maxSteps,
+              "model",
+            );
+            return null;
+          }
+          candidate = constrainCandidatePassageScope(
+            correctedCandidate,
+            `candidate-${correctionAttempt}`,
+          );
         }
-        candidate = constrainCandidatePassageScope(
-          correctedCandidate,
-          `candidate-${correctionAttempt}`,
-        );
         candidateAcceptance = requireAcceptedPassageCitationCoverage(
           getProofGatedWritebackCandidateAcceptance(
             evaluateCurrentAcceptance(candidate),
@@ -10231,10 +10307,13 @@ export async function runAgentMission({
 
       if (candidateAcceptance.status !== "pass") {
         lastFinalOutput = "";
+        // Chat gets the What/Why/Next dispatch without the raw token list —
+        // the tokens stay in Run Details (acceptance panel + traces), which
+        // renders the same formatter WITH detail.
         const message =
-          `Note writeback was not applied because proof verification is incomplete: ${
-            candidateAcceptance.missing.join(", ") || "unknown proof"
-          }. The existing note is unchanged and the run remains resumable.`;
+          `Note writeback was not applied because proof verification is incomplete. ` +
+          `${formatAcceptanceFailureCopy(candidateAcceptance.missing, { includeDetail: false })} ` +
+          `The existing note is unchanged and the run remains resumable.`;
         events.onStatus?.(message);
         emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
         await finishRun(
@@ -19835,9 +19914,9 @@ export async function runAgentMission({
           }
 
           const message =
-            `Final output was not shown because verification is incomplete: ${
-              candidateAcceptance.missing.join(", ") || "unknown proof"
-            }. The run remains resumable.`;
+            `Final output was not shown because verification is incomplete. ` +
+            `${formatAcceptanceFailureCopy(candidateAcceptance.missing, { includeDetail: false })} ` +
+            `The run remains resumable.`;
           events.onStatus?.(message);
           emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
           recordLedgerBlocker(message);
@@ -34622,6 +34701,168 @@ function isProofGatedCurrentNoteContentTool(toolName: string): boolean {
   ].includes(toolName);
 }
 
+export interface ClaimScopedRepairPlanEntry {
+  claim: ResearchClaim;
+  tokens: string[];
+  /** Verbatim current sentence bytes from the candidate. */
+  currentText: string;
+}
+
+export interface ClaimScopedRepairPlan {
+  /** Sorted descending by draftStart so splices never shift later ranges. */
+  repairs: ClaimScopedRepairPlanEntry[];
+}
+
+/**
+ * Build a per-claim repair plan, or null when only the whole-draft path is
+ * safe: any document-scoped token, any failing claim without offsets, offsets
+ * that no longer slice this exact candidate (a ledger from another draft), or
+ * overlapping ranges all disqualify. The null path is the pre-existing
+ * regenerate-everything flow, so this can only narrow blast radius.
+ */
+export function collectClaimScopedRepairPlan(
+  missing: string[],
+  ledger: ClaimLedger | null,
+  candidate: string,
+): ClaimScopedRepairPlan | null {
+  if (missing.length === 0 || !ledger) {
+    return null;
+  }
+  const byClaim = new Map<string, string[]>();
+  for (const token of missing) {
+    const claimId = claimIdFromGroundingToken(token);
+    if (!claimId) {
+      return null;
+    }
+    const tokens = byClaim.get(claimId) ?? [];
+    tokens.push(token);
+    byClaim.set(claimId, tokens);
+  }
+  const repairs: ClaimScopedRepairPlanEntry[] = [];
+  for (const [claimId, tokens] of byClaim) {
+    const claim = ledger.claims.find((item) => item.id === claimId);
+    if (
+      !claim ||
+      typeof claim.draftStart !== "number" ||
+      typeof claim.draftEnd !== "number" ||
+      claim.draftStart < 0 ||
+      claim.draftEnd > candidate.length ||
+      claim.draftEnd <= claim.draftStart
+    ) {
+      return null;
+    }
+    const currentText = candidate.slice(claim.draftStart, claim.draftEnd);
+    if (currentText.replace(/\s+/gu, " ").trim() !== claim.text) {
+      return null;
+    }
+    repairs.push({ claim, tokens, currentText });
+  }
+  repairs.sort((a, b) => b.claim.draftStart! - a.claim.draftStart!);
+  for (let index = 1; index < repairs.length; index += 1) {
+    if (repairs[index].claim.draftEnd! > repairs[index - 1].claim.draftStart!) {
+      return null;
+    }
+  }
+  return { repairs };
+}
+
+export function buildClaimScopedRepairPrompt(
+  plan: ClaimScopedRepairPlan,
+  quoteCorrections: ClaimQuoteCorrection[],
+): string {
+  const lines: string[] = [
+    "Repair ONLY the failing claim sentences listed below.",
+    "Return exactly one line per claim id, formatted `<claimId>: <corrected sentence>` — nothing else: no preamble, no headings, no unaffected text.",
+    "Each corrected sentence must keep valid citation identifiers, and any quotation must be copied character-for-character from the quotable source passages or the passage bytes shown here.",
+    "If a quotation cannot be supported, rewrite the sentence as an attributed paraphrase without quotation marks, still citing the supporting passage id.",
+  ];
+  for (const repair of plan.repairs) {
+    lines.push("");
+    lines.push(`Claim ${repair.claim.id}`);
+    lines.push(`Current sentence: ${repair.currentText}`);
+    lines.push(`Failures: ${repair.tokens.join(", ")}`);
+    for (const correction of quoteCorrections) {
+      if (correction.claimId === repair.claim.id) {
+        lines.push(
+          `Cited passage ${correction.passageId} actually reads: "${correction.passageExcerpt}"`,
+        );
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Apply model repair lines to the candidate. Every replacement is verified
+ * BEFORE splicing — cited ids must be known and quoted spans must appear
+ * verbatim in a cited (or previously bound) passage; unverifiable lines are
+ * dropped and their claims stay failing. Untouched sentences survive
+ * byte-identical, which is the entire point of this path.
+ */
+export function spliceClaimRepairs(input: {
+  candidate: string;
+  plan: ClaimScopedRepairPlan;
+  responseText: string;
+  passages: ClaimPassageRef[];
+  knownPassageIds: string[];
+}): { text: string; applied: string[]; dropped: string[] } {
+  const known = new Set(input.knownPassageIds);
+  const passageById = new Map(
+    input.passages.map((passage) => [passage.id, passage]),
+  );
+  const lines = input.responseText.split(/\r?\n/u);
+  const applied: string[] = [];
+  const dropped: string[] = [];
+  let text = input.candidate;
+  for (const repair of input.plan.repairs) {
+    const prefix = `${repair.claim.id}:`;
+    const line = lines.find((candidateLine) =>
+      candidateLine.trim().startsWith(prefix),
+    );
+    const replacement = line?.trim().slice(prefix.length).trim() ?? "";
+    if (!replacement) {
+      dropped.push(repair.claim.id);
+      continue;
+    }
+    const citedIds = collectPassageIdsFromText(replacement);
+    if (citedIds.some((id) => !known.has(id))) {
+      dropped.push(repair.claim.id);
+      continue;
+    }
+    const candidateIds =
+      citedIds.length > 0 ? citedIds : repair.claim.passageIds;
+    const quotePattern = createQuotedSpanPattern();
+    let quotesVerified = true;
+    let match: RegExpExecArray | null;
+    while ((match = quotePattern.exec(replacement)) !== null) {
+      const quote = match[1]?.replace(/\s+/gu, " ").trim();
+      if (!quote) {
+        continue;
+      }
+      const contained = candidateIds.some((id) => {
+        const passage = passageById.get(id);
+        return Boolean(
+          passage?.text && quoteAppearsVerbatim(quote, passage.text),
+        );
+      });
+      if (!contained) {
+        quotesVerified = false;
+        break;
+      }
+    }
+    if (!quotesVerified) {
+      dropped.push(repair.claim.id);
+      continue;
+    }
+    text =
+      text.slice(0, repair.claim.draftStart!) +
+      replacement +
+      text.slice(repair.claim.draftEnd!);
+    applied.push(repair.claim.id);
+  }
+  return { text, applied, dropped };
+}
+
 function isRepairableFinalOutputProof(item: string): boolean {
   return (
     item === "final_output" ||
@@ -34881,8 +35122,32 @@ function buildFinalOutputVerificationCorrectionPrompt(
         `Quote correction for ${correction.passageId}: your draft quoted "${correction.attempted}" but the cited passage actually reads: "${correction.passageExcerpt}". Copy the needed span character-for-character from that text, or cite the passage that truly contains your wording.`,
     ),
     "Return only the corrected final answer. Do not request tools or repeat this instruction.",
-    `Rejected draft for revision:\n${truncateForTrace(rejectedCandidate, 6000)}`,
+    `Rejected draft for revision:\n${formatRejectedDraftForCorrection(rejectedCandidate, 6000)}`,
   ].filter(Boolean).join("\n\n");
+}
+
+/**
+ * Bound the rejected draft for the correction prompt WITHOUT losing its tail.
+ * Head-only truncation cut exactly the sections corrections most often demand
+ * (Limitations/Confidence live at the end), so a long note was regenerated
+ * from a copy missing the parts under repair. Over the cap, keep a 60% head
+ * and 40% tail around an explicit elision marker.
+ */
+export function formatRejectedDraftForCorrection(
+  candidate: string,
+  maxChars: number,
+): string {
+  if (candidate.length <= maxChars) {
+    return candidate;
+  }
+  const headChars = Math.floor(maxChars * 0.6);
+  const tailChars = Math.floor(maxChars * 0.4);
+  const elided = candidate.length - headChars - tailChars;
+  return (
+    candidate.slice(0, headChars) +
+    `\n[... ${elided} characters elided; the head and tail above and below are verbatim ...]\n` +
+    candidate.slice(candidate.length - tailChars)
+  );
 }
 
 function getMissionLedgerStatusForStopReason(

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildClaimLedger,
+  claimIdFromGroundingToken,
   normalizeClaimLedger,
   serializeClaimLedger,
   shouldRequireClaimGrounding,
@@ -237,6 +238,63 @@ test("a quote differing only in smart quotes or spacing still verifies", () => {
     requireQuoteSpans: true,
   });
   assert.equal(ledger.status, "pass", ledger.missing.join(", "));
+});
+
+test("draft offsets slice back to each claim's sentence, and are never serialized", () => {
+  const source = fetchedSource();
+  // Bullets, CRLF line endings, and a two-sentence line in one draft.
+  const draft =
+    `## Findings\r\n` +
+    `- Quantum battery evidence compares independent laboratory sources [${source.passageId}].\r\n` +
+    `The follow-up study replicates the measurement protocol [${source.passageId}]. ` +
+    `The calibration series confirms the reported retention window [${source.passageId}].\r\n`;
+  const ledger = buildClaimLedger({
+    draft,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Research quantum batteries with cited passages.",
+  });
+  assert.ok(ledger.claims.length >= 3, `claims: ${ledger.claims.length}`);
+  for (const claim of ledger.claims) {
+    assert.equal(typeof claim.draftStart, "number");
+    assert.equal(typeof claim.draftEnd, "number");
+    const sliced = draft
+      .slice(claim.draftStart, claim.draftEnd)
+      .replace(/\s+/gu, " ")
+      .trim();
+    assert.equal(sliced, claim.text);
+  }
+  const serialized = serializeClaimLedger(ledger) as {
+    claims: Array<Record<string, unknown>>;
+  };
+  for (const claim of serialized.claims) {
+    assert.ok(!("draftStart" in claim), "draftStart must not persist");
+    assert.ok(!("draftEnd" in claim), "draftEnd must not persist");
+  }
+});
+
+test("claimIdFromGroundingToken partitions every mintable token shape", () => {
+  // One entry per push site in validateClaimGrounding. A new token shape added
+  // there without a row here (or a row misclassified) fails this table.
+  const table: Array<{ token: string; claimId: string | null }> = [
+    { token: "claim_grounding:fabricated_passage_id", claimId: null },
+    { token: "claim_grounding:missing_quote_span", claimId: null },
+    { token: "claim_grounding:ungrounded:claim:s-0123456789", claimId: "claim:s-0123456789" },
+    { token: "claim_grounding:fabricated:claim:s-abcdef0123-2", claimId: "claim:s-abcdef0123-2" },
+    { token: "claim_grounding:quote_passage:claim:1", claimId: "claim:1" },
+    { token: "claim_grounding:quote_mismatch:claim:7", claimId: "claim:7" },
+    // Document-scoped acceptance tokens from outside the ledger stay null.
+    { token: "limitations_section", claimId: null },
+    { token: "confidence_section", claimId: null },
+    { token: "verifier:final_relevance", claimId: null },
+  ];
+  for (const row of table) {
+    assert.equal(
+      claimIdFromGroundingToken(row.token),
+      row.claimId,
+      row.token,
+    );
+  }
 });
 
 test("claim ids are content-derived: stable across regeneration, changed only by edits", () => {

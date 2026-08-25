@@ -553,9 +553,24 @@ export function formatWebFetchToolFailureCopy(message?: string): string {
 }
 
 /** Prefer claim/conflict/phase copy when acceptance missing items match those gates. */
-export function formatAcceptanceFailureCopy(missing: string[]): string {
+export function formatAcceptanceFailureCopy(
+  missing: string[],
+  options: {
+    /**
+     * false renders the same What/Why/Next dispatch without the raw token
+     * list — for Chat, where `claim_grounding:ungrounded:claim:s-4f9c21ab77`
+     * is noise. Run Details keeps the default detailed form.
+     */
+    includeDetail?: boolean;
+  } = {},
+): string {
   const items = missing.map((item) => item.trim()).filter(Boolean);
-  const detail = items.length > 0 ? items.join(", ") : undefined;
+  const detail =
+    options.includeDetail === false
+      ? undefined
+      : items.length > 0
+        ? items.join(", ")
+        : undefined;
   if (items.some((item) => item.includes("claim_grounding"))) {
     return formatFailureCopy(claimGroundingFailureCopy(detail));
   }
@@ -588,9 +603,10 @@ export function formatAcceptanceFailureCopy(missing: string[]): string {
         .find(Boolean) ?? undefined;
     return formatFailureCopy(phaseGateFailureCopy(phase, detail));
   }
-  return detail
-    ? `Mission acceptance missing: ${detail}.`
-    : "Mission acceptance checks are incomplete.";
+  if (detail) {
+    return `Mission acceptance missing: ${detail}.`;
+  }
+  return "Mission acceptance checks are incomplete.";
 }
 
 export function formatModelFailureCopy(error: {
