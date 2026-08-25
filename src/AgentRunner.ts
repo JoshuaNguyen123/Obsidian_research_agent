@@ -672,6 +672,7 @@ import {
   evidenceFromReceipt,
   evidenceFromToolResult,
   claimPassagesFromToolResult,
+  formatQuotablePassagesForWriteback,
   upsertClaimPassageRefs,
 } from "./agent/missionEvidence";
 import { getFirstH1, removeFirstH1 } from "./tools/noteTitles";
@@ -10011,6 +10012,27 @@ export async function runAgentMission({
         input.messages.push({
           role: "system" as const,
           content: verifiedEvidenceContext,
+        });
+      }
+      // Claim-first quoting: show the writer the exact accepted passage BYTES
+      // it may quote, keyed by the same citation ids acceptance verifies.
+      // Summaries alone forced the model to transcribe quotes from memory,
+      // which the verbatim verifier then refused (quote-repair economy).
+      const quotablePassageContext = formatQuotablePassagesForWriteback(
+        claimPassageRefs,
+        { allowedPassageIds: acceptedWritebackPassageIds },
+      );
+      if (
+        quotablePassageContext &&
+        !input.messages.some(
+          (message) =>
+            message.role === "system" &&
+            message.content === quotablePassageContext,
+        )
+      ) {
+        input.messages.push({
+          role: "system" as const,
+          content: quotablePassageContext,
         });
       }
     }
