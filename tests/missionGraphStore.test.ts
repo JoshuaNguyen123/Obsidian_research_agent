@@ -331,6 +331,58 @@ test("fails closed on tampering, broken journal chains, and duplicate patch IDs"
   );
 });
 
+test("repeated reads of identical bytes stay isolated and re-validate on any edit", async () => {
+  // Store-record parsing is memoized on the exact markdown, because one CAS
+  // cycle otherwise re-validates the very same bytes its predecessor just
+  // validated. The memo must be indistinguishable from re-parsing.
+  const harness = createVaultHarness();
+  const graph = await createGraph("mission-store-repeat-read");
+  const written = await persistInitialMissionGraph(harness.context, graph);
+
+  const first = await readMissionGraphStoreRecord(
+    harness.context,
+    graph.missionId,
+  );
+  const second = await readMissionGraphStoreRecord(
+    harness.context,
+    graph.missionId,
+  );
+  assert.deepEqual(second?.record, written.record);
+  assert.deepEqual(second?.record, first?.record);
+
+  // A caller mutating its own record must not be able to poison a later read.
+  first!.record.graph.objective = "Mutated by a careless caller.";
+  first!.record.journal.push(...first!.record.journal);
+  const third = await readMissionGraphStoreRecord(
+    harness.context,
+    graph.missionId,
+  );
+  assert.deepEqual(third?.record, written.record);
+  assert.notEqual(third?.record.graph.objective, "Mutated by a careless caller.");
+
+  // Different bytes are a different key, so tampering after a successful read
+  // still fails closed rather than being served from the memo.
+  harness.files.set(
+    written.path,
+    harness.files.get(written.path)!.replace(
+      '"objective": "Read the trusted source."',
+      '"objective": "Tampered after a cached read."',
+    ),
+  );
+  await assert.rejects(
+    readMissionGraphStoreRecord(harness.context, graph.missionId),
+    MissionGraphStoreIntegrityError,
+  );
+
+  // Restoring the original bytes restores the original verdict.
+  harness.files.set(written.path, storeMarkdown(written.record));
+  const restored = await readMissionGraphStoreRecord(
+    harness.context,
+    graph.missionId,
+  );
+  assert.deepEqual(restored?.record, written.record);
+});
+
 test("bounds the retained journal while preserving its hash chain", async () => {
   const harness = createVaultHarness();
   let graph = await createGraph("mission-store-bounded-journal");

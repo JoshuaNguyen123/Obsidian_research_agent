@@ -31,6 +31,61 @@ const MISSION_GRAPH_STORE_BLOCK_PATTERN =
   /## Mission Graph Store\r?\n```json\r?\n[\s\S]*?\r?\n```/;
 const missionGraphStoreQueues = new WeakMap<object, Map<string, Promise<void>>>();
 
+// Parsing a store record is a pure, deterministic function of the markdown:
+// it validates the graph, re-parses every retained journal entry, and verifies
+// the record fingerprint and journal chain -- roughly 200 canonical-JSON
+// serializations plus SHA-256 digests for a full 64-entry journal. One CAS
+// cycle parses twice (the pre-write read and the post-write readback), and a
+// single tool step runs several CAS cycles, so the very same bytes were being
+// re-validated repeatedly: each cycle's opening read re-parses exactly what
+// the previous cycle's readback just parsed.
+//
+// Memoizing on the exact markdown is observably identical to re-parsing --
+// same input, same verdict, same record -- and cannot mask an integrity
+// failure, because a tampered file is different bytes and therefore a miss.
+// Entries are cloned on the way in and out so a caller mutating its record
+// can never poison the cache.
+const MISSION_GRAPH_STORE_PARSE_CACHE_MAX_ENTRIES = 8;
+const MISSION_GRAPH_STORE_PARSE_CACHE_MAX_CHARS = 16_000_000;
+const missionGraphStoreParseCache = new Map<string, MissionGraphStoreRecordV1>();
+let missionGraphStoreParseCacheChars = 0;
+
+function readParsedStoreRecordCache(
+  markdown: string,
+): MissionGraphStoreRecordV1 | null {
+  const cached = missionGraphStoreParseCache.get(markdown);
+  if (!cached) {
+    return null;
+  }
+  // Re-insert so Map iteration order stays least-recently-used first.
+  missionGraphStoreParseCache.delete(markdown);
+  missionGraphStoreParseCache.set(markdown, cached);
+  return cloneJson(cached);
+}
+
+function rememberParsedStoreRecord(
+  markdown: string,
+  record: MissionGraphStoreRecordV1,
+): void {
+  if (markdown.length > MISSION_GRAPH_STORE_PARSE_CACHE_MAX_CHARS) {
+    return;
+  }
+  missionGraphStoreParseCache.set(markdown, cloneJson(record));
+  missionGraphStoreParseCacheChars += markdown.length;
+  while (
+    missionGraphStoreParseCache.size > MISSION_GRAPH_STORE_PARSE_CACHE_MAX_ENTRIES ||
+    (missionGraphStoreParseCacheChars > MISSION_GRAPH_STORE_PARSE_CACHE_MAX_CHARS &&
+      missionGraphStoreParseCache.size > 1)
+  ) {
+    const oldest = missionGraphStoreParseCache.keys().next();
+    if (oldest.done) {
+      break;
+    }
+    missionGraphStoreParseCache.delete(oldest.value);
+    missionGraphStoreParseCacheChars -= oldest.value.length;
+  }
+}
+
 export interface MissionGraphStoreRecordV1 {
   version: typeof MISSION_GRAPH_STORE_RECORD_VERSION;
   /** Store CAS revision. This is deliberately independent of graph.revision. */
@@ -151,8 +206,14 @@ export async function parseMissionGraphStoreRecordFromMarkdown(
       "Mission graph store block is missing its JSON payload.",
     );
   }
+  const cached = readParsedStoreRecordCache(markdown);
+  if (cached) {
+    return cached;
+  }
   try {
-    return await parseMissionGraphStoreRecord(JSON.parse(json));
+    const record = await parseMissionGraphStoreRecord(JSON.parse(json));
+    rememberParsedStoreRecord(markdown, record);
+    return record;
   } catch (error) {
     if (error instanceof MissionGraphStoreIntegrityError) {
       throw error;

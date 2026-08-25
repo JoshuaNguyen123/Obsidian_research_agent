@@ -45,7 +45,40 @@ import {
 // AgentRunner both have to agree that a first-person recall question is a vault
 // question; when they disagreed, the mission was routed as chat with no vault
 // tools at all, so nothing could search and nothing could be grounded.
-import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
+//
+// That lesson applies to every predicate the two share, so the route classifier
+// imports them rather than keeping private copies. Re-inlining one here would
+// reintroduce exactly the split this module already paid for: the route and the
+// tool frontier silently deciding the same question two different ways.
+import {
+  hasBrowserAutomationIntent,
+  hasClearPageAndWriteIntent,
+  hasCurrentNoteSectionTarget,
+  hasCurrentWebFactIntent,
+  hasDeepResearchIntent,
+  hasEditIntent,
+  hasExplicitWebSearchIntent,
+  hasFetchedWebSourceIntent,
+  hasFolderContentQuestionIntent,
+  hasHtmlPreviewIntent,
+  hasLongResearchIntent,
+  hasNamedFolderTraversalIntent,
+  hasNegatedDeleteClause,
+  hasOpenWebSourceIntent,
+  hasOwnPriorThinkingRecallIntent,
+  hasPathTargetIntent,
+  hasPriorAssistantResponseWritebackIntent,
+  hasResearchMemoryReadIntent,
+  hasSectionAppendIntent,
+  hasSimpleDateTimePrompt,
+  hasSpecificFileReadIntent,
+  hasStaticGenerationIntent,
+  hasTitleOnlyIntent,
+  hasVaultBrowseIntent,
+  hasVaultContextQuestionIntent,
+  isPromptOnCurrentPageIntent,
+  isRecentAssistantWritebackFollowup,
+} from "./promptIntentClassifiers";
 import {
   classifyMissionSpeechAct,
   type ExecutionTier,
@@ -631,20 +664,6 @@ function hasSafeReflexLabel(
   );
 }
 
-function isPromptOnCurrentPageIntent(prompt: string): boolean {
-  return (
-    /\b(read|check|extract|use|answer|run|execute|follow|refer)\b[\s\S]{0,100}\b(prompt|instruction|question|task|request)\b[\s\S]{0,100}\b(?:on|from|in|as)\s+(?:the\s+)?(?:page|note|document|notepage)\b/i.test(
-      prompt,
-    ) ||
-    /\b(prompt|instruction|question|task|request)\b[\s\S]{0,100}\b(?:on|from|in)\s+(?:the\s+)?(?:page|note|document|notepage)\b/i.test(
-      prompt,
-    ) ||
-    /\b(read|check|extract|use|answer|run|execute|follow|refer)\b[\s\S]{0,120}\bnotes?\b[\s\S]{0,120}\b(?:notepage|page|note|document)\b[\s\S]{0,80}\bas\s+(?:the\s+)?prompt\b/i.test(
-      prompt,
-    )
-  );
-}
-
 function requiresCurrentNoteContent(prompt: string): boolean {
   return (
     isPromptOnCurrentPageIntent(prompt) ||
@@ -719,15 +738,6 @@ function hasTopicSearchVaultQuestionIntent(prompt: string): boolean {
   );
 }
 
-function hasVaultContextQuestionIntent(prompt: string): boolean {
-  return /\b(what\s+(did|do)\s+you\s+(learn|know|remember)\s+about\s+me|what\s+have\s+i\s+told\s+you|what\s+do\s+my\s+notes\s+say|based\s+on\s+my\s+notes|in\s+my\s+notes|across\s+my\s+notes|search\s+(my\s+)?notes|find\s+(notes?|details?|mentions?|references?)|where\s+did\s+i\s+mention|summari[sz]e\s+what\s+i\s+(know|have|wrote)|look\s+through\s+(my\s+)?vault|check\s+(my\s+)?folders?)\b/i.test(
-    prompt,
-  ) ||
-    hasOwnPriorThinkingRecallIntent(prompt) ||
-    hasFolderContentQuestionIntent(prompt) ||
-    hasGraphConnectionIntent(prompt);
-}
-
 function hasWordCountIntent(prompt: string): boolean {
   return /\b(word\s*count|count\s+(?:the\s+)?words?|how\s+many\s+words?|length\s+check|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(
     prompt,
@@ -749,12 +759,6 @@ function hasGraphConnectionIntent(prompt: string): boolean {
   return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
     intentText,
   ) && /\b(note|notes|file|files|vault|current|this|active|markdown)\b/i.test(intentText);
-}
-
-function hasOpenWebSourceIntent(prompt: string): boolean {
-  return /\b(open|view|show|launch)\b[\s\S]{0,120}\b(source|sources|link|url|web|browser|reference|citation|page)\b|\b(source|sources|link|url|web\s+page|reference|citation|page)\b[\s\S]{0,120}\b(open|view|show|launch)\b/i.test(
-    prompt,
-  );
 }
 
 function hasCodeExecutionIntent(prompt: string): boolean {
@@ -827,73 +831,13 @@ function countExplicitCodeToolNames(prompt: string): number {
   ).size;
 }
 
-function hasHtmlPreviewIntent(prompt: string): boolean {
-  return /\b(preview|render|show)\b[\s\S]{0,100}\b(html|css|web\s+page|mockup|prototype)\b|\b(html|css|web\s+page|mockup|prototype)\b[\s\S]{0,100}\b(preview|render|show)\b/i.test(
-    prompt,
-  );
-}
-
 function hasDesignIntent(prompt: string): boolean {
   return hasSharedDesignIntent(prompt);
-}
-
-function hasBrowserAutomationIntent(prompt: string): boolean {
-  return /\b(browser|web\s*acting|open\s+(?:the\s+)?page|open\s+(?:a\s+)?url|navigate|click|scroll|type\s+into|keypress|screenshot|extract\s+markdown|page\s+to\s+markdown|learn\s+(?:this\s+)?(?:page|site|workflow|game)|flash\s+game|swf)\b/i.test(
-    prompt,
-  );
-}
-
-function hasLongResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|long\s+research|in-depth\s+research|deep\s+dive|investigate|compare\s+sources|multi[-\s]?source|strategy|broad\s+constraints|evidence\s+ledger|checkpoint|long[-\s]?running)\b/i.test(
-    prompt,
-  );
 }
 
 function hasTemplateIntent(prompt: string): boolean {
   // Do not match bare "form" ("in the form of", "form a plan").
   return /\b(template|templates|templated|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i.test(
-    prompt,
-  );
-}
-
-function hasResearchMemoryReadIntent(prompt: string): boolean {
-  return /\b(research\s+memory|topic\s+memory|memory|remember|recall|long[-\s]?term|continue\s+(?:this|the)\s+research|build\s+on\s+(?:this|the)\s+research)\b/i.test(
-    prompt,
-  );
-}
-
-function hasVaultBrowseIntent(prompt: string): boolean {
-  if (/\btemplates?\b/i.test(prompt)) {
-    return false;
-  }
-  return /\b(vault|files|file names|filenames|markdown files|md files|folders|folder|directory|directories|path|paths|list|browse|inspect|where\s+this\s+note\s+belongs|placement|organize\s+(?:the\s+)?vault|across\s+files)\b/i.test(
-    prompt,
-  );
-}
-
-function hasFolderContentQuestionIntent(prompt: string): boolean {
-  return (
-    hasNamedFolderTraversalIntent(prompt) ||
-    /\b(other|all|nearby|related|vault|my)\s+(folders?|notes?|files?)\b/i.test(
-      prompt,
-    ) ||
-    /\b(folders?|vault)\b[\s\S]{0,100}\b(say|says|contain|contains|details?|contents?|report\s+back|gather|browse|locate|summari[sz]e|tell\s+me)\b/i.test(
-      prompt,
-    ) ||
-    /\b(gather|collect|read|inspect|look\s+through|browse|check|summari[sz]e|report)\b[\s\S]{0,140}\b(other\s+)?(folders?|vault|my\s+notes|notes?\s+in\s+(?:the\s+)?other\s+folders?|files?\s+in\s+(?:the\s+)?other\s+folders?)\b/i.test(
-      prompt,
-    )
-  );
-}
-
-function hasSpecificFileReadIntent(prompt: string): boolean {
-  return /(?:^|[\s"'`])[\w .@()-]+\/[\w .@()/-]+|\.md\b|\b(file named|note named|named file|named note|specific file|existing file|vault file)\b/i.test(
-    prompt,
-  );
-}
-
-function hasPathTargetIntent(prompt: string): boolean {
-  return /(?:^|[\s"'`])[\w .@()-]+\/[\w .@()/-]+|\.md\b|\b(path|folder|folders|directory|directories|vault file|vault folder|file named|note named|named file|named note|another file|specific file|existing file)\b/i.test(
     prompt,
   );
 }
@@ -906,19 +850,6 @@ function hasCurrentPageWritebackIntent(prompt: string): boolean {
     /\b(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,120}\b(stream|write|append|save|add|insert|put|record)\b/i.test(
       prompt,
     )
-  );
-}
-
-function hasCurrentNoteSectionTarget(prompt: string): boolean {
-  return /\b(?:below|under|after|beneath|inside)\b[\s\S]{0,100}\b(?:section|heading)\b|\b(?:section|heading)\b[\s\S]{0,100}\b(?:below|under|after|beneath|inside)\b/i.test(
-    prompt,
-  );
-}
-
-function hasSectionAppendIntent(prompt: string): boolean {
-  return (
-    hasCurrentNoteSectionTarget(prompt) &&
-    /\b(write|draft|compose|generate|append|add|insert|put)\b/i.test(prompt)
   );
 }
 
@@ -938,12 +869,6 @@ function hasReplaceIntent(prompt: string): boolean {
     /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\breplace\s+(?:the\s+)?existing\s+contents?\b/i.test(
       prompt,
     ) || hasClearPageAndWriteIntent(prompt)
-  );
-}
-
-function hasClearPageAndWriteIntent(prompt: string): boolean {
-  return /\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,180}\b(?:after|then)\b[\s\S]{0,120}\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
-    prompt,
   );
 }
 
@@ -981,16 +906,6 @@ function hasWholeNoteRevisionIntent(prompt: string): boolean {
     /\b(essay|draft|article|paragraphs?|body|content|document)\b|\b(?:whole|entire)\s+(?:note|page|file|markdown)\b/i.test(
       prompt,
     )
-  );
-}
-
-function hasEditIntent(prompt: string): boolean {
-  return isNamedSectionEditIntent(prompt);
-}
-
-function hasNegatedDeleteClause(clause: string): boolean {
-  return /\b(?:do\s+not|don't|never|without|avoid)\b[\s\S]{0,80}\b(?:delete|remove|trash)\b/iu.test(
-    clause,
   );
 }
 
@@ -1065,72 +980,6 @@ function hasWebSearchIntent(prompt: string): boolean {
   return /\b(research|investigate|find|gather)\b/i.test(prompt);
 }
 
-function hasPriorAssistantResponseWritebackIntent(prompt: string): boolean {
-  return /\bmost recent assistant response\b[\s\S]{0,120}\bcurrent Obsidian note\b/i.test(
-    prompt,
-  ) || isRecentAssistantWritebackFollowup(prompt);
-}
-
-function isRecentAssistantWritebackFollowup(prompt: string): boolean {
-  return /\b(write|copy|save|append|add|insert|paste|put)\b[\s\S]{0,100}\b(this|that|the|your|previous|prior|last|above)\s+(essay|answer|response|reply|summary|analysis|content|text|draft|paragraph|article|report)\b[\s\S]{0,100}\b(?:on|onto|to|into|in)\s+(?:the\s+)?(?:page|note|document|file|markdown)\b|\b(?:on|onto|to|into|in)\s+(?:the\s+)?(?:page|note|document|file|markdown)\b[\s\S]{0,100}\b(write|copy|save|append|add|insert|paste|put)\b[\s\S]{0,100}\b(this|that|the|your|previous|prior|last|above)\s+(essay|answer|response|reply|summary|analysis|content|text|draft|paragraph|article|report)\b/i.test(
-    prompt,
-  );
-}
-
-function hasFetchedWebSourceIntent(prompt: string): boolean {
-  if (
-    hasPrimaryTextCitationIntent(prompt) &&
-    !/\b(?:web|online|internet|https?:\/\/|bibliography|reference\s+list|source\s+urls?|verified\s+sources?|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
-      prompt,
-    )
-  ) {
-    return false;
-  }
-  return /\b(cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?))\b/i.test(
-    prompt,
-  );
-}
-
-function hasCurrentWebFactIntent(prompt: string): boolean {
-  return /\b(?:latest|recent|current|up[-\s]?to[-\s]?date)\b[\s\S]{0,100}\b(?:events?|news|information|info|data|facts?|research|reports?|papers?|studies?|market|markets?|industry|industries|trends?|prices?|rates?|status|versions?|law|policy|policies)\b/i.test(
-    prompt,
-  );
-}
-
-function hasDeepResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|in[-\s]?depth\s+(?:research|analysis|investigation)|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
-    prompt,
-  );
-}
-
-function hasExplicitWebSearchIntent(prompt: string): boolean {
-  if (
-    hasPrimaryTextCitationIntent(prompt) &&
-    !/\b(?:web|internet|online|search|look\s+up|browse|news|up[-\s]?to[-\s]?date|verify|fact[-\s]?check|https?:\/\/)\b/iu.test(
-      prompt,
-    )
-  ) {
-    return false;
-  }
-  return /\b(web|internet|online|search|look\s+up|browse|sources?|citations?|cited|cite|news|up[-\s]?to[-\s]?date|verify|fact[-\s]?check)\b|\b(?:latest|recent|current)\b[\s\S]{0,60}\b(events?|news|information|info|version|versions?|prices?|rates?|status|facts?|research|reports?|papers?|studies?)\b/i.test(
-    prompt,
-  );
-}
-
-function hasSimpleDateTimePrompt(prompt: string): boolean {
-  return /^\s*(?:(?:what(?:'s| is)?|tell me|give me|show me)\s+)?(?:today'?s\s+)?(?:current\s+)?(?:date|time|day)(?:\s+(?:today|now|right now))?\??\s*$/i.test(
-    prompt,
-  ) || /^\s*what\s+(?:date|time|day)\s+is\s+it(?:\s+(?:today|now|right now))?\??\s*$/i.test(
-    prompt,
-  );
-}
-
-function hasStaticGenerationIntent(prompt: string): boolean {
-  return /\b(generate|write|draft|compose|create)\b[\s\S]{0,80}\b(essay|article|paragraph|summary|brief|outline|report|note|content|post)\b|\b(essay|article|paragraph|summary|brief|outline|report)\b[\s\S]{0,80}\b\d+\s*words?\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,80}\b\d{1,5}\s*words?\b/i.test(
-    prompt,
-  );
-}
-
 function hasTitleIntent(prompt: string): boolean {
   if (/\b(retitle|rename|title|h1)\b|\bcall\s+(?:this|the)\s+note\b/i.test(prompt)) {
     return true;
@@ -1152,19 +1001,6 @@ function hasTitleIntent(prompt: string): boolean {
 
   return /\b(note|file)\b[\s\S]{0,80}\b(organize|restructure|improve)\b|\b(organize|restructure|improve)\b[\s\S]{0,80}\b(note|file)\b/i.test(
     prompt,
-  );
-}
-
-function hasTitleOnlyIntent(prompt: string): boolean {
-  return isTitleOnlyIntent(prompt);
-}
-
-function hasNamedFolderTraversalIntent(prompt: string): boolean {
-  return (
-    /\b(traverse|inspect|browse|read|look\s+through|check|summari[sz]e)\b[\s\S]{0,120}\bfolders?\b/i.test(
-      prompt,
-    ) &&
-    /\bfolders?\b[\s\S]{0,100}\b(?:named|called)\b/i.test(prompt)
   );
 }
 
