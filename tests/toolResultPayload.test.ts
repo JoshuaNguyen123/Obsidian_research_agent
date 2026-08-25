@@ -275,3 +275,114 @@ test("oversized linear description truncates honestly instead of vanishing", () 
   assert.equal(payload.output.descriptionTruncated, true);
   assert.equal(payload.truncated, true);
 });
+
+const LINEAR_ISSUE_FIXTURE_IDENTITY = {
+  id: "dc62477e-19bf-48ec-8331-16648e6c747f",
+  identifier: "APP-410",
+  title: "Dependency-Free Python CRDT Library",
+  url: "https://linear.app/example/issue/APP-410/crdt",
+};
+
+function serializeLinearIssueDescription(description: string): Record<string, any> {
+  const serialized = serializeToolResultForModel({
+    ok: true,
+    toolName: "linear_get_issue",
+    output: { ...LINEAR_ISSUE_FIXTURE_IDENTITY, description },
+  });
+  return JSON.parse(serialized) as Record<string, any>;
+}
+
+test("oversized linear description preserves the trailing signed contract byte-for-byte", () => {
+  // The mission treats the trailing fenced json block as the sole product
+  // specification. Tonight's live clip cut mid-acceptance-criterion and
+  // dropped the whole contract, forcing the model to reconstruct requirements
+  // from fragments. The prose before the contract is clipped instead.
+  const contract =
+    "```json\n" +
+    JSON.stringify(
+      {
+        workItem: "APP-410",
+        acceptanceCriteria: [
+          "GCounter merge is commutative, associative, idempotent",
+          "ORSet supports concurrent add/remove with add-wins semantics",
+        ],
+        validationRequirementKeys: ["python-unittest"],
+      },
+      null,
+      2,
+    ) +
+    "\n```\n";
+  const earlyBlock = "```json\n{\"context\": \"an earlier block that is NOT the contract\"}\n```\n";
+  const description =
+    `## Requirements\n${earlyBlock}${"requirement line\n".repeat(400)}${contract}`;
+  assert.ok(description.length > 4000);
+  const payload = serializeLinearIssueDescription(description);
+  // The trailing contract survives byte-for-byte (last fenced json block wins).
+  assert.ok(payload.output.description.endsWith(contract));
+  // The clip is explicit, honest, and placed before the preserved block.
+  assert.ok(
+    payload.output.description.includes(
+      "[... description clipped; full text in Linear ...]",
+    ),
+  );
+  assert.ok(payload.output.description.startsWith("## Requirements\n"));
+  assert.equal(payload.output.descriptionTruncated, true);
+  assert.equal(payload.truncated, true);
+});
+
+test("under-cap linear description with a contract block is untouched", () => {
+  const description =
+    "Short prose.\n\n```json\n{\"workItem\": \"APP-410\"}\n```\n";
+  const payload = serializeLinearIssueDescription(description);
+  assert.equal(payload.output.description, description);
+  assert.equal(payload.output.descriptionTruncated, undefined);
+});
+
+test("oversized linear description without a fenced json block keeps the legacy clip byte-for-byte", () => {
+  const description = "x".repeat(6000);
+  const payload = serializeLinearIssueDescription(description);
+  assert.equal(
+    payload.output.description,
+    `${"x".repeat(4000)}\n\n[truncated]`,
+  );
+  assert.equal(payload.output.descriptionTruncated, true);
+});
+
+test("prose after the trailing contract rides along inside the preserved tail", () => {
+  // Pinned behavior for a contract block that is near, but not exactly at,
+  // the end: the preserved tail runs from the last fenced json block to the
+  // end, so short acceptance notes after the contract are not clipped out
+  // from under it.
+  const contract = "```json\n{\"workItem\": \"APP-410\"}\n```";
+  const trailingProse = "\n\nAcceptance notes after the contract apply.\n";
+  const description = `${"p".repeat(6000)}${contract}${trailingProse}`;
+  const payload = serializeLinearIssueDescription(description);
+  assert.ok(payload.output.description.endsWith(`${contract}${trailingProse}`));
+  assert.ok(
+    payload.output.description.includes(
+      "[... description clipped; full text in Linear ...]",
+    ),
+  );
+  assert.equal(payload.output.descriptionTruncated, true);
+});
+
+test("a pathologically large contract tail falls back to the legacy clip", () => {
+  const contract = `\`\`\`json\n{"blob": "${"9".repeat(13000)}"}\n\`\`\``;
+  const description = `${"p".repeat(5000)}${contract}`;
+  const payload = serializeLinearIssueDescription(description);
+  assert.equal(
+    payload.output.description,
+    `${description.slice(0, 4000)}\n\n[truncated]`,
+  );
+  assert.equal(payload.output.descriptionTruncated, true);
+});
+
+test("an unterminated trailing json fence keeps the legacy clip", () => {
+  const description = `${"p".repeat(6000)}\`\`\`json\n{"open": true}\n`;
+  const payload = serializeLinearIssueDescription(description);
+  assert.equal(
+    payload.output.description,
+    `${description.slice(0, 4000)}\n\n[truncated]`,
+  );
+  assert.equal(payload.output.descriptionTruncated, true);
+});

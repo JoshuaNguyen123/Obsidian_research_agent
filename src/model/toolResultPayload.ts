@@ -15,6 +15,22 @@ const MAX_OMITTED_KEYS = 16;
 /** The issue description is the mission's product specification; 4000 chars
  * carries every observed accepted-research contract while bounding the turn. */
 const MAX_LINEAR_DESCRIPTION_CHARS = 4_000;
+/** A trailing fenced ```json contract block is preserved whole even past the
+ * description cap — missions treat it as the sole product specification, and
+ * clipping it mid-criterion forced the model to reconstruct requirements from
+ * fragments. Beyond this pathological bound we fall back to the plain clip. */
+const MAX_LINEAR_CONTRACT_TAIL_CHARS = 12_000;
+const LINEAR_DESCRIPTION_ELISION_MARKER =
+  "\n\n[... description clipped; full text in Linear ...]\n\n";
+/** Linear issue reads may legitimately carry a preserved trailing contract
+ * past the generic payload budget. Without this headroom the metadata-only
+ * fallback would drop the very contract the clip just preserved. */
+const MAX_LINEAR_ISSUE_SUMMARY_CHARS = 28_000;
+
+const LINEAR_ISSUE_TOOLS = new Set([
+  "linear_get_issue",
+  "linear_create_issue",
+]);
 const MAX_SANDBOX_PROVIDER_ITEMS = 6;
 const MAX_SANDBOX_MESSAGE_CHARS = 600;
 
@@ -44,7 +60,9 @@ export function serializeToolResultForModel(result: ToolExecutionResult): string
   const summary = summarizeToolOutput(result.toolName, result);
   const budget = FULL_CONTENT_NOTE_READ_TOOLS.has(result.toolName)
     ? MAX_CURRENT_NOTE_SUMMARY_CHARS
-    : MAX_SUMMARY_CHARS;
+    : LINEAR_ISSUE_TOOLS.has(result.toolName)
+      ? MAX_LINEAR_ISSUE_SUMMARY_CHARS
+      : MAX_SUMMARY_CHARS;
   // Compact JSON: pretty-printing spent 30-40% of the payload budget on
   // indentation, and the budget must measure what is actually sent.
   const serialized = JSON.stringify(summary);
@@ -371,10 +389,7 @@ function slimOutputForModel(
         target.state = selectFields(record.state, ["name", "type"]);
       }
       if (typeof record.description === "string") {
-        target.description = truncateText(
-          record.description,
-          MAX_LINEAR_DESCRIPTION_CHARS,
-        );
+        target.description = clipLinearDescriptionForModel(record.description);
         if (record.description.length > MAX_LINEAR_DESCRIPTION_CHARS) {
           target.descriptionTruncated = true;
           lossy = true;
@@ -457,6 +472,48 @@ function slimOutputForModel(
     omittedKeys,
     lossy,
   };
+}
+
+/**
+ * Clip an over-cap Linear issue description without destroying a trailing
+ * fenced ```json work-item contract. Missions treat that block as the sole
+ * product specification, so when the description exceeds the cap we clip the
+ * prose BEFORE the contract and keep the contract byte-for-byte, joined by an
+ * explicit elision marker. Descriptions with no complete fenced json block —
+ * or with a pathologically large contract tail — keep the legacy clip.
+ */
+function clipLinearDescriptionForModel(description: string): string {
+  if (description.length <= MAX_LINEAR_DESCRIPTION_CHARS) {
+    return description;
+  }
+  const contractTail = findTrailingLinearJsonContract(description);
+  if (contractTail === null || contractTail.length > MAX_LINEAR_CONTRACT_TAIL_CHARS) {
+    return truncateText(description, MAX_LINEAR_DESCRIPTION_CHARS);
+  }
+  const headBudget = Math.max(
+    0,
+    MAX_LINEAR_DESCRIPTION_CHARS -
+      contractTail.length -
+      LINEAR_DESCRIPTION_ELISION_MARKER.length,
+  );
+  const head = description.slice(0, headBudget);
+  return `${head}${LINEAR_DESCRIPTION_ELISION_MARKER}${contractTail}`;
+}
+
+/**
+ * The preserved tail runs from the LAST complete fenced ```json block to the
+ * end of the description: the block itself plus any short trailing prose
+ * (acceptance notes after the contract ride along rather than being clipped
+ * out from under it). Returns null when no complete fenced json block exists,
+ * or when the last ```json fence is never closed.
+ */
+function findTrailingLinearJsonContract(description: string): string | null {
+  const fenceOpen = description.lastIndexOf("```json");
+  if (fenceOpen === -1) return null;
+  const tail = description.slice(fenceOpen);
+  const fenceClose = tail.indexOf("```", "```json".length);
+  if (fenceClose === -1) return null;
+  return tail;
 }
 
 /**
