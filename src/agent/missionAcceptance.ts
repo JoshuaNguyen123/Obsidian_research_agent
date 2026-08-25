@@ -185,6 +185,7 @@ export function evaluateMissionAcceptance(
     evidence: input.evidence,
     finalOutput: input.finalOutput,
     conflicts: input.conflicts,
+    missionPrompt: input.prompt,
   });
   for (const item of researchAcceptance.missing) {
     missing.add(item);

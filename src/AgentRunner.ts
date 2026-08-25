@@ -813,6 +813,7 @@ import {
   createResearchPlanWithAssist,
   formatResearchPlanForPrompt,
   parseExplicitResearchSourceCount,
+  promptForbidsFetchedSourceWriteback,
   type ResearchEffortAssessment,
   type ResearchEffortAssist,
   type ResearchModeAssessment,
@@ -34673,10 +34674,6 @@ function getStreamingWritebackToolName(
     : kind === "replace"
       ? "replace_current_file"
       : "edit_current_section";
-}
-
-export function promptForbidsFetchedSourceWriteback(missionPrompt: string): boolean {
-  return /\bdo not use web\b/iu.test(missionPrompt);
 }
 
 export function requiresVerifiedFinalOutput(

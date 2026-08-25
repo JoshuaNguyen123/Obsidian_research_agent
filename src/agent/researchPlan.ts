@@ -660,12 +660,14 @@ export function evaluateResearchAcceptance({
   evidence,
   finalOutput,
   conflicts,
+  missionPrompt,
 }: {
   plan: ResearchPlan | null | undefined;
   evidence: ResearchEvidence[];
   finalOutput?: string;
   /** Optional passage/claim conflicts; open conflicts block hybrid/deep acceptance. */
   conflicts?: EvidenceConflict[] | null;
+  missionPrompt?: string;
 }): ResearchAcceptanceFinding {
   if (!plan || plan.mode === "none") {
     return { missing: [], reasons: [] };
@@ -755,7 +757,11 @@ export function evaluateResearchAcceptance({
       missing.add("confidence_section");
     }
 
-    const uncitedSubquestions = evaluatedPlan.subquestions
+    const uncitedSubquestions = promptForbidsFetchedSourceWriteback(
+      missionPrompt ?? "",
+    )
+      ? []
+      : evaluatedPlan.subquestions
       .filter((item) => item.status === "complete")
       .filter((item) => Math.max(0, item.minEvidence) > 0)
       .filter((item) => {
@@ -1745,6 +1751,11 @@ function hasDeepWebResearchIntent(prompt: string): boolean {
 
 function hasExplicitWebSignal(prompt: string): boolean {
   return /\b(web|online|internet|sources?|citations?|cited|cite|reference\s+list|bibliography|latest|recent|current(?!\s+(?:note|file|page)\b)|news|up[-\s]?to[-\s]?date|verify|fact[-\s]?check)\b/i.test(prompt);
+}
+
+/** Vault-only soak / "Do not use web" is not a fetched-source writeback contract. */
+export function promptForbidsFetchedSourceWriteback(prompt: string): boolean {
+  return /\bdo not use web\b/iu.test(prompt);
 }
 
 function hasDeepVaultResearchIntent(prompt: string): boolean {
