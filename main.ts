@@ -2314,9 +2314,23 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     settings.autoResumeOvernightRuns =
       settings.autoResumeOvernightRuns !== false;
-    // Default off: unfinished-run Chat banner must not nag on every Obsidian open.
+    // Default on: unfinished-run Chat banner when a resumable run exists.
+    // Persisted explicit false stays off; dismiss is per-run via the mission ledger.
     settings.showUnfinishedRunBannerOnOpen =
-      settings.showUnfinishedRunBannerOnOpen === true;
+      settings.showUnfinishedRunBannerOnOpen !== false;
+    settings.runRetentionDays = clampIntegerSetting(
+      settings.runRetentionDays,
+      0,
+      3650,
+      DEFAULT_SETTINGS.runRetentionDays ?? 30,
+    );
+    settings.runRetentionMaxRuns = clampIntegerSetting(
+      settings.runRetentionMaxRuns,
+      0,
+      10000,
+      DEFAULT_SETTINGS.runRetentionMaxRuns ?? 200,
+    );
+    settings.modelFallbackEnabled = settings.modelFallbackEnabled === true;
     settings.keepAwakeDuringOvernightRuns =
       settings.keepAwakeDuringOvernightRuns === true;
     settings.orchestratorEnabled =

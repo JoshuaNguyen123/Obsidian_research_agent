@@ -97,6 +97,12 @@ export interface NormalizableAgentSettings {
   overnightMaxSegments?: number;
   autoResumeOvernightRuns?: boolean;
   showUnfinishedRunBannerOnOpen?: boolean;
+  /** Days to keep Agent Runs. 0 disables the time sweep. */
+  runRetentionDays?: number;
+  /** Max Agent Runs to keep. 0 disables the cap. */
+  runRetentionMaxRuns?: number;
+  /** Opt-in model fallback on provider outage. Default off. */
+  modelFallbackEnabled?: boolean;
   keepAwakeDuringOvernightRuns?: boolean;
   orchestratorPreviewEnabled?: boolean;
   orchestratorEnabled?: boolean;
@@ -184,7 +190,10 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   overnightRunHours: 10,
   overnightMaxSegments: 24,
   autoResumeOvernightRuns: true,
-  showUnfinishedRunBannerOnOpen: false,
+  showUnfinishedRunBannerOnOpen: true,
+  runRetentionDays: 30,
+  runRetentionMaxRuns: 200,
+  modelFallbackEnabled: false,
   keepAwakeDuringOvernightRuns: false,
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,
@@ -302,6 +311,18 @@ export function normalizeAgentSettings(
   merged.githubEnabled = merged.githubEnabled === true;
   merged.githubOAuthClientId = normalizeGitHubOAuthClientIdSetting(
     merged.githubOAuthClientId,
+  );
+  merged.showUnfinishedRunBannerOnOpen =
+    merged.showUnfinishedRunBannerOnOpen !== false;
+  merged.autoResumeOvernightRuns = merged.autoResumeOvernightRuns !== false;
+  merged.modelFallbackEnabled = merged.modelFallbackEnabled === true;
+  merged.runRetentionDays = coerceNonNegativeInteger(
+    merged.runRetentionDays,
+    BASE_DEFAULTS.runRetentionDays ?? 30,
+  );
+  merged.runRetentionMaxRuns = coerceNonNegativeInteger(
+    merged.runRetentionMaxRuns,
+    BASE_DEFAULTS.runRetentionMaxRuns ?? 200,
   );
 
   // Schema 5 gives the second agent an explicit model slot and connection
@@ -584,6 +605,14 @@ function coerceBoolean(value: unknown, fallback: boolean): boolean {
     return value;
   }
   return fallback;
+}
+
+function coerceNonNegativeInteger(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.trunc(parsed);
 }
 
 function normalizeOptionalString(value: unknown): string {

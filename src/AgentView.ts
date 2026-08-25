@@ -1245,8 +1245,8 @@ export class AgentView extends ItemView {
     this.resumeBannerEl.addClass("is-hidden");
     this.resumeBannerEl.hide();
 
-    // Default off: do not nag on every Obsidian / panel open.
-    if (this.plugin.settings.showUnfinishedRunBannerOnOpen !== true) {
+    // Default on: show when a resumable run exists. Persisted explicit false stays off.
+    if (this.plugin.settings.showUnfinishedRunBannerOnOpen === false) {
       return;
     }
 
