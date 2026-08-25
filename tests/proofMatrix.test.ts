@@ -149,7 +149,7 @@ test("an empty scorecard harvest is not a matrix-stopping failure", () => {
 });
 
 test("attempt logs live outside Playwright's wiped test-results directory", () => {
-  const normalized = ATTEMPT_LOG_DIR.replaceAll("\\", "/");
+  const normalized = ATTEMPT_LOG_DIR.split("\\").join("/");
   assert.match(normalized, /\/docs\/eval\/proof-matrix-logs$/u);
   assert.equal(normalized.includes("/test-results/"), false);
 });
