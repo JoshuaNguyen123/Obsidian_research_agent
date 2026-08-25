@@ -12,16 +12,97 @@ export function laneHasScorecardBaselineFrom(
   baseline: { records?: unknown } | null | undefined,
   project: string,
 ): boolean;
+export const CLASSIFICATION_CONFIRMED: "confirmed";
+export const CLASSIFICATION_MECHANICAL: "mechanical";
+export const CLASSIFICATION_UNCLASSIFIED: "unclassified";
+export type ClassificationConfidence =
+  | "confirmed"
+  | "mechanical"
+  | "unclassified";
+export function collectMechanicalFailureClasses(logText: string): string[];
 export function classifyAttemptOutcome(input: {
   exitCode: number;
   summary?: unknown;
   summaryFresh?: boolean;
   logText?: string;
-}): { failureClass: string; detail: string };
+}): {
+  failureClass: string;
+  detail: string;
+  confidence: ClassificationConfidence;
+  secondaryClasses: string[];
+};
+export const LEGACY_RUN_CSV_HEADER: string;
+export const RUN_CSV_HEADER: string;
+export function upgradeRunCsvHeader(
+  text: string,
+  header?: string,
+): string | null;
+export const TOOL_EVENT_SOURCE_SUMMARY: "summary";
+export const TOOL_EVENT_SOURCE_GRAPHS: "graphs";
+export const TOOL_EVENT_SOURCE_NONE: "none";
+export interface SummaryToolEventTotals {
+  observed: number;
+  failed: number | null;
+  vacuous: number | null;
+  intentionalNoOp: number | null;
+  buckets: Record<string, number>;
+}
+export function summaryToolEventTotals(
+  summary: unknown,
+): SummaryToolEventTotals | null;
+export interface AttemptToolEvents {
+  source: "summary" | "graphs" | "none";
+  observed: number | null;
+  failed: number | null;
+  vacuous: number | null;
+  intentionalNoOp: number | null;
+  succeeded: number | null;
+  buckets: Record<string, number> | null;
+}
+export function resolveAttemptToolEvents(input: {
+  summary?: unknown;
+  summaryFresh?: boolean;
+  minedCounts?: {
+    observed: number;
+    failed: number;
+    buckets: Record<string, number> | null;
+  } | null;
+}): AttemptToolEvents;
 export function attemptLogExcerpt(
   logText: string,
   endIndex?: number | null,
 ): string;
+export function attemptLogExcerptFrom(
+  logText: string,
+  startIndex?: number,
+): string;
+export const LANE_ASSERTION_FAILURE_CLASS: string;
+export const RENDERER_DEATH_FAILURE_CLASS: string;
+export const PROOF_MATRIX_STATE_RELATIVE_DIR: string;
+export const PROOF_MATRIX_MANIFEST_RELATIVE_PATH: string;
+export const PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR: string;
+export const LEGACY_MANIFEST_RELATIVE_PATH: string;
+export function writeJsonAtomic(filePath: string, value: unknown): void;
+export function migrateLegacyManifestFile(
+  legacyPath: string,
+  newPath: string,
+): boolean;
+export const IN_FLIGHT_FAILURE_CLASS: string;
+export interface ProofMatrixInFlight {
+  cell: string;
+  project?: string;
+  attempt?: number;
+  startedAt?: string | null;
+  [key: string]: unknown;
+}
+export function markAttemptInFlight(
+  manifest: ProofMatrixManifest,
+  marker: ProofMatrixInFlight,
+): void;
+export function clearAttemptInFlight(manifest: ProofMatrixManifest): void;
+export function reconcileInFlightAttempt(
+  manifest: ProofMatrixManifest,
+): ProofMatrixAttempt | null;
 export function isEmptyScorecardHarvestOutput(output: string): boolean;
 
 export interface ProofMatrixAttempt {
@@ -34,6 +115,7 @@ export interface ProofMatrixManifest {
   attempts: ProofMatrixAttempt[];
   productClassCounts: Record<string, number>;
   harnessFailureCounts?: Record<string, number>;
+  inFlight?: unknown;
   [key: string]: unknown;
 }
 export const MAX_CONSECUTIVE_HARNESS_FAILURES: number;

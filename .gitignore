@@ -63,6 +63,10 @@ skills/
 [Mm][Ee][Mm][Oo][Rr][Yy].md
 *.local.md
 
+# Proof-matrix durable campaign state (must NOT live in test-results/,
+# which Playwright wipes at every attempt start)
+/proof-matrix-state/
+
 # Playwright
 /test-results/
 /playwright-report/

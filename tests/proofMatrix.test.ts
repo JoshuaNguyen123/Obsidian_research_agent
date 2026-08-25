@@ -1,14 +1,39 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { PLAYWRIGHT_PROJECTS } from "../scripts/run-e2e-exclusive.mjs";
 import {
   ATTEMPT_LOG_DIR,
   CELLS,
+  CLASSIFICATION_CONFIRMED,
+  CLASSIFICATION_MECHANICAL,
+  CLASSIFICATION_UNCLASSIFIED,
+  IN_FLIGHT_FAILURE_CLASS,
+  LANE_ASSERTION_FAILURE_CLASS,
+  LEGACY_RUN_CSV_HEADER,
+  RUN_CSV_HEADER,
+  TOOL_EVENT_SOURCE_GRAPHS,
+  TOOL_EVENT_SOURCE_NONE,
+  TOOL_EVENT_SOURCE_SUMMARY,
+  collectMechanicalFailureClasses,
+  resolveAttemptToolEvents,
+  summaryToolEventTotals,
+  upgradeRunCsvHeader,
+  LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
+  PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR,
+  PROOF_MATRIX_MANIFEST_RELATIVE_PATH,
+  PROOF_MATRIX_STATE_RELATIVE_DIR,
+  RENDERER_DEATH_FAILURE_CLASS,
   attemptConsumesBudget,
   attemptLogExcerpt,
+  attemptLogExcerptFrom,
   classifyAttemptOutcome,
+  clearAttemptInFlight,
   consecutiveGreens,
   consecutiveHarnessFailures,
   consumedAttemptCount,
@@ -16,8 +41,12 @@ import {
   isEmptyScorecardHarvestOutput,
   isInfrastructureFailureClass,
   laneHasScorecardBaselineFrom,
+  markAttemptInFlight,
+  migrateLegacyManifestFile,
   porcelainWithoutAllowedHarvest,
+  reconcileInFlightAttempt,
   registerProductFailure,
+  writeJsonAtomic,
   type ProofMatrixAttempt,
   type ProofMatrixManifest,
 } from "../scripts/run-proof-matrix.mjs";
@@ -160,7 +189,12 @@ test("a stale run summary must not classify a later attempt", () => {
 test("green attempts classify as none and unknown reds stay matrix_unclassified", () => {
   assert.deepEqual(
     classifyAttemptOutcome({ exitCode: 0, summaryFresh: false, logText: "" }),
-    { failureClass: "none", detail: "" },
+    {
+      failureClass: "none",
+      detail: "",
+      confidence: CLASSIFICATION_CONFIRMED,
+      secondaryClasses: [],
+    },
   );
   const unknown = classifyAttemptOutcome({
     exitCode: 1,
@@ -169,6 +203,8 @@ test("green attempts classify as none and unknown reds stay matrix_unclassified"
   });
   assert.equal(unknown.failureClass, "process:matrix_unclassified");
   assert.match(unknown.detail, /something nobody anticipated/u);
+  assert.equal(unknown.confidence, CLASSIFICATION_UNCLASSIFIED);
+  assert.deepEqual(unknown.secondaryClasses, []);
 });
 
 test("attempt log excerpt keeps the lines around the failure and stays bounded", () => {
@@ -286,8 +322,452 @@ test("an empty scorecard harvest is not a matrix-stopping failure", () => {
   );
 });
 
-test("attempt logs live outside Playwright's wiped test-results directory", () => {
-  const normalized = ATTEMPT_LOG_DIR.split("\\").join("/");
-  assert.match(normalized, /\/docs\/eval\/proof-matrix-logs$/u);
-  assert.equal(normalized.includes("/test-results/"), false);
+// ---------------------------------------------------------------------------
+// Durable campaign state (2026-08-25 defect A): the manifest and attempt logs
+// must live OUTSIDE test-results/, which Playwright wipes at attempt start.
+// ---------------------------------------------------------------------------
+
+test("durable state lives outside the Playwright-wiped tree", () => {
+  assert.equal(PROOF_MATRIX_STATE_RELATIVE_DIR, "proof-matrix-state");
+  assert.ok(
+    PROOF_MATRIX_MANIFEST_RELATIVE_PATH.startsWith(`${PROOF_MATRIX_STATE_RELATIVE_DIR}/`),
+    "manifest must live inside the durable state dir",
+  );
+  assert.ok(
+    PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR.startsWith(`${PROOF_MATRIX_STATE_RELATIVE_DIR}/`),
+    "attempt logs must live inside the durable state dir",
+  );
+  assert.doesNotMatch(PROOF_MATRIX_MANIFEST_RELATIVE_PATH, /test-results/u);
+  assert.doesNotMatch(PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR, /test-results/u);
+  // Backward compat: the migration source is exactly the old wiped location.
+  assert.equal(LEGACY_MANIFEST_RELATIVE_PATH, "test-results/proof-matrix-manifest.json");
+});
+
+test("the durable state dir is gitignored (exact-HEAD clean checks must not see it)", () => {
+  const gitignore = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".gitignore"),
+    "utf8",
+  );
+  assert.match(gitignore, /^\/proof-matrix-state\/$/mu);
+});
+
+function tempDir(): string {
+  return mkdtempSync(path.join(tmpdir(), "proof-matrix-test-"));
+}
+
+test("writeJsonAtomic uses temp-then-rename and leaves no torn or temp files", () => {
+  const dir = tempDir();
+  try {
+    const target = path.join(dir, "nested", "manifest.json");
+    writeJsonAtomic(target, { attempts: [1, 2, 3] });
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { attempts: [1, 2, 3] });
+    // Overwrite must succeed via rename (Windows MOVEFILE_REPLACE_EXISTING).
+    writeJsonAtomic(target, { attempts: [] });
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { attempts: [] });
+    const residue = readdirSync(path.dirname(target)).filter((name) => name.includes(".tmp"));
+    assert.deepEqual(residue, [], "no temp file may remain after a completed write");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy manifest in test-results/ migrates once and never clobbers durable state", () => {
+  const dir = tempDir();
+  try {
+    const legacyPath = path.join(dir, "test-results", "proof-matrix-manifest.json");
+    const newPath = path.join(dir, "proof-matrix-state", "proof-matrix-manifest.json");
+    // Nothing anywhere: no migration.
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), false);
+    // Legacy exists, durable does not: migrate (copy) and report it.
+    writeJsonAtomic(legacyPath, { expectedHead: "abc", attempts: [{ cell: "vault-recall" }] });
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), true);
+    assert.deepEqual(JSON.parse(readFileSync(newPath, "utf8")), {
+      expectedHead: "abc",
+      attempts: [{ cell: "vault-recall" }],
+    });
+    // Durable now exists: a second call must not re-migrate or overwrite.
+    writeFileSync(legacyPath, JSON.stringify({ expectedHead: "SHOULD-NOT-WIN" }));
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), false);
+    assert.equal(JSON.parse(readFileSync(newPath, "utf8")).expectedHead, "abc");
+    // A torn/unparseable legacy file migrates nothing.
+    rmSync(newPath);
+    writeFileSync(legacyPath, '{"expectedHead": "torn-mid-wri');
+    assert.equal(migrateLegacyManifestFile(legacyPath, newPath), false);
+    assert.equal(existsSync(newPath), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// In-flight attempt marker: persisted BEFORE launch so a mid-attempt runner
+// death is visible and resumable instead of silently restarting from zero.
+// ---------------------------------------------------------------------------
+
+test("a mid-attempt death reconciles as a budget-exempt harness attempt on resume", () => {
+  const manifest = manifestWith([
+    green("vault-recall"),
+    green("vault-recall"),
+  ]);
+  markAttemptInFlight(manifest, {
+    cell: "vault-recall",
+    project: "real-ai-soak",
+    attempt: 3,
+    startedAt: "2026-08-25T04:00:00.000Z",
+  });
+  assert.deepEqual(manifest.inFlight, {
+    cell: "vault-recall",
+    project: "real-ai-soak",
+    attempt: 3,
+    startedAt: "2026-08-25T04:00:00.000Z",
+  });
+  const reconciled = reconcileInFlightAttempt(manifest);
+  assert.ok(reconciled);
+  assert.equal(reconciled.cell, "vault-recall");
+  assert.equal(reconciled.attempt, 3);
+  assert.equal(reconciled.green, false);
+  assert.equal(reconciled.failureClass, IN_FLIGHT_FAILURE_CLASS);
+  assert.equal(reconciled.interrupted, true);
+  assert.equal(manifest.inFlight, undefined, "marker must be cleared after reconciliation");
+  // The death is infrastructure: it spends no budget and preserves the streak.
+  assert.equal(isInfrastructureFailureClass(IN_FLIGHT_FAILURE_CLASS), true);
+  assert.equal(attemptConsumesBudget(reconciled), false);
+  assert.equal(consecutiveGreens(manifest, "vault-recall"), 2);
+  assert.equal(consumedAttemptCount(manifest, "vault-recall"), 2);
+  assert.equal(harnessFailureCount(manifest, "vault-recall"), 1);
+  assert.deepEqual(manifest.harnessFailureCounts, { "vault-recall": 1 });
+  // But it does feed the consecutive-harness safety valve.
+  assert.equal(consecutiveHarnessFailures(manifest, "vault-recall"), 1);
+});
+
+test("reconciliation is a no-op without a marker and tolerates a malformed one", () => {
+  const clean = manifestWith([green("code-delivery")]);
+  assert.equal(reconcileInFlightAttempt(clean), null);
+  assert.equal(clean.attempts.length, 1);
+  const malformed = manifestWith([]);
+  malformed.inFlight = { notACell: true };
+  assert.equal(reconcileInFlightAttempt(malformed), null);
+  assert.equal(malformed.inFlight, undefined, "malformed marker must still be cleared");
+  assert.equal(malformed.attempts.length, 0);
+  // clearAttemptInFlight is what a completed attempt calls.
+  const finished = manifestWith([]);
+  markAttemptInFlight(finished, { cell: "x", project: "p", attempt: 1, startedAt: null });
+  clearAttemptInFlight(finished);
+  assert.equal(finished.inFlight, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Exit-1-without-summary classification (2026-08-25 defect B): parse the
+// captured attempt log instead of giving up as process:matrix_unclassified.
+// ---------------------------------------------------------------------------
+
+test("a renderer/target-closed death classifies as harness:renderer_death", () => {
+  const logText = [
+    "Running 1 test using 1 worker",
+    "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts:41:5 › deep vault retrieval ─────",
+    "    Error: page.waitForSelector: Target page, context or browser has been closed",
+    "        at e2e/real-ai-soak.spec.ts:58:20",
+    "  1 failed",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 1, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, RENDERER_DEATH_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, "harness:renderer_death");
+  assert.match(outcome.detail, /Target page, context or browser has been closed/u);
+  // Renderer deaths are infrastructure — budget-exempt like other harness:*.
+  assert.equal(isInfrastructureFailureClass(outcome.failureClass), true);
+});
+
+test("a lane assertion in the log classifies as lane_assertion_failed with the excerpt", () => {
+  const logText = [
+    "Running 1 test using 1 worker",
+    "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts:41:5 › deep vault retrieval ─────",
+    "    Error: expect(received).toContain(expected)",
+    '    Expected substring: "semantic expansion"',
+    '    Received string: "Mission stopped before acceptance"',
+    "  1 failed",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 1, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, "lane_assertion_failed");
+  assert.match(outcome.detail, /expect\(received\)\.toContain/u);
+  assert.match(outcome.detail, /Mission stopped before acceptance/u);
+  // Deliberately NOT model:/product: (cannot be decided mechanically) and NOT
+  // infrastructure: it consumes budget and resets the streak like a real red.
+  assert.equal(isInfrastructureFailureClass(outcome.failureClass), false);
+  assert.equal(
+    attemptConsumesBudget(red("vault-recall", outcome.failureClass)),
+    true,
+  );
+  assert.equal(registerProductFailure(manifestWith([]), outcome.failureClass), false);
+});
+
+test("test timeouts and bare failing-test headers also classify as lane_assertion_failed", () => {
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summaryFresh: false,
+      logText: "  Test timeout of 600000ms exceeded.\n  1 failed\n",
+    }).failureClass,
+    LANE_ASSERTION_FAILURE_CLASS,
+  );
+  const headerOnly = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText:
+      "  1) [interrupted-continuation-live] › e2e/interrupted-continuation-live.spec.ts:92:3 › resumes ─\n" +
+      "    Mission stopped before acceptance\n",
+  });
+  assert.equal(headerOnly.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.match(headerOnly.detail, /Mission stopped before acceptance/u);
+});
+
+test("pre-Playwright harness deaths keep their exact classification, whatever else the log holds", () => {
+  // A build-stage death whose log ALSO happens to contain assertion-looking
+  // text must still classify as the harness stage that actually died.
+  const logText = [
+    "tests/example.test.ts(1,1): error TS2345: Error: expect( mention in a compiler string",
+    "build exited with code 2.",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 2, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, "harness:build_failed");
+  // And a fresh run-summary proof class still outranks all log parsing.
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summary: { records: [{ proofClass: "product:writeback_unproven" }] },
+      summaryFresh: true,
+      logText: "Error: expect(received).toBe(expected)\nTarget closed\n",
+    }).failureClass,
+    "product:writeback_unproven",
+  );
+});
+
+test("attemptLogExcerptFrom reads forward from the match and stays bounded", () => {
+  const lines = [
+    "noise before",
+    "    Error: expect(received).toBe(expected)",
+    "    Expected: 2",
+    "    Received: 1",
+    ...Array.from({ length: 30 }, (_, i) => `    trailing ${i}`),
+  ];
+  const text = lines.join("\n");
+  const excerpt = attemptLogExcerptFrom(text, text.indexOf("Error: expect"));
+  assert.match(excerpt, /Error: expect/u);
+  assert.match(excerpt, /Received: 1/u);
+  assert.doesNotMatch(excerpt, /noise before/u);
+  assert.ok(excerpt.length <= 1_000);
+  assert.equal(attemptLogExcerptFrom(""), "");
+});
+
+// ---------------------------------------------------------------------------
+// Success/uncertainty wave (2026-08-25): appended CSV columns, tool-event
+// source precedence, unknown-vs-zero, secondary classes, and confidence.
+// ---------------------------------------------------------------------------
+
+test("new CSV columns are APPENDED - the legacy header survives as an exact prefix", () => {
+  // Readers index existing columns by position/name; reordering would corrupt
+  // every one of them. The new schema must start with the old one, verbatim.
+  assert.ok(
+    RUN_CSV_HEADER.startsWith(`${LEGACY_RUN_CSV_HEADER},`),
+    "legacy header must be an exact comma-prefix of the new header",
+  );
+  const appended = RUN_CSV_HEADER.slice(LEGACY_RUN_CSV_HEADER.length + 1).split(",");
+  assert.deepEqual(appended, [
+    "tool_events_source",
+    "tool_calls_succeeded",
+    "pct_tool_calls_succeeded",
+    "secondary_failure_classes",
+    "classification_confidence",
+    "tool_calls_vacuous",
+  ]);
+});
+
+test("upgradeRunCsvHeader rewrites only a legacy header line and never touches rows", () => {
+  const rows =
+    "2026-08-23T19:26:25Z,byok-autonomous-journey,deepseek-v4-pro,8e934f9,1286,red,product:x,,,,,,,,,2,,playwright_error_payload,notes\n" +
+    '2026-08-24T00:35:00Z,lane,"model, with comma",abc1234,10,green,none,,47,45,95.7,1,44,0,0,0,0,src,"quoted ""notes"""\n';
+  const legacyText = `${LEGACY_RUN_CSV_HEADER}\n${rows}`;
+  const upgraded = upgradeRunCsvHeader(legacyText);
+  assert.ok(upgraded);
+  assert.ok(upgraded.startsWith(`${RUN_CSV_HEADER}\n`));
+  // Old rows stay byte-for-byte identical (shorter than the header - readers
+  // must treat the missing trailing cells as blank/unknown).
+  assert.equal(upgraded.slice(RUN_CSV_HEADER.length + 1), rows);
+  // Already-current headers and unrecognized files are left alone.
+  assert.equal(upgradeRunCsvHeader(`${RUN_CSV_HEADER}\n${rows}`), null);
+  assert.equal(upgradeRunCsvHeader("some,other,csv\n1,2,3\n"), null);
+  assert.equal(upgradeRunCsvHeader(""), null);
+  // A header-only legacy file still upgrades.
+  assert.equal(upgradeRunCsvHeader(`${LEGACY_RUN_CSV_HEADER}\n`), `${RUN_CSV_HEADER}\n`);
+});
+
+test("a fresh run summary outranks graph mining as the tool-event source", () => {
+  const summary = {
+    records: [
+      { toolCalls: 40, toolCallsFailed: 3, toolCallsVacuous: 1 },
+      { toolCalls: 3, toolCallsFailed: 0, toolCallsVacuous: 0 },
+    ],
+  };
+  const minedCounts = { observed: 12, failed: 2, buckets: { tool_not_allowed: 2 } };
+  const events = resolveAttemptToolEvents({ summary, summaryFresh: true, minedCounts });
+  assert.equal(events.source, TOOL_EVENT_SOURCE_SUMMARY);
+  assert.equal(events.observed, 43);
+  assert.equal(events.failed, 3);
+  assert.equal(events.vacuous, 1);
+  // Succeeded excludes BOTH failed and (known) vacuous calls.
+  assert.equal(events.succeeded, 39);
+  // A stale summary must never label a later attempt: graphs win instead.
+  const stale = resolveAttemptToolEvents({ summary, summaryFresh: false, minedCounts });
+  assert.equal(stale.source, TOOL_EVENT_SOURCE_GRAPHS);
+  assert.equal(stale.observed, 12);
+  assert.equal(stale.failed, 2);
+  assert.equal(stale.succeeded, 10);
+  // Graph nodes carry no receipts, so graphs can never claim a vacuous count.
+  assert.equal(stale.vacuous, null);
+});
+
+test("unknown is never collapsed into zero: explicit summary zeros vs no source at all", () => {
+  // A fresh summary that SAID zero is an explicit zero.
+  const zeroSummary = {
+    records: [{ toolCalls: 0, toolCallsFailed: 0, toolCallsVacuous: 0 }],
+  };
+  const explicitZero = resolveAttemptToolEvents({
+    summary: zeroSummary,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(explicitZero.source, TOOL_EVENT_SOURCE_SUMMARY);
+  assert.equal(explicitZero.observed, 0);
+  assert.equal(explicitZero.failed, 0);
+  assert.equal(explicitZero.succeeded, 0);
+  // No summary and an empty mine: green lanes DELETE their run-owned graphs,
+  // so zero mined events is absence of evidence, not evidence of zero.
+  const nothing = resolveAttemptToolEvents({
+    summary: null,
+    summaryFresh: false,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(nothing.source, TOOL_EVENT_SOURCE_NONE);
+  assert.equal(nothing.observed, null);
+  assert.equal(nothing.failed, null);
+  assert.equal(nothing.vacuous, null);
+  assert.equal(nothing.succeeded, null);
+  assert.equal(nothing.buckets, null);
+});
+
+test("a summary that counts calls but not failures reports observed with failed unknown", () => {
+  // Today's specs feed toolCalls from missionEvidence lengths (successful
+  // calls only) and cannot distinguish failures: toolCallsFailed is null.
+  const summary = { records: [{ toolCalls: 43, toolCallsFailed: null }] };
+  const events = resolveAttemptToolEvents({
+    summary,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(events.source, TOOL_EVENT_SOURCE_SUMMARY);
+  assert.equal(events.observed, 43);
+  assert.equal(events.failed, null);
+  assert.equal(events.succeeded, null, "succeeded must stay unknown when failed is unknown");
+  assert.equal(events.vacuous, null);
+});
+
+test("summaryToolEventTotals sums refusal buckets and keeps partial knowledge a lower bound", () => {
+  const totals = summaryToolEventTotals({
+    records: [
+      {
+        toolCalls: 10,
+        toolCallsFailed: 2,
+        refusalBuckets: { mission_graph_authority_blocked: 2, bogus_bucket: 9 },
+      },
+      { toolCalls: 5, toolCallsFailed: null, refusalBuckets: null },
+      { toolCalls: 1, toolCallsFailed: 1, refusalBuckets: { tool_not_allowed: 1 } },
+    ],
+  });
+  assert.ok(totals);
+  assert.equal(totals.observed, 16);
+  // 2 + (unknown, skipped) + 1: a lower bound, not a fake zero for record 2.
+  assert.equal(totals.failed, 3);
+  assert.equal(totals.vacuous, null, "no record knew vacuous - the total is unknown");
+  assert.equal(totals.buckets.mission_graph_authority_blocked, 2);
+  assert.equal(totals.buckets.tool_not_allowed, 1);
+  assert.equal("bogus_bucket" in totals.buckets, false, "unknown bucket keys are dropped");
+  // No records: nothing to speak for the attempt.
+  assert.equal(summaryToolEventTotals({ records: [] }), null);
+  assert.equal(summaryToolEventTotals(null), null);
+});
+
+test("secondary failure classes surface every co-matching signature without stealing the primary", () => {
+  // A build death whose log ALSO carries assertion text: primary stays the
+  // harness stage (existing precedence), the assertion becomes secondary DATA.
+  const logText = [
+    "Error: expect(received).toBe(expected)",
+    "tests/example.test.ts(1,1): error TS2345: boom",
+    "build exited with code 2.",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 2, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, "harness:build_failed");
+  assert.deepEqual(outcome.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
+  // A renderer death inside a failing lane co-matches the lane's own
+  // failing-test header - both causes stay visible.
+  const rendererLog = [
+    "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts:41:5 › deep vault retrieval ─────",
+    "    Error: page.waitForSelector: Target page, context or browser has been closed",
+  ].join("\n");
+  const renderer = classifyAttemptOutcome({ exitCode: 1, summaryFresh: false, logText: rendererLog });
+  assert.equal(renderer.failureClass, RENDERER_DEATH_FAILURE_CLASS);
+  assert.deepEqual(renderer.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
+  // A fresh summary primary keeps mechanically-matched log classes as secondaries.
+  const confirmed = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: { records: [{ proofClass: "product:writeback_unproven" }] },
+    summaryFresh: true,
+    logText: rendererLog,
+  });
+  assert.equal(confirmed.failureClass, "product:writeback_unproven");
+  assert.deepEqual(confirmed.secondaryClasses, [
+    RENDERER_DEATH_FAILURE_CLASS,
+    LANE_ASSERTION_FAILURE_CLASS,
+  ]);
+  // collectMechanicalFailureClasses is deduplicated and ordered by precedence.
+  assert.deepEqual(collectMechanicalFailureClasses(rendererLog), [
+    RENDERER_DEATH_FAILURE_CLASS,
+    LANE_ASSERTION_FAILURE_CLASS,
+  ]);
+  assert.deepEqual(collectMechanicalFailureClasses(""), []);
+});
+
+test("classification confidence: confirmed from summaries, mechanical from logs, unclassified otherwise", () => {
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summary: { records: [{ proofClass: "product:writeback_unproven" }] },
+      summaryFresh: true,
+      logText: "",
+    }).confidence,
+    CLASSIFICATION_CONFIRMED,
+  );
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 2,
+      summaryFresh: false,
+      logText: "build exited with code 2.",
+    }).confidence,
+    CLASSIFICATION_MECHANICAL,
+  );
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summaryFresh: false,
+      logText: "Test timeout of 600000ms exceeded.",
+    }).confidence,
+    CLASSIFICATION_MECHANICAL,
+  );
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summaryFresh: false,
+      logText: "nothing recognizable",
+    }).confidence,
+    CLASSIFICATION_UNCLASSIFIED,
+  );
 });

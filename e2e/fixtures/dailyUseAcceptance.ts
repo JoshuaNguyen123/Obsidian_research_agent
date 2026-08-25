@@ -36,6 +36,29 @@ export async function recordDailyUseAcceptance(
     continuations?: number;
     approvals?: number;
     missionScorecard?: MissionScorecardV1 | null;
+    /**
+     * Failed-tool-call count when the spec's own trace observation can
+     * distinguish failures (tool_result with error / onToolDone ok:false /
+     * tool_rejected). Leave undefined when it cannot: the reporter records
+     * null (unknown), never zero. The counters most specs feed today
+     * (missionEvidence lengths) count SUCCESSFUL calls only and carry no
+     * failure signal.
+     */
+    toolCallsFailed?: number | null;
+    /**
+     * "Called but did no work" count — vacuous successes detected from
+     * receipts via countVacuousToolReceipts (zero-delta mutation receipts).
+     * Same unknown-≠-zero rule as toolCallsFailed.
+     */
+    toolCallsVacuous?: number | null;
+    /**
+     * Intentional no-ops (commitKind no_op/reconciled on enriched receipts,
+     * see countIntentionalNoOpReceipts): correct idempotent behavior,
+     * tracked separately from vacuous.
+     */
+    toolCallsIntentionalNoOp?: number | null;
+    /** Refusal counts keyed by the proof matrix's six bucket names. */
+    refusalBuckets?: Record<string, number> | null;
   } = {},
   options: { requireComplete?: boolean } = {},
 ) {
@@ -46,7 +69,14 @@ export async function recordDailyUseAcceptance(
     normalized,
   );
   const releaseSha = process.env.E2E_RELEASE_COMMIT_SHA?.trim() || null;
-  const { missionScorecard = null, ...metricCounters } = counters;
+  const {
+    missionScorecard = null,
+    toolCallsFailed = null,
+    toolCallsVacuous = null,
+    toolCallsIntentionalNoOp = null,
+    refusalBuckets = null,
+    ...metricCounters
+  } = counters;
   const metrics = createDailyUseRunMetricsV1({
     scenarioId,
     releaseSha,
@@ -60,7 +90,16 @@ export async function recordDailyUseAcceptance(
   });
   testInfo.annotations.push({
     type: DAILY_USE_METRICS_ANNOTATION,
-    description: JSON.stringify(metrics),
+    description: JSON.stringify({
+      ...metrics,
+      // Appended OUTSIDE createDailyUseRunMetricsV1 (its schema is fixed in
+      // src/): unknown counts serialize as null so the reporter can keep
+      // unknown ≠ zero explicit.
+      toolCallsFailed,
+      toolCallsVacuous,
+      toolCallsIntentionalNoOp,
+      ...(refusalBuckets ? { refusalBuckets } : {}),
+    }),
   });
   if (missionScorecard) {
     testInfo.annotations.push({
