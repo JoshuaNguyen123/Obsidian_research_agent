@@ -3101,6 +3101,22 @@ export async function runAgentMission({
    * tool commands the call the proof gate will hold again.
    */
   let lastProofGatedHoldToolName: string | null = null;
+  /**
+   * Per-tool count of `proof_gated_writeback_required` rejections raised
+   * while blocking pre-write proofs were still missing. Cheap models burn
+   * their budget re-trying the same held write tool (PRO-14 on flash);
+   * after PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD rejections the tool is
+   * withheld from the offered frontier until the blocking proofs clear —
+   * authority is untouched, only the menu narrows. The gate at the call
+   * site stays in place as the backstop for hallucinated calls.
+   */
+  const proofGateWriteRejectionCountsByTool = new Map<string, number>();
+  const recordProofGateWriteRejection = (toolName: string): void => {
+    proofGateWriteRejectionCountsByTool.set(
+      toolName,
+      (proofGateWriteRejectionCountsByTool.get(toolName) ?? 0) + 1,
+    );
+  };
   let literalWriteCorrectionUsed = false;
   let passageGroundedWriteContractInjected = false;
   let vaultTraversalCorrectionUsed = false;
@@ -12145,6 +12161,11 @@ export async function runAgentMission({
           : "";
         const message =
           `Held ${toolCall.name} at the mutation boundary because the final payload does not satisfy the closed fetched-source proof contract${missingDetail}. No note bytes were changed.`;
+        if (!durablePreWriteProofSatisfied) {
+          // Same evidence-incomplete signal as the step-loop hold: repeated
+          // re-tries narrow the offered frontier until the proofs clear.
+          recordProofGateWriteRejection(toolCall.name);
+        }
         const blockedResult: ToolExecutionResult = {
           ok: false,
           toolName: toolCall.name,
@@ -17394,6 +17415,29 @@ export async function runAgentMission({
       stepTools,
       compoundResearchClosureTurn,
     );
+    if (proofGateWriteRejectionCountsByTool.size > 0) {
+      const beforeContainment = stepTools;
+      stepTools = containProofGateRejectedWriteToolsV1(stepTools, {
+        rejectionCounts: proofGateWriteRejectionCountsByTool,
+        blockingProofsOutstanding: !hasSatisfiedDurablePreWriteProof(),
+      });
+      if (stepTools.length !== beforeContainment.length) {
+        const withheld = beforeContainment
+          .map((tool) => tool.function.name)
+          .filter(
+            (name) => !stepTools.some((tool) => tool.function.name === name),
+          );
+        events.onTrace?.({
+          id: `proof-gate-frontier-containment-${step}`,
+          kind: "allowed_tools",
+          step,
+          message:
+            `Withholding ${withheld.join(", ")} from the offered tools after repeated proof-gated rejections; ` +
+            "the menu restores once the blocking pre-write proofs are satisfied.",
+          outputPreview: withheld,
+        });
+      }
+    }
     const stepAllowedToolNames = new Set(
       stepTools.map((tool) => tool.function.name),
     );
@@ -20728,6 +20772,10 @@ export async function runAgentMission({
           // held so frontier rejections stop advising the same name while
           // the hold stands.
           lastProofGatedHoldToolName = toolCall.name;
+        } else {
+          // Evidence-incomplete arm: repeated re-tries of the same held tool
+          // narrow the offered frontier until the blocking proofs clear.
+          recordProofGateWriteRejection(toolCall.name);
         }
         events.onStatus?.(message);
         events.onTrace?.({
@@ -23352,6 +23400,38 @@ export type CompoundResearchToolCallGateV1 =
       counted: boolean;
       reason: "publication_only" | "research_budget_reached";
     };
+
+/**
+ * Cheap-model hardening WS2: rejections of the same write tool while blocking
+ * pre-write proofs are missing measure patience, not capability — weak models
+ * re-try the held tool until the budget dies. After this many rejections of
+ * one tool the frontier stops offering it until the proofs clear.
+ */
+export const PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD = 2;
+
+/**
+ * Drop tools that repeatedly hit `proof_gated_writeback_required` while
+ * blocking pre-write proofs remain outstanding. Purely a menu operation:
+ * authority, the proof gate itself, and every other tool are untouched, and
+ * the full menu returns the moment the blocking proofs are satisfied
+ * (`blockingProofsOutstanding` false) — the "restore" half of the rule.
+ */
+export function containProofGateRejectedWriteToolsV1<
+  T extends { function: { name: string } },
+>(
+  tools: readonly T[],
+  input: {
+    rejectionCounts: ReadonlyMap<string, number>;
+    blockingProofsOutstanding: boolean;
+  },
+): T[] {
+  if (!input.blockingProofsOutstanding) return [...tools];
+  return tools.filter(
+    (tool) =>
+      (input.rejectionCounts.get(tool.function.name) ?? 0) <
+      PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
+  );
+}
 
 export function restrictCompoundResearchClosureToolsV1<
   T extends { function: { name: string } },
