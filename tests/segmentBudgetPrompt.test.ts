@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   SEGMENT_BUDGET_PROFILE_DEFAULTS,
+  attachSegmentBudgetToMessages,
   formatSegmentBudgetExhaustedCopy,
   formatSegmentBudgetPrompt,
 } from "../src/agent/segmentBudgetPrompt";
@@ -62,4 +63,27 @@ test("segment budget exhaustion copy tells the model the segment is saved", () =
   assert.match(copy, /^What: Per-segment tool-call budget exhausted\./);
   assert.match(copy, /Why: This segment used every allowed tool call\./);
   assert.match(copy, /Next: The segment is saved for continuation/);
+});
+
+test("budget line folds into the existing system prompt instead of replacing the last message", () => {
+  const attached = attachSegmentBudgetToMessages(
+    [
+      { role: "system", content: "You are the researcher." },
+      {
+        role: "user",
+        content: "Request one of these allowed write tools now: append_to_current_file",
+      },
+    ],
+    "- Budget: 4 tool calls and 6 model turns remain in this segment.",
+  );
+  assert.equal(attached.length, 2);
+  assert.match(
+    attached[0]?.content ?? "",
+    /You are the researcher\.\n- Budget: 4 tool calls and 6 model turns remain in this segment\./,
+  );
+  assert.equal(
+    attached.at(-1)?.content,
+    "Request one of these allowed write tools now: append_to_current_file",
+    "last-message allowlist/correction contracts must stay last",
+  );
 });

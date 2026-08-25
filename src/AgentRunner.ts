@@ -65,6 +65,7 @@ import {
 import {
   formatSegmentBudgetExhaustedCopy,
   formatSegmentBudgetPrompt,
+  attachSegmentBudgetToMessages,
 } from "./agent/segmentBudgetPrompt";
 import type {
   AgentMissionMode,
@@ -17911,10 +17912,7 @@ export async function runAgentMission({
         remainingModelCalls: Math.max(0, stepLimit - step + 1),
       });
       const stepChatRequestBuilt = buildChatRequest(
-        [
-          ...stepMessages,
-          { role: "system" as const, content: segmentBudgetPrompt },
-        ],
+        attachSegmentBudgetToMessages(stepMessages, segmentBudgetPrompt),
         stepTools,
         escalateThisStep ? false : activeThink,
         modelOptions,

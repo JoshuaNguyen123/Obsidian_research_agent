@@ -40,3 +40,31 @@ export function formatSegmentBudgetExhaustedCopy(): string {
     next: "The segment is saved for continuation; resume the run to keep that progress.",
   });
 }
+
+/**
+ * Fold the one-line budget into the existing stage system prompt.
+ * A trailing extra system message would hide last-message allowlist/correction
+ * contracts the runner and tests rely on.
+ */
+export function attachSegmentBudgetToMessages<
+  T extends { role: string; content?: string },
+>(messages: readonly T[], budgetLine: string): T[] {
+  const line = budgetLine.trim();
+  if (!line) {
+    return [...messages];
+  }
+  const index = messages.findIndex((message) => message.role === "system");
+  if (index < 0) {
+    return [...messages, { role: "system", content: line } as T];
+  }
+  return messages.map((message, offset) => {
+    if (offset !== index) {
+      return message;
+    }
+    const existing = String(message.content ?? "").trimEnd();
+    return {
+      ...message,
+      content: existing ? `${existing}\n${line}` : line,
+    };
+  });
+}
