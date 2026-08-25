@@ -480,8 +480,13 @@ const RESUME_EMPTY_FRONTIER_WRITE_TOOLS = new Set([
  * True when a required (non-optional, non-final) node already paid a tool.
  * A streaming writeback stub is only `final` (and maybe a tool-less dispatch),
  * so this stays false and resume can still offer current-note writes.
+ *
+ * Exported as the ONE shared answer to "did the resumed graph already pay its
+ * required work?": the empty-frontier fallback below and the resume splice
+ * heal in AgentRunner must consult the same predicate, or the frontier and
+ * the graph authority drift apart again (two-subsystems-disagree #14).
  */
-function graphHasCompletedRequiredMutation(
+export function graphHasCompletedRequiredMutation(
   graph: MissionGraphV3,
 ): boolean {
   return Object.entries(graph.nodes).some(([nodeId, node]) => {
@@ -940,14 +945,22 @@ export function constrainToolsToMissionGraphFrontier(
     frontierConstrained.length === 0 &&
     !graphHasCompletedRequiredMutation(graph)
   ) {
-    const fallback = schemasForStep({
-      route: options.route ?? "single_model_writeback",
-      frontier: tools
-        .map((tool) => tool.function.name)
-        .filter((name) => RESUME_EMPTY_FRONTIER_WRITE_TOOLS.has(name)),
-      graphRequired: [],
-      allSchemas: tools,
-    }) as ModelToolDefinition[];
+    // The fallback exists ONLY to surface current-note writes on the resumed
+    // streaming stub. schemasForStep can widen past its frontier input (route
+    // bases, empty-menu safety), so the result must be re-intersected with
+    // the write set — otherwise any empty frontier (for example a blocked
+    // create-collision node) would resurrect the very tool the graph just
+    // refused.
+    const fallback = (
+      schemasForStep({
+        route: options.route ?? "single_model_writeback",
+        frontier: tools
+          .map((tool) => tool.function.name)
+          .filter((name) => RESUME_EMPTY_FRONTIER_WRITE_TOOLS.has(name)),
+        graphRequired: [],
+        allSchemas: tools,
+      }) as ModelToolDefinition[]
+    ).filter((tool) => RESUME_EMPTY_FRONTIER_WRITE_TOOLS.has(tool.function.name));
     if (fallback.length > 0) {
       return applyEffectClass(fallback, { respectMaxEffectClass: false });
     }

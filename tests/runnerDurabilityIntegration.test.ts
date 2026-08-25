@@ -29,8 +29,10 @@ import {
 } from "../packages/headless-runtime/src/missionGraphV3";
 import {
   persistInitialMissionGraph,
+  readMissionGraphStoreRecord,
   type MissionGraphStoreWriteResult,
 } from "../src/agent/missionGraphStore";
+import { canonicalMissionGraphId } from "../src/agent/missionGraphIds";
 import type { OrchestratorSnapshotV1 } from "../src/orchestrator/types";
 import {
   flattenMissionPlanTasks,
@@ -929,6 +931,19 @@ test("continue run of an interrupted streamed append requires append_to_current_
       originalMission,
       currentNotePath: "Current.md",
       status: "paused",
+      // The interrupted segment ran under mission-graph authority. The store
+      // itself did not survive this crash variant, so resume must fail
+      // toward REQUIRING the append tool rather than blindly re-streaming
+      // the original two-append prompt.
+      missionGraphRef: {
+        version: 1,
+        missionId: canonicalMissionGraphId(seedRunId),
+        path: `Agent Runs/Mission Graphs/${canonicalMissionGraphId(seedRunId)}.md`,
+        storeRevision: 1,
+        graphRevision: 0,
+        recordFingerprint: `sha256:${"a".repeat(64)}`,
+        journalHeadFingerprint: null,
+      },
       operationGoals: { current_note_content: "pending" },
       lastSafeStep: 1,
       createdAt: new Date("2026-08-25T13:00:00.000Z"),
@@ -984,6 +999,218 @@ test("continue run of an interrupted streamed append requires append_to_current_
     /append_to_current_file/u,
     JSON.stringify(completions.at(-1)),
   );
+});
+
+test("continue of a crash-restored tool-less final stub splices the owed write and pays it", async () => {
+  const vault = createVaultHarness();
+  vault.context.settings.streamWritebackMode = "all_current_note_content_writes";
+  vault.context.settings.enableStreaming = true;
+  const originalMission =
+    "Write a concise paragraph about durable autonomous writeback on the current note.";
+
+  // Segment 1: the streamed current-note write dies before the first byte.
+  // This is the crash shape from the proof matrix: the mission graph store
+  // already persisted the ready, tool-less `final` stub, while the promised
+  // append paid nothing (no evidence, no receipts, no journal ambiguity).
+  const configs: AgentRunConfigEvent[] = [];
+  const interruptedClient: ModelClient = {
+    async chat() {
+      throw new Error("Unexpected buffered chat call.");
+    },
+    async streamChat() {
+      throw new Error("Simulated crash before the first streamed byte.");
+    },
+  };
+  await assert.rejects(
+    () =>
+      runAgentMission({
+        prompt: originalMission,
+        modelClient: interruptedClient,
+        toolRegistry: createDefaultToolRegistry(),
+        toolContext: vault.context,
+        enableStreaming: true,
+        events: { onRunConfig: (event) => configs.push(event) },
+      }),
+    /Simulated crash before the first streamed byte/,
+  );
+  const interruptedRunId = configs.at(-1)?.runId;
+  assert.ok(interruptedRunId);
+  const interruptedStore = await readMissionGraphStoreRecord(
+    vault.context,
+    canonicalMissionGraphId(interruptedRunId),
+  );
+  assert.ok(
+    interruptedStore,
+    "Segment 1 must persist the mission graph store; without it this fixture no longer reproduces the crash-restored stub.",
+  );
+  // Rebuild the exact crash artifact the proof matrix observed: the store
+  // holds ONLY the ready, tool-less `final` stub (evidenceCount=0,
+  // receiptCount=0) under the product's own host-built envelope. The
+  // envelope is reused verbatim so the continuation's envelope-fingerprint
+  // gate exercises the same check the live resume passed.
+  const interruptedGraph = interruptedStore.record.graph;
+  const finalNode = interruptedGraph.nodes.final;
+  assert.ok(finalNode);
+  const graphStorePath = [...vault.files.keys()].find((path) =>
+    path.startsWith("Agent Runs/Mission Graphs/"),
+  );
+  assert.ok(graphStorePath);
+  vault.files.delete(graphStorePath);
+  await persistInitialMissionGraph(vault.context, {
+    ...interruptedGraph,
+    revision: 0,
+    journalHeadFingerprint: null,
+    continuationCheckpoint: null,
+    nodes: {
+      final: {
+        ...finalNode,
+        dependencyIds: [],
+        status: "ready",
+        allowedTools: [],
+        evidence: [],
+        receipts: [],
+      },
+    },
+  });
+  const storedStub = await readMissionGraphStoreRecord(
+    vault.context,
+    canonicalMissionGraphId(interruptedRunId),
+  );
+  assert.ok(storedStub);
+  assert.deepEqual(
+    Object.keys(storedStub.record.graph.nodes),
+    ["final"],
+    "The crash-restored store must hold only the tool-less final stub, or the resume splice has nothing to heal.",
+  );
+  assert.deepEqual(storedStub.record.graph.nodes.final.allowedTools, []);
+  // The crash also predates the error-path continuation handoff, so the run
+  // note holds only the safe-boundary ledger and snapshot: current-note work
+  // still pending, no handoff, no ambiguous operations.
+  const stubLedger = createMissionLedger({
+    runId: interruptedRunId,
+    mission: originalMission,
+    route: "single_model_writeback",
+    loopBudget: {
+      hardCap: 9,
+      toolStepBudget: 6,
+      finalizationReserve: 2,
+      expectedTools: [],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-08-25T13:00:00.000Z"),
+  });
+  stubLedger.status = "blocked";
+  stubLedger.continuationCommand = `continue run ${interruptedRunId}`;
+  await writeMissionLedger(vault.context, stubLedger);
+  await writeMissionRuntimeSnapshot(
+    vault.context,
+    createMissionRuntimeSnapshot({
+      runId: interruptedRunId,
+      originalMission,
+      currentNotePath: "Current.md",
+      status: "paused",
+      missionGraphRef: {
+        version: 1,
+        missionId: storedStub.record.missionId,
+        path: graphStorePath,
+        storeRevision: storedStub.record.storeRevision,
+        graphRevision: storedStub.record.graph.revision,
+        recordFingerprint: storedStub.record.recordFingerprint,
+        journalHeadFingerprint: storedStub.record.graph.journalHeadFingerprint,
+      },
+      operationGoals: { current_note_content: "pending" },
+      lastSafeStep: 1,
+      createdAt: new Date("2026-08-25T13:00:00.000Z"),
+      updatedAt: new Date("2026-08-25T13:01:00.000Z"),
+    }),
+  );
+
+  // Segment 2: continue must heal the restored graph BEFORE the loop starts —
+  // splice the owed write node — so the loop decision, the frontier, and the
+  // graph authority all answer "the write is still owed" identically.
+  const resumeRequests: ModelChatRequest[] = [];
+  const toolStarts: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const traces: AgentTraceEvent[] = [];
+  await runAgentMission({
+    prompt: `continue run ${interruptedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithToolCall("append_to_current_file", {
+          text: "MARKER_HEALED_APPEND: durable autonomous writeback keeps every promised note mutation receipt-backed.",
+        }),
+        {
+          message: {
+            role: "assistant",
+            content:
+              "The owed current-note paragraph is durably recorded via the spliced write node.",
+            toolCalls: [],
+          },
+          toolCalls: [],
+        },
+      ],
+      resumeRequests,
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onToolStart: (event) => toolStarts.push(event.name),
+      onRunComplete: (event) => completions.push(event),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  assert.ok(
+    traces.some((event) => event.id === "mission-graph-resume-writeback-splice"),
+    JSON.stringify({
+      rule: "Resume of a tool-less final stub that still owes its current-note mutation must splice the write node into the authoritative graph before the loop starts.",
+      traceIds: traces.map((event) => event.id).slice(0, 60),
+      failures: traces
+        .filter((event) => /failed|error/iu.test(event.id))
+        .map((event) => event.message)
+        .slice(0, 5),
+    }),
+  );
+  const healedRecord = await readMissionGraphStoreRecord(
+    vault.context,
+    canonicalMissionGraphId(interruptedRunId),
+  );
+  assert.ok(healedRecord);
+  assert.ok(
+    healedRecord.record.journal.some((entry) =>
+      entry.patch.operations.some(
+        (operation) =>
+          operation.op === "add_node" &&
+          operation.node.id === "resume-current-note-write",
+      ),
+    ),
+    "The splice must be journaled like any other authority patch; persisted graphs resume verbatim, so an unjournaled heal would vanish on the next crash.",
+  );
+  // Seat 1 must not force a tool-less final: the model was actually asked
+  // with the write tool offered.
+  const firstTools =
+    resumeRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(
+    firstTools.includes("append_to_current_file"),
+    JSON.stringify({
+      rule: "The healed graph must expose append_to_current_file through the normal frontier on the very first resumed step.",
+      requests: resumeRequests.map(
+        (request) => request.tools?.map((tool) => tool.function.name) ?? [],
+      ),
+    }),
+  );
+  // Seat 3 must authorize the call: the owed append executes and lands.
+  assert.ok(
+    toolStarts.includes("append_to_current_file"),
+    JSON.stringify({
+      rule: "The graph session must authorize the spliced tool instead of refusing its own required write.",
+      toolStarts,
+      completions,
+    }),
+  );
+  const noteContent = vault.files.get("Current.md") ?? "";
+  assert.match(noteContent, /MARKER_HEALED_APPEND/u);
 });
 
 test("coordinator-backed runner preserves config tool and completion events", async () => {

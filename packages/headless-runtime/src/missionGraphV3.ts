@@ -2345,13 +2345,94 @@ function rejectNewMutationAuthority(graph: MissionGraphV3, candidate: MissionNod
   );
   if (
     !authorizedByExistingNode &&
-    !isExactCreateCollisionRepairNode(graph, candidate)
+    !isExactCreateCollisionRepairNode(graph, candidate) &&
+    !isResumeCurrentNoteWritebackHealNode(graph, candidate)
   ) {
     fail(
       "authority_widening",
       `Patch cannot add new mutation, execution, or external authority for node ${candidate.id}.`,
     );
   }
+}
+
+/**
+ * A hard crash mid streamed current-note write persists a graph whose only
+ * live node is the tool-less `final` synthesis stub: the promised append was
+ * never paid, yet no node carries the tool that could pay it. Resume restores
+ * that graph verbatim, so every consumer then answers "does this mission still
+ * owe the current-note write?" from a different seat — the loop decision
+ * forces tool-less synthesis, the frontier offers the write, and the
+ * authority gate refuses the call. The one sanctioned heal is for the host to
+ * splice the owed write node back into the authoritative graph. This is a
+ * strict materialization of an authority the envelope already grants, never a
+ * widening: the tool grant must already exist in the host-built capability
+ * envelope, the graph must provably be the writeback stub (a ready or queued
+ * tool-less `final` and no tool-carrying node anywhere, terminal or not), and
+ * the candidate must carry no evidence, no receipts, no external-action
+ * budget, no capabilities beyond the tool grant's own, and exactly the
+ * envelope-granted mutation destination with its one exclusive lock.
+ */
+function isResumeCurrentNoteWritebackHealNode(
+  graph: MissionGraphV3,
+  candidate: MissionNodeV3,
+): boolean {
+  const toolName = candidate.allowedTools[0];
+  if (
+    candidate.allowedTools.length !== 1 ||
+    toolName !== "append_to_current_file" ||
+    candidate.effect !== "mutation" ||
+    candidate.status !== "ready" ||
+    candidate.dependencyIds.length !== 0 ||
+    candidate.evidence.length !== 0 ||
+    candidate.receipts.length !== 0 ||
+    candidate.destination === null ||
+    candidate.destination.effect !== "mutation" ||
+    candidate.resourceLocks.length !== 1 ||
+    candidate.resourceLocks[0]?.bindingId !== candidate.destination.bindingId ||
+    candidate.resourceLocks[0]?.mode !== "exclusive" ||
+    candidate.budget.externalActions !== 0 ||
+    Object.keys(candidate.inputs).length !== 0 ||
+    getMissionCompositeLifecycleSpecV1(candidate) !== null
+  ) {
+    return false;
+  }
+  const grant = graph.capabilityEnvelope.tools[toolName];
+  if (!grant || grant.effect !== "mutation") {
+    return false;
+  }
+  const binding =
+    graph.capabilityEnvelope.bindings[candidate.destination.bindingId];
+  if (
+    !binding ||
+    !binding.allowedEffects.includes("mutation") ||
+    (grant.bindingKinds.length > 0 && !grant.bindingKinds.includes(binding.kind))
+  ) {
+    return false;
+  }
+  if (
+    !candidate.requiredCapabilities.every((capabilityId) =>
+      grant.capabilityIds.includes(capabilityId),
+    )
+  ) {
+    return false;
+  }
+  const final = graph.nodes.final;
+  if (
+    !final ||
+    (final.status !== "ready" && final.status !== "queued") ||
+    final.allowedTools.length > 0 ||
+    getMissionCompositeLifecycleSpecV1(final) !== null
+  ) {
+    return false;
+  }
+  return Object.entries(graph.nodes).every(([nodeId, node]) => {
+    if (nodeId === "final") return true;
+    return (
+      (node.status === "complete" || node.status === "cancelled") &&
+      node.allowedTools.length === 0 &&
+      getMissionCompositeLifecycleSpecV1(node) === null
+    );
+  });
 }
 
 /**
