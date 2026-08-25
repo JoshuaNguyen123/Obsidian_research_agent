@@ -677,10 +677,17 @@ import {
 import { getFirstH1, removeFirstH1 } from "./tools/noteTitles";
 import {
   buildMissionResumeContext,
+  buildMissionResumePlan,
   extractRequestedRunId,
+  formatLedgerForModel,
   hasMissionResumeIntent,
   type MissionResumeContext,
 } from "./agent/missionResume";
+import {
+  buildCrashRecoveredContinuationV1,
+  formatCrashRecoveredContinuationForPrompt,
+  type CrashRecoveredContinuationV1,
+} from "./agent/crashRecoveredContinuation";
 import {
   formatMissionAcceptanceCorrection,
   mergeClaimGroundingIntoAcceptance,
@@ -1501,6 +1508,8 @@ interface CheckpointResumeState {
   runtimeSnapshot?: MissionRuntimeSnapshotV2;
   missingRequestedRunId?: string;
   invalidHandoffRunId?: string;
+  crashRecovery?: CrashRecoveredContinuationV1;
+  crashRecoveryRefusal?: { code: string; detail: string };
 }
 
 const SYSTEM_PROMPT = `You are an agentic research assistant running inside Obsidian.
@@ -3436,9 +3445,15 @@ export async function runAgentMission({
   });
   if (checkpointResumeContext?.missingRequestedRunId) {
     const missingRunId = checkpointResumeContext.missingRequestedRunId;
+    const gracefulHandoffHint =
+      checkpointResumeContext.crashRecoveryRefusal?.code ===
+      "graceful_handoff_present"
+        ? ` A gracefully checkpointed worker of that mission exists; use "${checkpointResumeContext.crashRecoveryRefusal.detail}" instead.`
+        : "";
     const message =
       `Run ${missingRunId} was requested explicitly, but its exact durable ` +
-      "checkpoint is unavailable. Refusing to continue from a different run.";
+      "checkpoint is unavailable. Refusing to continue from a different run." +
+      gracefulHandoffHint;
     events.onStatus?.(message);
     emitDirectAssistantAnswer(message, events, true);
     await completeRunAfterShadow("error", 0, runPlan.maxStepsForRun);
@@ -3459,7 +3474,11 @@ export async function runAgentMission({
   let receiptBackedResumeOutputTargetPath: string | null = null;
   runToolContext = {
     ...runToolContext,
-    rootMissionId: resumeSnapshot?.lineage.rootRunId ?? resumeLedger?.runId ?? runId,
+    rootMissionId:
+      resumeSnapshot?.lineage.rootRunId ??
+      resumeLedger?.runId ??
+      checkpointResumeContext?.crashRecovery?.resume.runId ??
+      runId,
   };
   if (resumeLedger && isRunRouteValue(resumeLedger.route)) {
     const resumeConfigHardCap = Math.max(
@@ -22461,16 +22480,76 @@ async function buildCheckpointResumeContext({
         );
         return { promptContext: formatCheckpointResumeContext(checkpoint) };
       }
+      // The ledger, runtime snapshot, and checkpoint all live in the run's
+      // Agent Runs note, which a hard crash can leave unwritten while the
+      // mission graph store already persisted resumable state. Attempt a
+      // fail-closed crash-recovery reconstruction before refusing.
+      const crashRecovery = await buildCrashRecoveredContinuationV1(
+        toolContext,
+        requestedRunId,
+      );
+      if (crashRecovery.ok) {
+        const crashMissionResume: MissionResumeContext | undefined =
+          crashRecovery.ledger && crashRecovery.ledgerPath
+            ? {
+                path: crashRecovery.ledgerPath,
+                ledger: crashRecovery.ledger,
+                plan: buildMissionResumePlan(crashRecovery.ledger),
+                promptContext: formatLedgerForModel(
+                  crashRecovery.ledger,
+                  crashRecovery.ledgerPath,
+                ),
+              }
+            : undefined;
+        events.onStatus?.(
+          `Rebuilt a crash-recovered continuation for run ${requestedRunId} from the durable mission graph store...`,
+        );
+        events.onTrace?.({
+          id: "checkpoint-resume:crash-recovered",
+          kind: "status",
+          message:
+            `Run ${requestedRunId} has no graceful checkpoint; continuing from a ` +
+            `crash-recovered reconstruction of mission graph ${crashRecovery.value.graph.missionId} ` +
+            `at graph revision ${crashRecovery.value.graph.graphRevision}.`,
+          outputPreview: crashRecovery.value,
+        });
+        return {
+          promptContext: [
+            formatCrashRecoveredContinuationForPrompt(crashRecovery.value),
+            crashMissionResume?.promptContext,
+          ]
+            .filter((part): part is string => Boolean(part))
+            .join("\n\n"),
+          ...(crashMissionResume ? { missionResume: crashMissionResume } : {}),
+          ...(crashRecovery.snapshot
+            ? { runtimeSnapshot: crashRecovery.snapshot }
+            : {}),
+          crashRecovery: crashRecovery.value,
+        };
+      }
       events.onTrace?.({
         id: "checkpoint-resume:requested-missing",
         kind: "error",
-        message: `Requested run ${requestedRunId} has no exact durable checkpoint.`,
+        message:
+          `Requested run ${requestedRunId} has no exact durable checkpoint ` +
+          `and crash recovery was refused (${crashRecovery.refusalCode}).`,
         error: {
           code: "requested_run_checkpoint_missing",
           message: `Requested run ${requestedRunId} has no exact durable checkpoint.`,
         },
+        outputPreview: {
+          crashRecoveryRefusal: crashRecovery.refusalCode,
+          detail: crashRecovery.detail,
+        },
       });
-      return { promptContext: "", missingRequestedRunId: requestedRunId };
+      return {
+        promptContext: "",
+        missingRequestedRunId: requestedRunId,
+        crashRecoveryRefusal: {
+          code: crashRecovery.refusalCode,
+          detail: crashRecovery.detail,
+        },
+      };
     }
 
     const checkpoint = await readLatestAgentRunCheckpoint(toolContext);
