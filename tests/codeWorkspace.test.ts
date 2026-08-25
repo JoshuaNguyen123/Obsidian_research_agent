@@ -41,3 +41,53 @@ test("MAX_CODE_RUNS_PER_MISSION default is 16", async () => {
   const { MAX_CODE_RUNS_PER_MISSION } = await import("../src/tools/constants");
   assert.equal(MAX_CODE_RUNS_PER_MISSION, 16);
 });
+
+test("replace_workspace_text fails closed when the replacement changes nothing", async () => {
+  __setNodeRequireForTests(require);
+  try {
+    const { createCodeWorkspaceTools } = await import(
+      "../src/tools/codeWorkspaceTools"
+    );
+    const tool = createCodeWorkspaceTools().find(
+      (candidate) => candidate.name === "replace_workspace_text",
+    );
+    assert.ok(tool);
+    const runId = `test-nsc-${Date.now()}`;
+    const workspace = await ensureCodeWorkspace(runId);
+    await writeWorkspaceFile(workspace, "src/app.js", "let x = 1;\nlet y = 1;\n");
+    const context = {
+      runId,
+      originalPrompt: "Update the code in my workspace file.",
+    } as unknown as import("../src/tools/types").ToolExecutionContext;
+
+    // find === replace rewrites identical bytes: no state change, so the
+    // tool must fail closed (github_no_state_change semantics) instead of
+    // minting a vacuous write receipt.
+    await assert.rejects(
+      () =>
+        tool!.execute(
+          { path: "src/app.js", find: "let x", replace: "let x" },
+          context,
+        ),
+      (error: unknown) => {
+        const failure = error as { code?: string; message?: string };
+        assert.equal(failure.code, "workspace_no_state_change");
+        assert.match(failure.message ?? "", /would not change/i);
+        return true;
+      },
+    );
+    // The file is untouched and a real replacement still works.
+    assert.equal(
+      (await readWorkspaceFile(workspace, "src/app.js")).content,
+      "let x = 1;\nlet y = 1;\n",
+    );
+    const changed = (await tool!.execute(
+      { path: "src/app.js", find: "let x", replace: "let z" },
+      context,
+    )) as { replacements: number; bytesWritten: number };
+    assert.equal(changed.replacements, 1);
+    assert.ok(changed.bytesWritten > 0);
+  } finally {
+    __setNodeRequireForTests(undefined);
+  }
+});

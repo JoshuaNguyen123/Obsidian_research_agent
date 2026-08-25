@@ -33713,6 +33713,9 @@ async function createStreamingNoteWriter({
     );
   };
   let baseContent = kind === "append" ? makeAppendBase(current) : "";
+  // Prior note content at writer creation, so the final receipt can carry a
+  // priorRevision fingerprint distinguishing overwrites from fresh notes.
+  const initialContentSnapshot = current;
   let baseContentChanged = false;
   let leadingTitleBuffer: string | null = kind === "edit" ? null : "";
   let extractedLeadingTitle: string | null = null;
@@ -34028,8 +34031,20 @@ async function createStreamingNoteWriter({
       const resolvedPath = file?.path ?? lazyCreatePath ?? "unknown";
       const operation =
         kind === "append" ? "append" : kind === "replace" ? "replace" : "edit";
+      // For a section edit the delta is the streamed section body, not the
+      // rendered whole document — a whole-document byte count would make a
+      // one-line section edit look like a full-note rewrite.
       const bytesWritten =
-        kind === "append" ? getByteLength(streamedContent) : getByteLength(render());
+        kind === "append"
+          ? getByteLength(streamedContent)
+          : kind === "edit"
+            ? getByteLength(
+                formatStreamingSectionBody(
+                  streamedContent,
+                  section?.suffix ?? "",
+                ),
+              )
+            : getByteLength(render());
       const target = await ensureFile();
       const expectedContent = render();
       const observedContent = await toolContext.app.vault.read(target);
@@ -34047,6 +34062,9 @@ async function createStreamingNoteWriter({
           content: observedContent,
         }),
         observedFingerprint: hashOperationInput(observedContent),
+        // Prior note fingerprint beside the observed one: overwrite vs
+        // fresh-note vs no-op stays reconstructable from the receipt alone.
+        priorRevision: hashOperationInput(initialContentSnapshot),
       };
       const output = {
         path: resolvedPath,

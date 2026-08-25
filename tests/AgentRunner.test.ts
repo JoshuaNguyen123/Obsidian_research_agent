@@ -20885,6 +20885,21 @@ test("section edit writeback prepares heading and preserves surrounding content"
   assert.equal(receipts[0].streamed, true);
   assert.equal(receipts[0].operation, "edit");
   assert.equal(receipts[0].heading, "Goals");
+  // The receipt delta is the streamed section body, not the rendered whole
+  // document — a one-section edit must not look like a full-note rewrite.
+  assert.equal(
+    receipts[0].bytesWritten,
+    Buffer.byteLength("New goals.\n- Ship streaming edits\n", "utf8"),
+  );
+  const sectionReadback = receipts[0].readback as {
+    priorRevision?: string;
+    observedFingerprint?: string;
+  };
+  assert.match(sectionReadback?.priorRevision ?? "", /^fnv1a32:/u);
+  assert.notEqual(
+    sectionReadback.priorRevision,
+    sectionReadback.observedFingerprint,
+  );
 });
 
 test("interrupted replacement candidate stream preserves the current note before approval", async () => {

@@ -159,6 +159,16 @@ const replaceWorkspaceTextTool: AgentTool = {
     const next = replaceAll
       ? current.content.split(find).join(replace)
       : current.content.replace(find, replace);
+    if (next === current.content) {
+      // Mirrors github_no_state_change semantics: a "successful" replace that
+      // rewrites the file to identical bytes did no work, and reporting it as
+      // a write would manufacture a vacuous receipt.
+      throw new ToolExecutionError(
+        "workspace_no_state_change",
+        `The approved replacement would not change ${path}: find and replace produce identical content.`,
+        { mutationState: "not_applied" },
+      );
+    }
     const replacements = replaceAll
       ? current.content.split(find).length - 1
       : 1;

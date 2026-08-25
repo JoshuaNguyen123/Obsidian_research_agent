@@ -1582,6 +1582,71 @@ test("every write path that can produce a notebook validates nbformat", async ()
   }
 });
 
+test("workspace reuse and idempotent retries emit reconciled zero-delta receipts, real creation stays committed", async () => {
+  const fixture = await createFixture("receipt-delta");
+  try {
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const context = fixture.context(
+      "Create a code workspace and write a file in the workspace.",
+    );
+
+    // Real creation: committed, affectedCount 1.
+    const created = await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "delta-space", kind: "scratch" },
+      context,
+    );
+    assert.equal(created.receipt.commitKind, "committed");
+    assert.equal(created.receipt.effects?.affectedCount, 1);
+
+    // Reuse of the existing workspace: reconciled, affectedCount 0 — the
+    // lease was re-bound but no workspace was provisioned.
+    const reused = await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "delta-space", kind: "scratch" },
+      context,
+    );
+    assert.equal(reused.receipt.commitKind, "reconciled");
+    assert.equal(reused.receipt.effects?.affectedCount, 0);
+
+    // Real file creation: committed with positive delta.
+    const content = "print('receipts')\n";
+    const wrote = await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      { workspaceId: "delta-space", path: "src/main.py", content },
+      context,
+    );
+    assert.equal(wrote.receipt.commitKind, "committed");
+    assert.ok((wrote.receipt.effects?.bytesWritten ?? 0) > 0);
+
+    // Byte-identical idempotent retry: reconciled, zero delta, and the known
+    // prior fingerprint is preserved as readback.priorRevision instead of
+    // being discarded.
+    const retried = await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      { workspaceId: "delta-space", path: "src/main.py", content },
+      context,
+    );
+    assert.equal(retried.receipt.commitKind, "reconciled");
+    assert.equal(retried.receipt.effects?.affectedCount, 0);
+    assert.equal(retried.receipt.effects?.bytesWritten, 0);
+    assert.match(
+      retried.receipt.readback.priorRevision ?? "",
+      /^sha256:[a-f0-9]{64}$/u,
+    );
+    assert.equal(
+      retried.receipt.readback.priorRevision,
+      retried.receipt.readback.observedRevision,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 async function createFixture(name: string) {
   const root = await mkdtemp(path.join(tmpdir(), `code-tools-v2-${name}-`));
   const repositoryRoot = path.join(root, "repository");
