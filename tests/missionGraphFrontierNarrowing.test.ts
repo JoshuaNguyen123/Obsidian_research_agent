@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import {
   constrainToolsToMissionGraphFrontier,
   narrowAdaptiveCodeMutationsToPlannedWritesV1,
+  pinnedAppendFrontierRequiresSeededFilePatchV1,
+  workspaceCreateReceiptProvesSeededFilesV1,
+  type WorkspaceCreateReceiptShapeV1,
 } from "../src/agent/missionGraphFrontier";
 import {
   countReadyMissionGraphToolSlots,
@@ -143,6 +146,136 @@ test("a failed planned write unpins its siblings so the named remedy stays calla
   });
   assert.ok(!fresh.some((item) => item.function.name === "code_workspace_create_file"));
   assert.ok(fresh.some((item) => item.function.name === "code_workspace_append"));
+});
+
+const SEEDED_WORKSPACE_CREATE_RECEIPT: WorkspaceCreateReceiptShapeV1 = {
+  toolName: "code_workspace_create",
+  commitKind: "committed",
+  readback: { status: "verified" },
+  resource: { system: "workspace" },
+  output: {
+    repositoryWriteScope: {
+      profileKey: "byok-autonomous-python",
+      projects: [
+        {
+          projectId: "crdt-sync",
+          projectRoot: "crdt-sync",
+          allowedPaths: ["README.md", "crdt_sync.py"],
+        },
+      ],
+    },
+  },
+};
+
+const SCRATCH_WORKSPACE_CREATE_RECEIPT: WorkspaceCreateReceiptShapeV1 = {
+  toolName: "code_workspace_create",
+  commitKind: "committed",
+  readback: { status: "verified" },
+  resource: { system: "workspace" },
+  output: {},
+};
+
+const PINNED_APPEND_GRAPH = {
+  nodes: {
+    "tool-04-code_workspace_create": {
+      status: "complete",
+      allowedTools: ["code_workspace_create"],
+    },
+    "tool-05-code_workspace_append": {
+      status: "ready",
+      allowedTools: ["code_workspace_append"],
+      retries: { attempts: 0 },
+    },
+    "tool-06-code_validate_fast": {
+      status: "queued",
+      allowedTools: ["code_validate_fast"],
+    },
+  },
+};
+
+test("a pinned append over a repository-seeded workspace keeps patch as its companion", () => {
+  // Live BYOK stage 8: the fixture seeds README.md ("Implementation pending.")
+  // and the graph plans only code_workspace_append for the README step.
+  // Replacing seeded placeholder content is not expressible with append, and
+  // withholding patch sent the model into a thinking spiral over an
+  // unsatisfiable menu. The seeded-workspace creation receipt is the earliest
+  // host-verified proof that the pinned write's target may already exist.
+  const narrowed = narrowAdaptiveCodeMutationsToPlannedWritesV1(
+    CODE_MENU,
+    PINNED_APPEND_GRAPH,
+    [SEEDED_WORKSPACE_CREATE_RECEIPT],
+  );
+  const names = narrowed.map((item) => item.function.name);
+  assert.ok(names.includes("code_workspace_append"));
+  assert.ok(names.includes("code_workspace_patch"));
+  // Only the append/patch pair widens; the rest of the pin holds.
+  assert.ok(!names.includes("code_workspace_create_file"));
+  assert.ok(!names.includes("code_workspace_write_expected"));
+  assert.ok(!names.includes("code_workspace_mkdir"));
+});
+
+test("a pinned append over a scratch workspace stays append-only", () => {
+  // A scratch workspace is empty at creation, so the planned append targets a
+  // file the mission itself creates: no seeded content exists to replace and
+  // the original pin is unchanged.
+  const scratch = narrowAdaptiveCodeMutationsToPlannedWritesV1(
+    CODE_MENU,
+    PINNED_APPEND_GRAPH,
+    [SCRATCH_WORKSPACE_CREATE_RECEIPT],
+  );
+  assert.ok(!scratch.some((item) => item.function.name === "code_workspace_patch"));
+  assert.ok(scratch.some((item) => item.function.name === "code_workspace_append"));
+
+  const noReceipts = narrowAdaptiveCodeMutationsToPlannedWritesV1(
+    CODE_MENU,
+    PINNED_APPEND_GRAPH,
+  );
+  assert.ok(!noReceipts.some((item) => item.function.name === "code_workspace_patch"));
+});
+
+test("the shared seeded-file predicate is the single authority for the widening", () => {
+  // Production and tests must consume this one predicate; the expression is
+  // never re-derived at a plant site.
+  assert.equal(
+    pinnedAppendFrontierRequiresSeededFilePatchV1(
+      new Set(["code_workspace_append"]),
+      [SEEDED_WORKSPACE_CREATE_RECEIPT],
+    ),
+    true,
+  );
+  // A planned patch already on the pin needs no widening.
+  assert.equal(
+    pinnedAppendFrontierRequiresSeededFilePatchV1(
+      new Set(["code_workspace_append", "code_workspace_patch"]),
+      [SEEDED_WORKSPACE_CREATE_RECEIPT],
+    ),
+    false,
+  );
+  // Non-append pins never widen.
+  assert.equal(
+    pinnedAppendFrontierRequiresSeededFilePatchV1(
+      new Set(["code_workspace_create_file"]),
+      [SEEDED_WORKSPACE_CREATE_RECEIPT],
+    ),
+    false,
+  );
+  // The proof must be a verified, committed workspace creation over a
+  // repository scope; an unverified or scratch receipt proves nothing.
+  assert.equal(
+    workspaceCreateReceiptProvesSeededFilesV1(SEEDED_WORKSPACE_CREATE_RECEIPT),
+    true,
+  );
+  assert.equal(
+    workspaceCreateReceiptProvesSeededFilesV1(SCRATCH_WORKSPACE_CREATE_RECEIPT),
+    false,
+  );
+  assert.equal(
+    workspaceCreateReceiptProvesSeededFilesV1({
+      ...SEEDED_WORKSPACE_CREATE_RECEIPT,
+      readback: { status: "failed" },
+    }),
+    false,
+  );
 });
 
 test("an active validation recovery window is never narrowed", () => {
