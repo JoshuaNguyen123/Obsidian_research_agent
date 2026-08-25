@@ -170,10 +170,12 @@ test("the reflection frontier writes Results while progress remains host-owned",
   assert.equal(offered.includes(REPORT_PROGRESS_TO_LINEAR_TOOL_NAME), false);
   assert.ok(offered.includes("write_project_results"));
 
-  // The same chain with current-note writes unauthorized is what stranded a
-  // live run: the host asked for a write while offering no write tool. If that
-  // state is reachable it must at least not silently look healthy.
-  const withoutWrite = constrainSetLooseCompanionsToAutonomyScope(
+  // This exact state (replace intent authorized, write.currentNote false) once
+  // stranded a live run: the host asked for a write while offering no write
+  // tool. The unified currentNoteAppendCatalogEligible predicate now offers
+  // append under authorized replace intent, so a write path always exists
+  // wherever the host demands a write — the dead-end is gone, not hidden.
+  const withReplaceIntentOnly = constrainSetLooseCompanionsToAutonomyScope(
     toolsOfferedForSetLooseTurn({
       stages: ["accepted_research"],
       currentStage: "accepted_research",
@@ -183,7 +185,27 @@ test("the reflection frontier writes Results while progress remains host-owned",
     }),
     { ...scope, write: { ...scope.write, currentNote: false } },
   );
-  assert.equal(withoutWrite.includes("append_to_current_file"), false);
+  assert.equal(withReplaceIntentOnly.includes("append_to_current_file"), true);
+  // With NO write authority of any kind, append must stay withheld.
+  const withoutAnyWrite = constrainSetLooseCompanionsToAutonomyScope(
+    toolsOfferedForSetLooseTurn({
+      stages: ["accepted_research"],
+      currentStage: "accepted_research",
+      passedFastRepairCycle: false,
+      codeDeliveryPaid: false,
+      unpaidDeliveryKeys: ["accepted_research"],
+    }),
+    {
+      ...scope,
+      write: { ...scope.write, currentNote: false },
+      destructive: {
+        ...scope.destructive,
+        replaceCurrentNote: false,
+        deleteCurrentNote: false,
+      },
+    },
+  );
+  assert.equal(withoutAnyWrite.includes("append_to_current_file"), false);
 });
 
 test("each status maps onto the workspace's configured state id", async () => {
