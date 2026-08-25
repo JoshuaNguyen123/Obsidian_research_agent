@@ -64,6 +64,8 @@ import {
   resolveCompletedCompoundLifecycleStagesV1,
   resolveCompoundCompletionSegmentBudgetV1,
   restrictCompoundResearchClosureToolsV1,
+  containProofGateRejectedWriteToolsV1,
+  PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
   resolveThinkingMode,
   canonicalLifecycleReflectionReceiptPaysV1,
   shouldPlanGenericInitiatingNoteReflectionV1,
@@ -17789,6 +17791,50 @@ test("compound research checks every counted tool and closure exposes only publi
       (tool) => tool.function.name,
     ),
     ["publish_research_to_linear"],
+  );
+});
+
+test("repeated proof-gated rejections withhold only that tool until proofs clear", () => {
+  const menu = ["append_to_current_file", "replace_current_file", "web_search"].map(
+    (name) => ({ function: { name } }),
+  );
+  const names = (tools: Array<{ function: { name: string } }>) =>
+    tools.map((tool) => tool.function.name);
+  // Below the threshold the menu is untouched.
+  assert.deepEqual(
+    names(
+      containProofGateRejectedWriteToolsV1(menu, {
+        rejectionCounts: new Map([
+          ["append_to_current_file", PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD - 1],
+        ]),
+        blockingProofsOutstanding: true,
+      }),
+    ),
+    ["append_to_current_file", "replace_current_file", "web_search"],
+  );
+  // At the threshold, only the repeatedly rejected tool is withheld — the
+  // read/research tools the hold message points to stay offered.
+  assert.deepEqual(
+    names(
+      containProofGateRejectedWriteToolsV1(menu, {
+        rejectionCounts: new Map([
+          ["append_to_current_file", PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD],
+        ]),
+        blockingProofsOutstanding: true,
+      }),
+    ),
+    ["replace_current_file", "web_search"],
+  );
+  // Restore: once the blocking pre-write proofs are satisfied the full menu
+  // returns even though the rejection counts remain.
+  assert.deepEqual(
+    names(
+      containProofGateRejectedWriteToolsV1(menu, {
+        rejectionCounts: new Map([["append_to_current_file", 5]]),
+        blockingProofsOutstanding: false,
+      }),
+    ),
+    ["append_to_current_file", "replace_current_file", "web_search"],
   );
 });
 
