@@ -9282,6 +9282,23 @@ test("prompt-grounded seeded research remains proof gated without a research-pla
   );
 });
 
+test("vault-only no-web synthesis is not fetched-source proof gated just because a research plan exists", () => {
+  const soakPrompt =
+    "Within one bounded mission, investigate my vault for MARKER. Use semantic retrieval, batch-read only the paths returned by semantic retrieval without guessing paths or repeatedly reading one file at a time, and append a grounded synthesis to the current note. Do not use web or memory tools.";
+  assert.equal(
+    requiresVerifiedFinalOutput(null, { version: 1 } as never, soakPrompt),
+    false,
+  );
+  assert.equal(
+    requiresVerifiedFinalOutput(
+      null,
+      { version: 1 } as never,
+      "Do deep research on quantum batteries and cite passages.",
+    ),
+    true,
+  );
+});
+
 test("an exact preverified payload keeps content acceptance after a complete verified receipt", () => {
   const preCommitAcceptance = {
     status: "pass" as const,
