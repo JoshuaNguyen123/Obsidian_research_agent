@@ -177,7 +177,7 @@ export function unresolvedScratchPythonImports(
 }
 
 export async function captureCatalogAndFrontierTrace(page: Page): Promise<string[]> {
-  await page.getByRole("tab", { name: "Run Details" }).click();
+  await page.getByTestId("agentic-run-details-tab").click();
   const text =
     (await page
       .locator(".agentic-researcher-details-panel")

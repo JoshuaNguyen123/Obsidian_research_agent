@@ -719,6 +719,9 @@ export class AgentView extends ItemView {
         role: "tab",
         "aria-selected": "true",
         "aria-controls": "agentic-researcher-chat-panel",
+        // e2e contract: lookups use this testid, never the visible label, so
+        // renaming a tab cannot silently break the suite again.
+        "data-testid": "agentic-chat-tab",
       },
     });
     this.tabsEl = tabsEl;
@@ -738,6 +741,7 @@ export class AgentView extends ItemView {
         role: "tab",
         "aria-selected": "false",
         "aria-controls": "agentic-researcher-run-details-panel",
+        "data-testid": "agentic-run-details-tab",
       },
     });
 
@@ -1023,7 +1027,9 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-secondary-action agentic-researcher-chat-continuation",
       attr: {
         type: "button",
-        "aria-label": "Continue latest run",
+        // Accessible name = visible label (WCAG 2.5.3); every render site uses
+        // this exact casing.
+        "aria-label": "Continue Latest Run",
       },
     });
     this.continueButtonEl.hidden = true;
@@ -5786,7 +5792,7 @@ export class AgentView extends ItemView {
         attr: {
           type: "button",
           "data-testid": "chat-blocked-continue",
-          "aria-label": "Continue latest run",
+          "aria-label": "Continue Latest Run",
         },
       });
       continueButton.disabled = true;

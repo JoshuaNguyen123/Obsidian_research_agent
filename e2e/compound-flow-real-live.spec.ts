@@ -889,7 +889,7 @@ async function focusNote(page: Page, notePath: string): Promise<void> {
     app.workspace.setActiveLeaf(leaf, { focus: true });
     await plugin?.activateView?.();
   }, { pluginId: NATIVE_CORE_PLUGIN_ID, notePath });
-  await page.getByRole("tab", { name: "Chat" }).click().catch(() => undefined);
+  await page.getByTestId("agentic-chat-tab").click().catch(() => undefined);
 }
 
 function extractLinearUrl(note: string): string | null {
@@ -1549,7 +1549,7 @@ async function prepareAgentChatSurface(
   page: Page,
   teamId: string,
 ): Promise<void> {
-  await page.getByRole("tab", { name: "Chat" }).click();
+  await page.getByTestId("agentic-chat-tab").click();
   for (let i = 0; i < 3; i += 1) {
     const dismiss = page.getByRole("button", { name: "Dismiss" });
     if (!(await dismiss.isVisible().catch(() => false))) break;
@@ -1621,7 +1621,7 @@ async function prepareAgentChatSurface(
   if (!linearReady.ok) {
     throw new Error(`Linear must be ready before COMPOUND-REAL: ${linearReady.message}`);
   }
-  await page.getByRole("tab", { name: "Chat" }).click();
+  await page.getByTestId("agentic-chat-tab").click();
   const dismissAgain = page.getByRole("button", { name: "Dismiss" });
   if (await dismissAgain.isVisible().catch(() => false)) {
     await dismissAgain.click().catch(() => undefined);

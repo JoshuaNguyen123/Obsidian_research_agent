@@ -554,7 +554,7 @@ async function focusNote(page: Page, notePath: string): Promise<void> {
     },
     { pluginId: NATIVE_CORE_PLUGIN_ID, notePath },
   );
-  await page.getByRole("tab", { name: "Chat" }).click().catch(() => undefined);
+  await page.getByTestId("agentic-chat-tab").click().catch(() => undefined);
 }
 
 async function readRunSnapshot(page: Page): Promise<any> {
