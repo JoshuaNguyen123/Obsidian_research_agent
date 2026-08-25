@@ -245,7 +245,7 @@ export async function prepareDemoPresentationV1(
       userProfileRoot: process.env.USERPROFILE?.trim() ?? "",
     },
   );
-  await page.getByRole("tab", { name: "Chat" }).click().catch(() => undefined);
+  await page.getByTestId("agentic-chat-tab").click().catch(() => undefined);
 }
 
 /**
@@ -490,7 +490,7 @@ export function waitForDemoMissionBrokerV1(
  * acceptance stay visible while presentation-only diagnostics remain hidden.
  */
 export async function prepareDemoFinaleV1(page: Page): Promise<void> {
-  await page.getByRole("tab", { name: "Run Details" }).click();
+  await page.getByTestId("agentic-run-details-tab").click();
   await page.evaluate(() => {
     document
       .querySelectorAll<HTMLDetailsElement>(

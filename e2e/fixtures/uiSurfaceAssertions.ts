@@ -103,7 +103,7 @@ export async function assertApprovalSurfaceUsableV1(
  * previously see.
  */
 export async function assertRunDetailsPopulatedV1(page: Page): Promise<string> {
-  await page.getByRole("tab", { name: "Run Details" }).click();
+  await page.getByTestId("agentic-run-details-tab").click();
   const panel = page.locator(".agentic-researcher-details-panel");
   await expect(panel).toHaveCount(1);
   const configLines = panel.locator(".agentic-researcher-config-line");
@@ -181,7 +181,7 @@ export async function assertMissionUiSurfacesV1(page: Page): Promise<{
 }> {
   const runDetails = await assertRunDetailsPopulatedV1(page);
   const acceptance = await readAcceptanceRowsV1(page);
-  await page.getByRole("tab", { name: "Chat" }).click();
+  await page.getByTestId("agentic-chat-tab").click();
   const transcript = await readChatTranscriptV1(page);
   const assistantReply = await readAssistantReplyV1(page);
 

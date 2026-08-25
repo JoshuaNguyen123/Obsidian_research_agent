@@ -6,7 +6,12 @@ import {
   type LinearProjectAssociationDecision,
 } from "./linearProjectAssociation";
 import type { LinearToolClient } from "./LinearTools";
-import { listAllLinearPages } from "./linearPagination";
+import {
+  LINEAR_SWEEP_MAX_PAGES,
+  LINEAR_SWEEP_PAGE_SIZE,
+  LINEAR_SWEEP_ROW_BOUND,
+  listAllLinearPages,
+} from "./linearPagination";
 import type { LinearBaseRecord, LinearRequestOptions } from "./types";
 
 export interface ResolveLinearProjectAssociationInput {
@@ -118,13 +123,13 @@ async function listTeamProjects(
   const sweep = await listAllLinearPages(
     client,
     "projects.list",
-    { first: 50, includeArchived: false },
+    { first: LINEAR_SWEEP_PAGE_SIZE, includeArchived: false },
     options,
-    { maxPages: 5 },
+    { maxPages: LINEAR_SWEEP_MAX_PAGES },
   );
   if (sweep.truncated) {
     throw new Error(
-      "Linear project association search exceeded the bounded 250-project sweep; project absence cannot be verified safely.",
+      `Linear project association search exceeded the bounded ${LINEAR_SWEEP_ROW_BOUND}-project sweep; project absence cannot be verified safely.`,
     );
   }
   return sweep.items

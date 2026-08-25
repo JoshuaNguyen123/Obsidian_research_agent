@@ -164,7 +164,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   ollamaBaseUrl: "https://ollama.com/api",
   openAiCompatibleApiKey: "",
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
-  model: "glm-5.2",
+  model: "deepseek-v4-pro",
   specialistEnabled: true,
   specialistModel: "",
   specialistConnectionMode: "shared_primary",

@@ -162,7 +162,7 @@ async function assertLiveProviderConfiguration() {
     : settings.modelProvider === "openai_compatible"
       ? "openai_compatible"
       : "ollama";
-  const model = process.env.E2E_AI_MODEL?.trim() || settings.model || "glm-5.2";
+  const model = process.env.E2E_AI_MODEL?.trim() || settings.model || "deepseek-v4-pro";
   const baseUrl = provider === "openai_compatible"
     ? process.env.E2E_OPENAI_COMPATIBLE_BASE_URL?.trim() || settings.openAiCompatibleBaseUrl
     : process.env.E2E_OLLAMA_BASE_URL?.trim() || settings.ollamaBaseUrl || "https://ollama.com/api";

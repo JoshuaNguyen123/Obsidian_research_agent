@@ -847,7 +847,7 @@ test.describe("Daily-use live research contract", () => {
       const prompt = `Replace the entire current note with exactly this markdown:\n# Approved Replacement\n\n${harness.marker}\n`;
 
       await harness.submitMission(prompt, { waitForCompletion: false });
-      await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      await harness.page.getByTestId("agentic-run-details-tab").click();
       const denied = harness.activePreparedApproval("replace_current_file");
       await expect(denied).toBeVisible({ timeout: harness.config.missionTimeoutMs });
       // Full approval-surface contract, not just the fingerprint substring:
@@ -925,7 +925,7 @@ test.describe("Daily-use live research contract", () => {
         // cleanup while an historical approval card remains rendered.
         clearChatFirst: false,
       });
-      await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      await harness.page.getByTestId("agentic-run-details-tab").click();
       const approved = harness.activePreparedApproval("replace_current_file");
       await expect(approved).toBeVisible({ timeout: harness.config.missionTimeoutMs });
       await assertApprovalSurfaceUsableV1(harness.page);
@@ -1126,7 +1126,7 @@ test.describe("Daily-use live research contract", () => {
       // require the offsets to survive. The persisted projection can trail
       // live UI events, so incrementing only base.sequence can correctly hit
       // the stale-snapshot guard without rendering anything.
-      await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      await harness.page.getByTestId("agentic-run-details-tab").click();
       const scrollRestore = await harness.page.evaluate((pluginId) => {
         const plugin = (window as any).app?.plugins?.plugins?.[pluginId];
         const tab = plugin?.activeAgentView?.orchestratorTab;

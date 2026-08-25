@@ -185,8 +185,8 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
     await expect(page.locator(".agentic-researcher-view")).toHaveCount(1, {
       timeout: 30_000,
     });
-    await expect(page.getByRole("tab", { name: "Chat" })).toBeVisible();
-    await expect(page.getByRole("tab", { name: "Run Details" })).toBeVisible();
+    await expect(page.getByTestId("agentic-chat-tab")).toBeVisible();
+    await expect(page.getByTestId("agentic-run-details-tab")).toBeVisible();
     await expect(page.locator("textarea.agentic-researcher-prompt")).toBeVisible();
     const requiredCodeTools = [
       ...PHASE4_REQUIRED_CRUD_TOOLS,
@@ -844,7 +844,7 @@ async function runPublicRepairWithApprovals(
     if (operation?.status === "failed") {
       return { available: true, approvals, error: operation.error };
     }
-    await page.getByRole("tab", { name: "Run Details" }).click();
+    await page.getByTestId("agentic-run-details-tab").click();
     const approvalCard = page
       .locator(".agentic-researcher-approval-card")
       .filter({
@@ -933,7 +933,7 @@ async function submitMissionWithApprovals(
   prompt: string,
   timeoutMs: number,
 ): Promise<string[]> {
-  await page.getByRole("tab", { name: "Chat" }).click();
+  await page.getByTestId("agentic-chat-tab").click();
   const input = page.locator("textarea.agentic-researcher-prompt");
   const runButton = page.locator("button.agentic-researcher-run");
   const dismissResume = page
@@ -981,7 +981,7 @@ async function submitMissionWithApprovals(
   let observedMissionStart = true;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    await page.getByRole("tab", { name: "Run Details" }).click();
+    await page.getByTestId("agentic-run-details-tab").click();
     const approve = page
       .locator(".agentic-researcher-approval-card")
       .filter({
@@ -1011,7 +1011,7 @@ async function submitMissionWithApprovals(
         .toBeGreaterThan(resolvedCountBefore);
       continue;
     }
-    await page.getByRole("tab", { name: "Chat" }).click();
+    await page.getByTestId("agentic-chat-tab").click();
     const buttonText = (await runButton.textContent())?.trim() ?? "";
     const buttonEnabled = await runButton.isEnabled();
     if (buttonText !== "Run Mission" || !buttonEnabled) {
@@ -1021,7 +1021,7 @@ async function submitMissionWithApprovals(
       observedMissionStart = true;
     }
     if (observedMissionStart && buttonText === "Run Mission" && buttonEnabled) {
-      await page.getByRole("tab", { name: "Run Details" }).click();
+      await page.getByTestId("agentic-run-details-tab").click();
       const currentRunContinuation = page
         .locator(".agentic-researcher-continuation-action")
         .filter({ hasText: currentRunId });

@@ -22,12 +22,22 @@ export interface LinearPageSweepResult {
   pagesFetched: number;
 }
 
+/**
+ * One shared bound for the fail-closed association/duplicate-detection sweeps:
+ * 5 pages × the 50-row server clamp = 250 rows. Callers quote
+ * LINEAR_SWEEP_ROW_BOUND in their refusal so the error names the real limit,
+ * and every sweep inherits the same cap instead of restating a literal.
+ */
+export const LINEAR_SWEEP_PAGE_SIZE = 50;
+export const LINEAR_SWEEP_MAX_PAGES = 5;
+export const LINEAR_SWEEP_ROW_BOUND = LINEAR_SWEEP_PAGE_SIZE * LINEAR_SWEEP_MAX_PAGES;
+
 export async function listAllLinearPages(
   client: LinearToolClient,
   operationKey: string,
   variables: Record<string, unknown>,
   options?: LinearRequestOptions,
-  { maxPages = 5 }: { maxPages?: number } = {},
+  { maxPages = LINEAR_SWEEP_MAX_PAGES }: { maxPages?: number } = {},
 ): Promise<LinearPageSweepResult> {
   const cap = Math.max(1, Math.trunc(maxPages));
   const items: LinearBaseRecord[] = [];

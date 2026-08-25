@@ -5,7 +5,7 @@ import { expect, type Page } from "@playwright/test";
  * Use before independent major e2e missions. Do not call mid-Continue.
  */
 export async function clearChatInline(page: Page): Promise<void> {
-  await page.getByRole("tab", { name: "Chat" }).click();
+  await page.getByTestId("agentic-chat-tab").click();
   const options = page.locator("details.agentic-researcher-composer-options");
   if (!(await options.evaluate((element: HTMLDetailsElement) => element.open))) {
     await options.locator("summary").click();

@@ -302,7 +302,7 @@ test("cloud provider presets include OpenAI OpenRouter Azure and Ollama Cloud", 
   );
   assert.match(getCloudProviderPreset("azure_openai")?.baseUrl ?? "", /azure/i);
   assert.equal(getCloudProviderPreset("ollama_cloud")?.provider, "ollama");
-  assert.equal(getCloudProviderPreset("ollama_cloud")?.suggestedModel, "glm-5.2");
+  assert.equal(getCloudProviderPreset("ollama_cloud")?.suggestedModel, "deepseek-v4-pro");
   assert.equal(
     getCloudProviderPreset("ollama_cloud")?.baseUrl,
     "https://ollama.com/api",

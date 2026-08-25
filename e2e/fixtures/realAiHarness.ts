@@ -723,7 +723,7 @@ async function waitUntilIdleOrComplete(
         }
         // Continue lives on the Chat composer; Orchestrator/Details can hide it.
         await page
-          .getByRole("tab", { name: "Chat" })
+          .getByTestId("agentic-chat-tab")
           .click({ timeout: 5_000 })
           .catch(() => undefined);
         const continuation = page.getByRole("button", {
@@ -1337,7 +1337,7 @@ async function approveUntilMissionComplete(
     if (committedRestartStage && options.restartCorePlugin) {
       restartedStages.add(committedRestartStage);
       await options.restartCorePlugin(committedRestartStage);
-      await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
+      await page.getByTestId("agentic-run-details-tab").click({ timeout: 10_000 });
       const continued = await continueLatestRunAfterStageRestart(page);
       if (continued) {
         continuations += 1;
@@ -2066,7 +2066,7 @@ async function submitMission(
     clearChatFirst?: boolean;
   },
 ): Promise<void> {
-  await page.getByRole("tab", { name: "Chat" }).click();
+  await page.getByTestId("agentic-chat-tab").click();
   if (options.clearChatFirst !== false) {
     await clearChatInline(page);
   }

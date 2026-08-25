@@ -98,6 +98,7 @@ const SANDBOX_E2E_PROJECTS = new Set([
   "obsidian-hello-github-live",
   "compound-flow-real-live",
   "release-vertical",
+  "notebook-execution-live",
 ]);
 
 let activeChild = null;
@@ -743,14 +744,14 @@ export function normalizeExclusiveArgs(rawArgs) {
 /**
  * Apply AI mode for the Playwright child. Explicit CLI flags win; otherwise
  * leave any caller-provided E2E_AI_* env vars alone. Default package scripts
- * pass --real-ai (glm-5.2) or --mock-ai for deterministic runs.
+ * pass --real-ai (deepseek-v4-pro) or --mock-ai for deterministic runs.
  */
 export function applyE2eAiMode(aiMode, env = process.env) {
   if (aiMode === "real") {
     env.E2E_AI_MODE = "real";
     env.E2E_REAL_AI = "1";
     if (!env.E2E_AI_MODEL?.trim()) {
-      env.E2E_AI_MODEL = "glm-5.2";
+      env.E2E_AI_MODEL = "deepseek-v4-pro";
     }
     return;
   }
