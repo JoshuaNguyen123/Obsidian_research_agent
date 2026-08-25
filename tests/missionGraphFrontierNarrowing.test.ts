@@ -484,3 +484,74 @@ test("an implementation frontier keeps the reads its hash-bound writes depend on
     );
   }
 });
+
+test("a tool-less ready final still offers current-note writes when no mutation has paid", () => {
+  // Proof-matrix interrupted-continuation, 2026-08-25: resume of a streamed
+  // two-append mission restored only `final` with allowedTools=[], offered the
+  // model zero tools, and died after two empty turns.
+  const definitions = [
+    "web_search",
+    "linear_create_issue",
+    "append_to_current_file",
+    "replace_current_file",
+    "read_current_file",
+  ].map(tool);
+  const streamingStub = {
+    nodes: {
+      dispatch: {
+        id: "dispatch",
+        status: "complete",
+        allowedTools: [],
+        inputs: {},
+        outputs: {},
+      },
+      final: {
+        id: "final",
+        status: "ready",
+        allowedTools: [],
+        inputs: {},
+        outputs: {},
+        completionContract: { requiredEvidenceKinds: ["final-output"] },
+      },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+
+  const offered = constrainToolsToMissionGraphFrontier(definitions, streamingStub, {
+    route: "single_model_writeback",
+  }).map((definition) => definition.function.name);
+  assert.ok(
+    offered.includes("append_to_current_file"),
+    `resume must offer append, got ${offered.join(",")}`,
+  );
+  assert.equal(offered.includes("linear_create_issue"), false);
+  assert.equal(offered.includes("web_search"), false);
+
+  const afterPaidWrite = {
+    nodes: {
+      write: {
+        id: "write",
+        status: "complete",
+        allowedTools: ["append_to_current_file"],
+        inputs: {},
+        outputs: {},
+      },
+      final: {
+        id: "final",
+        status: "ready",
+        allowedTools: [],
+        inputs: {},
+        outputs: {},
+        completionContract: { requiredEvidenceKinds: ["final-output"] },
+      },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, afterPaidWrite, {
+      route: "single_model_writeback",
+    }).map((definition) => definition.function.name),
+    [],
+    "paid current-note writes must not re-open append on the final node",
+  );
+});

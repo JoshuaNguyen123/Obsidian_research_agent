@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildHostMissionGraphPlanV1 } from "../src/agent/missionGraphHost";
+import { getRuntimeFrontierToolNames } from "../src/agent/missionGraphAuthority";
 import { constrainToolsToMissionGraphFrontier } from "../src/agent/missionGraphFrontier";
+import { missionGraphOnlyFinalSynthesisRemainsV1 } from "../src/agent/missionGraphSelectors";
 import { planMissionGraphV3 } from "../src/agent/missionGraphPlanner";
 import {
   MissionGraphSession,
@@ -2490,6 +2492,216 @@ test("an approval aborted by a run deadline reopens the node for continuation", 
   const denied = await session.resolveToolApproval(again, "denied");
   assert.equal(denied.nodes[again.nodeId].status, "blocked");
   assert.equal(denied.nodes[again.nodeId].blocker?.code, "approval_denied");
+});
+
+test("resume writeback splice heals the tool-less final stub so all three seats agree", async () => {
+  const harness = createVaultHarness();
+  // A streamed current-note write plans no tool nodes: the persisted graph is
+  // exactly the ready, tool-less `final` stub a hard crash leaves behind.
+  const graph = await graphFor({
+    missionId: "session-resume-writeback-splice",
+    allowedTools: ["append_to_current_file"],
+    plannedTools: [],
+    maxToolCalls: 4,
+  });
+  assert.deepEqual(
+    Object.keys(graph.nodes),
+    ["final"],
+    "The streaming-writeback fixture must persist only the tool-less final stub, or it no longer reproduces the crash-resume graph.",
+  );
+  assert.deepEqual(graph.nodes.final.allowedTools, []);
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+
+  const healed = await session.spliceResumeCurrentNoteWriteNode({
+    objective: "Pay the owed current-note append for the resumed streamed write.",
+    currentNotePath: "Research/Brief.md",
+    wallClockMs: 30_000,
+    minimumReceipts: 1,
+    requiredReceiptKinds: ["vault_write"],
+  });
+  assert.equal(
+    healed.splicedNodeId,
+    "resume-current-note-write",
+    "Resume must splice the owed write node into the stub graph; a graph that owes its promised current-note mutation may not stay tool-less.",
+  );
+  const spliced = session.graph.nodes["resume-current-note-write"];
+  assert.equal(spliced?.status, "ready");
+  assert.deepEqual(spliced?.allowedTools, ["append_to_current_file"]);
+  assert.equal(spliced?.effect, "mutation");
+  // The stub persists `final` as READY: ready->queued is not a legal
+  // transition and a ready node may not hold an incomplete dependency, so
+  // the splice must land the write node standalone rather than fail the
+  // whole heal; acceptance still gates on the write receipt.
+  assert.deepEqual(
+    session.graph.nodes.final.dependencyIds,
+    [],
+    "A ready final stub cannot accept the final->write edge; the splice must land the node standalone rather than fail the whole heal.",
+  );
+
+  // Seat 1 (loop decision): the graph no longer reads as final-synthesis-only.
+  assert.equal(
+    missionGraphOnlyFinalSynthesisRemainsV1(session.graph),
+    false,
+    "After the splice the loop decision must stop forcing tool-less final synthesis: a non-terminal write node remains.",
+  );
+  // Seat 2 (frontier): the NORMAL authority frontier exposes the write tool,
+  // without the empty-frontier fallback.
+  assert.ok(
+    getRuntimeFrontierToolNames(session.graph).includes(
+      "append_to_current_file",
+    ),
+    "The authoritative frontier must offer append_to_current_file from the spliced node itself, not from the resume fallback.",
+  );
+  // Seat 3 (authority gate): the session authorizes the actual call.
+  const execution = requireExecution(
+    await session.beginToolExecution("append_to_current_file"),
+  );
+  assert.equal(
+    execution.nodeId,
+    "resume-current-note-write",
+    "The session must authorize the owed append against the spliced node; refusing its own required tool is the three-seat disagreement this heal removes.",
+  );
+
+  // The splice records itself in the graph journal like every authority op.
+  const stored = await requireStored(harness.context, graph.missionId);
+  assert.ok(
+    stored.record.journal.some((entry) =>
+      entry.patch.operations.some(
+        (operation) =>
+          operation.op === "add_node" &&
+          operation.node.id === "resume-current-note-write",
+      ),
+    ),
+    "The splice must be journaled like any other authority patch: persisted graphs resume verbatim, so an unjournaled heal would vanish on the next crash.",
+  );
+
+  // Idempotent: a healed graph is no longer the stub, so a second resume
+  // must not splice again.
+  const again = await session.spliceResumeCurrentNoteWriteNode({
+    objective: "Pay the owed current-note append for the resumed streamed write.",
+    currentNotePath: "Research/Brief.md",
+    wallClockMs: 30_000,
+    minimumReceipts: 1,
+    requiredReceiptKinds: ["vault_write"],
+  });
+  assert.equal(
+    again.splicedNodeId,
+    null,
+    "A healed graph carries a tool-bearing node and must never be spliced twice: over-splicing would demand a second append the mission never promised.",
+  );
+});
+
+test("a resumed graph whose required mutation already completed gets no splice", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-resume-writeback-no-oversplice",
+    allowedTools: ["append_to_current_file"],
+    plannedTools: ["append_to_current_file"],
+    maxToolCalls: 4,
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const write = requireExecution(
+    await session.beginToolExecution("append_to_current_file"),
+  );
+  const writeNode = session.graph.nodes[write.nodeId]!;
+  await session.finishToolExecution(write, {
+    ok: true,
+    evidence: evidenceFor(writeNode, "1", harness.nextTimestamp()),
+    receipt: receiptFor(writeNode, "2", harness.nextTimestamp()),
+  });
+  assert.equal(session.graph.nodes[write.nodeId].status, "complete");
+
+  const healed = await session.spliceResumeCurrentNoteWriteNode({
+    objective: "Pay the owed current-note append for the resumed streamed write.",
+    currentNotePath: "Research/Brief.md",
+    wallClockMs: 30_000,
+    minimumReceipts: 1,
+    requiredReceiptKinds: ["vault_write"],
+  });
+  assert.equal(
+    healed.splicedNodeId,
+    null,
+    "A graph whose required mutation already completed owes nothing: splicing here would replay a paid write (the over-splicing guard).",
+  );
+});
+
+test("the reducer refuses a splice-shaped write node on any graph that is not the stub", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-resume-writeback-reducer-guard",
+    allowedTools: ["append_to_current_file"],
+    plannedTools: ["append_to_current_file"],
+    maxToolCalls: 4,
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const appendGrant =
+    graph.capabilityEnvelope.tools["append_to_current_file"];
+  assert.ok(appendGrant);
+  const appendBinding = Object.values(graph.capabilityEnvelope.bindings).find(
+    (binding) => binding.allowedEffects.includes("mutation"),
+  );
+  assert.ok(appendBinding);
+  await assert.rejects(
+    () =>
+      session.apply("Attempt an unsanctioned resume-heal splice.", [
+        {
+          op: "add_node",
+          node: {
+            id: "resume-current-note-write",
+            dependencyIds: [],
+            objective: "Mint an unsanctioned second write authority.",
+            executorId: "single-agent",
+            executionHost: "obsidian_core",
+            effect: "mutation",
+            inputs: {},
+            outputs: {},
+            requiredCapabilities: [...appendGrant.capabilityIds],
+            allowedTools: ["append_to_current_file"],
+            destination: {
+              bindingId: appendBinding.id,
+              effect: "mutation",
+              // A different selector than the planned append node: the
+              // candidate must not ride the same-authority-signature path,
+              // so the only remaining gates are the repair exceptions.
+              selector: "Somewhere-else.md",
+            },
+            resourceLocks: [{ bindingId: appendBinding.id, mode: "exclusive" }],
+            budget: { toolCalls: 2, externalActions: 0, wallClockMs: 30_000 },
+            retries: {
+              maxAttempts: 2,
+              attempts: 0,
+              failureFingerprints: [],
+              consecutiveFailureFingerprint: null,
+              consecutiveFailureCount: 0,
+            },
+            status: "ready",
+            evidence: [],
+            receipts: [],
+            verification: null,
+            completionContract: {
+              criteria: ["The unsanctioned write completes."],
+              minimumEvidence: 1,
+              requiredEvidenceKinds: ["tool-result"],
+              minimumReceipts: 0,
+              requiredReceiptKinds: [],
+              verifierId: null,
+            },
+            blocker: null,
+          },
+        },
+      ]),
+    /authority_widening|cannot add new mutation/u,
+    "The resume-heal reducer exception is scoped to the tool-less final stub: a graph that already carries a tool-bearing node must refuse the splice shape as authority widening.",
+  );
 });
 
 async function publicationReconciliationFixture(

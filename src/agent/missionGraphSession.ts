@@ -2942,6 +2942,169 @@ export class MissionGraphSession {
     });
   }
 
+  /**
+   * Splices the owed current-note write node into a resumed
+   * streaming-writeback stub graph: a hard crash mid streamed append persists
+   * a graph whose only live node is the ready, tool-less `final` synthesis
+   * stub, and resume restores that graph VERBATIM. Three seats then answer
+   * "does this graph still owe the current-note write?" differently — the
+   * loop decision forces tool-less final synthesis, the frontier fallback
+   * offers append_to_current_file, and this session refuses the actual call
+   * because no node carries the tool (two-subsystems-disagree #14). Healing
+   * the authoritative graph once, before the loop starts, makes every
+   * consumer agree; the store reducer independently re-checks the stub shape
+   * and the envelope grant, so this can never widen authority on a graph
+   * that is not the stub. Idempotent: a healed graph carries a tool-bearing
+   * node, so a second resume observes a non-stub graph and returns null.
+   */
+  async spliceResumeCurrentNoteWriteNode(input: {
+    objective: string;
+    currentNotePath: string | null;
+    wallClockMs: number;
+    minimumReceipts: number;
+    requiredReceiptKinds: string[];
+  }): Promise<{ graph: MissionGraphV3; splicedNodeId: string | null }> {
+    const toolName = "append_to_current_file";
+    return this.enqueueMutation(async () => {
+      const graph = this.record.graph;
+      const envelope = graph.capabilityEnvelope;
+      const grant = envelope.tools[toolName];
+      const final = graph.nodes.final;
+      const isWritebackStub =
+        grant !== undefined &&
+        grant.effect === "mutation" &&
+        final !== undefined &&
+        (final.status === "ready" || final.status === "queued") &&
+        final.allowedTools.length === 0 &&
+        Object.entries(graph.nodes).every(([nodeId, node]) =>
+          nodeId === "final"
+            ? true
+            : (node.status === "complete" || node.status === "cancelled") &&
+              node.allowedTools.length === 0 &&
+              !getMissionCompositeLifecycleSpecV1(node),
+        );
+      if (!isWritebackStub) {
+        return { graph: this.graph, splicedNodeId: null };
+      }
+      const executionHost = grant.executionHosts.includes("obsidian_core")
+        ? ("obsidian_core" as const)
+        : grant.executionHosts[0];
+      if (
+        !executionHost ||
+        !envelope.executionHosts.includes(executionHost)
+      ) {
+        return { graph: this.graph, splicedNodeId: null };
+      }
+      const executorId = ["single-agent", ...Object.keys(envelope.executors)].find(
+        (candidateId) => {
+          const executor = envelope.executors[candidateId];
+          return (
+            executor !== undefined &&
+            executor.allowedEffects.includes("mutation") &&
+            executor.executionHosts.includes(executionHost)
+          );
+        },
+      );
+      if (!executorId) {
+        return { graph: this.graph, splicedNodeId: null };
+      }
+      // The mutation destination must be the envelope's own host-trusted
+      // binding for this tool; without one the node could never validate,
+      // so the graph stays unhealed and the resume fallback remains in force.
+      const binding = Object.values(envelope.bindings).find(
+        (candidate) =>
+          candidate.allowedEffects.includes("mutation") &&
+          (grant.bindingKinds.length === 0 ||
+            grant.bindingKinds.includes(candidate.kind)),
+      );
+      if (!binding) {
+        return { graph: this.graph, splicedNodeId: null };
+      }
+      const nodeId = "resume-current-note-write";
+      if (graph.nodes[nodeId]) {
+        return { graph: this.graph, splicedNodeId: null };
+      }
+      const node: MissionNodeV3 = {
+        id: nodeId,
+        dependencyIds: [],
+        objective: input.objective.slice(0, 4_000),
+        executorId,
+        executionHost,
+        effect: "mutation",
+        inputs: {},
+        outputs: {},
+        requiredCapabilities: [...grant.capabilityIds],
+        allowedTools: [toolName],
+        destination: {
+          bindingId: binding.id,
+          effect: "mutation",
+          selector: input.currentNotePath ?? "prompt-scoped-vault-target",
+        },
+        resourceLocks: [{ bindingId: binding.id, mode: "exclusive" }],
+        budget: {
+          toolCalls: 2,
+          externalActions: 0,
+          wallClockMs: Math.max(1_000, Math.floor(input.wallClockMs)),
+        },
+        retries: {
+          maxAttempts: Math.min(
+            2,
+            Math.max(1, envelope.budgets.maxAttemptsPerNode),
+          ),
+          attempts: 0,
+          failureFingerprints: [],
+          consecutiveFailureFingerprint: null,
+          consecutiveFailureCount: 0,
+        },
+        status: "ready",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        completionContract: {
+          criteria: [
+            `${toolName} paid the current-note write the interrupted streamed segment still owes.`,
+          ],
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["tool-result"],
+          minimumReceipts: Math.max(0, Math.floor(input.minimumReceipts)),
+          requiredReceiptKinds: [...input.requiredReceiptKinds],
+          verifierId: null,
+        },
+        blocker: null,
+      };
+      // Chaining final behind the spliced write is the honest partial order,
+      // but the stub persists `final` as READY, ready->queued is not a legal
+      // transition, and a ready node may not hold an incomplete dependency —
+      // and a streamed-writeback envelope typically budgets maxDepth 1
+      // besides. Splice standalone in those cases rather than fail the whole
+      // heal: the host acceptance verifier still refuses to complete `final`
+      // until the write receipt exists, so acceptance cannot close over the
+      // unpaid mutation either way.
+      const chainFinal =
+        final.status === "queued" && envelope.budgets.maxDepth >= 2;
+      const applied = await this.applyUnlocked(
+        "Splice the owed current-note write node into the resumed streaming-writeback stub graph.",
+        [
+          { op: "add_node", node },
+          ...(chainFinal
+            ? [
+                {
+                  op: "update_node" as const,
+                  nodeId: "final",
+                  changes: {
+                    dependencyIds: [
+                      ...new Set([...final.dependencyIds, nodeId]),
+                    ],
+                  },
+                },
+              ]
+            : []),
+        ],
+      );
+      return { graph: applied, splicedNodeId: nodeId };
+    });
+  }
+
   async apply(
     reason: string,
     operations: MissionGraphPatchOperationV1[],

@@ -664,6 +664,20 @@ test("real AI and live external flags cannot widen into other projects", () => {
     ]).projects,
     ["vault-sibling-code-delivery-real-live"],
   );
+  assert.deepEqual(
+    normalizeExclusiveArgs([
+      "--real-ai",
+      "--project=interrupted-continuation-live",
+    ]).projects,
+    ["interrupted-continuation-live"],
+  );
+  assert.deepEqual(
+    normalizeExclusiveArgs([
+      "--real-ai",
+      "--project=notebook-execution-live",
+    ]).projects,
+    ["notebook-execution-live"],
+  );
   assert.throws(
     () => normalizeExclusiveArgs(["--real-ai", "--project=configured-linear-live"]),
     /restricted to attested live-provider/u,
@@ -972,6 +986,8 @@ test("package commands route only to real lanes and live projects disable reruns
     "vault-sibling-code-delivery-real-live",
     "daily-use-compound",
     "real-ai-soak",
+    "interrupted-continuation-live",
+    "notebook-execution-live",
     "provider-canary",
   ]) {
     assert.match(
@@ -986,6 +1002,8 @@ test("package commands route only to real lanes and live projects disable reruns
   assert.match(preflight, /"byok-autonomous-journey": \[\]/u);
   assert.match(preflight, /"core-native": \[\]/u);
   assert.match(preflight, /"safe-assistant-renderer": \[\]/u);
+  assert.match(preflight, /"interrupted-continuation-live": \[\]/u);
+  assert.match(preflight, /"notebook-execution-live": \[\]/u);
 });
 
 test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch broad or merge lanes", () => {

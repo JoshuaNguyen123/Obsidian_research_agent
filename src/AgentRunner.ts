@@ -282,6 +282,7 @@ import {
   getActiveValidationRecoveryFrontierV1,
   getPendingMissionGraphWriteToolNames,
   getPhaseCeilingProtectedToolNamesV1,
+  graphHasCompletedRequiredMutation,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
@@ -815,6 +816,7 @@ import {
   createResearchPlanWithAssist,
   formatResearchPlanForPrompt,
   parseExplicitResearchSourceCount,
+  promptForbidsFetchedSourceWriteback,
   type ResearchEffortAssessment,
   type ResearchEffortAssist,
   type ResearchModeAssessment,
@@ -980,6 +982,7 @@ import {
   buildHostMissionGraphPlanV1,
   isExactBackgroundCodeValidationCommitDescriptor,
   isExactBackgroundGitHubPreparedDescriptor,
+  missionGraphToolNodeWallClockMs,
 } from "./agent/missionGraphHost";
 import { canonicalMissionGraphId } from "./agent/missionGraphIds";
 import { planMissionGraphV3 } from "./agent/missionGraphPlanner";
@@ -2979,6 +2982,10 @@ export async function runAgentMission({
     runToolContext,
     enableStreaming,
   );
+  // True only when a resume continues a streamed current-note append: the
+  // promise the crashed segment made. Consumed by the resume splice heal so a
+  // restored tool-less final-only stub graph gets its owed write node back.
+  let resumeContinuesStreamedCurrentNoteAppend = false;
   if (
     noteOutputPlan.destination === "new_note" &&
     hasActiveCurrentMarkdownFile(runToolContext)
@@ -3887,6 +3894,23 @@ export async function runAgentMission({
     ) {
       streamingWritebackKind = null;
     }
+    // Continue of a streamed current-note append must not re-stream the original
+    // prompt (duplicate first append, or gated prose that never hits the note).
+    // Drop host-owned streaming so append_to_current_file becomes a required
+    // tool (proof-matrix interrupted-continuation, 2026-08-25). Scoped to
+    // resumes that carry a durable mission-graph reference: there the
+    // restored GRAPH is the write authority (and the resume splice heals it
+    // when it owes the write). A legacy plan-based resume without a graph
+    // reference keeps host-owned streaming — its sourced writeback replays
+    // under WAL and reconcile protection, and dropping streaming there
+    // strands the draft in unbounded tool-less planning turns.
+    if (
+      streamingWritebackKind === "append" &&
+      resumeSnapshot?.missionGraphRef
+    ) {
+      resumeContinuesStreamedCurrentNoteAppend = true;
+      streamingWritebackKind = null;
+    }
     tools = getAllowedToolDefinitions(
       toolRegistry,
       activeIntentPrompt,
@@ -3966,7 +3990,14 @@ export async function runAgentMission({
       reflex: reflexOutput.intent,
       outputTarget: noteOutputPlan.destination,
     });
-    if (isRunRouteValue(resumeLedger?.route)) {
+    if (
+      isRunRouteValue(resumeLedger?.route) &&
+      !(
+        streamingWritebackKind === null &&
+        (resumeLedger.route === "single_model_writeback" ||
+          resumeLedger.route === "direct_writeback")
+      )
+    ) {
       runPlan = { ...runPlan, route: resumeLedger.route };
     }
     runPlan.traceReasons = [
@@ -4714,6 +4745,56 @@ export async function runAgentMission({
             kind: "status",
             message: fallbackCopy,
             outputPreview: { fallbackReason: graphPlan.fallbackReason },
+          });
+        }
+      }
+      // Two-subsystems-disagree #14: a hard crash mid streamed current-note
+      // write persists a graph that is only a ready, tool-less `final` stub,
+      // and BOTH resume paths above (the direct store resume and the
+      // continuation open) restore it VERBATIM. Left unhealed, the loop
+      // decision forces tool-less synthesis, the frontier fallback offers
+      // append_to_current_file, and the graph session refuses the actual
+      // call. Heal the AUTHORITY once, before the loop starts, by splicing
+      // the owed write node back in; every consumer then answers "does this
+      // graph still owe the current-note write?" identically. The shared
+      // predicate below is the same one the frontier fallback consults, and
+      // the store reducer re-validates the stub shape and envelope grant.
+      if (
+        missionGraphSession &&
+        exactResumeRunId &&
+        resumeContinuesStreamedCurrentNoteAppend &&
+        missionGraphOnlyFinalSynthesisRemainsV1(missionGraphSession.graph) &&
+        !graphHasCompletedRequiredMutation(missionGraphSession.graph)
+      ) {
+        const appendDescriptor =
+          toolRegistry.getDescriptor?.("append_to_current_file") ?? null;
+        const writebackSplice =
+          await missionGraphSession.spliceResumeCurrentNoteWriteNode({
+            objective:
+              "Pay the current-note append the interrupted streamed segment still owes, exactly once, then finish the mission.",
+            currentNotePath:
+              runToolContext.getCurrentMarkdownFile?.()?.path ?? null,
+            wallClockMs: missionGraphToolNodeWallClockMs(
+              effectiveMaxRunMs ?? runPlan.effortDecision.maxWallClockMs,
+              maxToolCalls,
+            ),
+            minimumReceipts:
+              appendDescriptor?.durability.receipt === true ? 1 : 0,
+            requiredReceiptKinds:
+              appendDescriptor?.durability.receipt === true
+                ? [appendDescriptor.receiptKind ?? "action-receipt"]
+                : [],
+          });
+        if (writebackSplice.splicedNodeId) {
+          events.onTrace?.({
+            id: "mission-graph-resume-writeback-splice",
+            kind: "status",
+            message:
+              "Spliced the owed current-note write node into the resumed streaming-writeback stub graph.",
+            outputPreview: {
+              missionId: missionGraphSession.graph.missionId,
+              splicedNodeId: writebackSplice.splicedNodeId,
+            },
           });
         }
       }
@@ -34811,13 +34892,23 @@ export function requiresVerifiedFinalOutput(
   researchPlan: ResearchPlan | null,
   missionPrompt: string,
 ): boolean {
-  return Boolean(
-    shouldRequireClaimGrounding(missionPrompt) ||
-      researchPlan ||
-      missionPlan?.tasks.some((task) =>
-        task.completionContract.citationMode !== undefined,
-      ),
-  );
+  if (shouldRequireClaimGrounding(missionPrompt)) {
+    return true;
+  }
+  if (
+    missionPlan?.tasks.some(
+      (task) => task.completionContract.citationMode !== undefined,
+    )
+  ) {
+    return true;
+  }
+  if (!researchPlan) {
+    return false;
+  }
+  // A research plan is not itself a fetched-source writeback contract. Vault-only
+  // soak prompts ("Do not use web") were held at append because a researchPlan
+  // existed, then stalled on two empty tool turns (proof-matrix vault-recall).
+  return !promptForbidsFetchedSourceWriteback(missionPrompt);
 }
 
 function isProofGatedCurrentNoteContentTool(toolName: string): boolean {
