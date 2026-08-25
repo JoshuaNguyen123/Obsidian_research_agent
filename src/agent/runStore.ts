@@ -3225,7 +3225,9 @@ function normalizeRuntimeReceipt(
     startedAt: getNonEmptyString(value.startedAt),
     committedAt,
     commitKind:
-      value.commitKind === "committed" || value.commitKind === "reconciled"
+      value.commitKind === "committed" ||
+      value.commitKind === "reconciled" ||
+      value.commitKind === "no_op"
         ? value.commitKind
         : undefined,
     ...(readback ? { readback } : {}),
@@ -3236,6 +3238,9 @@ function normalizeRuntimeReceipt(
             bytesDeleted: getFiniteNumber(effects.bytesDeleted),
             affectedCount: getFiniteNumber(effects.affectedCount),
             changedFields: getStringArray(effects.changedFields),
+            ...(typeof effects.changed === "boolean"
+              ? { changed: effects.changed }
+              : {}),
           },
         }
       : {}),
@@ -3777,6 +3782,7 @@ function normalizeActionReadback(
     checkedAt,
     observedRevision: getNonEmptyString(value.observedRevision),
     observedFingerprint: getNonEmptyString(value.observedFingerprint),
+    priorRevision: getNonEmptyString(value.priorRevision),
   };
 }
 

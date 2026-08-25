@@ -31,6 +31,7 @@ import {
   executePreparedToolWithMetrics,
   extractExactMarkdownReplacementPayload,
   getExplicitCodeToolNames,
+  hasConcreteWriteReceipt,
   getCodeCapabilityRegistrationBlockerV1,
   getRequiredCodeWorkflowToolNames,
   getExplicitLinearMutationToolNames,
@@ -26470,4 +26471,69 @@ test("a deferred graph node does not promise that the preferred tool unblocks it
     readyFrontierToolNames: ["code_workspace_write_expected"],
   });
   assert.doesNotMatch(unavailable, /stays refused until its own node is ready/u);
+});
+
+test("hasConcreteWriteReceipt rejects affirmative zero-delta vault receipts but keeps legacy shapes", () => {
+  const vaultReceipt = (extra: Partial<AgentRunReceipt>): AgentRunReceipt => ({
+    toolName: "edit_current_section",
+    operation: "edit",
+    message: "edit Note.md",
+    path: "Note.md",
+    resource: {
+      system: "vault",
+      resourceType: "note",
+      id: "Note.md",
+      path: "Note.md",
+    },
+    ...extra,
+  });
+
+  // Legacy vault receipt without any delta fields still proves a write.
+  assert.equal(hasConcreteWriteReceipt([vaultReceipt({})]), true);
+
+  // An affirmative zero-delta receipt is a vacuous success, not proof.
+  assert.equal(
+    hasConcreteWriteReceipt([
+      vaultReceipt({ effects: { changed: false } }),
+    ]),
+    false,
+  );
+  assert.equal(
+    hasConcreteWriteReceipt([
+      vaultReceipt({ bytesWritten: 0, affectedCount: 0 }),
+    ]),
+    false,
+  );
+  assert.equal(
+    hasConcreteWriteReceipt([vaultReceipt({ commitKind: "no_op" })]),
+    false,
+  );
+
+  // Positive deltas keep proving work, including destructive ones.
+  assert.equal(
+    hasConcreteWriteReceipt([
+      vaultReceipt({ bytesWritten: 42, effects: { changed: true } }),
+    ]),
+    true,
+  );
+  assert.equal(
+    hasConcreteWriteReceipt([
+      vaultReceipt({
+        operation: "replace",
+        toolName: "replace_current_file",
+        bytesWritten: 0,
+        bytesDeleted: 512,
+      }),
+    ]),
+    true,
+  );
+
+  // One zero-delta receipt does not poison a set that also holds a real write.
+  assert.equal(
+    hasConcreteWriteReceipt([
+      vaultReceipt({ effects: { changed: false } }),
+      vaultReceipt({ bytesWritten: 42 }),
+    ]),
+    true,
+  );
 });

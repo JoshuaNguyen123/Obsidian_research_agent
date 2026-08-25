@@ -8,6 +8,7 @@ import {
   isWholeNoteEditIntent,
   missingIncludesWriteReceipt,
   prefersStreamedReplaceForEditOrganize,
+  receiptReportsAffirmativeZeroDelta,
   receiptsSatisfyWriteProof,
   WRITE_RECEIPT_MISSING,
 } from "../src/agent/editOrganizeIntent";
@@ -283,6 +284,140 @@ test("receiptsSatisfyWriteProof and write_receipt missing helpers", () => {
   );
   assert.equal(missingIncludesWriteReceipt([WRITE_RECEIPT_MISSING]), true);
   assert.equal(missingIncludesWriteReceipt(["vault_evidence"]), false);
+});
+
+test("receiptsSatisfyWriteProof rejects affirmative zero-delta receipts but keeps legacy field-less receipts", () => {
+  // Legacy shape: no delta fields at all — still counts as proof.
+  assert.equal(
+    receiptsSatisfyWriteProof([
+      { toolName: "append_to_current_file", operation: "append", path: "Note.md" },
+    ]),
+    true,
+  );
+  // Affirmative zero delta via effects.changed === false.
+  assert.equal(
+    receiptsSatisfyWriteProof([
+      {
+        toolName: "edit_current_section",
+        operation: "edit",
+        path: "Note.md",
+        effects: { changed: false },
+      },
+    ]),
+    false,
+  );
+  // Affirmative zero delta via all-zero carried delta fields.
+  assert.equal(
+    receiptsSatisfyWriteProof([
+      {
+        toolName: "edit_current_section",
+        operation: "edit",
+        path: "Note.md",
+        bytesWritten: 0,
+      },
+    ]),
+    false,
+  );
+  // Intentional no-op commitKind is not write proof.
+  assert.equal(
+    receiptsSatisfyWriteProof([
+      {
+        toolName: "restore_current_file_from_backup",
+        operation: "restore",
+        path: "Note.md",
+        commitKind: "no_op",
+      },
+    ]),
+    false,
+  );
+  // Positive delta passes.
+  assert.equal(
+    receiptsSatisfyWriteProof([
+      {
+        toolName: "edit_current_section",
+        operation: "edit",
+        path: "Note.md",
+        bytesWritten: 12,
+        effects: { changed: true },
+      },
+    ]),
+    true,
+  );
+  // A wipe (bytesDeleted > 0, bytesWritten 0) is a real destructive delta,
+  // distinguishable from a no-op.
+  assert.equal(
+    receiptsSatisfyWriteProof([
+      {
+        toolName: "replace_current_file",
+        operation: "replace",
+        path: "Note.md",
+        bytesWritten: 0,
+        bytesDeleted: 2048,
+      },
+    ]),
+    true,
+  );
+});
+
+test("receiptReportsAffirmativeZeroDelta shared predicate pins", () => {
+  // No delta fields: legacy, not affirmative.
+  assert.equal(
+    receiptReportsAffirmativeZeroDelta({
+      toolName: "create_file",
+      operation: "create",
+      path: "New.md",
+    }),
+    false,
+  );
+  // output.changed participates as a delta signal.
+  assert.equal(
+    receiptReportsAffirmativeZeroDelta({
+      toolName: "edit_current_section",
+      operation: "edit",
+      path: "Note.md",
+      output: { changed: false },
+    }),
+    true,
+  );
+  assert.equal(
+    receiptReportsAffirmativeZeroDelta({
+      toolName: "edit_current_section",
+      operation: "edit",
+      path: "Note.md",
+      output: { changed: true },
+    }),
+    false,
+  );
+  // effects-carried deltas count the same as top-level ones.
+  assert.equal(
+    receiptReportsAffirmativeZeroDelta({
+      toolName: "seed_default_templates",
+      operation: "create",
+      path: "Templates",
+      effects: { affectedCount: 0 },
+    }),
+    true,
+  );
+  assert.equal(
+    receiptReportsAffirmativeZeroDelta({
+      toolName: "seed_default_templates",
+      operation: "create",
+      path: "Templates",
+      effects: { affectedCount: 3 },
+    }),
+    false,
+  );
+  // effects.changed === false wins even when a stale positive byte count rides along.
+  assert.equal(
+    receiptReportsAffirmativeZeroDelta({
+      toolName: "edit_current_section",
+      operation: "edit",
+      path: "Note.md",
+      bytesWritten: 64,
+      effects: { changed: false },
+    }),
+    true,
+  );
 });
 
 test("runPlan routes current-note organize to writeback and vault organize to clarify", () => {

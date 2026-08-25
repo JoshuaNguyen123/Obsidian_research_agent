@@ -713,6 +713,7 @@ import {
   isWholeNoteEditIntent,
   missingIncludesWriteReceipt,
   prefersStreamedReplaceForEditOrganize,
+  receiptReportsAffirmativeZeroDelta,
 } from "./agent/editOrganizeIntent";
 
 import {
@@ -31346,7 +31347,7 @@ function buildDescriptorResourceRef(
   };
 }
 
-function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
+export function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
   return receipts.some((receipt) => {
     if (
       ["read", "list", "search", "validate"].includes(receipt.operation)
@@ -31354,7 +31355,13 @@ function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
       return false;
     }
     if (!receipt.resource) return Boolean(receipt.path);
-    if (receipt.resource.system === "vault") return true;
+    if (receipt.resource.system === "vault") {
+      // A vault receipt only proves real work when it does not AFFIRMATIVELY
+      // report a zero delta (effects.changed === false, commitKind "no_op",
+      // or all carried delta fields zero/false). Legacy receipts without any
+      // delta fields still pass. Shared predicate — do not re-inline.
+      return !receiptReportsAffirmativeZeroDelta(receipt);
+    }
     if (
       receipt.resource.system === "workspace" ||
       receipt.resource.system === "git"

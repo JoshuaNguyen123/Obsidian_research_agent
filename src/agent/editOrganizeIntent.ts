@@ -17,8 +17,18 @@ export interface WriteReceiptLike {
   operation?: string;
   path?: string;
   bytesWritten?: number;
+  bytesDeleted?: number;
+  affectedCount?: number;
+  commitKind?: string;
   message?: string;
   resource?: { system?: string };
+  effects?: {
+    bytesWritten?: number;
+    bytesDeleted?: number;
+    affectedCount?: number;
+    changed?: boolean;
+  };
+  output?: unknown;
 }
 
 const CURRENT_NOTE_TARGET =
@@ -197,7 +207,60 @@ export function classifyEditOrganizeRoute(prompt: string): EditOrganizeRoute {
   return "other";
 }
 
-/** True when any receipt proves a vault write completed. */
+/**
+ * True when a write receipt AFFIRMATIVELY reports that the tool changed
+ * nothing: `effects.changed === false`, `commitKind: "no_op"`, or every delta
+ * field it carries (bytesWritten / bytesDeleted / affectedCount /
+ * output.changed) is zero or false. Receipts that carry none of those fields
+ * are legacy shapes and are NOT treated as zero-delta — only an affirmative
+ * zero-delta signal disqualifies a receipt from proving real work.
+ *
+ * SHARED PREDICATE: `hasConcreteWriteReceipt` (AgentRunner) and
+ * `receiptsSatisfyWriteProof` (below) must both consume this — do not
+ * re-inline a private copy of the delta rule.
+ */
+export function receiptReportsAffirmativeZeroDelta(
+  receipt: WriteReceiptLike,
+): boolean {
+  if (receipt.effects?.changed === false) {
+    return true;
+  }
+  if (receipt.commitKind === "no_op") {
+    return true;
+  }
+  const bytesWritten = receipt.bytesWritten ?? receipt.effects?.bytesWritten;
+  const bytesDeleted = receipt.bytesDeleted ?? receipt.effects?.bytesDeleted;
+  const affectedCount = receipt.affectedCount ?? receipt.effects?.affectedCount;
+  const output =
+    typeof receipt.output === "object" && receipt.output !== null
+      ? (receipt.output as Record<string, unknown>)
+      : null;
+  const outputChanged =
+    output && typeof output.changed === "boolean" ? output.changed : undefined;
+  const carriesDeltaSignal =
+    typeof bytesWritten === "number" ||
+    typeof bytesDeleted === "number" ||
+    typeof affectedCount === "number" ||
+    typeof outputChanged === "boolean" ||
+    typeof receipt.effects?.changed === "boolean";
+  if (!carriesDeltaSignal) {
+    // Legacy receipt with no delta fields: not affirmative, still passes.
+    return false;
+  }
+  return !(
+    (bytesWritten ?? 0) > 0 ||
+    (bytesDeleted ?? 0) > 0 ||
+    (affectedCount ?? 0) > 0 ||
+    outputChanged === true ||
+    receipt.effects?.changed === true
+  );
+}
+
+/**
+ * True when any receipt proves a vault write completed AND did real work.
+ * A receipt that affirmatively reports a zero delta (see
+ * `receiptReportsAffirmativeZeroDelta`) is not proof of a write.
+ */
 export function receiptsSatisfyWriteProof(
   receipts: WriteReceiptLike[],
 ): boolean {
@@ -208,8 +271,8 @@ export function receiptsSatisfyWriteProof(
       receipt.path.trim().length > 0 &&
       (typeof receipt.operation === "string" ||
         typeof receipt.toolName === "string" ||
-        (typeof receipt.bytesWritten === "number" && receipt.bytesWritten > 0) ||
-        typeof receipt.message === "string"),
+        typeof receipt.message === "string") &&
+      !receiptReportsAffirmativeZeroDelta(receipt),
   );
 }
 
