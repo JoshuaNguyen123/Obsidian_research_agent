@@ -140,6 +140,10 @@ import {
 } from "./src/agent/missionScheduler";
 import { cleanupOldWorkspaces } from "./src/agent/codeWorkspace";
 import {
+  resolveRunRetentionPolicy,
+  sweepAgentRunsRetentionBestEffort,
+} from "./src/agent/runRetentionPolicy";
+import {
   canonicalMissionGraphId,
   runAgentMission,
   type AgentRunCompleteEvent,
@@ -1141,6 +1145,12 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
     this.startupPhase = "loading_runtime";
     void cleanupOldWorkspaces(7);
+    void sweepAgentRunsRetentionBestEffort({
+      vault: this.app.vault,
+      policy: resolveRunRetentionPolicy(
+        this.settings as { runRetentionDays?: number; runRetentionMaxRuns?: number },
+      ),
+    });
     this.startupPhase = "initializing_semantic_index";
     this.semanticIndexService = this.createSemanticIndexService();
     this.semanticIndexNeedsBootstrap = this.settings.semanticIndexEnabled;
