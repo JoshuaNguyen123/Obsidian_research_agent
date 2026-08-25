@@ -5,7 +5,9 @@ import {
   cloudProviderNeedsApiKey,
 } from "../src/agent/cloudModelReadiness";
 import {
+  enforcePhaseToolMenuCeilingV1,
   mapRunRouteToSchemaRoute,
+  PHASE_TOOL_MENU_CEILINGS_V1,
   schemasForStep,
 } from "../src/agent/toolSchemaPolicy";
 import {
@@ -193,6 +195,171 @@ test("runRoute maps to schema policy and drops Linear on current-note", () => {
   assert.ok(compoundNames.includes("publish_research_to_linear"));
   assert.ok(compoundNames.includes("web_search"));
   assert.ok(!compoundNames.includes("linear_create_issue"));
+});
+
+function ceilingTool(name: string): { type: "function"; function: { name: string } } {
+  return { type: "function", function: { name } };
+}
+
+test("phase tool-menu ceiling caps gather/analyze at 10 and write/verify at 6", () => {
+  assert.equal(PHASE_TOOL_MENU_CEILINGS_V1.gather, 10);
+  assert.equal(PHASE_TOOL_MENU_CEILINGS_V1.analyze, 10);
+  assert.equal(PHASE_TOOL_MENU_CEILINGS_V1.write, 6);
+  assert.equal(PHASE_TOOL_MENU_CEILINGS_V1.verify, 6);
+
+  const wideMenu = Array.from({ length: 14 }, (_, index) =>
+    ceilingTool(`extra_tool_${index}`),
+  );
+  const gather = enforcePhaseToolMenuCeilingV1({
+    phase: "gather",
+    schemas: wideMenu,
+  });
+  assert.equal(gather.length, 10);
+
+  const write = enforcePhaseToolMenuCeilingV1({
+    phase: "write",
+    schemas: wideMenu,
+  });
+  assert.equal(write.length, 6);
+
+  const analyze = enforcePhaseToolMenuCeilingV1({
+    phase: "analyze",
+    schemas: wideMenu,
+  });
+  assert.equal(analyze.length, 10);
+
+  const verify = enforcePhaseToolMenuCeilingV1({
+    phase: "verify",
+    schemas: wideMenu,
+  });
+  assert.equal(verify.length, 6);
+});
+
+test("phase tool-menu ceiling never drops graph-required tools", () => {
+  const graphRequired = Array.from({ length: 8 }, (_, index) => `required_${index}`);
+  const menu = [
+    ...graphRequired.map(ceilingTool),
+    ...Array.from({ length: 6 }, (_, index) => ceilingTool(`noise_${index}`)),
+  ];
+  const capped = enforcePhaseToolMenuCeilingV1({
+    phase: "write",
+    schemas: menu,
+    graphRequired,
+  });
+  // Eight graph-required names exceed the write ceiling of 6; every one of
+  // them survives anyway, and no extras ride along above the ceiling.
+  const names = capped.map((tool) => tool.function.name);
+  assert.deepEqual(names, graphRequired);
+});
+
+test("phase tool-menu ceiling keeps preferred-next and route-base over extras", () => {
+  const menu = [
+    ceilingTool("noise_a"),
+    ceilingTool("noise_b"),
+    ceilingTool("web_search"),
+    ceilingTool("web_fetch"),
+    ceilingTool("read_current_file"),
+    ceilingTool("noise_c"),
+    ceilingTool("synthesize_target"),
+    ceilingTool("required_read"),
+    ceilingTool("noise_d"),
+  ];
+  const capped = enforcePhaseToolMenuCeilingV1({
+    phase: "write",
+    schemas: menu,
+    graphRequired: ["required_read"],
+    preferredNextTool: "synthesize_target",
+    route: "grounded_workflow",
+  });
+  const names = capped.map((tool) => tool.function.name);
+  assert.equal(names.length, 6);
+  // graph-required first, then preferred next, then route-base reads.
+  assert.ok(names.includes("required_read"));
+  assert.ok(names.includes("synthesize_target"));
+  assert.ok(names.includes("web_search"));
+  assert.ok(names.includes("web_fetch"));
+  assert.ok(names.includes("read_current_file"));
+  // Original schema order is preserved for the survivors.
+  assert.deepEqual(
+    names,
+    menu
+      .map((tool) => tool.function.name)
+      .filter((name) => names.includes(name)),
+  );
+  // The dropped extras are the lowest-priority noise.
+  assert.ok(!names.includes("noise_c") || !names.includes("noise_d"));
+});
+
+test("phase tool-menu ceiling leaves under-ceiling menus and unknown phases unchanged", () => {
+  const smallMenu = [
+    ceilingTool("read_current_file"),
+    ceilingTool("append_to_current_file"),
+  ];
+  assert.deepEqual(
+    enforcePhaseToolMenuCeilingV1({ phase: "write", schemas: smallMenu }),
+    smallMenu,
+  );
+  const wideMenu = Array.from({ length: 14 }, (_, index) =>
+    ceilingTool(`tool_${index}`),
+  );
+  assert.deepEqual(
+    enforcePhaseToolMenuCeilingV1({ phase: null, schemas: wideMenu }),
+    wideMenu,
+  );
+  assert.deepEqual(
+    enforcePhaseToolMenuCeilingV1({ phase: "someday_phase", schemas: wideMenu }),
+    wideMenu,
+  );
+  // "publish" is treated as the write bucket.
+  assert.equal(
+    enforcePhaseToolMenuCeilingV1({ phase: "publish", schemas: wideMenu }).length,
+    6,
+  );
+});
+
+test("phase tool-menu ceiling only applies to research-bearing runs", () => {
+  // Non-research runs derive phase "write" immediately; a blanket write
+  // ceiling would let route-base reads crowd out the mission's own mutation
+  // or inspection tools (observed: create_file dropped from a CRUD mission,
+  // code_repository_detect_profile dropped from repository inspection).
+  const wideMenu = Array.from({ length: 14 }, (_, index) =>
+    ceilingTool(`tool_${index}`),
+  );
+  assert.deepEqual(
+    enforcePhaseToolMenuCeilingV1({
+      phase: "write",
+      schemas: wideMenu,
+      researchBearing: false,
+    }),
+    wideMenu,
+  );
+  assert.equal(
+    enforcePhaseToolMenuCeilingV1({
+      phase: "write",
+      schemas: wideMenu,
+      researchBearing: true,
+    }).length,
+    6,
+  );
+  // Graphless intent-gated menus pass through untouched: without a governing
+  // MissionGraph the assembled menu is the intent gate's own answer, and the
+  // ceiling must not evict deliberately admitted tools.
+  assert.deepEqual(
+    enforcePhaseToolMenuCeilingV1({
+      phase: "gather",
+      schemas: wideMenu,
+      graphGoverned: false,
+    }),
+    wideMenu,
+  );
+  assert.equal(
+    enforcePhaseToolMenuCeilingV1({
+      phase: "gather",
+      schemas: wideMenu,
+      graphGoverned: true,
+    }).length,
+    10,
+  );
 });
 
 test("constrainToolsToMissionGraphFrontier shrinks note route without graph", () => {
