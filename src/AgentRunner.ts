@@ -12252,6 +12252,17 @@ export async function runAgentMission({
         }
       }
       const durablePreWriteProofSatisfied = hasSatisfiedDurablePreWriteProof();
+      // Same vacuous-gate rule as the step-loop hold above: an unsatisfied flag
+      // with no outstanding blocking proof means this mission never carried
+      // pre-write proof debt, so this boundary does not govern the write.
+      // Without this the step-loop fix would only move the deadlock here.
+      const boundaryBlockingPreWriteMissing = durablePreWriteProofSatisfied
+        ? []
+        : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
+      const preWriteProofGateApplies = preWriteProofGateAppliesV1({
+        durablePreWriteProofSatisfied,
+        blockingPreWriteMissing: boundaryBlockingPreWriteMissing,
+      });
       const finalPayloadAcceptance =
         durablePreWriteProofSatisfied && finalPayload.trim()
           ? requireAcceptedPassageCitationCoverage(
@@ -12266,8 +12277,9 @@ export async function runAgentMission({
             )
           : null;
       if (
-        !durablePreWriteProofSatisfied ||
-        finalPayloadAcceptance?.status !== "pass"
+        preWriteProofGateApplies &&
+        (!durablePreWriteProofSatisfied ||
+          finalPayloadAcceptance?.status !== "pass")
       ) {
         const missingDetail = finalPayloadAcceptance?.missing.length
           ? ` (${finalPayloadAcceptance.missing.join(", ")})`
@@ -20865,6 +20877,20 @@ export async function runAgentMission({
       const blockingPreWriteMissing = durablePreWriteProofSatisfied
         ? []
         : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
+      // The gate must decide from the same data its receipt reports. An unsatisfied
+      // flag with an EMPTY blocking list is not "evidence is incomplete" — it is
+      // "this mission declared no blocking pre-write proof at all", because
+      // hasSatisfiedDurablePreWriteProof() returns false both when proofs are
+      // outstanding and when none were ever required. That vacuous arm held the
+      // write of a mission whose own prompt says it needs no web, memory, or vault
+      // research, and then advised research tools the frontier could not offer —
+      // an unsatisfiable remedy (proof-matrix interrupted-continuation, 2026-08-25).
+      // Nothing outstanding means nothing to wait for: the gate does not govern
+      // this write. Missions that DO carry pre-write proof debt are untouched.
+      const preWriteProofGateApplies = preWriteProofGateAppliesV1({
+        durablePreWriteProofSatisfied,
+        blockingPreWriteMissing,
+      });
       const proposedWriteAcceptance =
         proofGatedCurrentNoteTool &&
         requiresVerifiedFinalOutput(
@@ -20902,6 +20928,7 @@ export async function runAgentMission({
           : null;
       if (
         proofGatedCurrentNoteTool &&
+        preWriteProofGateApplies &&
         requiresVerifiedFinalOutput(
           missionPlan,
           researchPlan,
@@ -23578,6 +23605,30 @@ export const PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD = 2;
  * the full menu returns the moment the blocking proofs are satisfied
  * (`blockingProofsOutstanding` false) — the "restore" half of the rule.
  */
+/**
+ * Does the durable pre-write proof gate govern this write at all?
+ *
+ * `hasSatisfiedDurablePreWriteProof()` returns false for TWO different
+ * situations: proofs are required and still outstanding, and no proof was ever
+ * required. Only the first is a reason to hold a write. The second produced a
+ * hold whose own receipt reported an EMPTY blocking list — a gate with an empty
+ * contract — on a mission whose prompt says it needs no web, memory, or vault
+ * research, and then advised research tools the frontier could not offer.
+ *
+ * This is the ONE shared answer for both proof-gate seats (the step-loop hold
+ * and the mutation-boundary hold), so they cannot disagree about whether a
+ * write is governed.
+ */
+export function preWriteProofGateAppliesV1(input: {
+  durablePreWriteProofSatisfied: boolean;
+  blockingPreWriteMissing: readonly string[];
+}): boolean {
+  return (
+    input.durablePreWriteProofSatisfied ||
+    input.blockingPreWriteMissing.length > 0
+  );
+}
+
 export function containProofGateRejectedWriteToolsV1<
   T extends { function: { name: string } },
 >(
@@ -34461,13 +34512,29 @@ export function validateRequiredLiteralWriteArguments(
     return null;
   }
   const normalizedContent = content.toLowerCase();
-  const missing = anchors.filter(
-    (anchor) => !normalizedContent.includes(anchor.toLowerCase()),
+  const present = anchors.filter((anchor) =>
+    normalizedContent.includes(anchor.toLowerCase()),
   );
-  if (missing.length === 0) {
+  // Step-scoped, not mission-scoped. A mission may order SEVERAL writes, each
+  // owning one literal ("append a line containing A and verify, then append a
+  // separate line containing B"). Validating every call against every mission
+  // literal made the first append of any such mission structurally impossible:
+  // the call that correctly carries A alone was rejected for "missing" B, and
+  // the only way to satisfy the checker — putting both markers in one call —
+  // violates the mission's own "two appends, in that order" instruction
+  // (proof-matrix interrupted-continuation, 2026-08-25).
+  //
+  // Per call the contract is therefore progress, not completeness: a write
+  // must carry at least one of the literals the mission demanded, and a write
+  // that drops them all is still rejected. Single-literal missions are
+  // unchanged — one anchor means "present at least one" is exactly "present".
+  if (present.length > 0) {
     return null;
   }
-  return `The ${toolCall.name} content is missing ${missing.length} literal value(s) explicitly required by the mission. Return one corrected call whose content preserves every requested literal exactly.`;
+  // Sentence one is unchanged (every anchor is absent whenever this rejects).
+  // Sentence two no longer demands EVERY literal in one call: that instruction
+  // is what pushed the model to merge two ordered appends into a single write.
+  return `The ${toolCall.name} content is missing ${anchors.length} literal value(s) explicitly required by the mission. Return one corrected call whose content preserves this step's required literal exactly.`;
 }
 
 export function sanitizeAssistantContent(content: string): string {

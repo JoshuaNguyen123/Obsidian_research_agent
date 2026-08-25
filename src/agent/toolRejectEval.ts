@@ -302,7 +302,11 @@ export function buildOffFrontierToolRejectionMessage(input: {
       : null;
   const preferredLine = heldPreferred
     ? `${heldPreferred} is currently held by proof verification — return the corrected note content as your final answer instead of calling it.`
-    : `Preferred next: ${preferred}. Call that exact name.`;
+    : preferred === "none"
+      ? // "Preferred next: none. Call that exact name." literally instructs the
+        // model to call a tool named "none". When nothing is callable, say so.
+        "No tool is ready to call; return your best final answer instead."
+      : `Preferred next: ${preferred}. Call that exact name.`;
   return [
     base,
     `category=${category}`,

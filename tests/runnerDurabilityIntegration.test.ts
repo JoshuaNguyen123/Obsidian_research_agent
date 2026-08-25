@@ -994,11 +994,23 @@ test("continue run of an interrupted streamed append requires append_to_current_
       })),
     ),
   );
-  assert.match(
-    String(completions.at(-1)?.stopDetail ?? ""),
-    /append_to_current_file/u,
-    JSON.stringify(completions.at(-1)),
+  // The resumed segment must PAY the appends it owes, one marker per call.
+  // This assertion previously read "the run ends still owing
+  // append_to_current_file", which the mission-scoped literal checker
+  // satisfied for the wrong reason: it rejected every single-marker append
+  // for "missing" the other step's marker, so the owed write could never be
+  // paid at all. With the checker step-scoped, both ordered appends land.
+  const note = vault.files.get("Current.md") ?? "";
+  assert.equal(
+    note.split("MARKER_A1").length - 1,
+    1,
+    JSON.stringify({ note, completion: completions.at(-1) }),
   );
+  // This segment's budget ends after the first ordered append; the remaining
+  // marker is owed to the next segment, and the run must say so rather than
+  // reporting completion.
+  assert.equal(completions.at(-1)?.stopReason, "budget");
+  assert.equal(completions.at(-1)?.autoContinueRecommended, true);
 });
 
 test("continue of a crash-restored tool-less final stub splices the owed write and pays it", async () => {
