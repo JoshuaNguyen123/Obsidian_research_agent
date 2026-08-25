@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   getOllamaChatUrl,
   normalizeOllamaBaseUrl,
+  isOllamaCloudBaseUrl,
   OllamaClient,
   parseOllamaChatStream,
   parseOllamaChatResponse,
@@ -18,6 +19,18 @@ test("normalizes Ollama base URLs and builds chat URLs", () => {
     getOllamaChatUrl("http://localhost:11434/api/"),
     "http://localhost:11434/api/chat",
   );
+});
+
+test("Ollama Cloud hostnames are only ollama.com and its subdomains", () => {
+  const cases: Array<{ url: string; cloud: boolean; rule: string }> = [
+    { url: "https://ollama.com/api", cloud: true, rule: "ollama.com is the cloud API host" },
+    { url: "https://api.ollama.com/v1", cloud: true, rule: "subdomains of ollama.com are cloud" },
+    { url: "http://localhost:11434", cloud: false, rule: "loopback is a local Ollama daemon, not cloud" },
+    { url: "https://example.com/ollama.com", cloud: false, rule: "a path mentioning ollama.com is not the cloud host" },
+  ];
+  for (const { url, cloud, rule } of cases) {
+    assert.equal(isOllamaCloudBaseUrl(url), cloud, rule);
+  }
 });
 
 test("exposes a redacted production descriptor", () => {

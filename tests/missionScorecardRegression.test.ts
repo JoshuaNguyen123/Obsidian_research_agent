@@ -3,8 +3,12 @@ import test from "node:test";
 
 import {
   DEFAULT_MISSION_SCORECARD_BASELINE_PATH,
+  NO_RUN_SUMMARY_SKIP_MESSAGE,
   assertMissionScorecardRegressions,
+  assertMissionScorecardSummaryFile,
+  formatMissionScorecardCliResult,
   missionScorecardRecordKey,
+  parseMissionScorecardCliArgs,
 } from "../scripts/mission-scorecard-regression.mjs";
 import {
   scoreMissionV1,
@@ -395,4 +399,75 @@ test("the committed baseline manifest carries `applicable` on every dimension", 
       );
     }
   }
+});
+
+test("empty selectedProjects compares every lane present in the summary", () => {
+  assert.deepEqual(
+    assertMissionScorecardRegressions({
+      summary: summary(),
+      baseline: baseline(),
+      selectedProjects: [],
+    }),
+    { checkedRecords: 1, skipped: false },
+    "no-args comparison uses the summary's lanes rather than skipping",
+  );
+});
+
+test("missing run summary is a loud skip unless --require-summary is set", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(tmpdir(), "mission-scorecards-"));
+  try {
+    const baselinePath = path.join(dir, "baseline.json");
+    const summaryPath = path.join(dir, "missing-summary.json");
+    await writeFile(baselinePath, JSON.stringify(baseline()), "utf8");
+    const skipped = await assertMissionScorecardSummaryFile({
+      baselinePath,
+      summaryPath,
+    });
+    assert.deepEqual(skipped, {
+      checkedRecords: 0,
+      skipped: true,
+      reason: "no_run_summary",
+      validatedBaselineRecords: 1,
+    });
+    assert.equal(
+      formatMissionScorecardCliResult(skipped),
+      NO_RUN_SUMMARY_SKIP_MESSAGE,
+    );
+    assert.equal(
+      NO_RUN_SUMMARY_SKIP_MESSAGE,
+      "mission-scorecards: NO RUN SUMMARY — regression comparison skipped (baseline structure validated only)",
+    );
+  await assert.rejects(
+    () =>
+      assertMissionScorecardSummaryFile({
+        baselinePath,
+        summaryPath,
+        requireSummary: true,
+      }),
+    /--require-summary requires a daily-use run summary/u,
+  );
+    const presentSummaryPath = path.join(dir, "present-summary.json");
+    await writeFile(presentSummaryPath, JSON.stringify(summary()), "utf8");
+    assert.deepEqual(
+      await assertMissionScorecardSummaryFile({
+        baselinePath,
+        summaryPath: presentSummaryPath,
+        selectedProjects: [],
+      }),
+      { checkedRecords: 1, skipped: false },
+      "when a summary exists, no-args comparison uses the lanes in it",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scorecard CLI treats --require-summary as a fail-closed flag", () => {
+  assert.deepEqual(parseMissionScorecardCliArgs([]), { requireSummary: false });
+  assert.deepEqual(parseMissionScorecardCliArgs(["--require-summary"]), {
+    requireSummary: true,
+  });
 });

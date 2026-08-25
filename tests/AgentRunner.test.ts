@@ -146,6 +146,7 @@ import {
 } from "../src/agent/verifiedWorkspaceBinding";
 import {
   buildWordCountCorrectionPromptForTests,
+  hasUnclosedFence,
   softWordCountCorrectionBand,
 } from "../src/agent/wordCountCorrectionPolicy";
 import {
@@ -16199,6 +16200,18 @@ test("word-count correction prefers expand-in-place edit into soft ±5% band", (
     5600,
   );
   assert.match(over, /Prefer edit-in-place: trim redundancy/i);
+});
+
+test("unclosed fences block word-count correction of a partial draft", () => {
+  const cases: Array<{ content: string; unclosed: boolean; rule: string }> = [
+    { content: "plain prose", unclosed: false, rule: "prose without fences is complete for counting" },
+    { content: "```js\nconst x = 1;\n```", unclosed: false, rule: "a matched fence pair is closed" },
+    { content: "```js\nconst x = 1;", unclosed: true, rule: "an odd fence count means the draft is still open" },
+    { content: "```a```b```", unclosed: true, rule: "three fences leave the last block unclosed" },
+  ];
+  for (const { content, unclosed, rule } of cases) {
+    assert.equal(hasUnclosedFence(content), unclosed, rule);
+  }
 });
 
 test("streamed append onto Untitled 1 auto-renames visible title from leading H1", async () => {

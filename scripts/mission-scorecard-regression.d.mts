@@ -24,11 +24,22 @@ export function assertMissionScorecardRegressions(input: {
   selectedProjects?: string[];
   executedTests?: Array<{ project: string; file: string; title: string }>;
 }): MissionScorecardRegressionResult;
+export const NO_RUN_SUMMARY_SKIP_MESSAGE: string;
+
+export function parseMissionScorecardCliArgs(argv?: string[]): {
+  requireSummary: boolean;
+};
+
+export function formatMissionScorecardCliResult(
+  result: MissionScorecardRegressionResult,
+): string;
+
 export function assertMissionScorecardSummaryFile(options?: {
   baselinePath?: string;
   summaryPath?: string;
   selectedProjects?: string[];
   executedTests?: Array<{ project: string; file: string; title: string }>;
+  requireSummary?: boolean;
 }): Promise<MissionScorecardRegressionResult>;
 
 export function baselineRecordIsCurrent(record: unknown): boolean;
