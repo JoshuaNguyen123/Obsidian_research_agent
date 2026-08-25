@@ -214,6 +214,16 @@ export interface SpecialistHandoffV2 extends WorkerHandoff {
   workspaceLeaseId?: string;
   workspaceDiffFingerprint?: string;
   repairCycle: 0 | 1;
+  /**
+   * Worker-side quote-verification counts, carried into progressFingerprint so
+   * the handoff attests both the sanitized prose AND that sanitation ran.
+   * Absent on pre-existing persisted handoffs and non-research specialists.
+   */
+  quoteSanitation?: {
+    verifiedCount: number;
+    reattributedCount: number;
+    downgradedCount: number;
+  };
 }
 
 export interface SpecialistRepairStateV2 {

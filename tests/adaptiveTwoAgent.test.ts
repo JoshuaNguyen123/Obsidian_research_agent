@@ -106,6 +106,44 @@ test("Specialist handoff binds input/progress and fails closed on stale proof", 
   assert.ok(stale.missing.includes("evidence:evidence-1"));
 });
 
+test("quote-sanitation counts round-trip and distinguish progress fingerprints", () => {
+  const base = {
+    handoff: workerHandoff(),
+    missionGraphId: "mission-1",
+    specialistMode: "researcher" as const,
+    missionInput: { prompt: "Verify sources" },
+    acceptanceCriteria: ["Two fetched passages are independently verified."],
+    recommendedNextAction: "Lead verifies and synthesizes.",
+  };
+  const withCounts = createSpecialistHandoffV2({
+    ...base,
+    quoteSanitation: { verifiedCount: 2, reattributedCount: 1, downgradedCount: 0 },
+  });
+  assert.deepEqual(withCounts.quoteSanitation, {
+    verifiedCount: 2,
+    reattributedCount: 1,
+    downgradedCount: 0,
+  });
+  // Same prose, different verification outcome = different progress.
+  const differentCounts = createSpecialistHandoffV2({
+    ...base,
+    quoteSanitation: { verifiedCount: 2, reattributedCount: 0, downgradedCount: 1 },
+  });
+  const withoutCounts = createSpecialistHandoffV2(base);
+  assert.notEqual(withCounts.progressFingerprint, differentCounts.progressFingerprint);
+  assert.notEqual(withCounts.progressFingerprint, withoutCounts.progressFingerprint);
+  // Legacy shape: producers without counts still create and validate cleanly.
+  assert.equal(withoutCounts.quoteSanitation, undefined);
+  const valid = validateSpecialistHandoffV2(withCounts, {
+    missionGraphId: "mission-1",
+    evidenceIds: new Set(["evidence-1"]),
+    receiptIds: new Set(),
+    artifactIds: new Set(),
+    validationIds: new Set(),
+  });
+  assert.deepEqual(valid, { ok: true, missing: [], stale: [] });
+});
+
 test("code authority is workspace-only and never grants external mutation", () => {
   const authority = createSpecialistAuthorityV2({
     mode: "code_builder",

@@ -25,6 +25,11 @@ export interface CreateSpecialistHandoffV2Input {
   workspaceLeaseId?: string;
   workspaceDiffFingerprint?: string;
   repairCycle?: 0 | 1;
+  quoteSanitation?: {
+    verifiedCount: number;
+    reattributedCount: number;
+    downgradedCount: number;
+  };
 }
 
 export interface SpecialistHandoffAuthorityV2 {
@@ -95,6 +100,11 @@ export function createSpecialistHandoffV2(
       64,
       1_000,
     ),
+    // Sanitation counts are part of what "this progress" means: two handoffs
+    // whose prose matches but whose verification outcomes differ are different
+    // progress. Null (not absent) when the producer carries none, so the
+    // fingerprint payload shape stays deterministic.
+    quoteSanitation: input.quoteSanitation ?? null,
   });
 
   return {
@@ -109,6 +119,9 @@ export function createSpecialistHandoffV2(
     acceptanceCriteria,
     proofReferences,
     changedFiles,
+    ...(input.quoteSanitation
+      ? { quoteSanitation: { ...input.quoteSanitation } }
+      : {}),
     conflicts: uniqueNarrative(input.conflicts ?? [], "conflicts", 64, 1_000),
     limitations: uniqueNarrative(
       input.limitations ?? [],
