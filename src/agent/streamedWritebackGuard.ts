@@ -156,6 +156,84 @@ export function formatExternalStreamEditMessage(
   );
 }
 
+export interface WritebackPreambleStrip {
+  content: string;
+  strippedPreamble: string | null;
+}
+
+const PREAMBLE_SCAN_CHARS = 1200;
+const PREAMBLE_MAX_CHARS = 400;
+const PREAMBLE_MAX_LINES = 4;
+const PREAMBLE_DIALOGUE_OPENER =
+  /^(?:here(?:'|’)?s\b|here is\b|below is\b|sure\b|certainly\b|of course\b|okay\b|ok[,.!]|as requested\b|i(?:'|’)?ve\b|i have\b|i (?:corrected|updated|revised|rewrote|fixed|addressed)\b|this is the\b|the (?:corrected|revised|updated) \b)/iu;
+
+/**
+ * Drop conversational dialogue the model emitted above the note's opening
+ * heading in a staged writeback candidate.
+ *
+ * The writeback prompt forbids preambles, but under a verification-correction
+ * exchange the model sometimes answers the correction conversationally
+ * ("I've fixed the quoted passage — here is the corrected note:") before the
+ * markdown, and the staged commit would write that dialogue into the vault
+ * above the H1 (observed in a committed Math note, 2026-08-24).
+ *
+ * Deliberately conservative — a legitimate note may open with prose before
+ * its first heading, so the prefix is removed only when every signal agrees
+ * it is dialogue: the candidate does not open with YAML frontmatter, a `#`
+ * heading appears early, the prefix is short plain prose with no markdown
+ * structure of its own, and it either opens with a dialogue phrase or ends
+ * with the colon of a lead-in. Anything ambiguous is kept verbatim.
+ */
+export function stripWritebackDialoguePreamble(
+  candidate: string,
+): WritebackPreambleStrip {
+  const keep: WritebackPreambleStrip = {
+    content: candidate,
+    strippedPreamble: null,
+  };
+  const normalized = normalizeLineEndings(candidate);
+  if (normalized.startsWith("---\n") || normalized.startsWith("#")) {
+    return keep;
+  }
+  const headingMatch = /^#{1,6} \S/mu.exec(normalized);
+  if (!headingMatch || headingMatch.index > PREAMBLE_SCAN_CHARS) {
+    return keep;
+  }
+  const prefix = normalized.slice(0, headingMatch.index);
+  const prefixLines = prefix
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (
+    prefixLines.length === 0 ||
+    prefixLines.length > PREAMBLE_MAX_LINES ||
+    prefix.trim().length > PREAMBLE_MAX_CHARS
+  ) {
+    return keep;
+  }
+  const hasMarkdownStructure = prefixLines.some((line) =>
+    /^(?:#{1,6} |[-*+] |\d+[.)] |> |```|\||---)/u.test(line),
+  );
+  if (hasMarkdownStructure) {
+    return keep;
+  }
+  const opensAsDialogue = PREAMBLE_DIALOGUE_OPENER.test(prefixLines[0]);
+  const endsAsLeadIn = /:\s*$/u.test(prefixLines[prefixLines.length - 1]);
+  if (!opensAsDialogue && !endsAsLeadIn) {
+    return keep;
+  }
+  // Re-locate the heading in the un-normalized candidate so the kept slice
+  // preserves the original bytes (a CRLF candidate shifts every index).
+  const originalHeading = /^#{1,6} \S/mu.exec(candidate);
+  if (!originalHeading) {
+    return keep;
+  }
+  return {
+    content: candidate.slice(originalHeading.index),
+    strippedPreamble: prefix.trim(),
+  };
+}
+
 function normalizeLineEndings(value: string): string {
   return value.replace(/\r\n/gu, "\n");
 }

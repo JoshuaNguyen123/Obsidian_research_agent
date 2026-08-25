@@ -246,6 +246,7 @@ import {
   createIdempotentStreamRetryPolicy,
   detectExternalStreamEdit,
   formatExternalStreamEditMessage,
+  stripWritebackDialoguePreamble,
   type StreamWriteSession,
 } from "./agent/streamedWritebackGuard";
 import {
@@ -10026,7 +10027,23 @@ export async function runAgentMission({
         onThinkingUnsupported: input.onThinkingUnsupported,
         deferVisibleOutput: true,
       });
-      return response?.message.content ?? "";
+      const preambleStrip = stripWritebackDialoguePreamble(
+        response?.message.content ?? "",
+      );
+      if (preambleStrip.strippedPreamble !== null) {
+        events.onTrace?.({
+          id: `proof-gated-writeback-${step}:${retry ? "correction" : "candidate"}:preamble-stripped`,
+          kind: "verification",
+          step,
+          toolName: plannedToolName,
+          message:
+            "Removed conversational dialogue above the note's opening heading from the staged writeback candidate.",
+          outputPreview: {
+            strippedPreamble: preambleStrip.strippedPreamble,
+          },
+        });
+      }
+      return preambleStrip.content;
     };
 
     let initialCandidate: string;

@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   detectExternalStreamEdit,
   formatExternalStreamEditMessage,
+  stripWritebackDialoguePreamble,
 } from "../src/agent/streamedWritebackGuard";
 
 test("identical live content is not an external edit", () => {
@@ -58,4 +59,63 @@ test("the stop message names the path, keeps the edit, and never offers an overw
 test("the stop message stays well-formed without a path", () => {
   const message = formatExternalStreamEditMessage(null, 0);
   assert.match(message, /the note changed outside this run/u);
+});
+
+test("correction dialogue above the opening heading is stripped from a staged candidate", () => {
+  const note = "# Fundamental Theorem of Calculus\n\nBody with [P1] citations.\n";
+  const candidate =
+    "I've corrected the quoted passage as requested \u2014 here is the corrected note:\n\n" +
+    note;
+  const result = stripWritebackDialoguePreamble(candidate);
+  assert.equal(result.content, note);
+  assert.ok(result.strippedPreamble);
+  assert.match(result.strippedPreamble, /corrected the quoted passage/);
+});
+
+test("a lead-in line ending with a colon is stripped even without a first-person opener", () => {
+  const note = "## Findings\n\ncontent\n";
+  const result = stripWritebackDialoguePreamble(
+    "The corrected note follows below:\n\n" + note,
+  );
+  assert.equal(result.content, note);
+});
+
+test("a candidate opening with YAML frontmatter is never touched", () => {
+  const candidate = "---\ntitle: x\n---\n\nHere is a phrase:\n\n# Heading\n";
+  const result = stripWritebackDialoguePreamble(candidate);
+  assert.equal(result.content, candidate);
+  assert.equal(result.strippedPreamble, null);
+});
+
+test("legitimate prose before a later heading is kept verbatim", () => {
+  // No dialogue opener and no lead-in colon: this could be the note's own
+  // introduction, so ambiguity must resolve to keeping the bytes.
+  const candidate =
+    "Quantum error correction protects logical qubits.\n\n# Approaches\n";
+  const result = stripWritebackDialoguePreamble(candidate);
+  assert.equal(result.content, candidate);
+  assert.equal(result.strippedPreamble, null);
+});
+
+test("a prefix containing markdown structure is treated as content, not dialogue", () => {
+  const candidate = "Here is the summary:\n- first point\n\n# Details\n";
+  const result = stripWritebackDialoguePreamble(candidate);
+  assert.equal(result.content, candidate);
+  assert.equal(result.strippedPreamble, null);
+});
+
+test("a CRLF candidate keeps its original bytes after the strip", () => {
+  const note = "# Title\r\n\r\nCRLF body\r\n";
+  const result = stripWritebackDialoguePreamble(
+    "Sure, here is the revised note:\r\n\r\n" + note,
+  );
+  assert.equal(result.content, note);
+});
+
+test("an over-long prefix is kept even when it opens conversationally", () => {
+  const longPrefix = "I've updated the note. " + "x".repeat(420);
+  const candidate = longPrefix + "\n\n# Heading\n";
+  const result = stripWritebackDialoguePreamble(candidate);
+  assert.equal(result.content, candidate);
+  assert.equal(result.strippedPreamble, null);
 });

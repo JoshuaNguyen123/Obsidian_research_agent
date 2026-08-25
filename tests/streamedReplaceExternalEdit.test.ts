@@ -236,3 +236,59 @@ function createSettings(): AgentSettings {
     scheduledMissions: [],
   } as unknown as AgentSettings;
 }
+
+test("a conversational preamble above the H1 never reaches the committed note", async () => {
+  const vault = createVaultHarness();
+  const statuses: string[] = [];
+  const preambled =
+    "Sure, here is the rewritten note:" + String.fromCharCode(10, 10) + MODEL_ANSWER;
+  const responses: ModelChatResponse[] = [
+    responseWithToolCall("read_current_file", {}),
+    responseWithContent(preambled),
+  ];
+  let responseIndex = 0;
+  const nextResponse = () => responses[Math.min(responseIndex++, responses.length - 1)];
+  const modelClient: ModelClient = {
+    async chat() {
+      return nextResponse();
+    },
+    async streamChat(_request, events: ModelChatStreamEvents = {}) {
+      const response = nextResponse();
+      if (!response.toolCalls?.length && response.message.content) {
+        events.onContentDelta?.(response.message.content);
+      }
+      return response;
+    },
+  };
+  const broker = new ApprovalBroker();
+  await runAgentMission({
+    prompt: "Rewrite the entire current note as a concise overview of CRDTs.",
+    modelClient,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onStatus: (message) => statuses.push(message),
+    },
+  }).catch(() => {
+    // Commit outcome is asserted on the vault below.
+  });
+
+  const note = vault.files.get("Current.md") ?? "";
+  assert.ok(
+    note.includes("CRDT Overview"),
+    `the rewrite never committed; note: ${note.slice(0, 200)} statuses: ${statuses.join(" | ")}`,
+  );
+  assert.ok(
+    !note.includes("here is the rewritten note"),
+    `dialogue preamble leaked into the committed note: ${note.slice(0, 200)}`,
+  );
+  assert.ok(
+    note.trimStart().startsWith("#"),
+    `committed note does not open at the heading: ${note.slice(0, 120)}`,
+  );
+});
