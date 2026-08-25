@@ -3870,6 +3870,13 @@ export async function runAgentMission({
     ) {
       streamingWritebackKind = null;
     }
+    // Continue of a streamed current-note append must not re-stream the original
+    // prompt (duplicate first append, or gated prose that never hits the note).
+    // Drop host-owned streaming so append_to_current_file becomes a required
+    // tool (proof-matrix interrupted-continuation, 2026-08-25).
+    if (streamingWritebackKind === "append") {
+      streamingWritebackKind = null;
+    }
     tools = getAllowedToolDefinitions(
       toolRegistry,
       activeIntentPrompt,
@@ -3949,7 +3956,14 @@ export async function runAgentMission({
       reflex: reflexOutput.intent,
       outputTarget: noteOutputPlan.destination,
     });
-    if (isRunRouteValue(resumeLedger?.route)) {
+    if (
+      isRunRouteValue(resumeLedger?.route) &&
+      !(
+        streamingWritebackKind === null &&
+        (resumeLedger.route === "single_model_writeback" ||
+          resumeLedger.route === "direct_writeback")
+      )
+    ) {
       runPlan = { ...runPlan, route: resumeLedger.route };
     }
     runPlan.traceReasons = [
