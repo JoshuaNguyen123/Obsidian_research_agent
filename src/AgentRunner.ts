@@ -1385,6 +1385,15 @@ export interface MissionEvidenceAttestationV1 {
   confidence: MissionEvidence["confidence"];
 }
 
+/**
+ * Identity-only run announcement. Carries no authority: it never adopts a
+ * config, never accepts a mission graph or ledger, and never replaces an
+ * identity a resumed run already established.
+ */
+export interface AgentRunIdentityEvent {
+  runId: string;
+}
+
 export interface AgentRunEvents {
   onStatus?: (message: string) => void;
   onPhaseChange?: (phase: AgentRunPhase, message: string) => void;
@@ -1413,6 +1422,15 @@ export interface AgentRunEvents {
   onMissionEvidence?: (event: MissionEvidenceAttestationV1) => void;
   /** Graded run-quality projection; acceptance remains the independent gate. */
   onMissionScorecard?: (scorecard: MissionScorecardV1) => void;
+  /**
+   * The run's durable identity, published the instant the runner owns it and
+   * before any pre-planning model work. `onRunConfig` still owns the full
+   * configuration and the durable ledger identity; this event exists only so
+   * a live mission is never addressable-by-nothing while the structured
+   * router, the reflex pass, and the planner spend their (bounded, but
+   * minutes-long on a slow model) budgets before the first config event.
+   */
+  onRunIdentity?: (event: AgentRunIdentityEvent) => void;
   onRunConfig?: (event: AgentRunConfigEvent) => void;
   onRunComplete?: (event: AgentRunCompleteEvent) => void;
   onApprovalRequest?: (request: ApprovalRequest) => void | Promise<void>;
@@ -1977,6 +1995,18 @@ export async function runAgentMission({
       return Reflect.get(target, property, receiver);
     },
   });
+  // Publish the run identity NOW — before the structured router, the reflex
+  // pass, the planner, and the mission-graph open, every one of which may
+  // spend a bounded-but-long model budget (the router alone is capped at
+  // MAX_STRUCTURED_PLANNING_TIMEOUT_MS) before the first `onRunConfig`.
+  // Two subsystems otherwise disagree about the same live run: the
+  // RunCoordinator reports `running` the moment start() is called, while its
+  // `runId` stayed null until config landed, so anything that addresses a
+  // mission by id (Run Details, `continue run <id>`, crash-resume ownership,
+  // the interrupted-continuation proof lane) had an unbounded blind window on
+  // a mission the host was already showing as live. Identity is knowable at
+  // this line, so it is published at this line.
+  events.onRunIdentity?.({ runId });
   const configuredStepBudget = Math.max(
     1,
     Math.min(

@@ -1213,6 +1213,83 @@ test("continue of a crash-restored tool-less final stub splices the owed write a
   assert.match(noteContent, /MARKER_HEALED_APPEND/u);
 });
 
+test("a live mission publishes its run identity before the pre-config router call", async () => {
+  // Regression: proof-matrix lane interrupted-continuation-live, phase 1.
+  // RunCoordinator.start() reports `running` synchronously, but the run id
+  // only reached the snapshot with the first `onRunConfig` — which sits behind
+  // the structured router (capped at 120s), the reflex pass, and the planner.
+  // On a slow model the host therefore showed a live mission that nothing
+  // could address by id for minutes, and `continue run <id>` had no id to use.
+  const vault = createVaultHarness();
+  vault.context.settings.modelRouterEnabled = true;
+  vault.context.settings.modelRouterMode = "authority";
+  const coordinator = new RunCoordinator();
+  const runIdsAtModelCall: Array<string | null> = [];
+  let configRunId: string | null = null;
+  coordinator.subscribe({
+    onRunConfig: (event: AgentRunConfigEvent) => {
+      configRunId = event.runId;
+    },
+  });
+
+  await coordinator.start((abortSignal, events) =>
+    runAgentMission({
+      prompt: "Append exactly this text to the current note: run identity proof",
+      modelClient: createModelClient(
+        [
+          responseWithToolCall("append_to_current_file", {
+            text: "run identity proof",
+          }),
+        ],
+        [],
+        () => {
+          runIdsAtModelCall.push(coordinator.getSnapshot().runId);
+        },
+      ),
+      toolRegistry: createDefaultToolRegistry(),
+      toolContext: vault.context,
+      enableStreaming: false,
+      abortSignal,
+      events,
+    }),
+  );
+
+  assert.ok(
+    runIdsAtModelCall.length > 0,
+    "The mission must reach the model for this pin to mean anything.",
+  );
+  assert.match(
+    String(runIdsAtModelCall[0]),
+    /^run-/u,
+    JSON.stringify({
+      rule: "The coordinator must already carry the run identity at the very first model call — every pre-config stage is model work the identity must not wait behind.",
+      runIdsAtModelCall,
+      configRunId,
+    }),
+  );
+  assert.equal(
+    runIdsAtModelCall[0],
+    configRunId,
+    "The early identity must be the same run id the config event later publishes, not a second identity.",
+  );
+});
+
+test("an early run identity never replaces an identity the coordinator already holds", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_abortSignal, events) => {
+    (events as { onRunIdentity?: (event: { runId: string }) => void })
+      .onRunIdentity?.({ runId: "run-first" });
+    assert.equal(coordinator.getSnapshot().runId, "run-first");
+    // A child seat, a retry, or a nested runner announcing its own identity
+    // must never re-point a mission the host is already showing by id.
+    (events as { onRunIdentity?: (event: { runId: string }) => void })
+      .onRunIdentity?.({ runId: "run-second" });
+    assert.equal(coordinator.getSnapshot().runId, "run-first");
+    events.onRunComplete?.({ step: 0, maxSteps: 1, stopReason: "final" });
+  });
+  assert.equal(coordinator.getSnapshot().runId, "run-first");
+});
+
 test("coordinator-backed runner preserves config tool and completion events", async () => {
   const vault = createVaultHarness();
   const coordinator = new RunCoordinator();
