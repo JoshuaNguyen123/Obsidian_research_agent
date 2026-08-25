@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { PLAYWRIGHT_PROJECTS } from "../scripts/run-e2e-exclusive.mjs";
 import {
   ATTEMPT_LOG_DIR,
+  CELLS,
   attemptLogExcerpt,
   classifyAttemptOutcome,
   isEmptyScorecardHarvestOutput,
@@ -61,6 +63,20 @@ test("an attempt that dies in the build stage is a harness failure, not matrix_u
   assert.match(outcome.detail, /error TS2307/u);
 });
 
+test("proof-matrix cell projects are exclusive-runner allowlisted", () => {
+  // 2026-08-25: interrupted-continuation-live existed in playwright.config.ts
+  // and package.json but not PLAYWRIGHT_PROJECTS, so four proof-matrix
+  // attempts died in seconds as Unknown E2E project.
+  assert.equal(CELLS.length, 6);
+  for (const cell of CELLS) {
+    assert.equal(
+      PLAYWRIGHT_PROJECTS.has(cell.project),
+      true,
+      `${cell.id} project ${cell.project} is missing from PLAYWRIGHT_PROJECTS`,
+    );
+  }
+});
+
 test("preflight refusals and lock timeouts get their own harness classes", () => {
   assert.equal(
     classifyAttemptOutcome({
@@ -80,6 +96,15 @@ test("preflight refusals and lock timeouts get their own harness classes", () =>
         "Timed out after 30000 ms waiting for the exclusive Obsidian e2e lock. Owner PID 24444 on host, started now.",
     }).failureClass,
     "harness:e2e_lock_timeout",
+  );
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summaryFresh: false,
+      logText:
+        "Unknown E2E project interrupted-continuation-live. Allowed projects: core-native, real-ai-soak.",
+    }).failureClass,
+    "harness:unknown_project",
   );
 });
 

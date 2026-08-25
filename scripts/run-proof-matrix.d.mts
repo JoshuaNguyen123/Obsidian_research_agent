@@ -1,3 +1,10 @@
+export const CELLS: Array<{
+  id: string;
+  project: string;
+  grep: string | null;
+  requiredGreens: number;
+  maxAttempts: number;
+}>;
 export const ATTEMPT_LOG_DIR: string;
 export const SCORECARD_BASELINE_RELATIVE_PATH: string;
 export function porcelainWithoutAllowedHarvest(status: string): string;

@@ -1,3 +1,5 @@
+export const PLAYWRIGHT_PROJECTS: Set<string>;
+
 export interface ExecutedPlaywrightTestV1 {
   project: string;
   file: string;

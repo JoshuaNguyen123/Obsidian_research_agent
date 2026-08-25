@@ -23,7 +23,7 @@ const DEFAULT_PLAYWRIGHT_PROJECT = "core-native";
 // Only lanes that drive the production plugin against a real model, a real
 // external service, or both. Mock-model projects were removed: they proved
 // nothing about a host the product could not actually run on.
-const PLAYWRIGHT_PROJECTS = new Set([
+export const PLAYWRIGHT_PROJECTS = new Set([
   DEFAULT_PLAYWRIGHT_PROJECT,
   "desktop-checkers-delivery-real-live",
   "safe-assistant-renderer",
@@ -39,6 +39,8 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "obsidian-hello-github-live",
   "real-ai-contract",
   "real-ai-soak",
+  "interrupted-continuation-live",
+  "notebook-execution-live",
   "provider-canary",
   "release-vertical",
   "disposable-live-external",
@@ -705,6 +707,8 @@ export function normalizeExclusiveArgs(rawArgs) {
     "core-native",
     "real-ai-contract",
     "real-ai-soak",
+    "interrupted-continuation-live",
+    "notebook-execution-live",
     "provider-canary",
     "release-vertical",
     "daily-use-research",

@@ -83,7 +83,7 @@ const RUN_CSV_HEADER =
  * bounds total spend per cell. Grep filters follow the audit's stage-6
  * precedent of pinning one scenario inside a larger spec.
  */
-const CELLS = [
+export const CELLS = [
   {
     id: "research-current-note",
     project: "daily-use-research",
@@ -320,6 +320,7 @@ const HARNESS_LOG_SIGNATURES = [
   [/^build exited with code \d+\.$/mu, "harness:build_failed"],
   [/^test-vault sync exited with code \d+\.$/mu, "harness:vault_sync_failed"],
   [/^e2e preflight exited with code \d+\.$/mu, "harness:preflight_refused"],
+  [/Unknown E2E project /u, "harness:unknown_project"],
 ];
 
 /**

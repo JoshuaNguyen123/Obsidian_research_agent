@@ -54,6 +54,8 @@ await assertLegacyPluginsRetired();
 if (playwrightLanes.some((lane) => [
   "real-ai-contract",
   "real-ai-soak",
+  "interrupted-continuation-live",
+  "notebook-execution-live",
   "provider-canary",
   "release-vertical",
   "daily-use-research",
@@ -108,6 +110,8 @@ async function resolveExpectedPluginIds() {
     "obsidian-hello-github-live": [],
     "real-ai-contract": [],
     "real-ai-soak": [],
+    "interrupted-continuation-live": [],
+    "notebook-execution-live": [],
     "provider-canary": [],
     "release-vertical": [],
     "disposable-live-external": [],
