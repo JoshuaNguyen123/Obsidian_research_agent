@@ -31687,6 +31687,9 @@ function buildReceipt(
     messageParts.push(`matches: ${matchCount}`);
   }
 
+  const changed =
+    typeof output.changed === "boolean" ? output.changed : undefined;
+
   return {
     toolName,
     operation,
@@ -31698,6 +31701,12 @@ function buildReceipt(
     bytesDeleted,
     affectedCount: affectedCount ?? matchCount,
     readback,
+    // Tools that verify their own delta report it; an unchanged outcome is
+    // an honest no-op receipt, not proof of work.
+    ...(changed !== undefined
+      ? { effects: { bytesWritten, bytesDeleted, affectedCount, changed } }
+      : {}),
+    ...(changed === false ? { commitKind: "no_op" as const } : {}),
     output,
     message: messageParts.join("; "),
   };
@@ -32129,11 +32138,13 @@ function parseLegacyReceiptReadback(
   }
   const observedRevision = getString(value.observedRevision);
   const observedFingerprint = getString(value.observedFingerprint);
+  const priorRevision = getString(value.priorRevision);
   return {
     status,
     checkedAt,
     ...(observedRevision ? { observedRevision } : {}),
     ...(observedFingerprint ? { observedFingerprint } : {}),
+    ...(priorRevision ? { priorRevision } : {}),
   };
 }
 

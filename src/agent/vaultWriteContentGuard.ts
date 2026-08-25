@@ -110,6 +110,17 @@ export function assertSafeCurrentNoteWritePayload(input: {
     return;
   }
 
+  // An empty replacement is a silent wipe of the whole note, not a no-op:
+  // it destroys the current content while producing a receipt that looks
+  // like a routine write. Fail closed unconditionally — even an explicit
+  // clear/reset mission must state the new content (or use the delete tool),
+  // never route destruction through an empty replace payload.
+  if (text.trim().length === 0) {
+    throw new Error(
+      "Refused replace: the replacement text is empty, which would wipe the entire note while reporting a successful write. Provide the full new note body, or use the delete tool for an intentional clear.",
+    );
+  }
+
   if (input.allowDestructiveShortReplace) {
     return;
   }

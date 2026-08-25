@@ -143,7 +143,14 @@ test("prepare then approve then executePrepared works with fingerprint binding",
     path: "Current.md",
     backupPath: ".agent-backups/123-Current.md",
     bytesWritten: new TextEncoder().encode("Replacement").length,
+    // The wiped prior content is part of the durable record so a replace
+    // that destroys a draft is distinguishable from a no-op.
+    bytesDeleted: new TextEncoder().encode("Initial note").length,
   });
+  assert.equal(
+    executed.receipt?.effects?.bytesDeleted,
+    new TextEncoder().encode("Initial note").length,
+  );
   assert.equal(mock.content.get("Current.md"), "Replacement");
   assert.equal(mock.content.get(".agent-backups/123-Current.md"), "Initial note");
 });
