@@ -6,8 +6,20 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  CLASSIFICATION_CONFIRMED,
+  CLASSIFICATION_MECHANICAL,
+  CLASSIFICATION_UNCLASSIFIED,
   IN_FLIGHT_FAILURE_CLASS,
   LANE_ASSERTION_FAILURE_CLASS,
+  LEGACY_RUN_CSV_HEADER,
+  RUN_CSV_HEADER,
+  TOOL_EVENT_SOURCE_GRAPHS,
+  TOOL_EVENT_SOURCE_NONE,
+  TOOL_EVENT_SOURCE_SUMMARY,
+  collectMechanicalFailureClasses,
+  resolveAttemptToolEvents,
+  summaryToolEventTotals,
+  upgradeRunCsvHeader,
   LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
   PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR,
@@ -151,7 +163,12 @@ test("a stale run summary must not classify a later attempt", () => {
 test("green attempts classify as none and unknown reds stay matrix_unclassified", () => {
   assert.deepEqual(
     classifyAttemptOutcome({ exitCode: 0, summaryFresh: false, logText: "" }),
-    { failureClass: "none", detail: "" },
+    {
+      failureClass: "none",
+      detail: "",
+      confidence: CLASSIFICATION_CONFIRMED,
+      secondaryClasses: [],
+    },
   );
   const unknown = classifyAttemptOutcome({
     exitCode: 1,
@@ -160,6 +177,8 @@ test("green attempts classify as none and unknown reds stay matrix_unclassified"
   });
   assert.equal(unknown.failureClass, "process:matrix_unclassified");
   assert.match(unknown.detail, /something nobody anticipated/u);
+  assert.equal(unknown.confidence, CLASSIFICATION_UNCLASSIFIED);
+  assert.deepEqual(unknown.secondaryClasses, []);
 });
 
 test("attempt log excerpt keeps the lines around the failure and stays bounded", () => {
@@ -512,4 +531,217 @@ test("attemptLogExcerptFrom reads forward from the match and stays bounded", () 
   assert.doesNotMatch(excerpt, /noise before/u);
   assert.ok(excerpt.length <= 1_000);
   assert.equal(attemptLogExcerptFrom(""), "");
+});
+
+// ---------------------------------------------------------------------------
+// Success/uncertainty wave (2026-08-25): appended CSV columns, tool-event
+// source precedence, unknown-vs-zero, secondary classes, and confidence.
+// ---------------------------------------------------------------------------
+
+test("new CSV columns are APPENDED - the legacy header survives as an exact prefix", () => {
+  // Readers index existing columns by position/name; reordering would corrupt
+  // every one of them. The new schema must start with the old one, verbatim.
+  assert.ok(
+    RUN_CSV_HEADER.startsWith(`${LEGACY_RUN_CSV_HEADER},`),
+    "legacy header must be an exact comma-prefix of the new header",
+  );
+  const appended = RUN_CSV_HEADER.slice(LEGACY_RUN_CSV_HEADER.length + 1).split(",");
+  assert.deepEqual(appended, [
+    "tool_events_source",
+    "tool_calls_succeeded",
+    "pct_tool_calls_succeeded",
+    "secondary_failure_classes",
+    "classification_confidence",
+    "tool_calls_vacuous",
+  ]);
+});
+
+test("upgradeRunCsvHeader rewrites only a legacy header line and never touches rows", () => {
+  const rows =
+    "2026-08-23T19:26:25Z,byok-autonomous-journey,deepseek-v4-pro,8e934f9,1286,red,product:x,,,,,,,,,2,,playwright_error_payload,notes\n" +
+    '2026-08-24T00:35:00Z,lane,"model, with comma",abc1234,10,green,none,,47,45,95.7,1,44,0,0,0,0,src,"quoted ""notes"""\n';
+  const legacyText = `${LEGACY_RUN_CSV_HEADER}\n${rows}`;
+  const upgraded = upgradeRunCsvHeader(legacyText);
+  assert.ok(upgraded);
+  assert.ok(upgraded.startsWith(`${RUN_CSV_HEADER}\n`));
+  // Old rows stay byte-for-byte identical (shorter than the header - readers
+  // must treat the missing trailing cells as blank/unknown).
+  assert.equal(upgraded.slice(RUN_CSV_HEADER.length + 1), rows);
+  // Already-current headers and unrecognized files are left alone.
+  assert.equal(upgradeRunCsvHeader(`${RUN_CSV_HEADER}\n${rows}`), null);
+  assert.equal(upgradeRunCsvHeader("some,other,csv\n1,2,3\n"), null);
+  assert.equal(upgradeRunCsvHeader(""), null);
+  // A header-only legacy file still upgrades.
+  assert.equal(upgradeRunCsvHeader(`${LEGACY_RUN_CSV_HEADER}\n`), `${RUN_CSV_HEADER}\n`);
+});
+
+test("a fresh run summary outranks graph mining as the tool-event source", () => {
+  const summary = {
+    records: [
+      { toolCalls: 40, toolCallsFailed: 3, toolCallsVacuous: 1 },
+      { toolCalls: 3, toolCallsFailed: 0, toolCallsVacuous: 0 },
+    ],
+  };
+  const minedCounts = { observed: 12, failed: 2, buckets: { tool_not_allowed: 2 } };
+  const events = resolveAttemptToolEvents({ summary, summaryFresh: true, minedCounts });
+  assert.equal(events.source, TOOL_EVENT_SOURCE_SUMMARY);
+  assert.equal(events.observed, 43);
+  assert.equal(events.failed, 3);
+  assert.equal(events.vacuous, 1);
+  // Succeeded excludes BOTH failed and (known) vacuous calls.
+  assert.equal(events.succeeded, 39);
+  // A stale summary must never label a later attempt: graphs win instead.
+  const stale = resolveAttemptToolEvents({ summary, summaryFresh: false, minedCounts });
+  assert.equal(stale.source, TOOL_EVENT_SOURCE_GRAPHS);
+  assert.equal(stale.observed, 12);
+  assert.equal(stale.failed, 2);
+  assert.equal(stale.succeeded, 10);
+  // Graph nodes carry no receipts, so graphs can never claim a vacuous count.
+  assert.equal(stale.vacuous, null);
+});
+
+test("unknown is never collapsed into zero: explicit summary zeros vs no source at all", () => {
+  // A fresh summary that SAID zero is an explicit zero.
+  const zeroSummary = {
+    records: [{ toolCalls: 0, toolCallsFailed: 0, toolCallsVacuous: 0 }],
+  };
+  const explicitZero = resolveAttemptToolEvents({
+    summary: zeroSummary,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(explicitZero.source, TOOL_EVENT_SOURCE_SUMMARY);
+  assert.equal(explicitZero.observed, 0);
+  assert.equal(explicitZero.failed, 0);
+  assert.equal(explicitZero.succeeded, 0);
+  // No summary and an empty mine: green lanes DELETE their run-owned graphs,
+  // so zero mined events is absence of evidence, not evidence of zero.
+  const nothing = resolveAttemptToolEvents({
+    summary: null,
+    summaryFresh: false,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(nothing.source, TOOL_EVENT_SOURCE_NONE);
+  assert.equal(nothing.observed, null);
+  assert.equal(nothing.failed, null);
+  assert.equal(nothing.vacuous, null);
+  assert.equal(nothing.succeeded, null);
+  assert.equal(nothing.buckets, null);
+});
+
+test("a summary that counts calls but not failures reports observed with failed unknown", () => {
+  // Today's specs feed toolCalls from missionEvidence lengths (successful
+  // calls only) and cannot distinguish failures: toolCallsFailed is null.
+  const summary = { records: [{ toolCalls: 43, toolCallsFailed: null }] };
+  const events = resolveAttemptToolEvents({
+    summary,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(events.source, TOOL_EVENT_SOURCE_SUMMARY);
+  assert.equal(events.observed, 43);
+  assert.equal(events.failed, null);
+  assert.equal(events.succeeded, null, "succeeded must stay unknown when failed is unknown");
+  assert.equal(events.vacuous, null);
+});
+
+test("summaryToolEventTotals sums refusal buckets and keeps partial knowledge a lower bound", () => {
+  const totals = summaryToolEventTotals({
+    records: [
+      {
+        toolCalls: 10,
+        toolCallsFailed: 2,
+        refusalBuckets: { mission_graph_authority_blocked: 2, bogus_bucket: 9 },
+      },
+      { toolCalls: 5, toolCallsFailed: null, refusalBuckets: null },
+      { toolCalls: 1, toolCallsFailed: 1, refusalBuckets: { tool_not_allowed: 1 } },
+    ],
+  });
+  assert.ok(totals);
+  assert.equal(totals.observed, 16);
+  // 2 + (unknown, skipped) + 1: a lower bound, not a fake zero for record 2.
+  assert.equal(totals.failed, 3);
+  assert.equal(totals.vacuous, null, "no record knew vacuous - the total is unknown");
+  assert.equal(totals.buckets.mission_graph_authority_blocked, 2);
+  assert.equal(totals.buckets.tool_not_allowed, 1);
+  assert.equal("bogus_bucket" in totals.buckets, false, "unknown bucket keys are dropped");
+  // No records: nothing to speak for the attempt.
+  assert.equal(summaryToolEventTotals({ records: [] }), null);
+  assert.equal(summaryToolEventTotals(null), null);
+});
+
+test("secondary failure classes surface every co-matching signature without stealing the primary", () => {
+  // A build death whose log ALSO carries assertion text: primary stays the
+  // harness stage (existing precedence), the assertion becomes secondary DATA.
+  const logText = [
+    "Error: expect(received).toBe(expected)",
+    "tests/example.test.ts(1,1): error TS2345: boom",
+    "build exited with code 2.",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 2, summaryFresh: false, logText });
+  assert.equal(outcome.failureClass, "harness:build_failed");
+  assert.deepEqual(outcome.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
+  // A renderer death inside a failing lane co-matches the lane's own
+  // failing-test header - both causes stay visible.
+  const rendererLog = [
+    "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts:41:5 › deep vault retrieval ─────",
+    "    Error: page.waitForSelector: Target page, context or browser has been closed",
+  ].join("\n");
+  const renderer = classifyAttemptOutcome({ exitCode: 1, summaryFresh: false, logText: rendererLog });
+  assert.equal(renderer.failureClass, RENDERER_DEATH_FAILURE_CLASS);
+  assert.deepEqual(renderer.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
+  // A fresh summary primary keeps mechanically-matched log classes as secondaries.
+  const confirmed = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: { records: [{ proofClass: "product:writeback_unproven" }] },
+    summaryFresh: true,
+    logText: rendererLog,
+  });
+  assert.equal(confirmed.failureClass, "product:writeback_unproven");
+  assert.deepEqual(confirmed.secondaryClasses, [
+    RENDERER_DEATH_FAILURE_CLASS,
+    LANE_ASSERTION_FAILURE_CLASS,
+  ]);
+  // collectMechanicalFailureClasses is deduplicated and ordered by precedence.
+  assert.deepEqual(collectMechanicalFailureClasses(rendererLog), [
+    RENDERER_DEATH_FAILURE_CLASS,
+    LANE_ASSERTION_FAILURE_CLASS,
+  ]);
+  assert.deepEqual(collectMechanicalFailureClasses(""), []);
+});
+
+test("classification confidence: confirmed from summaries, mechanical from logs, unclassified otherwise", () => {
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summary: { records: [{ proofClass: "product:writeback_unproven" }] },
+      summaryFresh: true,
+      logText: "",
+    }).confidence,
+    CLASSIFICATION_CONFIRMED,
+  );
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 2,
+      summaryFresh: false,
+      logText: "build exited with code 2.",
+    }).confidence,
+    CLASSIFICATION_MECHANICAL,
+  );
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summaryFresh: false,
+      logText: "Test timeout of 600000ms exceeded.",
+    }).confidence,
+    CLASSIFICATION_MECHANICAL,
+  );
+  assert.equal(
+    classifyAttemptOutcome({
+      exitCode: 1,
+      summaryFresh: false,
+      logText: "nothing recognizable",
+    }).confidence,
+    CLASSIFICATION_UNCLASSIFIED,
+  );
 });

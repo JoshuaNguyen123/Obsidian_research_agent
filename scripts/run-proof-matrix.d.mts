@@ -4,12 +4,62 @@ export function laneHasScorecardBaselineFrom(
   baseline: { records?: unknown } | null | undefined,
   project: string,
 ): boolean;
+export const CLASSIFICATION_CONFIRMED: "confirmed";
+export const CLASSIFICATION_MECHANICAL: "mechanical";
+export const CLASSIFICATION_UNCLASSIFIED: "unclassified";
+export type ClassificationConfidence =
+  | "confirmed"
+  | "mechanical"
+  | "unclassified";
+export function collectMechanicalFailureClasses(logText: string): string[];
 export function classifyAttemptOutcome(input: {
   exitCode: number;
   summary?: unknown;
   summaryFresh?: boolean;
   logText?: string;
-}): { failureClass: string; detail: string };
+}): {
+  failureClass: string;
+  detail: string;
+  confidence: ClassificationConfidence;
+  secondaryClasses: string[];
+};
+export const LEGACY_RUN_CSV_HEADER: string;
+export const RUN_CSV_HEADER: string;
+export function upgradeRunCsvHeader(
+  text: string,
+  header?: string,
+): string | null;
+export const TOOL_EVENT_SOURCE_SUMMARY: "summary";
+export const TOOL_EVENT_SOURCE_GRAPHS: "graphs";
+export const TOOL_EVENT_SOURCE_NONE: "none";
+export interface SummaryToolEventTotals {
+  observed: number;
+  failed: number | null;
+  vacuous: number | null;
+  intentionalNoOp: number | null;
+  buckets: Record<string, number>;
+}
+export function summaryToolEventTotals(
+  summary: unknown,
+): SummaryToolEventTotals | null;
+export interface AttemptToolEvents {
+  source: "summary" | "graphs" | "none";
+  observed: number | null;
+  failed: number | null;
+  vacuous: number | null;
+  intentionalNoOp: number | null;
+  succeeded: number | null;
+  buckets: Record<string, number> | null;
+}
+export function resolveAttemptToolEvents(input: {
+  summary?: unknown;
+  summaryFresh?: boolean;
+  minedCounts?: {
+    observed: number;
+    failed: number;
+    buckets: Record<string, number> | null;
+  } | null;
+}): AttemptToolEvents;
 export function attemptLogExcerpt(
   logText: string,
   endIndex?: number | null,

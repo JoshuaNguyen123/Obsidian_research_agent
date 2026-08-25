@@ -68,14 +68,19 @@ const ATTEMPT_LOG_DIR = path.join(REPO_ROOT, ...PROOF_MATRIX_ATTEMPT_LOG_RELATIV
 const LEGACY_MANIFEST_PATH = path.join(REPO_ROOT, ...LEGACY_MANIFEST_RELATIVE_PATH.split("/"));
 const RUN_SUMMARY_PATH = path.join(REPO_ROOT, "test-results", "daily-use-run-summary.json");
 const SCORECARD_BASELINE_PATH = path.join(REPO_ROOT, "e2e", "baselines", "mission-scorecards.v1.json");
-const GRAPH_DIR = path.join(
-  process.env.USERPROFILE ?? "",
-  "OneDrive",
-  "Desktop",
-  "test_vault_obsidian_ai",
-  "Agent Runs",
-  "Mission Graphs",
-);
+// Graph mining honors OBSIDIAN_VAULT (the same env the exclusive runner and
+// vault sync honor) before the hardcoded default vault: a campaign pointed at
+// a different vault must mine THAT vault's persisted graphs, not the stale
+// default one.
+const VAULT_ROOT =
+  process.env.OBSIDIAN_VAULT?.trim() ||
+  path.join(
+    process.env.USERPROFILE ?? "",
+    "OneDrive",
+    "Desktop",
+    "test_vault_obsidian_ai",
+  );
+const GRAPH_DIR = path.join(VAULT_ROOT, "Agent Runs", "Mission Graphs");
 const WORKSPACES_ROOT = path.join(
   process.env.LOCALAPPDATA ?? "",
   "AgenticResearcher",
@@ -88,11 +93,58 @@ const WORKSPACES_ROOT = path.join(
 // the behavioral canary.
 const PROOF_MATRIX_MODEL = "deepseek-v4-pro";
 
-const RUN_CSV_HEADER =
+/**
+ * The pre-2026-08-25 header. New columns are APPENDED only — readers index by
+ * header name and existing rows must keep their positions forever.
+ */
+export const LEGACY_RUN_CSV_HEADER =
   "run_started_at,lane,model,head_sha,duration_s,mission_outcome,primary_failure_class," +
   "primary_failure_detail,tool_events_observed,tool_events_failed,pct_tool_calls_failed," +
   "tool_not_allowed,mission_graph_authority_blocked,invalid_arguments,execution_failed," +
   "authority_grant_invalid,tool_failure_terminal,data_source,notes";
+
+/**
+ * Appended columns (2026-08-25, success/uncertainty wave):
+ *   tool_events_source          summary|graphs|none — which source produced the
+ *                               tool-event columns. "summary" = the attempt's
+ *                               fresh daily-use run summary; "graphs" = mined
+ *                               persisted mission graphs; "none" = no source
+ *                               (blank counts mean UNKNOWN, never zero).
+ *   tool_calls_succeeded        observed - failed - (vacuous when known);
+ *                               blank when failed is unknown.
+ *   pct_tool_calls_succeeded    complement of the failed pct; blank when unknown.
+ *   secondary_failure_classes   semicolon-joined extra failure classes that
+ *                               ALSO matched this attempt (a failure can have
+ *                               more than one cause).
+ *   classification_confidence   confirmed|mechanical|unclassified.
+ *   tool_calls_vacuous          "called but did no work" count; blank = unknown
+ *                               (graph mining cannot see receipts; only fresh
+ *                               summaries with receipt-counting specs know).
+ * Rows written before this wave are shorter than the header — readers must
+ * treat the missing cells as blank/unknown.
+ */
+export const RUN_CSV_HEADER =
+  LEGACY_RUN_CSV_HEADER +
+  ",tool_events_source,tool_calls_succeeded,pct_tool_calls_succeeded," +
+  "secondary_failure_classes,classification_confidence,tool_calls_vacuous";
+
+/**
+ * Upgrade an existing CSV's header line in place when it is a strict
+ * column-prefix of the current header (an older schema). Data rows are left
+ * byte-for-byte untouched — they simply stay shorter than the new header,
+ * which name-indexing readers already tolerate. Returns the upgraded text,
+ * or null when nothing should change (already current, unrecognized header,
+ * or empty file).
+ */
+export function upgradeRunCsvHeader(text, header = RUN_CSV_HEADER) {
+  if (typeof text !== "string" || text === "") return null;
+  const newlineIndex = text.search(/\r?\n/u);
+  const firstLine = newlineIndex === -1 ? text : text.slice(0, newlineIndex);
+  if (firstLine === header) return null;
+  if (!header.startsWith(`${firstLine},`)) return null;
+  const rest = newlineIndex === -1 ? "\n" : text.slice(newlineIndex);
+  return header + rest;
+}
 
 /**
  * The six mission cells. `requiredGreens` are CONSECUTIVE; `maxAttempts`
@@ -316,6 +368,110 @@ function mineToolEvents(windowStartMs, windowEndMs) {
   return counts;
 }
 
+export const TOOL_EVENT_SOURCE_SUMMARY = "summary";
+export const TOOL_EVENT_SOURCE_GRAPHS = "graphs";
+export const TOOL_EVENT_SOURCE_NONE = "none";
+
+function safeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function nullableCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Sum the tool-call counters across a daily-use run summary's records. The
+ * caller guarantees freshness (the summary was written during THIS attempt),
+ * so every record belongs to the attempt window. Failed and vacuous sums are
+ * nullable: null when NO record knew its count (unknown ≠ zero); a number
+ * when at least one did (an explicit lower bound). Returns null when the
+ * summary has no records to speak for the attempt.
+ */
+export function summaryToolEventTotals(summary) {
+  const records = Array.isArray(summary?.records) ? summary.records : null;
+  if (!records || records.length === 0) return null;
+  const totals = {
+    observed: 0,
+    failed: null,
+    vacuous: null,
+    intentionalNoOp: null,
+    buckets: Object.fromEntries(BLOCKER_BUCKETS.map(([key]) => [key, 0])),
+  };
+  for (const record of records) {
+    totals.observed += safeCount(record?.toolCalls);
+    const failed = nullableCount(record?.toolCallsFailed);
+    if (failed !== null) totals.failed = (totals.failed ?? 0) + failed;
+    const vacuous = nullableCount(record?.toolCallsVacuous);
+    if (vacuous !== null) totals.vacuous = (totals.vacuous ?? 0) + vacuous;
+    // Intentional no-ops (commitKind no_op/reconciled) are correct behavior:
+    // tracked, but NEVER subtracted from succeeded like vacuous calls are.
+    const noOp = nullableCount(record?.toolCallsIntentionalNoOp);
+    if (noOp !== null) totals.intentionalNoOp = (totals.intentionalNoOp ?? 0) + noOp;
+    const buckets = record?.refusalBuckets;
+    if (buckets && typeof buckets === "object") {
+      for (const key of Object.keys(totals.buckets)) {
+        totals.buckets[key] += safeCount(buckets[key]);
+      }
+    }
+  }
+  return totals;
+}
+
+/**
+ * Resolve one attempt's tool-event counts with explicit provenance:
+ *   1. "summary" — the attempt's own fresh run-summary records (the durable
+ *      per-lane source; survives the cleanup that deletes mission graphs).
+ *      A summary that says zero is an EXPLICIT zero.
+ *   2. "graphs" — mined persisted mission graphs, kept for failed attempts
+ *      whose cleanup never ran. Zero mined events is NOT evidence of zero
+ *      tool calls (green lanes delete their run-owned graphs), so an empty
+ *      mine falls through to...
+ *   3. "none" — no source; every count is null (unknown, never zero).
+ * `succeeded` = observed - failed - (vacuous when known); null when failed
+ * is unknown. Graph mining cannot see receipts, so its vacuous is null.
+ */
+export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts }) {
+  if (summaryFresh) {
+    const totals = summaryToolEventTotals(summary);
+    if (totals) {
+      return {
+        source: TOOL_EVENT_SOURCE_SUMMARY,
+        observed: totals.observed,
+        failed: totals.failed,
+        vacuous: totals.vacuous,
+        intentionalNoOp: totals.intentionalNoOp,
+        succeeded:
+          totals.failed === null
+            ? null
+            : Math.max(0, totals.observed - totals.failed - (totals.vacuous ?? 0)),
+        buckets: totals.buckets,
+      };
+    }
+  }
+  const mined = minedCounts ?? { observed: 0, failed: 0, buckets: null };
+  if (safeCount(mined.observed) > 0) {
+    return {
+      source: TOOL_EVENT_SOURCE_GRAPHS,
+      observed: mined.observed,
+      failed: mined.failed,
+      vacuous: null,
+      intentionalNoOp: null,
+      succeeded: Math.max(0, mined.observed - mined.failed),
+      buckets: mined.buckets,
+    };
+  }
+  return {
+    source: TOOL_EVENT_SOURCE_NONE,
+    observed: null,
+    failed: null,
+    vacuous: null,
+    intentionalNoOp: null,
+    succeeded: null,
+    buckets: null,
+  };
+}
+
 function readJsonFile(file) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
@@ -392,8 +548,54 @@ function firstPatternMatch(text, patterns) {
  * assertion text. Only a log with none of those stays matrix_unclassified,
  * and even then the log tail rides along in failureDetail.
  */
+/**
+ * How much to trust the classification:
+ *   confirmed    — the lane's own fresh run-summary proof class matched (or
+ *                  the attempt was green: nothing to classify).
+ *   mechanical   — pattern-matched from the attempt log (harness signatures,
+ *                  renderer deaths, lane assertions). Correct shape, but the
+ *                  root cause was never confirmed by the lane or a human.
+ *   unclassified — nothing parseable; only the log tail rides along.
+ */
+export const CLASSIFICATION_CONFIRMED = "confirmed";
+export const CLASSIFICATION_MECHANICAL = "mechanical";
+export const CLASSIFICATION_UNCLASSIFIED = "unclassified";
+
+/**
+ * Every failure class the log MECHANICALLY matches, in precedence order and
+ * deduplicated. A failure can have more than one cause (a harness death whose
+ * log also carries an assertion diff); the primary classifier picks one, and
+ * the others become secondary classes instead of being silently dropped.
+ */
+export function collectMechanicalFailureClasses(logText) {
+  const text = typeof logText === "string" ? logText : "";
+  const classes = [];
+  for (const [pattern, failureClass] of HARNESS_LOG_SIGNATURES) {
+    if (pattern.test(text) && !classes.includes(failureClass)) {
+      classes.push(failureClass);
+    }
+  }
+  if (firstPatternMatch(text, RENDERER_DEATH_PATTERNS)) {
+    classes.push(RENDERER_DEATH_FAILURE_CLASS);
+  }
+  if (firstPatternMatch(text, LANE_ASSERTION_PATTERNS)) {
+    classes.push(LANE_ASSERTION_FAILURE_CLASS);
+  }
+  return classes;
+}
+
 export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logText }) {
-  if (exitCode === 0) return { failureClass: "none", detail: "" };
+  if (exitCode === 0) {
+    return {
+      failureClass: "none",
+      detail: "",
+      confidence: CLASSIFICATION_CONFIRMED,
+      secondaryClasses: [],
+    };
+  }
+  const text = typeof logText === "string" ? logText : "";
+  const mechanical = collectMechanicalFailureClasses(text);
+  const secondaryFor = (primary) => mechanical.filter((cls) => cls !== primary);
   if (summaryFresh) {
     const records = Array.isArray(summary?.records)
       ? summary.records
@@ -403,15 +605,24 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
     for (const record of records) {
       const cls = record?.proofClass ?? record?.failureClass ?? null;
       if (typeof cls === "string" && cls.includes(":")) {
-        return { failureClass: cls, detail: "" };
+        return {
+          failureClass: cls,
+          detail: "",
+          confidence: CLASSIFICATION_CONFIRMED,
+          secondaryClasses: secondaryFor(cls),
+        };
       }
     }
   }
-  const text = typeof logText === "string" ? logText : "";
   for (const [pattern, failureClass] of HARNESS_LOG_SIGNATURES) {
     const match = pattern.exec(text);
     if (match) {
-      return { failureClass, detail: attemptLogExcerpt(text, match.index) };
+      return {
+        failureClass,
+        detail: attemptLogExcerpt(text, match.index),
+        confidence: CLASSIFICATION_MECHANICAL,
+        secondaryClasses: secondaryFor(failureClass),
+      };
     }
   }
   const rendererDeath = firstPatternMatch(text, RENDERER_DEATH_PATTERNS);
@@ -419,6 +630,8 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
     return {
       failureClass: RENDERER_DEATH_FAILURE_CLASS,
       detail: attemptLogExcerptFrom(text, rendererDeath.index),
+      confidence: CLASSIFICATION_MECHANICAL,
+      secondaryClasses: secondaryFor(RENDERER_DEATH_FAILURE_CLASS),
     };
   }
   const laneAssertion = firstPatternMatch(text, LANE_ASSERTION_PATTERNS);
@@ -426,9 +639,16 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
     return {
       failureClass: LANE_ASSERTION_FAILURE_CLASS,
       detail: attemptLogExcerptFrom(text, laneAssertion.index),
+      confidence: CLASSIFICATION_MECHANICAL,
+      secondaryClasses: secondaryFor(LANE_ASSERTION_FAILURE_CLASS),
     };
   }
-  return { failureClass: "process:matrix_unclassified", detail: attemptLogExcerpt(text) };
+  return {
+    failureClass: "process:matrix_unclassified",
+    detail: attemptLogExcerpt(text),
+    confidence: CLASSIFICATION_UNCLASSIFIED,
+    secondaryClasses: [],
+  };
 }
 
 /**
@@ -488,6 +708,11 @@ function appendRunCsvRow(row) {
   mkdirSync(EVAL_DIR, { recursive: true });
   if (!existsSync(RUN_CSV)) {
     writeFileSync(RUN_CSV, RUN_CSV_HEADER + "\n");
+  } else {
+    // A CSV started under the old schema keeps its rows untouched; only the
+    // header line is upgraded so name-indexing readers see the new columns.
+    const upgraded = upgradeRunCsvHeader(readFileSync(RUN_CSV, "utf8"));
+    if (upgraded !== null) writeFileSync(RUN_CSV, upgraded);
   }
   appendFileSync(RUN_CSV, row.map(csvField).join(",") + "\n");
 }
@@ -632,6 +857,9 @@ export function reconcileInFlightAttempt(manifest) {
     green: false,
     exitCode: null,
     failureClass: IN_FLIGHT_FAILURE_CLASS,
+    // Derived from the persisted marker, not from lane output or a human.
+    confidence: CLASSIFICATION_MECHANICAL,
+    secondaryClasses: [],
     failureDetail:
       "runner process died mid-attempt; reconciled from the persisted in-flight marker on the next load",
     interrupted: true,
@@ -864,10 +1092,18 @@ async function main() {
       assertExactCleanHead(expectedHead, `${stage} post`);
 
       const summary = readJsonFile(RUN_SUMMARY_PATH);
-      const { failureClass, detail: failureDetail } = classifyAttemptOutcome({
+      // One freshness verdict feeds BOTH classification and tool-event
+      // sourcing — two predicates would eventually disagree.
+      const summaryFresh = summaryWrittenDuring(RUN_SUMMARY_PATH, startedAt);
+      const {
+        failureClass,
+        detail: failureDetail,
+        confidence,
+        secondaryClasses,
+      } = classifyAttemptOutcome({
         exitCode,
         summary,
-        summaryFresh: summaryWrittenDuring(RUN_SUMMARY_PATH, startedAt),
+        summaryFresh,
         logText: attemptLogText,
       });
       if (!green) {
@@ -876,10 +1112,23 @@ async function main() {
           attemptLogExcerpt(attemptLogText),
         );
       }
-      const toolEvents = mineToolEvents(startedAt, endedAt);
-      const pctFailed = toolEvents.observed
-        ? ((100 * toolEvents.failed) / toolEvents.observed).toFixed(1) + "%"
-        : "";
+      const toolEvents = resolveAttemptToolEvents({
+        summary,
+        summaryFresh,
+        minedCounts: mineToolEvents(startedAt, endedAt),
+      });
+      const sourceKnown = toolEvents.source !== TOOL_EVENT_SOURCE_NONE;
+      const failedKnown = sourceKnown && toolEvents.failed !== null;
+      const pctFailed =
+        failedKnown && toolEvents.observed > 0
+          ? ((100 * toolEvents.failed) / toolEvents.observed).toFixed(1) + "%"
+          : "";
+      const pctSucceeded =
+        failedKnown && toolEvents.observed > 0
+          ? ((100 * toolEvents.succeeded) / toolEvents.observed).toFixed(1) + "%"
+          : "";
+      const bucketCell = (key) =>
+        sourceKnown && toolEvents.buckets ? toolEvents.buckets[key] ?? "" : "";
       const consumesBudget = green || !isInfrastructureFailureClass(failureClass);
       const csvNotes = consumesBudget
         ? `attempt ${consumedAttemptCount(manifest, cell.id) + 1}/${cell.maxAttempts}; ` +
@@ -887,6 +1136,9 @@ async function main() {
         : `harness failure ${harnessFailureCount(manifest, cell.id) + 1}; ` +
           `attempt budget ${consumedAttemptCount(manifest, cell.id)}/${cell.maxAttempts} unspent; streak preserved`;
 
+      // Unknown vs zero is explicit: a fresh summary that said zero writes an
+      // explicit 0; blank means NO source was available (tool_events_source
+      // says which case a row is).
       appendRunCsvRow([
         new Date(startedAt).toISOString(),
         cell.project,
@@ -899,17 +1151,23 @@ async function main() {
           ? ""
           : `matrix ${stage} exit ${exitCode}` +
             (failureDetail ? `: ${failureDetail.split(/\r?\n/u).at(-1).slice(0, 160)}` : ""),
-        toolEvents.observed || "",
-        toolEvents.observed ? toolEvents.failed : "",
+        sourceKnown ? toolEvents.observed : "",
+        failedKnown ? toolEvents.failed : "",
         pctFailed,
-        toolEvents.buckets.tool_not_allowed || "",
-        toolEvents.buckets.mission_graph_authority_blocked || "",
-        toolEvents.buckets.invalid_arguments || "",
-        toolEvents.buckets.execution_failed || "",
-        toolEvents.buckets.authority_grant_invalid || "",
-        toolEvents.buckets.tool_failure_terminal || "",
+        bucketCell("tool_not_allowed"),
+        bucketCell("mission_graph_authority_blocked"),
+        bucketCell("invalid_arguments"),
+        bucketCell("execution_failed"),
+        bucketCell("authority_grant_invalid"),
+        bucketCell("tool_failure_terminal"),
         "proof-matrix",
         csvNotes,
+        toolEvents.source,
+        failedKnown ? toolEvents.succeeded : "",
+        pctSucceeded,
+        secondaryClasses.join(";"),
+        confidence,
+        toolEvents.vacuous ?? "",
       ]);
 
       // The attempt finished (green or red) — the in-flight marker is now
@@ -924,12 +1182,15 @@ async function main() {
         green,
         exitCode,
         failureClass,
+        confidence,
+        secondaryClasses,
         ...(green
           ? {}
           : {
               failureDetail,
               attemptLog: path.relative(REPO_ROOT, attemptLogPath),
             }),
+        // source/succeeded/vacuous mirror the CSV columns; null = unknown.
         toolEvents,
       });
 

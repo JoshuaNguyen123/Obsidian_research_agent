@@ -62,6 +62,194 @@ interface DailyUseRunRecord extends Pick<
   proofClass: E2EProofClassV1 | null;
   /** Explicit alias for the legacy `approvals` interaction counter. */
   interactiveApprovals: number;
+  /**
+   * Failed-tool-call count for this record, or null when UNKNOWN. The
+   * counters the specs feed today (missionEvidence lengths, usage.toolCalls)
+   * do not distinguish failed tool events — missionEvidence records
+   * successful calls only — so this stays null unless the spec passed an
+   * explicit `toolCallsFailed` counter through recordDailyUseAcceptance.
+   * Unknown is never collapsed to zero.
+   */
+  toolCallsFailed: number | null;
+  /**
+   * "Tool called but did no work" count, or null when UNKNOWN. Covered
+   * signal: a mutation receipt that EXPLICITLY reports zero delta
+   * (bytesWritten/bytesDeleted/affectedCount all present-and-zero) — see
+   * isVacuousToolReceipt. Not detectable from reporter-visible data (and
+   * therefore never guessed): a success payload that is empty where the tool
+   * contract promises content, and a mutation completing with no receipt at
+   * all where receipts are mandatory. Those need product-side receipt
+   * enrichment. Null unless the spec passed an explicit counter.
+   */
+  toolCallsVacuous: number | null;
+  /**
+   * Intentional no-ops (commitKind no_op/reconciled on enriched receipts):
+   * correct idempotent behavior, counted SEPARATELY from vacuous so
+   * eliminating unintended no-work successes never penalizes replays.
+   * Null when unknown.
+   */
+  toolCallsIntentionalNoOp: number | null;
+  /**
+   * Refusal-marker sightings, keyed by the same six bucket names the proof
+   * matrix's graph mining uses. Provenance is explicit in
+   * `refusalBucketsSource`: "annotation" means the spec counted them from
+   * traces it observed; "error_messages" means they were mined from this
+   * record's Playwright error text (sightings, NOT per-event counts — a
+   * retried refusal that never failed the test is invisible here); null
+   * means there was nothing to mine (no annotation, no errors), which is
+   * unknown, not zero.
+   */
+  refusalBuckets: Record<string, number> | null;
+  refusalBucketsSource: "annotation" | "error_messages" | null;
+}
+
+/**
+ * Refusal-marker vocabulary shared with the proof matrix's BLOCKER_BUCKETS
+ * (scripts/run-proof-matrix.mjs): the same six bucket keys, so
+ * summary-sourced and graph-mined rows in
+ * docs/eval/playwright-run-metrics.csv stay comparable. Entries are regex
+ * SOURCES so counting can always build a fresh global regex (no lastIndex
+ * state).
+ */
+export const TOOL_REFUSAL_MARKER_BUCKETS: ReadonlyArray<readonly [string, string]> = [
+  ["tool_not_allowed", "tool_not_allowed"],
+  ["mission_graph_authority_blocked", "mission_graph_authority_blocked"],
+  ["invalid_arguments", "invalid_argument"],
+  ["execution_failed", "execution_failed"],
+  ["authority_grant_invalid", "authority_grant_invalid"],
+  ["tool_failure_terminal", "tool_failure_(?:terminal|repeated)"],
+];
+
+/** Marker SIGHTINGS in error text; only nonzero buckets are emitted. */
+export function countRefusalMarkers(
+  errorMessages: readonly string[],
+): Record<string, number> {
+  const text = errorMessages.join("\n");
+  const buckets: Record<string, number> = {};
+  for (const [key, source] of TOOL_REFUSAL_MARKER_BUCKETS) {
+    const count = [...text.matchAll(new RegExp(source, "giu"))].length;
+    if (count > 0) buckets[key] = count;
+  }
+  return buckets;
+}
+
+/**
+ * Bucket provenance resolution: an annotation the spec counted from live
+ * traces always wins; otherwise markers are mined from the record's error
+ * text; when there is neither, the answer is null (unknown), never {}.
+ */
+export function resolveRefusalBuckets(
+  annotated: Record<string, number> | null,
+  errorMessages: readonly string[],
+): {
+  buckets: Record<string, number> | null;
+  source: "annotation" | "error_messages" | null;
+} {
+  if (annotated) return { buckets: annotated, source: "annotation" };
+  if (errorMessages.some((message) => message.length > 0)) {
+    return { buckets: countRefusalMarkers(errorMessages), source: "error_messages" };
+  }
+  return { buckets: null, source: null };
+}
+
+/**
+ * Receipt shape subset shared with src/agent/missionEvidence's
+ * MissionReceiptLike, plus the enriched fields the receipt-delta-integrity
+ * wave adds (effects.changed, commitKind, readback.priorRevision).
+ */
+export interface VacuousDetectableReceipt {
+  operation?: unknown;
+  bytesWritten?: unknown;
+  bytesDeleted?: unknown;
+  affectedCount?: unknown;
+  commitKind?: unknown;
+  effects?: unknown;
+}
+
+export type ToolReceiptWorkClass =
+  | "worked"
+  | "vacuous"
+  | "intentional_no_op"
+  | "unknown";
+
+/**
+ * Classify what a success receipt says about the WORK behind it. The user's
+ * target is UNINTENDED no-work successes (the empty-contract bug family), so
+ * intentional no-ops are their own class, never lumped with vacuous:
+ *
+ * 1. commitKind "no_op"/"reconciled" (enriched receipts): the tool decided
+ *    doing nothing was correct — idempotent replays are correct behavior.
+ * 2. effects.changed === false (enriched receipts): completion with an
+ *    explicit no-observable-change attestation -> vacuous;
+ *    effects.changed === true -> worked.
+ * 3. Legacy fallback: a receipt carrying at least one delta field
+ *    (bytesWritten/bytesDeleted/affectedCount) is vacuous only when EVERY
+ *    present delta is exactly zero; any nonzero delta is work.
+ * 4. No usable signal (read-style receipts report no deltas): "unknown",
+ *    never guessed.
+ *
+ * Signals still invisible from reporter-visible data (product-side receipt
+ * enrichment needed): an empty success payload where the tool contract
+ * promises content, and a mutation completing with NO receipt at all where
+ * receipts are mandatory.
+ */
+export function classifyToolReceiptWork(
+  receipt: VacuousDetectableReceipt | null | undefined,
+): ToolReceiptWorkClass {
+  if (!receipt || typeof receipt !== "object") return "unknown";
+  if (receipt.commitKind === "no_op" || receipt.commitKind === "reconciled") {
+    return "intentional_no_op";
+  }
+  const effects = receipt.effects;
+  if (
+    effects &&
+    typeof effects === "object" &&
+    typeof (effects as { changed?: unknown }).changed === "boolean"
+  ) {
+    return (effects as { changed: boolean }).changed ? "worked" : "vacuous";
+  }
+  const deltas = [receipt.bytesWritten, receipt.bytesDeleted, receipt.affectedCount]
+    .filter((value) => value !== undefined && value !== null);
+  if (deltas.length === 0) return "unknown";
+  return deltas.every((value) => value === 0) ? "vacuous" : "worked";
+}
+
+/** True only for UNINTENDED no-work successes (see classifyToolReceiptWork). */
+export function isVacuousToolReceipt(
+  receipt: VacuousDetectableReceipt | null | undefined,
+): boolean {
+  return classifyToolReceiptWork(receipt) === "vacuous";
+}
+
+/** Count of vacuous successes among a run's receipts (see classifyToolReceiptWork). */
+export function countVacuousToolReceipts(
+  receipts: readonly (VacuousDetectableReceipt | null | undefined)[],
+): number {
+  return receipts.filter((receipt) => isVacuousToolReceipt(receipt)).length;
+}
+
+/** Count of intentional no-ops — correct behavior, tracked separately. */
+export function countIntentionalNoOpReceipts(
+  receipts: readonly (VacuousDetectableReceipt | null | undefined)[],
+): number {
+  return receipts.filter(
+    (receipt) => classifyToolReceiptWork(receipt) === "intentional_no_op",
+  ).length;
+}
+
+/**
+ * Aggregate nullable counters without collapsing unknown into zero: null
+ * only when EVERY input is null; otherwise the sum of the known values (an
+ * explicit lower bound — per-record nulls remain visible in the records).
+ */
+export function sumNullableCounters(
+  values: readonly (number | null)[],
+): number | null {
+  let total: number | null = null;
+  for (const value of values) {
+    if (value !== null) total = (total ?? 0) + value;
+  }
+  return total;
 }
 
 export interface DailyUseAtomicObservationRecord {
@@ -121,6 +309,10 @@ export default class DailyUseReporter implements Reporter {
           observedAt: new Date().toISOString(),
         })
       : null;
+    const refusal = resolveRefusalBuckets(
+      annotatedMetrics?.refusalBuckets ?? null,
+      errorMessages,
+    );
     this.records.push({
       version: 1,
       scenarioId: typedScenarioId,
@@ -135,6 +327,12 @@ export default class DailyUseReporter implements Reporter {
       observed,
       missionScorecard,
       proofClass,
+      toolCallsFailed: annotatedMetrics?.toolCallsFailed ?? null,
+      toolCallsVacuous: annotatedMetrics?.toolCallsVacuous ?? null,
+      toolCallsIntentionalNoOp:
+        annotatedMetrics?.toolCallsIntentionalNoOp ?? null,
+      refusalBuckets: refusal.buckets,
+      refusalBucketsSource: refusal.source,
       modelCalls: metrics?.modelCalls ?? 0,
       toolCalls: metrics?.toolCalls ?? 0,
       continuations: metrics?.continuations ?? 0,
@@ -225,6 +423,18 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         p95DurationMs: percentile(durations, 0.95),
         modelCalls: metrics?.modelCalls ?? 0,
         toolCalls: metrics?.toolCalls ?? 0,
+        // Nullable on purpose: null means no record in the group knew its
+        // failed/vacuous count (unknown ≠ zero); a number is the sum of the
+        // records that did know — an explicit lower bound.
+        toolCallsFailed: sumNullableCounters(
+          group.map((record) => record.toolCallsFailed),
+        ),
+        toolCallsVacuous: sumNullableCounters(
+          group.map((record) => record.toolCallsVacuous),
+        ),
+        toolCallsIntentionalNoOp: sumNullableCounters(
+          group.map((record) => record.toolCallsIntentionalNoOp),
+        ),
         continuations: metrics?.continuations ?? 0,
         approvals: metrics?.approvals ?? 0,
         interactiveApprovals: metrics?.approvals ?? 0,
@@ -269,10 +479,15 @@ function parseObservedAnnotation(
 function parseMetricsAnnotation(
   test: TestCase,
   scenarioId: DailyUseScenarioId,
-): Pick<
+): (Pick<
   DailyUseRunMetricsV1,
   "modelCalls" | "toolCalls" | "continuations" | "approvals"
-> | null {
+> & {
+  toolCallsFailed: number | null;
+  toolCallsVacuous: number | null;
+  toolCallsIntentionalNoOp: number | null;
+  refusalBuckets: Record<string, number> | null;
+}) | null {
   const raw = [...test.annotations]
     .reverse()
     .find((annotation) => annotation.type === DAILY_USE_METRICS_ANNOTATION)
@@ -286,10 +501,32 @@ function parseMetricsAnnotation(
       toolCalls: safeCounter(value.toolCalls),
       continuations: safeCounter(value.continuations),
       approvals: safeCounter(value.approvals),
+      // Absent or malformed stays null (unknown), never zero.
+      toolCallsFailed: nullableCounter(value.toolCallsFailed),
+      toolCallsVacuous: nullableCounter(value.toolCallsVacuous),
+      toolCallsIntentionalNoOp: nullableCounter(value.toolCallsIntentionalNoOp),
+      refusalBuckets: counterRecord(value.refusalBuckets),
     };
   } catch {
     return null;
   }
+}
+
+/** A non-negative safe integer, else null — unknown is never coerced to 0. */
+export function nullableCounter(value: unknown): number | null {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    ? (value as number)
+    : null;
+}
+
+function counterRecord(value: unknown): Record<string, number> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record: Record<string, number> = {};
+  for (const [key, count] of Object.entries(value as Record<string, unknown>)) {
+    const parsed = nullableCounter(count);
+    if (parsed !== null && parsed > 0) record[key] = parsed;
+  }
+  return record;
 }
 
 function parseScorecardAnnotation(test: TestCase): MissionScorecardV1 | null {
