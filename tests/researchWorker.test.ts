@@ -1163,6 +1163,65 @@ test("research worker rejects its own handoff when it never calls a tool", async
   assert.equal(result.modelSteps, 6);
 });
 
+test("worker sanitizes its handoff summary against its own passages before returning", async () => {
+  const url = "https://example.com/committee-record";
+  const passageSentence =
+    "The committee approved the final draft on Tuesday after a full review of the amended text.";
+  const model = sequenceModel([
+    toolResponse("web_search", { query: "committee record" }),
+    toolResponse("web_fetch", { url }),
+    finalResponse(
+      "From https://example.com/committee-record the record states “The committee ratified the ultimate draft on Wednesday”.",
+    ),
+  ]);
+  const registry: ToolRegistry = {
+    getDefinitions: () => ["web_search", "web_fetch"].map((name) => ({
+      type: "function" as const,
+      function: { name, parameters: { type: "object" } },
+    })),
+    async execute(call) {
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: { results: [{ title: "Committee record", url, snippet: "Record" }] },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: "Committee record",
+          url,
+          content: passageSentence,
+          parserStatus: "parsed",
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-quote-seam",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Report what the committee record says.",
+    originalMission: "Research the committee record.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 6,
+  });
+
+  // The quoted span is model prose, not verbatim capture: the worker itself
+  // downgrades it before the handoff exists, so the fingerprinted summary and
+  // the returned finalSummary are the same already-sanitized text.
+  assert.equal(result.quoteSanitation.downgradedCount, 1);
+  assert.doesNotMatch(result.handoff.summary, /[“"]The committee ratified/u);
+  assert.match(result.handoff.summary, /paraphrase — not verbatim/u);
+  assert.equal(result.handoff.summary, result.finalSummary);
+});
+
 function sequenceModel(responses: ModelChatResponse[]): ModelClient {
   let index = 0;
   return {

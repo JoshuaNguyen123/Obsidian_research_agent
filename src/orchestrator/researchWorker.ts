@@ -40,6 +40,7 @@ import {
   deadLinks,
   recheckLinkLiveness,
 } from "../agent/deadLinkCheck";
+import { sanitizeHandoffQuotes } from "../agent/handoffQuoteSanitizer";
 import { inferSourceSignals } from "../agent/sourceSignals";
 import { resolveThinkForCall } from "../agent/thinkPolicy";
 import {
@@ -99,6 +100,16 @@ export interface ResearchWorkerResult {
   toolCalls: number;
   alternativeSourceReads?: number;
   sourceLedger: SourceCandidateLedgerV1;
+  /**
+   * Outcome of the worker's own pre-handoff quote verification. Required so
+   * every producer of a worker result runs the sanitizer (or consciously
+   * reports zeros) — the merge no longer re-edits specialist prose.
+   */
+  quoteSanitation: {
+    verifiedCount: number;
+    reattributedCount: number;
+    downgradedCount: number;
+  };
 }
 
 export interface ResearchWorkerEvents {
@@ -789,6 +800,17 @@ export async function runResearchWorker(input: {
       .join("\n\n");
   }
 
+  // The composed summary is model prose; verify attributed quotations against
+  // this worker's own captured passage bytes BEFORE the handoff object is
+  // built, so the specialist fingerprint attests exactly the prose the Lead
+  // receives (same shared predicate the write-time claim ledger enforces).
+  const quoteSanitation = sanitizeHandoffQuotes({
+    text: finalSummary,
+    passages: claimPassages,
+    evidence,
+  });
+  finalSummary = quoteSanitation.text;
+
   const now = (input.now?.() ?? new Date()).toISOString();
   const sourceIds = unique(
     evidence.flatMap((item) => [item.sourceId, item.url, item.path].filter(isString)),
@@ -832,6 +854,11 @@ export async function runResearchWorker(input: {
     toolCalls,
     alternativeSourceReads,
     sourceLedger,
+    quoteSanitation: {
+      verifiedCount: quoteSanitation.verifiedCount,
+      reattributedCount: quoteSanitation.reattributedCount,
+      downgradedCount: quoteSanitation.downgradedCount,
+    },
   };
 }
 

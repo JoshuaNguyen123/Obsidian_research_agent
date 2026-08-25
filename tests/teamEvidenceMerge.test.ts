@@ -25,6 +25,7 @@ test("empty handoff recovery instructs Lead to web_search then web_fetch", () =>
     finalSummary: "No usable sources",
     modelSteps: 2,
     toolCalls: 1,
+    quoteSanitation: { verifiedCount: 0, reattributedCount: 0, downgradedCount: 0 },
     sourceLedger: createSourceCandidateLedger({
       runId: "run-1",
       query: "X",
@@ -70,6 +71,7 @@ test("usable handoff makes the Lead-only proof and write contract explicit", () 
     finalSummary: "Evidence is ready.",
     modelSteps: 2,
     toolCalls: 2,
+    quoteSanitation: { verifiedCount: 0, reattributedCount: 0, downgradedCount: 0 },
     sourceLedger: createSourceCandidateLedger({
       runId: "run-proof",
       query: "proof",
@@ -122,6 +124,7 @@ test("usable partial evidence cannot upgrade a rejected worker handoff", () => {
     finalSummary: "One of two required sources was gathered.",
     modelSteps: 6,
     toolCalls: 2,
+    quoteSanitation: { verifiedCount: 0, reattributedCount: 0, downgradedCount: 0 },
     sourceLedger: createSourceCandidateLedger({
       runId: "run-rejected-partial",
       query: "partial proof",

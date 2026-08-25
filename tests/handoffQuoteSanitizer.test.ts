@@ -186,7 +186,13 @@ test("findQuoteRawSpan recovers raw bytes across case, smart quotes, and whitesp
   assert.equal(findQuoteRawSpan("absent phrase entirely", source), null);
 });
 
-test("merge seam: worker handoff summary reaches the Lead with the quote defused", () => {
+test("merge seam is byte-identity: sanitation authority lives in the worker, not the merge", () => {
+  // The summary still carries an unverified quote on purpose: the worker is
+  // the single sanitize authority (runResearchWorker), so the merge must pass
+  // specialist prose through unmodified — otherwise the persisted
+  // progressFingerprint would attest text the Lead never saw. Any future
+  // second producer that skips worker-side sanitation trips this test and
+  // must add its own sanitation instead of reviving one here.
   const summary =
     "The Nicene Creed's third article reads “" +
     MODERNIZED_QUOTE +
@@ -228,13 +234,11 @@ test("merge seam: worker handoff summary reaches the Lead with the quote defused
       runId: "run-quote",
       query: "nicene creed",
     }),
+    quoteSanitation: { verifiedCount: 0, reattributedCount: 0, downgradedCount: 0 },
   };
 
   const merged = mergeResearchWorkerResult({ worker });
-  assert.doesNotMatch(merged.handoff.summary, /["“]proceeds from the Father/u);
-  assert.match(merged.handoff.summary, /paraphrase/iu);
-  assert.doesNotMatch(merged.promptContext, /["“]proceeds from the Father/u);
-  assert.match(merged.promptContext, /paraphrase/iu);
+  assert.equal(merged.handoff.summary, summary);
 });
 
 test("continuation seam: ledger evidence summaries defuse unverifiable quotes", () => {
