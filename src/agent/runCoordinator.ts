@@ -129,6 +129,16 @@ export interface RunCoordinatorOptions {
    * plugin, not in per-run state, so they survive across runs.
    */
   observeModelCallEvidence?: (evidence: ModelCallEvidenceV1) => void;
+  /**
+   * Host-owned tap fired with the merged scorecard after every scorecard
+   * observation, tagged with the accepted run identity. Feeds durable
+   * session-crossing consumers (e.g. the capability ratchet) that live on the
+   * plugin, not in per-run state.
+   */
+  observeMissionScorecard?: (observation: {
+    runId: string | null;
+    scorecard: MissionScorecardV1;
+  }) => void;
 }
 
 export class RunCoordinator {
@@ -585,6 +595,15 @@ export class RunCoordinator {
           this.lastMissionScorecard,
           scorecard,
         );
+        this.options.observeMissionScorecard?.({
+          runId: this.runId,
+          scorecard: {
+            ...this.lastMissionScorecard,
+            dimensions: this.lastMissionScorecard.dimensions.map((item) => ({
+              ...item,
+            })),
+          },
+        });
       }
     } else if (key === "onTrace") {
       const trace = args[0] as

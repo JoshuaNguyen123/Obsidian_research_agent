@@ -27,9 +27,18 @@ export interface ReconciledLinearSelectionsV1 extends LinearQueueSelectionV1 {
 /**
  * Derives the bounded fixed-operation catalog from connection evidence. The
  * persisted legacy ceiling is deliberately not authoritative.
+ *
+ * Gates 0–3 come exclusively from the fresh connection-discovery snapshot.
+ * Gates 4–5 (labels-as-entities, relations, initiative↔project links,
+ * customer objects) additionally require an earned extension from the
+ * evidence-based capability ratchet (`src/agent/capabilityRatchet.ts`): the
+ * ratchet can widen a fully-bound connection's catalog, but can never
+ * substitute for missing connection evidence — a base gate below 3 ignores
+ * the extension entirely.
  */
 export function deriveLinearCapabilityGate(
   snapshot: LinearCapabilitySnapshotV1 | null,
+  options: { earnedExtension?: number } = {},
 ): LinearCapabilityGate {
   if (!hasCapability(snapshot, "authenticated_connection")) return 0;
   // Ticket publication needs only the authenticated issue/comment catalog.
@@ -38,7 +47,13 @@ export function deriveLinearCapabilityGate(
   // fresh probe returned a compatible project binding. Mutations at every gate
   // remain independently subject to prepared approval and provider readback.
   if (!hasCapability(snapshot, "team_selection")) return 1;
-  return hasCapability(snapshot, "project_selection") ? 3 : 2;
+  if (!hasCapability(snapshot, "project_selection")) return 2;
+  return (3 + normalizeEarnedExtension(options.earnedExtension)) as LinearCapabilityGate;
+}
+
+/** Anything but an exact earned tier of 1 or 2 fails closed to no extension. */
+function normalizeEarnedExtension(value: number | undefined): 0 | 1 | 2 {
+  return value === 1 || value === 2 ? value : 0;
 }
 
 export function evaluateLinearQueueConfiguration(

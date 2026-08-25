@@ -172,6 +172,14 @@ import type {
   SteeringEnqueueResult,
 } from "./src/agent/runSteering";
 import {
+  createCapabilityRatchetState,
+  deriveRatchetedLinearCapabilityGate,
+  normalizeCapabilityRatchetState,
+  observeCapabilityRatchetScorecard,
+  type CapabilityRatchetStateV1,
+} from "./src/agent/capabilityRatchet";
+import type { MissionScorecardV1 } from "./src/agent/missionScorecard";
+import {
   getDurablyCompletedLifecycleToolNames,
   loadLatestPersistedMissionRunProjection,
   loadPersistedMissionRunProjectionByRunId,
@@ -806,7 +814,12 @@ export default class AgenticResearcherPlugin extends Plugin {
   private readonly runCoordinator = new RunCoordinator({
     observeModelCallEvidence: (evidence) =>
       this.modelLatencyTracker.observeEvidence(evidence),
+    observeMissionScorecard: (observation) =>
+      this.observeMissionScorecardForCapabilityRatchet(observation),
   });
+  /** Durable evidence-derived tier record; persisted in local plugin data. */
+  private capabilityRatchetState: CapabilityRatchetStateV1 =
+    createCapabilityRatchetState(new Date().toISOString());
   private readonly approvalBroker = new ApprovalBroker();
   private readonly durableMissionOwnerId = `plugin-${createAgentRunId()}`;
   private durableMissionRuntime: LiveDurableMissionRuntime | null = null;
@@ -2048,6 +2061,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       githubReviewRepairCheckpoints: rawGitHubReviewRepairCheckpoints,
       githubGitPushAttempts: rawGitPushAttempts,
       linearCapabilitySnapshot: rawLinearCapabilitySnapshot,
+      capabilityRatchetState: rawCapabilityRatchetState,
       linearIntegrationState: rawLinearIntegrationState,
       pendingLinearReconciliationState: rawPendingLinearReconciliationState,
       externalActionReceiptLedger: rawExternalActionReceiptLedger,
@@ -2569,8 +2583,14 @@ export default class AgenticResearcherPlugin extends Plugin {
     } catch {
       this.linearCapabilitySnapshot = null;
     }
-    this.settings.linearCapabilityGate = deriveLinearCapabilityGate(
+    // Malformed ratchet records fail closed to a fresh tier-0 record: a
+    // corrupt record must tighten the earned extension, never loosen it.
+    this.capabilityRatchetState =
+      normalizeCapabilityRatchetState(rawCapabilityRatchetState) ??
+      createCapabilityRatchetState(new Date().toISOString());
+    this.settings.linearCapabilityGate = deriveRatchetedLinearCapabilityGate(
       this.linearCapabilitySnapshot,
+      this.capabilityRatchetState,
     );
     if (
       this.settings.linearQueueEnabled &&
@@ -3632,7 +3652,10 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.settings.linearStartedStateId = selections.startedStateId;
       this.settings.linearCompletedStateId = selections.completedStateId;
       this.settings.linearBlockedStateId = selections.blockedStateId;
-      this.settings.linearCapabilityGate = deriveLinearCapabilityGate(snapshot);
+      this.settings.linearCapabilityGate = deriveRatchetedLinearCapabilityGate(
+        snapshot,
+        this.capabilityRatchetState,
+      );
       const at = nextMonotonicIso(this.linearIntegrationState.updatedAt);
       const configFingerprint = await this.computeLinearConfigFingerprint();
       this.linearIntegrationState = recordLinearIntegrationSuccess(
@@ -3811,6 +3834,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   private computeLinearConfigFingerprint(): Promise<string> {
     return sha256LinearValue({
       capabilitySnapshotHash: this.linearCapabilitySnapshot?.snapshotHash ?? null,
+      // Deliberately the connection-derived base gate: the earned ratchet
+      // extension is reliability evidence, not configuration, and must not
+      // churn the config fingerprint when a tier moves.
       derivedCapabilityGate: deriveLinearCapabilityGate(
         this.linearCapabilitySnapshot,
       ),
@@ -7951,6 +7977,34 @@ export default class AgenticResearcherPlugin extends Plugin {
     await this.saveProjectMemoryData();
   }
 
+  /**
+   * Fold each merged mission scorecard into the durable capability ratchet.
+   * Tier changes (and streak movement) persist immediately with the evidence
+   * that justified them; the derived Linear gate display follows the record.
+   */
+  private observeMissionScorecardForCapabilityRatchet(observation: {
+    runId: string | null;
+    scorecard: MissionScorecardV1;
+  }): void {
+    const result = observeCapabilityRatchetScorecard(
+      this.capabilityRatchetState,
+      {
+        runId: observation.runId,
+        at: new Date().toISOString(),
+        scorecard: observation.scorecard,
+      },
+    );
+    if (!result.changed) return;
+    this.capabilityRatchetState = result.state;
+    this.settings.linearCapabilityGate = deriveRatchetedLinearCapabilityGate(
+      this.linearCapabilitySnapshot,
+      this.capabilityRatchetState,
+    );
+    void this.savePluginData().catch((error) =>
+      console.warn("Unable to persist the capability ratchet record.", error),
+    );
+  }
+
   private async savePluginData(gitPushAttemptWrite?: {
     gitPushAttemptNamespace: GitPushAttemptNamespaceV1;
     expectedRevision: number;
@@ -8003,6 +8057,7 @@ export default class AgenticResearcherPlugin extends Plugin {
                 this.githubReviewRepairCheckpointNamespace,
               githubGitPushAttempts: gitPushAttemptNamespace,
               linearCapabilitySnapshot: this.linearCapabilitySnapshot,
+              capabilityRatchetState: this.capabilityRatchetState,
               conversationHistory: this.conversationHistory,
               researchMemoryIndex: this.researchMemoryIndex,
               latestOrchestratorSnapshot: this.latestOrchestratorSnapshot,
@@ -15245,7 +15300,13 @@ export default class AgenticResearcherPlugin extends Plugin {
       return createDefaultToolRegistry({
         linear: {
           client: linearClient,
-          gate: deriveLinearCapabilityGate(this.linearCapabilitySnapshot),
+          // The model-facing catalog is the ratchet's first consumer: gates
+          // 4-5 open only with the evidence-earned extension on top of a
+          // fully-bound connection snapshot.
+          gate: deriveRatchetedLinearCapabilityGate(
+            this.linearCapabilitySnapshot,
+            this.capabilityRatchetState,
+          ),
           researchPublicationTool:
             this.createResearchPublicationAgentTool(linearClient) ?? undefined,
           researchProjectHierarchyTool:

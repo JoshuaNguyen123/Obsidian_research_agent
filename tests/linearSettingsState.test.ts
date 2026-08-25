@@ -103,6 +103,36 @@ test("Linear queue and hierarchy readiness are derived from discovered bindings,
   assert.equal(deriveLinearCapabilityGate(null), 0);
 });
 
+test("the earned ratchet extension widens only a fully-bound gate and fails closed", () => {
+  // Base gate 3 plus an earned extension reaches the previously stranded
+  // catalog tiers.
+  assert.equal(deriveLinearCapabilityGate(snapshot, { earnedExtension: 1 }), 4);
+  assert.equal(deriveLinearCapabilityGate(snapshot, { earnedExtension: 2 }), 5);
+  assert.equal(deriveLinearCapabilityGate(snapshot, {}), 3);
+  // Anything but an exact earned tier of 1 or 2 earns nothing.
+  assert.equal(deriveLinearCapabilityGate(snapshot, { earnedExtension: 3 }), 3);
+  assert.equal(deriveLinearCapabilityGate(snapshot, { earnedExtension: -1 }), 3);
+  assert.equal(deriveLinearCapabilityGate(snapshot, { earnedExtension: 1.5 }), 3);
+  assert.equal(
+    deriveLinearCapabilityGate(snapshot, { earnedExtension: Number.NaN }),
+    3,
+  );
+  // The extension can never substitute for missing connection evidence.
+  const withoutProjects = {
+    ...snapshot,
+    capabilities: snapshot.capabilities.map((capability) =>
+      capability.id === "project_selection"
+        ? { ...capability, enabled: false }
+        : capability,
+    ),
+  };
+  assert.equal(
+    deriveLinearCapabilityGate(withoutProjects, { earnedExtension: 2 }),
+    2,
+  );
+  assert.equal(deriveLinearCapabilityGate(null, { earnedExtension: 2 }), 0);
+});
+
 test("Linear selection migration preserves known IDs and only auto-selects unambiguous choices", () => {
   assert.deepEqual(
     reconcileLinearSelections(snapshot, {
