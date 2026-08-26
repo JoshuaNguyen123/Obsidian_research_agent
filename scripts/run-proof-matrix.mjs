@@ -50,6 +50,8 @@ import {
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-campaign-sweep.mjs";
+
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
 const RUN_CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
@@ -127,11 +129,29 @@ export const LEGACY_RUN_CSV_HEADER =
  *                               summaries with receipt-counting specs know).
  * Rows written before this wave are shorter than the header — readers must
  * treat the missing cells as blank/unknown.
+ *
+ * Appended (2026-08-26, off-frontier gate wave):
+ *   frontier_narrowed_mid_response
+ *                               HOST-caused off-frontier refusals: the tool was
+ *                               on the menu the model answered, and AgentRunner
+ *                               rebuilt the menu after an earlier call in the
+ *                               same response. Split out of tool_not_allowed,
+ *                               which means the opposite ("the model named a
+ *                               tool it was never offered"). It is APPENDED
+ *                               rather than slotted beside the other bucket
+ *                               columns because every existing row indexes the
+ *                               legacy block by position.
+ *   frontier_withheld_since_earlier_step
+ *                               HOST-caused off-frontier refusals of a tool the
+ *                               run offered in an EARLIER step and withheld
+ *                               since. Also split out of tool_not_allowed; the
+ *                               model was pursuing a name it had been taught.
  */
 export const RUN_CSV_HEADER =
   LEGACY_RUN_CSV_HEADER +
   ",tool_events_source,tool_calls_succeeded,pct_tool_calls_succeeded," +
-  "secondary_failure_classes,classification_confidence,tool_calls_vacuous";
+  "secondary_failure_classes,classification_confidence,tool_calls_vacuous," +
+  "frontier_narrowed_mid_response,frontier_withheld_since_earlier_step";
 
 /**
  * Upgrade an existing CSV's header line in place when it is a strict
@@ -254,26 +274,25 @@ function assertExactCleanHead(expectedHead, stage) {
 }
 
 /**
- * Kill leaked test-vault Obsidian processes between cells. Copied from
- * sweepTestVaultObsidianZombiesV1 (scripts/run-workflow-audit-e2e.mjs) — the
- * command-line filter guarantees a user's real-vault Obsidian is untouched.
+ * Kill leaked test-vault Obsidian processes between cells.
+ *
+ * The sweep body now lives in scripts/e2e-obsidian-campaign-sweep.mjs (over the
+ * shared CommonJS core in scripts/e2e-obsidian-sweep.js) and is shared
+ * with run-workflow-audit-e2e.mjs. The previously duplicated copies selected
+ * by command-line vault match and force-killed with `Stop-Process -Force`,
+ * with NO consultation of the exclusive e2e lock — and they ran here in the
+ * campaign PARENT, before the child runner acquires that lock. A campaign
+ * starting while another session's lane was mid-mission therefore force-killed
+ * that lane's live Obsidian, producing exit 4294967295 with no Windows Error
+ * Reporting event and no crash dump: the "silent host death". The shared
+ * helper defers to a live lock holder and journals every decision.
  */
-function sweepTestVaultObsidianZombies(stage) {
-  if (process.platform !== "win32") return;
-  const script =
-    "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Obsidian.exe'\" | " +
-    "Where-Object { $_.CommandLine -match 'test_vault_obsidian_ai' }); " +
-    "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; " +
-    "Write-Output $procs.Count";
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", timeout: 30_000, windowsHide: true },
-  );
-  const count = Number.parseInt(String(result.stdout ?? "").trim(), 10);
-  if (Number.isFinite(count) && count > 0) {
-    console.log(`proof-matrix[${stage}]: swept ${count} test-vault Obsidian zombie(s).`);
-  }
+async function sweepTestVaultObsidianZombies(stage) {
+  await sweepTestVaultObsidianZombiesV1({
+    stage: `proof-matrix[${stage}]`,
+    env: process.env,
+    repoRoot: REPO_ROOT,
+  });
 }
 
 function listWorkspaceEntries() {
@@ -315,8 +334,14 @@ function runTimestampMs(missionId) {
   return Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`);
 }
 
-const BLOCKER_BUCKETS = [
+// Must stay key-for-key with TOOL_REFUSAL_MARKER_BUCKETS in
+// e2e/reporters/dailyUseReporter.ts, or graph-mined and summary-sourced rows
+// in docs/eval/playwright-run-metrics.csv stop being comparable.
+// tests/proofMatrix.test.ts asserts the two lists agree.
+export const BLOCKER_BUCKETS = [
   ["tool_not_allowed", /tool_not_allowed/iu],
+  ["frontier_narrowed_mid_response", /frontier_narrowed_mid_response/iu],
+  ["frontier_withheld_since_earlier_step", /frontier_withheld_since_earlier_step/iu],
   ["mission_graph_authority_blocked", /mission_graph_authority_blocked/iu],
   ["invalid_arguments", /invalid_argument/iu],
   ["execution_failed", /execution_failed/iu],
@@ -1028,7 +1053,7 @@ async function main() {
       const attemptIndex = totalAttemptCount(manifest, cell.id) + 1;
       const stage = `${cell.id}#${attemptIndex}`;
       assertExactCleanHead(expectedHead, `${stage} pre`);
-      sweepTestVaultObsidianZombies(stage);
+      await sweepTestVaultObsidianZombies(stage);
       const workspacesBefore = listWorkspaceEntries();
 
       const env = {
@@ -1100,7 +1125,7 @@ async function main() {
         // The excerpt is best-effort; classification falls back to the tail rule.
       }
 
-      sweepTestVaultObsidianZombies(`${stage} post`);
+      await sweepTestVaultObsidianZombies(`${stage} post`);
       removeCampaignWorkspaceDebris(workspacesBefore, stage);
       assertExactCleanHead(expectedHead, `${stage} post`);
 
@@ -1181,6 +1206,8 @@ async function main() {
         secondaryClasses.join(";"),
         confidence,
         toolEvents.vacuous ?? "",
+        bucketCell("frontier_narrowed_mid_response"),
+        bucketCell("frontier_withheld_since_earlier_step"),
       ]);
 
       // The attempt finished (green or red) — the in-flight marker is now

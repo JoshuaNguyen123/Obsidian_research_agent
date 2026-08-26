@@ -70,9 +70,35 @@ export interface LinearProgressCommentResultV1 {
 }
 
 export interface LinearProgressStateResultV1 {
+  /** Empty when no mutation occurred, so no receipt exists. */
   receiptId: string;
   /** False when the issue was already in the requested state. */
   changed: boolean;
+}
+
+/** Why the state-transition half of a report performed no move. */
+export type LinearProgressStateSkipReasonV1 =
+  | "no_state_configured"
+  | "already_in_state";
+
+/**
+ * Structured result of one progress report. The comment half always posts
+ * (real work); the state half is honest about whether it moved anything:
+ * `stateChanged` is true only when the issue actually transitioned, false
+ * when it was already in the requested state, and null when no move was
+ * attempted at all (no status requested, or no workspace state configured
+ * for it) — never a faked boolean. `stateOutcome` keeps the human prose;
+ * consumers (receipt ledgers, run summaries, the metrics census) must read
+ * `stateChanged`/`stateSkipReason` instead of parsing it.
+ */
+export interface ReportProgressToLinearResultV1 {
+  issueId: string;
+  commentId: string;
+  status: LinearProgressStatusV1 | null;
+  stateOutcome: string;
+  stateChanged: boolean | null;
+  stateSkipReason?: LinearProgressStateSkipReasonV1;
+  receiptIds: string[];
 }
 
 export interface CreateReportProgressToLinearOptionsV1 {
@@ -233,33 +259,53 @@ export function createReportProgressToLinearTool(
 
       const receiptIds = [posted.receiptId];
       let stateOutcome: string;
+      // Structurally honest state outcome beside the prose: a success result
+      // must say whether the state half did real work, not bury a skip in
+      // `stateOutcome` text. null means no move was attempted (nothing to
+      // fake a boolean about); false means attempted-but-already-there.
+      let stateChanged: boolean | null;
+      let stateSkipReason: LinearProgressStateSkipReasonV1 | undefined;
       if (!status) {
         stateOutcome = "no state change requested";
+        stateChanged = null;
       } else if (!stateResolution.stateId) {
         // Deliberately not fatal. The publication finalizer throws when the
         // completed state is unset because it gates a release; a reflection
         // that cannot move the ticket has still reported successfully.
         stateOutcome = `skipped: no Linear state is configured for "${status}"`;
+        stateChanged = null;
+        stateSkipReason = "no_state_configured";
       } else {
         const moved = await options.moveIssueState({
           issueId,
           stateId: stateResolution.stateId,
           context,
         });
-        receiptIds.push(moved.receiptId);
+        // A no-op move ("already in that state") produces no receipt; an
+        // empty id in the receipts list would make consumers overcount.
+        if (moved.receiptId.trim()) {
+          receiptIds.push(moved.receiptId);
+        }
         // "Already in that state" is a confirmation, not a failure.
         stateOutcome = moved.changed
           ? `moved to ${status}`
           : `already ${status}`;
+        stateChanged = moved.changed;
+        if (!moved.changed) {
+          stateSkipReason = "already_in_state";
+        }
       }
 
-      return {
+      const result: ReportProgressToLinearResultV1 = {
         issueId,
         commentId: posted.commentId,
         status: status ?? null,
         stateOutcome,
+        stateChanged,
+        ...(stateSkipReason ? { stateSkipReason } : {}),
         receiptIds,
       };
+      return result;
     },
   };
 }

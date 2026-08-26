@@ -597,7 +597,7 @@ async function prepareMutation(
       variables.id = canonicalId;
     }
     assertPreparationChangesState(config, variables, before);
-    const changedFields = mutationChangedFields(config, variables);
+    const changedFields = mutationDiffChangedFields(config, variables, before);
     const target = targetResource(
       config,
       canonicalId,
@@ -747,8 +747,8 @@ async function executePreparedMutation(
     context,
     true,
   );
-  const verification = verifyPostcondition(config, payload.variables, observation);
-  if (!verification.ok) {
+  const verified = verifyPostcondition(config, payload.variables, observation);
+  if (!verified) {
     const mismatchFields = describePostconditionMismatch(
       config,
       payload.variables,
@@ -791,7 +791,11 @@ async function executePreparedMutation(
     action,
     context,
     observation,
-    changedFields: verification.changedFields,
+    // Diff-derived at preparation against the pre-mutation readback (and
+    // still exact here: assertExactPrecondition pinned the dispatch to that
+    // same observed revision). An intent-derived list would claim untouched
+    // fields on a partial no-op update.
+    changedFields: payload.changedFields,
     commitKind: "committed",
     startedAt,
     grantId: context.authorizedAction!.grantId,
@@ -834,7 +838,7 @@ async function reconcilePreparedMutation(
     };
   }
 
-  const verification = verifyPostcondition(config, payload.variables, observation);
+  const verified = verifyPostcondition(config, payload.variables, observation);
   const payloadHash = await sha256LinearValue(payload.variables);
   let journal = createLinearMutationJournalRecord({
     operationId: action.reconciliationKey ?? action.idempotencyKey ?? action.id,
@@ -844,7 +848,7 @@ async function reconcilePreparedMutation(
     payloadHash,
     preconditionHash: payload.preconditionHash ?? undefined,
     expectedPostHash:
-      verification.ok && observation.found
+      verified && observation.found
         ? observation.record.snapshotHash
         : undefined,
     expectedAbsent: payload.expectedAbsent,
@@ -865,14 +869,17 @@ async function reconcilePreparedMutation(
       : undefined,
   });
 
-  if (decision.action === "commit_observed_result" && verification.ok) {
+  if (decision.action === "commit_observed_result" && verified) {
     const timestamp = now(context).toISOString();
     const receipt = await createReceipt({
       config,
       action,
       context,
       observation,
-      changedFields: verification.changedFields,
+      // Same diff-derived preparation delta as the committed path: the
+      // reconciled mutation is the prepared one, so its honest delta is the
+      // one measured against the prepared precondition state.
+      changedFields: payload.changedFields,
       commitKind: "reconciled",
       startedAt: timestamp,
       grantId: context.authorizedAction?.grantId ?? "linear-reconciliation",
@@ -1140,7 +1147,7 @@ function assertPreparationChangesState(
   if (!before.found || isCreate(config.kind) || expectsAbsence(config.kind)) {
     return;
   }
-  if (verifyPostcondition(config, variables, before).ok) {
+  if (verifyPostcondition(config, variables, before)) {
     throw new ToolExecutionError(
       "linear_no_changes",
       "The Linear target already matches the requested state.",
@@ -1149,86 +1156,65 @@ function assertPreparationChangesState(
   }
 }
 
+/**
+ * Whether the observed readback satisfies the mutation's requested state.
+ * This deliberately returns only the verdict: receipt `changedFields` are
+ * diff-derived once, at preparation, against the pre-mutation readback
+ * (mutationDiffChangedFields) — deriving them here from the mutation input
+ * would resurrect the intent-derived delta this predicate replaced.
+ */
 function verifyPostcondition(
   config: MutationToolConfig,
   variables: Record<string, JsonValue>,
   observation: LinearReadback,
-): { ok: boolean; changedFields: string[] } {
-  const changedFields = mutationChangedFields(config, variables);
+): boolean {
   if (
     (config.kind === "issue_trash" || config.kind === "generic_trash") &&
     !observation.found
   ) {
-    return { ok: true, changedFields };
+    return true;
   }
   if (expectsAbsence(config.kind)) {
-    return { ok: !observation.found, changedFields };
+    return !observation.found;
   }
   if (!observation.found || observation.record.resourceType !== config.resourceType) {
-    return { ok: false, changedFields };
+    return false;
   }
   if (config.kind === "issue_archive") {
-    return {
-      ok: observation.record.archivedAt !== undefined &&
-        (observation.record as LinearIssueRecord).trashed !== true,
-      changedFields,
-    };
+    return observation.record.archivedAt !== undefined &&
+      (observation.record as LinearIssueRecord).trashed !== true;
   }
   if (config.kind === "issue_unarchive") {
-    return {
-      ok: observation.record.archivedAt === undefined &&
-        (observation.record as LinearIssueRecord).trashed !== true,
-      changedFields,
-    };
+    return observation.record.archivedAt === undefined &&
+      (observation.record as LinearIssueRecord).trashed !== true;
   }
   if (config.kind === "issue_trash") {
-    return {
-      ok: (observation.record as LinearIssueRecord).trashed === true,
-      changedFields,
-    };
+    return (observation.record as LinearIssueRecord).trashed === true;
   }
   if (config.kind === "generic_archive" || config.kind === "generic_retire") {
-    return {
-      ok: observation.record.archivedAt !== undefined &&
-        observation.record.trashed !== true,
-      changedFields,
-    };
+    return observation.record.archivedAt !== undefined &&
+      observation.record.trashed !== true;
   }
   if (config.kind === "generic_unarchive" || config.kind === "generic_restore") {
-    return {
-      ok: observation.record.archivedAt === undefined &&
-        observation.record.trashed !== true,
-      changedFields,
-    };
+    return observation.record.archivedAt === undefined &&
+      observation.record.trashed !== true;
   }
   if (config.kind === "generic_trash") {
-    return { ok: observation.record.trashed === true, changedFields };
+    return observation.record.trashed === true;
   }
   if (config.kind === "generic_link" || config.kind === "generic_unlink") {
     const labelId = typeof variables.labelId === "string" ? variables.labelId : "";
     const hasLabel = observation.record.labels?.some((label) => label.id === labelId) === true;
-    return {
-      ok: config.kind === "generic_link" ? hasLabel : !hasLabel,
-      changedFields,
-    };
+    return config.kind === "generic_link" ? hasLabel : !hasLabel;
   }
   const input = recordValue(variables.input);
   if (config.kind === "generic_create" || config.kind === "generic_update") {
-    return {
-      ok: matchesGenericInput(observation.record, input),
-      changedFields,
-    };
+    return matchesGenericInput(observation.record, input);
   }
   if (config.resourceType === "issue") {
-    return {
-      ok: matchesIssueInput(observation.record as LinearIssueRecord, input),
-      changedFields,
-    };
+    return matchesIssueInput(observation.record as LinearIssueRecord, input);
   }
-  return {
-    ok: matchesCommentInput(observation.record as LinearCommentRecord, input),
-    changedFields,
-  };
+  return matchesCommentInput(observation.record as LinearCommentRecord, input);
 }
 
 function matchesIssueInput(
@@ -1339,6 +1325,16 @@ function canonicalizeLinearDescription(value: unknown): string {
         (match, text, destination) => (text === destination ? text : match),
       );
       normalized = normalized.replace(/<(https?:\/\/[^>\s]+)>/gu, "$1");
+      // The serializer rewrites inline `__strong__` as `**strong**` anywhere
+      // in a line (observed live: `__init__(replica_id)` came back as
+      // `**init**(replica_id)`). Converge both sides on the asterisk form so
+      // an emphasis-only spelling difference is presentation, not content;
+      // a genuinely different token still fails closed. Same rule as
+      // normalizeComparableTicketText (ResearchTicketPublisher.ts).
+      normalized = normalized.replace(
+        /__([^\s_](?:[^_\r\n]*?[^\s_])?)__/gu,
+        "**$1**",
+      );
       normalized = normalized.replace(
         /^([ \t]*)#{1,6}[ \t]+/u,
         "$1",
@@ -1401,38 +1397,66 @@ function matchesCommentInput(
   comment: LinearCommentRecord,
   input: Record<string, JsonValue>,
 ): boolean {
+  return (
+    comment.id.length > 0 &&
+    commentInputMismatchFields(comment, input).length === 0
+  );
+}
+
+/** Input fields whose requested value differs from the observed comment. */
+function commentInputMismatchFields(
+  comment: LinearCommentRecord,
+  input: Record<string, JsonValue>,
+): string[] {
+  const mismatchedFields: string[] = [];
   if (typeof input.body === "string" && comment.body !== input.body) {
-    return false;
+    mismatchedFields.push("body");
   }
   if (typeof input.issueId === "string" && comment.issue?.id !== input.issueId) {
-    return false;
+    mismatchedFields.push("issueId");
   }
-  return comment.id.length > 0;
+  return mismatchedFields.sort();
 }
 
 function matchesGenericInput(
   record: LinearBaseRecord,
   input: Record<string, JsonValue>,
 ): boolean {
+  return genericInputMismatchFields(record, input).length === 0;
+}
+
+/** Input fields whose requested value differs from the observed record. */
+function genericInputMismatchFields(
+  record: LinearBaseRecord,
+  input: Record<string, JsonValue>,
+): string[] {
+  const mismatchedFields: string[] = [];
   for (const [key, expected] of Object.entries(input)) {
     if (key === "id") continue;
     const actual = genericObservedValue(record, key);
-    if (actual === undefined && expected !== null) return false;
+    if (actual === undefined && expected !== null) {
+      mismatchedFields.push(key);
+      continue;
+    }
     if (Array.isArray(expected)) {
-      if (!Array.isArray(actual)) return false;
       const expectedValues = expected.map(String).sort();
-      const actualValues = actual.map(String).sort();
-      if (canonicalJson(expectedValues) !== canonicalJson(actualValues)) return false;
+      if (
+        !Array.isArray(actual) ||
+        canonicalJson(expectedValues) !== canonicalJson(actual.map(String).sort())
+      ) {
+        mismatchedFields.push(key);
+      }
       continue;
     }
     if (typeof expected === "object" && expected !== null) {
-      return false;
+      mismatchedFields.push(key);
+      continue;
     }
     if (expected === null ? actual !== null && actual !== undefined : actual !== expected) {
-      return false;
+      mismatchedFields.push(key);
     }
   }
-  return true;
+  return mismatchedFields.sort();
 }
 
 function genericObservedValue(
@@ -1704,6 +1728,12 @@ function relatedResourcesFor(
   );
 }
 
+/**
+ * Fields the mutation INTENDS to touch, from its kind and input alone. Only
+ * an honest source for single-effect kinds (archive/trash/delete/link) and
+ * creates; for updates it claims every supplied field, changed or not, so
+ * receipts must use mutationDiffChangedFields instead.
+ */
 function mutationChangedFields(
   config: MutationToolConfig,
   variables: Record<string, JsonValue>,
@@ -1725,6 +1755,46 @@ function mutationChangedFields(
   return Object.keys(recordValue(variables.input))
     .filter((key) => key !== "id")
     .sort();
+}
+
+/**
+ * Diff-derived changed fields for the prepared action and its receipt: each
+ * input field is compared against the pre-mutation readback with the SAME
+ * comparators the postcondition verifier uses (issue/comment/generic mismatch
+ * fields, including the canonicalized description comparison), so a partial
+ * no-op update — title unchanged, description changed — claims only the
+ * fields that actually change. Kinds without an input record keep their fixed
+ * single-effect lists, and creates change every field they carry; both are
+ * already guarded against full vacuity by assertPreparationChangesState /
+ * the create-duplicate check. Because the diff and the linear_no_changes gate
+ * share one comparator, an empty diff here is exactly the fully-vacuous case
+ * that preparation has already refused.
+ */
+function mutationDiffChangedFields(
+  config: MutationToolConfig,
+  variables: Record<string, JsonValue>,
+  before: LinearReadback,
+): string[] {
+  if (
+    !before.found ||
+    before.record.resourceType !== config.resourceType ||
+    isCreate(config.kind) ||
+    expectsAbsence(config.kind) ||
+    !isJsonRecord(variables.input)
+  ) {
+    return mutationChangedFields(config, variables);
+  }
+  const input = recordValue(variables.input);
+  if (config.kind === "generic_update") {
+    return genericInputMismatchFields(before.record, input);
+  }
+  if (config.resourceType === "issue") {
+    return issueInputMismatchFields(before.record as LinearIssueRecord, input);
+  }
+  return commentInputMismatchFields(
+    before.record as LinearCommentRecord,
+    input,
+  );
 }
 
 function previewAfter(

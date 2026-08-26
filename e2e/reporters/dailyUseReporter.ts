@@ -63,6 +63,17 @@ interface DailyUseRunRecord extends Pick<
   /** Explicit alias for the legacy `approvals` interaction counter. */
   interactiveApprovals: number;
   /**
+   * ATTEMPTED tool calls for this record, or null when UNKNOWN. This is the
+   * denominator the success rate always lacked: `toolCalls` above is fed
+   * from `missionEvidence.length` / `usage.toolCalls`, and
+   * `evidenceFromToolResult` (src/agent/missionEvidence.ts:43) yields
+   * nothing for `!result.ok`, so failed calls never reached that counter and
+   * the attempt itself went uncounted. A spec supplies this by folding the
+   * mission event stream through e2e/fixtures/toolCallOutcomes.ts. Null —
+   * never 0 — when no spec counted.
+   */
+  toolCallsAttempted: number | null;
+  /**
    * Failed-tool-call count for this record, or null when UNKNOWN. The
    * counters the specs feed today (missionEvidence lengths, usage.toolCalls)
    * do not distinguish failed tool events — missionEvidence records
@@ -105,14 +116,33 @@ interface DailyUseRunRecord extends Pick<
 
 /**
  * Refusal-marker vocabulary shared with the proof matrix's BLOCKER_BUCKETS
- * (scripts/run-proof-matrix.mjs): the same six bucket keys, so
+ * (scripts/run-proof-matrix.mjs): the same seven bucket keys, so
  * summary-sourced and graph-mined rows in
  * docs/eval/playwright-run-metrics.csv stay comparable. Entries are regex
  * SOURCES so counting can always build a fresh global regex (no lastIndex
  * state).
+ *
+ * Two of these are HOST-caused refusals split out of `tool_not_allowed`,
+ * whose meaning is the opposite -- "the model named a tool it was never
+ * offered":
+ *   frontier_narrowed_mid_response    the tool was on the menu the model
+ *                                     answered, and AgentRunner rebuilt the
+ *                                     menu after an earlier call in the SAME
+ *                                     response;
+ *   frontier_withheld_since_earlier_step
+ *                                     the tool was offered in an EARLIER step
+ *                                     of the run and withheld since (proof-gate
+ *                                     containment, phase ceiling, graph
+ *                                     advance), so the model was pursuing a
+ *                                     name it had been taught.
+ * Buckets stay disjoint: neither code carries a `tool_not_allowed` substring
+ * nor each other's, and the rejection text they produce never uses that
+ * phrase either.
  */
 export const TOOL_REFUSAL_MARKER_BUCKETS: ReadonlyArray<readonly [string, string]> = [
   ["tool_not_allowed", "tool_not_allowed"],
+  ["frontier_narrowed_mid_response", "frontier_narrowed_mid_response"],
+  ["frontier_withheld_since_earlier_step", "frontier_withheld_since_earlier_step"],
   ["mission_graph_authority_blocked", "mission_graph_authority_blocked"],
   ["invalid_arguments", "invalid_argument"],
   ["execution_failed", "execution_failed"],
@@ -327,6 +357,7 @@ export default class DailyUseReporter implements Reporter {
       observed,
       missionScorecard,
       proofClass,
+      toolCallsAttempted: annotatedMetrics?.toolCallsAttempted ?? null,
       toolCallsFailed: annotatedMetrics?.toolCallsFailed ?? null,
       toolCallsVacuous: annotatedMetrics?.toolCallsVacuous ?? null,
       toolCallsIntentionalNoOp:
@@ -424,8 +455,11 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         modelCalls: metrics?.modelCalls ?? 0,
         toolCalls: metrics?.toolCalls ?? 0,
         // Nullable on purpose: null means no record in the group knew its
-        // failed/vacuous count (unknown ≠ zero); a number is the sum of the
-        // records that did know — an explicit lower bound.
+        // attempted/failed/vacuous count (unknown ≠ zero); a number is the
+        // sum of the records that did know — an explicit lower bound.
+        toolCallsAttempted: sumNullableCounters(
+          group.map((record) => record.toolCallsAttempted),
+        ),
         toolCallsFailed: sumNullableCounters(
           group.map((record) => record.toolCallsFailed),
         ),
@@ -483,6 +517,7 @@ function parseMetricsAnnotation(
   DailyUseRunMetricsV1,
   "modelCalls" | "toolCalls" | "continuations" | "approvals"
 > & {
+  toolCallsAttempted: number | null;
   toolCallsFailed: number | null;
   toolCallsVacuous: number | null;
   toolCallsIntentionalNoOp: number | null;
@@ -502,6 +537,7 @@ function parseMetricsAnnotation(
       continuations: safeCounter(value.continuations),
       approvals: safeCounter(value.approvals),
       // Absent or malformed stays null (unknown), never zero.
+      toolCallsAttempted: nullableCounter(value.toolCallsAttempted),
       toolCallsFailed: nullableCounter(value.toolCallsFailed),
       toolCallsVacuous: nullableCounter(value.toolCallsVacuous),
       toolCallsIntentionalNoOp: nullableCounter(value.toolCallsIntentionalNoOp),

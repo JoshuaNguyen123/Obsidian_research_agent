@@ -16,6 +16,7 @@ import {
   createAcceptedResearchArtifactV1,
   createExternalActionReceiptLedgerState,
   createWorkItemSpecV2,
+  parseAcceptedResearchNotePackageV1,
   renderQueueExecutableHumanWorkItemSpecV2,
   type AcceptedResearchNoteReadRequestV1,
   type AcceptedResearchNoteWriteRequestV1,
@@ -27,6 +28,8 @@ import {
   type ResearchTicketWorkItemDraftV2,
 } from "../src/integrations/linear";
 import {
+  assertProjectIdeaSeedPublicationBindingV1,
+  canonicalSeedExactAcceptedResearchPackageV1,
   createResearchPublicationTool,
   hasExplicitResearchPublicationIntent,
   resolveResearchPublicationNotePathV1,
@@ -359,31 +362,288 @@ test("restart resumes ideation-bound publication only from the exact durable sig
   assert.equal(missing.grants.length, 0);
 });
 
-test("ideation-origin publication rejects an objective divergent from the signed selected direction before mutation", async () => {
+// Guard-teeth pin: the binding assert itself is never loosened. Without going
+// through parseToolArguments' host substitution seat, a divergent seed-bound
+// value still fails closed exactly as before.
+test("ideation-origin publication binding rejects an objective divergent from the signed selected direction", () => {
+  const cache = ideationRuntimeCacheFixture();
+  const seed = cache.projectIdeaAcceptedResearchSeed!;
+  const package_ = parseAcceptedResearchNotePackageV1({
+    schemaVersion: 1,
+    title: seed.title,
+    problemImpact: seed.problemImpact,
+    evidence: seed.evidence.map((entry) => ({
+      ...entry,
+      label: "Evidence",
+      summary: "Supports the work.",
+    })),
+    confidenceLimitations: "Provider smoke testing remains separate.",
+    proposedWork: seed.proposedWork,
+    nonGoals: seed.nonGoals,
+    scope: ["Trusted repository only."],
+    dependencies: [],
+    acceptanceCriteria: seed.acceptanceCriteria,
+    validationRequirementKeys: ["trusted.validation"],
+    riskClass: seed.riskClass,
+    executionClass: "code",
+    objective: seed.selectedDirection.summary,
+    repositoryKey: "trusted-repo",
+    vaultBindingKey: "vault-test",
+    originRunId: "run-ideation-binding",
+    projectIdeaSeed: seed,
+  });
+  assert.throws(
+    () =>
+      assertProjectIdeaSeedPublicationBindingV1(
+        {
+          ...package_,
+          objective:
+            "Perform unauthorized work outside the selected project direction.",
+        },
+        cache,
+      ),
+    (error: unknown) =>
+      error instanceof Error &&
+      (error as Error & { code?: string }).code ===
+        "research_publication_project_idea_drift",
+  );
+});
+
+test("host substitution repairs a paraphrased seed-bound package so publication proceeds with seeded values", async () => {
   const fixture = createFixture("created", { resumeCheckpoints: true });
+  const cache = ideationRuntimeCacheFixture();
+  const seed = cache.projectIdeaAcceptedResearchSeed as {
+    selectedDirection: { summary: string };
+    proposedWork: string[];
+  };
   const args = argsFixture();
-  (args.package as Record<string, unknown>).objective =
-    "Perform unauthorized work outside the selected project direction.";
+  const packageRecord = args.package as Record<string, unknown>;
+  // Keep evidence identity aligned with the seed so only the paraphrased
+  // prose fields drift (the live compound-flow failure shape: the model
+  // paraphrased objective and proposedWork instead of echoing the seed).
+  (packageRecord.evidence as Array<Record<string, unknown>>)[0].id =
+    `evidence-${"a".repeat(64)}`;
+  packageRecord.objective =
+    "Persist a restart-safe signed handoff covering the accepted work item.";
+  packageRecord.proposedWork = ["Implement roughly what was accepted."];
+
+  const substitution = canonicalSeedExactAcceptedResearchPackageV1({
+    toolName: "publish_research_to_linear",
+    packageValue: packageRecord,
+    runtimeCache: cache,
+  });
+  assert.ok(substitution, "a paraphrased seed-bound package must be substituted");
+  assert.deepEqual(substitution.substitutedFields, ["objective", "proposedWork"]);
+  assert.equal(
+    (substitution.packageValue as { objective: string }).objective,
+    seed.selectedDirection.summary,
+  );
+  assert.deepEqual(substitution.packageValue.proposedWork, seed.proposedWork);
+
   const context = contextFixture(
     "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.",
-    "run-ideation-objective-drift",
-    "call-ideation-objective-drift",
+    "run-ideation-substituted",
+    "call-ideation-substituted",
   );
-  context.runtimeCache = ideationRuntimeCacheFixture();
+  context.runtimeCache = cache;
   context.requestNestedApproval = approveNested;
-
+  // Pass the paraphrased package — parseToolArguments must substitute.
   const result = await new DefaultToolRegistry([fixture.tool]).execute(
     { name: "publish_research_to_linear", arguments: args },
     context,
   );
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites.length, 1);
+  assert.equal(
+    fixture.noteWrites[0]?.package.objective,
+    seed.selectedDirection.summary,
+  );
+  assert.deepEqual(
+    fixture.noteWrites[0]?.package.proposedWork,
+    seed.proposedWork,
+  );
+  assert.equal(fixture.publisher.publishCount, 1);
+});
 
+test("canonicalSeedExactAcceptedResearchPackageV1 substitutes only under durable seed authority", () => {
+  const cache = ideationRuntimeCacheFixture();
+  const paraphrased = () => {
+    const args = argsFixture();
+    const packageRecord = args.package as Record<string, unknown>;
+    (packageRecord.evidence as Array<Record<string, unknown>>)[0].id =
+      `evidence-${"a".repeat(64)}`;
+    packageRecord.objective = "A paraphrase of the selected direction.";
+    return packageRecord;
+  };
+
+  // No seed cache: null, so downstream guard behavior stays byte-identical.
+  assert.equal(
+    canonicalSeedExactAcceptedResearchPackageV1({
+      toolName: "publish_research_to_linear",
+      packageValue: paraphrased(),
+      runtimeCache: { toolResults: new Map() },
+    }),
+    null,
+  );
+  // Absent runtime cache entirely: null.
+  assert.equal(
+    canonicalSeedExactAcceptedResearchPackageV1({
+      toolName: "publish_research_to_linear",
+      packageValue: paraphrased(),
+      runtimeCache: undefined,
+    }),
+    null,
+  );
+  // Partial ideation cache: null, preserving the tool's own
+  // research_publication_project_idea_not_promotable error path.
+  assert.equal(
+    canonicalSeedExactAcceptedResearchPackageV1({
+      toolName: "publish_research_to_linear",
+      packageValue: paraphrased(),
+      runtimeCache: {
+        toolResults: new Map(),
+        projectIdeaBrief: cache.projectIdeaBrief,
+      },
+    }),
+    null,
+  );
+  // Wrong tool name: null.
+  assert.equal(
+    canonicalSeedExactAcceptedResearchPackageV1({
+      toolName: "linear_create_issue",
+      packageValue: paraphrased(),
+      runtimeCache: cache,
+    }),
+    null,
+  );
+  // Non-record package: null.
+  assert.equal(
+    canonicalSeedExactAcceptedResearchPackageV1({
+      toolName: "publish_research_to_linear",
+      packageValue: "not a package",
+      runtimeCache: cache,
+    }),
+    null,
+  );
+  // Already exact: null (no substitution to journal).
+  const exact = paraphrased();
+  const seed = cache.projectIdeaAcceptedResearchSeed as {
+    selectedDirection: { summary: string };
+  };
+  exact.objective = seed.selectedDirection.summary;
+  assert.equal(
+    canonicalSeedExactAcceptedResearchPackageV1({
+      toolName: "publish_research_to_linear",
+      packageValue: exact,
+      runtimeCache: cache,
+    }),
+    null,
+  );
+  // A missing seed-bound field is never filled in: schema validation keeps
+  // rejecting it exactly as before.
+  const missingTitle = paraphrased();
+  delete missingTitle.title;
+  const substituted = canonicalSeedExactAcceptedResearchPackageV1({
+    toolName: "publish_research_to_linear",
+    packageValue: missingTitle,
+    runtimeCache: cache,
+  });
+  assert.ok(substituted);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(substituted.packageValue, "title"),
+    false,
+  );
+  assert.deepEqual(substituted.substitutedFields, ["objective"]);
+  // Substituted values are clones: mutating the result cannot poison the
+  // cached seed for later verification.
+  const cloneProbe = canonicalSeedExactAcceptedResearchPackageV1({
+    toolName: "publish_research_to_linear",
+    packageValue: (() => {
+      const record = paraphrased();
+      record.proposedWork = ["Different paraphrased work."];
+      return record;
+    })(),
+    runtimeCache: cache,
+  });
+  assert.ok(cloneProbe);
+  (cloneProbe.packageValue.proposedWork as string[]).push("injected");
+  const seedProposedWork = (
+    cache.projectIdeaAcceptedResearchSeed as { proposedWork: string[] }
+  ).proposedWork;
+  assert.equal(seedProposedWork.includes("injected"), false);
+});
+
+test("genuine seed corruption still fails closed with no substitution authority", async () => {
+  // Shape 1: a poisoned ideation cache. The substitution refuses (returns
+  // null instead of masking the cache error) and the tool's own guard rejects
+  // exactly as before.
+  const fixture = createFixture("created", { resumeCheckpoints: true });
+  const cache = ideationRuntimeCacheFixture();
+  const poisonedBrief = JSON.parse(
+    JSON.stringify(cache.projectIdeaBrief),
+  ) as Record<string, unknown>;
+  poisonedBrief.title = "A tampered brief title breaking the fingerprint";
+  const poisonedCache = {
+    ...cache,
+    projectIdeaBrief: poisonedBrief,
+  } as unknown as NonNullable<ToolExecutionContext["runtimeCache"]>;
+  const args = argsFixture();
+  const packageRecord = args.package as Record<string, unknown>;
+  packageRecord.objective = "A paraphrase of the selected direction.";
+  assert.equal(
+    canonicalSeedExactAcceptedResearchPackageV1({
+      toolName: "publish_research_to_linear",
+      packageValue: packageRecord,
+      runtimeCache: poisonedCache as ToolExecutionContext["runtimeCache"],
+    }),
+    null,
+  );
+  const context = contextFixture(
+    "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.",
+    "run-ideation-poisoned-cache",
+    "call-ideation-poisoned-cache",
+  );
+  context.runtimeCache = poisonedCache as ToolExecutionContext["runtimeCache"];
+  context.requestNestedApproval = approveNested;
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
   assert.equal(result.ok, false);
-  assert.equal(result.error?.code, "research_publication_invalid_arguments");
-  assert.match(result.error?.message ?? "", /project idea seed|objective|drift/iu);
+  assert.match(result.error?.code ?? "", /research_publication/u);
   assert.equal(result.mutationState, "not_applied");
   assert.equal(fixture.noteWrites.length, 0);
   assert.equal(fixture.publisher.publishCount, 0);
-  assert.equal(fixture.grants.length, 0);
+
+  // Shape 2: the durable-boundary parser (checkpoint/replay seats have no
+  // substitution seat). A persisted package whose seed-bound field genuinely
+  // drifted from its attached signed seed still throws the exact drift error.
+  const seed = deriveAcceptedResearchSeedFromProjectIdeaBriefV1(
+    (ideationRuntimeCacheFixture().projectIdeaBrief) as Parameters<
+      typeof deriveAcceptedResearchSeedFromProjectIdeaBriefV1
+    >[0],
+  );
+  const durablePackage: Record<string, unknown> = {
+    ...(argsFixture().package as Record<string, unknown>),
+    vaultBindingKey: "vault-binding",
+    originRunId: "run-durable",
+    projectIdeaSeed: seed,
+  };
+  (durablePackage.evidence as Array<Record<string, unknown>>)[0].id =
+    `evidence-${"a".repeat(64)}`;
+  assert.doesNotThrow(() =>
+    parseAcceptedResearchNotePackageV1(
+      JSON.parse(JSON.stringify(durablePackage)),
+    ),
+  );
+  const corrupted = JSON.parse(
+    JSON.stringify(durablePackage),
+  ) as Record<string, unknown>;
+  corrupted.title = "A genuinely different durable title";
+  assert.throws(
+    () => parseAcceptedResearchNotePackageV1(corrupted),
+    /drifted from their durable project idea seed[\s\S]*title/u,
+  );
 });
 
 test("continuation segments replay one root-bound completed publication without another Linear mutation", async () => {
@@ -2186,4 +2446,74 @@ test("trusted validation key catalog derives the profile id and numbered command
       "retained-journey-crdt.validation.2",
     ],
   );
+});
+
+/**
+ * A mission routinely outlives the host's Linear capability snapshot. These
+ * pin the recovery seam: the gate still fails closed on its own, but a host
+ * that can re-resolve availability gets to, and is only consulted when the
+ * plain gate said no.
+ */
+function availabilityGatedPublicationTool(options: {
+  isAvailable: () => boolean;
+  recoverAvailability?: () => Promise<boolean>;
+}) {
+  return createResearchPublicationTool(
+    options as unknown as Parameters<typeof createResearchPublicationTool>[0],
+  );
+}
+
+async function publicationGateErrorCode(options: {
+  isAvailable: () => boolean;
+  recoverAvailability?: () => Promise<boolean>;
+}): Promise<string> {
+  const tool = availabilityGatedPublicationTool(options);
+  try {
+    await tool.execute({} as never, { originalPrompt: "" } as never);
+  } catch (error) {
+    return (error as Error & { code?: string }).code ?? "";
+  }
+  return "";
+}
+
+test("an unavailable publication tool with no recovery hook still fails closed", async () => {
+  assert.equal(
+    await publicationGateErrorCode({ isAvailable: () => false }),
+    "research_publication_unavailable",
+  );
+});
+
+test("a recovery hook that cannot restore availability still fails closed", async () => {
+  assert.equal(
+    await publicationGateErrorCode({
+      isAvailable: () => false,
+      recoverAvailability: async () => false,
+    }),
+    "research_publication_unavailable",
+  );
+});
+
+test("a stale capability snapshot the host can re-resolve no longer fails the node", async () => {
+  // Passing the gate lands on the next check (explicit mission intent), which
+  // is exactly how we know availability stopped being the blocker.
+  assert.equal(
+    await publicationGateErrorCode({
+      isAvailable: () => false,
+      recoverAvailability: async () => true,
+    }),
+    "research_publication_explicit_user_mission_required",
+  );
+});
+
+test("recovery is never attempted while the tool is already available", async () => {
+  let recoveryAttempts = 0;
+  const code = await publicationGateErrorCode({
+    isAvailable: () => true,
+    recoverAvailability: async () => {
+      recoveryAttempts += 1;
+      return true;
+    },
+  });
+  assert.equal(recoveryAttempts, 0);
+  assert.equal(code, "research_publication_explicit_user_mission_required");
 });

@@ -499,3 +499,43 @@ test("negated quote phrases do not arm the quote-span requirement", () => {
     true,
   );
 });
+
+test("an ordered write contract's 'verify that write' is not a demand for passage citations", () => {
+  // Proof-matrix interrupted-continuation, 2026-08-26 06:41Z: with the
+  // deadlock healed and the append paid (acceptance PASS, receiptCount 1),
+  // the run STILL could not emit its final answer — the bare \bverify\b
+  // trigger read "append exactly one line containing MARKER_A1 and verify
+  // that write" as factual-source verification and demanded persisted
+  // passage ids that a research-free mission can never have. The answer was
+  // blocked with "Ground each material claim with a persisted passage
+  // citation", the run ended budget/blocked instead of final, and the lane
+  // never reached a terminal state.
+  const laneMission =
+    "Perform exactly two ordered durable appends to the current note, then finish. " +
+    "First append exactly one line containing MARKER_A1 and verify that write. " +
+    "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+  assert.equal(shouldRequireClaimGrounding(laneMission), false);
+
+  // Write-verification phrasings in general are durable-write proof.
+  for (const prompt of [
+    "Append the summary to the note and verify the write.",
+    "Edit the section and verify that edit.",
+    "Save the file and verify its save.",
+  ]) {
+    assert.equal(shouldRequireClaimGrounding(prompt), false, prompt);
+  }
+
+  // Genuine source-verification work keeps its claim ledger — including a
+  // mission that BOTH writes and cites.
+  for (const prompt of [
+    "Research the topic with 3 web sources and cite them.",
+    "Verify these facts against the sources.",
+    "Fact-check this article.",
+    "Verify the claims with citations.",
+    "Do deep research on the subject.",
+    "Append a cited summary to the note and verify that write.",
+  ]) {
+    assert.equal(shouldRequireClaimGrounding(prompt), true, prompt);
+  }
+});

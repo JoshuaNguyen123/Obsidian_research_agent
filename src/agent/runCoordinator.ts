@@ -815,7 +815,16 @@ function isAttestedDiagnosticTraceId(id: string): boolean {
     id.endsWith(":proof-gated-writeback-rejected") ||
     id.endsWith(":rejected") ||
     id.endsWith(":append_to_current_file:result") ||
-    id.endsWith(":append_to_current_file:graph-rejected")
+    id.endsWith(":append_to_current_file:graph-rejected") ||
+    // The resume writeback heal decides whether a crash-restored stub graph
+    // gets its owed write node back. Run 5 of the interrupted-continuation
+    // proof lane (2026-08-26 06:13Z) was undiagnosable because these
+    // verdicts were never attested: the sidecar showed seven authority
+    // rejections but could not say whether the gate skipped or which splice
+    // guard refused.
+    id === "mission-graph-resume-writeback-heal-gate" ||
+    id === "mission-graph-resume-writeback-splice" ||
+    id === "mission-graph-resume-writeback-splice-refused"
   );
 }
 

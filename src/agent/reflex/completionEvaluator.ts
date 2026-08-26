@@ -7,6 +7,7 @@ import {
 import {
   isCompletedAcceptedResearchPublicationReceipt,
 } from "../setLooseCompoundAutonomy";
+import { stripWriteVerificationPhrasesV1 } from "../claimLedger";
 
 export { WRITE_RECEIPT_MISSING, receiptsSatisfyWriteProof };
 
@@ -35,10 +36,19 @@ export function evaluateCompletion(input: AgenticReflexInput): CompletionSignal 
   ) {
     missing.push(WRITE_RECEIPT_MISSING);
   }
-  if (requiresVaultEvidence(input.prompt) && !hasVaultEvidence(input)) {
+  const forswearsResearch = missionForswearsResearchEvidence(input.prompt);
+  if (
+    !forswearsResearch &&
+    requiresVaultEvidence(input.prompt) &&
+    !hasVaultEvidence(input)
+  ) {
     missing.push("vault_evidence");
   }
-  if (requiresWebEvidence(input.prompt) && !hasWebEvidence(input)) {
+  if (
+    !forswearsResearch &&
+    requiresWebEvidence(input.prompt) &&
+    !hasWebEvidence(input)
+  ) {
     missing.push("web_evidence");
   }
   if (requiresWordCount(input.prompt) && !hasToolEvidence(input, "count_words")) {
@@ -68,6 +78,23 @@ export function requiresVaultEvidence(prompt: string): boolean {
   );
 }
 
+/**
+ * A mission that explicitly FORSWEARS research must not have research
+ * evidence demanded back onto it by the lexical triggers here: the
+ * forswearing sentence itself contains the trigger words — "This task needs
+ * no web, memory, or vault research" matches \bweb\b AND \bvault\b, and an
+ * ordered write contract's "verify that write" matches \bverify\b. The
+ * negation-blind reading turned every step of an evidence-complete resumed
+ * segment into a completion correction and then terminal-failed an
+ * acceptance-passing run (proof-matrix interrupted-continuation, 2026-08-26
+ * 02:16Z). Same lesson as the negation-aware quote trigger.
+ */
+export function missionForswearsResearchEvidence(prompt: string): boolean {
+  return /\b(?:needs?|requires?|uses?)\s+no\s+(?:web|internet|online|research)\b|\bno\s+(?:web|memory|vault)\b[^.!?\n]{0,60}\bresearch\b|\bwithout\s+(?:any\s+)?(?:web\s+|internet\s+|online\s+)?research\b|\bdo(?:es)?\s+not\s+(?:need|require|use)\s+(?:any\s+)?(?:the\s+)?(?:web|internet|research)\b/i.test(
+    prompt,
+  );
+}
+
 function isBlockedBroadUnscopedMutation(input: AgenticReflexInput): boolean {
   return (
     input.missionIntent.explicitMutation &&
@@ -76,8 +103,10 @@ function isBlockedBroadUnscopedMutation(input: AgenticReflexInput): boolean {
 }
 
 export function requiresWebEvidence(prompt: string): boolean {
+  // Shared with shouldRequireClaimGrounding: "verify that write" is durable
+  // write proof, not a demand for web sources.
   return /\b(web|online|sources?|citations?|latest|current\s+(?:events?|information|data|news)|verify|fact[-\s]?check)\b/i.test(
-    prompt,
+    stripWriteVerificationPhrasesV1(prompt),
   );
 }
 

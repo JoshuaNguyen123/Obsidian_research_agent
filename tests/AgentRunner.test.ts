@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   MAX_AGENT_STEPS,
+  isPlaceholderToolNameV1,
+  repairPlaceholderToolCallNamesV1,
   attachGroundedPassageCitations,
   constrainExactFindingSentenceContract,
   pruneUniquelyMatchedUngroundedClaims,
@@ -68,6 +71,7 @@ import {
   restrictCompoundResearchClosureToolsV1,
   containProofGateRejectedWriteToolsV1,
   PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
+  canonicalRequiredLiteralWriteContentV1,
   validateRequiredLiteralWriteArguments,
   preWriteProofGateAppliesV1,
   resolveThinkingMode,
@@ -1473,7 +1477,7 @@ test("exact pipeline-difficulty question stays one-call direct chat", async () =
   );
 });
 
-test("unchanged executable frontier blocks after two no-tool model responses", async () => {
+test("unchanged executable frontier steers twice after the first correction then blocks", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const deltas: string[] = [];
@@ -1484,6 +1488,8 @@ test("unchanged executable frontier blocks after two no-tool model responses", a
     chatResponders: [
       () => responseWithContent("I should search, but I did not call the tool."),
       () => responseWithContent("I still did not call the required tool."),
+      () => responseWithContent("More planning prose without any call."),
+      () => responseWithContent("Final prose, still no call."),
     ],
   });
 
@@ -1502,7 +1508,9 @@ test("unchanged executable frontier blocks after two no-tool model responses", a
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  // Strike 1: first-strike correction. Strikes 2-3: bounded prose-steering
+  // escalations (the small-model variance absorber). Strike 4: breaker.
+  assert.equal(chatRequests.length, 4);
   assert.equal(chatRequests[1]?.toolChoice, "required");
   assert.equal(chatRequests[1]?.think, false);
   assert.match(
@@ -1511,16 +1519,96 @@ test("unchanged executable frontier blocks after two no-tool model responses", a
       .join("\n") ?? "",
     /prior response contained prose but no tool call[\s\S]*Call the single most relevant tool now[\s\S]*Return the tool call only/iu,
   );
+  const thirdRequestText =
+    chatRequests[2]?.messages
+      .map((message) => String(message.content ?? ""))
+      .join("\n") ?? "";
+  assert.match(
+    thirdRequestText,
+    /Prose without a tool call cannot advance this mission[\s\S]*required tool work is still owed/iu,
+  );
+  assert.match(
+    thirdRequestText,
+    /ready frontier tool\(s\):.*web_search/iu,
+    "the steering escalation must name the exact frontier tool(s)",
+  );
+  assert.match(
+    thirdRequestText,
+    /or state in one sentence why you cannot/iu,
+  );
+  assert.equal(chatRequests[2]?.toolChoice, "required");
+  assert.equal(chatRequests[3]?.toolChoice, "required");
+  // The stale-correction pruner must keep exactly one correction in history,
+  // so the steering seat cannot bloat requests (30k compactness contract).
+  const finalRequestCorrections = (chatRequests[3]?.messages ?? []).filter(
+    (message) =>
+      message.role === "system" &&
+      String(message.content ?? "").startsWith("FRONTIER CORRECTION"),
+  );
+  assert.equal(finalRequestCorrections.length, 1);
   assert.deepEqual(executedCalls, []);
   assert.match(deltas.join(""), /twice returned no tool call/iu);
   assert.ok(
     traces.some(
       (event) =>
         event.error?.code === "model_tool_noncompliance" &&
-        (event.outputPreview as { attempts?: number } | undefined)?.attempts === 2,
+        (event.outputPreview as { attempts?: number } | undefined)?.attempts === 4,
     ),
   );
+  assert.equal(
+    traces.filter((event) => event.id.startsWith("prose-steering-injection-"))
+      .length,
+    2,
+    "the steering cap is two injections per segment",
+  );
   assert.equal(completions[0]?.stopReason, "error");
+  assert.equal(completions[0]?.autonomyStats?.prose_steering_injections, 2);
+});
+
+test("a single prose stall recovers without spending a prose-steering injection", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("Let me think about the search first."),
+      () => responseWithToolCall("web_search", { query: "Obsidian release" }),
+      () => responseWithToolCall("web_fetch", { url: "https://example.com/rel" }),
+      (request) =>
+        responseWithContent(
+          `The latest release is documented at https://example.com/rel ${getPassageCitationIds(request)[0] ?? ""}`.trim(),
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Search the web for the latest Obsidian release and cite the source.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {
+      settings: createRunnerSettings(),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  // The first prose response is legitimate thinking: the first-strike
+  // correction may fire, but the bounded steering escalation must not.
+  assert.ok(
+    executedCalls.some((call) => call.name === "web_search"),
+    "the corrected model resumed the required tool ladder",
+  );
+  assert.equal(
+    traces.filter((event) => event.id.startsWith("prose-steering-injection-"))
+      .length,
+    0,
+  );
+  assert.equal(completions[0]?.autonomyStats?.prose_steering_injections, 0);
 });
 
 test("observes the current note before the first model planning step", async () => {
@@ -15974,7 +16062,7 @@ test("a host-linked wall-clock abort remains a budget rather than a user stop", 
   assert.deepEqual(completions, ["budget"]);
 });
 
-test("write-required no-tool answers stop after two unchanged-frontier responses", async () => {
+test("write-required no-tool answers steer twice then stop against the unchanged frontier", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const deltas: string[] = [];
@@ -16000,7 +16088,14 @@ test("write-required no-tool answers stop after two unchanged-frontier responses
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  // First-strike correction, then two bounded prose-steering escalations,
+  // then the noncompliance breaker: four requests total.
+  assert.equal(chatRequests.length, 4);
+  assert.ok(
+    statuses.some((message) =>
+      /Prose without a tool call cannot advance the mission/iu.test(message),
+    ),
+  );
   assert.ok(
     statuses.some((message) => /twice returned no tool call/iu.test(message)),
   );
@@ -16011,6 +16106,7 @@ test("web research can search then fetch a source before answering", async () =>
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const deltas: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
   const client = createClient({
     chatRequests,
     chatResponders: [
@@ -16031,6 +16127,7 @@ test("web research can search then fetch a source before answering", async () =>
     enableStreaming: false,
     events: {
       onAssistantDelta: (delta) => deltas.push(delta),
+      onRunComplete: (event) => completions.push(event),
     },
   });
 
@@ -16045,6 +16142,9 @@ test("web research can search then fetch a source before answering", async () =>
   assert.equal(deltas.length, 1);
   assert.match(deltas[0], /Cited answer with https:\/\/example\.com\/mcp/);
   assert.match(deltas[0], /source:[a-z0-9]+:passage:\d+-\d+/i);
+  // The prose final synthesis owes no further frontier work, so the reactive
+  // prose-steering seat must never fire on it.
+  assert.equal(completions[0]?.autonomyStats?.prose_steering_injections, 0);
 });
 
 test("low-cap sourced generated essay finalizes with note writeback", async () => {
@@ -22594,12 +22694,18 @@ test("repository read intent exposes only safe workspace bootstrap and inspectio
   assert.equal(names.has("code_commit_verified"), false);
 });
 
-test("missing required literal rejects a write before mutation and accepts one corrected payload", async () => {
+test("a dropped required literal is restored before mutation instead of refusing the write", async () => {
+  // CONTRACT CHANGE (deliberate). This seat used to reject the first payload,
+  // spend a bounded safeFailureRetry attempt, and require a second model turn
+  // to land the marker — while the final-answer path restored the identical
+  // marker deterministically. The host knows the exact literal, so it now
+  // makes the edit and the call does its work on the first attempt.
   const marker = "E2E_MARKER_1784066436149_631764";
   const prompt = `Append two findings to the current note. Include the marker ${marker}.`;
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const statuses: string[] = [];
+  const traceMessages: string[] = [];
   const vault = createRunnerVaultContext({
     prompt,
     content: "# Existing\n",
@@ -22627,28 +22733,39 @@ test("missing required literal rejects a write before mutation and accepts one c
     enableStreaming: false,
     events: {
       onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traceMessages.push(event.message ?? ""),
     },
   });
 
-  assert.ok(chatRequests.length >= 2);
+  // One model turn, one executed call, mission satisfied.
+  assert.equal(chatRequests.length, 1);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
     ["append_to_current_file"],
     statuses.join("\n"),
   );
-  assert.equal(
-    vault.content.get("Current.md"),
-    `# Existing\n- Finding Alpha\n- Finding Beta\n- ${marker}\n`,
-  );
+  const written = vault.content.get("Current.md") ?? "";
+  assert.match(written, /- Finding Alpha/u);
+  assert.match(written, /- Finding Beta/u);
+  assert.ok(written.includes(marker), written);
   assert.ok(
-    statuses.some((message) =>
+    traceMessages.some((message) =>
+      /Deterministically restored the exact user-required literal marker/iu.test(
+        message,
+      ),
+    ),
+    "the restore must be journalled on the trace",
+  );
+  // The refusal and its retry-burning corrective must no longer occur.
+  assert.ok(
+    !statuses.some((message) =>
       /missing 1 literal value\(s\) explicitly required by the mission/iu.test(
         message,
       ),
     ),
   );
   assert.ok(
-    chatRequests.some((request) =>
+    !chatRequests.some((request) =>
       /Tool-call schema correction: append_to_current_file rejected the supplied arguments/iu.test(
         request.messages.at(-1)?.content ?? "",
       ),
@@ -26665,6 +26782,186 @@ test("the required-literal write contract is step-scoped, not mission-scoped", (
     ),
     /missing 1 literal value\(s\) explicitly required by the mission/u,
   );
+
+  // Anti-duplication redirect (the flip side of the step-scoped contract,
+  // proof-matrix duplication failure): an append that only repeats a marker
+  // the note already contains, while the other marker is still missing, must
+  // be redirected to the missing one — it would pay no new work.
+  const redirect = validateRequiredLiteralWriteArguments(
+    prompt,
+    {
+      name: "append_to_current_file",
+      arguments: { text: `line with ${markerA} again` },
+    },
+    `Initial note\n${markerA}`,
+  );
+  assert.match(String(redirect), /already contains/u);
+  assert.ok(String(redirect).includes(markerB));
+  // The append that carries the still-missing marker passes with the same
+  // note context.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(
+      prompt,
+      {
+        name: "append_to_current_file",
+        arguments: { text: `line with ${markerB}` },
+      },
+      `Initial note\n${markerA}`,
+    ),
+    null,
+  );
+  // Once every mission literal is durably present, repeats stay allowed —
+  // terminal completeness belongs to acceptance, and a mission may
+  // legitimately repeat a line.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(
+      prompt,
+      {
+        name: "append_to_current_file",
+        arguments: { text: `line with ${markerA} again` },
+      },
+      `Initial note\n${markerA}\n${markerB}`,
+    ),
+    null,
+  );
+  // Callers that cannot observe the note keep the plain progress contract.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(prompt, {
+      name: "append_to_current_file",
+      arguments: { text: `line with ${markerA}` },
+    }),
+    null,
+  );
+});
+
+test("a paraphrased required literal is repaired, not refused", () => {
+  // The asymmetry this closes: the final-answer path restored a missing
+  // user-required marker deterministically
+  // (attachMissingRequiredLiteralAnchors), while the tool-call path refused
+  // the identical failure and spent a bounded retry asking the model for an
+  // edit the host already knew how to make. Live evidence: the current
+  // byok-autonomous-journey baseline's primary failure class is
+  // harness:marker_literal_pin.
+  const markerA = "E2E_MARKER_1787685662535_651586A1";
+  const markerB = "E2E_MARKER_1787685662535_651586B2";
+  const singlePrompt = `Append one line containing ${markerA} to the current note.`;
+
+  const repaired = canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+    name: "append_to_current_file",
+    arguments: { text: "Some prose that carries no required marker at all." },
+  });
+  assert.ok(repaired, "a droppped marker must be repairable");
+  assert.equal(repaired.field, "text");
+  assert.equal(repaired.insertedAnchor, markerA);
+  assert.equal(
+    repaired.content,
+    `Some prose that carries no required marker at all.\n\n${markerA}`,
+  );
+  // The repaired payload satisfies the validator for the same reason any
+  // compliant call does — the validator stays the single authority.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(singlePrompt, {
+      name: "append_to_current_file",
+      arguments: { text: repaired.content },
+    }),
+    null,
+  );
+
+  // Step-scoped, so exactly ONE anchor is restored: inserting both is what
+  // collapses a mission's two ordered appends into a single write.
+  const orderedPrompt =
+    `Perform exactly two ordered durable appends to the current note, then finish. ` +
+    `First append exactly one line containing ${markerA} and verify that write. ` +
+    `Then append exactly one separate line containing ${markerB} and verify that write.`;
+  const firstAppend = canonicalRequiredLiteralWriteContentV1(orderedPrompt, {
+    name: "append_to_current_file",
+    arguments: { text: "prose with no marker" },
+  });
+  assert.equal(firstAppend?.insertedAnchor, markerA);
+  assert.doesNotMatch(String(firstAppend?.content), new RegExp(markerB, "u"));
+  // With the note observable, the anchor restored is the one the note still
+  // lacks, so an ordered mission progresses in its stated order.
+  const secondAppend = canonicalRequiredLiteralWriteContentV1(
+    orderedPrompt,
+    {
+      name: "append_to_current_file",
+      arguments: { text: "prose with no marker" },
+    },
+    `Initial note\n${markerA}\n`,
+  );
+  assert.equal(secondAppend?.insertedAnchor, markerB);
+
+  // Declines wherever refusal is the right answer.
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+      name: "append_to_current_file",
+      arguments: { text: `already carries ${markerA}` },
+    }),
+    null,
+    "content that already carries an anchor is never rewritten",
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(
+      orderedPrompt,
+      {
+        name: "append_to_current_file",
+        arguments: { text: `line with ${markerA} again` },
+      },
+      `Initial note\n${markerA}\n`,
+    ),
+    null,
+    "the anti-duplication redirect must keep its teeth",
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(
+      "Append a summary to the current note.",
+      { name: "append_to_current_file", arguments: { text: "no contract" } },
+    ),
+    null,
+    "a mission demanding no literals is untouched",
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+      name: "semantic_search_notes",
+      arguments: { text: "not a write tool" },
+    }),
+    null,
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+      name: "append_to_current_file",
+      arguments: { path: "Note.md" },
+    }),
+    null,
+    "a call with no text/content string has nothing to repair",
+  );
+});
+
+test("the AgentRunner literal seat repairs before it validates", () => {
+  // Source-level ordering guard: the repair must run against the same
+  // toolCall the validator then reads, or the refusal it was meant to remove
+  // fires anyway.
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const repairAt = runnerSource.indexOf(
+    "const literalRepair = canonicalRequiredLiteralWriteContentV1(",
+  );
+  const validateAt = runnerSource.indexOf(
+    "const literalContractError = validateRequiredLiteralWriteArguments(",
+  );
+  assert.ok(repairAt > 0, "the literal seat must consume the repair predicate");
+  assert.ok(validateAt > 0);
+  assert.ok(
+    repairAt < validateAt,
+    "the repair must be applied before the validator reads the call",
+  );
+  assert.equal(
+    runnerSource.match(/canonicalRequiredLiteralWriteContentV1\(/gu)?.length,
+    2,
+    "one definition and exactly one consuming seat",
+  );
 });
 
 test("the pre-write proof gate does not govern a mission that declared no pre-write proof", () => {
@@ -26695,4 +26992,263 @@ test("the pre-write proof gate does not govern a mission that declared no pre-wr
     }),
     true,
   );
+});
+
+test("an unfilled placeholder tool name is repaired to the single offered read tool", () => {
+  // Observed live in the compound flow lane (2026-08-26): right after a
+  // successful read_template the model emitted a tool call literally named
+  // "$TOOL_NAME" — an unfilled function-calling template, not a request for
+  // an unavailable tool. It cost a full model step on an unknown-tool
+  // refusal (~11% of a 9-step segment) while the frontier offered exactly
+  // one tool: web_fetch.
+  const readOnly = (name: string) =>
+    ["web_fetch", "web_search", "read_current_file"].includes(name);
+
+  const repaired = repairPlaceholderToolCallNamesV1({
+    toolCalls: [
+      { name: "$TOOL_NAME", arguments: { url: "https://example.com/a" } },
+    ],
+    offeredToolNames: ["web_fetch"],
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(repaired.repaired, ["$TOOL_NAME->web_fetch"]);
+  assert.equal(repaired.toolCalls[0].name, "web_fetch");
+  // Arguments pass through untouched: the model's intent is preserved and
+  // the tool's own schema validation still governs.
+  assert.deepEqual(repaired.toolCalls[0].arguments, {
+    url: "https://example.com/a",
+  });
+
+  // Ambiguity is never guessed: more than one offered tool leaves the call
+  // alone so the existing rejection can name the exact next tool.
+  assert.deepEqual(
+    repairPlaceholderToolCallNamesV1({
+      toolCalls: [{ name: "$TOOL_NAME", arguments: {} }],
+      offeredToolNames: ["web_fetch", "web_search"],
+      isReadOnlyToolName: readOnly,
+    }).repaired,
+    [],
+  );
+
+  // A mutation is NEVER invented from a placeholder, even unambiguously.
+  assert.deepEqual(
+    repairPlaceholderToolCallNamesV1({
+      toolCalls: [{ name: "$TOOL_NAME", arguments: { text: "hello" } }],
+      offeredToolNames: ["append_to_current_file"],
+      isReadOnlyToolName: readOnly,
+    }).repaired,
+    [],
+  );
+
+  // Real tool names are never touched.
+  const untouched = repairPlaceholderToolCallNamesV1({
+    toolCalls: [{ name: "web_search", arguments: { query: "x" } }],
+    offeredToolNames: ["web_fetch"],
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(untouched.repaired, []);
+  assert.equal(untouched.toolCalls[0].name, "web_search");
+});
+
+test("placeholder tool-name detection covers template shapes without shadowing real tools", () => {
+  for (const placeholder of [
+    "$TOOL_NAME",
+    "${toolName}",
+    "$tool",
+    "<tool_name>",
+    "<tool>",
+    "{{tool_name}}",
+    "tool_name",
+    "your_tool_name",
+    "exact_tool_name",
+    "  $TOOL_NAME  ",
+  ]) {
+    assert.equal(
+      isPlaceholderToolNameV1(placeholder),
+      true,
+      `expected placeholder: ${placeholder}`,
+    );
+  }
+  for (const real of [
+    "web_search",
+    "web_fetch",
+    "read_template",
+    "append_to_current_file",
+    "code_workspace_create_file",
+    "linear_create_issue",
+    "publish_research_to_linear",
+    "",
+  ]) {
+    assert.equal(
+      isPlaceholderToolNameV1(real),
+      false,
+      `expected real tool name: ${real}`,
+    );
+  }
+});
+
+test("a mid-response menu rebuild is recorded as host-caused, not as an unoffered tool name", async () => {
+  // The prime suspect, reproduced. AgentRunner clears and rebuilds
+  // `stepAllowedToolNames` after every committed call in a multi-call
+  // response. Here the step-start menu offers create_folder, the model asks
+  // for the two folders the user named plus the note, and call 1 completes
+  // the graph's only create_folder node -- which drops create_folder from the
+  // menu BEFORE call 2 is validated against it.
+  //
+  // The refusal itself is correct (the graph has no second folder slot and
+  // the authority seats behind this gate refuse the call regardless). What
+  // was wrong is the ATTRIBUTION: this was recorded as `tool_not_allowed`,
+  // the bucket whose meaning is "the model named a tool it was never
+  // offered", and the rejection told the model the tool was "not available
+  // for this prompt" moments after offering it.
+  const prompt =
+    "Create folder Projects/Alpha, create folder Projects/Beta, and create note Projects/Alpha/Brief.md.";
+  const executedCalls: ModelToolCall[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const rejectedTraces: AgentTraceEvent[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.researchMemoryEnabled = false;
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCalls([
+          { name: "create_folder", arguments: { path: "Projects/Alpha" } },
+          { name: "create_folder", arguments: { path: "Projects/Beta" } },
+          {
+            name: "create_file",
+            arguments: {
+              path: "Projects/Alpha/Brief.md",
+              content: "# Brief",
+            },
+          },
+        ]),
+      () => responseWithContent("Created what the mission graph had slots for."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 2,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => {
+        if (event.kind === "tool_rejected") rejectedTraces.push(event);
+      },
+    },
+  });
+
+  // Precondition: the model really was offered create_folder at step start.
+  // Without this the rest of the test proves nothing.
+  const stepStartMenu =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(
+    stepStartMenu.includes("create_folder"),
+    `step-start menu must offer create_folder: ${JSON.stringify(stepStartMenu)}`,
+  );
+
+  const narrowed = rejectedTraces.find(
+    (event) => event.toolName === "create_folder",
+  );
+  assert.ok(
+    narrowed,
+    `expected a create_folder refusal: ${JSON.stringify(
+      rejectedTraces.map((event) => [event.id, event.error?.code]),
+    )}`,
+  );
+  // The refusal is attributed to the host, and NOT to the tool_not_allowed
+  // bucket. This is the assertion that fails on the unfixed tree, where the
+  // code is "tool_not_allowed".
+  assert.equal(narrowed.error?.code, "frontier_narrowed_mid_response");
+  assert.doesNotMatch(String(narrowed.error?.code), /tool_not_allowed/u);
+
+  // The facts reach the trace structurally, so a census never has to parse
+  // the rejection sentence to split host drift from model naming errors.
+  const facts = (narrowed.outputPreview as { offFrontier?: Record<string, unknown> })
+    ?.offFrontier;
+  assert.ok(facts, "refusal trace must carry offFrontier provenance");
+  assert.equal(facts.offeredAtStepStart, true);
+  assert.equal(facts.provenance, "host_narrowed_mid_response");
+  // The multi-call index is what proves the menu changed after the model
+  // answered: index 0 is always validated against the step-start menu.
+  assert.equal(facts.responseCallIndex, 1);
+  assert.equal(facts.responseCallCount, 3);
+  assert.ok(
+    (facts.droppedSinceStepStart as string[]).includes("create_folder"),
+    "the rebuild dropped create_folder and the record must say so",
+  );
+
+  // The model is told the truth rather than a claim it can see is false.
+  assert.doesNotMatch(
+    String(narrowed.message),
+    /not available for this prompt/u,
+  );
+  assert.match(String(narrowed.message), /WAS offered at the start of this step/u);
+
+  // The eval status line carries the same facts for the CSV/census path.
+  const evalLine = statuses.find((message) =>
+    message.startsWith("tool_reject_eval="),
+  );
+  assert.ok(evalLine, "tool_reject_eval status line missing");
+  const evalRecord = JSON.parse(evalLine.slice("tool_reject_eval=".length));
+  assert.equal(evalRecord.errorCategory, "frontier_narrowed");
+  assert.equal(evalRecord.offFrontier.offeredAtStepStart, true);
+  assert.equal(evalRecord.offFrontier.responseCallIndex, 1);
+
+  // Authority is unchanged: the refusal still happened, the unplanned second
+  // folder was NOT created, and the calls the graph did authorize still ran.
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["create_folder", "create_file"],
+  );
+});
+
+test("a genuinely unoffered tool name stays in the tool_not_allowed bucket", async () => {
+  // The other half of the split: if the instrumentation reclassified every
+  // off-frontier refusal, it would drain tool_not_allowed to zero and be
+  // just as wrong as before. A name the step-start menu never carried must
+  // keep its model-side attribution.
+  const prompt = "Summarize the current note.";
+  const executedCalls: ModelToolCall[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const rejectedTraces: AgentTraceEvent[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.researchMemoryEnabled = false;
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("git_commit", { message: "wip" }),
+      () => responseWithContent("Summarized."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 2,
+    events: {
+      onTrace: (event) => {
+        if (event.kind === "tool_rejected") rejectedTraces.push(event);
+      },
+    },
+  });
+
+  const stepStartMenu =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(!stepStartMenu.includes("git_commit"));
+  const refusal = rejectedTraces.find((event) => event.toolName === "git_commit");
+  assert.ok(refusal, "expected git_commit to be refused");
+  assert.notEqual(refusal.error?.code, "frontier_narrowed_mid_response");
+  const facts = (refusal.outputPreview as { offFrontier?: Record<string, unknown> })
+    ?.offFrontier;
+  assert.equal(facts?.offeredAtStepStart, false);
+  assert.equal(facts?.provenance, "model_named_unoffered_tool");
 });

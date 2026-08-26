@@ -8,6 +8,11 @@ import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { getE2EAiConfig } from "./aiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
+  foldToolCallOutcomesV1,
+  toolCallOutcomeAcceptanceCountersV1,
+  type ToolCallOutcomeEventV1,
+} from "./fixtures/toolCallOutcomes";
+import {
   buildProgressiveDu06Observations,
   createDu06RetainedLinearEvidenceProof,
   type DailyUseDu06SafeLifecycleState,
@@ -178,6 +183,18 @@ interface Du06FastValidationDiagnosticV1 {
 interface Du06TransientRunCaptureV1 {
   diagnostic: Du06FastValidationDiagnosticV1 | null;
   toolCalls: number;
+  /**
+   * Normalized mission tool events for the outcome fold. The page side is a
+   * dumb collector — it never judges an event — so every count is decided by
+   * e2e/fixtures/toolCallOutcomes.ts, where it is unit-tested.
+   */
+  outcomeEvents: ToolCallOutcomeEventV1[];
+  /**
+   * True when the capture cannot prove it saw every event (armed mid-run
+   * after the replay buffer had already dropped some). The fold degrades the
+   * whole record to unknown rather than reporting a short count as if exact.
+   */
+  outcomeCoverageLossy: boolean;
 }
 
 function resolveProtectedThinkingMode(model: string): string {
@@ -362,6 +379,8 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   let recoveredLifecycleState: SafeLifecycleState | null = null;
   let researchNotebookVerified = false;
   let failedFastValidationDiagnostic: Du06FastValidationDiagnosticV1 | null = null;
+  /** Tool events harvested in teardown, for the progressive acceptance record. */
+  let du06OutcomeCapture: Du06ToolCallObservation | null = null;
 
   try {
     harness = await startRealAiHarness(
@@ -1101,6 +1120,12 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         toolCalls: toolCallCount + hierarchy.items.length,
         continuations: harness.readProgressCounters().continuations,
         approvals: approvalCount,
+        // Honest per-call counts from the live mission event stream. The
+        // `toolCalls` counter above stays as it was for back-compat: it is
+        // an evidence count, so it sees successes only.
+        ...du06ToolCallCounters([
+          await peekDu06ToolCallOutcomes(harness.page),
+        ]),
       },
       { requireComplete: true },
     );
@@ -1117,6 +1142,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       if (transientCapture) {
         failedFastValidationDiagnostic = transientCapture.diagnostic;
         toolCallCount = Math.max(toolCallCount, transientCapture.toolCalls);
+        du06OutcomeCapture = transientCapture;
       }
     }
     if (harness) {
@@ -1439,6 +1465,9 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
           toolCalls: toolCallCount,
           continuations: harness?.readProgressCounters().continuations ?? 0,
           approvals: approvalCount,
+          // A failed DU-06 is exactly the run whose failed calls matter most;
+          // the teardown harvest is the only place they are still readable.
+          ...du06ToolCallCounters([du06OutcomeCapture]),
         },
       ).catch((error) => {
         cleanupErrors.push(`metrics attachment: ${safeError(error)}`);
@@ -1659,6 +1688,7 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
         toolCalls: toolCallCount,
         continuations: harness.readProgressCounters().continuations,
         approvals: approvalCount,
+        ...du06ToolCallCounters([transientCapture]),
       },
       { requireComplete: true },
     );
@@ -1710,6 +1740,7 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
           toolCalls: toolCallCount,
           continuations: harness.readProgressCounters().continuations,
           approvals: approvalCount,
+          ...du06ToolCallCounters([transientCapture]),
         },
       ).catch(() => undefined);
     }
@@ -3274,6 +3305,8 @@ async function armDu06FastValidationDiagnosticCapture(
       | {
           diagnostic: Du06FastValidationDiagnosticV1 | null;
           toolCalls: number;
+          outcomeEvents?: unknown[];
+          outcomeCoverageLossy?: boolean;
           unsubscribe?: () => void;
         }
       | undefined;
@@ -3287,15 +3320,85 @@ async function armDu06FastValidationDiagnosticCapture(
     if (!plugin?.subscribeMissionEvents) {
       throw new Error("The native mission trace subscription is unavailable.");
     }
+    // Coverage probe at arm time. A subscriber that was already listening
+    // receives every live event, so drops that happen LATER lose nothing;
+    // the one lossy combination is arming beside a run that had already
+    // dropped events, because replay can no longer supply the prefix.
+    const armSnapshot = plugin.getMissionRunSnapshot?.() ?? null;
+    const armDropped = Number.isSafeInteger(armSnapshot?.droppedEventCount)
+      ? armSnapshot.droppedEventCount
+      : null;
+    const armedLossy =
+      armSnapshot?.isRunning === true && (armDropped === null || armDropped > 0);
     const state = {
       diagnostic: existing?.diagnostic ?? null,
       toolCalls:
         Number.isSafeInteger(existing?.toolCalls) && existing!.toolCalls >= 0
           ? existing!.toolCalls
           : 0,
+      outcomeEvents: Array.isArray(existing?.outcomeEvents)
+        ? [...existing!.outcomeEvents!]
+        : ([] as unknown[]),
+      outcomeCoverageLossy:
+        existing?.outcomeCoverageLossy === true || armedLossy,
       unsubscribe: undefined as (() => void) | undefined,
     };
     host[slotKey] = state;
+    const text = (value: unknown): string | null =>
+      typeof value === "string" && value.length > 0 ? value : null;
+    const errorCodeOf = (value: any): string | null =>
+      value && typeof value === "object" ? text(value.code) : null;
+    // Dumb collector: normalize and push. No judgment happens on this side.
+    const collectTrace = (event: any) => {
+      const kind = text(event?.kind);
+      const id = text(event?.id);
+      if (!id) return;
+      if (kind === "tool_start") {
+        state.outcomeEvents.push({
+          kind: "tool_start",
+          id,
+          toolName: text(event?.toolName),
+        });
+        return;
+      }
+      if (kind === "tool_result" || kind === "tool_rejected") {
+        state.outcomeEvents.push({
+          kind,
+          id,
+          toolName: text(event?.toolName),
+          errorCode: errorCodeOf(event?.error),
+        });
+      }
+    };
+    const collectToolDone = (event: any) => {
+      const id = text(event?.id);
+      if (!id) return;
+      state.outcomeEvents.push({
+        kind: "tool_done",
+        id,
+        toolName: text(event?.name) ?? text(event?.toolName),
+        ok: typeof event?.ok === "boolean" ? event.ok : null,
+        errorCode: errorCodeOf(event?.error),
+      });
+    };
+    const collectReceipt = (receipt: any) => {
+      // Delta/commit projection only: never paths, never payload text.
+      state.outcomeEvents.push({
+        kind: "receipt",
+        id: text(receipt?.id),
+        toolName: text(receipt?.toolName),
+        receipt: {
+          operation: receipt?.operation,
+          bytesWritten: receipt?.bytesWritten,
+          bytesDeleted: receipt?.bytesDeleted,
+          affectedCount: receipt?.affectedCount,
+          commitKind: receipt?.commitKind,
+          ...(receipt?.effects && typeof receipt.effects === "object"
+            ? { effects: { changed: receipt.effects.changed } }
+            : {}),
+        },
+      });
+    };
     const redact = (value: unknown): string => {
       const sanitized = (typeof value === "string" ? value : "")
         .replace(
@@ -3334,6 +3437,7 @@ async function armDu06FastValidationDiagnosticCapture(
     };
     state.unsubscribe = plugin.subscribeMissionEvents({
       onTrace: (event: any) => {
+        collectTrace(event);
         if (event?.kind === "tool_start") {
           state.toolCalls += 1;
           return;
@@ -3347,10 +3451,12 @@ async function armDu06FastValidationDiagnosticCapture(
         observeValidationOutput(event.outputPreview);
       },
       onToolDone: (event: any) => {
+        collectToolDone(event);
         if (event?.name === "code_validate_fast") {
           observeValidationOutput(event.output);
         }
       },
+      onReceipt: collectReceipt,
     }, { replay: false });
   }, {
     pluginId: NATIVE_CORE_PLUGIN_ID,
@@ -3361,15 +3467,26 @@ async function armDu06FastValidationDiagnosticCapture(
 async function takeDu06TransientRunCapture(
   page: Page,
 ): Promise<Du06TransientRunCaptureV1> {
-  return page.evaluate(({ pluginId, slotKey }) => {
+  const capture = await page.evaluate(({ pluginId, slotKey }) => {
     const host = window as typeof window & Record<string, any>;
     const state = host[slotKey] as
       | {
           diagnostic?: Du06FastValidationDiagnosticV1 | null;
           toolCalls?: number;
+          outcomeEvents?: unknown[];
+          outcomeCoverageLossy?: boolean;
           unsubscribe?: () => void;
         }
       | undefined;
+    // The replay pass re-reads the buffered prefix; the fold de-duplicates by
+    // event id, so live and replayed events merge into one exact count.
+    const outcomeEvents: unknown[] = Array.isArray(state?.outcomeEvents)
+      ? [...state!.outcomeEvents!]
+      : [];
+    const textOf = (value: unknown): string | null =>
+      typeof value === "string" && value.length > 0 ? value : null;
+    const codeOf = (value: any): string | null =>
+      value && typeof value === "object" ? textOf(value.code) : null;
     let replayToolCalls = 0;
     let replayValidationSeen = false;
     let replayDiagnostic: Du06FastValidationDiagnosticV1 | null = null;
@@ -3415,6 +3532,22 @@ async function takeDu06TransientRunCapture(
     if (plugin?.subscribeMissionEvents) {
       replayUnsubscribe = plugin.subscribeMissionEvents({
         onTrace: (event: any) => {
+          const kind = textOf(event?.kind);
+          const id = textOf(event?.id);
+          if (id && kind === "tool_start") {
+            outcomeEvents.push({
+              kind: "tool_start",
+              id,
+              toolName: textOf(event?.toolName),
+            });
+          } else if (id && (kind === "tool_result" || kind === "tool_rejected")) {
+            outcomeEvents.push({
+              kind,
+              id,
+              toolName: textOf(event?.toolName),
+              errorCode: codeOf(event?.error),
+            });
+          }
           if (event?.kind === "tool_start") replayToolCalls += 1;
           if (
             event?.kind === "tool_result" &&
@@ -3424,9 +3557,36 @@ async function takeDu06TransientRunCapture(
           }
         },
         onToolDone: (event: any) => {
+          const id = textOf(event?.id);
+          if (id) {
+            outcomeEvents.push({
+              kind: "tool_done",
+              id,
+              toolName: textOf(event?.name) ?? textOf(event?.toolName),
+              ok: typeof event?.ok === "boolean" ? event.ok : null,
+              errorCode: codeOf(event?.error),
+            });
+          }
           if (event?.name === "code_validate_fast") {
             observeReplayValidationOutput(event.output);
           }
+        },
+        onReceipt: (receipt: any) => {
+          outcomeEvents.push({
+            kind: "receipt",
+            id: textOf(receipt?.id),
+            toolName: textOf(receipt?.toolName),
+            receipt: {
+              operation: receipt?.operation,
+              bytesWritten: receipt?.bytesWritten,
+              bytesDeleted: receipt?.bytesDeleted,
+              affectedCount: receipt?.affectedCount,
+              commitKind: receipt?.commitKind,
+              ...(receipt?.effects && typeof receipt.effects === "object"
+                ? { effects: { changed: receipt.effects.changed } }
+                : {}),
+            },
+          });
         },
       }, { replay: true });
     }
@@ -3449,12 +3609,15 @@ async function takeDu06TransientRunCapture(
         ? state!.toolCalls!
         : 0;
     const toolCalls = Math.max(liveToolCalls, replayToolCalls);
+    // The slot is gone whenever the collector never armed (or a restart
+    // dropped it); an empty stream then folds to unknown, not to zero.
+    const outcomeCoverageLossy = state?.outcomeCoverageLossy === true;
     if (
       !diagnostic ||
       typeof diagnostic.stdout !== "string" ||
       typeof diagnostic.stderr !== "string"
     ) {
-      return { diagnostic: null, toolCalls };
+      return { diagnostic: null, toolCalls, outcomeEvents, outcomeCoverageLossy };
     }
     return {
       diagnostic: {
@@ -3468,11 +3631,74 @@ async function takeDu06TransientRunCapture(
             : 0,
       },
       toolCalls,
+      outcomeEvents,
+      outcomeCoverageLossy,
     };
   }, {
     pluginId: NATIVE_CORE_PLUGIN_ID,
     slotKey: DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT,
   });
+  return {
+    ...capture,
+    // The page normalized these; the fold still re-checks each entry, so a
+    // malformed one is skipped rather than trusted.
+    outcomeEvents: capture.outcomeEvents as ToolCallOutcomeEventV1[],
+  };
+}
+
+/**
+ * Read the collected tool events WITHOUT unsubscribing or clearing the slot,
+ * for record sites that run before the destructive harvest. Never throws: a
+ * dead renderer or a missing slot degrades to no events, which the fold
+ * reports as unknown rather than zero.
+ */
+async function peekDu06ToolCallOutcomes(
+  page: Page,
+): Promise<Pick<
+  Du06TransientRunCaptureV1,
+  "outcomeEvents" | "outcomeCoverageLossy"
+> | null> {
+  try {
+    const peeked = await page.evaluate((slotKey) => {
+      const host = window as typeof window & Record<string, any>;
+      const state = host[slotKey];
+      if (!state || !Array.isArray(state.outcomeEvents)) return null;
+      return {
+        outcomeEvents: state.outcomeEvents.map((event: object) => ({ ...event })),
+        outcomeCoverageLossy: state.outcomeCoverageLossy === true,
+      };
+    }, DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT);
+    if (!peeked) return null;
+    return {
+      outcomeEvents: peeked.outcomeEvents as ToolCallOutcomeEventV1[],
+      outcomeCoverageLossy: peeked.outcomeCoverageLossy,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fold whatever this run's captures observed into the honest tool-call
+ * counters. Passing no capture (the collector never armed, or the renderer
+ * died before harvest) yields all-null — unknown, never zero.
+ */
+type Du06ToolCallObservation = Pick<
+  Du06TransientRunCaptureV1,
+  "outcomeEvents" | "outcomeCoverageLossy"
+>;
+
+function du06ToolCallCounters(
+  captures: readonly (Du06ToolCallObservation | null | undefined)[],
+): ReturnType<typeof toolCallOutcomeAcceptanceCountersV1> {
+  const observed = captures.filter(
+    (capture): capture is Du06ToolCallObservation => Boolean(capture),
+  );
+  const events = observed.flatMap((capture) => capture.outcomeEvents ?? []);
+  const lossy = observed.some((capture) => capture.outcomeCoverageLossy);
+  return toolCallOutcomeAcceptanceCountersV1(
+    foldToolCallOutcomesV1(events, lossy ? { coverage: "lossy" } : {}),
+  );
 }
 
 async function readRedactedDailyUseCounters(

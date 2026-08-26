@@ -82,14 +82,19 @@ test("exclusive e2e lock recovers only after its recorded owner exits", async ()
   }
 });
 
-test("default e2e lock path coordinates all runs using the same CDP port", () => {
+test("default e2e lock path coordinates every run on the machine, whatever its CDP port", () => {
   const first = resolveE2eLockPath({ OBSIDIAN_CDP_PORT: "11223" });
   const second = resolveE2eLockPath({
     OBSIDIAN_CDP_PORT: "11223",
     OBSIDIAN_VAULT: "D:/another-vault",
   });
   assert.equal(first, second);
-  assert.match(first, /obsidian-e2e-cdp-11223\.lock$/);
+  // A different CDP port must NOT buy a second lock: one machine has one
+  // Obsidian install and one test vault, and two coexisting harness instances
+  // force-kill each other's hosts during teardown sweeps.
+  const otherPort = resolveE2eLockPath({ OBSIDIAN_CDP_PORT: "11999" });
+  assert.equal(first, otherPort);
+  assert.match(first, /agentic-researcher-obsidian-e2e\.lock$/);
 });
 
 async function createExitedPid(): Promise<number> {

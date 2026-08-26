@@ -1500,3 +1500,171 @@ test("a lagging trash readback fails as readback, not as caller arguments", asyn
   assert.deepEqual(result.error?.details?.mismatchFields, ["trashed"]);
 });
 
+function updateFlowClient(
+  before: LinearIssueRecord,
+): { client: LinearToolClient; state: { updated: Record<string, unknown> | null } } {
+  const state: { updated: Record<string, unknown> | null } = { updated: null };
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !state.updated) return before;
+      if (key === "issues.update") {
+        state.updated = (variables.input as Record<string, unknown>) ?? {};
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && state.updated) {
+        return {
+          ...before,
+          ...(typeof state.updated.title === "string"
+            ? { title: state.updated.title }
+            : {}),
+          ...(typeof state.updated.description === "string"
+            ? { description: state.updated.description }
+            : {}),
+          snapshotHash: HASH_B,
+        } satisfies LinearIssueRecord;
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  return { client, state };
+}
+
+test("a partial-overlap update claims only the field that actually changes", async () => {
+  // Intent-derived changedFields (Object.keys of the input) reported BOTH
+  // title and description as changed when the title was resupplied unchanged.
+  // The receipt delta must come from diffing the input against the
+  // pre-mutation readback record instead.
+  const { client } = updateFlowClient(
+    issueRecord({ title: "Stable title", description: "Old body" }),
+  );
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_update_issue",
+      arguments: {
+        id: "PLAT-42",
+        title: "Stable title",
+        description: "New body",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  assert.deepEqual(
+    prepared.action.normalizedArgs.changedFields,
+    ["description"],
+    "the prepared delta must be diff-derived, not intent-derived",
+  );
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-partial-delta",
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.receipt?.effects?.changedFields, ["description"]);
+});
+
+test("an update that changes every supplied field still reports them all", async () => {
+  const { client } = updateFlowClient(
+    issueRecord({ title: "Old title", description: "Old body" }),
+  );
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_update_issue",
+      arguments: {
+        id: "PLAT-42",
+        title: "New title",
+        description: "New body",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-full-delta",
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.receipt?.effects?.changedFields, [
+    "description",
+    "title",
+  ]);
+});
+
+test("a canonicalization-equivalent description counts as unchanged", async () => {
+  // Linear rewrites inline `__strong__` to `**strong**` (observed live with
+  // `__init__(replica_id)`). Resupplying the underscore spelling of a stored
+  // asterisk description is presentation, not a change — the delta must name
+  // only the title. The same shared comparator then keeps the readback green
+  // when the provider echoes the asterisk form back.
+  const { client } = updateFlowClient(
+    issueRecord({
+      title: "Old title",
+      description: "Call **init**(replica_id) once.",
+    }),
+  );
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_update_issue",
+      arguments: {
+        id: "PLAT-42",
+        title: "New title",
+        description: "Call __init__(replica_id) once.",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  assert.deepEqual(prepared.action.normalizedArgs.changedFields, ["title"]);
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-canonical-delta",
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.receipt?.effects?.changedFields, ["title"]);
+});
+
+test("a fully-vacuous update still fails closed at preparation", async () => {
+  // The diff-derived delta and the linear_no_changes gate share one
+  // comparator: an update whose every field already matches (including a
+  // description equivalent only under canonicalization) must never produce
+  // an empty-delta receipt — it must refuse to prepare.
+  const before = issueRecord({
+    title: "Stable title",
+    description: "Call **init**(replica_id) once.",
+  });
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      if (key === "issues.get") return before;
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const prepared = await registry.prepare(
+    {
+      name: "linear_update_issue",
+      arguments: {
+        id: "PLAT-42",
+        title: "Stable title",
+        description: "Call __init__(replica_id) once.",
+      },
+    },
+    contextFixture(),
+  );
+  assert.equal(prepared.ok, false);
+  if (!prepared.ok) assert.equal(prepared.error.code, "linear_no_changes");
+});
+

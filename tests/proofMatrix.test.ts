@@ -14,6 +14,7 @@ import {
   CLASSIFICATION_UNCLASSIFIED,
   IN_FLIGHT_FAILURE_CLASS,
   LANE_ASSERTION_FAILURE_CLASS,
+  BLOCKER_BUCKETS,
   LEGACY_RUN_CSV_HEADER,
   RUN_CSV_HEADER,
   TOOL_EVENT_SOURCE_GRAPHS,
@@ -50,6 +51,7 @@ import {
   type ProofMatrixAttempt,
   type ProofMatrixManifest,
 } from "../scripts/run-proof-matrix.mjs";
+import { TOOL_REFUSAL_MARKER_BUCKETS } from "../e2e/reporters/dailyUseReporter";
 
 function manifestWith(attempts: ProofMatrixAttempt[]): ProofMatrixManifest {
   return { attempts, productClassCounts: {} };
@@ -579,7 +581,46 @@ test("new CSV columns are APPENDED - the legacy header survives as an exact pref
     "secondary_failure_classes",
     "classification_confidence",
     "tool_calls_vacuous",
+    // Host-caused off-frontier refusals, split out of tool_not_allowed. They
+    // are appended rather than placed beside the other bucket columns
+    // precisely because of the rule this test guards.
+    "frontier_narrowed_mid_response",
+    "frontier_withheld_since_earlier_step",
   ]);
+});
+
+test("the proof matrix and the reporter share one refusal-bucket vocabulary", () => {
+  // Two hand-kept copies of the same bucket list is this repo's recurring
+  // failure shape: they drift, and graph-mined rows stop being comparable
+  // with summary-sourced rows in the same CSV.
+  assert.deepEqual(
+    BLOCKER_BUCKETS.map(([key]) => key),
+    TOOL_REFUSAL_MARKER_BUCKETS.map(([key]) => key),
+  );
+  // Every bucket key must also have a column to land in, or a counted
+  // refusal is silently dropped on the way to the CSV.
+  for (const [key] of BLOCKER_BUCKETS) {
+    assert.ok(
+      RUN_CSV_HEADER.split(",").includes(key),
+      `refusal bucket ${key} has no CSV column`,
+    );
+  }
+});
+
+test("every refusal bucket matches exactly one code - no double counting", () => {
+  // The buckets are matched by substring against the same text. If any new
+  // code contained "tool_not_allowed" (or each other), a single refusal would
+  // be counted in two buckets and the split would be worthless.
+  for (const [key] of BLOCKER_BUCKETS) {
+    const matching = BLOCKER_BUCKETS.filter(([, pattern]) =>
+      pattern.test(key),
+    ).map(([matched]) => matched);
+    assert.deepEqual(
+      matching,
+      [key],
+      `refusal code ${key} lands in more than one bucket`,
+    );
+  }
 });
 
 test("upgradeRunCsvHeader rewrites only a legacy header line and never touches rows", () => {

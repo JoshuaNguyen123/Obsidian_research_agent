@@ -215,11 +215,20 @@ test("each status maps onto the workspace's configured state id", async () => {
     ["completed", STATE_IDS.completed],
   ] as const) {
     const { tool, states } = createTool();
-    await tool.execute(
+    const result = (await tool.execute(
       { issueId: BOUND_ISSUE, status, comment: `Reporting ${status}.` },
       context(),
-    );
+    )) as Record<string, unknown>;
     assert.deepEqual(states, [{ issueId: BOUND_ISSUE, stateId: expected }]);
+    // A real transition is structurally reported, with no skip reason.
+    assert.equal(result.stateChanged, true);
+    assert.equal("stateSkipReason" in result, false);
+    assert.equal(result.stateOutcome, `moved to ${status}`);
+    assert.deepEqual(
+      result.receiptIds,
+      ["receipt-comment-1", "receipt-state-1"],
+      "a real move contributes its receipt alongside the comment's",
+    );
   }
   assert.equal(resolveStatusState(null, STATE_IDS).stateId, null);
 });
@@ -236,6 +245,10 @@ test("an unconfigured state posts the comment and skips the move", async () => {
   assert.equal(comments.length, 1, "the comment must still be posted");
   assert.deepEqual(states, [], "no state move without a configured id");
   assert.match(String(result.stateOutcome), /skipped: no Linear state is configured/u);
+  // No move was attempted: null (not false) so an unconfigured workspace is
+  // never mistaken for an issue that was already in the requested state.
+  assert.equal(result.stateChanged, null);
+  assert.equal(result.stateSkipReason, "no_state_configured");
 });
 
 test("an issue this run did not touch is refused", async () => {
@@ -299,6 +312,15 @@ test("an issue already at the requested level is a confirmation, not a failure",
     context(),
   )) as Record<string, unknown>;
   assert.equal(result.stateOutcome, "already completed");
+  // The move was attempted and did no work: an explicit false plus its
+  // reason, never a success that only prose can disambiguate.
+  assert.equal(result.stateChanged, false);
+  assert.equal(result.stateSkipReason, "already_in_state");
+  assert.deepEqual(
+    result.receiptIds,
+    ["receipt-comment-1"],
+    "a no-op move has no receipt; an empty id must not pad the list",
+  );
 });
 
 test("progress is reported once per issue per run", async () => {
@@ -330,6 +352,10 @@ test("status is optional and an unknown status is rejected", async () => {
   assert.deepEqual(states, []);
   assert.equal(result.status, null);
   assert.equal(result.stateOutcome, "no state change requested");
+  // Nothing was requested, so nothing was attempted: null, and no skip
+  // reason — the skip enum is reserved for a requested-but-unperformed move.
+  assert.equal(result.stateChanged, null);
+  assert.equal("stateSkipReason" in result, false);
 
   const second = createTool();
   await assert.rejects(

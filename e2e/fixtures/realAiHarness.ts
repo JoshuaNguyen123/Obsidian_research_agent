@@ -9,6 +9,7 @@ import {
 import {
   NATIVE_CORE_PLUGIN_ID,
   startNativeObsidianHarness,
+  summarizeRecentHostDeathV1,
   type NativeObsidianHarness,
 } from "./nativeObsidianHarness";
 import { clearChatInline } from "./chatCleanup";
@@ -1646,7 +1647,7 @@ async function approveUntilMissionComplete(
     } catch (error) {
       const cause = error instanceof Error ? error.message : String(error);
       throw new Error(
-        `Mission page closed during the running poll; approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}. Cause: ${cause}`,
+        `Mission page closed during the running poll; ${explainHostDisappearance()}approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}. Cause: ${cause}`,
       );
     }
   }
@@ -1851,12 +1852,29 @@ async function approveFirstVisiblePreparedAction(
     const message = error instanceof Error ? error.message : String(error);
     if (page.isClosed() || /has been closed/iu.test(message)) {
       throw new Error(
-        `Obsidian page/context closed while clicking prepared approval. Cause: ${message}`,
+        `Obsidian page/context closed while clicking prepared approval. ` +
+          `${explainHostDisappearance()}Cause: ${message}`,
       );
     }
     throw error;
   }
 }
+
+/**
+ * The harness polls the renderer several times a second, so ANY host
+ * disappearance surfaces as "closed while clicking prepared approval" —
+ * whichever poll happened to be in flight. That is an instrumentation
+ * artifact: real deaths were observed mid-`web_fetch`, nowhere near an
+ * approval, and the misleading message is a large part of why these deaths
+ * stayed unexplained. Prefix the truth from the durable host journal when it
+ * has one.
+ */
+function explainHostDisappearance(): string {
+  const death = summarizeRecentHostDeathV1(harnessStartedAtMs);
+  return death ? `HOST DEATH RECORDED — ${death}. ` : "";
+}
+
+const harnessStartedAtMs = Date.now();
 
 async function continueLatestRunAfterStageRestart(page: Page): Promise<boolean> {
   const deadline = Date.now() + 15_000;

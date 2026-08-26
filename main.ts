@@ -11827,6 +11827,63 @@ export default class AgenticResearcherPlugin extends Plugin {
       : null;
   }
 
+  /**
+   * Single source of truth for whether a Linear publication tool may run and
+   * for whether an unavailable verdict is worth re-resolving. Both publication
+   * seats and both recovery hooks read this one predicate, so the node the
+   * mission graph planned and the gate that admits it cannot disagree.
+   *
+   * Only an aged-out capability snapshot is recoverable. A disabled
+   * integration, an absent credential, or a destination this workspace never
+   * had stays unavailable, so the gate keeps its teeth.
+   */
+  private linearPublicationAvailabilityV1(
+    resolveDestination: () => unknown,
+  ): "available" | "stale_capability" | "unavailable" {
+    if (
+      !this.getOptionalExtensionCapabilities().integrations ||
+      this.settings.linearEnabled !== true ||
+      !this.hasLinearApiKey()
+    ) {
+      return "unavailable";
+    }
+    if (resolveDestination() !== null) {
+      return "available";
+    }
+    const snapshot = this.linearCapabilitySnapshot;
+    return snapshot &&
+      getLinearCapabilitySnapshotFreshness(snapshot) !== "fresh"
+      ? "stale_capability"
+      : "unavailable";
+  }
+
+  /**
+   * Re-discovers Linear capability once when the only thing between a planned
+   * publication node and its destination is a snapshot that aged out
+   * mid-mission. A compound mission routinely runs longer than the snapshot's
+   * freshness window, and failing the node closed there strands work the
+   * planner already owes. Resolves true only when the destination actually
+   * came back, so a failed rediscovery still fails closed.
+   */
+  private async recoverLinearPublicationAvailabilityV1(
+    resolveDestination: () => unknown,
+  ): Promise<boolean> {
+    if (
+      this.linearPublicationAvailabilityV1(resolveDestination) !==
+        "stale_capability"
+    ) {
+      return false;
+    }
+    try {
+      await this.testLinearConnection();
+    } catch {
+      return false;
+    }
+    return (
+      this.linearPublicationAvailabilityV1(resolveDestination) === "available"
+    );
+  }
+
   private createResearchPublicationAgentTool(
     client: LinearToolClient,
   ): AgentTool | null {
@@ -12006,10 +12063,13 @@ export default class AgenticResearcherPlugin extends Plugin {
         );
       },
       isAvailable: () =>
-        this.getOptionalExtensionCapabilities().integrations &&
-        this.settings.linearEnabled === true &&
-        this.hasLinearApiKey() &&
-        this.getResearchPublicationDestination() !== null,
+        this.linearPublicationAvailabilityV1(() =>
+          this.getResearchPublicationDestination(),
+        ) === "available",
+      recoverAvailability: () =>
+        this.recoverLinearPublicationAvailabilityV1(() =>
+          this.getResearchPublicationDestination(),
+        ),
     });
   }
 
@@ -12665,10 +12725,13 @@ export default class AgenticResearcherPlugin extends Plugin {
         }
       },
       isAvailable: () =>
-        this.getOptionalExtensionCapabilities().integrations &&
-        this.settings.linearEnabled === true &&
-        this.hasLinearApiKey() &&
-        this.getResearchProjectHierarchyDestination() !== null,
+        this.linearPublicationAvailabilityV1(() =>
+          this.getResearchProjectHierarchyDestination(),
+        ) === "available",
+      recoverAvailability: () =>
+        this.recoverLinearPublicationAvailabilityV1(() =>
+          this.getResearchProjectHierarchyDestination(),
+        ),
     });
   }
 

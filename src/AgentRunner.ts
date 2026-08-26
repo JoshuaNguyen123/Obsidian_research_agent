@@ -288,10 +288,11 @@ import {
   filterSetLooseToolNamesByMissionGraphAuthority,
   getActiveValidationRecoveryFrontierV1,
   getPendingMissionGraphWriteToolNames,
+  getPendingResumeOwedWriteNodeIds,
   getPhaseCeilingProtectedToolNamesV1,
-  graphHasCompletedRequiredMutation,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
+  missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
 } from "./agent/missionGraphFrontier";
 import { enforcePhaseToolMenuCeilingV1 } from "./agent/toolSchemaPolicy";
@@ -301,6 +302,7 @@ import {
   finalizeAutonomyRunStats,
   recordApproval,
   recordContinue,
+  recordProseSteeringInjection,
   recordToolsOffered,
 } from "./agent/autonomyRunStats";
 import {
@@ -691,8 +693,15 @@ import {
 } from "./agent/hostRoutingToolCard";
 import {
   buildOffFrontierToolRejectionMessage as buildOffFrontierToolRejectionMessageImpl,
+  buildProofGatedWritebackHoldV1,
+  buildRepeatedInvalidToolCallCorrectiveV1,
   buildToolRejectEvalV1,
+  classifyOffFrontierRefusalV1,
   describeOffFrontierToolNearMiss as describeOffFrontierToolNearMissImpl,
+  FRONTIER_NARROWED_REFUSAL_CODE_V1,
+  FRONTIER_WITHHELD_REFUSAL_CODE_V1,
+  isHostNarrowedOffFrontierRefusalV1,
+  isHostWithheldOffFrontierRefusalV1,
   mapToolRejectCategory,
 } from "./agent/toolRejectEval";
 import { selectCodeWorkspaceEditToolName } from "./agent/codeWorkflowPlanner";
@@ -1064,6 +1073,7 @@ export {
   getPendingMissionGraphWriteToolNames,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
+  missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
 } from "./agent/missionGraphFrontier";
 export {
@@ -3305,6 +3315,24 @@ export async function runAgentMission({
    * site stays in place as the backstop for hallucinated calls.
    */
   const proofGateWriteRejectionCountsByTool = new Map<string, number>();
+  /**
+   * Offered-menu history for this run: tool name -> the most recent step whose
+   * offered menu carried it.
+   *
+   * The offered menu DECAYS across a segment (proof-gate containment, the
+   * phase ceiling, and graph advance all withhold names between steps). A
+   * model that was shown `append_to_current_file` at steps 1-4 and keeps
+   * pursuing it at step 6 did not pick a wrong name -- it picked the name it
+   * was taught, and the host stopped offering it. Refusing that with "not
+   * available for this prompt" is actively misleading, and counting it as
+   * `tool_not_allowed` attributes a host-side menu change to the model.
+   */
+  const offeredToolNameLastStep = new Map<string, number>();
+  /**
+   * Which transform last withheld a name from the offered menu, so the
+   * refusal can say WHY the menu changed instead of only that it did.
+   */
+  const toolMenuWithholdReasonByTool = new Map<string, string>();
   const recordProofGateWriteRejection = (toolName: string): void => {
     proofGateWriteRejectionCountsByTool.set(
       toolName,
@@ -4352,7 +4380,11 @@ export async function runAgentMission({
       );
     };
     const exactResumeRunId = extractRequestedRunId(prompt);
-    const canonicalResumeGraphId =
+    // Cleared only when the restored record proves unusable for this
+    // mission's required write (see the adoption refusal below): the replan
+    // then persists under this segment's own canonical id instead of
+    // colliding with a stub whose envelope fingerprint can never match.
+    let canonicalResumeGraphId =
       resumeSnapshot?.missionGraphRef?.missionId ??
       (exactResumeRunId ? canonicalMissionGraphId(exactResumeRunId) : null);
     try {
@@ -4363,7 +4395,53 @@ export async function runAgentMission({
             missionId: canonicalResumeGraphId,
             events: { onGraphUpdate: emitMissionGraph },
           });
+          // A restored graph is authority ONLY if its capability envelope can
+          // still serve the restored mission's required write. A crash can
+          // persist a tool-less `final` stub whose envelope never granted
+          // append_to_current_file (the segment that planted it planned no
+          // write node, so no grant was minted): adopting it makes the write
+          // structurally impossible — the heal cannot splice a node the
+          // envelope does not authorize (refusedReason
+          // envelope_grant_missing, observed 3x in one lane run), the
+          // frontier fallback still offers the tool, and the authority
+          // refuses every call until the budget dies. Fail the ADOPTION
+          // instead and fall through to a fresh plan, which mints a real
+          // append node and a matching grant. Scoped hard: only an unpaid
+          // final-only stub qualifies — a graph with real nodes, or one whose
+          // required mutation is already paid, resumes verbatim as always.
+          const restoredGraph = missionGraphSession.graph;
+          const restoredStubCannotServeRequiredWrite =
+            requiredWriteTools.includes("append_to_current_file") &&
+            missionGraphFinalOnlyStubOwesRequiredWorkV1(restoredGraph) &&
+            restoredGraph.capabilityEnvelope.tools["append_to_current_file"] ===
+              undefined;
+          if (restoredStubCannotServeRequiredWrite) {
+            const abandonMessage =
+              "Refused to adopt the restored mission graph: it is an unpaid final-only stub whose capability envelope cannot grant the mission's required current-note write. Replanning this continuation from the restored mission.";
+            missionGraphSession = null;
+            missionGraph = null;
+            missionPlan = null;
+            // The replan mints a fresh envelope, which can never match the
+            // stub's fingerprint — so it must persist under this segment's
+            // own canonical id rather than reopening the stub's record.
+            // The stub stays on disk untouched as forensic residue.
+            canonicalResumeGraphId = null;
+            events.onTrace?.({
+              id: "mission-graph-resume-stub-envelope-unusable",
+              kind: "status",
+              message: abandonMessage,
+              outputPreview: {
+                missionId: canonicalResumeGraphId,
+                nodeIds: Object.keys(restoredGraph.nodes),
+                envelopeToolNames: Object.keys(
+                  restoredGraph.capabilityEnvelope.tools,
+                ).slice(0, 24),
+                requiredWriteTools: [...requiredWriteTools],
+              },
+            });
+          }
           if (
+            missionGraphSession &&
             resumeSnapshot &&
             requiredWriteTools.includes(
               PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
@@ -4969,16 +5047,121 @@ export async function runAgentMission({
       // graph still owe the current-note write?" identically. The shared
       // predicate below is the same one the frontier fallback consults, and
       // the store reducer re-validates the stub shape and envelope grant.
-      if (
-        missionGraphSession &&
-        exactResumeRunId &&
-        resumeContinuesStreamedCurrentNoteAppend &&
-        missionGraphOnlyFinalSynthesisRemainsV1(missionGraphSession.graph) &&
-        !graphHasCompletedRequiredMutation(missionGraphSession.graph)
-      ) {
+      // The gate is the graph's own state plus the restored mission's write
+      // contract — NOT the streamed-writeback flag alone: a stub can also be
+      // resumed with streaming off and no runtime snapshot (killed before the
+      // first checkpoint), and that continuation owes the append just the
+      // same (proof-matrix interrupted-continuation, 2026-08-25 22:41Z).
+      const writebackHealMissionRequiresAppend =
+        resumeContinuesStreamedCurrentNoteAppend ||
+        requiredWriteTools.includes("append_to_current_file");
+      const resumedGraphForWritebackHealCandidate =
+        missionGraphSession && exactResumeRunId
+          ? missionGraphSession.graph
+          : null;
+      const writebackHealShapeFinalOnly =
+        missionGraphOnlyFinalSynthesisRemainsV1(
+          resumedGraphForWritebackHealCandidate,
+        );
+      if (resumedGraphForWritebackHealCandidate) {
+        // One gate verdict per continuation: three live lane reds could not
+        // distinguish "the gate never armed" from "the splice refused", so
+        // the gate states its inputs even when it skips. A stub that OWES
+        // work with an unarmed gate is error-coded so the run-record
+        // diagnostics retain it past recency eviction.
+        const writebackHealStubOwesWork =
+          missionGraphFinalOnlyStubOwesRequiredWorkV1(
+            resumedGraphForWritebackHealCandidate,
+          );
+        const writebackHealGateMessage = `Resume writeback heal gate: missionRequiresAppend=${writebackHealMissionRequiresAppend}; graphFinalOnly=${writebackHealShapeFinalOnly}; stubOwesWork=${writebackHealStubOwesWork}.`;
+        const writebackHealGateUnarmedOverOwedWork =
+          writebackHealStubOwesWork && !writebackHealMissionRequiresAppend;
+        events.onTrace?.({
+          id: "mission-graph-resume-writeback-heal-gate",
+          kind: writebackHealGateUnarmedOverOwedWork ? "error" : "status",
+          message: writebackHealGateMessage,
+          outputPreview: {
+            missionRequiresAppend: writebackHealMissionRequiresAppend,
+            graphFinalOnly: writebackHealShapeFinalOnly,
+            stubOwesWork: writebackHealStubOwesWork,
+            streamedResumeFlag: resumeContinuesStreamedCurrentNoteAppend,
+            requiredWriteTools: [...requiredWriteTools],
+            envelopeGrantsAppend: Boolean(
+              resumedGraphForWritebackHealCandidate.capabilityEnvelope.tools[
+                "append_to_current_file"
+              ],
+            ),
+            nodeIds: Object.keys(resumedGraphForWritebackHealCandidate.nodes),
+          },
+          ...(writebackHealGateUnarmedOverOwedWork
+            ? {
+                error: {
+                  code: "resume_writeback_heal_gate_unarmed",
+                  message: writebackHealGateMessage,
+                },
+              }
+            : {}),
+        });
+      }
+      const resumedGraphForWritebackHeal =
+        resumedGraphForWritebackHealCandidate &&
+        writebackHealMissionRequiresAppend &&
+        writebackHealShapeFinalOnly
+          ? resumedGraphForWritebackHealCandidate
+          : null;
+      if (missionGraphSession && resumedGraphForWritebackHeal) {
         const appendDescriptor =
           toolRegistry.getDescriptor?.("append_to_current_file") ?? null;
-        const writebackSplice =
+        // A multi-append mission interrupted pre-first-write owes one node
+        // per still-missing required literal marker: a plain node's
+        // completion contract closes at its first satisfied receipt, so a
+        // single spliced node can never carry a second append across
+        // segments — the next continuation would find a "paid" graph and
+        // deadlock on the remaining marker. Count against the live note so
+        // (a) a between-writes interruption — first marker already landed,
+        // its receipt-carrying node complete — splices exactly the remaining
+        // owed writes even though the graph shows proven work, and (b) a
+        // mission whose every marker is already durably present splices
+        // NOTHING: re-appending present content is the duplication flip side
+        // of this deadlock. Missions without literal-marker contracts cannot
+        // be content-checked; they owe the single promised write exactly
+        // when the graph itself proves no paid mutation (the fc57558 shape).
+        const owedLiteralAnchors =
+          extractRequiredLiteralAnchors(activeIntentPrompt);
+        let owedWriteCount: number;
+        if (owedLiteralAnchors.length > 0) {
+          let owedNoteText: unknown = null;
+          try {
+            const owedNoteFile =
+              runToolContext.getCurrentMarkdownFile?.() ??
+              runToolContext.app.workspace.getActiveFile();
+            if (owedNoteFile) {
+              owedNoteText =
+                runToolContext.getCurrentMarkdownContent?.(
+                  owedNoteFile as never,
+                ) ??
+                (await runToolContext.app.vault.read(owedNoteFile as never));
+            }
+          } catch {
+            owedNoteText = null;
+          }
+          const missingAnchors =
+            typeof owedNoteText === "string"
+              ? owedLiteralAnchors.filter(
+                  (anchor) => !(owedNoteText as string).includes(anchor),
+                )
+              : owedLiteralAnchors;
+          owedWriteCount = missingAnchors.length;
+        } else {
+          owedWriteCount = missionGraphFinalOnlyStubOwesRequiredWorkV1(
+            resumedGraphForWritebackHeal,
+          )
+            ? 1
+            : 0;
+        }
+        const writebackSplice = owedWriteCount === 0
+          ? { splicedNodeId: null, refusedReason: "owed_write_count_zero" as const }
+          :
           await missionGraphSession.spliceResumeCurrentNoteWriteNode({
             objective:
               "Pay the current-note append the interrupted streamed segment still owes, exactly once, then finish the mission.",
@@ -4994,6 +5177,11 @@ export async function runAgentMission({
               appendDescriptor?.durability.receipt === true
                 ? [appendDescriptor.receiptKind ?? "action-receipt"]
                 : [],
+            owedWriteCount,
+            // Only a literal-anchor mission's count is checked against the
+            // live note; anchor-less missions splice solely on the bare
+            // unpaid stub, where the guard has nothing to protect.
+            contentVerifiedOwedWork: owedLiteralAnchors.length > 0,
           });
         if (writebackSplice.splicedNodeId) {
           events.onTrace?.({
@@ -5004,8 +5192,53 @@ export async function runAgentMission({
             outputPreview: {
               missionId: missionGraphSession.graph.missionId,
               splicedNodeId: writebackSplice.splicedNodeId,
+              owedWriteCount,
             },
           });
+        } else {
+          // A refused heal on a stub that provably owes work is an ERROR:
+          // the segment will burn its budget against a graph nothing can
+          // pay. Error-coded so the run-record diagnostics RETAIN it (the
+          // run-5 sidecar evicted the status-kind verdicts as recency
+          // rolled) and the census can count refusals by reason. The
+          // owed_write_count_zero skip stays a status — nothing is owed.
+          const refusalReason =
+            writebackSplice.refusedReason ?? "unspecified";
+          const refusalOutputPreview = {
+            missionId: missionGraphSession.graph.missionId,
+            refusedReason: writebackSplice.refusedReason ?? null,
+            owedWriteCount,
+            missionRequiresAppend: writebackHealMissionRequiresAppend,
+            streamedResumeFlag: resumeContinuesStreamedCurrentNoteAppend,
+            requiredWriteTools: [...requiredWriteTools],
+            envelopeGrantsAppend: Boolean(
+              resumedGraphForWritebackHeal.capabilityEnvelope.tools[
+                "append_to_current_file"
+              ],
+            ),
+            nodeIds: Object.keys(resumedGraphForWritebackHeal.nodes),
+          };
+          if (refusalReason === "owed_write_count_zero") {
+            events.onTrace?.({
+              id: "mission-graph-resume-writeback-splice-refused",
+              kind: "status",
+              message:
+                "Resume writeback heal did not splice: owed_write_count_zero (every required literal already landed in the note).",
+              outputPreview: refusalOutputPreview,
+            });
+          } else {
+            const refusalMessage = `Resume writeback heal refused: ${refusalReason}. The resumed graph still owes its required current-note write and nothing in this segment can pay it.`;
+            events.onTrace?.({
+              id: "mission-graph-resume-writeback-splice-refused",
+              kind: "error",
+              message: refusalMessage,
+              outputPreview: refusalOutputPreview,
+              error: {
+                code: "resume_writeback_heal_refused",
+                message: refusalMessage,
+              },
+            });
+          }
         }
       }
       if (missionGraphSession && backgroundContinuation) {
@@ -12481,12 +12714,23 @@ export async function runAgentMission({
         (!durablePreWriteProofSatisfied ||
           finalPayloadAcceptance?.status !== "pass")
       ) {
-        const missingDetail = finalPayloadAcceptance?.missing.length
-          ? ` (${finalPayloadAcceptance.missing.join(", ")})`
-          : "";
-        const message =
-          `Held ${toolCall.name} at the mutation boundary because the final payload does not satisfy the closed fetched-source proof contract${missingDetail}. No note bytes were changed.`;
-        if (!durablePreWriteProofSatisfied) {
+        // Same hold, same builder as the step-loop seat. This boundary used to
+        // state the violated contract and stop: no remedy, no corrective, and
+        // no `lastProofGatedHoldToolName`, so off-frontier refusals kept
+        // advising the very tool this gate was holding.
+        const boundaryHold = buildProofGatedWritebackHoldV1({
+          toolName: toolCall.name,
+          boundary: "commit",
+          evidenceSatisfied: durablePreWriteProofSatisfied,
+          missing: finalPayloadAcceptance?.missing ?? [],
+          blockingProofs: boundaryBlockingPreWriteMissing,
+          quoteCorrections: lastClaimLedger?.quoteCorrections ?? [],
+        });
+        const message = boundaryHold.message;
+        if (boundaryHold.heldWriteToolName) {
+          lastProofGatedHoldToolName = boundaryHold.heldWriteToolName;
+        }
+        if (boundaryHold.narrowsOfferedFrontier) {
           // Same evidence-incomplete signal as the step-loop hold: repeated
           // re-tries narrow the offered frontier until the proofs clear.
           recordProofGateWriteRejection(toolCall.name);
@@ -12533,6 +12777,10 @@ export async function runAgentMission({
               toolIndex,
               toolCall.name,
             ),
+          });
+          messages.push({
+            role: "system" as const,
+            content: boundaryHold.systemCorrective,
           });
         }
         return blockedResult;
@@ -12725,6 +12973,10 @@ export async function runAgentMission({
         buildOffFrontierToolRejectionMessageImpl({
           toolName: toolCall.name,
           readyFrontierToolNames: authorityReadyFrontier,
+          // Classification must read the authority's real reason: "not ready
+          // in the authoritative mission graph" is invalid_state, not
+          // unknown_tool.
+          reasonMessage: getUnknownErrorMessage(error),
           heldWriteToolNames: lastProofGatedHoldToolName
             ? [lastProofGatedHoldToolName]
             : [],
@@ -15603,6 +15855,17 @@ export async function runAgentMission({
             message: blocker,
             error: { code: "repeated_invalid_tool_call", message: blocker },
           });
+          // The first failure taught; the repeat used to say nothing at all.
+          messages.push({
+            role: "system" as const,
+            content: buildRepeatedInvalidToolCallCorrectiveV1({
+              toolName: toolCall.name,
+              failureCode: failureCode || "invalid_arguments",
+              readyFrontierToolNames: tools.map(
+                (candidate) => candidate.function.name,
+              ),
+            }),
+          });
         } else {
           invalidToolCallFailureSignatures.add(failureSignature);
           const definition = tools.find(
@@ -17765,6 +18028,13 @@ export async function runAgentMission({
           .filter(
             (name) => !stepTools.some((tool) => tool.function.name === name),
           );
+        for (const name of withheld) {
+          toolMenuWithholdReasonByTool.set(
+            name,
+            "proof_gate_containment: withheld after repeated proof-gated rejections; " +
+              "restores once the blocking pre-write proofs are satisfied",
+          );
+        }
         events.onTrace?.({
           id: `proof-gate-frontier-containment-${step}`,
           kind: "allowed_tools",
@@ -17801,6 +18071,14 @@ export async function runAgentMission({
           .filter(
             (name) => !stepTools.some((tool) => tool.function.name === name),
           );
+        for (const name of dropped) {
+          toolMenuWithholdReasonByTool.set(
+            name,
+            `phase_menu_ceiling: dropped by the ${
+              researchPhaseDescriptor?.phase ?? "unknown"
+            } phase tool-menu ceiling`,
+          );
+        }
         events.onTrace?.({
           id: `phase-tool-menu-ceiling-${step}`,
           kind: "allowed_tools",
@@ -17815,6 +18093,12 @@ export async function runAgentMission({
     const stepAllowedToolNames = new Set(
       stepTools.map((tool) => tool.function.name),
     );
+    // Offered-menu history, recorded once the step menu is final. A name that
+    // is offered again is no longer withheld, so its stale reason is cleared.
+    for (const name of stepAllowedToolNames) {
+      offeredToolNameLastStep.set(name, step);
+      toolMenuWithholdReasonByTool.delete(name);
+    }
     recordToolsOffered(autonomyRunStats, stepTools.length);
     events.onTrace?.({
       id: `mission-graph-tool-frontier-${step}`,
@@ -18482,7 +18766,30 @@ export async function runAgentMission({
         (stepAllowedToolNames.has("append_to_current_file") &&
           !stepAllowedToolNames.has("append_file")),
     });
-    const responseToolCalls = remappedAppendAliases.toolCalls;
+    // An unfilled template name ($TOOL_NAME) is a formatting failure, not a
+    // request for an unavailable tool. Retry it as the single offered
+    // read-effect tool rather than burning the step on a refusal.
+    const repairedPlaceholderCalls = repairPlaceholderToolCallNamesV1({
+      toolCalls: remappedAppendAliases.toolCalls,
+      offeredToolNames: [...stepAllowedToolNames],
+      isReadOnlyToolName: (toolName) =>
+        toolRegistry.getDescriptor?.(toolName)?.effect === "read",
+    });
+    if (repairedPlaceholderCalls.repaired.length > 0) {
+      const placeholderMessage = `Repaired placeholder tool name(s): ${repairedPlaceholderCalls.repaired.join(", ")}`;
+      events.onStatus?.(placeholderMessage);
+      events.onTrace?.({
+        id: `placeholder-tool-name-repair-${step}`,
+        kind: "status",
+        step,
+        message: placeholderMessage,
+        outputPreview: {
+          repaired: repairedPlaceholderCalls.repaired,
+          offeredToolNames: [...stepAllowedToolNames],
+        },
+      });
+    }
+    const responseToolCalls = repairedPlaceholderCalls.toolCalls;
     if (remappedAppendAliases.remapped.length > 0) {
       events.onStatus?.(
         `Remapped tool alias: ${remappedAppendAliases.remapped.join(", ")}`,
@@ -19093,6 +19400,48 @@ export async function runAgentMission({
             lastFinalOutput || undefined,
           );
           return;
+        }
+        const proseSteeringInjectionsSoFar =
+          autonomyRunStats.prose_steering_injections ?? 0;
+        if (
+          proseCannotFinishMission &&
+          proseSteeringInjectionsSoFar < MAX_PROSE_STEERING_INJECTIONS &&
+          step < stepLimit
+        ) {
+          // Reactive prose steering: the mission still owes required tool work
+          // (the same predicate that gated the first-strike correction above),
+          // so a repeated prose-only response gets a bounded steering
+          // escalation instead of the terminal noncompliance breaker.
+          // Small/variable models recover on a re-ask more often than not
+          // (2026-08-26 campaign: 3 of 6 notebook runs at the same HEAD
+          // engaged the identical frontier perfectly while the others
+          // prose-stalled at step 2), and killing the run at strike two
+          // forfeited 13 remaining budgeted steps. The cap keeps this from
+          // becoming an infinite nudge loop: once spent, the breaker below
+          // decides exactly as before.
+          const readySteeringToolNames = stepTools.map(
+            (tool) => tool.function.name,
+          );
+          recordProseSteeringInjection(autonomyRunStats);
+          events.onStatus?.(
+            `Prose without a tool call cannot advance the mission; steering the model back to ${readySteeringToolNames.join(", ")}...`,
+          );
+          events.onTrace?.({
+            id: `prose-steering-injection-${step}`,
+            kind: "status",
+            step,
+            message: [
+              `prose_steering_injections=${autonomyRunStats.prose_steering_injections ?? 0}`,
+              `frontier=${readySteeringToolNames.join(",") || "none"}`,
+              `attempts=${unchangedNoToolResponseCount}`,
+            ].join("; "),
+          });
+          messages.push({
+            role: "system" as const,
+            content: buildProseSteeringEscalation(readySteeringToolNames),
+          });
+          noToolEscalationActive = true;
+          continue;
         }
         const rejectedFrontier = stepTools
           .map((tool) => tool.function.name)
@@ -19949,11 +20298,26 @@ export async function runAgentMission({
         }
 
         // Item 15: do not terminal-fail reflex when write recovery is still
-        // available; let mission acceptance decide the hard stop.
+        // available; let mission acceptance decide the hard stop. The same
+        // rule governs the no-recovery arm (proof-matrix
+        // interrupted-continuation, 2026-08-26 02:16Z): the reflex is a
+        // heuristic checkpoint, and terminal-failing a run whose MISSION
+        // ACCEPTANCE passes turned a fully-paid resumed segment into an
+        // "error" at the step cap. One acceptance evaluation at this
+        // terminal seat only — never per step.
         if (writeRecoveryAvailable) {
           events.onStatus?.(
             `Reflex still missing ${reflexOutput.completion.missing.join(", ")}; deferring to acceptance.`,
           );
+        } else if (evaluateCurrentAcceptance().status === "pass") {
+          events.onTrace?.({
+            id: `reflex-completion-deferred-${step}`,
+            kind: "verification",
+            step,
+            message:
+              "Reflex completion gate deferred at the terminal step: mission acceptance passes, and acceptance owns the hard stop.",
+            outputPreview: { missing: reflexOutput.completion.missing },
+          });
         } else {
           const message = `I could not complete the mission because required evidence is missing: ${reflexOutput.completion.missing.join(", ")}. No additional vault files were changed.`;
           emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
@@ -20755,9 +21119,45 @@ export async function runAgentMission({
                 node.allowedTools.includes(toolCall.name),
             )
           : null;
-        const rejectionCode = pendingGraphNode
-          ? "plan_dependency_violation"
-          : "tool_not_allowed";
+        // `stepAllowedToolNames` is cleared and rebuilt after every committed
+        // call in a multi-call response, so calls 2..N are validated against a
+        // menu that changed AFTER the model answered. Record whether the name
+        // was on the menu the model actually saw, so a host-caused refusal is
+        // never again indistinguishable from the model naming a tool it was
+        // never offered. `stepTools` is the step-start menu and is not
+        // reassigned inside the call loop.
+        const offFrontierFacts = classifyOffFrontierRefusalV1({
+          toolName: toolCall.name,
+          offeredAtStepStartToolNames: stepTools.map(
+            (candidate) => candidate.function.name,
+          ),
+          liveReadyToolNames: [...stepAllowedToolNames],
+          responseCallIndex: toolIndex,
+          responseCallCount: responseToolCalls.length,
+          // Only steps STRICTLY BEFORE this one count as menu decay; the
+          // current step's names were just written into the same history.
+          lastOfferedAtStep:
+            (offeredToolNameLastStep.get(toolCall.name) ?? step) < step
+              ? offeredToolNameLastStep.get(toolCall.name)!
+              : null,
+          withheldBy: toolMenuWithholdReasonByTool.get(toolCall.name) ?? null,
+        });
+        const hostNarrowedRefusal =
+          isHostNarrowedOffFrontierRefusalV1(offFrontierFacts);
+        const hostWithheldRefusal =
+          isHostWithheldOffFrontierRefusalV1(offFrontierFacts);
+        // Authority is unchanged: this only stops host-side menu drift from
+        // being counted in the bucket that means "the model named a tool it
+        // was never offered". The call is still refused, and the seats behind
+        // this gate (mission-graph authority, plan dependency, approval) are
+        // untouched.
+        const rejectionCode = hostNarrowedRefusal
+          ? FRONTIER_NARROWED_REFUSAL_CODE_V1
+          : hostWithheldRefusal
+            ? FRONTIER_WITHHELD_REFUSAL_CODE_V1
+            : pendingGraphNode
+              ? "plan_dependency_violation"
+              : "tool_not_allowed";
         const preferredNextOnReject = pickPreferredNextTool({
           unpaidDeliveryTools: pendingToolsForUnpaidSetLooseDelivery(
             setLooseDeliveryComplete({
@@ -20767,20 +21167,27 @@ export async function runAgentMission({
           ),
           readyFrontierToolNames: [...stepAllowedToolNames],
         });
-        const rejectCategory = mapToolRejectCategory({
-          toolName: toolCall.name,
-          pendingGraphNodeId: pendingGraphNode?.id ?? null,
-          code: rejectionCode,
-          message: pendingGraphNode
-            ? "off-frontier"
-            : "not available for this prompt",
-        });
+        const rejectCategory = hostNarrowedRefusal
+          ? "frontier_narrowed"
+          : hostWithheldRefusal
+          ? "frontier_withheld"
+          : offFrontierFacts.provenance === "model_emitted_placeholder_name"
+          ? "placeholder_tool_name"
+          : mapToolRejectCategory({
+              toolName: toolCall.name,
+              pendingGraphNodeId: pendingGraphNode?.id ?? null,
+              code: rejectionCode,
+              message: pendingGraphNode
+                ? "off-frontier"
+                : "not available for this prompt",
+            });
         const rejectionMessage = buildOffFrontierToolRejectionMessage({
           toolName: toolCall.name,
           pendingGraphNodeId: pendingGraphNode?.id ?? null,
           readyFrontierToolNames: [...stepAllowedToolNames],
           preferredNextTool: preferredNextOnReject,
           category: rejectCategory,
+          offFrontier: offFrontierFacts,
           heldWriteToolNames: lastProofGatedHoldToolName
             ? [lastProofGatedHoldToolName]
             : [],
@@ -20791,13 +21198,14 @@ export async function runAgentMission({
           expectedPrerequisite: preferredNextOnReject,
           errorCategory: rejectCategory,
           readyFrontier: [...stepAllowedToolNames],
+          offFrontier: offFrontierFacts,
         });
         events.onStatus?.(
           `tool_reject_eval=${JSON.stringify(rejectEval)}`,
         );
         lastUnavailableToolName = toolCall.name;
         events.onStatus?.(
-          pendingGraphNode
+          pendingGraphNode || hostNarrowedRefusal || hostWithheldRefusal
             ? rejectionMessage
             : `Rejected unavailable tool: ${toolCall.name}`,
         );
@@ -20808,6 +21216,10 @@ export async function runAgentMission({
           toolName: toolCall.name,
           message: rejectionMessage,
           inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
+          // Structured provenance, not only prose: a census reading traces
+          // must be able to split host-side menu drift from model-side naming
+          // errors without parsing the rejection sentence.
+          outputPreview: { offFrontier: offFrontierFacts },
           error: {
             code: rejectionCode,
             message: rejectionMessage,
@@ -20951,9 +21363,54 @@ export async function runAgentMission({
           : typeof toolCall.arguments.content === "string"
             ? toolCall.arguments.content
             : "";
+      let literalContractNoteText: string | null = null;
+      if (toolCall.name === "append_to_current_file") {
+        try {
+          const literalContractNoteFile =
+            runToolContext.getCurrentMarkdownFile?.() ?? null;
+          literalContractNoteText = literalContractNoteFile
+            ? (runToolContext.getCurrentMarkdownContent?.(
+                literalContractNoteFile,
+              ) ?? null)
+            : null;
+        } catch {
+          literalContractNoteText = null;
+        }
+      }
+      // Repair before validate. The host knows the exact literal this step
+      // owes and the final-answer path already restores it deterministically;
+      // refusing here only spent a bounded retry to ask the model for an edit
+      // the host could make itself. The validator below stays the single
+      // authority: a repaired payload now carries an anchor, so it passes for
+      // the same reason any compliant call does.
+      const literalRepair = canonicalRequiredLiteralWriteContentV1(
+        activeIntentPrompt,
+        toolCall,
+        literalContractNoteText,
+      );
+      if (literalRepair) {
+        proposedWriteText = literalRepair.content;
+        toolCall.arguments = {
+          ...toolCall.arguments,
+          [literalRepair.field]: literalRepair.content,
+        };
+        events.onTrace?.({
+          id: `${toolEventBase.id}:required-literal-restored`,
+          kind: "verification",
+          step,
+          toolName: toolCall.name,
+          message:
+            `Deterministically restored the exact user-required literal marker "${literalRepair.insertedAnchor}" before executing ${toolCall.name}.`,
+          outputPreview: {
+            insertedAnchor: literalRepair.insertedAnchor,
+            payloadFingerprint: hashOperationInput(literalRepair.content),
+          },
+        });
+      }
       const literalContractError = validateRequiredLiteralWriteArguments(
         activeIntentPrompt,
         toolCall,
+        literalContractNoteText,
       );
       if (literalContractError) {
         const rejectedResult: ToolExecutionResult = {
@@ -21032,6 +21489,17 @@ export async function runAgentMission({
             toolName: toolCall.name,
             message: blocker,
             error: { code: "repeated_invalid_tool_call", message: blocker },
+          });
+          // The first failure taught; the repeat used to say nothing at all.
+          messages.push({
+            role: "system" as const,
+            content: buildRepeatedInvalidToolCallCorrectiveV1({
+              toolName: toolCall.name,
+              failureCode: "invalid_arguments",
+              readyFrontierToolNames: stepTools.map(
+                (candidate) => candidate.function.name,
+              ),
+            }),
           });
         } else {
           invalidToolCallFailureSignatures.add(failureSignature);
@@ -21150,31 +21618,25 @@ export async function runAgentMission({
         (!durablePreWriteProofSatisfied ||
           proposedWriteAcceptance?.status !== "pass")
       ) {
-        const message = !durablePreWriteProofSatisfied
-          ? `Held ${toolCall.name} before mutation because required research evidence is still incomplete${
-              blockingPreWriteMissing.length
-                ? ` (${blockingPreWriteMissing.join(", ")})`
-                : ""
-            }. Continue with the allowed read and research tools before drafting the final writeback.`
-          : `Held ${toolCall.name} before mutation because this sourced writeback requires final passage verification${
-              proposedWriteAcceptance?.missing.length
-                ? ` (${proposedWriteAcceptance.missing.join(", ")})`
-                : ""
-            }. Return the complete corrected note content as the final answer without another write tool call; read tools such as web_search or read_source_section may still be used first to verify exact quotations. The runner will verify and commit the final content exactly once.${
-              (lastClaimLedger?.quoteCorrections ?? [])
-                .map(
-                  (correction) =>
-                    ` Quote correction for ${correction.passageId}: your draft quoted "${correction.attempted}" but the cited passage actually reads: "${correction.passageExcerpt}".`,
-                )
-                .join("")
-            }`;
-        if (durablePreWriteProofSatisfied) {
+        const hold = buildProofGatedWritebackHoldV1({
+          toolName: toolCall.name,
+          boundary: "pre_mutation",
+          evidenceSatisfied: durablePreWriteProofSatisfied,
+          missing: durablePreWriteProofSatisfied
+            ? (proposedWriteAcceptance?.missing ?? [])
+            : blockingPreWriteMissing,
+          blockingProofs: blockingPreWriteMissing,
+          quoteCorrections: lastClaimLedger?.quoteCorrections ?? [],
+        });
+        const message = hold.message;
+        if (hold.heldWriteToolName) {
           // Only the verification-required arm promised "return the content
           // as the final answer". Remember which write tool that promise
           // held so frontier rejections stop advising the same name while
           // the hold stands.
-          lastProofGatedHoldToolName = toolCall.name;
-        } else {
+          lastProofGatedHoldToolName = hold.heldWriteToolName;
+        }
+        if (hold.narrowsOfferedFrontier) {
           // Evidence-incomplete arm: repeated re-tries of the same held tool
           // narrow the offered frontier until the blocking proofs clear.
           recordProofGateWriteRejection(toolCall.name);
@@ -21221,11 +21683,7 @@ export async function runAgentMission({
         });
         messages.push({
           role: "system" as const,
-          content: durablePreWriteProofSatisfied
-            ? "Do not request a current-note write tool again. Return the complete sourced markdown as your final answer. The runner will hold it, verify passage ids and quotation spans, and perform the single authorized note mutation only after verification passes."
-            : `Do not request a current-note write tool again yet. Continue with allowed read or research tools until these blocking proof requirements are satisfied: ${
-                blockingPreWriteMissing.join(", ") || "required research evidence"
-              }. Only then return the complete sourced markdown for final verification.`,
+          content: hold.systemCorrective,
         });
         shouldReplanAfterProofGatedWriteTool = true;
         toolIndex += 1;
@@ -21814,9 +22272,21 @@ export async function runAgentMission({
         continue;
       }
     }
+    // Mission-level required-write accounting says "the append tool ran";
+    // the authoritative graph says which HEAL-SPLICED owed write nodes are
+    // still open. A healed multi-append continuation carries one spliced
+    // node per owed marker, so closing the write mission after the first
+    // paid append would cancel the remaining owed node when `final`
+    // completes over unpaid work. Scoped to the heal's exactly-once nodes:
+    // planned workflows keep their historical completion semantics.
+    const pendingResumeOwedWriteNodesAfterToolUse =
+      getPendingResumeOwedWriteNodeIds(
+        missionGraphSession?.graph ?? missionGraph,
+      );
     const operationWriteComplete =
       completedAnyWrite &&
       pendingRequiredWriteToolsAfterToolUse.length === 0 &&
+      pendingResumeOwedWriteNodesAfterToolUse.length === 0 &&
       missingRequiredWebToolsAfterToolUse.length === 0 &&
       !pendingStreamingWriteback;
     const requiresPostWriteAcceptance = researchPlan !== null;
@@ -21910,8 +22380,31 @@ export async function runAgentMission({
       loopBudgetPlan.expectedTools,
       successfulToolNames,
     );
+    // "Graph outranks segment accounting" holds only when the graph actually
+    // PROVED its work: a final-only graph whose completed nodes carry no
+    // receipts/evidence (the crash-resumed stub) still owes the mission's
+    // required tools, and treating it as satisfied forces tool-less final
+    // synthesis against an acceptance that can never pass. Shared predicate
+    // with the resume splice heal and the empty-frontier fallback.
+    // The ACCEPTABLY-COMPLETE arm covers the continuation of a run killed
+    // AFTER its graph finished everything (final complete included): the
+    // final-only-remains shape check requires `final` ready/queued, so a
+    // fully terminal restored graph armed nothing, the frontier was
+    // rightly empty, and the segment burned every step asking a tool-less
+    // model to do work the graph had already proved (proof-matrix
+    // interrupted-continuation, 2026-08-26 02:16Z — eleven tool-less calls
+    // ending in an error instead of the final answer).
+    const loopDecisionMissionGraph = missionGraphSession?.graph ?? null;
+    const missionGraphStubOwesRequiredWork =
+      missionGraphFinalOnlyStubOwesRequiredWorkV1(loopDecisionMissionGraph);
     const missionGraphFinalSynthesisOnly =
-      missionGraphOnlyFinalSynthesisRemainsV1(missionGraphSession?.graph);
+      (missionGraphOnlyFinalSynthesisRemainsV1(loopDecisionMissionGraph) ||
+        // isMissionGraphAcceptablyComplete treats a NULL graph as complete
+        // (graphless legacy paths own their accounting); this arm may only
+        // fire for a real, fully-terminal restored graph.
+        (loopDecisionMissionGraph !== null &&
+          isMissionGraphAcceptablyComplete(loopDecisionMissionGraph))) &&
+      !missionGraphStubOwesRequiredWork;
     const setLooseDeliveryStillUnpaid =
       setLooseCompoundEnabled &&
       !setLooseDeliveryComplete({
@@ -21972,6 +22465,7 @@ export async function runAgentMission({
         `repeated_responses=${consecutiveNoProgressSteps}`,
         `required_tools_satisfied=${requiredLoopToolsSatisfied}`,
         `graph_final_only=${missionGraphFinalSynthesisOnly}`,
+        `graph_stub_owes_work=${missionGraphStubOwesRequiredWork}`,
       ].join("; "),
     });
     const verifiedHostExportFinalAnswerAfterToolUse =
@@ -24718,6 +25212,68 @@ function reflectionCodeFenceV1(code: string): string {
     ...Array.from(code.matchAll(/`+/gu), (match) => match[0].length),
   );
   return "`".repeat(longest + 1);
+}
+
+/**
+ * Tool names that are obviously an unfilled TEMPLATE rather than a request:
+ * `$TOOL_NAME`, `${toolName}`, `<tool_name>`, `{{tool}}`, `your_tool_name`.
+ * Cheap models emit these mid-ladder when they compose the next call from a
+ * remembered function-calling form instead of the offered schema list
+ * (observed live in the compound flow lane, 2026-08-26: a literal
+ * `$TOOL_NAME` call right after a successful read_template).
+ *
+ * No installed tool name can match these shapes — every real name is
+ * snake_case words without `$`, `<`, or `{` — so this cannot shadow a real
+ * tool.
+ */
+export function isPlaceholderToolNameV1(toolName: string): boolean {
+  const value = toolName.trim();
+  if (!value) return false;
+  return (
+    /^\$\{?\s*[a-z0-9_]*tool[a-z0-9_]*\s*\}?$/iu.test(value) ||
+    /^<+\s*\/?\s*(?:tool|tool[_\s-]?name|name)\s*>+$/iu.test(value) ||
+    /^\{\{\s*(?:tool|tool[_\s-]?name)\s*\}\}$/iu.test(value) ||
+    /^(?:tool[_\s-]?name|toolname|your[_\s-]?tool(?:[_\s-]?name)?|name[_\s-]?of[_\s-]?tool|exact[_\s-]?tool[_\s-]?name)$/iu.test(
+      value,
+    )
+  );
+}
+
+/**
+ * A placeholder-named call is a formatting failure, not a request for
+ * something unavailable: the model meant to call the tool it was just
+ * offered. When the offered frontier is exactly ONE read-effect tool, retry
+ * the call as that tool instead of spending the step on an unknown-tool
+ * refusal (~11% of a 9-step segment's budget, live).
+ *
+ * Deliberately narrow, in the shape of the append-alias remap below:
+ *  - only obvious placeholders (isPlaceholderToolNameV1);
+ *  - only when exactly one tool is offered, so there is nothing to guess;
+ *  - only when that tool is READ-effect — silently redirecting a
+ *    placeholder into a mutation would invent an effectful call the model
+ *    never named, which is exactly how a two-subsystems bug gets written.
+ * Anything else falls through to the existing rejection, whose copy already
+ * names the exact tool to call next.
+ */
+export function repairPlaceholderToolCallNamesV1(input: {
+  toolCalls: readonly ModelToolCall[];
+  offeredToolNames: readonly string[];
+  isReadOnlyToolName: (toolName: string) => boolean;
+}): { toolCalls: ModelToolCall[]; repaired: string[] } {
+  const offered = [
+    ...new Set(input.offeredToolNames.map((name) => name.trim()).filter(Boolean)),
+  ];
+  const target = offered.length === 1 ? offered[0] : null;
+  if (!target || !input.isReadOnlyToolName(target)) {
+    return { toolCalls: [...input.toolCalls], repaired: [] };
+  }
+  const repaired: string[] = [];
+  const toolCalls = input.toolCalls.map((call) => {
+    if (!isPlaceholderToolNameV1(call.name)) return call;
+    repaired.push(`${call.name}->${target}`);
+    return { ...call, name: target };
+  });
+  return { toolCalls, repaired };
 }
 
 /**
@@ -29026,6 +29582,35 @@ function buildGenericNoToolCorrection(
     `The tools available this step are: ${readyToolNames.join(", ")}.`,
     "Call the single most relevant tool now using its offered schema, or the run will stop as blocked.",
     "Return the tool call only. Do not explain, summarize, or claim completion.",
+  ].join(" ");
+}
+
+/**
+ * Reactive prose-steering budget: after the first-strike correction above, at
+ * most this many escalations per segment before the two-strike noncompliance
+ * breaker decides. Bounded so a model that never calls tools cannot turn the
+ * steering seat into an infinite nudge loop.
+ */
+const MAX_PROSE_STEERING_INJECTIONS = 2;
+
+/**
+ * Escalated sibling of the no-tool corrections above, issued only after a
+ * first correction already failed (two-plus consecutive prose-only responses
+ * while required frontier work is still owed). Same sentinel, so the stale-
+ * correction pruner keeps exactly one correction in history.
+ */
+function buildProseSteeringEscalation(
+  readyToolNames: readonly string[],
+): string {
+  const exactInstruction =
+    readyToolNames.length === 1
+      ? `Call ${readyToolNames[0]} now using its offered schema, or state in one sentence why you cannot.`
+      : `Call exactly one ready tool now — ${readyToolNames.join(", ")} — or state in one sentence why you cannot.`;
+  return [
+    FRONTIER_CORRECTION_SENTINEL,
+    "Prose without a tool call cannot advance this mission; required tool work is still owed.",
+    `The ready frontier tool(s): ${readyToolNames.join(", ")}.`,
+    exactInstruction,
   ].join(" ");
 }
 
@@ -34750,9 +35335,87 @@ const LITERAL_CONTENT_WRITE_TOOLS = new Set([
   "create_file",
 ]);
 
+/**
+ * The final-answer path has always REPAIRED a missing user-required literal
+ * (attachMissingRequiredLiteralAnchors, consumed above); the tool-call path
+ * REFUSED the identical failure, spent a bounded safeFailureRetry attempt on
+ * it, and blocked the node on the repeat. Same prompt, same
+ * extractRequiredLiteralAnchors, two verdicts -- and the refusal's own advice
+ * ("return one corrected call whose content preserves this step's required
+ * literal exactly") describes a deterministic edit the host can simply make.
+ * A model that paraphrases a marker on its write is the same model that would
+ * have had it restored for free one code path over.
+ *
+ * Restores exactly ONE anchor, because this contract is step-scoped, not
+ * mission-scoped (see validateRequiredLiteralWriteArguments below): inserting
+ * every missing marker is precisely what collapses a mission's ordered
+ * appends into a single write. The anchor chosen is the first the live note
+ * still lacks, so ordered multi-append missions keep progressing in their
+ * stated order; with no observable note the first anchor is used.
+ *
+ * Deliberately declines wherever refusal is the right answer, leaving
+ * validateRequiredLiteralWriteArguments the sole authority on whether a call
+ * satisfies the contract -- this only removes the cases where the host knew
+ * the exact fix and refused anyway:
+ * - not a literal-content write tool, no demanded literals, or no text /
+ *   content string to repair;
+ * - content already carries an anchor, which includes the anti-duplication
+ *   case where the model re-carries a marker the note already landed and the
+ *   validator's redirect must keep its teeth.
+ */
+export function canonicalRequiredLiteralWriteContentV1(
+  prompt: string,
+  toolCall: ModelToolCall,
+  currentNoteText?: string | null,
+): { field: "text" | "content"; content: string; insertedAnchor: string } | null {
+  if (!LITERAL_CONTENT_WRITE_TOOLS.has(toolCall.name)) {
+    return null;
+  }
+  const anchors = extractRequiredLiteralAnchors(prompt);
+  if (anchors.length === 0) {
+    return null;
+  }
+  const field: "text" | "content" | null =
+    typeof toolCall.arguments.text === "string"
+      ? "text"
+      : typeof toolCall.arguments.content === "string"
+        ? "content"
+        : null;
+  if (field === null) {
+    return null;
+  }
+  const content = toolCall.arguments[field] as string;
+  const normalizedContent = content.toLowerCase();
+  if (
+    anchors.some((anchor) => normalizedContent.includes(anchor.toLowerCase()))
+  ) {
+    return null;
+  }
+  const normalizedNote =
+    typeof currentNoteText === "string" ? currentNoteText.toLowerCase() : null;
+  const insertedAnchor =
+    (normalizedNote === null
+      ? undefined
+      : anchors.find(
+          (anchor) => !normalizedNote.includes(anchor.toLowerCase()),
+        )) ?? anchors[0];
+  const separator = content === "" ? "" : content.endsWith("\n") ? "\n" : "\n\n";
+  return {
+    field,
+    content: `${content}${separator}${insertedAnchor}`,
+    insertedAnchor,
+  };
+}
+
 export function validateRequiredLiteralWriteArguments(
   prompt: string,
   toolCall: ModelToolCall,
+  /**
+   * Live content of the append target, when the caller can observe it.
+   * Enables the anti-duplication redirect below; callers that cannot read
+   * the note pass nothing and keep the plain progress contract.
+   */
+  currentNoteText?: string | null,
 ): string | null {
   if (!LITERAL_CONTENT_WRITE_TOOLS.has(toolCall.name)) {
     return null;
@@ -34788,6 +35451,29 @@ export function validateRequiredLiteralWriteArguments(
   // that drops them all is still rejected. Single-literal missions are
   // unchanged — one anchor means "present at least one" is exactly "present".
   if (present.length > 0) {
+    // Anti-duplication redirect — the flip side of the step-scoped progress
+    // contract. On a healed continuation the model can re-carry a marker an
+    // earlier segment already durably landed; appending it again pays no new
+    // work and duplicates note content (the proof-matrix duplication
+    // failure). Redirect ONLY while another required literal is still
+    // missing from the live note: when every mission literal is already
+    // present, repeats stay allowed (a mission may legitimately repeat a
+    // line, and acceptance owns terminal completeness).
+    if (
+      toolCall.name === "append_to_current_file" &&
+      typeof currentNoteText === "string"
+    ) {
+      const normalizedNote = currentNoteText.toLowerCase();
+      const missingFromNote = anchors.filter(
+        (anchor) => !normalizedNote.includes(anchor.toLowerCase()),
+      );
+      const carriesOnlyLandedLiterals = present.every((anchor) =>
+        normalizedNote.includes(anchor.toLowerCase()),
+      );
+      if (carriesOnlyLandedLiterals && missingFromNote.length > 0) {
+        return `The ${toolCall.name} content only repeats literal value(s) the note already contains (${present.join(", ")}); appending them again would duplicate completed work. Still missing from the note: ${missingFromNote.join(", ")}. Return one corrected call whose content carries the next missing literal exactly.`;
+      }
+    }
     return null;
   }
   // Sentence one is unchanged (every anchor is absent whenever this rejects).
@@ -36519,14 +37205,13 @@ export function describeOffFrontierToolNearMiss(
   );
 }
 
-export function buildOffFrontierToolRejectionMessage(input: {
-  toolName: string;
-  pendingGraphNodeId?: string | null;
-  readyFrontierToolNames: readonly string[];
-  preferredNextTool?: string | null;
-  category?: string | null;
-  heldWriteToolNames?: readonly string[];
-}): string {
+export function buildOffFrontierToolRejectionMessage(
+  // Parameters flow straight through: a hand-restated shape here would drop
+  // any field the implementation later gains (it silently dropped
+  // `reasonMessage` and `offFrontier` when those were added), and the
+  // rejection text would quietly diverge between the two callers.
+  input: Parameters<typeof buildOffFrontierToolRejectionMessageImpl>[0],
+): string {
   return buildOffFrontierToolRejectionMessageImpl(input);
 }
 

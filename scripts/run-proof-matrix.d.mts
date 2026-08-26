@@ -33,6 +33,11 @@ export function classifyAttemptOutcome(input: {
 };
 export const LEGACY_RUN_CSV_HEADER: string;
 export const RUN_CSV_HEADER: string;
+/**
+ * Refusal buckets, key-for-key with TOOL_REFUSAL_MARKER_BUCKETS in
+ * e2e/reporters/dailyUseReporter.ts (tests/proofMatrix.test.ts asserts it).
+ */
+export const BLOCKER_BUCKETS: ReadonlyArray<readonly [string, RegExp]>;
 export function upgradeRunCsvHeader(
   text: string,
   header?: string,
