@@ -945,6 +945,34 @@ export function taskHasRecordedProof(
   }
 }
 
+/**
+ * Required literal markers the mission demanded that are NOT present in the
+ * durable artifact yet.
+ *
+ * The ONE authority for "how much of a literal write contract is still
+ * owed". A mission ordering N markers is not discharged by ONE receipt:
+ * `requiredTools` is a SET (append_to_current_file appears once however many
+ * appends were ordered) and `write_receipt` is satisfied by the PRESENCE of
+ * a receipt, so a two-marker mission that paid one append passed acceptance
+ * with `required_evidence_and_receipts_present` while its second marker had
+ * never been written (proof-matrix interrupted-continuation, 2026-08-26
+ * 04:4xZ, pre-first-write kill). Counting the markers actually landed in the
+ * note is the only count-aware check available.
+ *
+ * Fails OPEN: an unreadable artifact levies no debt, because a gate that
+ * cannot see the evidence must not block on it.
+ */
+export function getRequiredLiteralAnchorsMissingFromTextV1(
+  prompt: string,
+  text: string | null | undefined,
+): string[] {
+  if (typeof text !== "string") return [];
+  const anchors = extractRequiredLiteralAnchors(prompt);
+  if (anchors.length === 0) return [];
+  const haystack = text.toLowerCase();
+  return anchors.filter((anchor) => !haystack.includes(anchor.toLowerCase()));
+}
+
 export function isFinalOutputRelevant(
   plan: MissionPlan,
   finalOutput: string | undefined,

@@ -4313,3 +4313,94 @@ function createSettings(): AgentSettings {
     scheduledMissions: [],
   };
 }
+
+test("a two-marker write contract is not discharged by one receipt", async () => {
+  // Proof-matrix interrupted-continuation at fully-merged main, 2026-08-26:
+  // the lane was killed pre-first-write (BOTH markers owed), the resumed
+  // segment paid exactly ONE append, and acceptance returned
+  // status "pass" / reasons ["required_evidence_and_receipts_present",
+  // "mission_plan_contracts_satisfied"] while the second marker had never
+  // been written. `requiredTools` is a SET (append_to_current_file appears
+  // once however many appends were ordered) and write_receipt is satisfied
+  // by the PRESENCE of a receipt, so nothing in acceptance counted the work.
+  // The artifact is the only count-aware evidence.
+  const vault = createVaultHarness();
+  vault.context.settings.semanticSearchEnabled = true;
+  const mission =
+    "Perform exactly two ordered durable appends to the current note, then finish. " +
+    "First append exactly one line containing MARKER_A1 and verify that write. " +
+    "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+
+  const completions: AgentRunCompleteEvent[] = [];
+  const traces: AgentTraceEvent[] = [];
+  await runAgentMission({
+    prompt: mission,
+    // The model pays ONLY the first marker, then declares completion — the
+    // exact live shape.
+    modelClient: createModelClient([
+      responseWithToolCall("append_to_current_file", { text: "MARKER_A1" }),
+      {
+        message: {
+          role: "assistant",
+          content: "The first ordered append is durably recorded. Mission complete.",
+          toolCalls: [],
+        },
+        toolCalls: [],
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "The first ordered append is durably recorded. Mission complete.",
+          toolCalls: [],
+        },
+        toolCalls: [],
+      },
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onRunComplete: (event) => completions.push(event),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  const note = vault.files.get("Current.md") ?? "";
+  assert.equal(note.split("MARKER_A1").length - 1, 1, note);
+  assert.equal(
+    note.includes("MARKER_B2"),
+    false,
+    "fixture guard: this test is about the SECOND marker never landing",
+  );
+  const acceptanceTrace = traces
+    .filter((event) => event.id.startsWith("mission-acceptance-"))
+    .at(-1);
+  assert.ok(acceptanceTrace);
+  const acceptanceMissing = Array.isArray(
+    (acceptanceTrace.outputPreview as { missing?: unknown })?.missing,
+  )
+    ? ((acceptanceTrace.outputPreview as { missing: string[] }).missing)
+    : [];
+  assert.ok(
+    acceptanceMissing.includes("literal:MARKER_B2"),
+    JSON.stringify({
+      rule: "Acceptance must name the required literal that was never written; one receipt does not discharge a two-marker contract.",
+      note,
+      missing: acceptanceMissing,
+      acceptance: acceptanceTrace.message,
+    }),
+  );
+  assert.doesNotMatch(
+    String(acceptanceTrace.message),
+    /Mission acceptance: pass/u,
+    JSON.stringify({ note, acceptance: acceptanceTrace.message }),
+  );
+  const completion = completions.at(-1);
+  assert.ok(completion);
+  assert.notEqual(
+    completion.stopReason,
+    "write_completed",
+    JSON.stringify({ rule: "half-paid literal contract must not close as a completed write", completion }),
+  );
+});

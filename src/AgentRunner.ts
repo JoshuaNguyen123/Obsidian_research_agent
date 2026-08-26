@@ -776,6 +776,7 @@ import {
   countRemainingMissionPlanTasks,
   createMissionPlan,
   extractRequiredLiteralAnchors,
+  getRequiredLiteralAnchorsMissingFromTextV1,
   getActiveMissionPlanTask,
   getNextMissionPlanAction,
   isFetchedWebEvidence,
@@ -5129,10 +5130,16 @@ export async function runAgentMission({
           } catch {
             owedNoteText = null;
           }
+          // Same authority the acceptance seat uses for durable literal debt,
+          // so "how much of this write contract is still owed" has ONE answer.
+          // The helper fails open on an unreadable note (no debt), while the
+          // heal must then assume every marker is still owed — an unreadable
+          // note is not evidence that the work landed.
           const missingAnchors =
             typeof owedNoteText === "string"
-              ? owedLiteralAnchors.filter(
-                  (anchor) => !(owedNoteText as string).includes(anchor),
+              ? getRequiredLiteralAnchorsMissingFromTextV1(
+                  activeIntentPrompt,
+                  owedNoteText,
                 )
               : owedLiteralAnchors;
           owedWriteCount = missingAnchors.length;
@@ -8145,6 +8152,16 @@ export async function runAgentMission({
           isHostFollowupToolExecutable("read_markdown_files")) &&
         vaultSearchSurfacedPaths.length > 0,
     });
+  /** Live current-note text for the durable literal-debt check; null when unreadable. */
+  const readCurrentNoteTextForLiteralDebt = (): string | null => {
+    try {
+      const file = runToolContext.getCurrentMarkdownFile?.();
+      if (!file) return null;
+      return runToolContext.getCurrentMarkdownContent?.(file) ?? null;
+    } catch {
+      return null;
+    }
+  };
   const evaluateCurrentAcceptance = (
     finalOutput?: string,
   ): MissionAcceptanceResult => {
@@ -8278,6 +8295,61 @@ export async function runAgentMission({
           `Open ${vaultBodyReadDebt.unreadPaths
             .slice(0, 3)
             .join(", ")} before answering from the vault search results.`,
+      };
+    }
+    // A multi-marker write contract is not discharged by ONE receipt.
+    //
+    // `requiredTools` is a SET, so `append_to_current_file` appears once
+    // however many ordered appends the mission demanded, and `write_receipt`
+    // is satisfied by the PRESENCE of a receipt rather than by the count of
+    // work. A two-marker mission that paid one append therefore passed with
+    // `required_evidence_and_receipts_present` while its second marker had
+    // never been written — an empty contract at the acceptance seat
+    // (proof-matrix interrupted-continuation, 2026-08-26: pre-first-write
+    // kill, one receipt, acceptance pass, second marker absent). The only
+    // count-aware evidence is the artifact itself, so read the note and name
+    // each marker still missing. Scoped to current-note write contracts —
+    // a mission whose literals belong to some other artifact must not be
+    // charged here — and it fails OPEN on an unreadable note.
+    // Scoped to a mission that has ALREADY PAID a current-note write: this
+    // debt exists to catch a HALF-paid literal contract, not to pre-empt an
+    // unwritten one. Levying it before any receipt exists would double the
+    // still-outstanding `write_receipt` debt and, worse, add turns to a
+    // sourced writeback whose content (and therefore its literals) is
+    // committed only at finalization — three such fixtures ran past their
+    // scripted responders when this was unscoped.
+    const currentNoteWritePaid = writeReceipts.some((receipt) =>
+      CURRENT_NOTE_LITERAL_CONTRACT_TOOL_NAMES.has(receipt.toolName),
+    );
+    const currentNoteLiteralDebt =
+      currentNoteWritePaid &&
+      requiredWriteTools.some((toolName) =>
+        CURRENT_NOTE_LITERAL_CONTRACT_TOOL_NAMES.has(toolName),
+      )
+        ? getRequiredLiteralAnchorsMissingFromTextV1(
+            activeIntentPrompt,
+            readCurrentNoteTextForLiteralDebt(),
+          )
+        : [];
+    if (currentNoteLiteralDebt.length > 0) {
+      acceptance = {
+        ...acceptance,
+        status: acceptance.status === "fail" ? "fail" : "needs_more_work",
+        confidence: Math.min(acceptance.confidence, 0.65),
+        missing: [
+          ...new Set([
+            ...acceptance.missing,
+            ...currentNoteLiteralDebt.map((anchor) => `literal:${anchor}`),
+          ]),
+        ],
+        reasons: [
+          ...new Set([...acceptance.reasons, "required_literal_not_written"]),
+        ],
+        nextAction:
+          acceptance.nextAction ??
+          `Append the still-missing required line(s) to the current note: ${currentNoteLiteralDebt
+            .slice(0, 3)
+            .join(", ")}.`,
       };
     }
     // Final acceptance only after verify-complete for research-bearing missions.
@@ -35307,6 +35379,19 @@ export function extractExactMarkdownReplacementPayload(
   );
   return fenced ? fenced[1] : match[1];
 }
+
+/**
+ * Write contracts whose required literal markers must land in the CURRENT
+ * NOTE. Only these levy durable literal debt at the acceptance seat: a
+ * mission writing to a new file, a workspace, or a provider issue keeps its
+ * literals elsewhere and must not be charged against the current note.
+ */
+const CURRENT_NOTE_LITERAL_CONTRACT_TOOL_NAMES = new Set([
+  "append_to_current_file",
+  "replace_current_file",
+  "edit_current_section",
+  "append_to_current_section",
+]);
 
 const LITERAL_CONTENT_WRITE_TOOLS = new Set([
   "append_to_current_file",
