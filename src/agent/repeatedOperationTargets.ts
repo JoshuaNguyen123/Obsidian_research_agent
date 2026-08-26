@@ -165,9 +165,33 @@ function markdownTargetsInClauseV1(clause: string): string[] {
   const compact = [
     ...clause.matchAll(new RegExp(COMPACT_MARKDOWN_PATH, "gu")),
   ].map((match) => match[0] ?? "");
-  return [...quoted, ...labelled, ...compact]
+  // A DELIMITED match wins over the compact scan of the SAME text.
+  //
+  // `COMPACT_MARKDOWN_PATH` cannot cross a space, so a quoted vault path such
+  // as "E2E Agent Tests/crud-source.md" is reported twice: once correctly, and
+  // once as its own tail "Tests/crud-source.md". Counting the tail turns a
+  // single-destination request into two nodes and plants the second against a
+  // path that does not exist — `product:unpayable_debt` from a request that
+  // named exactly one destination, and enough on its own to re-author the plan
+  // of every CRUD mission that quotes a path containing a space.
+  //
+  // Scoped to ONE clause on purpose. Two genuinely distinct destinations that
+  // happen to share a tail ("Archive/Projects/Alpha.md" and
+  // "Projects/Alpha.md") are coordinated, so clause splitting has already put
+  // them in separate clauses and neither can absorb the other.
+  const delimited = [...quoted, ...labelled]
     .map((value) => normalizeTargetV1(value))
     .filter((value) => /\.md$/iu.test(value));
+  const compactWithoutTruncations = compact
+    .map((value) => normalizeTargetV1(value))
+    .filter(
+      (value) =>
+        /\.md$/iu.test(value) &&
+        !delimited.some(
+          (full) => full !== value && full.toLowerCase().endsWith(value.toLowerCase()),
+        ),
+    );
+  return [...delimited, ...compactWithoutTruncations];
 }
 
 function normalizeTargetV1(value: string): string {

@@ -344,6 +344,40 @@ export function saferWriteScope(
     : right;
 }
 
+/**
+ * THE authority write-scope answer: how much write scope survives when a
+ * high-confidence model route meets the regex safety net.
+ *
+ * `regex` is not merely a second opinion. `deriveRoutedIntentFallback` builds
+ * it from the run's ACTUAL write-tool exposure, and in a mission-graph run the
+ * exposed tool set IS the frontier's current offer — the host only offers what
+ * the graph planned. So a non-"none" regex scope is the host stating "I am
+ * offering a mutation right now".
+ *
+ * `saferWriteScope` alone let a model opinion of "none" win that intersection.
+ * `evaluateToolPolicy` then refused `create_file` with `mutation_scope` on a
+ * mission whose own plan was `tool-01-create_file … tool-04-delete_path`: the
+ * host planned the write, offered the tool, and its own gate refused it —
+ * `offered ⊄ gate-accepted`, and the node died on `tool_failure_repeated`.
+ *
+ * The intersection stays a CEILING: authority still can never widen past the
+ * regex scope, and a model may still narrow AMONG write scopes. It is no longer
+ * a FLOOR, so a model may not revoke mutation authority the host itself
+ * granted. That is exactly the boundary the mutation-scope block documents for
+ * itself — it "only fires for tool calls that slipped past tool exposure", and
+ * a call the frontier is actively offering did not slip past anything.
+ *
+ * When no write tool is exposed the regex scope is already "none", so a
+ * read-only mission keeps the block with its full force.
+ */
+export function resolveAuthoritativeWriteScopeV1(
+  model: RoutedMissionIntent["writeScope"],
+  regex: RoutedMissionIntent["writeScope"],
+): RoutedMissionIntent["writeScope"] {
+  const withinCeiling = saferWriteScope(model, regex);
+  return withinCeiling === "none" && regex !== "none" ? regex : withinCeiling;
+}
+
 export function intersectAuthoritativeIntent(
   model: RoutedMissionIntent,
   regex: RoutedMissionIntent,
@@ -358,7 +392,10 @@ export function intersectAuthoritativeIntent(
     needsVaultContext: model.needsVaultContext || regex.needsVaultContext,
     needsCodeExecution:
       model.needsCodeExecution && regex.needsCodeExecution,
-    writeScope: saferWriteScope(model.writeScope, regex.writeScope),
+    writeScope: resolveAuthoritativeWriteScopeV1(
+      model.writeScope,
+      regex.writeScope,
+    ),
     wordTarget: regex.wordTarget ?? model.wordTarget,
   };
 }

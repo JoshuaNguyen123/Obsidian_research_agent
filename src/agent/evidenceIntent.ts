@@ -33,6 +33,40 @@ export function isLiteraryPrimaryTextWriteMission(prompt: string): boolean {
   );
 }
 
+/**
+ * Vault words that name an ADDRESSING CONVENTION rather than a corpus:
+ * "the exact vault-relative path Notes/Alpha.md" tells the model how to SPELL a
+ * destination, it does not ask for anything to be retrieved.
+ */
+const VAULT_ADDRESSING_VOCABULARY =
+  /\bvault[-\s]?(?:relative|rooted|absolute)\b|\bvault\s+paths?\b/giu;
+
+/**
+ * THE one seat that decides which occurrences of vault vocabulary name a
+ * SEARCHABLE CORPUS rather than a way of spelling a path.
+ *
+ * Both vault-signal consumers (`requiresVaultEvidenceProof` here and
+ * `hasDeepVaultResearchIntent` in researchPlan) matched a bare `\bvault\b`, so
+ * the phrase "vault-relative path" alone made a self-contained note-editing
+ * mission research-bearing. `createResearchPlan` then minted rq-1..rq-3,
+ * `deriveResearchPhase` parked the run in `gather`, and the research phase gate
+ * refused the very mutation the mission graph was planned around — the
+ * `planned ⊄ gate-accepted` shape. The refusal was permanent, because a diagram
+ * mission has no sources to fetch and gather can therefore never complete.
+ *
+ * Only addressing vocabulary is removed. "investigate my vault", "across my
+ * notes", and "search my vault" are untouched, so every genuine vault-research
+ * mission keeps its full evidence contract.
+ *
+ * Every consumer must call THIS function. A second private "is this word really
+ * a vault signal" rule is the two-subsystems-disagree shape that produced the
+ * defect — the research-mode gate and the evidence gate would once again answer
+ * differently for the same prompt.
+ */
+export function withoutVaultAddressingVocabularyV1(prompt: string): string {
+  return prompt.replace(VAULT_ADDRESSING_VOCABULARY, " ");
+}
+
 export function requiresVaultEvidenceProof(
   prompt: string,
   intent: MissionIntent,
@@ -46,7 +80,7 @@ export function requiresVaultEvidenceProof(
   }
 
   return /\b(vault|my notes|across notes|other folders|related notes|semantic search|what do my notes say|search my notes)\b/i.test(
-    prompt,
+    withoutVaultAddressingVocabularyV1(prompt),
   );
 }
 

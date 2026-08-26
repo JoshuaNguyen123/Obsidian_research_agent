@@ -519,3 +519,109 @@ test("the repeated-operation derivation is never re-inlined by a second seat", (
     "The shared module must not grow its own literal-anchor pattern.",
   );
 });
+
+/**
+ * NON-REGRESSION PIN for the interrupted-continuation cell, which is green
+ * BECAUSE of this derivation. The prompt below is the exact objective
+ * `e2e/interrupted-continuation-live.spec.ts` submits, so a change that quietly
+ * stopped provisioning the second owed append would fail here instead of
+ * costing a live lane run.
+ *
+ * Pinned while fixing two real-ai-soak blockers whose prime suspect was this
+ * very derivation. It was not the cause — it returns nothing for either of
+ * those missions — and it must keep returning exactly two nodes for this one.
+ */
+const INTERRUPTED_CONTINUATION_OBJECTIVE =
+  "Perform exactly two ordered durable appends to the current note, then finish. " +
+  "First append exactly one line containing E2EMARKA1 and verify that write. " +
+  "Then append exactly one separate line containing E2EMARKB2 and verify that write. " +
+  "Two appends total, in that order. This task needs no web, memory, or vault research.";
+
+test("the interrupted-continuation mission still provisions two append nodes", () => {
+  const nodes = deriveRepeatedOperationNodesV1({
+    toolName: "append_to_current_file",
+    objective: INTERRUPTED_CONTINUATION_OBJECTIVE,
+  });
+  assert.equal(nodes.length, 2);
+  assert.deepEqual(
+    nodes.map((node) => node.objective),
+    [
+      "Append to the current note exactly one separate line containing E2EMARKA1.",
+      "Append to the current note exactly one separate line containing E2EMARKB2.",
+    ],
+  );
+  // Ordered same-target writes never bind a selector — the host resolves the
+  // active note, and binding the marker instead would be unpayable debt.
+  assert.deepEqual(nodes.map((node) => node.selector), [undefined, undefined]);
+});
+
+/**
+ * The two real-ai-soak missions that failed at main. Neither is a repeated
+ * operation, so this derivation must leave both plans byte-identical: the CRUD
+ * chain keeps one node per tool (tool-01-create_file … tool-04-delete_path) and
+ * the diagram ladder keeps its read/upsert/read/upsert shape. Proving the
+ * emptiness here is what exonerated this file as the cause of either blocker.
+ */
+test("neither failing soak mission is a repeated operation", () => {
+  // Verbatim from e2e/real-ai-soak.spec.ts — the paths are unquoted there.
+  const crud =
+    'Create the exact markdown file E2E Agent Tests/crud-source-M.md with content "created M". ' +
+    "Read E2E Agent Tests/crud-source-M.md. " +
+    'Replace the entire content of E2E Agent Tests/crud-source-M.md with "updated M". ' +
+    "Move E2E Agent Tests/crud-source-M.md to E2E Agent Tests/crud-moved-M.md, then trash E2E Agent Tests/crud-moved-M.md. " +
+    "Request approval wherever required and preserve every receipt and readback.";
+  const diagram =
+    'In the current note at the exact vault-relative path "E2E Agent Tests/live-provider.md" under the exact heading "E2E Diagram", ' +
+    "create a small Mermaid diagram showing mission plan -> tool -> receipt. " +
+    "First read the selector to obtain the current note hash, create the block, read that saved Mermaid block back, " +
+    "then revise the same block in place to add a verification node and read it once more.";
+  for (const objective of [crud, diagram]) {
+    for (const toolName of [
+      "create_file",
+      "replace_file",
+      "delete_path",
+      "append_file",
+      "create_folder",
+      "append_to_current_file",
+      "upsert_mermaid_block",
+    ]) {
+      assert.deepEqual(
+        deriveRepeatedOperationNodesV1({ toolName, objective }),
+        [],
+        `${toolName} must not expand this mission`,
+      );
+    }
+  }
+});
+
+test("a quoted path containing spaces is ONE destination, not two", () => {
+  // The compact scanner cannot cross a space, so it re-reports the tail of a
+  // quoted path as if it were a second destination. One node is owed here; a
+  // second would be levied against a path that does not exist.
+  assert.deepEqual(
+    deriveRepeatedOperationTargetsV1({
+      toolName: "create_file",
+      objective:
+        'Create the exact markdown file "E2E Agent Tests/crud-source-M.md" with content "created M".',
+    }),
+    [],
+  );
+  // And the same request, quoted, still owes exactly one node's worth of plan.
+  assert.deepEqual(
+    deriveRepeatedOperationNodesV1({
+      toolName: "create_file",
+      objective:
+        'Create the exact markdown file "E2E Agent Tests/crud-source-M.md" with content "created M".',
+    }),
+    [],
+  );
+  // Two genuinely distinct quoted destinations with spaces still expand.
+  assert.deepEqual(
+    deriveRepeatedOperationTargetsV1({
+      toolName: "create_file",
+      objective:
+        'Create the note "Team Notes/Alpha One.md" and the note "Team Notes/Beta Two.md".',
+    }),
+    ["Team Notes/Alpha One.md", "Team Notes/Beta Two.md"],
+  );
+});
