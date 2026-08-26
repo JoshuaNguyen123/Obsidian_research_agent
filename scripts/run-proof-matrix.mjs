@@ -258,7 +258,8 @@ function assertExactCleanHead(expectedHead, stage) {
 /**
  * Kill leaked test-vault Obsidian processes between cells.
  *
- * The sweep body now lives in scripts/e2e-obsidian-sweep.mjs and is shared
+ * The sweep body now lives in scripts/e2e-obsidian-campaign-sweep.mjs (over the
+ * shared CommonJS core in scripts/e2e-obsidian-sweep.js) and is shared
  * with run-workflow-audit-e2e.mjs. The previously duplicated copies selected
  * by command-line vault match and force-killed with `Stop-Process -Force`,
  * with NO consultation of the exclusive e2e lock — and they ran here in the
