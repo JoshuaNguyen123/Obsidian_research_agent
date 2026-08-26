@@ -13,7 +13,7 @@ import {
   enumerateObsidianProcessesV1,
   selectOwnedObsidianPidsV1,
   sweepOwnedObsidianSurvivorsV1,
-} from "../../scripts/e2e-obsidian-sweep.mjs";
+} from "../../scripts/e2e-obsidian-sweep";
 import {
   restoreOwnedE2EArtifacts,
   snapshotOwnedE2EArtifacts,

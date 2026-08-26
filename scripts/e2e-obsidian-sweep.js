@@ -1,28 +1,28 @@
-import { appendFileSync, mkdirSync } from "node:fs";
-import { execFile } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-import os from "node:os";
-import path from "node:path";
-
-import {
-  isProcessAlive,
-  readLockOwner,
-  resolveE2eLockPath,
-} from "./run-e2e-exclusive.mjs";
+// CommonJS on purpose. Playwright loads the e2e fixtures as CommonJS, so a
+// fixture cannot import an ESM `.mjs` (it fails with "Cannot use 'import.meta'
+// outside a module"), while the campaign runners are plain Node ESM. A CJS
+// core is the one shape BOTH can consume, which is what keeps this single
+// shared implementation from splitting back into per-caller copies.
+//
+// The lock-aware campaign sweep needs the ESM runner's lock helpers and
+// therefore lives in the thin ESM wrapper, e2e-obsidian-campaign-sweep.mjs.
+const { appendFileSync, mkdirSync, readFileSync } = require("node:fs");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const path = require("node:path");
 
 const execFileAsync = promisify(execFile);
-const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const REPO_ROOT = path.dirname(__dirname);
 
 /**
  * Durable host-death journal. It must NOT live under test-results/, which
  * Playwright wipes at the start of every run — that wipe is why three silent
  * host deaths on 2026-08-26 left no evidence behind. Gitignored.
  */
-export const HOST_DIAGNOSTICS_RELATIVE_DIR = "e2e-host-diagnostics";
-export const HOST_EVENT_JOURNAL_RELATIVE_PATH = `${HOST_DIAGNOSTICS_RELATIVE_DIR}/host-events.jsonl`;
+const HOST_DIAGNOSTICS_RELATIVE_DIR = "e2e-host-diagnostics";
+const HOST_EVENT_JOURNAL_RELATIVE_PATH = `${HOST_DIAGNOSTICS_RELATIVE_DIR}/host-events.jsonl`;
 
-export function hostEventJournalPath(repoRoot = REPO_ROOT) {
+function hostEventJournalPath(repoRoot = REPO_ROOT) {
   return path.join(repoRoot, ...HOST_EVENT_JOURNAL_RELATIVE_PATH.split("/"));
 }
 
@@ -32,7 +32,7 @@ export function hostEventJournalPath(repoRoot = REPO_ROOT) {
  * surviving process, and so concurrent writers cannot corrupt each other's
  * records (single append-mode write per line).
  */
-export function appendHostEventV1(event, repoRoot = REPO_ROOT) {
+function appendHostEventV1(event, repoRoot = REPO_ROOT) {
   try {
     const file = hostEventJournalPath(repoRoot);
     mkdirSync(path.dirname(file), { recursive: true });
@@ -65,7 +65,7 @@ export function appendHostEventV1(event, repoRoot = REPO_ROOT) {
  * It is always an external force-kill, so a death carrying it must be blamed
  * on whoever swept, never on the product.
  */
-export function describeWindowsExitCodeV1(code, signal) {
+function describeWindowsExitCodeV1(code, signal) {
   if (signal) {
     return {
       kind: "signalled",
@@ -113,7 +113,7 @@ export function describeWindowsExitCodeV1(code, signal) {
  * CIM also carries ParentProcessId, CommandLine and CreationDate, which are
  * exactly the fields ownership scoping needs.
  */
-export async function enumerateObsidianProcessesV1(imageName = "Obsidian.exe") {
+async function enumerateObsidianProcessesV1(imageName = "Obsidian.exe") {
   if (process.platform !== "win32") return [];
   const script =
     `Get-CimInstance Win32_Process -Filter "Name='${imageName.replace(/'/gu, "''")}'" | ` +
@@ -190,7 +190,7 @@ function isHelperProcess(commandLine) {
  * with no port at all, i.e. the user's own Obsidian) is excluded first and can
  * never be selected, even if rule 3 would otherwise claim it.
  */
-export function selectOwnedObsidianPidsV1({
+function selectOwnedObsidianPidsV1({
   processes = [],
   rootPid = null,
   cdpPort = null,
@@ -244,7 +244,7 @@ export function selectOwnedObsidianPidsV1({
  * enumeration next to the kill list. If a sweep ever takes a PID that was not
  * ours, that pairing proves it from a single lane's journal.
  */
-export async function sweepOwnedObsidianSurvivorsV1({
+async function sweepOwnedObsidianSurvivorsV1({
   stage = "unknown",
   rootPid = null,
   cdpPort = null,
@@ -289,89 +289,47 @@ export async function sweepOwnedObsidianSurvivorsV1({
 }
 
 /**
- * Is some OTHER live process holding the machine-wide exclusive e2e lock?
- *
- * The campaign zombie sweeps ran in the campaign PARENT, before the child
- * runner acquires this lock, and never consulted it — so a campaign starting
- * while another session's lane was mid-mission force-killed that lane's host.
- * That is the 4294967295 death. One shared guard now serves every campaign
- * sweep site so the two can never drift apart again.
+ * Read back what the journal says about this run's host, so a failing poll can
+ * report the REAL cause instead of the poll it happened to die in. Returns the
+ * most recent host_exited/renderer_crashed record at or after `sinceMs`.
  */
-export async function foreignExclusiveLockHolderV1(env = process.env) {
-  const owner = await readLockOwner(resolveE2eLockPath(env)).catch(() => null);
-  const metadata = owner?.metadata;
-  if (!metadata || metadata.hostname !== os.hostname()) return null;
-  const pid = Number(metadata.pid);
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  if (pid === process.pid) return null;
-  if (!isProcessAlive(pid)) return null;
-  return {
-    pid,
-    startedAt: metadata.startedAt ?? null,
-    cwd: metadata.cwd ?? null,
-    playwrightArgs: metadata.playwrightArgs ?? null,
-  };
+function summarizeRecentHostDeathV1(sinceMs, repoRoot = REPO_ROOT) {
+  let lines;
+  try {
+    lines = readFileSync(hostEventJournalPath(repoRoot), "utf8")
+      .split(/\r?\n/u)
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+  for (const line of lines.reverse()) {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const at = Date.parse(String(event.ts ?? ""));
+    if (!Number.isFinite(at) || at < sinceMs) continue;
+    if (event.kind !== "host_exited" && event.kind !== "renderer_crashed") continue;
+    return (
+      `${String(event.kind)}: ${String(event.diagnosis ?? "")} ` +
+      `(exitCode=${String(event.exitCode ?? "n/a")}, ` +
+      `signal=${String(event.signal ?? "n/a")}, ` +
+      `teardownRequested=${String(event.teardownRequested ?? "n/a")})`
+    );
+  }
+  return null;
 }
 
-/**
- * Kill leaked test-vault Obsidian processes between campaign cells — but never
- * while another runner legitimately holds the exclusive lock.
- *
- * Selecting by `CommandLine -match 'test_vault_obsidian_ai'` matches a LIVE
- * lane's root just as readily as a zombie; `Stop-Process -Force` then produces
- * exit 4294967295, no Windows Error Reporting event, no crash dump and no
- * stderr — a death indistinguishable from a product crash until you decode the
- * exit code. Deferring to the lock holder is what makes the sweep safe.
- */
-export async function sweepTestVaultObsidianZombiesV1({
-  stage = "unknown",
-  env = process.env,
-  repoRoot = REPO_ROOT,
-  log = console,
-} = {}) {
-  if (process.platform !== "win32") return { swept: 0, skipped: false, reason: null };
-  const holder = await foreignExclusiveLockHolderV1(env);
-  if (holder) {
-    const reason =
-      `exclusive Obsidian e2e lock is held by live PID ${holder.pid}` +
-      `${holder.startedAt ? ` (since ${holder.startedAt})` : ""}` +
-      `${holder.cwd ? ` in ${holder.cwd}` : ""}`;
-    appendHostEventV1(
-      { kind: "campaign_sweep_skipped", stage, reason, holder },
-      repoRoot,
-    );
-    log.warn?.(
-      `Skipped the test-vault Obsidian sweep before ${stage}: ${reason}. ` +
-        "Sweeping now would force-kill a running lane's host.",
-    );
-    return { swept: 0, skipped: true, reason };
-  }
-  const processes = await enumerateObsidianProcessesV1();
-  const targets = processes.filter((row) =>
-    /test_vault_obsidian_ai/iu.test(row.commandLine),
-  );
-  appendHostEventV1(
-    {
-      kind: "campaign_sweep",
-      stage,
-      observed: processes.map((row) => ({
-        pid: row.pid,
-        parentPid: row.parentPid,
-        commandLine: row.commandLine.slice(0, 400),
-      })),
-      killedPids: targets.map((row) => row.pid),
-    },
-    repoRoot,
-  );
-  for (const row of targets) {
-    await execFileAsync("taskkill", ["/PID", String(row.pid), "/F"], {
-      windowsHide: true,
-    }).catch(() => undefined);
-  }
-  if (targets.length > 0) {
-    log.log?.(
-      `Swept ${targets.length} test-vault Obsidian zombie process(es) before ${stage}.`,
-    );
-  }
-  return { swept: targets.length, skipped: false, reason: null };
-}
+module.exports = {
+  summarizeRecentHostDeathV1,
+  HOST_DIAGNOSTICS_RELATIVE_DIR,
+  HOST_EVENT_JOURNAL_RELATIVE_PATH,
+  hostEventJournalPath,
+  appendHostEventV1,
+  describeWindowsExitCodeV1,
+  enumerateObsidianProcessesV1,
+  selectOwnedObsidianPidsV1,
+  sweepOwnedObsidianSurvivorsV1,
+};

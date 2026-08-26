@@ -9,7 +9,7 @@ import {
   containsSensitiveProofText,
   proofDirectoryForSha,
 } from "./run-targeted-protected-release.mjs";
-import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-sweep.mjs";
+import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-campaign-sweep.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(import.meta.url);

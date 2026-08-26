@@ -19,13 +19,6 @@ export interface WindowsExitDescriptionV1 {
   summary: string;
 }
 
-export interface ExclusiveLockHolderV1 {
-  pid: number;
-  startedAt: string | null;
-  cwd: string | null;
-  playwrightArgs: string[] | null;
-}
-
 export function hostEventJournalPath(repoRoot?: string): string;
 
 export function appendHostEventV1(
@@ -62,13 +55,7 @@ export function sweepOwnedObsidianSurvivorsV1(options?: {
   observed: ObsidianProcessRowV1[];
 }>;
 
-export function foreignExclusiveLockHolderV1(
-  env?: NodeJS.ProcessEnv,
-): Promise<ExclusiveLockHolderV1 | null>;
-
-export function sweepTestVaultObsidianZombiesV1(options?: {
-  stage?: string;
-  env?: NodeJS.ProcessEnv;
-  repoRoot?: string;
-  log?: Partial<Console>;
-}): Promise<{ swept: number; skipped: boolean; reason: string | null }>;
+export function summarizeRecentHostDeathV1(
+  sinceMs: number,
+  repoRoot?: string,
+): string | null;

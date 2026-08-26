@@ -1,7 +1,7 @@
 import { chromium, type Browser, type Page } from "@playwright/test";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, mkdirSync, readFileSync, type WriteStream } from "node:fs";
+import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -14,10 +14,17 @@ import {
   appendHostEventV1,
   describeWindowsExitCodeV1,
   enumerateObsidianProcessesV1,
-  hostEventJournalPath,
   selectOwnedObsidianPidsV1,
+  summarizeRecentHostDeathV1,
   sweepOwnedObsidianSurvivorsV1,
-} from "../../scripts/e2e-obsidian-sweep.mjs";
+} from "../../scripts/e2e-obsidian-sweep";
+
+/**
+ * Re-exported so realAiHarness can name the REAL cause of a vanished host
+ * instead of whichever poll happened to be in flight. The implementation lives
+ * in the shared core so it is unit-testable without booting Playwright.
+ */
+export { summarizeRecentHostDeathV1 };
 import {
   restoreOwnedE2EArtifacts,
   snapshotOwnedE2EArtifacts,
@@ -1051,43 +1058,6 @@ function watchRendererLiveness(
       teardownRequested: hostTeardownRequested,
     });
   });
-}
-
-/**
- * Read back what the journal says about this run's host, so a failing poll can
- * report the REAL cause instead of the poll it happened to die in.
- */
-export function summarizeRecentHostDeathV1(
-  sinceMs: number,
-  repoRoot?: string,
-): string | null {
-  let lines: string[];
-  try {
-    lines = readFileSync(hostEventJournalPath(repoRoot), "utf8")
-      .split(/\r?\n/u)
-      .filter(Boolean);
-  } catch {
-    return null;
-  }
-  for (const line of lines.reverse()) {
-    let event: Record<string, unknown>;
-    try {
-      event = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    const at = Date.parse(String(event.ts ?? ""));
-    if (!Number.isFinite(at) || at < sinceMs) continue;
-    if (event.kind === "host_exited" || event.kind === "renderer_crashed") {
-      return (
-        `${String(event.kind)}: ${String(event.diagnosis ?? "")} ` +
-        `(exitCode=${String(event.exitCode ?? "n/a")}, ` +
-        `signal=${String(event.signal ?? "n/a")}, ` +
-        `teardownRequested=${String(event.teardownRequested ?? "n/a")})`
-      );
-    }
-  }
-  return null;
 }
 
 async function waitForCdp(

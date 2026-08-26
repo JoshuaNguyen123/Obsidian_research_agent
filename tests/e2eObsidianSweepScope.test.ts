@@ -3,11 +3,14 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-// @ts-ignore The e2e sweep helper is an intentionally unbundled Node ESM script.
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
 import {
+  appendHostEventV1,
   describeWindowsExitCodeV1,
   selectOwnedObsidianPidsV1,
-} from "../scripts/e2e-obsidian-sweep.mjs";
+  summarizeRecentHostDeathV1,
+} from "../scripts/e2e-obsidian-sweep";
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const OUR_PORT = 11223;
@@ -155,7 +158,7 @@ test("Windows exit codes name the ACTION that produced them", () => {
 test("no campaign or harness sweep may force-kill Obsidian by image name again", () => {
   // Source-level guard: the two duplicated Stop-Process sweeps and the two
   // duplicated tasklist image-name sweeps are what killed live hosts. All four
-  // now route through scripts/e2e-obsidian-sweep.mjs; re-inlining any of them
+  // now route through the shared scoped sweep; re-inlining any of them
   // must fail here rather than in a mystery lane at 3am.
   const guarded = [
     "scripts/run-proof-matrix.mjs",
@@ -180,5 +183,63 @@ test("no campaign or harness sweep may force-kill Obsidian by image name again",
       /IMAGENAME eq/u,
       `${relative} must not enumerate Obsidian by image name (tasklist /FI is unreliable here); use the shared CIM enumeration.`,
     );
+  }
+});
+
+test("a force-killed host death reads back as self-describing, not as a crash", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "host-journal-"));
+  try {
+    const sinceMs = Date.now() - 1_000;
+    // Exactly what the harness writes when a sweep force-kills a live host:
+    // an exit the run never asked for.
+    const decoded = describeWindowsExitCodeV1(4294967295, null);
+    appendHostEventV1(
+      {
+        kind: "host_exited",
+        label: "compound-flow-real-live",
+        pid: 4242,
+        exitCode: 4294967295,
+        signal: null,
+        lifetimeMs: 204_000,
+        exitKind: decoded.kind,
+        forcedExternally: decoded.forcedExternally,
+        diagnosis: decoded.summary,
+        teardownRequested: false,
+      },
+      repoRoot,
+    );
+
+    const summary = summarizeRecentHostDeathV1(sinceMs, repoRoot);
+    assert.ok(summary, "a recorded death must be readable back");
+    // The three facts that were missing from every artifact before this:
+    // WHO ended it, that nobody asked it to end, and that it was not a crash.
+    assert.match(summary!, /host_exited/u);
+    assert.match(summary!, /Stop-Process -Force/u);
+    assert.match(summary!, /teardownRequested=false/u);
+    assert.match(summary!, /exitCode=4294967295/u);
+    assert.match(summary!, /did not crash/u);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("an orderly teardown is not reported as a death", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "host-journal-"));
+  try {
+    const sinceMs = Date.now() - 1_000;
+    appendHostEventV1({ kind: "host_spawned", pid: 1 }, repoRoot);
+    appendHostEventV1({ kind: "page_closed", pid: 1 }, repoRoot);
+    // No host_exited yet: nothing to blame, so the poll error must stay bare
+    // rather than inventing a cause.
+    assert.equal(summarizeRecentHostDeathV1(sinceMs, repoRoot), null);
+
+    // A death recorded BEFORE the window under test belongs to an earlier run.
+    appendHostEventV1(
+      { kind: "host_exited", exitCode: 1, signal: null, diagnosis: "old" },
+      repoRoot,
+    );
+    assert.equal(summarizeRecentHostDeathV1(Date.now() + 60_000, repoRoot), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });

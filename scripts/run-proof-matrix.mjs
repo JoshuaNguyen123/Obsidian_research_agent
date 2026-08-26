@@ -50,7 +50,7 @@ import {
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-sweep.mjs";
+import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-campaign-sweep.mjs";
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
