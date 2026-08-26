@@ -2629,6 +2629,11 @@ test("a resumed graph whose required mutation already completed gets no splice",
     null,
     "A graph whose required mutation already completed owes nothing: splicing here would replay a paid write (the over-splicing guard).",
   );
+  assert.equal(
+    healed.refusedReason,
+    "completed_mutation_without_content_verification",
+    "every heal refusal must name its guard — a silent null made three live lane reds undiagnosable",
+  );
 
   // The between-writes exception: a caller that content-verified the owed
   // count against the live note's required literals (marker A landed, marker

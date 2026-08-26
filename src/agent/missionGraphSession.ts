@@ -157,6 +157,21 @@ export type MissionGraphToolStartResult =
       code?: "budget_exhausted";
     };
 
+/**
+ * Named guards of spliceResumeCurrentNoteWriteNode. A silent null made a
+ * live no-heal undiagnosable from run artifacts; every refusal now says
+ * which guard refused (proof-matrix interrupted-continuation, 2026-08-26).
+ */
+export type MissionGraphWritebackSpliceRefusalV1 =
+  | "envelope_grant_missing"
+  | "envelope_grant_not_mutation"
+  | "graph_not_writeback_stub"
+  | "completed_mutation_without_content_verification"
+  | "execution_host_unavailable"
+  | "mutation_executor_unavailable"
+  | "mutation_binding_unavailable"
+  | "already_healed";
+
 const READ_NODE_LOCK_LEASE_MS = 60_000;
 /** Longer than the runner's 120-second approval window. */
 const EFFECTFUL_NODE_LOCK_LEASE_MS = 180_000;
@@ -2982,7 +2997,12 @@ export class MissionGraphSession {
      * beside paid work on faith would replay a paid write.
      */
     contentVerifiedOwedWork?: boolean;
-  }): Promise<{ graph: MissionGraphV3; splicedNodeId: string | null }> {
+  }): Promise<{
+    graph: MissionGraphV3;
+    splicedNodeId: string | null;
+    /** Named guard that refused the heal; absent when the splice landed. */
+    refusedReason?: MissionGraphWritebackSpliceRefusalV1;
+  }> {
     const toolName = "append_to_current_file";
     const owedWriteCount = Math.min(
       8,
@@ -2993,6 +3013,10 @@ export class MissionGraphSession {
       const envelope = graph.capabilityEnvelope;
       const grant = envelope.tools[toolName];
       const final = graph.nodes.final;
+      // Every refusal names its exact guard: a silent null made a live
+      // no-heal undiagnosable from run artifacts (proof-matrix
+      // interrupted-continuation, 2026-08-26 05:57Z — three lane reds could
+      // not distinguish a failed gate from a refused splice).
       // The healable shape: only the tool-less `final` remains open. Every
       // other node must be terminal — tool-less dispatch stubs (the streamed
       // fc57558 crash artifact) AND completed tool nodes (a between-writes
@@ -3000,9 +3024,21 @@ export class MissionGraphSession {
       // the CALLER decides how many writes are still owed, content-checked
       // against the live note. Any nonterminal node means a real frontier
       // still exists and healing would fork the write authority.
+      if (grant === undefined) {
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "envelope_grant_missing" as const,
+        };
+      }
+      if (grant.effect !== "mutation") {
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "envelope_grant_not_mutation" as const,
+        };
+      }
       const isWritebackStub =
-        grant !== undefined &&
-        grant.effect === "mutation" &&
         final !== undefined &&
         (final.status === "ready" || final.status === "queued") &&
         final.allowedTools.length === 0 &&
@@ -3013,7 +3049,11 @@ export class MissionGraphSession {
               !getMissionCompositeLifecycleSpecV1(node),
         );
       if (!isWritebackStub) {
-        return { graph: this.graph, splicedNodeId: null };
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "graph_not_writeback_stub" as const,
+        };
       }
       // The historical over-splicing guard: a completed tool-bearing node
       // means the graph already paid a mutation, and splicing beside paid
@@ -3027,7 +3067,11 @@ export class MissionGraphSession {
           node.allowedTools.length > 0,
       );
       if (hasCompletedToolNode && input.contentVerifiedOwedWork !== true) {
-        return { graph: this.graph, splicedNodeId: null };
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "completed_mutation_without_content_verification" as const,
+        };
       }
       const executionHost = grant.executionHosts.includes("obsidian_core")
         ? ("obsidian_core" as const)
@@ -3036,7 +3080,11 @@ export class MissionGraphSession {
         !executionHost ||
         !envelope.executionHosts.includes(executionHost)
       ) {
-        return { graph: this.graph, splicedNodeId: null };
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "execution_host_unavailable" as const,
+        };
       }
       const executorId = ["single-agent", ...Object.keys(envelope.executors)].find(
         (candidateId) => {
@@ -3049,7 +3097,11 @@ export class MissionGraphSession {
         },
       );
       if (!executorId) {
-        return { graph: this.graph, splicedNodeId: null };
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "mutation_executor_unavailable" as const,
+        };
       }
       // The mutation destination must be the envelope's own host-trusted
       // binding for this tool; without one the node could never validate,
@@ -3061,7 +3113,11 @@ export class MissionGraphSession {
             grant.bindingKinds.includes(candidate.kind)),
       );
       if (!binding) {
-        return { graph: this.graph, splicedNodeId: null };
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "mutation_binding_unavailable" as const,
+        };
       }
       const nodeIds = Array.from({ length: owedWriteCount }, (_, index) =>
         index === 0
@@ -3069,7 +3125,11 @@ export class MissionGraphSession {
           : `resume-current-note-write-${index + 1}`,
       );
       if (nodeIds.some((nodeId) => graph.nodes[nodeId])) {
-        return { graph: this.graph, splicedNodeId: null };
+        return {
+          graph: this.graph,
+          splicedNodeId: null,
+          refusedReason: "already_healed" as const,
+        };
       }
       // One node per owed write, all ready siblings sharing the exact same
       // authority (executor, host, tool grant, destination binding, exclusive

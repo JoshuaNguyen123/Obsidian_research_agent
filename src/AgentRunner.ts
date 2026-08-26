@@ -4959,13 +4959,44 @@ export async function runAgentMission({
       // resumed with streaming off and no runtime snapshot (killed before the
       // first checkpoint), and that continuation owes the append just the
       // same (proof-matrix interrupted-continuation, 2026-08-25 22:41Z).
-      const resumedGraphForWritebackHeal =
-        missionGraphSession &&
-        exactResumeRunId &&
-        (resumeContinuesStreamedCurrentNoteAppend ||
-          requiredWriteTools.includes("append_to_current_file")) &&
-        missionGraphOnlyFinalSynthesisRemainsV1(missionGraphSession.graph)
+      const writebackHealMissionRequiresAppend =
+        resumeContinuesStreamedCurrentNoteAppend ||
+        requiredWriteTools.includes("append_to_current_file");
+      const resumedGraphForWritebackHealCandidate =
+        missionGraphSession && exactResumeRunId
           ? missionGraphSession.graph
+          : null;
+      const writebackHealShapeFinalOnly =
+        missionGraphOnlyFinalSynthesisRemainsV1(
+          resumedGraphForWritebackHealCandidate,
+        );
+      if (resumedGraphForWritebackHealCandidate) {
+        // One gate verdict per continuation: three live lane reds could not
+        // distinguish "the gate never armed" from "the splice refused", so
+        // the gate states its inputs even when it skips.
+        events.onTrace?.({
+          id: "mission-graph-resume-writeback-heal-gate",
+          kind: "status",
+          message: `Resume writeback heal gate: missionRequiresAppend=${writebackHealMissionRequiresAppend}; graphFinalOnly=${writebackHealShapeFinalOnly}; stubOwesWork=${missionGraphFinalOnlyStubOwesRequiredWorkV1(resumedGraphForWritebackHealCandidate)}.`,
+          outputPreview: {
+            missionRequiresAppend: writebackHealMissionRequiresAppend,
+            graphFinalOnly: writebackHealShapeFinalOnly,
+            streamedResumeFlag: resumeContinuesStreamedCurrentNoteAppend,
+            requiredWriteTools: [...requiredWriteTools],
+            envelopeGrantsAppend: Boolean(
+              resumedGraphForWritebackHealCandidate.capabilityEnvelope.tools[
+                "append_to_current_file"
+              ],
+            ),
+            nodeIds: Object.keys(resumedGraphForWritebackHealCandidate.nodes),
+          },
+        });
+      }
+      const resumedGraphForWritebackHeal =
+        resumedGraphForWritebackHealCandidate &&
+        writebackHealMissionRequiresAppend &&
+        writebackHealShapeFinalOnly
+          ? resumedGraphForWritebackHealCandidate
           : null;
       if (missionGraphSession && resumedGraphForWritebackHeal) {
         const appendDescriptor =
@@ -5018,7 +5049,7 @@ export async function runAgentMission({
             : 0;
         }
         const writebackSplice = owedWriteCount === 0
-          ? { splicedNodeId: null }
+          ? { splicedNodeId: null, refusedReason: "owed_write_count_zero" as const }
           :
           await missionGraphSession.spliceResumeCurrentNoteWriteNode({
             objective:
@@ -5050,6 +5081,19 @@ export async function runAgentMission({
             outputPreview: {
               missionId: missionGraphSession.graph.missionId,
               splicedNodeId: writebackSplice.splicedNodeId,
+              owedWriteCount,
+            },
+          });
+        } else {
+          events.onTrace?.({
+            id: "mission-graph-resume-writeback-splice-refused",
+            kind: "status",
+            message: `Resume writeback heal did not splice: ${
+              writebackSplice.refusedReason ?? "unspecified"
+            }.`,
+            outputPreview: {
+              missionId: missionGraphSession.graph.missionId,
+              refusedReason: writebackSplice.refusedReason ?? null,
               owedWriteCount,
             },
           });
