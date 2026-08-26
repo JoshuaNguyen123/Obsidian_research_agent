@@ -200,6 +200,7 @@ import {
 import {
   decideAutoContinuation,
   resolvePendingToolsForAutoContinuation,
+  suppressedBudgetTerminalBlockerV1,
   type AutoContinuationDecision,
   type AutoContinuationReason,
 } from "./agent/autoContinuation";
@@ -17790,6 +17791,20 @@ export async function runAgentMission({
         const message =
           "Adaptive research budget is spent and its reserved publication turn did not close the accepted-research stage. The saved run requires explicit review before more retrieval.";
         events.onStatus?.(message);
+        // This terminal reports `budget` but forbids its own resume, so the
+        // host cannot continue it and the mission goes Idle with ready graph
+        // nodes and unspent budget. Say so DURABLY: `onStatus` is transient,
+        // and without a ledger blocker the run reported `blockedGraph: []`,
+        // `autoContinueReason: "not_budget"`, and no reason at all — the
+        // operator saw only "stopped before acceptance".
+        const suppressedBlocker = suppressedBudgetTerminalBlockerV1({
+          stopReason: "budget",
+          suppressAutoContinuation: true,
+          reason: `compound_research_closure_exhausted after ${compoundResearchGate.closureAttempts} reserved publication turn(s) at stage ${currentLifecycleStage ?? "unknown"}`,
+        });
+        if (suppressedBlocker) {
+          recordLedgerBlocker(suppressedBlocker);
+        }
         await finishRun(
           "budget",
           Math.max(0, step - 1),
