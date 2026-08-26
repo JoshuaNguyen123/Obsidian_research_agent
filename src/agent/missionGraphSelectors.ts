@@ -13,7 +13,7 @@ import {
   type MissionGraphV3,
 } from "../../packages/headless-runtime/src/missionGraphV3";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
-import { collectRequiredDependencyIds, isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority } from "./missionGraphAuthority";
+import { collectRequiredDependencyIds, isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
 import { type MissionEvidence } from "./missionLedger";
 import { getString, isRecord } from "./recordUtils";
 import type { MissionEvidenceAttestationV1 } from "../AgentRunner";
@@ -264,9 +264,7 @@ export function missionGraphOnlyFinalSynthesisRemainsV1(
   if (!final) return false;
   if (final.status !== "ready" && final.status !== "queued") return false;
   return Object.entries(nodes).every(([id, node]) =>
-    id === "final"
-      ? true
-      : node.status === "complete" || node.status === "cancelled",
+    id === "final" ? true : missionGraphNodeIsTerminalV1(node),
   );
 }
 

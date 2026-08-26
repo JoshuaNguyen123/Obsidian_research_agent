@@ -940,7 +940,8 @@ export function validateMissionGraphV3(graph: MissionGraphV3): void {
   for (const node of Object.values(nodes)) {
     if (requiresCompletedDependencies(node.status)) {
       const pending = node.dependencyIds.find(
-        (dependencyId) => nodes[dependencyId].status !== "complete",
+        (dependencyId) =>
+          !missionGraphNodeStatusIsTerminalV1(nodes[dependencyId].status),
       );
       if (pending) {
         fail(
@@ -3059,6 +3060,28 @@ function getNodeBindingIds(node: MissionNodeV3): string[] {
 
 function requiresCompletedDependencies(status: MissionNodeStatusV3): boolean {
   return !["queued", "blocked", "cancelled"].includes(status);
+}
+
+/**
+ * A node that no longer owes work. `cancelled` is as terminal as `complete`:
+ * a deliberately abandoned node will never produce evidence, so a dependant
+ * waiting for it to complete waits forever.
+ *
+ * This is the one shared definition three subsystems must agree on — the
+ * validator below, `MissionGraphSession.completeFinalOutput`, and
+ * `missionGraphOnlyFinalSynthesisRemainsV1`. They previously disagreed: the
+ * selector steered the loop to a final-only synthesis on `complete | cancelled`
+ * while the other two demanded `complete`, so a graph carrying one cancelled
+ * dependency was forced into a final answer that could never be recorded, and
+ * `plan:final:final_relevance` / `verifier:final:final_relevance` stayed
+ * missing for the rest of the mission. The `final` node declares a dependency
+ * on every other node, so this is reachable whenever any sibling is cancelled —
+ * including by `completeFinalOutput`'s own cancellation sweep.
+ */
+export function missionGraphNodeStatusIsTerminalV1(
+  status: MissionNodeStatusV3 | undefined,
+): boolean {
+  return status === "complete" || status === "cancelled";
 }
 
 function isStatusTransitionAllowed(

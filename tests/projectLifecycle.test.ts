@@ -7,6 +7,7 @@ import {
   LINEAR_HIERARCHY_STAGE_DISCHARGE_V1,
   LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES,
   nextProjectLineageStagesV1,
+  projectLineageCarriesLinearHierarchyV1,
   toolCommitsLinearHierarchyLineageV1,
   createProjectLifecycleIntentV1,
   createProjectLifecycleIntentV2,
@@ -848,6 +849,50 @@ test("a hierarchy-less mission records its verified commit and reaches the Resul
     projectLinearBindingsFromProjectLineageV1({ lineage }),
     [],
   );
+
+  // This is the exact single-issue shape the compound flow-real lane produces:
+  // five stages, no linear_hierarchy commit. Acceptance used to demand
+  // `linear_project_progress_terminal_readback` from it because the prompt
+  // said "full pipeline", while the host drain could only ever be satisfied by
+  // a hierarchy commit this ladder never plans. The demander must now read the
+  // same fact the satisfier reads.
+  assert.equal(
+    projectLineageCarriesLinearHierarchyV1({ lineage }),
+    false,
+    "a single-issue lineage must not arm the terminal Linear project drain",
+  );
+});
+
+test("terminal Linear drain arming reads the lineage commit, not prompt stage words", () => {
+  // The drain is the fourth consumer of the shared discharge answer. It is
+  // applicable exactly when the stage's OPTIONAL commit was actually written,
+  // so the single-issue tool -- which discharges the stage and writes no
+  // commit -- must never arm it.
+  assert.equal(LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.lineageCommitOptional, true);
+  assert.equal(
+    toolCommitsLinearHierarchyLineageV1(
+      LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.singleIssueToolName,
+    ),
+    false,
+    "a single-issue publication writes no linear_hierarchy commit, so the drain is inapplicable",
+  );
+
+  // Prompt wording detects the STAGE and cannot distinguish the two tools, so
+  // it is not a lawful source for the drain demand.
+  assert.ok(
+    detectProjectLifecycleStagesV1(
+      "Run the full pipeline: web research, Linear issue, repository workspace, private GitHub, and note reflection.",
+    ).includes("linear_hierarchy"),
+    "compound wording detects the stage even for a single-issue mission",
+  );
+
+  // Unparseable/absent lineages cannot claim a hierarchy: the delivery stage
+  // gates remain responsible for unpaid stages, not this projection.
+  assert.equal(projectLineageCarriesLinearHierarchyV1({ lineage: null }), false);
+  assert.equal(
+    projectLineageCarriesLinearHierarchyV1({ lineage: { commits: "nope" } }),
+    false,
+  );
 });
 
 test("only the declared-optional stage may be skipped and a missing commit is still refused", () => {
@@ -1112,6 +1157,14 @@ test("new lineage order proves validation and reflection while legacy order rema
       ? linearProof.workUnits?.[0]?.linearIssueIdentifier
       : null,
     "ENG-42",
+  );
+  // The positive half of the shared predicate: a lineage that really did build
+  // the hierarchy still arms the terminal drain, so the DU-06 end-to-end shape
+  // keeps its Linear progress readback.
+  assert.equal(
+    projectLineageCarriesLinearHierarchyV1({ lineage }),
+    true,
+    "a hierarchy-bearing lineage must still demand the terminal Linear drain",
   );
   const singleBinding = projectLinearBindingsFromProjectLineageV1({
     lineage,

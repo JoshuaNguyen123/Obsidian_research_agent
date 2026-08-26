@@ -157,6 +157,41 @@ export function toolCommitsLinearHierarchyLineageV1(toolName: string): boolean {
 }
 
 /**
+ * The fourth consumer of the shared answer above: terminal Linear PROJECT
+ * progress.
+ *
+ * `verifyProjectLifecycleCompletion` drains a per-work-unit progress outbox
+ * whose bindings are read out of the `linear_hierarchy` lineage commit
+ * (`projectLinearBindingsFromProjectLineageV1`). Because that commit is
+ * OPTIONAL — a single-issue publication discharges the stage and writes no
+ * commit — the drain is applicable only to lineages that actually carry it.
+ *
+ * Whoever decides *whether to demand* the drain must ask this question, not
+ * `detectProjectLifecycleStagesV1(prompt).includes("linear_hierarchy")`. Prompt
+ * wording detects the STAGE, and the stage is discharged by both tools; only
+ * the hierarchy tool leaves the commit the drain needs. Keying the demand off
+ * the prompt made acceptance require `linear_project_progress_terminal_readback`
+ * from single-issue missions that could never produce it, which stopped a
+ * fully-delivered compound run at the no-progress circuit.
+ */
+export function projectLineageCarriesLinearHierarchyV1(input: {
+  lineage: unknown;
+}): boolean {
+  let lineage: ProjectLineageV1;
+  try {
+    lineage = parseProjectLineageV1(input.lineage);
+  } catch {
+    // An unparseable lineage cannot be shown to carry the commit. Unpaid
+    // delivery stages remain the stage gates' responsibility, not this
+    // post-completion projection's.
+    return false;
+  }
+  return lineage.commits.some(
+    (commit) => commit.proof.stage === "linear_hierarchy",
+  );
+}
+
+/**
  * Stages a lineage may legitimately carry no commit for.
  *
  * Derived from the shared answer above rather than hand-listed, so the set can

@@ -29,7 +29,7 @@ import {
 } from "./missionGraphStore";
 import type { MissionGraphStoreReferenceV1 } from "./runStore";
 import { missionGraphToolNodeWallClockMs } from "./missionGraphHost";
-import { collectRequiredDependencyIds } from "./missionGraphAuthority";
+import { collectRequiredDependencyIds, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
 import { sha256Fingerprint } from "../../packages/headless-runtime/src/canonicalize";
 import { assertWorkspaceRelativePathV2 } from "../../extensions/code/workspaces/WorkspaceManifestV2";
 
@@ -2800,9 +2800,13 @@ export class MissionGraphSession {
             candidate.status !== "cancelled",
         );
       if (!node || node.status === "complete") return this.graph;
-      const dependenciesComplete = node.dependencyIds.every(
-        (dependencyId) =>
-          this.record.graph.nodes[dependencyId]?.status === "complete",
+      // Use the same terminal definition the runner steers on. Demanding
+      // `complete` here while missionGraphOnlyFinalSynthesisRemainsV1 accepts
+      // `complete | cancelled` let the loop force a final-only synthesis whose
+      // evidence this method then silently refused to record, stranding
+      // plan:final:final_relevance permanently missing.
+      const dependenciesComplete = node.dependencyIds.every((dependencyId) =>
+        missionGraphNodeIsTerminalV1(this.record.graph.nodes[dependencyId]),
       );
       if (!dependenciesComplete) return this.graph;
       const operations: MissionGraphPatchOperationV1[] = [];
