@@ -31,6 +31,15 @@ export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
   "disposable-live-external",
   // Single-call provider smoke; qualifies a model, not a mission.
   "provider-canary",
+  // Kill/resume durability proof: its evidence is the exactly-once marker
+  // assertions and append receipts inside the spec, not a scorecard. The
+  // daily-use reporter records no scenario mapping for it, and gating it on
+  // an absent baseline turned PASSING runs red after Playwright exit 0
+  // (2026-08-25: the gate fired post-success and the matrix could never
+  // harvest because harvest requires the green the gate just prevented).
+  "interrupted-continuation-live",
+  // Same shape: notebook cell proof is Jupyter execution + receipts in-spec.
+  "notebook-execution-live",
   // Bare-prompt Desktop delivery with no scenario mapping: the daily-use
   // reporter records scenarioId=null for it, so no scorecard is ever emitted.
   // Its proof lives in the execution report and mission acceptance asserts.

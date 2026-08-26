@@ -393,7 +393,11 @@ function runPlaywright(playwrightArgs) {
   return runCommand(process.execPath, [
     playwrightCli,
     "test",
-    `--reporter=json,./e2e/reporters/dailyUseReporter.ts`,
+    // `list` first: --reporter REPLACES the config's reporters, and without
+    // list no assertion text ever reaches stdout — every red then classified
+    // as process:matrix_unclassified (budget-exempt), which let a failing
+    // cell loop past its attempt budget to the campaign abort valve.
+    `--reporter=list,json,./e2e/reporters/dailyUseReporter.ts`,
     ...playwrightArgs,
   ], { PLAYWRIGHT_JSON_OUTPUT_NAME: PLAYWRIGHT_EXECUTION_REPORT_PATH });
 }

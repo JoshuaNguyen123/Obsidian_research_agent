@@ -413,11 +413,15 @@ test("the real AI harness clicks only the exact rendered prepared action", () =>
   }
 });
 
-test("the exclusive runner preserves both execution JSON and scorecard reports", () => {
+test("the exclusive runner preserves list output plus execution JSON and scorecard reports", () => {
+  // list must stay first: --reporter REPLACES the config's reporters, and
+  // without it no assertion text reaches stdout, so every red classifies as
+  // budget-exempt process:matrix_unclassified and a failing cell can loop
+  // past its attempt budget to the campaign abort valve.
   const runner = readFileText("../scripts/run-e2e-exclusive.mjs");
   assert.match(
     runner,
-    /--reporter=json,\.\/e2e\/reporters\/dailyUseReporter\.ts/u,
+    /--reporter=list,json,\.\/e2e\/reporters\/dailyUseReporter\.ts/u,
   );
 });
 
