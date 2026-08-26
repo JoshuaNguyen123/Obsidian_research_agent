@@ -9,7 +9,10 @@
 // harness, not the product; more than MAX_CONSECUTIVE_HARNESS_FAILURES of
 // them in a row for one cell aborts the campaign instead of looping. The
 // campaign fails fast when any `product:` failure class is seen twice — that is
-// a regression alarm, not a statistic.
+// a regression alarm, not a statistic. A lane that refuses to start because a
+// variable it requires is unset is `environment_not_configured`: terminal for
+// the cell, budget-exempt, and stamped `not_run` in the manifest — it is not a
+// red, because the product was never exercised (see that class below).
 //
 // Environment (PowerShell only — Git Bash mangles AGENTIC_SANDBOX_CI_RUNTIME_ROOT):
 //   PROOF_MATRIX_EXPECTED_HEAD   exact 40-char lowercase sha this campaign pins
@@ -559,6 +562,67 @@ const LANE_ASSERTION_PATTERNS = [
 export const LANE_ASSERTION_FAILURE_CLASS = "lane_assertion_failed";
 export const RENDERER_DEATH_FAILURE_CLASS = "harness:renderer_death";
 
+/**
+ * The lane refused to start because a variable IT requires is absent (or
+ * unusable) in the process environment. Nothing about the product was
+ * exercised, so this is not a red, not a green, and not an attempt: it is
+ * terminal for the cell, spends no budget, and is never scored.
+ *
+ * On 2026-08-26 08:49 `--cells=compound-linear-github` burned all five
+ * attempts in three minutes, every one of them dying instantly at
+ * compound-flow-real-live.spec.ts:116 on an unset LINEAR_LIVE_TEST_TEAM_ID.
+ * Because Playwright still printed a numbered failing-test header, each death
+ * matched LANE_ASSERTION_PATTERNS and was filed as `lane_assertion_failed` —
+ * the bucket a genuine product failure lands in — and the cell was recorded as
+ * "exhausted 5 attempts with streak 0/3". That record is indistinguishable
+ * from "the product failed five times" when the truth is that the cell never
+ * ran. An instrument must not misreport what it measured.
+ */
+export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS = "environment_not_configured";
+
+/**
+ * The live lanes guard their required environment with a `requiredEnvironment()`
+ * (or `requiredSecret()`) helper that throws a DELIBERATE, fixed, greppable
+ * sentence NAMING the variable. Detection keys on those whole sentences plus an
+ * ALL-CAPS variable token — never on a bare "missing" or "environment", either
+ * of which a product assertion could easily contain in its expected/received
+ * diff. Two contract families cover every such guard in e2e/:
+ *
+ *   A. "<label> is missing required environment <NAME>."
+ *      e2e/compound-flow-real-live.spec.ts, e2e/daily-use-compound.spec.ts,
+ *      e2e/obsidian-hello-github-live.spec.ts
+ *   B. "<NAME> is {required and must be bounded|missing or invalid}; no
+ *      external mutation was attempted."
+ *      e2e/disposable-live-external.spec.ts (env + secret guards) — the
+ *      trailing clause is itself the lane stating that it exercised nothing.
+ *
+ * Adding a new guard means speaking one of these two sentences; a lane that
+ * invents its own phrasing silently falls back to `lane_assertion_failed` and
+ * will burn its cell's budget, which is why the wording is a contract.
+ */
+const REQUIRED_ENVIRONMENT_CONTRACTS = [
+  /\bis missing required environment ([A-Z][A-Z0-9_]{2,})\b/gu,
+  /\b([A-Z][A-Z0-9_]{2,}) is (?:required and must be bounded|missing or invalid); no external mutation was attempted/gu,
+];
+
+/**
+ * Every required-environment variable the log reports as absent, in first-seen
+ * order and deduplicated. Empty when the log carries no such guard sentence —
+ * which is the only thing that distinguishes this class from a real red, so it
+ * is deliberately strict.
+ */
+export function detectMissingRequiredEnvironment(logText) {
+  const text = typeof logText === "string" ? logText : "";
+  const names = [];
+  for (const contract of REQUIRED_ENVIRONMENT_CONTRACTS) {
+    for (const match of text.matchAll(contract)) {
+      const name = match[1];
+      if (name && !names.includes(name)) names.push(name);
+    }
+  }
+  return names;
+}
+
 /** Earliest match of any pattern in the text, or null. */
 function firstPatternMatch(text, patterns) {
   let best = null;
@@ -570,19 +634,27 @@ function firstPatternMatch(text, patterns) {
 }
 
 /**
- * Failure class for a red attempt: prefer the lane's own proof-class
- * annotation, but only when the run summary was written during THIS attempt —
- * a summary left behind by an earlier run must not label a later failure.
- * Otherwise scan the attempt's captured output: harness-stage signatures
- * (pre-Playwright deaths) first — their classification must never change —
- * then renderer/target-closed driver deaths, then the failing lane's own
- * assertion text. Only a log with none of those stays matrix_unclassified,
- * and even then the log tail rides along in failureDetail.
+ * Failure class for a red attempt. A required-environment refusal is settled
+ * FIRST, ahead of even the lane's own proof class: a lane that threw on an
+ * absent variable never exercised the product, so nothing further down the log
+ * can be evidence about it. That precedence can only ever refuse to score a
+ * run — never score one falsely — which is the safe direction for an
+ * instrument. Otherwise prefer the lane's own proof-class annotation, but only
+ * when the run summary was written during THIS attempt — a summary left behind
+ * by an earlier run must not label a later failure. Otherwise scan the
+ * attempt's captured output: harness-stage signatures (pre-Playwright deaths)
+ * first — their classification must never change — then renderer/target-closed
+ * driver deaths, then the failing lane's own assertion text. Only a log with
+ * none of those stays matrix_unclassified, and even then the log tail rides
+ * along in failureDetail.
  */
 /**
  * How much to trust the classification:
- *   confirmed    — the lane's own fresh run-summary proof class matched (or
- *                  the attempt was green: nothing to classify).
+ *   confirmed    — the lane's own fresh run-summary proof class matched, or
+ *                  the lane's own required-environment guard named the absent
+ *                  variable (both are the lane stating a fact about itself,
+ *                  not the matrix guessing), or the attempt was green:
+ *                  nothing to classify.
  *   mechanical   — pattern-matched from the attempt log (harness signatures,
  *                  renderer deaths, lane assertions). Correct shape, but the
  *                  root cause was never confirmed by the lane or a human.
@@ -627,6 +699,22 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
   const text = typeof logText === "string" ? logText : "";
   const mechanical = collectMechanicalFailureClasses(text);
   const secondaryFor = (primary) => mechanical.filter((cls) => cls !== primary);
+  const missingEnvironment = detectMissingRequiredEnvironment(text);
+  if (missingEnvironment.length > 0) {
+    return {
+      failureClass: ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
+      detail:
+        `required environment not set: ${missingEnvironment.join(", ")}\n` +
+        attemptLogExcerptFrom(text, text.search(/\bis missing required environment\b|; no external mutation was attempted/u)),
+      confidence: CLASSIFICATION_CONFIRMED,
+      // Deliberately EMPTY even though the log also matches the lane-assertion
+      // patterns (Playwright still prints a numbered failing-test header for a
+      // guard that threw). Carrying `lane_assertion_failed` here would smuggle
+      // the same lie into a different column of the report.
+      secondaryClasses: [],
+      missingEnvironment,
+    };
+  }
   if (summaryFresh) {
     const records = Array.isArray(summary?.records)
       ? summary.records
@@ -909,9 +997,17 @@ export function reconcileInFlightAttempt(manifest) {
  * consecutive-green streak — on 2026-08-25 one bad commit burned a whole cell
  * in 3 minutes as four harness:build_failed reds. Real reds (model:*,
  * product:*, external:*) keep their full cost.
+ *
+ * `environment_not_configured` joins them: a lane that threw on an absent
+ * required variable measured nothing either. The live path aborts the cell
+ * before any attempt record is written, so this exemption is defense in depth
+ * — one shared predicate, so budget, streak and counts can never disagree
+ * about it if such a record ever reaches the manifest another way.
  */
 export function isInfrastructureFailureClass(failureClass) {
-  return /^(?:harness|process):/u.test(String(failureClass ?? ""));
+  const cls = String(failureClass ?? "");
+  if (cls === ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS) return true;
+  return /^(?:harness|process):/u.test(cls);
 }
 
 /** True when the attempt spends budget and can move the streak. */
@@ -974,6 +1070,41 @@ function totalAttemptCount(manifest, cellId) {
   return manifest.attempts.filter((attempt) => attempt.cell === cellId).length;
 }
 
+/**
+ * The per-cell verdict the manifest records, so a campaign report never has to
+ * infer a cell's fate from attempt arithmetic (where "0 greens" reads as red
+ * whether the cell failed or never ran):
+ *
+ *   done       — reached its consecutive-green bar. Product evidence.
+ *   exhausted  — spent its attempt budget without reaching the bar. Product
+ *                evidence, and a genuine red.
+ *   not_run    — never exercised the product at all (the environment it
+ *                requires was not configured). Honestly NEITHER green nor red.
+ */
+export const CELL_STATUS_DONE = "done";
+export const CELL_STATUS_EXHAUSTED = "exhausted";
+export const CELL_STATUS_NOT_RUN = "not_run";
+
+/**
+ * True when a cell's status carries product evidence and therefore belongs in
+ * a pass-rate. `not_run` does not: it must appear in neither the numerator nor
+ * the DENOMINATOR — counting it as a failure is the exact lie this status
+ * exists to prevent. One shared predicate for every future reader.
+ */
+export function cellStatusIsScored(status) {
+  return status === CELL_STATUS_DONE || status === CELL_STATUS_EXHAUSTED;
+}
+
+export function recordCellStatus(manifest, cellId, status, extra = {}) {
+  manifest.cellStatus = manifest.cellStatus ?? {};
+  manifest.cellStatus[cellId] = { status, ...extra };
+  return manifest.cellStatus[cellId];
+}
+
+export function cellStatusOf(manifest, cellId) {
+  return manifest.cellStatus?.[cellId]?.status ?? null;
+}
+
 async function main() {
   const expectedHead = (process.env.PROOF_MATRIX_EXPECTED_HEAD ?? "").trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(expectedHead)) {
@@ -1025,6 +1156,10 @@ async function main() {
         attempts: [],
         productClassCounts: {},
         harnessFailureCounts: {},
+        // Per-cell verdicts are campaign-scoped like the attempts they
+        // summarize: a fresh campaign must not inherit an earlier HEAD's
+        // `done`/`not_run` stamps through the loadManifest() spread.
+        cellStatus: {},
       };
   if (flag("--resume") && manifest.expectedHead && manifest.expectedHead !== expectedHead) {
     fail(`manifest pins ${manifest.expectedHead}; refusing to resume at ${expectedHead}.`);
@@ -1133,17 +1268,58 @@ async function main() {
       // One freshness verdict feeds BOTH classification and tool-event
       // sourcing — two predicates would eventually disagree.
       const summaryFresh = summaryWrittenDuring(RUN_SUMMARY_PATH, startedAt);
-      const {
-        failureClass,
-        detail: failureDetail,
-        confidence,
-        secondaryClasses,
-      } = classifyAttemptOutcome({
+      const classification = classifyAttemptOutcome({
         exitCode,
         summary,
         summaryFresh,
         logText: attemptLogText,
       });
+      const {
+        failureClass,
+        detail: failureDetail,
+        confidence,
+        secondaryClasses,
+      } = classification;
+
+      // METRIC INTEGRITY: the lane refused to start because the environment it
+      // requires is not configured, so it measured nothing. Stop the cell here,
+      // before ANY of the recording below runs:
+      //   - no CSV row       — a run that never happened has no run metrics,
+      //                        and every reader of playwright-run-metrics.csv
+      //                        counts each row in its pass-rate denominator;
+      //   - no attempt record — budget and streak stay exactly where they were,
+      //                        and nothing can later read as "attempted";
+      //   - no in-flight marker — otherwise the next --resume would reconcile
+      //                        it into a phantom attempt;
+      //   - cellStatus not_run — the positive record: neither green nor red.
+      // Burning the budget on a misconfiguration is waste; scoring it is a lie.
+      if (failureClass === ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS) {
+        const missing = classification.missingEnvironment ?? [];
+        const missingList = missing.join(", ");
+        clearAttemptInFlight(manifest);
+        recordCellStatus(manifest, cell.id, CELL_STATUS_NOT_RUN, {
+          failureClass,
+          missingEnvironment: missing,
+          detectedAt: new Date(endedAt).toISOString(),
+          project: cell.project,
+          attemptsConsumed: consumedAttemptCount(manifest, cell.id),
+          maxAttempts: cell.maxAttempts,
+          attemptLog: path.relative(REPO_ROOT, attemptLogPath),
+          note:
+            "the lane threw on required environment that is not configured, before it exercised the " +
+            "product: not an attempt, not a red, not scored",
+        });
+        saveManifest(manifest);
+        fail(
+          `cell '${cell.id}' did NOT RUN — required environment not configured: ${missingList}. ` +
+          `${cell.project} threw before it exercised the product, so this is neither a green nor a red: ` +
+          `no attempt budget was spent (${consumedAttemptCount(manifest, cell.id)}/${cell.maxAttempts} ` +
+          `still available), no streak was recorded, and the manifest marks the cell '${CELL_STATUS_NOT_RUN}'. ` +
+          `Set ${missingList} in the campaign environment (PowerShell) and re-run with --resume. ` +
+          `Attempt log: ${path.relative(REPO_ROOT, attemptLogPath)}.`,
+        );
+      }
+
       if (!green) {
         console.error(
           `proof-matrix[${stage}]: red (exit ${exitCode}, ${failureClass}). Attempt log tail:\n` +
@@ -1280,13 +1456,22 @@ async function main() {
     }
 
     const streak = consecutiveGreens(manifest, cell.id);
+    const cellVerdict = {
+      project: cell.project,
+      greens: streak,
+      requiredGreens: cell.requiredGreens,
+      attemptsConsumed: consumedAttemptCount(manifest, cell.id),
+      maxAttempts: cell.maxAttempts,
+    };
     if (streak < cell.requiredGreens) {
+      recordCellStatus(manifest, cell.id, CELL_STATUS_EXHAUSTED, cellVerdict);
       saveManifest(manifest);
       fail(
         `cell '${cell.id}' exhausted ${cell.maxAttempts} attempts with streak ${streak}/${cell.requiredGreens}. ` +
         "Investigate before spending more.",
       );
     }
+    recordCellStatus(manifest, cell.id, CELL_STATUS_DONE, cellVerdict);
     console.log(`proof-matrix: cell '${cell.id}' DONE (${streak} consecutive greens).`);
   }
 

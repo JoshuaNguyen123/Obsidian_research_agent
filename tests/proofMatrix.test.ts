@@ -12,9 +12,17 @@ import {
   CLASSIFICATION_CONFIRMED,
   CLASSIFICATION_MECHANICAL,
   CLASSIFICATION_UNCLASSIFIED,
+  CELL_STATUS_DONE,
+  CELL_STATUS_EXHAUSTED,
+  CELL_STATUS_NOT_RUN,
+  ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
   IN_FLIGHT_FAILURE_CLASS,
   LANE_ASSERTION_FAILURE_CLASS,
   BLOCKER_BUCKETS,
+  cellStatusIsScored,
+  cellStatusOf,
+  detectMissingRequiredEnvironment,
+  recordCellStatus,
   LEGACY_RUN_CSV_HEADER,
   RUN_CSV_HEADER,
   TOOL_EVENT_SOURCE_GRAPHS,
@@ -811,4 +819,199 @@ test("classification confidence: confirmed from summaries, mechanical from logs,
     }).confidence,
     CLASSIFICATION_UNCLASSIFIED,
   );
+});
+
+// ---------------------------------------------------------------------------
+// environment_not_configured — a run that never happened must never be scored
+// ---------------------------------------------------------------------------
+
+/**
+ * Verbatim shape of the 2026-08-26 08:49 attempt log: the lane threw at
+ * compound-flow-real-live.spec.ts:116 because LINEAR_LIVE_TEST_TEAM_ID was
+ * absent from the process environment, and Playwright still printed a numbered
+ * failing-test header — which is exactly why the matrix filed all five
+ * attempts as `lane_assertion_failed` and reported "streak 0/3".
+ */
+const MISSING_ENV_ATTEMPT_LOG = [
+  "Running 1 test using 1 worker",
+  "  1) [compound-flow-real-live] › e2e/compound-flow-real-live.spec.ts:98:3 › compound Linear + GitHub flow ─",
+  "",
+  "    Error: compound-flow-real-live is missing required environment LINEAR_LIVE_TEST_TEAM_ID. It mutates a real Linear workspace, so the target team must be named explicitly.",
+  "",
+  "      at requiredEnvironment (e2e/compound-flow-real-live.spec.ts:1984:11)",
+  "      at e2e/compound-flow-real-live.spec.ts:116:18",
+  "",
+  "  1 failed",
+].join("\n");
+
+test("an absent required environment variable is NOT a lane assertion failure", () => {
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: MISSING_ENV_ATTEMPT_LOG,
+  });
+  // The whole point: this log used to land in the same bucket as a genuine
+  // product failure.
+  assert.notEqual(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, "environment_not_configured");
+  assert.deepEqual(outcome.missingEnvironment, ["LINEAR_LIVE_TEST_TEAM_ID"]);
+  // The lane named the variable itself — that is a fact, not a mechanical guess.
+  assert.equal(outcome.confidence, CLASSIFICATION_CONFIRMED);
+  // The operator must be able to read the variable straight out of the detail.
+  assert.match(outcome.detail, /LINEAR_LIVE_TEST_TEAM_ID/u);
+  // The log DOES match the lane-assertion patterns; carrying that as a
+  // secondary class would smuggle the same lie into another column.
+  assert.deepEqual(outcome.secondaryClasses, []);
+});
+
+test("an absent required environment variable spends no attempt budget and moves no streak", () => {
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: MISSING_ENV_ATTEMPT_LOG,
+  });
+  const attempt = red("compound-linear-github", outcome.failureClass);
+  // Budget: a misconfiguration is not evidence about the product.
+  assert.equal(isInfrastructureFailureClass(outcome.failureClass), true);
+  assert.equal(attemptConsumesBudget(attempt), false);
+  // Streak: five of these in a row must not turn a 2-green cell into 0/3.
+  const manifest = manifestWith([
+    green("compound-linear-github"),
+    green("compound-linear-github"),
+    attempt,
+    attempt,
+    attempt,
+    attempt,
+    attempt,
+  ]);
+  assert.equal(consecutiveGreens(manifest, "compound-linear-github"), 2);
+  assert.equal(consumedAttemptCount(manifest, "compound-linear-github"), 2);
+  // And it is never a regression alarm either — it is not a product class.
+  assert.equal(registerProductFailure(manifestWith([]), outcome.failureClass), false);
+});
+
+test("required-environment detection keys on the shared guard contract, across every spec that speaks it", () => {
+  // e2e/compound-flow-real-live.spec.ts and e2e/daily-use-compound.spec.ts
+  assert.deepEqual(
+    detectMissingRequiredEnvironment(
+      "Error: Protected DU-06 is missing required environment E2E_RELEASE_COMMIT_SHA.",
+    ),
+    ["E2E_RELEASE_COMMIT_SHA"],
+  );
+  // e2e/obsidian-hello-github-live.spec.ts (unified onto the same sentence)
+  assert.deepEqual(
+    detectMissingRequiredEnvironment(
+      "Error: OBS-HELLO is missing required environment E2E_GITHUB_TOKEN.",
+    ),
+    ["E2E_GITHUB_TOKEN"],
+  );
+  // e2e/disposable-live-external.spec.ts — env guard and secret guard
+  assert.deepEqual(
+    detectMissingRequiredEnvironment(
+      "Error: E2E_LIVE_PROVIDER is required and must be bounded; no external mutation was attempted.",
+    ),
+    ["E2E_LIVE_PROVIDER"],
+  );
+  assert.deepEqual(
+    detectMissingRequiredEnvironment(
+      "Error: E2E_GITHUB_TOKEN is missing or invalid; no external mutation was attempted.",
+    ),
+    ["E2E_GITHUB_TOKEN"],
+  );
+  // Several absent variables in one log: all named, first-seen order, deduped.
+  assert.deepEqual(
+    detectMissingRequiredEnvironment(
+      [
+        "Error: compound-flow-real-live is missing required environment LINEAR_LIVE_TEST_TEAM_ID.",
+        "Error: compound-flow-real-live is missing required environment LINEAR_LIVE_TEST_PROJECT_ID.",
+        "Error: compound-flow-real-live is missing required environment LINEAR_LIVE_TEST_TEAM_ID.",
+      ].join("\n"),
+    ),
+    ["LINEAR_LIVE_TEST_TEAM_ID", "LINEAR_LIVE_TEST_PROJECT_ID"],
+  );
+});
+
+test("product assertions that merely mention missing environments stay lane_assertion_failed", () => {
+  // Every one of these is a REAL red whose text brushes against the words
+  // "missing" / "environment" / "required". None may be excused as a
+  // misconfiguration: that would silently forgive product failures.
+  const productReds = [
+    [
+      "  1) [daily-use-research] › e2e/daily-use-research.spec.ts:41:5 › DU-02 sourced writeback ─",
+      "    Error: expect(received).toContain(expected)",
+      '    Expected substring: "semantic expansion"',
+      '    Received string: "Mission stopped: the environment is missing a required note"',
+      "  1 failed",
+    ].join("\n"),
+    [
+      "  1) [compound-flow-real-live] › e2e/compound-flow-real-live.spec.ts:98:3 › compound flow ─",
+      "    Error: expect(received).toBe(expected)",
+      '    Expected: "missing required environment variables were reported to the user"',
+      '    Received: "no such report"',
+      "  1 failed",
+    ].join("\n"),
+    [
+      "  1) [vault-recall] › e2e/vault-recall.spec.ts:12:1 › recalls ─",
+      "    AssertionError: required environment section is missing from the note",
+      "  1 failed",
+    ].join("\n"),
+  ];
+  for (const logText of productReds) {
+    assert.deepEqual(detectMissingRequiredEnvironment(logText), []);
+    const outcome = classifyAttemptOutcome({ exitCode: 1, summaryFresh: false, logText });
+    assert.equal(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+    assert.equal(attemptConsumesBudget(red("vault-recall", outcome.failureClass)), true);
+  }
+});
+
+test("a not-run cell is neither green nor red, and never enters a pass-rate denominator", () => {
+  const manifest = manifestWith([green("vault-recall"), green("vault-recall")]);
+  recordCellStatus(manifest, "vault-recall", CELL_STATUS_DONE, { greens: 2 });
+  recordCellStatus(manifest, "compound-linear-github", CELL_STATUS_NOT_RUN, {
+    failureClass: ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
+    missingEnvironment: ["LINEAR_LIVE_TEST_TEAM_ID"],
+  });
+
+  assert.equal(cellStatusOf(manifest, "compound-linear-github"), CELL_STATUS_NOT_RUN);
+  assert.equal(cellStatusOf(manifest, "compound-linear-github"), "not_run");
+  // The cell has NO attempt records at all — the abort happens before any are
+  // written, so attempt arithmetic cannot present it as attempted-and-failed.
+  assert.equal(consumedAttemptCount(manifest, "compound-linear-github"), 0);
+  assert.equal(
+    manifest.attempts.filter((a) => a.cell === "compound-linear-github").length,
+    0,
+  );
+  // Scored/not-scored is one shared predicate for every reader.
+  assert.equal(cellStatusIsScored(CELL_STATUS_NOT_RUN), false);
+  assert.equal(cellStatusIsScored(CELL_STATUS_DONE), true);
+  assert.equal(cellStatusIsScored(CELL_STATUS_EXHAUSTED), true);
+  const scored = Object.values(manifest.cellStatus ?? {}).filter((verdict) =>
+    cellStatusIsScored(verdict.status),
+  );
+  assert.equal(scored.length, 1, "a not-run cell must not sit in the denominator");
+});
+
+test("the matrix aborts on environment_not_configured before it records anything", () => {
+  // main() cannot be unit-run (it drives real lanes), so pin the ORDER of the
+  // recording steps in the source: the abort must come before the CSV row and
+  // before the attempt record, or a not-run cell reappears as a red row.
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "run-proof-matrix.mjs"),
+    "utf8",
+  );
+  const guard = source.indexOf("if (failureClass === ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS) {");
+  const csvRow = source.indexOf("appendRunCsvRow([");
+  const attemptPush = source.indexOf("manifest.attempts.push({");
+  assert.ok(guard > 0, "the attempt loop must guard on environment_not_configured");
+  assert.ok(csvRow > 0 && attemptPush > 0);
+  assert.ok(guard < csvRow, "the abort must precede the CSV row (a run that never happened has no metrics)");
+  assert.ok(guard < attemptPush, "the abort must precede the attempt record (budget and streak stay put)");
+  // The in-flight marker must be cleared, or the next --resume reconciles this
+  // non-attempt into a phantom harness attempt.
+  const abortBlock = source.slice(guard, csvRow);
+  assert.match(abortBlock, /clearAttemptInFlight\(manifest\)/u);
+  assert.match(abortBlock, /CELL_STATUS_NOT_RUN/u);
+  // And the operator is told exactly which variables to set.
+  assert.match(abortBlock, /did NOT RUN — required environment not configured: \$\{missingList\}/u);
 });

@@ -362,7 +362,11 @@ async function listOpenPullRequests(
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
-  if (!value) throw new Error(`OBS-HELLO requires ${name}.`);
+  // Same guard, same condition — but phrased in the shared contract sentence
+  // ("<label> is missing required environment <NAME>") that the proof matrix
+  // greps to tell "not configured" apart from "the product failed". A lane
+  // with its own phrasing is scored as a red it never earned.
+  if (!value) throw new Error(`OBS-HELLO is missing required environment ${name}.`);
   return value;
 }
 

@@ -30,6 +30,11 @@ export function classifyAttemptOutcome(input: {
   detail: string;
   confidence: ClassificationConfidence;
   secondaryClasses: string[];
+  /**
+   * Present only on ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS: the required
+   * variables the lane named as absent, in first-seen order.
+   */
+  missingEnvironment?: string[];
 };
 export const LEGACY_RUN_CSV_HEADER: string;
 export const RUN_CSV_HEADER: string;
@@ -83,6 +88,8 @@ export function attemptLogExcerptFrom(
 ): string;
 export const LANE_ASSERTION_FAILURE_CLASS: string;
 export const RENDERER_DEATH_FAILURE_CLASS: string;
+export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS: "environment_not_configured";
+export function detectMissingRequiredEnvironment(logText: string): string[];
 export const PROOF_MATRIX_STATE_RELATIVE_DIR: string;
 export const PROOF_MATRIX_MANIFEST_RELATIVE_PATH: string;
 export const PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR: string;
@@ -116,13 +123,34 @@ export interface ProofMatrixAttempt {
   failureClass: string;
   [key: string]: unknown;
 }
+export type ProofMatrixCellStatus = "done" | "exhausted" | "not_run";
+export interface ProofMatrixCellVerdict {
+  status: ProofMatrixCellStatus;
+  [key: string]: unknown;
+}
 export interface ProofMatrixManifest {
   attempts: ProofMatrixAttempt[];
   productClassCounts: Record<string, number>;
   harnessFailureCounts?: Record<string, number>;
+  /** Per-cell verdicts; `not_run` is neither green nor red (never scored). */
+  cellStatus?: Record<string, ProofMatrixCellVerdict>;
   inFlight?: unknown;
   [key: string]: unknown;
 }
+export const CELL_STATUS_DONE: "done";
+export const CELL_STATUS_EXHAUSTED: "exhausted";
+export const CELL_STATUS_NOT_RUN: "not_run";
+export function cellStatusIsScored(status: string | null | undefined): boolean;
+export function recordCellStatus(
+  manifest: ProofMatrixManifest,
+  cellId: string,
+  status: ProofMatrixCellStatus,
+  extra?: Record<string, unknown>,
+): ProofMatrixCellVerdict;
+export function cellStatusOf(
+  manifest: ProofMatrixManifest,
+  cellId: string,
+): ProofMatrixCellStatus | null;
 export const MAX_CONSECUTIVE_HARNESS_FAILURES: number;
 export function isInfrastructureFailureClass(
   failureClass: string | null | undefined,
