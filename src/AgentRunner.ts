@@ -147,7 +147,6 @@ import {
   hasExplicitPermanentLinearDeleteIntent,
 } from "./agent/linearIntent";
 import {
-  canonicalSeedExactAcceptedResearchPackageV1,
   hasExplicitResearchPublicationIntent,
   PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
 } from "./tools/researchPublicationTool";
@@ -11029,38 +11028,6 @@ export async function runAgentMission({
           outputPreview: {
             echoedIssueId,
             exactIssueIdentity: canonicalLinearReadId,
-          },
-        });
-      }
-    }
-    if (toolCall.name === PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) {
-      // Seed-exactness mirror of the linear_get_issue canonicalization above:
-      // while a durable project idea seed exists, its seed-bound fields have
-      // exactly one admissible value each, so the host substitutes the seeded
-      // values for a model paraphrase and journals the substitution here at
-      // the execution boundary. The tool's own parse seat consumes the SAME
-      // predicate for non-runner callers; the drift guard is unchanged and
-      // still rejects any value without seed authority, and the post-publish
-      // verifier/readback stays fail-closed.
-      const seedExact = canonicalSeedExactAcceptedResearchPackageV1({
-        toolName: toolCall.name,
-        packageValue: toolCall.arguments.package,
-        runtimeCache,
-      });
-      if (seedExact) {
-        toolCall.arguments = {
-          ...toolCall.arguments,
-          package: seedExact.packageValue,
-        };
-        events.onTrace?.({
-          id: `${step}:publish_research_to_linear:seed-exact-fields-canonicalized`,
-          kind: "status",
-          step,
-          toolName: toolCall.name,
-          message:
-            "Host replaced paraphrased seed-bound accepted research fields with the exact values from the durable project idea seed.",
-          outputPreview: {
-            substitutedFields: seedExact.substitutedFields,
           },
         });
       }
