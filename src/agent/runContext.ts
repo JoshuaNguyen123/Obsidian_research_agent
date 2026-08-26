@@ -626,3 +626,67 @@ function findLastIndex<T>(
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+
+/**
+ * How much of a prompt is byte-identical to the previous one.
+ *
+ * On a cloud-billed provider the agent loop resends a long, unchanged prefix --
+ * system prompt, tool policies, authority blocks -- on every one of up to 100
+ * steps. Providers that cache automatically match on an exact byte prefix, so
+ * the only thing that matters is how far the two prompts agree before the first
+ * difference. One changed character near the top costs the whole cache for that
+ * call.
+ *
+ * Appending to the message list preserves that prefix. Compaction does not:
+ * `compactLoopMessages` rebuilds the array as prefix + mission state + recent,
+ * and `keepPrefixMessages` retains a *different* set of authority blocks
+ * depending on how deep the compaction had to go (six, then three, then one).
+ * So the prefix can shrink mid-run, and it does so on long missions -- exactly
+ * the expensive ones. This measures that instead of assuming it.
+ */
+export interface PromptPrefixReuseV1 {
+  /** Characters identical to the previous prompt, counted from the start. */
+  stableChars: number;
+  /** Total characters in the new prompt. */
+  totalChars: number;
+  /** stableChars / totalChars, 1 when nothing before the tail changed. */
+  reuseRatio: number;
+  /** Index of the first message that differs, or null when none does. */
+  firstDivergentIndex: number | null;
+}
+
+export function measurePromptPrefixReuseV1(
+  previous: ModelChatMessage[],
+  next: ModelChatMessage[],
+): PromptPrefixReuseV1 {
+  let stableChars = 0;
+  let firstDivergentIndex: number | null = null;
+
+  const shared = Math.min(previous.length, next.length);
+  for (let index = 0; index < shared; index += 1) {
+    const before = previous[index];
+    const after = next[index];
+    if (before.role === after.role && before.content === after.content) {
+      stableChars += after.content.length;
+      continue;
+    }
+    firstDivergentIndex = index;
+    break;
+  }
+  if (firstDivergentIndex === null && next.length > previous.length) {
+    // Pure append: everything the provider saw last time is still there, and
+    // the new turns are the only uncached part.
+    firstDivergentIndex = previous.length;
+  }
+
+  const totalChars = next.reduce(
+    (total, message) => total + message.content.length,
+    0,
+  );
+  return {
+    stableChars,
+    totalChars,
+    reuseRatio: totalChars === 0 ? 1 : stableChars / totalChars,
+    firstDivergentIndex,
+  };
+}
