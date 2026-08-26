@@ -1,4 +1,6 @@
 import {
+  LINEAR_HIERARCHY_STAGE_DISCHARGE_V1,
+  LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES,
   PROJECT_LIFECYCLE_STAGES,
   type ProjectLifecycleStageV1,
 } from "./projectLifecycle";
@@ -150,8 +152,13 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
   ],
   linear_hierarchy: [
-    PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
-    PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+    // Both publication tools, taken from the one shared answer in
+    // projectLifecycle rather than listed again here. That module also
+    // declares the half of the answer this allowlist cannot see: only the
+    // hierarchy tool can write the stage's durable lineage commit, so the
+    // lineage treats the stage's commit as optional instead of stalling a
+    // legitimate single-issue mission at one commit.
+    ...LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES,
     "linear_get_connection_context",
     "linear_create_issue",
     "linear_get_issue",

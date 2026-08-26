@@ -584,6 +584,7 @@ import {
   advanceProjectLineageV1,
   createProjectLineageV1,
   createResearcherHandoffV1,
+  nextProjectLineageStagesV1,
   parseGitHubPublicationLineageProofV2,
   parseProjectLineageNamespaceV1,
   projectGitHubPublicationLineageProofV2ToCompatibleV1,
@@ -12292,7 +12293,11 @@ export default class AgenticResearcherPlugin extends Plugin {
           binding.repository.toLowerCase()
       );
     });
-    if (!lineage || lineage.commits.length < 4) return;
+    // The finder above already requires a matching private_github_publication
+    // commit, so the prerequisite is proven by construction; `commits.length <
+    // 4` added nothing but a second silent drop for lineages that legitimately
+    // carry fewer stages (no Linear hierarchy, or the legacy branch).
+    if (!lineage) return;
     if (
       checkpoint.receipt.commitKind === "committed" &&
       !checkpoint.receipt.grantId
@@ -14442,12 +14447,30 @@ export default class AgenticResearcherPlugin extends Plugin {
           origin.artifact.artifactFingerprint,
     );
     // Standalone verified publication remains supported without manufacturing
-    // an end-to-end project lineage. Compound lifecycle lineage begins only
-    // after the exact Linear hierarchy has been committed.
-    if (!lineage || lineage.commits.length < 2) return null;
+    // an end-to-end project lineage: no lineage bound to this accepted-research
+    // artifact means no compound mission is in flight.
+    if (!lineage) return null;
     const existingExecution = lineage.commits.find(
       (commit) => commit.stage === "code_execution",
     );
+    // FAIL CLOSED. This used to be `lineage.commits.length < 2`, a stand-in for
+    // "the Linear hierarchy has been committed" that silently returned null for
+    // any lineage still at one commit. A mission that legitimately published a
+    // single Linear issue never reaches two commits, so a REAL, attested commit
+    // SHA was dropped from the durable lineage with no diagnostic at all -- the
+    // mission then ran three more nodes and died in write_project_results with
+    // a message about the reader ("commitAttested true, commitSha null")
+    // instead of the missing prerequisite stage. The lineage contract now
+    // decides what may follow, and a refusal says which stage is missing.
+    if (!existingExecution) {
+      const recorded = lineage.commits.map((commit) => commit.stage);
+      const expected = nextProjectLineageStagesV1(recorded);
+      if (!expected.includes("code_execution")) {
+        throw new Error(
+          `Verified commit ${handoff.commitSha} cannot be committed to project lineage ${lineage.lineageId}: it records ${recorded.join(" -> ")} and requires ${expected.join(" or ") || "no further stage"} before code_execution.`,
+        );
+      }
+    }
     if (existingExecution) {
       if (
         existingExecution.proof.stage !== "code_execution" ||
@@ -14722,7 +14745,23 @@ export default class AgenticResearcherPlugin extends Plugin {
         candidate.commits[0].proof.artifactFingerprint ===
           input.origin.artifact.artifactFingerprint,
     );
-    if (!lineage || lineage.commits.length < 3) return;
+    // Same fail-open one stage later: `commits.length < 3` only ever happened
+    // to equal "the verified commit is already recorded". A hierarchy-less
+    // lineage reaches this point with exactly three commits by coincidence, and
+    // a legacy-branch one with two -- which silently dropped the publication.
+    // Ask the lineage for its verified commit instead of counting.
+    if (!lineage) return;
+    if (
+      !lineage.commits.some(
+        (commit) =>
+          commit.stage === "code_validation" ||
+          commit.stage === "code_execution",
+      )
+    ) {
+      throw new Error(
+        `GitHub publication cannot be committed to project lineage ${lineage.lineageId}: it records ${lineage.commits.map((commit) => commit.stage).join(" -> ")} and carries no verified code commit to bind the remote SHA to.`,
+      );
+    }
     const binding =
       this.trustedGitHubRepositoryBindingsV2[
         input.handoff.repositoryProfileKey

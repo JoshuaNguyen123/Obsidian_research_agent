@@ -4,6 +4,10 @@ import test from "node:test";
 import {
   advanceProjectLineageV1,
   buildProjectLifecycleStageNodesV1,
+  LINEAR_HIERARCHY_STAGE_DISCHARGE_V1,
+  LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES,
+  nextProjectLineageStagesV1,
+  toolCommitsLinearHierarchyLineageV1,
   createProjectLifecycleIntentV1,
   createProjectLifecycleIntentV2,
   createProjectLineageV1,
@@ -679,6 +683,243 @@ test("project lineage advances once per verified stage and binds exact local and
     committedAt: "2026-07-16T12:05:00.000Z",
     proof: lineage.commits[4].proof,
   }), /already complete/u);
+});
+
+test("the one shared answer says both tools discharge linear_hierarchy but only the hierarchy tool commits its lineage", () => {
+  assert.deepEqual([...LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES].sort(), [
+    "publish_research_project_to_linear",
+    "publish_research_to_linear",
+  ]);
+  assert.equal(
+    toolCommitsLinearHierarchyLineageV1("publish_research_project_to_linear"),
+    true,
+  );
+  // The half the lifecycle allowlist and mission acceptance could not see. A
+  // single issue has no initiative and no project, so it has nothing honest to
+  // put in the commit proof -- which is why the stage's commit is optional
+  // rather than why the tool should be dropped from the stage.
+  assert.equal(
+    toolCommitsLinearHierarchyLineageV1("publish_research_to_linear"),
+    false,
+  );
+  assert.equal(LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.lineageCommitOptional, true);
+});
+
+test("a hierarchy-less mission records its verified commit and reaches the Results binding", () => {
+  const artifact = acceptedArtifact();
+  const handoff = createResearcherHandoffV1({
+    artifact,
+    runId: artifact.originRunId,
+    taskId: "research-task-single-issue",
+    evidenceIds: ["evidence-web"],
+    summary: "Accepted research published as one Linear issue.",
+    unresolvedQuestions: [],
+    acceptedAt: AT,
+  });
+  let lineage = createProjectLineageV1({
+    lineageId: "project-lineage-single-issue",
+    runId: artifact.originRunId,
+    vaultBindingKey: "current-vault",
+    handoff,
+    updatedAt: AT,
+  });
+
+  // publish_research_to_linear discharged linear_hierarchy and wrote no commit
+  // for it, so the lineage is still one commit deep when the verified commit
+  // arrives. That used to be a dead end.
+  assert.equal(lineage.commits.length, 1);
+  assert.deepEqual(nextProjectLineageStagesV1(["accepted_research"]), [
+    "linear_hierarchy",
+    "code_execution",
+  ]);
+
+  const commitSha = "b".repeat(40);
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:02:00.000Z",
+    proof: {
+      stage: "code_execution",
+      repositoryProfileKey: "compound-flow-real-ts",
+      repositoryProfileFingerprint: SHA("a"),
+      workspaceId: "flow-real-workspace",
+      validationReceiptFingerprints: [SHA("b"), SHA("c")],
+      diffFingerprint: SHA("f"),
+      targetedValidationPassed: true,
+      freshFullValidationPassed: true,
+      commitSha,
+      commitReadbackFingerprint: SHA("d"),
+    },
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:03:00.000Z",
+    proof: {
+      stage: "code_validation",
+      repositoryProfileKey: "compound-flow-real-ts",
+      repositoryProfileFingerprint: SHA("a"),
+      workspaceId: "flow-real-workspace",
+      validationReceiptFingerprints: [SHA("b"), SHA("c")],
+      diffFingerprint: SHA("f"),
+      targetedValidationPassed: true,
+      freshFullValidationPassed: true,
+      commitSha,
+      commitReadbackFingerprint: SHA("d"),
+    },
+  });
+
+  // The SHA check that never ran while the hole existed: tool-21 could only
+  // "succeed" because private_github_publication was never committed either.
+  assert.throws(
+    () =>
+      advanceProjectLineageV1({
+        lineage,
+        committedAt: "2026-07-16T12:04:00.000Z",
+        proof: {
+          stage: "private_github_publication",
+          trustedBindingFingerprint: SHA("e"),
+          owner: "acme",
+          repository: "flow-real",
+          verifiedPrivate: true,
+          branch: "codex/flow-real",
+          pullRequestNumber: 7,
+          draft: true,
+          remoteSha: "c".repeat(40),
+          repositoryReadbackFingerprint: SHA("f"),
+          pullRequestReadbackFingerprint: SHA("1"),
+        },
+      }),
+    /remote SHA must equal/u,
+  );
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:04:00.000Z",
+    proof: {
+      stage: "private_github_publication",
+      trustedBindingFingerprint: SHA("e"),
+      owner: "acme",
+      repository: "flow-real",
+      verifiedPrivate: true,
+      branch: "codex/flow-real",
+      pullRequestNumber: 7,
+      draft: true,
+      remoteSha: commitSha,
+      repositoryReadbackFingerprint: SHA("f"),
+      pullRequestReadbackFingerprint: SHA("1"),
+    },
+  });
+  lineage = advanceProjectLineageV1({
+    lineage,
+    committedAt: "2026-07-16T12:05:00.000Z",
+    proof: {
+      stage: "reflection",
+      resultsPath: "E2E Agent Tests/FLOW-REAL-results.md",
+      resultsSha256: SHA("2"),
+      writeReceiptFingerprint: SHA("3"),
+      summaryFingerprint: SHA("4"),
+    },
+  });
+
+  assert.deepEqual(
+    lineage.commits.map((commit) => commit.stage),
+    [
+      "accepted_research",
+      "code_execution",
+      "code_validation",
+      "private_github_publication",
+      "reflection",
+    ],
+  );
+  assert.equal(parseProjectLineageV1(lineage).fingerprint, lineage.fingerprint);
+
+  // Exactly the lookup write_project_results performs before it will emit
+  // verified code examples. It found nothing at all before this fix, which is
+  // why tool-22 refused with commitAttested true and commitSha null.
+  const resultsBindings = lineage.commits.filter(
+    (commit) =>
+      (commit.proof.stage === "code_execution" ||
+        commit.proof.stage === "code_validation") &&
+      commit.proof.commitSha === commitSha,
+  );
+  assert.equal(resultsBindings.length, 2);
+
+  // A hierarchy-less lineage yields no Linear work-unit bindings, and says so
+  // by returning nothing rather than by refusing the mission.
+  assert.deepEqual(
+    projectLinearBindingsFromProjectLineageV1({ lineage }),
+    [],
+  );
+});
+
+test("only the declared-optional stage may be skipped and a missing commit is still refused", () => {
+  const artifact = acceptedArtifact();
+  const handoff = createResearcherHandoffV1({
+    artifact,
+    runId: artifact.originRunId,
+    taskId: "research-task-strictness",
+    evidenceIds: ["evidence-web"],
+    summary: "Accepted research package.",
+    unresolvedQuestions: [],
+    acceptedAt: AT,
+  });
+  const lineage = createProjectLineageV1({
+    lineageId: "project-lineage-strictness",
+    runId: artifact.originRunId,
+    vaultBindingKey: "current-vault",
+    handoff,
+    updatedAt: AT,
+  });
+
+  // A mission that genuinely never committed cannot jump to publication: the
+  // sequence list gained hierarchy-less variants, the matcher did NOT become a
+  // subsequence test, so every other stage is still mandatory and in order.
+  assert.throws(
+    () =>
+      advanceProjectLineageV1({
+        lineage,
+        committedAt: "2026-07-16T12:02:00.000Z",
+        proof: {
+          stage: "private_github_publication",
+          trustedBindingFingerprint: SHA("e"),
+          owner: "acme",
+          repository: "flow-real",
+          verifiedPrivate: true,
+          branch: "codex/flow-real",
+          pullRequestNumber: 7,
+          draft: true,
+          remoteSha: "b".repeat(40),
+          repositoryReadbackFingerprint: SHA("f"),
+          pullRequestReadbackFingerprint: SHA("1"),
+        },
+      }),
+    // The diagnostic names the prerequisite stage instead of silently
+    // dropping the proof.
+    /expected linear_hierarchy or code_execution before private_github_publication/u,
+  );
+  assert.equal(
+    lineage.commits.some(
+      (commit) =>
+        commit.proof.stage === "code_execution" ||
+        commit.proof.stage === "code_validation",
+    ),
+    false,
+  );
+
+  // code_validation may not be skipped on the current sequence, and reflection
+  // may not overtake publication.
+  assert.deepEqual(
+    nextProjectLineageStagesV1(["accepted_research", "code_execution"]),
+    ["code_validation", "private_github_publication"],
+  );
+  assert.deepEqual(
+    nextProjectLineageStagesV1([
+      "accepted_research",
+      "code_execution",
+      "code_validation",
+    ]),
+    ["private_github_publication"],
+  );
+  // Reordering is still impossible: the hierarchy can never follow the code.
+  assert.deepEqual(nextProjectLineageStagesV1(["code_execution"]), []);
 });
 
 test("new lineage order proves validation and reflection while legacy order remains readable", () => {

@@ -96,6 +96,82 @@ const REFLECTION_UPGRADED_LEGACY_PROJECT_LINEAGE_STAGES_V1 = Object.freeze([
   "reconciliation_cleanup",
 ] as const satisfies readonly ProjectLifecycleStageV1[]);
 
+/**
+ * THE single answer to "what discharges `linear_hierarchy`".
+ *
+ * Three subsystems ask this question and used to answer it separately:
+ * `lifecycleStagePolicy` (which tools the stage may call), `missionAcceptance`
+ * (whose receipt proves the stage's work), and the lineage contract below
+ * (whether the stage can record a durable commit). They disagreed, and the
+ * disagreement cost a real verified commit SHA -- see
+ * `lineageCommitOptional`.
+ *
+ * Consume this record; do not re-inline either tool name.
+ */
+export const LINEAR_HIERARCHY_STAGE_DISCHARGE_V1 = Object.freeze({
+  /**
+   * Builds the full initiative -> project -> issues hierarchy, and is the only
+   * tool that can write the `linear_hierarchy` lineage commit: that commit's
+   * proof requires `initiativeId`, `projectId`, and three independent provider
+   * readbacks (initiative, project, issue).
+   */
+  hierarchyToolName: "publish_research_project_to_linear",
+  /**
+   * Publishes accepted research as a SINGLE Linear issue. It discharges the
+   * stage -- the lifecycle allowlist and mission acceptance have both said so
+   * for as long as they have existed -- but it creates no initiative and no
+   * project, so it has no honest value for the commit proof's `initiativeId` /
+   * `projectId` and records no lineage commit for the stage.
+   */
+  singleIssueToolName: "publish_research_to_linear",
+  /**
+   * The consequence, stated once so the lineage contract can act on it:
+   * `linear_hierarchy` is the one lifecycle stage whose durable commit is
+   * OPTIONAL.
+   *
+   * Before this was declared, a mission that legitimately published one issue
+   * left its lineage at a single `accepted_research` commit, and every later
+   * stage silently refused to record against it -- discarding a real,
+   * attested commit SHA and stranding the mission at
+   * `write_project_results`, which could find no `code_execution` /
+   * `code_validation` commit to bind its verified code examples to.
+   *
+   * Note what this does NOT relax: the stage still has to be discharged by one
+   * of the two tools above, mission acceptance still demands that receipt, and
+   * a mission that genuinely builds a hierarchy still commits the full proof.
+   * Only the durable RECORDING of the stage is optional, never its work.
+   */
+  lineageCommitOptional: true,
+} as const);
+
+/** Tools whose successful publication discharges the `linear_hierarchy` stage. */
+export const LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES: readonly string[] =
+  Object.freeze([
+    LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.hierarchyToolName,
+    LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.singleIssueToolName,
+  ]);
+
+/** Of those, the ones that can also write the stage's durable lineage commit. */
+export function toolCommitsLinearHierarchyLineageV1(toolName: string): boolean {
+  return toolName === LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.hierarchyToolName;
+}
+
+/**
+ * Stages a lineage may legitimately carry no commit for.
+ *
+ * Derived from the shared answer above rather than hand-listed, so the set can
+ * never drift from the reason it exists.
+ */
+const OPTIONAL_PROJECT_LINEAGE_STAGES: ReadonlySet<ProjectLifecycleStageV1> =
+  new Set<ProjectLifecycleStageV1>(
+    LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.lineageCommitOptional &&
+    LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES.some(
+      (name) => !toolCommitsLinearHierarchyLineageV1(name),
+    )
+      ? ["linear_hierarchy"]
+      : [],
+  );
+
 export type ProjectLifecycleStageV2 =
   (typeof PROJECT_LIFECYCLE_STAGES_V2)[number];
 
@@ -1813,11 +1889,48 @@ function buildProjectLineage(input: {
   return { ...fixed, fingerprint: fingerprintContract(stable) };
 }
 
-const PROJECT_LINEAGE_STAGE_SEQUENCES: readonly (readonly ProjectLifecycleStageV1[])[] = [
-  PROJECT_LIFECYCLE_STAGES,
-  LEGACY_PROJECT_LINEAGE_STAGES_V1,
-  REFLECTION_UPGRADED_LEGACY_PROJECT_LINEAGE_STAGES_V1,
-];
+/**
+ * Every canonical sequence, plus the same sequence with lineage-optional
+ * stages elided.
+ *
+ * Deliberately an expansion of the sequence LIST rather than a loosening of
+ * the prefix MATCHER: relaxing `isValidProjectLineagePrefix` into a
+ * subsequence test would have let any stage be skipped, which is a weaker
+ * guard wearing a richer matcher's clothes. Here a lineage may omit only a
+ * stage this module has declared optional, and may still never reorder stages
+ * or skip a required one.
+ */
+function expandOptionalProjectLineageStages(
+  sequences: readonly (readonly ProjectLifecycleStageV1[])[],
+): readonly (readonly ProjectLifecycleStageV1[])[] {
+  const expanded: (readonly ProjectLifecycleStageV1[])[] = [];
+  const seen = new Set<string>();
+  for (const sequence of sequences) {
+    let variants: ProjectLifecycleStageV1[][] = [[...sequence]];
+    for (const optional of OPTIONAL_PROJECT_LINEAGE_STAGES) {
+      variants = variants.flatMap((variant) =>
+        variant.includes(optional)
+          ? [variant, variant.filter((stage) => stage !== optional)]
+          : [variant],
+      );
+    }
+    for (const variant of variants) {
+      const key = variant.join(">");
+      if (variant.length > 0 && !seen.has(key)) {
+        seen.add(key);
+        expanded.push(Object.freeze(variant));
+      }
+    }
+  }
+  return Object.freeze(expanded);
+}
+
+const PROJECT_LINEAGE_STAGE_SEQUENCES: readonly (readonly ProjectLifecycleStageV1[])[] =
+  expandOptionalProjectLineageStages([
+    PROJECT_LIFECYCLE_STAGES,
+    LEGACY_PROJECT_LINEAGE_STAGES_V1,
+    REFLECTION_UPGRADED_LEGACY_PROJECT_LINEAGE_STAGES_V1,
+  ]);
 
 function isValidProjectLineagePrefix(
   stages: readonly ProjectLifecycleStageV1[],
@@ -1827,6 +1940,18 @@ function isValidProjectLineagePrefix(
       stages.length <= sequence.length &&
       stages.every((stage, index) => stage === sequence[index]),
   );
+}
+
+/**
+ * The stages this lineage may commit next, given what it has already
+ * committed. Exported so callers can fail CLOSED with a message naming the
+ * missing prerequisite stage instead of dropping a verified proof on the
+ * floor.
+ */
+export function nextProjectLineageStagesV1(
+  stages: readonly ProjectLifecycleStageV1[],
+): ProjectLifecycleStageV1[] {
+  return nextProjectLineageStages(stages);
 }
 
 function nextProjectLineageStages(
