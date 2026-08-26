@@ -16,6 +16,8 @@ import {
   CELL_STATUS_EXHAUSTED,
   CELL_STATUS_NOT_RUN,
   ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
+  HARNESS_CLEANUP_FAILURE_CLASS,
+  detectLaneCleanupFailure,
   IN_FLIGHT_FAILURE_CLASS,
   LANE_ASSERTION_FAILURE_CLASS,
   BLOCKER_BUCKETS,
@@ -62,6 +64,7 @@ import {
   type ProofMatrixManifest,
 } from "../scripts/run-proof-matrix.mjs";
 import { TOOL_REFUSAL_MARKER_BUCKETS } from "../e2e/reporters/dailyUseReporter";
+import { composeMandatoryCleanupError } from "../e2e/fixtures/externalCleanup";
 
 function manifestWith(attempts: ProofMatrixAttempt[]): ProofMatrixManifest {
   return { attempts, productClassCounts: {} };
@@ -1017,6 +1020,130 @@ test("the matrix aborts on environment_not_configured before it records anything
   assert.match(abortBlock, /CELL_STATUS_NOT_RUN/u);
   // And the operator is told exactly which variables to set.
   assert.match(abortBlock, /did NOT RUN — required environment not configured: \$\{missingList\}/u);
+});
+
+/**
+ * The real 2026-08-26 compound-linear-github attempt 2: 1120s, every product
+ * assertion passed, and the run went red purely on a teardown process probe.
+ */
+const CLEANUP_FAILED_ATTEMPT_LOG = [
+  "Running 1 test using 1 worker",
+  "FLOW-REAL success linear=https://linear.app/x/issue/E2E-41 github=https://github.com/o/r note=Results.md",
+  "",
+  "  1) [compound-flow-real-live] › e2e/compound-flow-real-live.spec.ts:98:3 › compound Linear + GitHub flow ─",
+  "",
+  "    Error: COMPOUND-REAL assertions passed; mandatory cleanup failed: Harness cleanup: Controlled Obsidian teardown did not drain cleanly (owned process exit; Obsidian process drain).",
+  "",
+  "      at e2e/compound-flow-real-live.spec.ts:884:13",
+  "",
+  "  1 failed",
+].join("\n");
+
+test("a mission that passed every assertion and only failed teardown is NOT a lane assertion failure", () => {
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: CLEANUP_FAILED_ATTEMPT_LOG,
+  });
+  // The defect: this log landed in the bucket a genuine product failure lands
+  // in, so a fully successful mission capped the measured pass rate.
+  assert.notEqual(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, HARNESS_CLEANUP_FAILURE_CLASS);
+  assert.equal(outcome.failureClass, "harness:cleanup_failed");
+  // The lane stated the fact about itself; the matrix did not guess it.
+  assert.equal(outcome.confidence, CLASSIFICATION_CONFIRMED);
+  assert.equal(outcome.cleanupFailure?.lane, "COMPOUND-REAL");
+  assert.match(outcome.detail, /did not drain cleanly/u);
+  // Playwright prints a numbered failing-test header for ANY throw, so the log
+  // does match the lane-assertion patterns. Carrying that as a secondary class
+  // would smuggle the product-failure reading into another column.
+  assert.ok(!outcome.secondaryClasses.includes(LANE_ASSERTION_FAILURE_CLASS));
+});
+
+test("a lane whose ASSERTIONS failed stays a product-bucket red even when cleanup also failed", () => {
+  // The discriminator. Both halves of the wrapper mention cleanup; only the
+  // "assertions passed" half means the product succeeded. A failure on both
+  // must never be laundered into the budget-exempt harness bucket.
+  const bothFailed = CLEANUP_FAILED_ATTEMPT_LOG.replace(
+    "COMPOUND-REAL assertions passed;",
+    "COMPOUND-REAL failed: expected Results note to contain the marker;",
+  );
+  assert.equal(detectLaneCleanupFailure(bothFailed), null);
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: bothFailed,
+  });
+  assert.equal(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.equal(attemptConsumesBudget(red("compound-linear-github", outcome.failureClass)), true);
+});
+
+test("the lane's composed sentence and the matrix's detector are one contract", () => {
+  // Anti-drift bond: the wrapper is written in exactly one place and parsed in
+  // exactly one place, and this test is the only thing holding them together.
+  // Re-wording either half silently returns the false red.
+  const passed = composeMandatoryCleanupError("COMPOUND-REAL", null, [
+    "Harness cleanup: Controlled Obsidian teardown did not drain cleanly (owned process exit).",
+  ]);
+  const detected = detectLaneCleanupFailure(passed.message);
+  assert.equal(detected?.lane, "COMPOUND-REAL");
+  assert.match(detected?.detail ?? "", /did not drain cleanly/u);
+
+  const alsoFailed = composeMandatoryCleanupError(
+    "BYOK-AUTONOMOUS",
+    new Error("expected 19 deliverables, saw 17"),
+    ["Harness cleanup: teardown did not drain cleanly"],
+  );
+  assert.equal(detectLaneCleanupFailure(alsoFailed.message), null);
+});
+
+test("a harness cleanup failure spends no attempt budget and preserves the green streak", () => {
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: CLEANUP_FAILED_ATTEMPT_LOG,
+  });
+  const attempt = red("compound-linear-github", outcome.failureClass);
+  assert.equal(isInfrastructureFailureClass(outcome.failureClass), true);
+  assert.equal(attemptConsumesBudget(attempt), false);
+  // The concrete harm: a streak that needs 3 consecutive greens was reset by a
+  // teardown probe, so two successful missions were thrown away.
+  const manifest = manifestWith([
+    green("compound-linear-github"),
+    green("compound-linear-github"),
+    attempt,
+  ]);
+  assert.equal(consecutiveGreens(manifest, "compound-linear-github"), 2);
+  assert.equal(consumedAttemptCount(manifest, "compound-linear-github"), 2);
+  // Still loud: it counts toward the valve that aborts a persistently broken
+  // harness, so a genuinely leaking teardown cannot loop forever unnoticed.
+  assert.equal(harnessFailureCount(manifest, "compound-linear-github"), 1);
+  assert.equal(consecutiveHarnessFailures(manifest, "compound-linear-github"), 1);
+});
+
+test("a harness cleanup failure writes no run-metrics row but keeps its attempt record", () => {
+  // main() cannot be unit-run, so pin the source shape: the CSV append is
+  // conditioned on the class (every reader counts each row in its pass-rate
+  // denominator and can only say green/not-green), while the attempt record is
+  // NOT — the event must stay durable and greppable in the manifest.
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "run-proof-matrix.mjs"),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /if \(failureClass !== HARNESS_CLEANUP_FAILURE_CLASS\) appendRunCsvRow\(\[/u,
+    "the run-metrics row must be skipped for a harness cleanup failure",
+  );
+  const csvRow = source.indexOf("appendRunCsvRow([");
+  const attemptPush = source.indexOf("manifest.attempts.push({");
+  const guardedPush = source.slice(attemptPush - 400, attemptPush);
+  assert.ok(csvRow > 0 && attemptPush > csvRow);
+  assert.doesNotMatch(
+    guardedPush,
+    /HARNESS_CLEANUP_FAILURE_CLASS/u,
+    "the attempt record must NOT be skipped — the leak has to stay on the record",
+  );
 });
 
 test("a summary whose records know nothing falls through instead of reporting zero", () => {

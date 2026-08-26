@@ -169,6 +169,42 @@ function isHelperProcess(commandLine) {
 }
 
 /**
+ * Is this row's creation instant inside the window our root process occupied?
+ *
+ * THE PID-RECYCLING HOLE THIS CLOSES. Windows hands PIDs back out aggressively,
+ * and EVERY process in an Electron app shares one image name — so "PID 8412
+ * named Obsidian.exe" is not an identity at all, and the image-name guard that
+ * was supposed to defeat recycling defeats nothing here: the likeliest claimant
+ * of a freed Obsidian PID is another Obsidian process. A recycled root PID made
+ * BOTH teardown process probes report a dead root as still-alive, which is the
+ * false red this window removes.
+ *
+ * Creation time closes it, and the bound is causal rather than a tolerance
+ * guess: `rootCreatedAtMs` is stamped immediately BEFORE spawn() and
+ * `teardownStartedAtMs` when teardown begins, so our root was necessarily
+ * created inside that interval. Our root's PID cannot be recycled until our
+ * root dies, and our root dies DURING teardown — therefore a row bearing our
+ * PID but created after teardown began is, by construction, a different process
+ * wearing our number.
+ *
+ * When a bound (or the row's own creation time) is unknown the window opens
+ * fully and ownership degrades to the historical PID-only test. That direction
+ * is deliberate: disowning a real survivor turns a genuine leak into a silent
+ * green that poisons the NEXT lane's already-running check, which is strictly
+ * worse than the false red this exists to remove.
+ */
+function createdWithinRootLifetimeV1(
+  createdAtMs,
+  rootCreatedAtMs = null,
+  teardownStartedAtMs = null,
+) {
+  if (createdAtMs === null || createdAtMs === undefined) return true;
+  if (rootCreatedAtMs !== null && createdAtMs < rootCreatedAtMs) return false;
+  if (teardownStartedAtMs !== null && createdAtMs > teardownStartedAtMs) return false;
+  return true;
+}
+
+/**
  * Decide which Obsidian PIDs THIS harness instance owns.
  *
  * The bug this replaces killed by image name alone, so one harness instance
@@ -176,8 +212,11 @@ function isHelperProcess(commandLine) {
  * user's own Obsidian window. Ownership is established three ways, in order of
  * strength:
  *
- *  1. our spawned root PID, and any root whose command line carries OUR unique
- *     `--remote-debugging-port` (Electron puts it only on the browser process);
+ *  1. our spawned root PID *qualified by creation time* (see
+ *     createdWithinRootLifetimeV1 — a bare PID is not an identity on Windows),
+ *     and any root whose command line carries OUR unique
+ *     `--remote-debugging-port` (Electron puts it only on the browser process,
+ *     and the port is exclusive, so that match needs no time qualifier);
  *  2. everything transitively descended from those roots by ParentProcessId
  *     (this is how renderer/GPU/utility children are claimed — they carry no
  *     port of their own);
@@ -195,6 +234,7 @@ function selectOwnedObsidianPidsV1({
   rootPid = null,
   cdpPort = null,
   rootCreatedAtMs = null,
+  teardownStartedAtMs = null,
 } = {}) {
   const rows = processes.filter(
     (row) => Number.isSafeInteger(row?.pid) && row.pid > 0,
@@ -211,8 +251,10 @@ function selectOwnedObsidianPidsV1({
     for (const child of childrenOf.get(pid) ?? []) collectTree(child, into);
   };
 
+  const withinRootLifetime = (row) =>
+    createdWithinRootLifetimeV1(row.createdAtMs, rootCreatedAtMs, teardownStartedAtMs);
   const isOurRoot = (row) =>
-    (rootPid !== null && row.pid === rootPid) ||
+    (rootPid !== null && row.pid === rootPid && withinRootLifetime(row)) ||
     commandLineNamesPort(row.commandLine, cdpPort);
   // A root we did not launch: no --type= helper marker and not ours. This is
   // the user's own Obsidian, or a concurrent harness on another port.
@@ -232,7 +274,12 @@ function selectOwnedObsidianPidsV1({
       // which we already classified. Only true orphans are claimable.
       if (byPid.has(row.parentPid)) continue;
       if (!isHelperProcess(row.commandLine)) continue;
-      if (row.createdAtMs === null || row.createdAtMs < rootCreatedAtMs) continue;
+      // No creation time => no claim. An orphan is claimed on evidence, never
+      // on suspicion, and the same lifetime window that qualifies the root PID
+      // bounds the claim at BOTH ends: a helper that appeared after teardown
+      // began cannot be a child of the root we are tearing down.
+      if (row.createdAtMs === null) continue;
+      if (!withinRootLifetime(row)) continue;
       owned.add(row.pid);
     }
   }
@@ -249,16 +296,20 @@ async function sweepOwnedObsidianSurvivorsV1({
   rootPid = null,
   cdpPort = null,
   rootCreatedAtMs = null,
+  teardownStartedAtMs = null,
   imageName = "Obsidian.exe",
   repoRoot = REPO_ROOT,
 } = {}) {
-  if (process.platform !== "win32") return { swept: 0, killedPids: [], observed: [] };
+  if (process.platform !== "win32") {
+    return { swept: 0, killedPids: [], killResults: [], observed: [] };
+  }
   const processes = await enumerateObsidianProcessesV1(imageName);
   const killedPids = selectOwnedObsidianPidsV1({
     processes,
     rootPid,
     cdpPort,
     rootCreatedAtMs,
+    teardownStartedAtMs,
   });
   appendHostEventV1(
     {
@@ -267,6 +318,7 @@ async function sweepOwnedObsidianSurvivorsV1({
       rootPid,
       cdpPort,
       rootCreatedAtMs,
+      teardownStartedAtMs,
       observed: processes.map((row) => ({
         pid: row.pid,
         parentPid: row.parentPid,
@@ -280,12 +332,122 @@ async function sweepOwnedObsidianSurvivorsV1({
     },
     repoRoot,
   );
+  // Per-PID outcomes, not a swallowed `.catch(() => undefined)`. A kill that
+  // FAILED and a kill that succeeded used to be the same observable event, so
+  // "the drain still sees survivors after the sweep" could not be read as
+  // either "the sweep could not kill them" or "the probe is lying about them" —
+  // the exact discrimination this teardown failure needs.
+  const killResults = [];
   for (const pid of killedPids) {
-    await execFileAsync("taskkill", ["/PID", String(pid), "/F"], {
-      windowsHide: true,
-    }).catch(() => undefined);
+    killResults.push(
+      await execFileAsync("taskkill", ["/PID", String(pid), "/F"], {
+        windowsHide: true,
+      }).then(
+        () => ({ pid, killed: true, error: null }),
+        (error) => ({
+          pid,
+          killed: false,
+          error: String(error?.stderr || error?.message || error)
+            .replace(/\s+/gu, " ")
+            .trim()
+            .slice(0, 200),
+        }),
+      ),
+    );
   }
-  return { swept: killedPids.length, killedPids, observed: processes };
+  const result = {
+    swept: killResults.filter((entry) => entry.killed).length,
+    killedPids,
+    killResults,
+    observed: processes,
+  };
+  appendHostEventV1(
+    { kind: "owned_survivor_sweep_result", stage, rootPid, cdpPort, killResults },
+    repoRoot,
+  );
+  return result;
+}
+
+/**
+ * One line naming what the sweep SAW versus what it could actually reap, for
+ * the teardown error a human reads at 3am. The two shapes it must tell apart:
+ *
+ *   "observed 4, claimed 0" — Obsidian processes exist but none is ours. A
+ *      probe that still fails after this is lying (recycled PID, foreign
+ *      instance), not reporting a leak.
+ *   "claimed 4, kill FAILED for 8412" — a genuine survivor the harness could
+ *      not reap. That is a real leak and must stay red.
+ */
+function describeSweepOutcomeV1(result) {
+  const observed = result?.observed ?? [];
+  const killResults = result?.killResults ?? [];
+  const failed = killResults.filter((entry) => !entry.killed);
+  const parts = [`observed ${observed.length} Obsidian process(es)`];
+  if (killResults.length === 0) {
+    parts.push("claimed 0 as owned");
+  } else {
+    parts.push(
+      `claimed ${killResults.length} as owned [${killResults.map((entry) => entry.pid).join(", ")}], ` +
+      `force-killed ${killResults.length - failed.length}`,
+    );
+  }
+  if (failed.length > 0) {
+    parts.push(
+      `kill FAILED for ${failed.map((entry) => `${entry.pid} (${entry.error})`).join(", ")}`,
+    );
+  }
+  return parts.join("; ");
+}
+
+function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wait for OUR root Obsidian process to be gone, authoritatively.
+ *
+ * This replaces a `tasklist /FI "PID eq <pid>"` readback. Two independent
+ * reasons, both already paid for in this repo:
+ *   - `tasklist /FI` is documented to lie about liveness on this machine; CIM
+ *     is the enumeration every other liveness question here already uses.
+ *   - the old readback identified our root as "this PID, image Obsidian.exe",
+ *     which cannot survive PID recycling inside an Electron app where every
+ *     process carries that image name. CIM carries CreationDate, so identity
+ *     becomes PID *and* creation instant.
+ *
+ * The child handle stays the fastest authority: Node sets exitCode only once
+ * the OS has reported the child's exit, so a non-null exitCode ends the wait
+ * without consulting the OS at all.
+ */
+async function waitForOwnedRootExitV1({
+  handle = null,
+  rootPid = null,
+  rootCreatedAtMs = null,
+  teardownStartedAtMs = null,
+  imageName = "Obsidian.exe",
+  timeoutMs = 30_000,
+  pollMs = 250,
+} = {}) {
+  if (rootPid === null || rootPid === undefined) return true;
+  const stillAlive = async () => {
+    if (handle && handle.exitCode !== null) return false;
+    const processes = await enumerateObsidianProcessesV1(imageName);
+    return processes.some(
+      (row) =>
+        row.pid === rootPid &&
+        createdWithinRootLifetimeV1(
+          row.createdAtMs,
+          rootCreatedAtMs,
+          teardownStartedAtMs,
+        ),
+    );
+  };
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await stillAlive())) return true;
+    await delayMs(pollMs);
+  }
+  return !(await stillAlive());
 }
 
 /**
@@ -330,6 +492,9 @@ module.exports = {
   appendHostEventV1,
   describeWindowsExitCodeV1,
   enumerateObsidianProcessesV1,
+  createdWithinRootLifetimeV1,
   selectOwnedObsidianPidsV1,
   sweepOwnedObsidianSurvivorsV1,
+  describeSweepOutcomeV1,
+  waitForOwnedRootExitV1,
 };

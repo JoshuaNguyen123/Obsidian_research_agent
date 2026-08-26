@@ -1,31 +1,27 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
-import {
-  tasklistContainsProcessId,
-  terminateControlledObsidian,
-} from "../scripts/obsidian-process-lifecycle";
+import { terminateControlledObsidian } from "../scripts/obsidian-process-lifecycle";
 
-test("owned process readback matches only the exact tasklist PID row", () => {
-  const tasklist = [
-    '"Obsidian.exe","1234","Console","1","100,000 K"',
-    '"Obsidian.exe","91234","Console","1","100,000 K"',
-  ].join("\r\n");
-  assert.equal(tasklistContainsProcessId(tasklist, 1234), true);
-  assert.equal(tasklistContainsProcessId(tasklist, 234), false);
-  assert.equal(tasklistContainsProcessId(tasklist, 91234), true);
-  assert.equal(
-    tasklistContainsProcessId("INFO: No tasks are running which match the specified criteria.", 1234),
-    false,
-  );
-});
+const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
-test("an image-scoped readback never matches a foreign process on a recycled PID", () => {
-  const foreign = '"notepad.exe","1234","Console","1","10,000 K"';
-  const owned = '"Obsidian.exe","1234","Console","1","100,000 K"';
-  assert.equal(tasklistContainsProcessId(foreign, 1234, "Obsidian.exe"), false);
-  assert.equal(tasklistContainsProcessId(owned, 1234, "Obsidian.exe"), true);
-  // Without an expected image the historical bare-PID behavior is preserved.
-  assert.equal(tasklistContainsProcessId(foreign, 1234), true);
+test("teardown asks the OS nothing directly — liveness comes from the shared CIM enumeration", () => {
+  // This module used to answer "is our root still alive?" with
+  // `tasklist /FI "PID eq <pid>"`, a filter this repo has documented as
+  // unreliable, matched on PID + image name — which is not an identity inside
+  // an Electron app where every process shares one image name. Reinstating any
+  // tasklist readback here must fail loudly rather than in a 20-minute lane.
+  const source = readFileSync(
+    path.join(REPO_ROOT, "scripts", "obsidian-process-lifecycle.ts"),
+    "utf8",
+  )
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*(\/\/|\/\*|\*)/u.test(line))
+    .join("\n");
+  assert.doesNotMatch(source, /tasklist/iu);
+  assert.doesNotMatch(source, /execFile/u);
 });
 
 test("controlled Obsidian teardown targets only its owned PID and rejects an incomplete drain", async () => {
@@ -212,6 +208,110 @@ test("a drain failure sweeps orphaned survivors before the terminal recheck", as
   );
 
   assert.deepEqual(calls, ["process-drain:1", "sweep", "process-drain:2"]);
+});
+
+test("the survivor sweep runs BEFORE the owned-exit recheck, so it can rescue it", async () => {
+  // THE ORDERING DEFECT. The sweep used to run after the owned-exit recheck had
+  // already returned its final verdict, so the one remediation this teardown
+  // owns could never rescue the one probe a surviving ROOT fails. A fully
+  // successful mission was therefore reported red for a process the harness had
+  // just successfully reaped. On the unfixed tree the sweep is never reached
+  // before the second owned-exit call and this rejects.
+  const calls: string[] = [];
+  let rootReaped = false;
+  await terminateControlledObsidian(
+    { pid: 4242, exitCode: null },
+    {
+      terminateOwnedTree: async () => {
+        calls.push("terminate");
+      },
+      waitForOwnedExit: async (phase) => {
+        calls.push(`owned-exit:${phase}`);
+        return rootReaped;
+      },
+      waitForNoRunningProcess: async (phase) => {
+        calls.push(`process-drain:${phase}`);
+        return rootReaped;
+      },
+      waitForCdpClose: async () => {
+        calls.push("cdp-close");
+        return true;
+      },
+      sweepSurvivingProcesses: async () => {
+        calls.push("sweep");
+        rootReaped = true;
+      },
+    },
+  );
+
+  assert.deepEqual(calls, [
+    "terminate",
+    "owned-exit:initial",
+    "process-drain:initial",
+    "cdp-close",
+    "sweep",
+    "owned-exit:recheck",
+    "process-drain:recheck",
+  ]);
+});
+
+test("the sweep still runs when CDP never closed — that is when the machine most needs it", async () => {
+  // Remediation used to be gated on the CDP probe passing. A still-open CDP
+  // port means the app is MORE alive, so skipping the sweep there leaked a
+  // process into the next lane's already-running check.
+  const calls: string[] = [];
+  await assert.rejects(
+    terminateControlledObsidian(
+      { pid: 5150, exitCode: null },
+      {
+        terminateOwnedTree: async () => undefined,
+        waitForOwnedExit: async () => true,
+        waitForNoRunningProcess: async () => {
+          calls.push("process-drain");
+          return false;
+        },
+        waitForCdpClose: async () => false,
+        sweepSurvivingProcesses: async () => {
+          calls.push("sweep");
+        },
+      },
+    ),
+    /did not drain cleanly \(Obsidian process drain; CDP port close\)/u,
+  );
+  assert.deepEqual(calls, ["process-drain", "sweep", "process-drain"]);
+});
+
+test("what the sweep saw rides along in the teardown error", async () => {
+  // A leaked child and a probe lying about a recycled PID produce the identical
+  // "did not drain cleanly" sentence and need opposite fixes. The sweep's own
+  // account of what it observed versus what it could reap is the discriminator,
+  // and it must survive into the message a human reads.
+  await assert.rejects(
+    terminateControlledObsidian(
+      { pid: 6060, exitCode: 1 },
+      {
+        terminateOwnedTree: async () => undefined,
+        waitForOwnedExit: async () => true,
+        waitForNoRunningProcess: async () => false,
+        waitForCdpClose: async () => true,
+        sweepSurvivingProcesses: async () =>
+          "observed 4 Obsidian process(es); claimed 0 as owned",
+      },
+    ),
+    (error: Error) => {
+      // The parenthesised probe list stays the stable contract; diagnostics ride
+      // outside it so existing readers keep matching.
+      assert.match(
+        error.message,
+        /did not drain cleanly \(Obsidian process drain\)\./u,
+      );
+      assert.match(
+        error.message,
+        /Survivor sweep: observed 4 Obsidian process\(es\); claimed 0 as owned/u,
+      );
+      return true;
+    },
+  );
 });
 
 test("a failing survivor sweep still defers to the terminal drain recheck", async () => {

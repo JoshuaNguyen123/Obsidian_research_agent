@@ -43,6 +43,7 @@ import {
   preflightDisposableRepositoryDeleteAuthority,
   proveRestCreateAndDeleteProbe,
   retryTransientExternalCleanupRead,
+  composeMandatoryCleanupError,
   safeExternalCleanupError,
 } from "./fixtures/externalCleanup";
 import { createAutonomousJourneyPythonFixture } from "./fixtures/autonomousJourneyGitRepo";
@@ -2308,14 +2309,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       exportPath = null;
     }
     if (cleanupErrors.length > 0) {
-      throw new Error(
-        [
-          primaryError
-            ? `BYOK-AUTONOMOUS failed: ${safeExternalCleanupError(primaryError)}`
-            : "BYOK-AUTONOMOUS assertions passed",
-          `mandatory cleanup failed: ${cleanupErrors.join("; ")}`,
-        ].join("; "),
-      );
+      throw composeMandatoryCleanupError("BYOK-AUTONOMOUS", primaryError, cleanupErrors);
     }
   }
   if (primaryError) throw primaryError;

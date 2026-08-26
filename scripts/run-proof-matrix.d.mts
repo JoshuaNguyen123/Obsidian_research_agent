@@ -35,6 +35,11 @@ export function classifyAttemptOutcome(input: {
    * variables the lane named as absent, in first-seen order.
    */
   missingEnvironment?: string[];
+  /**
+   * Present only on HARNESS_CLEANUP_FAILURE_CLASS: which lane reported passing
+   * assertions, and what its mandatory cleanup said when it failed.
+   */
+  cleanupFailure?: { lane: string; detail: string };
 };
 export const LEGACY_RUN_CSV_HEADER: string;
 export const RUN_CSV_HEADER: string;
@@ -104,6 +109,14 @@ export function attemptLogExcerptFrom(
 export const LANE_ASSERTION_FAILURE_CLASS: string;
 export const RENDERER_DEATH_FAILURE_CLASS: string;
 export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS: "environment_not_configured";
+/**
+ * Every product assertion passed; only mandatory harness cleanup failed. Loud
+ * and still a failure, but harness evidence — never counted as a product red.
+ */
+export const HARNESS_CLEANUP_FAILURE_CLASS: "harness:cleanup_failed";
+export function detectLaneCleanupFailure(
+  logText: string,
+): { lane: string; detail: string; index: number } | null;
 export function detectMissingRequiredEnvironment(logText: string): string[];
 export const PROOF_MATRIX_STATE_RELATIVE_DIR: string;
 export const PROOF_MATRIX_MANIFEST_RELATIVE_PATH: string;

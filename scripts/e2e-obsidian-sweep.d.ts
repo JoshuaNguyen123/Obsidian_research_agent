@@ -35,25 +35,62 @@ export function enumerateObsidianProcessesV1(
   imageName?: string,
 ): Promise<ObsidianProcessRowV1[]>;
 
+/**
+ * Ownership identity is PID *plus* creation instant: a bare PID is not an
+ * identity on Windows, where PIDs recycle and every Electron process shares one
+ * image name. Unknown bounds open the window (degrade to PID-only) so a real
+ * survivor is never disowned into a silent leak.
+ */
+export function createdWithinRootLifetimeV1(
+  createdAtMs: number | null | undefined,
+  rootCreatedAtMs?: number | null,
+  teardownStartedAtMs?: number | null,
+): boolean;
+
 export function selectOwnedObsidianPidsV1(options?: {
   processes?: ObsidianProcessRowV1[];
   rootPid?: number | null;
   cdpPort?: number | null;
   rootCreatedAtMs?: number | null;
+  teardownStartedAtMs?: number | null;
 }): number[];
+
+export interface OwnedSurvivorKillResultV1 {
+  pid: number;
+  killed: boolean;
+  error: string | null;
+}
+
+export interface OwnedSurvivorSweepResultV1 {
+  swept: number;
+  killedPids: number[];
+  killResults: OwnedSurvivorKillResultV1[];
+  observed: ObsidianProcessRowV1[];
+}
 
 export function sweepOwnedObsidianSurvivorsV1(options?: {
   stage?: string;
   rootPid?: number | null;
   cdpPort?: number | null;
   rootCreatedAtMs?: number | null;
+  teardownStartedAtMs?: number | null;
   imageName?: string;
   repoRoot?: string;
-}): Promise<{
-  swept: number;
-  killedPids: number[];
-  observed: ObsidianProcessRowV1[];
-}>;
+}): Promise<OwnedSurvivorSweepResultV1>;
+
+export function describeSweepOutcomeV1(
+  result: OwnedSurvivorSweepResultV1 | null | undefined,
+): string;
+
+export function waitForOwnedRootExitV1(options?: {
+  handle?: { readonly exitCode: number | null } | null;
+  rootPid?: number | null;
+  rootCreatedAtMs?: number | null;
+  teardownStartedAtMs?: number | null;
+  imageName?: string;
+  timeoutMs?: number;
+  pollMs?: number;
+}): Promise<boolean>;
 
 export function summarizeRecentHostDeathV1(
   sinceMs: number,
