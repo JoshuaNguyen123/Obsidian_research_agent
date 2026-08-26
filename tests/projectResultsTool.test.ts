@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -237,6 +238,185 @@ test("Results code examples come only from the exact lineage-bound verified hand
     assert.equal(
       unavailable.error.code,
       "project_results_code_examples_unavailable",
+    );
+  }
+});
+
+/**
+ * The exact evidence shape the real `code_commit_verified` tool produces. Its
+ * PreparedAction targets the durable repair CHECKPOINT, so the ActionReceipt —
+ * and every stage event projected from it — carries the checkpoint id as
+ * `resource.id` and the checkpoint SEQUENCE NUMBER as `resource.revision`. The
+ * Git object id is never in this event; only the durable lineage holds it.
+ */
+function checkpointShapedCommitEvent(occurredAt: string): ProjectStageEventV1 {
+  return createProjectStageEventV1({
+    schemaVersion: 1,
+    runId: RUN_ID,
+    phase: "test",
+    evidenceKind: "commit_readback",
+    disposition: "verified",
+    occurredAt,
+    sourceReceiptId: "receipt-code_commit_verified-1",
+    evidenceFingerprint: SHA("9"),
+    resource: {
+      system: "git",
+      resourceType: "verified_local_commit",
+      id: "code-repair:run-project-results-1:code-workspace-1:repair-request-1",
+      url: null,
+      path: null,
+      // The checkpoint sequence number, exactly as preparedAction() stamps it.
+      revision: "1",
+    },
+    workUnits: [],
+  });
+}
+
+test("Results reads the verified commit SHA from the durable lineage, never from the repair checkpoint the receipt addresses", async () => {
+  const vault = new MemoryVault();
+  const { examples } = verifiedCodeReflectionFixture("b".repeat(40));
+  const lineage = fullCodeLineage(examples.commitSha);
+  const requested: { repositoryProfileKey: string; commitSha: string }[] = [];
+  const context = toolContext(vault, {
+      // The checkpoint-shaped receipt event is the LATEST commit_readback, so
+      // "most recent verified commit evidence" resolves to it.
+      getProjectStageEvents: () => [
+        checkpointShapedCommitEvent("2026-08-19T15:05:00.000Z"),
+      ],
+      getProjectLineages: () => [lineage],
+      resolveVerifiedCodeReflectionExamples: async (input) => {
+        requested.push(input);
+        return input.commitSha === examples.commitSha ? examples : null;
+      },
+  });
+  const prepared = await createProjectResultsTool().prepare!({}, context);
+  assert.equal(
+    prepared.ok,
+    true,
+    prepared.ok ? "" : JSON.stringify(prepared.error),
+  );
+  if (!prepared.ok) return;
+  // The checkpoint sequence "1" must never be offered as a commit id.
+  assert.deepEqual(requested, [{
+    repositoryProfileKey: "reflection-fixture",
+    commitSha: examples.commitSha,
+  }]);
+  const report = parseProjectRunReportV1(prepared.action.normalizedArgs.report);
+  assert.equal(report.codeExamples.length, 1);
+  assert.equal(report.codeExamples[0]?.path, "src/add.ts");
+  assert.match(report.codeExamples[0]?.code ?? "", /return left \+ right/u);
+
+  // The execute path re-derives the example binding from the sealed report. It
+  // must select the same commit event prepare did, or tool-22 simply moves its
+  // refusal from prepare to execute.
+  const path = prepared.action.target.path!;
+  const execution = await createProjectResultsTool().executePrepared!(
+    prepared.action,
+    {
+      ...context,
+      authorizedAction: {
+        preparedActionId: prepared.action.id,
+        payloadFingerprint: prepared.action.payloadFingerprint,
+        grantId: "approval-checkpoint-shaped-results",
+      },
+    },
+  );
+  assert.equal(execution.receipt.readback.status, "verified");
+  const markdown = vault.files.get(path) ?? "";
+  assert.match(markdown, /## Verified code examples/u);
+  // The delivered artifact must name the commit, not the checkpoint sequence.
+  assert.match(
+    markdown,
+    new RegExp(`- Verified commit: \`${examples.commitSha}\``, "u"),
+  );
+  assert.doesNotMatch(markdown, /- Verified commit: `1`/u);
+  assert.doesNotMatch(markdown, /bound to commit `1`/u);
+});
+
+test("Results still refuses when the only commit evidence is a checkpoint that names no Git object id", async () => {
+  const refused = await createProjectResultsTool().prepare!(
+    {},
+    toolContext(new MemoryVault(), {
+      getProjectStageEvents: () => [
+        checkpointShapedCommitEvent("2026-08-19T15:05:00.000Z"),
+      ],
+      // No durable code lineage: nothing anywhere names a real commit.
+      getProjectLineages: () => [],
+      resolveVerifiedCodeReflectionExamples: async () => {
+        throw new Error("must not be asked to resolve an unnamed commit");
+      },
+    }),
+  );
+  assert.equal(refused.ok, false);
+  if (refused.ok) return;
+  assert.equal(refused.error.code, "project_results_code_examples_unavailable");
+  assert.match(refused.error.message, /canonical commit SHA/u);
+});
+
+test("Results refuses when the host stage event and the durable lineage name different commits", async () => {
+  const { examples } = verifiedCodeReflectionFixture("b".repeat(40));
+  const lineage = fullCodeLineage(examples.commitSha);
+  const conflicting = createProjectStageEventV1({
+    schemaVersion: 1,
+    runId: RUN_ID,
+    phase: "test",
+    evidenceKind: "commit_readback",
+    disposition: "verified",
+    occurredAt: "2026-08-19T15:05:00.000Z",
+    sourceReceiptId: "receipt-code_commit_verified-conflict-1",
+    evidenceFingerprint: SHA("9"),
+    resource: {
+      system: "git",
+      resourceType: "commit",
+      id: "e".repeat(40),
+      url: null,
+      path: null,
+      revision: "e".repeat(40),
+    },
+    workUnits: [],
+  });
+  const refused = await createProjectResultsTool().prepare!(
+    {},
+    toolContext(new MemoryVault(), {
+      getProjectStageEvents: () => [conflicting],
+      getProjectLineages: () => [lineage],
+      resolveVerifiedCodeReflectionExamples: async () => examples,
+    }),
+  );
+  assert.equal(refused.ok, false);
+  if (refused.ok) return;
+  assert.equal(refused.error.code, "project_results_code_examples_unavailable");
+  assert.match(refused.error.message, /different commits/u);
+});
+
+/**
+ * Source-level guard, deliberately not behavioural: the two reflection writers
+ * must keep asking resolveVerifiedCommitEvidenceV1 which commit a run verified.
+ * Every private re-read of `resource.revision ?? resource.id` is a second
+ * authority on that question, and the first one drifted into a hard blocker on
+ * the final node of the compound journey. Drift is only observable once the
+ * copies disagree, which is exactly too late.
+ */
+test("the reflection writers keep one shared answer for the verified commit SHA", () => {
+  const sources = [
+    "../src/tools/projectResultsTool.ts",
+    "../src/tools/jupyterReflectionTool.ts",
+  ].map((relative) => ({
+    relative,
+    text: readFileSync(new URL(relative, import.meta.url), "utf8"),
+  }));
+  for (const source of sources) {
+    assert.match(
+      source.text,
+      /resolveVerifiedCommitEvidenceV1/u,
+      `${source.relative} must resolve the verified commit through the shared projection.`,
+    );
+    assert.doesNotMatch(
+      source.text,
+      /\[0-9a-f\]\{40\}|\[a-f0-9\]\{40\}/u,
+      `${source.relative} declares its own Git object id pattern. Use ` +
+        "canonicalGitCommitShaV1 from projectStageLineageMapper so both " +
+        "writers accept and reject exactly the same values.",
     );
   }
 });

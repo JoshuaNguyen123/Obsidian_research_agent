@@ -6,6 +6,7 @@
  * module only turns their redacted stage/status signals into six stable labels.
  */
 
+import { verifiedCommitShaFromReportEvidenceV1 } from "../agent/projectRunReport";
 import type {
   ProjectPhaseStatusV1,
   ProjectRunReportV1,
@@ -358,11 +359,15 @@ export function developerMissionCompletionFromProjectRunReportV1(
     report,
     "commit_readback",
   );
-  if (commit) {
-    const revision = commit.resource.revision ?? commit.resource.id;
+  // The commit_readback projected from the code_commit_verified receipt
+  // addresses the repair checkpoint, so its revision is that checkpoint's
+  // sequence number. Use the same selection the Results Markdown uses so the
+  // chip and the artifact never name different commits — and never "Commit 1".
+  const commitSha = verifiedCommitShaFromReportEvidenceV1(report.evidence);
+  if (commit && commitSha) {
     artifacts.push({
       kind: "commit",
-      label: `Commit ${revision.slice(0, 8)}`,
+      label: `Commit ${commitSha.slice(0, 8)}`,
       url: commit.resource.url,
     });
   }
