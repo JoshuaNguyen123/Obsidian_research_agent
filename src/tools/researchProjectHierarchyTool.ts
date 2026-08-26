@@ -84,6 +84,13 @@ export interface CreateResearchProjectHierarchyToolOptionsV1 {
     context: ToolExecutionContext;
   }): Promise<void>;
   isAvailable?: () => boolean;
+  /**
+   * Re-resolves availability when {@link isAvailable} says no, and resolves
+   * true only if the tool became available again. Shares the publication
+   * tool's contract: a mission outliving the host's Linear capability
+   * snapshot must not fail a node the planner already owes.
+   */
+  recoverAvailability?: () => Promise<boolean>;
   now?: () => Date;
 }
 
@@ -97,7 +104,10 @@ export function createResearchProjectHierarchyTool(
     parameters: RESEARCH_PROJECT_HIERARCHY_PARAMETERS,
     descriptor: RESEARCH_PROJECT_HIERARCHY_DESCRIPTOR,
     async execute(args, context) {
-      if (options.isAvailable?.() === false) {
+      if (
+        options.isAvailable?.() === false &&
+        (await options.recoverAvailability?.()) !== true
+      ) {
         throw notApplied(
           "linear_hierarchy_unavailable",
           "Linear hierarchy publication requires a verified Linear connection and team destination.",

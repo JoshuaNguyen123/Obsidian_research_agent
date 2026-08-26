@@ -2447,3 +2447,73 @@ test("trusted validation key catalog derives the profile id and numbered command
     ],
   );
 });
+
+/**
+ * A mission routinely outlives the host's Linear capability snapshot. These
+ * pin the recovery seam: the gate still fails closed on its own, but a host
+ * that can re-resolve availability gets to, and is only consulted when the
+ * plain gate said no.
+ */
+function availabilityGatedPublicationTool(options: {
+  isAvailable: () => boolean;
+  recoverAvailability?: () => Promise<boolean>;
+}) {
+  return createResearchPublicationTool(
+    options as unknown as Parameters<typeof createResearchPublicationTool>[0],
+  );
+}
+
+async function publicationGateErrorCode(options: {
+  isAvailable: () => boolean;
+  recoverAvailability?: () => Promise<boolean>;
+}): Promise<string> {
+  const tool = availabilityGatedPublicationTool(options);
+  try {
+    await tool.execute({} as never, { originalPrompt: "" } as never);
+  } catch (error) {
+    return (error as Error & { code?: string }).code ?? "";
+  }
+  return "";
+}
+
+test("an unavailable publication tool with no recovery hook still fails closed", async () => {
+  assert.equal(
+    await publicationGateErrorCode({ isAvailable: () => false }),
+    "research_publication_unavailable",
+  );
+});
+
+test("a recovery hook that cannot restore availability still fails closed", async () => {
+  assert.equal(
+    await publicationGateErrorCode({
+      isAvailable: () => false,
+      recoverAvailability: async () => false,
+    }),
+    "research_publication_unavailable",
+  );
+});
+
+test("a stale capability snapshot the host can re-resolve no longer fails the node", async () => {
+  // Passing the gate lands on the next check (explicit mission intent), which
+  // is exactly how we know availability stopped being the blocker.
+  assert.equal(
+    await publicationGateErrorCode({
+      isAvailable: () => false,
+      recoverAvailability: async () => true,
+    }),
+    "research_publication_explicit_user_mission_required",
+  );
+});
+
+test("recovery is never attempted while the tool is already available", async () => {
+  let recoveryAttempts = 0;
+  const code = await publicationGateErrorCode({
+    isAvailable: () => true,
+    recoverAvailability: async () => {
+      recoveryAttempts += 1;
+      return true;
+    },
+  });
+  assert.equal(recoveryAttempts, 0);
+  assert.equal(code, "research_publication_explicit_user_mission_required");
+});
