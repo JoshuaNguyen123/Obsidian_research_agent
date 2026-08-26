@@ -70,6 +70,7 @@ export interface LinearProgressCommentResultV1 {
 }
 
 export interface LinearProgressStateResultV1 {
+  /** Empty when no mutation occurred, so no receipt exists. */
   receiptId: string;
   /** False when the issue was already in the requested state. */
   changed: boolean;
@@ -280,7 +281,11 @@ export function createReportProgressToLinearTool(
           stateId: stateResolution.stateId,
           context,
         });
-        receiptIds.push(moved.receiptId);
+        // A no-op move ("already in that state") produces no receipt; an
+        // empty id in the receipts list would make consumers overcount.
+        if (moved.receiptId.trim()) {
+          receiptIds.push(moved.receiptId);
+        }
         // "Already in that state" is a confirmation, not a failure.
         stateOutcome = moved.changed
           ? `moved to ${status}`

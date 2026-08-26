@@ -224,6 +224,11 @@ test("each status maps onto the workspace's configured state id", async () => {
     assert.equal(result.stateChanged, true);
     assert.equal("stateSkipReason" in result, false);
     assert.equal(result.stateOutcome, `moved to ${status}`);
+    assert.deepEqual(
+      result.receiptIds,
+      ["receipt-comment-1", "receipt-state-1"],
+      "a real move contributes its receipt alongside the comment's",
+    );
   }
   assert.equal(resolveStatusState(null, STATE_IDS).stateId, null);
 });
@@ -311,6 +316,11 @@ test("an issue already at the requested level is a confirmation, not a failure",
   // reason, never a success that only prose can disambiguate.
   assert.equal(result.stateChanged, false);
   assert.equal(result.stateSkipReason, "already_in_state");
+  assert.deepEqual(
+    result.receiptIds,
+    ["receipt-comment-1"],
+    "a no-op move has no receipt; an empty id must not pad the list",
+  );
 });
 
 test("progress is reported once per issue per run", async () => {
