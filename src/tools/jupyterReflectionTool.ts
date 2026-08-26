@@ -23,6 +23,8 @@ import {
   projectLinearBindingsFromProjectLineageV1,
   projectStageEventsFromProjectLineageV1,
   resolveProjectPriorPhaseAttestationsV1,
+  resolveVerifiedCommitEvidenceV1,
+  type VerifiedCommitEvidenceV1,
 } from "../agent/projectStageLineageMapper";
 import {
   projectWorkUnitOutcomesV1,
@@ -644,81 +646,56 @@ function composeNotebookReportMarkdown(
   return `${renderProjectRunReportMarkdownV1(report).trimEnd()}\n\n## Supplemental assistant notes\n\n> These notes are bounded assistant prose, not completion evidence. Phase status is derived only from the host evidence above.\n\n${assistantMarkdown.trim()}\n`;
 }
 
-/** Git object ids are 40-hex (SHA-1) or 64-hex (SHA-256 repositories). */
-const GIT_COMMIT_SHA_V1 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
-
 async function resolveCurrentRunCodeExamples(
   context: ToolExecutionContext,
   runId: string,
   events: readonly ProjectStageEventV1[],
 ): Promise<ResolvedJupyterCodeExamplesV1> {
   const acceptedRunIds = new Set(
-    [context.rootMissionId, context.runId]
+    [context.rootMissionId, context.runId, runId]
       .filter((value): value is string => Boolean(value?.trim()))
       .map((value) => value.trim()),
   );
-  const lineage = (context.getProjectLineages?.() ?? [])
-    .map(parseProjectLineageV1)
-    .filter((candidate) => acceptedRunIds.has(candidate.runId))
-    .sort((left, right) => {
-      const byCommitCount = right.commits.length - left.commits.length;
-      return byCommitCount || right.updatedAt.localeCompare(left.updatedAt);
-    })[0];
-  const codeCommit = [...(lineage?.commits ?? [])].reverse().find(
-    (commit) =>
-      commit.proof.stage === "code_execution" ||
-      commit.proof.stage === "code_validation",
-  );
-  const commitEvent = [...events]
-    .filter(
-      (event) =>
-        event.runId === runId &&
-        event.disposition === "verified" &&
-        event.evidenceKind === "commit_readback",
-    )
-    .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt))[0];
+  // One shared answer with write_project_results. See
+  // resolveVerifiedCommitEvidenceV1 for why the commit_readback event resource
+  // is checkpoint identity and the durable lineage owns the Git object id.
+  let evidence: VerifiedCommitEvidenceV1;
+  try {
+    evidence = resolveVerifiedCommitEvidenceV1({
+      acceptedRunIds,
+      events,
+      lineages: (context.getProjectLineages?.() ?? []).map(parseProjectLineageV1),
+    });
+  } catch (error) {
+    throw notApplied(
+      "jupyter_reflection_code_examples_unavailable",
+      `Exact-commit reflection examples could not be resolved: ${safeErrorMessage(error)}`,
+    );
+  }
+  const commitEvent = evidence.commitEvent;
+  const codeCommit = evidence.lineageCommit;
   const codeCompletionRequested =
     hasCodeExecutionIntent(context.originalPrompt) ||
     /\b(?:code|implementation|repository|commit|github|tests?|validation)\b/iu.test(
       context.originalPrompt,
     );
-  if (!codeCommit && !commitEvent && !codeCompletionRequested) {
+  if (!evidence.commitAttested && !codeCompletionRequested) {
     return { bundle: null, reportExamples: [] };
   }
   let resolved: VerifiedCodeReflectionExamplesV1 | null = null;
-  // A commit_readback event proves a verified local commit happened, but its
-  // resource is the durable repair checkpoint: the id is the checkpoint id and
-  // the revision is that checkpoint's sequence number ("1"), never a Git
-  // object id. Reading it as a commit sha made the tool demand that the
-  // resolved examples be "bound to commit 1" and blocked the final node of the
-  // journey. Only a value that is actually a commit id may constrain which
-  // commit the examples must come from; otherwise the durable publication
-  // handoff remains the authority.
-  const rawEventRevision = commitEvent
-    ? commitEvent.resource.revision ?? commitEvent.resource.id
-    : null;
-  const eventCommitSha =
-    rawEventRevision !== null && GIT_COMMIT_SHA_V1.test(rawEventRevision)
-      ? rawEventRevision
-      : null;
-  let expectedCommitSha = eventCommitSha;
+  const expectedCommitSha = evidence.commitSha;
   let triedExactCommitSha: string | null = null;
   try {
     if (
-      codeCommit?.proof.stage === "code_execution" ||
-      codeCommit?.proof.stage === "code_validation"
+      codeCommit &&
+      evidence.repositoryProfileKey &&
+      expectedCommitSha !== null
     ) {
-      if (expectedCommitSha && expectedCommitSha !== codeCommit.proof.commitSha) {
-        throw new Error(
-          "Host stage evidence and durable code lineage name different commits.",
-        );
-      }
-      expectedCommitSha = codeCommit.proof.commitSha;
-      triedExactCommitSha = codeCommit.proof.commitSha;
+      triedExactCommitSha = expectedCommitSha;
       resolved =
         (await context.resolveVerifiedCodeReflectionExamples?.({
-          repositoryProfileKey: codeCommit.proof.repositoryProfileKey,
-          commitSha: codeCommit.proof.commitSha,
+          repositoryProfileKey: evidence.repositoryProfileKey,
+          commitSha: expectedCommitSha,
         })) ?? null;
     }
     if (

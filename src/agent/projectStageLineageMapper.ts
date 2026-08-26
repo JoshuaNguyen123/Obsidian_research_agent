@@ -20,6 +20,7 @@ import {
   createProjectWorkUnitLinearBindingV1,
   type ProjectWorkUnitLinearBindingV1,
 } from "./projectProgressProjection";
+import { DurableLinearContractError } from "../integrations/linear/LinearContractSupport";
 import type {
   ToolExecutionContext,
   VerifiedLinearCodeRepositoryBindingV1,
@@ -285,6 +286,115 @@ function lineageProvesAcceptedResearchArtifactV1(
       commit.proof.stage === "accepted_research" &&
       commit.proof.artifactFingerprint === fingerprint,
   );
+}
+
+const GIT_COMMIT_SHA_V1 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+
+/** A Git object id, or null for any value that is not one. */
+export function canonicalGitCommitShaV1(value: unknown): string | null {
+  const text = typeof value === "string" ? value.trim() : "";
+  return GIT_COMMIT_SHA_V1.test(text) ? text : null;
+}
+
+export interface VerifiedCommitEvidenceV1 {
+  /** Latest verified commit_readback event for the accepted runs, if any. */
+  commitEvent: ProjectStageEventV1 | null;
+  /** The durable lineage code commit that owns the verified SHA, if any. */
+  lineageCommit: ProjectLifecycleStageCommitV1 | null;
+  /** Canonical Git object id naming the verified commit, or null. */
+  commitSha: string | null;
+  /** Trusted repository profile the lineage bound that commit to, or null. */
+  repositoryProfileKey: string | null;
+  /** True when any subsystem attests a verified local commit for these runs. */
+  commitAttested: boolean;
+}
+
+/**
+ * The single answer to "which commit does this run's verified commit evidence
+ * name?", consumed by every reflection writer.
+ *
+ * Two independent subsystems record one verified local commit, and they do NOT
+ * put the Git object id in the same place:
+ *
+ *  - The `code_commit_verified` ActionReceipt targets the durable repair
+ *    CHECKPOINT. Its `resource.id` is the checkpoint id and its
+ *    `resource.revision` is that checkpoint's SEQUENCE NUMBER ("1"), because
+ *    the checkpoint is what reconciliation must address. The receipt proves a
+ *    commit happened and carries its receipt identity; it never carries the
+ *    commit SHA.
+ *  - The durable project lineage records the SHA itself, on the
+ *    `code_execution`/`code_validation` proof, and `assertLineageContinuity`
+ *    refuses a GitHub publication commit whose remote SHA does not equal it.
+ *
+ * So reading the event resource as a commit id yields a checkpoint sequence
+ * number, and any consumer that then demands a canonical SHA from it blocks
+ * the final node of the journey. Only a value that IS a Git object id may name
+ * the commit; the durable lineage is the authority otherwise. Callers decide
+ * whether a run with no attested commit is acceptable — this projection never
+ * invents one, and it refuses outright when the two subsystems disagree.
+ */
+export function resolveVerifiedCommitEvidenceV1(input: {
+  /** Run ids whose evidence the caller has already accepted. */
+  acceptedRunIds: ReadonlySet<string>;
+  events: readonly ProjectStageEventV1[];
+  lineages: readonly ProjectLineageV1[];
+}): VerifiedCommitEvidenceV1 {
+  const commitEvent =
+    [...input.events]
+      .filter(
+        (event) =>
+          input.acceptedRunIds.has(event.runId) &&
+          event.disposition === "verified" &&
+          event.evidenceKind === "commit_readback",
+      )
+      .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt))[0] ??
+    null;
+  const eventCommitSha = commitEvent
+    ? canonicalGitCommitShaV1(
+        commitEvent.resource.revision ?? commitEvent.resource.id,
+      )
+    : null;
+
+  // Richest lineage wins: a resumed or continued mission keeps the lineage that
+  // recorded the most stages, and ties break on the most recent write.
+  const lineage = [...input.lineages]
+    .filter((candidate) => input.acceptedRunIds.has(candidate.runId))
+    .sort((left, right) => {
+      const byCommitCount = right.commits.length - left.commits.length;
+      return byCommitCount || right.updatedAt.localeCompare(left.updatedAt);
+    })[0];
+  const lineageCommit =
+    [...(lineage?.commits ?? [])]
+      .reverse()
+      .find(
+        (commit) =>
+          commit.proof.stage === "code_execution" ||
+          commit.proof.stage === "code_validation",
+      ) ?? null;
+  const lineageProof =
+    lineageCommit?.proof.stage === "code_execution" ||
+    lineageCommit?.proof.stage === "code_validation"
+      ? lineageCommit.proof
+      : null;
+  const lineageCommitSha = canonicalGitCommitShaV1(lineageProof?.commitSha);
+
+  if (
+    eventCommitSha !== null &&
+    lineageCommitSha !== null &&
+    eventCommitSha !== lineageCommitSha
+  ) {
+    throw new DurableLinearContractError(
+      "Host stage evidence and durable code lineage name different commits.",
+    );
+  }
+
+  return {
+    commitEvent,
+    lineageCommit,
+    commitSha: lineageCommitSha ?? eventCommitSha,
+    repositoryProfileKey: lineageProof?.repositoryProfileKey ?? null,
+    commitAttested: Boolean(commitEvent || lineageCommit),
+  };
 }
 
 /**

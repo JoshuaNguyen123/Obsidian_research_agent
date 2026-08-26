@@ -21,10 +21,13 @@ import {
   parseProjectLineageV1,
 } from "../agent/projectLifecycle";
 import {
+  canonicalGitCommitShaV1,
   mergeProjectStageEventsPreferExactWorkUnitScopeV1,
   projectLinearBindingsFromProjectLineageV1,
   projectStageEventsFromProjectLineageV1,
   resolveProjectPriorPhaseAttestationsV1,
+  resolveVerifiedCommitEvidenceV1,
+  type VerifiedCommitEvidenceV1,
 } from "../agent/projectStageLineageMapper";
 import {
   projectWorkUnitOutcomesV1,
@@ -471,50 +474,45 @@ async function resolveExactCodeExamples(
   runId: string,
   events: readonly ProjectStageEventV1[],
 ): Promise<ResolvedCodeExamplesV1> {
-  const commitEvent = [...events]
-    .filter(
-      (event) =>
-        event.runId === runId &&
-        event.disposition === "verified" &&
-        event.evidenceKind === "commit_readback",
-    )
-    .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt))[0];
-  if (!commitEvent) return { bundle: null, reportExamples: [] };
-  const commitSha = commitEvent.resource.revision ?? commitEvent.resource.id;
-  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(commitSha)) {
+  // One shared answer with append_jupyter_reflection: a commit_readback event's
+  // resource addresses the durable repair CHECKPOINT (revision = its sequence
+  // number), never a Git object id, so the durable lineage owns the SHA.
+  let evidence: VerifiedCommitEvidenceV1;
+  try {
+    evidence = resolveVerifiedCommitEvidenceV1({
+      acceptedRunIds: new Set([runId]),
+      events,
+      lineages: (context.getProjectLineages?.() ?? []).map(parseProjectLineageV1),
+    });
+  } catch (error) {
+    throw notApplied(
+      "project_results_code_examples_unavailable",
+      `Verified commit evidence is inconsistent: ${safeErrorMessage(error)}`,
+    );
+  }
+  // No subsystem attests a verified local commit: this run has no code stage to
+  // illustrate, which is not the same as failing to read one.
+  if (!evidence.commitAttested) return { bundle: null, reportExamples: [] };
+  const commitSha = evidence.commitSha;
+  if (!commitSha) {
     throw notApplied(
       "project_results_code_examples_unavailable",
       "Verified commit evidence does not contain a canonical commit SHA.",
     );
   }
-  const bindings = new Map<string, { repositoryProfileKey: string; commitSha: string }>();
-  for (const raw of context.getProjectLineages?.() ?? []) {
-    const lineage = parseProjectLineageV1(raw);
-    if (lineage.runId !== runId) continue;
-    for (const candidate of lineage.commits) {
-      if (
-        (candidate.proof.stage === "code_execution" ||
-          candidate.proof.stage === "code_validation") &&
-        candidate.proof.commitSha === commitSha
-      ) {
-        const binding = {
-          repositoryProfileKey: candidate.proof.repositoryProfileKey,
-          commitSha,
-        };
-        bindings.set(`${binding.repositoryProfileKey}:${commitSha}`, binding);
-      }
-    }
-  }
-  if (bindings.size !== 1 || !context.resolveVerifiedCodeReflectionExamples) {
+  const repositoryProfileKey = evidence.repositoryProfileKey;
+  if (!repositoryProfileKey || !context.resolveVerifiedCodeReflectionExamples) {
     throw notApplied(
       "project_results_code_examples_unavailable",
       "Exact verified code examples require one current/root lineage commit and its host handoff resolver.",
     );
   }
-  const binding = [...bindings.values()][0]!;
   let bundle: VerifiedCodeReflectionExamplesV1;
   try {
-    const resolved = await context.resolveVerifiedCodeReflectionExamples(binding);
+    const resolved = await context.resolveVerifiedCodeReflectionExamples({
+      repositoryProfileKey,
+      commitSha,
+    });
     if (!resolved) throw new Error("No exact verified handoff matched the lineage commit.");
     bundle = parseVerifiedCodeReflectionExamplesV1(resolved);
   } catch (error) {
@@ -529,17 +527,20 @@ async function resolveExactCodeExamples(
       "Resolved Results examples do not match the exact verified commit.",
     );
   }
+  const commitEvent = evidence.commitEvent;
   return {
     bundle,
-    reportExamples: bundle.examples.map((example) => ({
-      path: example.path,
-      language: example.language,
-      startLine: example.startLine,
-      endLine: example.endLine,
-      code: example.code,
-      sourceReceiptId: commitEvent.sourceReceiptId,
-      sourceFingerprint: example.codeSha256,
-    })),
+    reportExamples: commitEvent
+      ? bundle.examples.map((example) => ({
+          path: example.path,
+          language: example.language,
+          startLine: example.startLine,
+          endLine: example.endLine,
+          code: example.code,
+          sourceReceiptId: commitEvent.sourceReceiptId,
+          sourceFingerprint: example.codeSha256,
+        }))
+      : [],
   };
 }
 
@@ -692,14 +693,24 @@ function projectExamplesFromBundle(
   evidence: readonly ProjectStageEventV1[],
   bundle: VerifiedCodeReflectionExamplesV1,
 ): ProjectCodeExampleV1[] {
+  // Select the same event prepare bound the examples to: the most recent
+  // verified commit readback. Selecting by SHA equality instead would silently
+  // pick a different event whenever the latest readback is the checkpoint-
+  // shaped receipt projection (see resolveVerifiedCommitEvidenceV1), and the
+  // recomputed sourceReceiptId would then fail its own consistency check.
   const commitEvent = [...evidence]
     .filter(
       (event) =>
         event.evidenceKind === "commit_readback" &&
-        (event.resource.revision ?? event.resource.id) === bundle.commitSha,
+        event.disposition === "verified",
     )
     .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt))[0];
-  if (!commitEvent) {
+  const eventCommitSha = commitEvent
+    ? canonicalGitCommitShaV1(commitEvent.resource.revision ?? commitEvent.resource.id)
+    : null;
+  // Still fail closed: when the selected evidence does name a Git object id, it
+  // must be the commit these examples came from.
+  if (!commitEvent || (eventCommitSha !== null && eventCommitSha !== bundle.commitSha)) {
     throw invalidPrepared(
       "Prepared code examples are not bound to report commit evidence.",
     );
