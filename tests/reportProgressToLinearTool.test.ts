@@ -215,11 +215,16 @@ test("each status maps onto the workspace's configured state id", async () => {
     ["completed", STATE_IDS.completed],
   ] as const) {
     const { tool, states } = createTool();
-    await tool.execute(
+    const result = (await tool.execute(
       { issueId: BOUND_ISSUE, status, comment: `Reporting ${status}.` },
       context(),
-    );
+    )) as Record<string, unknown>;
     assert.deepEqual(states, [{ issueId: BOUND_ISSUE, stateId: expected }]);
+    assert.deepEqual(
+      result.receiptIds,
+      ["receipt-comment-1", "receipt-state-1"],
+      "a real move contributes its receipt alongside the comment's",
+    );
   }
   assert.equal(resolveStatusState(null, STATE_IDS).stateId, null);
 });
@@ -299,6 +304,11 @@ test("an issue already at the requested level is a confirmation, not a failure",
     context(),
   )) as Record<string, unknown>;
   assert.equal(result.stateOutcome, "already completed");
+  assert.deepEqual(
+    result.receiptIds,
+    ["receipt-comment-1"],
+    "a no-op move has no receipt; an empty id must not pad the list",
+  );
 });
 
 test("progress is reported once per issue per run", async () => {
