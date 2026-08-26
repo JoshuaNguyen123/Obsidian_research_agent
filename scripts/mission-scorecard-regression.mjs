@@ -130,7 +130,18 @@ export function formatMissionScorecardCliResult(result) {
   if (result?.skipped) {
     return "Mission scorecard regression gate skipped: no baselined records were selected.";
   }
-  return `Mission scorecard regression gate passed for ${result.checkedRecords} record(s).`;
+  const passed = `Mission scorecard regression gate passed for ${result.checkedRecords} record(s).`;
+  // Name every excused record. A lane that did not pass is excused from the
+  // comparison but must never be silent about it: the reader has to be able to
+  // tell "8 records compared clean" from "7 compared clean and one lane is red".
+  if (result?.unscoredNonPassing?.length) {
+    return (
+      `${passed}\nNOT COMPARED (lane did not pass; no scorecard emitted) — ` +
+      `the lane run itself is the failure signal, not this gate:\n- ` +
+      `${result.unscoredNonPassing.join("\n- ")}`
+    );
+  }
+  return passed;
 }
 
 export async function assertMissionScorecardSummaryFile(options = {}) {
@@ -305,6 +316,7 @@ export function assertMissionScorecardRegressions({
   }
 
   const failures = [];
+  const unscoredNonPassing = [];
   for (const expected of applicableBaselines) {
     const key = missionScorecardRecordKey(expected);
     if (expected.key !== key) {
@@ -313,6 +325,31 @@ export function assertMissionScorecardRegressions({
     const currentRecord = currentByKey.get(key);
     if (!currentRecord) {
       failures.push(`${key}: required baseline record is missing`);
+      continue;
+    }
+    // A lane that did not pass emits no scorecard, and that absence is not a
+    // scorecard regression -- it is a lane failure, already reported by the
+    // lane's own exit code and by the proof matrix. Comparing it is impossible
+    // and throwing here misreports a failed run as a structurally corrupt one.
+    //
+    // This matters because `test-results/` is gitignored runtime residue that
+    // nothing cleans: without this branch, one failed e2e lane makes every
+    // later `npm run test:ci` on that machine die at this gate BEFORE a single
+    // unit test runs, while a fresh clone passes. That is a false red on the
+    // unit suite, and it hides real regressions behind stale local state.
+    //
+    // The proof-debt case stays fatal below: a record that PASSED while
+    // dropping its scorecard is exactly the silent-weakening shape this gate
+    // exists to catch, so only an explicitly non-passing status is excused. An
+    // absent status keeps the old strict behaviour rather than opting itself in.
+    const currentStatus =
+      typeof currentRecord.status === "string" ? currentRecord.status.trim() : "";
+    if (
+      currentStatus.length > 0 &&
+      currentStatus !== "passed" &&
+      currentRecord.missionScorecard == null
+    ) {
+      unscoredNonPassing.push(`${key} (status=${currentStatus})`);
       continue;
     }
     const current = validateScorecard(
@@ -357,7 +394,13 @@ export function assertMissionScorecardRegressions({
       `Mission scorecard regression gate failed:\n- ${failures.join("\n- ")}`,
     );
   }
-  return { checkedRecords: applicableBaselines.length, skipped: false };
+  return {
+    checkedRecords: applicableBaselines.length - unscoredNonPassing.length,
+    skipped: false,
+    ...(unscoredNonPassing.length > 0
+      ? { unscoredNonPassing: Object.freeze([...unscoredNonPassing]) }
+      : {}),
+  };
 }
 
 function assertProofClassCoverage({ records, activeProjects, executedTestKeys }) {
