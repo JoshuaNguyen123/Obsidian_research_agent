@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import {
   MAX_OUTCOME_PENALTY,
   MAX_OUTCOME_RECORDS,
@@ -7,11 +8,22 @@ import {
   classifyToolTargetKind,
   createToolOutcomeMemory,
   isValidToolOutcomeMemory,
+  isNotablyFailing,
+  outcomeRecencyWeight,
   outcomePenaltyForAction,
   recordToolOutcome,
   summarizeOutcomeMemoryForPrompt,
   type ToolOutcomeMemoryV1,
 } from "../src/agent/outcomeMemory";
+
+/**
+ * Observation clock for the fixtures below, two days after the newest one they
+ * record. Recency weighting means every assertion about penalties or the prompt
+ * projection is relative to *when it is read*, so these pin the read instant
+ * rather than silently measuring the distance from a hardcoded July date to
+ * whatever today happens to be.
+ */
+const JUST_AFTER = new Date("2026-07-12T00:00:00.000Z");
 
 function failNTimes(
   memory: ToolOutcomeMemoryV1,
@@ -83,13 +95,13 @@ test("different error codes are tracked as different failure modes", () => {
 test("penalty is zero until failures form a pattern", () => {
   const once = failNTimes(createToolOutcomeMemory(), PENALTY_FREE_FAILURES);
   assert.equal(
-    outcomePenaltyForAction(once, "code_workspace_create", "code_workspace"),
+    outcomePenaltyForAction(once, "code_workspace_create", "code_workspace", JUST_AFTER),
     0,
   );
 
   const twice = failNTimes(createToolOutcomeMemory(), PENALTY_FREE_FAILURES + 1);
   assert.ok(
-    outcomePenaltyForAction(twice, "code_workspace_create", "code_workspace") > 0,
+    outcomePenaltyForAction(twice, "code_workspace_create", "code_workspace", JUST_AFTER) > 0,
   );
 });
 
@@ -205,7 +217,7 @@ test("the prompt projection lists failures without leaking vault structure", () 
     startMinute: 100,
   });
 
-  const summary = summarizeOutcomeMemoryForPrompt(memory);
+  const summary = summarizeOutcomeMemoryForPrompt(memory, 8, JUST_AFTER);
   assert.ok(summary);
   assert.match(summary, /code_workspace_create on code_workspace: failed 4x with workspace_exists/);
   assert.match(summary, /web_fetch/);
@@ -215,10 +227,10 @@ test("the prompt projection lists failures without leaking vault structure", () 
 });
 
 test("no notable failures projects nothing", () => {
-  assert.equal(summarizeOutcomeMemoryForPrompt(createToolOutcomeMemory()), null);
+  assert.equal(summarizeOutcomeMemoryForPrompt(createToolOutcomeMemory(), 8, JUST_AFTER), null);
 
   const singleFailure = failNTimes(createToolOutcomeMemory(), PENALTY_FREE_FAILURES);
-  assert.equal(summarizeOutcomeMemoryForPrompt(singleFailure), null);
+  assert.equal(summarizeOutcomeMemoryForPrompt(singleFailure, 8, JUST_AFTER), null);
 });
 
 test("malformed observations are ignored rather than stored", () => {
@@ -278,4 +290,121 @@ test("a failure with no error code is recorded as unknown, not dropped", () => {
 
   assert.equal(memory.records[0]?.errorCode, "unknown");
   assert.equal(memory.records[0]?.targetKind, "none");
+});
+
+/*
+ * Recency weighting and the shared failing-record predicate.
+ *
+ * Before these, the ledger could not forget and its two readers disagreed: the
+ * ranking penalty scaled by failure ratio while the prompt projection filtered
+ * on the raw failure count, so an approach that failed three times and
+ * succeeded three hundred was still announced to the model as one to avoid.
+ */
+
+const HALF_LIFE_LATER = new Date("2026-08-09T00:00:00.000Z");
+const THREE_HALF_LIVES_LATER = new Date("2026-10-08T00:00:00.000Z");
+
+test("an observation's weight halves once per half-life", () => {
+  const seen = "2026-07-10T00:00:00.000Z";
+
+  assert.equal(outcomeRecencyWeight(seen, new Date(seen)), 1);
+  assert.ok(Math.abs(outcomeRecencyWeight(seen, HALF_LIFE_LATER) - 0.5) < 0.02);
+  assert.ok(
+    Math.abs(outcomeRecencyWeight(seen, THREE_HALF_LIVES_LATER) - 0.125) < 0.02,
+  );
+});
+
+test("a clock that disagrees never silently discounts a record", () => {
+  // Unparseable and future timestamps weigh 1 rather than 0: a skewed clock
+  // must not quietly erase real observed history.
+  assert.equal(outcomeRecencyWeight("not-a-date", JUST_AFTER), 1);
+  assert.equal(
+    outcomeRecencyWeight("2027-01-01T00:00:00.000Z", JUST_AFTER),
+    1,
+  );
+});
+
+test("stale failures decay out of both the penalty and the prompt", () => {
+  const memory = failNTimes(createToolOutcomeMemory(), 6);
+
+  const fresh = outcomePenaltyForAction(
+    memory,
+    "code_workspace_create",
+    "code_workspace",
+    JUST_AFTER,
+  );
+  const stale = outcomePenaltyForAction(
+    memory,
+    "code_workspace_create",
+    "code_workspace",
+    THREE_HALF_LIVES_LATER,
+  );
+
+  assert.ok(fresh > 0);
+  assert.ok(stale < fresh);
+  // Six failures weighed at ~1/8 fall back under the pattern threshold, which
+  // is the point: a fix that landed months ago stops being charged forever.
+  assert.equal(stale, 0);
+  assert.equal(
+    summarizeOutcomeMemoryForPrompt(memory, 8, THREE_HALF_LIVES_LATER),
+    null,
+  );
+});
+
+test("a mostly-successful approach is never announced as one to avoid", () => {
+  let memory = failNTimes(createToolOutcomeMemory(), 3, {
+    toolName: "web_fetch",
+    errorCode: "timeout",
+    targetKind: "none",
+  });
+  for (let index = 0; index < 300; index += 1) {
+    memory = recordToolOutcome(memory, {
+      toolName: "web_fetch",
+      ok: true,
+      targetKind: "none",
+      observedAt: "2026-07-11T00:00:00.000Z",
+    });
+  }
+
+  assert.equal(summarizeOutcomeMemoryForPrompt(memory, 8, JUST_AFTER), null);
+
+  const failing = memory.records.find(
+    (record) => record.toolName === "web_fetch" && record.errorCode === "timeout",
+  );
+  assert.ok(failing);
+  assert.equal(isNotablyFailing(memory, failing, JUST_AFTER), false);
+
+  // The same three failures with nothing to offset them stay notable.
+  const unrelieved = failNTimes(createToolOutcomeMemory(), 3, {
+    toolName: "web_fetch",
+    errorCode: "timeout",
+    targetKind: "none",
+  });
+  assert.ok(summarizeOutcomeMemoryForPrompt(unrelieved, 8, JUST_AFTER));
+});
+
+test("the prompt reports raw observed counts even though it selects on weighted ones", () => {
+  const memory = failNTimes(createToolOutcomeMemory(), 4);
+  const summary = summarizeOutcomeMemoryForPrompt(memory, 8, JUST_AFTER);
+
+  assert.ok(summary);
+  // Selection is recency-weighted; the sentence still tells the truth about
+  // what was actually observed rather than reporting a decayed fraction.
+  assert.match(summary, /failed 4x/);
+});
+
+test("both readers derive their counts from the shared helper", () => {
+  // Source-level guard. The regression this blocks is re-inlining a raw-count
+  // filter into the prompt projection, which is exactly how the two readers
+  // drifted apart the first time.
+  const source = readFileSync(
+    new URL("../src/agent/outcomeMemory.ts", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(source, /\.filter\(\s*\(record\)\s*=>\s*record\.failures/);
+  assert.equal(
+    source.split("weightedOutcomeCounts(").length - 1 >= 2,
+    true,
+    "penalty, prompt selection, and the notable predicate must all read the shared helper",
+  );
 });

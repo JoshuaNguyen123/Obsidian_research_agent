@@ -146,7 +146,12 @@ test("repeated matching failures down-rank a tool without removing it", async ()
   }
 
   const output = await new AgenticReflexController().evaluate(
-    input({ toolOutcomeMemory: memory }),
+    // Outcome history is recency-weighted, so the read instant is pinned next to
+    // the fixture rather than left to drift with the wall clock.
+    input({
+      toolOutcomeMemory: memory,
+      outcomeMemoryNow: new Date("2026-07-24T01:00:00.000Z"),
+    }),
   );
   const semantic = output.actionScores.find(
     (item) => item.action.toolName === "semantic_search_notes",
