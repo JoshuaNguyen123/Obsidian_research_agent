@@ -113,7 +113,7 @@ export function createResearchProjectHierarchyTool(
           "Linear hierarchy publication requires a verified Linear connection and team destination.",
         );
       }
-      if (!hasExplicitResearchProjectHierarchyIntent(context.originalPrompt)) {
+      if (!missionAuthorizesResearchProjectHierarchyV1(context.originalPrompt)) {
         throw notApplied(
           "linear_hierarchy_explicit_intent_required",
           "Creating a Linear hierarchy requires an explicit user request to shape accepted research into an initiative, project, and issues.",
@@ -322,6 +322,45 @@ export function createResearchProjectHierarchyTool(
     };
   };
   return tool;
+}
+
+/**
+ * The ONE mission-level answer to "may this mission shape accepted research
+ * into a Linear initiative, project, and issues?"
+ *
+ * Every seat that reasons about hierarchy authority must consume this function
+ * rather than re-deriving the answer from a broader signal:
+ *
+ *  - this module's own execution gate (`createResearchProjectHierarchyTool`),
+ *  - the frontier seat that decides whether to OFFER
+ *    `publish_research_project_to_linear`, and
+ *  - the planner seat that decides whether to PLAN its ordered node
+ *    (`getRequiredWriteToolNames`).
+ *
+ * It was re-derived, and the two answers drifted. The planner and frontier
+ * accepted `hasExplicitResearchProjectHierarchyIntent(prompt) ||
+ * hasAffirmativeJoinedDeveloperLifecycleIntent(prompt)`, while the gate
+ * accepted only the first term. The compound lane asks for "web research,
+ * Linear issue, repository workspace, private GitHub, and note reflection" and
+ * publishes exactly one issue — it never asks for a hierarchy — so the joined
+ * disjunct planned a node whose own gate then refused it, and the mission
+ * blocked at `tool-10` with `tool_failure_repeated`.
+ *
+ * A joined developer lifecycle is deliberately NOT sufficient on its own: it
+ * describes the shape of the delivery pipeline, not a request to fan accepted
+ * research out into an initiative + project + issues. Missions that genuinely
+ * want the hierarchy say so and match the explicit intent directly — including
+ * the canonical "Research X and create measurable Linear work" developer
+ * mission, which needs no widening to keep its hierarchy node.
+ *
+ * Ambient availability (Linear enabled, an active note, a resumable run) stays
+ * an offer-side concern. Narrowing the offer further is always safe; widening
+ * it past this predicate is what produced an unpayable node.
+ */
+export function missionAuthorizesResearchProjectHierarchyV1(
+  prompt: string,
+): boolean {
+  return hasExplicitResearchProjectHierarchyIntent(prompt);
 }
 
 export function hasExplicitResearchProjectHierarchyIntent(prompt: string): boolean {

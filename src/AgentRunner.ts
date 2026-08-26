@@ -161,6 +161,7 @@ import {
 } from "./agent/jupyterReflectionIntent";
 import {
   hasExplicitResearchProjectHierarchyIntent,
+  missionAuthorizesResearchProjectHierarchyV1,
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
 } from "./tools/researchProjectHierarchyTool";
 import {
@@ -27488,9 +27489,12 @@ function getAllowedToolDefinitions(
     if (name === PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) {
       return (
         settings?.linearEnabled === true &&
-        ((linearIntent.explicit &&
-          hasExplicitResearchProjectHierarchyIntent(prompt)) ||
-          joinedDeveloperLifecycle) &&
+        linearIntent.explicit &&
+        // One shared answer with the tool's own execution gate. Offering the
+        // hierarchy on a broader signal than the gate honors planned an
+        // unpayable node; `linearEnabled`/`linearIntent.explicit` may narrow
+        // the offer further, but nothing here may widen it.
+        missionAuthorizesResearchProjectHierarchyV1(prompt) &&
         // A joined pathless mission first pays accepted publication; the
         // hierarchy composite consumes that durable lineage rather than an
         // ambient active-note assumption.
@@ -28473,9 +28477,13 @@ function getRequiredWriteToolNames(
     (hasExplicitResearchPublicationIntent(prompt) ||
       joinedDeveloperLifecycle) &&
     allowedToolNames.has(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME);
+  // One shared answer with the hierarchy tool's own execution gate. A joined
+  // developer lifecycle used to widen this seat past the gate, which planned
+  // `tool-10-publish_research_project_to_linear` into compound missions that
+  // had only ever asked for a single published Linear issue; the model then
+  // called the tool correctly and the gate refused it twice.
   const wantsResearchHierarchy =
-    (hasExplicitResearchProjectHierarchyIntent(prompt) ||
-      joinedDeveloperLifecycle) &&
+    missionAuthorizesResearchProjectHierarchyV1(prompt) &&
     allowedToolNames.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME);
   const explicitGitHubMutationToolNames =
     getExplicitGitHubCatalogMutationToolNames(prompt).filter((name) =>
@@ -28594,7 +28602,7 @@ function getRequiredWriteToolNames(
   if (
     !compoundLifecycle &&
     allowedToolNames.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) &&
-    hasExplicitResearchProjectHierarchyIntent(prompt)
+    missionAuthorizesResearchProjectHierarchyV1(prompt)
   ) {
     return withRequestedReflection([
       ...lifecycleRequiredToolNames,
