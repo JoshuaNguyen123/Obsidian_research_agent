@@ -23,6 +23,10 @@ import {
   RealAiConnectionAttestationRegistry,
   verifyWithWorkerConnectionAttestation,
 } from "./realAiConnectionAttestation";
+import {
+  armToolCallCollector,
+  harvestToolCallCollector,
+} from "./toolCallCollector";
 
 export { clearChatInline } from "./chatCleanup";
 
@@ -320,12 +324,25 @@ export async function startRealAiHarness(
     ...(nativeOptions.retainVaultPaths
       ? { retainVaultPaths: nativeOptions.retainVaultPaths }
       : {}),
-    setup: (context) =>
-      installRealAiPageHarness(context, {
+    setup: async (context) => {
+      await installRealAiPageHarness(context, {
         placeholderCurrentNote:
           nativeOptions.placeholderCurrentNote === true,
-      }),
-    beforeClose: async ({ page }) => restoreOwnedWebBackend(page),
+      });
+      // THE tool-call instrumentation seam. Arming here — before any lane can
+      // submit a mission — is what makes segment 0 provably complete
+      // (armedWhileRunning=false), and it is why every lane that starts
+      // through this harness gets honest counters without its own collector.
+      // See e2e/fixtures/toolCallCollector.ts.
+      await armToolCallCollector(context.page);
+    },
+    beforeClose: async ({ page }) => {
+      // Harvest FIRST: it never throws, and the counts must be read before any
+      // teardown that could disturb the page. The whole hook shares
+      // nativeObsidianHarness's bounded 5s beforeClose budget.
+      await harvestToolCallCollector(page);
+      await restoreOwnedWebBackend(page);
+    },
   });
   let recordedApprovals = 0;
   let recordedContinuations = 0;
@@ -503,6 +520,12 @@ async function restartCorePlugin(
     timeout: 30_000,
   });
   await assertProductionClientReady(page, config, provider);
+  // The disable/enable cycle destroyed the coordinator and with it the old
+  // subscription, so open a NEW collector segment. `replay: true` recovers the
+  // resumed run's prefix from the new coordinator's buffer; a segment that
+  // cannot prove it saw that prefix marks itself lossy, which degrades the
+  // whole merged answer to UNKNOWN rather than reporting a short count.
+  await armToolCallCollector(page);
 }
 
 async function waitUntilIdleOrComplete(

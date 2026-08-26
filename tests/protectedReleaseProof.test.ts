@@ -334,3 +334,68 @@ test("protected runner never streams raw child output or Playwright failure medi
   assert.match(config, /trace: protectedLogMode \? "off"/u);
   assert.match(config, /video: protectedLogMode \? "off"/u);
 });
+
+test("the public proof preserves an unknown tool-call count as null, never as zero", () => {
+  // boundedPublicInteger maps null -> 0, which re-manufactured in the PUBLIC
+  // proof exactly the fabricated zero the reporter had just stopped emitting.
+  const projected = projectDailyUseSummaryForPublicProof({
+    version: 1,
+    status: "passed",
+    records: [
+      {
+        scenarioId: null,
+        taskFamily: "soak",
+        project: "real-ai-soak",
+        file: "e2e/real-ai-soak.spec.ts",
+        title: "a mission completes",
+        status: "passed",
+        durationMs: 10,
+        retry: 0,
+        failureCategory: null,
+        acceptanceStatus: "needs_more_work",
+        missingAcceptanceCriteria: [],
+        fingerprint: `sha256:${"b".repeat(64)}`,
+        modelCalls: 2,
+        toolCalls: null,
+        continuations: 0,
+        approvals: 0,
+        artifactProofCount: 0,
+        cleanupProofCount: 0,
+      },
+      { ...knownRecord(), toolCalls: 0 },
+      { ...knownRecord(), toolCalls: 9 },
+    ],
+  }) as any;
+  assert.equal(projected.records[0].toolCalls, null, "unknown must stay unknown");
+  assert.notEqual(projected.records[0].toolCalls, 0);
+  assert.equal(
+    JSON.parse(JSON.stringify(projected)).records[0].toolCalls,
+    null,
+    "null must survive serialization distinctly from 0",
+  );
+  // A measured zero is still a zero, and a real count is untouched.
+  assert.equal(projected.records[1].toolCalls, 0);
+  assert.equal(projected.records[2].toolCalls, 9);
+});
+
+function knownRecord() {
+  return {
+    scenarioId: null,
+    taskFamily: "soak",
+    project: "real-ai-soak",
+    file: "e2e/real-ai-soak.spec.ts",
+    title: "a mission completes",
+    status: "passed",
+    durationMs: 10,
+    retry: 0,
+    failureCategory: null,
+    acceptanceStatus: "needs_more_work",
+    missingAcceptanceCriteria: [],
+    fingerprint: `sha256:${"c".repeat(64)}`,
+    modelCalls: 1,
+    continuations: 0,
+    approvals: 0,
+    artifactProofCount: 0,
+    cleanupProofCount: 0,
+  };
+}

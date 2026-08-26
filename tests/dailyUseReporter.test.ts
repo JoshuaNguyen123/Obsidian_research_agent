@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import {
+import DailyUseReporter, {
   classifyToolReceiptWork,
   countIntentionalNoOpReceipts,
   countRefusalMarkers,
@@ -14,9 +14,15 @@ import {
   resolveRefusalBuckets,
   selectAtomicDailyUseObservation,
   shouldWriteDailyUseSummary,
+  resolveToolCallCounters,
   sumNullableCounters,
+  summarizeRecords,
   writeDailyUseSummaryIfAny,
 } from "../e2e/reporters/dailyUseReporter";
+import {
+  DAILY_USE_METRICS_ANNOTATION,
+  DAILY_USE_TOOL_OUTCOMES_ANNOTATION,
+} from "../e2e/fixtures/dailyUseAcceptance";
 
 test("daily-use reporter preserves the prior summary for listing and zero-test selections", () => {
   assert.equal(shouldWriteDailyUseSummary(0), false);
@@ -235,4 +241,276 @@ test("nullable counters never coerce unknown into zero", () => {
   assert.equal(sumNullableCounters([]), null);
   assert.equal(sumNullableCounters([2, null, 3]), 5);
   assert.equal(sumNullableCounters([0, null]), 0, "a known zero is zero, not unknown");
+});
+
+/**
+ * Reporter record building. The unit under test is `onTestEnd`, because the
+ * fabricated zeros this wave removes were produced there, not in any exported
+ * helper: `metrics` is null for every record without a typed
+ * DailyUseScenarioId, and `metrics?.toolCalls ?? 0` turned that null into an
+ * explicit observed=0 CSV row for lanes that certainly called tools.
+ */
+function fakeTest(options: {
+  title?: string;
+  project?: string;
+  file?: string;
+  annotations?: { type: string; description: string }[];
+}): any {
+  return {
+    title: options.title ?? "a mission completes",
+    location: { file: path.join(process.cwd(), options.file ?? "e2e/real-ai-soak.spec.ts") },
+    annotations: options.annotations ?? [],
+    parent: { project: () => ({ name: options.project ?? "real-ai-soak" }) },
+  };
+}
+
+function fakeResult(overrides: Record<string, unknown> = {}): any {
+  return { status: "passed", duration: 1_000, retry: 0, errors: [], ...overrides };
+}
+
+function recordsOf(reporter: DailyUseReporter): any[] {
+  return (reporter as unknown as { records: any[] }).records;
+}
+
+function outcomesAnnotation(
+  counts: Record<string, unknown>,
+): { type: string; description: string } {
+  return {
+    type: DAILY_USE_TOOL_OUTCOMES_ANNOTATION,
+    description: JSON.stringify({
+      version: 1,
+      coverage: "complete",
+      attempted: null,
+      succeeded: null,
+      failed: null,
+      undetermined: null,
+      vacuous: null,
+      intentionalNoOp: null,
+      receiptsUnknown: null,
+      succeededWithWork: null,
+      failureBuckets: null,
+      atLeast: null,
+      observedEvents: 0,
+      ...counts,
+    }),
+  };
+}
+
+test("an unannotated lane records UNKNOWN tool calls, never an explicit zero", () => {
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(fakeTest({}), fakeResult());
+  const [record] = recordsOf(reporter);
+  // The four scenario-less proof lanes land here. Zero would be a claim.
+  assert.equal(record.scenarioId, null);
+  assert.equal(record.toolCalls, null, "unknown tool calls must not print as 0");
+  assert.equal(record.toolCallsAttempted, null);
+  assert.equal(record.toolCallsFailed, null);
+  assert.equal(record.toolCallsVacuous, null);
+  assert.equal(record.refusalBuckets, null);
+  assert.equal(record.refusalBucketsSource, null);
+  // Serialization is what the CSV pipeline consumes.
+  const serialized = JSON.parse(JSON.stringify(record));
+  assert.equal(serialized.toolCalls, null);
+  assert.notEqual(serialized.toolCalls, 0);
+});
+
+test("a folded outcomes annotation supplies real counters for a scenario-less lane", () => {
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(
+    fakeTest({
+      annotations: [
+        outcomesAnnotation({
+          attempted: 41,
+          succeeded: 38,
+          failed: 3,
+          undetermined: 0,
+          vacuous: 2,
+          intentionalNoOp: 1,
+          succeededWithWork: 36,
+          failureBuckets: { execution_failed: 3, tool_not_allowed: 0 },
+          observedEvents: 120,
+        }),
+      ],
+    }),
+    fakeResult(),
+  );
+  const [record] = recordsOf(reporter);
+  assert.equal(record.toolCallsAttempted, 41);
+  assert.equal(record.toolCallsFailed, 3);
+  assert.equal(record.toolCallsVacuous, 2);
+  assert.equal(record.toolCallsIntentionalNoOp, 1);
+  assert.equal(record.refusalBucketsSource, "outcomes");
+  // A watched bucket that saw nothing is an EXPLICIT zero — unlike a mined
+  // sighting, where absence is only absence.
+  assert.equal(record.refusalBuckets.tool_not_allowed, 0);
+  assert.equal(record.refusalBuckets.execution_failed, 3);
+  // The fingerprinted DU counter is a different quantity and stays unknown.
+  assert.equal(record.toolCalls, null);
+  assert.equal(record.toolCallOutcomes.coverage, "complete");
+});
+
+test("a lossy or malformed outcomes annotation stays unknown rather than becoming zero", () => {
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(
+    fakeTest({
+      annotations: [
+        {
+          type: DAILY_USE_TOOL_OUTCOMES_ANNOTATION,
+          description: JSON.stringify({
+            version: 1,
+            coverage: "lossy",
+            attempted: null,
+            failed: null,
+            failureBuckets: null,
+            atLeast: { attempted: 12, failed: 2 },
+            observedEvents: 30,
+          }),
+        },
+      ],
+    }),
+    fakeResult(),
+  );
+  reporter.onTestEnd(
+    fakeTest({ annotations: [{ type: DAILY_USE_TOOL_OUTCOMES_ANNOTATION, description: "{not json" }] }),
+    fakeResult(),
+  );
+  reporter.onTestEnd(
+    fakeTest({
+      annotations: [
+        { type: DAILY_USE_TOOL_OUTCOMES_ANNOTATION, description: JSON.stringify({ version: 2, coverage: "complete", attempted: 9 }) },
+      ],
+    }),
+    fakeResult(),
+  );
+  for (const record of recordsOf(reporter)) {
+    assert.equal(record.toolCallsAttempted, null);
+    assert.equal(record.toolCallsFailed, null);
+    assert.equal(record.refusalBuckets, null);
+    assert.equal(record.toolCalls, null);
+  }
+  // The lossy fold is still kept for provenance, with its lower bounds intact.
+  assert.equal(recordsOf(reporter)[0].toolCallOutcomes.coverage, "lossy");
+  assert.deepEqual(recordsOf(reporter)[0].toolCallOutcomes.atLeast, {
+    attempted: 12,
+    failed: 2,
+  });
+  assert.equal(recordsOf(reporter)[1].toolCallOutcomes, null);
+  assert.equal(recordsOf(reporter)[2].toolCallOutcomes, null);
+});
+
+test("a spec's own counters outrank the harness-wide fold", () => {
+  // DU-06 folds PER PHASE and knows its own scoping; the harness-wide fold
+  // spans the whole session. The spec wins, and the two are never averaged.
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(
+    fakeTest({
+      title: "DU-06 checkers exact-SHA lifecycle",
+      project: "daily-use-compound",
+      file: "e2e/daily-use-compound.spec.ts",
+      annotations: [
+        {
+          type: DAILY_USE_METRICS_ANNOTATION,
+          description: JSON.stringify({
+            scenarioId: "DU-06",
+            modelCalls: 7,
+            toolCalls: 11,
+            toolCallsAttempted: 19,
+            toolCallsFailed: 4,
+          }),
+        },
+        outcomesAnnotation({ attempted: 99, failed: 40, observedEvents: 300 }),
+      ],
+    }),
+    fakeResult(),
+  );
+  const [record] = recordsOf(reporter);
+  assert.equal(record.scenarioId, "DU-06");
+  assert.equal(record.toolCallsAttempted, 19);
+  assert.equal(record.toolCallsFailed, 4);
+  // The fingerprinted evidence-derived counter is untouched.
+  assert.equal(record.toolCalls, 11);
+});
+
+test("group summaries keep unknown tool calls unknown", () => {
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(fakeTest({}), fakeResult());
+  reporter.onTestEnd(fakeTest({}), fakeResult());
+  const [summary] = summarizeRecords(recordsOf(reporter));
+  assert.equal(summary.toolCalls, null, "no record knew: the group total is unknown");
+  assert.equal(summary.toolCallsAttempted, null);
+});
+
+test("counters come from ONE source: annotation and fold are never blended", () => {
+  // Blending the annotation's `attempted` with the fold's `failed` yields a
+  // ratio neither source ever measured. The annotation wins as a WHOLE when it
+  // carries any counter; its own gaps stay unknown.
+  const annotated = resolveToolCallCounters(
+    {
+      toolCallsAttempted: 19,
+      toolCallsFailed: 4,
+      toolCallsVacuous: null,
+      toolCallsIntentionalNoOp: null,
+      toolCallsUndetermined: null,
+    },
+    {
+      version: 1,
+      coverage: "complete",
+      attempted: 99,
+      succeeded: 50,
+      failed: 40,
+      undetermined: 9,
+      vacuous: 7,
+      intentionalNoOp: 2,
+      receiptsUnknown: 0,
+      succeededWithWork: 43,
+      failureBuckets: {},
+      atLeast: null,
+      observedEvents: 300,
+    },
+  );
+  assert.equal(annotated.toolCallsAttempted, 19);
+  assert.equal(annotated.toolCallsFailed, 4);
+  assert.equal(annotated.toolCallsVacuous, null, "the fold's 7 must not fill this gap");
+  assert.equal(annotated.toolCallsUndetermined, null);
+
+  // With no annotated counters at all, the complete fold supplies every field —
+  // including undetermined, which stops `attempted - failed` from scoring an
+  // interrupted call as a success.
+  const folded = resolveToolCallCounters(
+    {
+      toolCallsAttempted: null,
+      toolCallsFailed: null,
+      toolCallsVacuous: null,
+      toolCallsIntentionalNoOp: null,
+      toolCallsUndetermined: null,
+    },
+    {
+      version: 1,
+      coverage: "complete",
+      attempted: 10,
+      succeeded: 6,
+      failed: 1,
+      undetermined: 3,
+      vacuous: 1,
+      intentionalNoOp: 0,
+      receiptsUnknown: 0,
+      succeededWithWork: 5,
+      failureBuckets: {},
+      atLeast: null,
+      observedEvents: 40,
+    },
+  );
+  assert.equal(folded.toolCallsAttempted, 10);
+  assert.equal(folded.toolCallsUndetermined, 3);
+  assert.equal(folded.toolCallsVacuous, 1);
+
+  // Neither source: every field unknown, never zero.
+  const nothing = resolveToolCallCounters(null, null);
+  assert.deepEqual(nothing, {
+    toolCallsAttempted: null,
+    toolCallsFailed: null,
+    toolCallsVacuous: null,
+    toolCallsIntentionalNoOp: null,
+    toolCallsUndetermined: null,
+  });
 });
