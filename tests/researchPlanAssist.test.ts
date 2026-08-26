@@ -400,3 +400,70 @@ test("createResearchPlanWithAssist preserves an explicit closed source set", asy
   ]);
   assert.equal(completed.status, "complete");
 });
+
+/**
+ * REGRESSION GUARD — real-ai-soak "diagram creation and revision produces
+ * structurally verified artifact".
+ *
+ * The mission is a self-contained current-note ladder: read the selector,
+ * upsert a Mermaid block, read it back, revise it in place. It fetches nothing.
+ * But it addresses its destination as "the exact vault-relative path …", and
+ * both vault-signal consumers matched a bare `\bvault\b`, so
+ * `allowsResearchModeAssistActivation` opened the research-mode assist. A
+ * utility model answering `deep_vault` then minted rq-1..rq-3,
+ * `deriveResearchPhase` parked the run in `gather`, and the research phase gate
+ * refused `tool-02-upsert_mermaid_block` — the mission's own planned node — with
+ * `policy_deferral_repeated`. Gather could never complete, because the mission
+ * had no sources to gather, so the refusal was permanent.
+ */
+const DIAGRAM_MISSION_PROMPT =
+  'In the current note at the exact vault-relative path "E2E Agent Tests/live-provider.md" under the exact heading "E2E Diagram", create a small Mermaid diagram showing mission plan -> tool -> receipt. Use that heading as the Mermaid block selector. First read the selector to obtain the current note hash, create the block, read that saved Mermaid block back, then revise the same block in place to add a verification node and read it once more to validate the resulting structure.';
+
+function diagramMissionIntent() {
+  return {
+    ...researchIntent(),
+    mode: "explicit_file_mutation" as const,
+    vaultContext: false,
+    explicitMutation: true,
+    requireWriteCompletion: true,
+  };
+}
+
+test("a vault-relative path does not make a note-editing mission research-bearing", async () => {
+  const missionIntent = diagramMissionIntent();
+  assert.equal(
+    allowsResearchModeAssistActivation(DIAGRAM_MISSION_PROMPT, missionIntent),
+    false,
+  );
+
+  // Even with a utility model standing by and eager to upgrade, the assist must
+  // not fire: an upgraded plan hands the phase gate a gather it can never close.
+  const plan = await createResearchPlanWithAssist({
+    prompt: DIAGRAM_MISSION_PROMPT,
+    missionIntent,
+    runPlan: { route: "grounded_workflow", slowPathReason: "none" },
+    utilityModelConfigured: true,
+    modeAssist: async () => ({ mode: "deep_vault" as const, sourceFloor: 2 }),
+  });
+  assert.equal(plan, null);
+});
+
+test("naming the vault as a corpus still carries the full research contract", async () => {
+  // The real-ai-soak "deep vault retrieval" cell — the one the proof matrix
+  // actually greps — must keep every bit of its evidence contract.
+  const vaultRecallPrompt =
+    "Within one bounded mission, investigate my vault for MARKER. Use semantic retrieval, batch-read only the paths returned by semantic retrieval, and append a grounded synthesis to the current note. Do not use web or memory tools.";
+  assert.equal(
+    allowsResearchModeAssistActivation(vaultRecallPrompt, researchIntent()),
+    true,
+  );
+  const plan = await createResearchPlanWithAssist({
+    prompt: vaultRecallPrompt,
+    missionIntent: researchIntent(),
+    runPlan: { route: "grounded_workflow", slowPathReason: "none" },
+    utilityModelConfigured: true,
+    modeAssist: async () => ({ mode: "deep_vault" as const }),
+  });
+  assert.ok(plan);
+  assert.equal(plan.mode, "deep_vault");
+});

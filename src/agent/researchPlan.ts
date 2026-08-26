@@ -14,6 +14,7 @@ import {
   hasExplicitNoWebIntent,
   requiresVaultEvidenceProof,
   requiresWebEvidenceProof,
+  withoutVaultAddressingVocabularyV1,
 } from "./evidenceIntent";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "./replaceIntent";
 import { hasExplicitNoVaultReadIntent } from "./missionScope";
@@ -1759,7 +1760,11 @@ export function promptForbidsFetchedSourceWriteback(prompt: string): boolean {
 }
 
 function hasDeepVaultResearchIntent(prompt: string): boolean {
-  return /\b(vault|my\s+notes?|across\s+notes?|other\s+folders?|semantic\s+search|local\s+notes?|all\s+notes?|large\s+vault)\b/i.test(prompt);
+  // Addressing vocabulary is neutralized by THE shared seat in evidenceIntent,
+  // never by a private rule here — see withoutVaultAddressingVocabularyV1.
+  return /\b(vault|my\s+notes?|across\s+notes?|other\s+folders?|semantic\s+search|local\s+notes?|all\s+notes?|large\s+vault)\b/i.test(
+    withoutVaultAddressingVocabularyV1(prompt),
+  );
 }
 
 function hasBroadVaultSynthesisIntent(prompt: string): boolean {

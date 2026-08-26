@@ -9,12 +9,14 @@ import {
   intersectAuthoritativeIntent,
   normalizeModelRouterMode,
   normalizeRoutedMissionIntent,
+  resolveAuthoritativeWriteScopeV1,
   resolveModelRouterMode,
   resolveRoutedMissionIntent,
   saferWriteScope,
 } from "../src/agent/missionRouter";
 import {
   deriveRoutedIntentFallback,
+  evaluateToolPolicy,
   resolvePolicyRoutedIntent,
 } from "../src/agent/policyEngine";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
@@ -463,4 +465,112 @@ test("authority unions read needs but intersects generated-code execution", () =
   assert.equal(resolved.intent.needsWebEvidence, true);
   assert.equal(resolved.intent.needsVaultContext, true);
   assert.equal(resolved.intent.needsCodeExecution, false);
+});
+
+/**
+ * REGRESSION GUARD — real-ai-soak "approved vault CRUD chain preserves backups
+ * and receipts".
+ *
+ * The mission graph planned tool-01-create_file … tool-04-delete_path and the
+ * frontier offered create_file, so the run's write-tool exposure made the regex
+ * safety net say `vault_files`. A high-confidence authority route answering
+ * `writeScope: "none"` used to win the intersection, and evaluateToolPolicy
+ * then blocked the mission's own first planned node with `mutation_scope`.
+ * That is `offered ⊄ gate-accepted`: the host refused a call it was actively
+ * offering, and the node died on `tool_failure_repeated` after two attempts.
+ */
+test("an authority route may not revoke mutation authority the host is offering", () => {
+  const missionIntent = intentFixture(
+    'Create the exact markdown file "E2E Agent Tests/crud-source.md", replace its content, move it, then trash it.',
+    { explicitMutation: true },
+  );
+  const regexIntent = deriveRoutedIntentFallback({
+    missionIntent,
+    writeAutonomy: false,
+    // The frontier is offering create_file for the mission's own planned node.
+    writeToolExposed: true,
+    prompt: "vault crud chain",
+  });
+  assert.notEqual(regexIntent.writeScope, "none");
+
+  const modelIntent = normalizeRoutedMissionIntent(
+    routedJson({ writeScope: "none", confidence: 0.9 }),
+  );
+  assert.ok(modelIntent);
+
+  const resolved = resolveRoutedMissionIntent({
+    mode: "authority",
+    modelIntent,
+    regexIntent,
+  });
+  assert.equal(resolved.source, "model");
+  assert.notEqual(resolved.intent.writeScope, "none");
+
+  const decision = evaluateToolPolicy({
+    toolName: "create_file",
+    args: {},
+    intent: resolved.intent,
+    approvalGranted: false,
+    isDesktop: true,
+    writeAutonomy: false,
+  });
+  assert.equal(decision.action, "allow");
+  assert.ok(!decision.tags.includes("mutation_scope"));
+});
+
+/**
+ * The ceiling half of the same seat must survive: a read-only mission exposes
+ * no write tool, so the regex scope is already "none" and the mutation-scope
+ * block keeps its full force. This is the half that made the min-intersection
+ * look correct, and removing it would trade one defect for a worse one.
+ */
+test("mutation scope still blocks when the host exposes no write tool", () => {
+  const missionIntent = intentFixture("Summarize what my notes say about X.");
+  const regexIntent = deriveRoutedIntentFallback({
+    missionIntent,
+    writeAutonomy: false,
+    writeToolExposed: false,
+    prompt: "summarize my notes",
+  });
+  assert.equal(regexIntent.writeScope, "none");
+
+  const modelIntent = normalizeRoutedMissionIntent(
+    routedJson({ writeScope: "vault_files", confidence: 0.9 }),
+  );
+  assert.ok(modelIntent);
+
+  const resolved = resolveRoutedMissionIntent({
+    mode: "authority",
+    modelIntent,
+    regexIntent,
+  });
+  assert.equal(resolved.intent.writeScope, "none");
+
+  const decision = evaluateToolPolicy({
+    toolName: "create_file",
+    args: {},
+    intent: resolved.intent,
+    approvalGranted: false,
+    isDesktop: true,
+    writeAutonomy: false,
+  });
+  assert.equal(decision.action, "block");
+  assert.ok(decision.tags.includes("mutation_scope"));
+});
+
+test("resolveAuthoritativeWriteScopeV1 is a ceiling, never a floor", () => {
+  // Authority can still never widen past the regex safety net.
+  assert.equal(
+    resolveAuthoritativeWriteScopeV1("vault_files", "current_note_append"),
+    "current_note_append",
+  );
+  // Narrowing among write scopes is still allowed.
+  assert.equal(
+    resolveAuthoritativeWriteScopeV1("current_note_append", "vault_files"),
+    "current_note_append",
+  );
+  // Revoking an offered mutation is not.
+  assert.equal(resolveAuthoritativeWriteScopeV1("none", "vault_files"), "vault_files");
+  // With nothing offered, "none" stands.
+  assert.equal(resolveAuthoritativeWriteScopeV1("none", "none"), "none");
 });
