@@ -1546,6 +1546,156 @@ test("completed canonical research publication receipts restore composite proof"
   );
 });
 
+/**
+ * The exact `waiting_obsidian` return of ResearchPublicationWorkflow: the Linear
+ * issue was created and verified, the binding and `linear_verified` lineage are
+ * durable, and only the vault backlink append failed. That result shape carries
+ * no `backlink` record and no `publication` discriminator at all, and its `ok`
+ * is false.
+ */
+function waitingObsidianResearchPublicationReceiptFixture(
+  publication: "created" | "deduplicated",
+): SetLooseDeliveryReceiptLikeV1 {
+  const completed = completedResearchPublicationReceiptFixture(publication);
+  const {
+    publication: _publication,
+    backlink: _backlink,
+    ...withoutBacklink
+  } = completed.output as Record<string, unknown>;
+  return {
+    ...completed,
+    output: {
+      ...withoutBacklink,
+      ok: false,
+      status: "waiting_obsidian",
+      error: {
+        code: "research_publication_backlink_waiting_obsidian",
+        message: "Research note changed before Linear backlink append.",
+      },
+    },
+  };
+}
+
+test("a publication still owing its vault backlink already published and is never re-offered", () => {
+  const compoundStages: ProjectLifecycleStageV1[] = [
+    "accepted_research",
+    "linear_hierarchy",
+    "code_execution",
+    "code_validation",
+    "private_github_publication",
+    "reflection",
+  ];
+
+  for (const publication of ["created", "deduplicated"] as const) {
+    const waitingObsidian =
+      waitingObsidianResearchPublicationReceiptFixture(publication);
+
+    // The mission is NOT finished: the note backlink is still outstanding.
+    assert.equal(
+      isCompletedAcceptedResearchPublicationReceipt(waitingObsidian),
+      false,
+      "a publication owing its backlink is not a completed publication",
+    );
+
+    // ...but the run HAS published, so the resume seat must pay
+    // accepted_research from the same evidence the live seat uses.
+    const restored = seedSetLooseDeliveryStateFromReceipts([waitingObsidian]);
+    assert.equal(
+      restored.proofs.acceptedResearchPublication,
+      true,
+      "a Continue segment must not forget a Linear issue this run created",
+    );
+    assert.equal(restored.proofs.linearIssueUrlOrId, true);
+    assert.ok(restored.paidStages.includes("accepted_research"));
+    assert.ok(restored.paidStages.includes("linear_hierarchy"));
+
+    const gate = setLooseDeliveryComplete({
+      stages: compoundStages,
+      proofs: restored.proofs,
+    });
+    assert.equal(
+      gate.unpaid.includes("accepted_research"),
+      false,
+      "accepted_research must not be re-derived as unpaid after publication",
+    );
+
+    // The frontier consequence: publish_research_to_linear is not re-offered,
+    // so the run cannot open a second exact approval for the same mutation.
+    assert.equal(
+      pendingToolsForUnpaidSetLooseDelivery(gate.unpaid).includes(
+        "publish_research_to_linear",
+      ),
+      false,
+    );
+    assert.equal(
+      toolsOfferedForSetLooseTurn({
+        stages: compoundStages,
+        currentStage: "accepted_research",
+        passedFastRepairCycle: false,
+        codeDeliveryPaid: false,
+        unpaidDeliveryKeys: gate.unpaid,
+      }).includes("publish_research_to_linear"),
+      false,
+      "a published mission must never be offered the Linear mutation again",
+    );
+
+    // The LIVE seat answers the same question from the same status rule.
+    assert.equal(
+      applySetLooseDeliveryProofFromSuccessfulTool({
+        toolName: "publish_research_to_linear",
+        output: waitingObsidian.output,
+        proofs: {},
+      }).acceptedResearchPublication,
+      true,
+    );
+
+    // Fail closed: an ambiguous provider outcome is not a publication, on
+    // either seat, so it stays settleable rather than silently counted.
+    const reconcileRequired: SetLooseDeliveryReceiptLikeV1 = {
+      ...waitingObsidian,
+      output: {
+        ...(waitingObsidian.output as Record<string, unknown>),
+        status: "reconcile_required",
+      },
+    };
+    assert.equal(
+      seedSetLooseDeliveryStateFromReceipts([reconcileRequired]).proofs
+        .acceptedResearchPublication,
+      undefined,
+    );
+    assert.equal(
+      applySetLooseDeliveryProofFromSuccessfulTool({
+        toolName: "publish_research_to_linear",
+        output: reconcileRequired.output,
+        proofs: {},
+      }).acceptedResearchPublication,
+      undefined,
+    );
+
+    // Fail closed: a result that claims to own the issue but drops the provider
+    // receipt evidence is not a publication either.
+    assert.equal(
+      seedSetLooseDeliveryStateFromReceipts([
+        { ...waitingObsidian, readback: { status: "not_verified" } },
+      ]).proofs.acceptedResearchPublication,
+      undefined,
+    );
+    assert.equal(
+      seedSetLooseDeliveryStateFromReceipts([
+        {
+          ...waitingObsidian,
+          output: {
+            ...(waitingObsidian.output as Record<string, unknown>),
+            ok: true,
+          },
+        },
+      ]).proofs.acceptedResearchPublication,
+      undefined,
+      "`ok` must match the completion status exactly",
+    );
+  }
+});
+
 test("a generic Linear issue does not pay accepted research publication", () => {
   const genericIssue = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "linear_create_issue",
@@ -1565,11 +1715,30 @@ test("a generic Linear issue does not pay accepted research publication", () => 
     ["accepted_research"],
   );
 
+  // The publication tool only ever returns a result that owns a Linear issue —
+  // `complete`, or `waiting_obsidian` when only the vault backlink is left. The
+  // live seat states that rule instead of assuming it from the tool name, so a
+  // result that does not own an issue cannot pay the stage.
+  assert.equal(
+    applySetLooseDeliveryProofFromSuccessfulTool({
+      toolName: "publish_research_to_linear",
+      output: {
+        ok: false,
+        status: "reconcile_required",
+        issue: { url: "https://linear.app/team/issue/APP-2", id: "issue-2" },
+      },
+      proofs: genericIssue,
+    }).acceptedResearchPublication,
+    undefined,
+  );
+
   const published = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "publish_research_to_linear",
     output: {
-      issueUrl: "https://linear.app/team/issue/APP-2",
-      issueId: "issue-2",
+      ok: true,
+      status: "complete",
+      publication: "created",
+      issue: { url: "https://linear.app/team/issue/APP-2", id: "issue-2" },
     },
     proofs: genericIssue,
   });
