@@ -7,6 +7,7 @@ import {
 import {
   isCompletedAcceptedResearchPublicationReceipt,
 } from "../setLooseCompoundAutonomy";
+import { stripWriteVerificationPhrasesV1 } from "../claimLedger";
 
 export { WRITE_RECEIPT_MISSING, receiptsSatisfyWriteProof };
 
@@ -102,8 +103,10 @@ function isBlockedBroadUnscopedMutation(input: AgenticReflexInput): boolean {
 }
 
 export function requiresWebEvidence(prompt: string): boolean {
+  // Shared with shouldRequireClaimGrounding: "verify that write" is durable
+  // write proof, not a demand for web sources.
   return /\b(web|online|sources?|citations?|latest|current\s+(?:events?|information|data|news)|verify|fact[-\s]?check)\b/i.test(
-    prompt,
+    stripWriteVerificationPhrasesV1(prompt),
   );
 }
 
