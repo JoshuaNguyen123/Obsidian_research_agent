@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_AGENT_STEPS,
+  isPlaceholderToolNameV1,
+  repairPlaceholderToolCallNamesV1,
   attachGroundedPassageCitations,
   constrainExactFindingSentenceContract,
   pruneUniquelyMatchedUngroundedClaims,
@@ -26691,4 +26693,97 @@ test("the pre-write proof gate does not govern a mission that declared no pre-wr
     }),
     true,
   );
+});
+
+test("an unfilled placeholder tool name is repaired to the single offered read tool", () => {
+  // Observed live in the compound flow lane (2026-08-26): right after a
+  // successful read_template the model emitted a tool call literally named
+  // "$TOOL_NAME" — an unfilled function-calling template, not a request for
+  // an unavailable tool. It cost a full model step on an unknown-tool
+  // refusal (~11% of a 9-step segment) while the frontier offered exactly
+  // one tool: web_fetch.
+  const readOnly = (name: string) =>
+    ["web_fetch", "web_search", "read_current_file"].includes(name);
+
+  const repaired = repairPlaceholderToolCallNamesV1({
+    toolCalls: [
+      { name: "$TOOL_NAME", arguments: { url: "https://example.com/a" } },
+    ],
+    offeredToolNames: ["web_fetch"],
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(repaired.repaired, ["$TOOL_NAME->web_fetch"]);
+  assert.equal(repaired.toolCalls[0].name, "web_fetch");
+  // Arguments pass through untouched: the model's intent is preserved and
+  // the tool's own schema validation still governs.
+  assert.deepEqual(repaired.toolCalls[0].arguments, {
+    url: "https://example.com/a",
+  });
+
+  // Ambiguity is never guessed: more than one offered tool leaves the call
+  // alone so the existing rejection can name the exact next tool.
+  assert.deepEqual(
+    repairPlaceholderToolCallNamesV1({
+      toolCalls: [{ name: "$TOOL_NAME", arguments: {} }],
+      offeredToolNames: ["web_fetch", "web_search"],
+      isReadOnlyToolName: readOnly,
+    }).repaired,
+    [],
+  );
+
+  // A mutation is NEVER invented from a placeholder, even unambiguously.
+  assert.deepEqual(
+    repairPlaceholderToolCallNamesV1({
+      toolCalls: [{ name: "$TOOL_NAME", arguments: { text: "hello" } }],
+      offeredToolNames: ["append_to_current_file"],
+      isReadOnlyToolName: readOnly,
+    }).repaired,
+    [],
+  );
+
+  // Real tool names are never touched.
+  const untouched = repairPlaceholderToolCallNamesV1({
+    toolCalls: [{ name: "web_search", arguments: { query: "x" } }],
+    offeredToolNames: ["web_fetch"],
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(untouched.repaired, []);
+  assert.equal(untouched.toolCalls[0].name, "web_search");
+});
+
+test("placeholder tool-name detection covers template shapes without shadowing real tools", () => {
+  for (const placeholder of [
+    "$TOOL_NAME",
+    "${toolName}",
+    "$tool",
+    "<tool_name>",
+    "<tool>",
+    "{{tool_name}}",
+    "tool_name",
+    "your_tool_name",
+    "exact_tool_name",
+    "  $TOOL_NAME  ",
+  ]) {
+    assert.equal(
+      isPlaceholderToolNameV1(placeholder),
+      true,
+      `expected placeholder: ${placeholder}`,
+    );
+  }
+  for (const real of [
+    "web_search",
+    "web_fetch",
+    "read_template",
+    "append_to_current_file",
+    "code_workspace_create_file",
+    "linear_create_issue",
+    "publish_research_to_linear",
+    "",
+  ]) {
+    assert.equal(
+      isPlaceholderToolNameV1(real),
+      false,
+      `expected real tool name: ${real}`,
+    );
+  }
 });

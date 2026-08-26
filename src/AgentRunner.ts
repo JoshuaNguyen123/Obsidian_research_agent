@@ -18652,7 +18652,30 @@ export async function runAgentMission({
         (stepAllowedToolNames.has("append_to_current_file") &&
           !stepAllowedToolNames.has("append_file")),
     });
-    const responseToolCalls = remappedAppendAliases.toolCalls;
+    // An unfilled template name ($TOOL_NAME) is a formatting failure, not a
+    // request for an unavailable tool. Retry it as the single offered
+    // read-effect tool rather than burning the step on a refusal.
+    const repairedPlaceholderCalls = repairPlaceholderToolCallNamesV1({
+      toolCalls: remappedAppendAliases.toolCalls,
+      offeredToolNames: [...stepAllowedToolNames],
+      isReadOnlyToolName: (toolName) =>
+        toolRegistry.getDescriptor?.(toolName)?.effect === "read",
+    });
+    if (repairedPlaceholderCalls.repaired.length > 0) {
+      const placeholderMessage = `Repaired placeholder tool name(s): ${repairedPlaceholderCalls.repaired.join(", ")}`;
+      events.onStatus?.(placeholderMessage);
+      events.onTrace?.({
+        id: `placeholder-tool-name-repair-${step}`,
+        kind: "status",
+        step,
+        message: placeholderMessage,
+        outputPreview: {
+          repaired: repairedPlaceholderCalls.repaired,
+          offeredToolNames: [...stepAllowedToolNames],
+        },
+      });
+    }
+    const responseToolCalls = repairedPlaceholderCalls.toolCalls;
     if (remappedAppendAliases.remapped.length > 0) {
       events.onStatus?.(
         `Remapped tool alias: ${remappedAppendAliases.remapped.join(", ")}`,
@@ -24954,6 +24977,68 @@ function reflectionCodeFenceV1(code: string): string {
     ...Array.from(code.matchAll(/`+/gu), (match) => match[0].length),
   );
   return "`".repeat(longest + 1);
+}
+
+/**
+ * Tool names that are obviously an unfilled TEMPLATE rather than a request:
+ * `$TOOL_NAME`, `${toolName}`, `<tool_name>`, `{{tool}}`, `your_tool_name`.
+ * Cheap models emit these mid-ladder when they compose the next call from a
+ * remembered function-calling form instead of the offered schema list
+ * (observed live in the compound flow lane, 2026-08-26: a literal
+ * `$TOOL_NAME` call right after a successful read_template).
+ *
+ * No installed tool name can match these shapes — every real name is
+ * snake_case words without `$`, `<`, or `{` — so this cannot shadow a real
+ * tool.
+ */
+export function isPlaceholderToolNameV1(toolName: string): boolean {
+  const value = toolName.trim();
+  if (!value) return false;
+  return (
+    /^\$\{?\s*[a-z0-9_]*tool[a-z0-9_]*\s*\}?$/iu.test(value) ||
+    /^<+\s*\/?\s*(?:tool|tool[_\s-]?name|name)\s*>+$/iu.test(value) ||
+    /^\{\{\s*(?:tool|tool[_\s-]?name)\s*\}\}$/iu.test(value) ||
+    /^(?:tool[_\s-]?name|toolname|your[_\s-]?tool(?:[_\s-]?name)?|name[_\s-]?of[_\s-]?tool|exact[_\s-]?tool[_\s-]?name)$/iu.test(
+      value,
+    )
+  );
+}
+
+/**
+ * A placeholder-named call is a formatting failure, not a request for
+ * something unavailable: the model meant to call the tool it was just
+ * offered. When the offered frontier is exactly ONE read-effect tool, retry
+ * the call as that tool instead of spending the step on an unknown-tool
+ * refusal (~11% of a 9-step segment's budget, live).
+ *
+ * Deliberately narrow, in the shape of the append-alias remap below:
+ *  - only obvious placeholders (isPlaceholderToolNameV1);
+ *  - only when exactly one tool is offered, so there is nothing to guess;
+ *  - only when that tool is READ-effect — silently redirecting a
+ *    placeholder into a mutation would invent an effectful call the model
+ *    never named, which is exactly how a two-subsystems bug gets written.
+ * Anything else falls through to the existing rejection, whose copy already
+ * names the exact tool to call next.
+ */
+export function repairPlaceholderToolCallNamesV1(input: {
+  toolCalls: readonly ModelToolCall[];
+  offeredToolNames: readonly string[];
+  isReadOnlyToolName: (toolName: string) => boolean;
+}): { toolCalls: ModelToolCall[]; repaired: string[] } {
+  const offered = [
+    ...new Set(input.offeredToolNames.map((name) => name.trim()).filter(Boolean)),
+  ];
+  const target = offered.length === 1 ? offered[0] : null;
+  if (!target || !input.isReadOnlyToolName(target)) {
+    return { toolCalls: [...input.toolCalls], repaired: [] };
+  }
+  const repaired: string[] = [];
+  const toolCalls = input.toolCalls.map((call) => {
+    if (!isPlaceholderToolNameV1(call.name)) return call;
+    repaired.push(`${call.name}->${target}`);
+    return { ...call, name: target };
+  });
+  return { toolCalls, repaired };
 }
 
 /**
