@@ -24,8 +24,11 @@ import {
 } from "../src/agent/evidenceIntent";
 import {
   allowsResearchModeAssistActivation,
+  mergeResearchLadderToolNamesV1,
   parseExplicitResearchSourceCount,
+  researchLadderToolNamesV1,
 } from "../src/agent/researchPlan";
+import { getCompoundLifecycleResearchGraphToolNames } from "../src/AgentRunner";
 import {
   resolveAuthoritativeWriteScopeV1,
   saferWriteScope,
@@ -298,6 +301,176 @@ test("the linear_hierarchy allowlist reorder does not change the offered menu", 
       `the opening compound menu must still offer ${required}`,
     );
   }
+});
+
+/**
+ * Compose the two research ladders exactly as the mission-graph planning site
+ * does: the proof-debt ladder is folded against the compound-lifecycle ladder,
+ * then the lifecycle ladder lands with the rest of the workflow. The
+ * source-level guard below pins that the site really is this composition.
+ */
+function plannedResearchLadderForCompoundMission(
+  prompt: string,
+  requiredGraphFetchCount: number,
+): string[] {
+  const compound = getCompoundLifecycleResearchGraphToolNames(prompt, 0);
+  const proofDebt = researchLadderToolNamesV1(requiredGraphFetchCount);
+  return [
+    ...mergeResearchLadderToolNamesV1(compound, proofDebt),
+    ...compound,
+  ];
+}
+
+test("the compound lane plans one web ladder sized to its two-source contract", () => {
+  // FAILS on the unfixed tree: both seats size themselves correctly from
+  // parseExplicitResearchSourceCount, but the graph CONCATENATED them, so the
+  // lane planned 2x web_search + 4x web_fetch (the observed tool-01..tool-06)
+  // for a contract that asks for exactly two sources. The surplus fetch nodes
+  // are unpayable source debt, and unpaid debt is what left tool-05/tool-06
+  // READY when the closure-exhausted terminal armed.
+  const requested = parseExplicitResearchSourceCount(COMPOUND_MISSION);
+  assert.equal(requested, 2);
+  // Which CLAUSE carries the count is load-bearing and not the obvious one:
+  // "exactly two public web sources" does NOT parse, because "public" is not an
+  // adjective the parser steps over between the number and "sources". The 2 is
+  // recovered from "fetch both sources". Anyone tidying that phrase out of the
+  // lane's prompt would silently drop the ladder to its default floor.
+  assert.equal(
+    parseExplicitResearchSourceCount("exactly two public web sources"),
+    null,
+  );
+  assert.equal(parseExplicitResearchSourceCount("fetch both sources"), 2);
+  // requiredGraphFetchCount at the planning site is
+  // max(plan.minFetchedSources, explicit count) and the plan's floor is the
+  // explicit count itself, so both inputs are 2.
+  const planned = plannedResearchLadderForCompoundMission(
+    COMPOUND_MISSION,
+    requested!,
+  );
+  assert.deepEqual(planned, ["web_search", "web_fetch", "web_fetch"]);
+  assert.equal(
+    planned.filter((name) => name === "web_fetch").length,
+    requested,
+    "one fetch node per requested source -- no surplus source debt",
+  );
+  assert.equal(
+    planned.filter((name) => name === "web_search").length,
+    1,
+    "one discovery search, not one per contributing seat",
+  );
+  // The unfixed composition, pinned for contrast: a plain concatenation of the
+  // two ladders is exactly the six web nodes observed as tool-01..tool-06.
+  const compound = getCompoundLifecycleResearchGraphToolNames(
+    COMPOUND_MISSION,
+    0,
+  );
+  assert.deepEqual(
+    [...researchLadderToolNamesV1(requested!), ...compound],
+    [
+      "web_search",
+      "web_fetch",
+      "web_fetch",
+      "web_search",
+      "web_fetch",
+      "web_fetch",
+    ],
+    "the observed over-plan was the sum of two individually-correct ladders",
+  );
+  assert.equal(planned.length, 3);
+});
+
+test("an explicit larger source count scales the single ladder up", () => {
+  const prompt = [
+    "Research American checkers using exactly five web sources and fetch every source.",
+    "Write the accepted research notebook, create the Linear hierarchy, implement Python in the repository,",
+    "run targeted validation, commit it, and publish it to a private GitHub repository.",
+  ].join(" ");
+  assert.equal(parseExplicitResearchSourceCount(prompt), 5);
+  assert.deepEqual(
+    plannedResearchLadderForCompoundMission(prompt, 5),
+    ["web_search", "web_fetch", "web_fetch", "web_fetch", "web_fetch", "web_fetch"],
+    "five requested sources plan five fetch nodes, still behind one search",
+  );
+});
+
+test("the fold never under-plans the larger of the two ladders", () => {
+  // The mirror-image guard from the write-side fix. The seats can disagree
+  // (the compound seat discounts sources already verified this run), and the
+  // graph must carry the LARGER ladder -- never the smaller, and never the sum.
+  assert.deepEqual(
+    mergeResearchLadderToolNamesV1(
+      ["web_search", "web_fetch"],
+      ["web_search", "web_fetch", "web_fetch", "web_fetch"],
+    ),
+    ["web_fetch", "web_fetch"],
+    "the proof-debt ladder contributes only its surplus over the compound one",
+  );
+  assert.deepEqual(
+    mergeResearchLadderToolNamesV1(
+      ["web_search", "web_fetch", "web_fetch", "web_fetch"],
+      ["web_search", "web_fetch"],
+    ),
+    [],
+    "a ladder wholly covered by the one already planned adds nothing",
+  );
+  // Retry margin lives INSIDE a node, not in surplus nodes: a node completes
+  // only on a successful receipt, so a failed fetch returns it to `ready`.
+  assert.deepEqual(researchLadderToolNamesV1(2), [
+    "web_search",
+    "web_fetch",
+    "web_fetch",
+  ]);
+  assert.deepEqual(researchLadderToolNamesV1(0), []);
+  assert.deepEqual(researchLadderToolNamesV1(-3), []);
+});
+
+test("a prompt with no stated source count keeps today's ladder exactly", () => {
+  // The byte-identical requirement. Nothing here reaches the compound seat, so
+  // the fold must be a pass-through and the proof-debt ladder must survive
+  // whole -- including the default floor of 1 fetch the site applies.
+  const prompt =
+    "Look up what the current guidance says about hydration during endurance events and summarize it.";
+  assert.equal(parseExplicitResearchSourceCount(prompt), null);
+  assert.deepEqual(getCompoundLifecycleResearchGraphToolNames(prompt, 0), []);
+  const proofDebt = researchLadderToolNamesV1(1);
+  assert.deepEqual(
+    mergeResearchLadderToolNamesV1([], proofDebt),
+    proofDebt,
+    "with no compound ladder the fold returns the ladder unchanged",
+  );
+  assert.deepEqual(plannedResearchLadderForCompoundMission(prompt, 1), [
+    "web_search",
+    "web_fetch",
+  ]);
+});
+
+test("the mission graph folds its two research ladders instead of summing them", () => {
+  // Source-level guard. The composition helper above re-derives the site's
+  // shape, so it can only stay honest if the site keeps consuming the shared
+  // fold. Re-inlining a second ladder here is the exact regression.
+  const runner = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const seatIndex = runner.indexOf("...(!seededResearchHandoffSatisfiesReads");
+  assert.ok(seatIndex > 0, "the planned-research graph seat moved");
+  const seat = runner.slice(seatIndex, seatIndex + 400);
+  assert.match(
+    seat,
+    /mergeResearchLadderToolNamesV1\(\s*explicitCompoundResearchToolNames,\s*plannedResearchGraphToolNames,\s*\)/u,
+    "the graph must fold the proof-debt ladder against the compound ladder",
+  );
+  // Both ladders must keep deriving their shape from the ONE shared helper.
+  assert.match(
+    runner,
+    /const plannedResearchGraphToolNames = researchLadderToolNamesV1\(/u,
+    "the proof-debt ladder must consume the shared ladder derivation",
+  );
+  assert.match(
+    runner,
+    /return researchLadderToolNamesV1\(remainingFetchCount\);/u,
+    "the compound-lifecycle ladder must consume the shared ladder derivation",
+  );
 });
 
 test("a budget terminal that forbids its own resume must name a blocker", () => {

@@ -837,8 +837,10 @@ import {
   createResearchPlan,
   createResearchPlanWithAssist,
   formatResearchPlanForPrompt,
+  mergeResearchLadderToolNamesV1,
   parseExplicitResearchSourceCount,
   promptForbidsFetchedSourceWriteback,
+  researchLadderToolNamesV1,
   type ResearchEffortAssessment,
   type ResearchEffortAssist,
   type ResearchModeAssessment,
@@ -4589,16 +4591,9 @@ export async function runAgentMission({
             ? (parseExplicitResearchSourceCount(activeIntentPrompt) ?? 1)
             : 0,
         );
-        const plannedResearchGraphToolNames =
-          requiredGraphFetchCount > 0
-            ? [
-                "web_search",
-                ...Array.from(
-                  { length: requiredGraphFetchCount },
-                  () => "web_fetch",
-                ),
-              ].filter((name) => graphAllowedToolNames.includes(name))
-            : [];
+        const plannedResearchGraphToolNames = researchLadderToolNamesV1(
+          requiredGraphFetchCount,
+        ).filter((name) => graphAllowedToolNames.includes(name));
         for (const name of plannedResearchGraphToolNames) {
           currentlyRunnableGraphToolNames.add(name);
         }
@@ -4793,8 +4788,19 @@ export async function runAgentMission({
           ...(promptOnPageBootstrap
             ? runnerOwnedGraphToolNames
             : [
+                // The compound-lifecycle seat sizes a web ladder from the SAME
+                // contract this one does, and whenever it produces a ladder it
+                // is itself the reason `explicitGraphWorkflowToolNames` chose
+                // the lifecycle branch — so that ladder is certain to land
+                // below. Concatenating both planned two searches and 2N fetches
+                // for an N-source request; fold this ladder against it so the
+                // graph carries ONE, sized to the larger. With no compound
+                // ladder the fold returns this ladder unchanged.
                 ...(!seededResearchHandoffSatisfiesReads
-                  ? plannedResearchGraphToolNames
+                  ? mergeResearchLadderToolNamesV1(
+                      explicitCompoundResearchToolNames,
+                      plannedResearchGraphToolNames,
+                    )
                   : []),
                 ...(explicitGraphWorkflowToolNames.length > 0
                   ? []
@@ -31291,11 +31297,7 @@ export function getCompoundLifecycleResearchGraphToolNames(
     0,
     fetchCount - Math.max(0, Math.trunc(verifiedFetchedSourceCount)),
   );
-  if (remainingFetchCount === 0) return [];
-  return [
-    "web_search",
-    ...Array.from({ length: remainingFetchCount }, () => "web_fetch"),
-  ];
+  return researchLadderToolNamesV1(remainingFetchCount);
 }
 
 /**

@@ -508,6 +508,66 @@ export function parseExplicitResearchSourceCount(prompt: string): number | null 
     : null;
 }
 
+/**
+ * THE shape a web-evidence ladder takes: one search that discovers candidate
+ * sources, then exactly one fetch node per source the contract owes.
+ *
+ * The count is the contract, NOT a capacity estimate with headroom. A mission
+ * graph node completes only on a SUCCESSFUL receipt — a failed or empty fetch
+ * returns its node to `ready` and spends one of the node's `maxAttemptsPerNode`
+ * (3) attempts — so retry margin already lives INSIDE each node. An extra fetch
+ * node is therefore not spare capacity; it is one more distinct source the
+ * mission owes, and source debt the request never asked for is exactly what
+ * drives low-yield fetch batches into the evidence-saturation terminal with
+ * ready nodes left unspent.
+ */
+export function researchLadderToolNamesV1(fetchCount: number): string[] {
+  const fetches = Math.max(0, Math.trunc(fetchCount));
+  if (fetches <= 0) return [];
+  return ["web_search", ...Array.from({ length: fetches }, () => "web_fetch")];
+}
+
+/**
+ * Fold one research ladder into another the mission graph is already carrying.
+ *
+ * Two independent seats size a web ladder from the same request: the graph
+ * proof-debt seat (`plannedResearchGraphToolNames`) and the compound-lifecycle
+ * seat (`getCompoundLifecycleResearchGraphToolNames`). Each sizes ITSELF
+ * correctly from `parseExplicitResearchSourceCount` — the defect was that the
+ * graph concatenated both, so a request for two sources planned two searches
+ * and four fetches. Both describe one contract, so the graph must carry one
+ * ladder sized to the larger of the two, never their sum.
+ *
+ * Returns only `candidate`'s SURPLUS over what is already planned. With no
+ * ladder already planned it returns `candidate` unchanged, so a request that
+ * reaches only one seat keeps byte-identical behavior.
+ */
+export function mergeResearchLadderToolNamesV1(
+  alreadyPlanned: readonly string[],
+  candidate: readonly string[],
+): string[] {
+  const occurrences = (names: readonly string[], tool: string): number =>
+    names.filter((name) => name === tool).length;
+  const plannedSearches = occurrences(alreadyPlanned, "web_search");
+  const plannedFetches = occurrences(alreadyPlanned, "web_fetch");
+  if (plannedSearches === 0 && plannedFetches === 0) return [...candidate];
+  const surplusSearches = Math.max(
+    0,
+    occurrences(candidate, "web_search") - plannedSearches,
+  );
+  const surplusFetches = Math.max(
+    0,
+    occurrences(candidate, "web_fetch") - plannedFetches,
+  );
+  return [
+    ...Array.from({ length: surplusSearches }, () => "web_search"),
+    ...Array.from({ length: surplusFetches }, () => "web_fetch"),
+    ...candidate.filter(
+      (name) => name !== "web_search" && name !== "web_fetch",
+    ),
+  ];
+}
+
 export function getNextResearchAction(
   plan: ResearchPlan,
 ): ResearchNextAction | undefined {
