@@ -52,6 +52,16 @@ const FLOW_REAL_ALLOWED_PREPARED_APPROVAL_TOOLS = Object.freeze([
   "finalize_github_link_in_linear",
   "finalize_linear_issue_completion",
   "append_to_current_file",
+  // Vault reflection write, not an external mutation: write_project_results
+  // has capability {system:"vault", action:"create"} with
+  // execution.preparation "required" and approval.fallback "exact" (see
+  // src/tools/projectResultsTool.ts DESCRIPTOR), and it is the host's default
+  // note_reflection surface for a set-loose compound mission. It has demanded
+  // an exact prepared approval since the day it was added; this lane simply
+  // never reached the approval before, because prepare() aborted earlier on
+  // "Verified commit evidence does not contain a canonical commit SHA". The
+  // Linear-mutation budget below is unaffected: it counts Linear tools only.
+  "write_project_results",
 ] as const);
 
 /**
