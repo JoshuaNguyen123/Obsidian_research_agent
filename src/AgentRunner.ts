@@ -281,10 +281,11 @@ import {
   filterSetLooseToolNamesByMissionGraphAuthority,
   getActiveValidationRecoveryFrontierV1,
   getPendingMissionGraphWriteToolNames,
+  getPendingResumeOwedWriteNodeIds,
   getPhaseCeilingProtectedToolNamesV1,
-  graphHasCompletedRequiredMutation,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
+  missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
 } from "./agent/missionGraphFrontier";
 import { enforcePhaseToolMenuCeilingV1 } from "./agent/toolSchemaPolicy";
@@ -1057,6 +1058,7 @@ export {
   getPendingMissionGraphWriteToolNames,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
+  missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
 } from "./agent/missionGraphFrontier";
 export {
@@ -4952,16 +4954,121 @@ export async function runAgentMission({
       // graph still owe the current-note write?" identically. The shared
       // predicate below is the same one the frontier fallback consults, and
       // the store reducer re-validates the stub shape and envelope grant.
-      if (
-        missionGraphSession &&
-        exactResumeRunId &&
-        resumeContinuesStreamedCurrentNoteAppend &&
-        missionGraphOnlyFinalSynthesisRemainsV1(missionGraphSession.graph) &&
-        !graphHasCompletedRequiredMutation(missionGraphSession.graph)
-      ) {
+      // The gate is the graph's own state plus the restored mission's write
+      // contract — NOT the streamed-writeback flag alone: a stub can also be
+      // resumed with streaming off and no runtime snapshot (killed before the
+      // first checkpoint), and that continuation owes the append just the
+      // same (proof-matrix interrupted-continuation, 2026-08-25 22:41Z).
+      const writebackHealMissionRequiresAppend =
+        resumeContinuesStreamedCurrentNoteAppend ||
+        requiredWriteTools.includes("append_to_current_file");
+      const resumedGraphForWritebackHealCandidate =
+        missionGraphSession && exactResumeRunId
+          ? missionGraphSession.graph
+          : null;
+      const writebackHealShapeFinalOnly =
+        missionGraphOnlyFinalSynthesisRemainsV1(
+          resumedGraphForWritebackHealCandidate,
+        );
+      if (resumedGraphForWritebackHealCandidate) {
+        // One gate verdict per continuation: three live lane reds could not
+        // distinguish "the gate never armed" from "the splice refused", so
+        // the gate states its inputs even when it skips. A stub that OWES
+        // work with an unarmed gate is error-coded so the run-record
+        // diagnostics retain it past recency eviction.
+        const writebackHealStubOwesWork =
+          missionGraphFinalOnlyStubOwesRequiredWorkV1(
+            resumedGraphForWritebackHealCandidate,
+          );
+        const writebackHealGateMessage = `Resume writeback heal gate: missionRequiresAppend=${writebackHealMissionRequiresAppend}; graphFinalOnly=${writebackHealShapeFinalOnly}; stubOwesWork=${writebackHealStubOwesWork}.`;
+        const writebackHealGateUnarmedOverOwedWork =
+          writebackHealStubOwesWork && !writebackHealMissionRequiresAppend;
+        events.onTrace?.({
+          id: "mission-graph-resume-writeback-heal-gate",
+          kind: writebackHealGateUnarmedOverOwedWork ? "error" : "status",
+          message: writebackHealGateMessage,
+          outputPreview: {
+            missionRequiresAppend: writebackHealMissionRequiresAppend,
+            graphFinalOnly: writebackHealShapeFinalOnly,
+            stubOwesWork: writebackHealStubOwesWork,
+            streamedResumeFlag: resumeContinuesStreamedCurrentNoteAppend,
+            requiredWriteTools: [...requiredWriteTools],
+            envelopeGrantsAppend: Boolean(
+              resumedGraphForWritebackHealCandidate.capabilityEnvelope.tools[
+                "append_to_current_file"
+              ],
+            ),
+            nodeIds: Object.keys(resumedGraphForWritebackHealCandidate.nodes),
+          },
+          ...(writebackHealGateUnarmedOverOwedWork
+            ? {
+                error: {
+                  code: "resume_writeback_heal_gate_unarmed",
+                  message: writebackHealGateMessage,
+                },
+              }
+            : {}),
+        });
+      }
+      const resumedGraphForWritebackHeal =
+        resumedGraphForWritebackHealCandidate &&
+        writebackHealMissionRequiresAppend &&
+        writebackHealShapeFinalOnly
+          ? resumedGraphForWritebackHealCandidate
+          : null;
+      if (missionGraphSession && resumedGraphForWritebackHeal) {
         const appendDescriptor =
           toolRegistry.getDescriptor?.("append_to_current_file") ?? null;
-        const writebackSplice =
+        // A multi-append mission interrupted pre-first-write owes one node
+        // per still-missing required literal marker: a plain node's
+        // completion contract closes at its first satisfied receipt, so a
+        // single spliced node can never carry a second append across
+        // segments — the next continuation would find a "paid" graph and
+        // deadlock on the remaining marker. Count against the live note so
+        // (a) a between-writes interruption — first marker already landed,
+        // its receipt-carrying node complete — splices exactly the remaining
+        // owed writes even though the graph shows proven work, and (b) a
+        // mission whose every marker is already durably present splices
+        // NOTHING: re-appending present content is the duplication flip side
+        // of this deadlock. Missions without literal-marker contracts cannot
+        // be content-checked; they owe the single promised write exactly
+        // when the graph itself proves no paid mutation (the fc57558 shape).
+        const owedLiteralAnchors =
+          extractRequiredLiteralAnchors(activeIntentPrompt);
+        let owedWriteCount: number;
+        if (owedLiteralAnchors.length > 0) {
+          let owedNoteText: unknown = null;
+          try {
+            const owedNoteFile =
+              runToolContext.getCurrentMarkdownFile?.() ??
+              runToolContext.app.workspace.getActiveFile();
+            if (owedNoteFile) {
+              owedNoteText =
+                runToolContext.getCurrentMarkdownContent?.(
+                  owedNoteFile as never,
+                ) ??
+                (await runToolContext.app.vault.read(owedNoteFile as never));
+            }
+          } catch {
+            owedNoteText = null;
+          }
+          const missingAnchors =
+            typeof owedNoteText === "string"
+              ? owedLiteralAnchors.filter(
+                  (anchor) => !(owedNoteText as string).includes(anchor),
+                )
+              : owedLiteralAnchors;
+          owedWriteCount = missingAnchors.length;
+        } else {
+          owedWriteCount = missionGraphFinalOnlyStubOwesRequiredWorkV1(
+            resumedGraphForWritebackHeal,
+          )
+            ? 1
+            : 0;
+        }
+        const writebackSplice = owedWriteCount === 0
+          ? { splicedNodeId: null, refusedReason: "owed_write_count_zero" as const }
+          :
           await missionGraphSession.spliceResumeCurrentNoteWriteNode({
             objective:
               "Pay the current-note append the interrupted streamed segment still owes, exactly once, then finish the mission.",
@@ -4977,6 +5084,11 @@ export async function runAgentMission({
               appendDescriptor?.durability.receipt === true
                 ? [appendDescriptor.receiptKind ?? "action-receipt"]
                 : [],
+            owedWriteCount,
+            // Only a literal-anchor mission's count is checked against the
+            // live note; anchor-less missions splice solely on the bare
+            // unpaid stub, where the guard has nothing to protect.
+            contentVerifiedOwedWork: owedLiteralAnchors.length > 0,
           });
         if (writebackSplice.splicedNodeId) {
           events.onTrace?.({
@@ -4987,8 +5099,53 @@ export async function runAgentMission({
             outputPreview: {
               missionId: missionGraphSession.graph.missionId,
               splicedNodeId: writebackSplice.splicedNodeId,
+              owedWriteCount,
             },
           });
+        } else {
+          // A refused heal on a stub that provably owes work is an ERROR:
+          // the segment will burn its budget against a graph nothing can
+          // pay. Error-coded so the run-record diagnostics RETAIN it (the
+          // run-5 sidecar evicted the status-kind verdicts as recency
+          // rolled) and the census can count refusals by reason. The
+          // owed_write_count_zero skip stays a status — nothing is owed.
+          const refusalReason =
+            writebackSplice.refusedReason ?? "unspecified";
+          const refusalOutputPreview = {
+            missionId: missionGraphSession.graph.missionId,
+            refusedReason: writebackSplice.refusedReason ?? null,
+            owedWriteCount,
+            missionRequiresAppend: writebackHealMissionRequiresAppend,
+            streamedResumeFlag: resumeContinuesStreamedCurrentNoteAppend,
+            requiredWriteTools: [...requiredWriteTools],
+            envelopeGrantsAppend: Boolean(
+              resumedGraphForWritebackHeal.capabilityEnvelope.tools[
+                "append_to_current_file"
+              ],
+            ),
+            nodeIds: Object.keys(resumedGraphForWritebackHeal.nodes),
+          };
+          if (refusalReason === "owed_write_count_zero") {
+            events.onTrace?.({
+              id: "mission-graph-resume-writeback-splice-refused",
+              kind: "status",
+              message:
+                "Resume writeback heal did not splice: owed_write_count_zero (every required literal already landed in the note).",
+              outputPreview: refusalOutputPreview,
+            });
+          } else {
+            const refusalMessage = `Resume writeback heal refused: ${refusalReason}. The resumed graph still owes its required current-note write and nothing in this segment can pay it.`;
+            events.onTrace?.({
+              id: "mission-graph-resume-writeback-splice-refused",
+              kind: "error",
+              message: refusalMessage,
+              outputPreview: refusalOutputPreview,
+              error: {
+                code: "resume_writeback_heal_refused",
+                message: refusalMessage,
+              },
+            });
+          }
         }
       }
       if (missionGraphSession && backgroundContinuation) {
@@ -12697,6 +12854,10 @@ export async function runAgentMission({
         buildOffFrontierToolRejectionMessageImpl({
           toolName: toolCall.name,
           readyFrontierToolNames: authorityReadyFrontier,
+          // Classification must read the authority's real reason: "not ready
+          // in the authoritative mission graph" is invalid_state, not
+          // unknown_tool.
+          reasonMessage: getUnknownErrorMessage(error),
           heldWriteToolNames: lastProofGatedHoldToolName
             ? [lastProofGatedHoldToolName]
             : [],
@@ -19908,11 +20069,26 @@ export async function runAgentMission({
         }
 
         // Item 15: do not terminal-fail reflex when write recovery is still
-        // available; let mission acceptance decide the hard stop.
+        // available; let mission acceptance decide the hard stop. The same
+        // rule governs the no-recovery arm (proof-matrix
+        // interrupted-continuation, 2026-08-26 02:16Z): the reflex is a
+        // heuristic checkpoint, and terminal-failing a run whose MISSION
+        // ACCEPTANCE passes turned a fully-paid resumed segment into an
+        // "error" at the step cap. One acceptance evaluation at this
+        // terminal seat only — never per step.
         if (writeRecoveryAvailable) {
           events.onStatus?.(
             `Reflex still missing ${reflexOutput.completion.missing.join(", ")}; deferring to acceptance.`,
           );
+        } else if (evaluateCurrentAcceptance().status === "pass") {
+          events.onTrace?.({
+            id: `reflex-completion-deferred-${step}`,
+            kind: "verification",
+            step,
+            message:
+              "Reflex completion gate deferred at the terminal step: mission acceptance passes, and acceptance owns the hard stop.",
+            outputPreview: { missing: reflexOutput.completion.missing },
+          });
         } else {
           const message = `I could not complete the mission because required evidence is missing: ${reflexOutput.completion.missing.join(", ")}. No additional vault files were changed.`;
           emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
@@ -20910,9 +21086,24 @@ export async function runAgentMission({
           : typeof toolCall.arguments.content === "string"
             ? toolCall.arguments.content
             : "";
+      let literalContractNoteText: string | null = null;
+      if (toolCall.name === "append_to_current_file") {
+        try {
+          const literalContractNoteFile =
+            runToolContext.getCurrentMarkdownFile?.() ?? null;
+          literalContractNoteText = literalContractNoteFile
+            ? (runToolContext.getCurrentMarkdownContent?.(
+                literalContractNoteFile,
+              ) ?? null)
+            : null;
+        } catch {
+          literalContractNoteText = null;
+        }
+      }
       const literalContractError = validateRequiredLiteralWriteArguments(
         activeIntentPrompt,
         toolCall,
+        literalContractNoteText,
       );
       if (literalContractError) {
         const rejectedResult: ToolExecutionResult = {
@@ -21773,9 +21964,21 @@ export async function runAgentMission({
         continue;
       }
     }
+    // Mission-level required-write accounting says "the append tool ran";
+    // the authoritative graph says which HEAL-SPLICED owed write nodes are
+    // still open. A healed multi-append continuation carries one spliced
+    // node per owed marker, so closing the write mission after the first
+    // paid append would cancel the remaining owed node when `final`
+    // completes over unpaid work. Scoped to the heal's exactly-once nodes:
+    // planned workflows keep their historical completion semantics.
+    const pendingResumeOwedWriteNodesAfterToolUse =
+      getPendingResumeOwedWriteNodeIds(
+        missionGraphSession?.graph ?? missionGraph,
+      );
     const operationWriteComplete =
       completedAnyWrite &&
       pendingRequiredWriteToolsAfterToolUse.length === 0 &&
+      pendingResumeOwedWriteNodesAfterToolUse.length === 0 &&
       missingRequiredWebToolsAfterToolUse.length === 0 &&
       !pendingStreamingWriteback;
     const requiresPostWriteAcceptance = researchPlan !== null;
@@ -21869,8 +22072,31 @@ export async function runAgentMission({
       loopBudgetPlan.expectedTools,
       successfulToolNames,
     );
+    // "Graph outranks segment accounting" holds only when the graph actually
+    // PROVED its work: a final-only graph whose completed nodes carry no
+    // receipts/evidence (the crash-resumed stub) still owes the mission's
+    // required tools, and treating it as satisfied forces tool-less final
+    // synthesis against an acceptance that can never pass. Shared predicate
+    // with the resume splice heal and the empty-frontier fallback.
+    // The ACCEPTABLY-COMPLETE arm covers the continuation of a run killed
+    // AFTER its graph finished everything (final complete included): the
+    // final-only-remains shape check requires `final` ready/queued, so a
+    // fully terminal restored graph armed nothing, the frontier was
+    // rightly empty, and the segment burned every step asking a tool-less
+    // model to do work the graph had already proved (proof-matrix
+    // interrupted-continuation, 2026-08-26 02:16Z — eleven tool-less calls
+    // ending in an error instead of the final answer).
+    const loopDecisionMissionGraph = missionGraphSession?.graph ?? null;
+    const missionGraphStubOwesRequiredWork =
+      missionGraphFinalOnlyStubOwesRequiredWorkV1(loopDecisionMissionGraph);
     const missionGraphFinalSynthesisOnly =
-      missionGraphOnlyFinalSynthesisRemainsV1(missionGraphSession?.graph);
+      (missionGraphOnlyFinalSynthesisRemainsV1(loopDecisionMissionGraph) ||
+        // isMissionGraphAcceptablyComplete treats a NULL graph as complete
+        // (graphless legacy paths own their accounting); this arm may only
+        // fire for a real, fully-terminal restored graph.
+        (loopDecisionMissionGraph !== null &&
+          isMissionGraphAcceptablyComplete(loopDecisionMissionGraph))) &&
+      !missionGraphStubOwesRequiredWork;
     const setLooseDeliveryStillUnpaid =
       setLooseCompoundEnabled &&
       !setLooseDeliveryComplete({
@@ -21931,6 +22157,7 @@ export async function runAgentMission({
         `repeated_responses=${consecutiveNoProgressSteps}`,
         `required_tools_satisfied=${requiredLoopToolsSatisfied}`,
         `graph_final_only=${missionGraphFinalSynthesisOnly}`,
+        `graph_stub_owes_work=${missionGraphStubOwesRequiredWork}`,
       ].join("; "),
     });
     const verifiedHostExportFinalAnswerAfterToolUse =
@@ -34701,6 +34928,12 @@ const LITERAL_CONTENT_WRITE_TOOLS = new Set([
 export function validateRequiredLiteralWriteArguments(
   prompt: string,
   toolCall: ModelToolCall,
+  /**
+   * Live content of the append target, when the caller can observe it.
+   * Enables the anti-duplication redirect below; callers that cannot read
+   * the note pass nothing and keep the plain progress contract.
+   */
+  currentNoteText?: string | null,
 ): string | null {
   if (!LITERAL_CONTENT_WRITE_TOOLS.has(toolCall.name)) {
     return null;
@@ -34736,6 +34969,29 @@ export function validateRequiredLiteralWriteArguments(
   // that drops them all is still rejected. Single-literal missions are
   // unchanged — one anchor means "present at least one" is exactly "present".
   if (present.length > 0) {
+    // Anti-duplication redirect — the flip side of the step-scoped progress
+    // contract. On a healed continuation the model can re-carry a marker an
+    // earlier segment already durably landed; appending it again pays no new
+    // work and duplicates note content (the proof-matrix duplication
+    // failure). Redirect ONLY while another required literal is still
+    // missing from the live note: when every mission literal is already
+    // present, repeats stay allowed (a mission may legitimately repeat a
+    // line, and acceptance owns terminal completeness).
+    if (
+      toolCall.name === "append_to_current_file" &&
+      typeof currentNoteText === "string"
+    ) {
+      const normalizedNote = currentNoteText.toLowerCase();
+      const missingFromNote = anchors.filter(
+        (anchor) => !normalizedNote.includes(anchor.toLowerCase()),
+      );
+      const carriesOnlyLandedLiterals = present.every((anchor) =>
+        normalizedNote.includes(anchor.toLowerCase()),
+      );
+      if (carriesOnlyLandedLiterals && missingFromNote.length > 0) {
+        return `The ${toolCall.name} content only repeats literal value(s) the note already contains (${present.join(", ")}); appending them again would duplicate completed work. Still missing from the note: ${missingFromNote.join(", ")}. Return one corrected call whose content carries the next missing literal exactly.`;
+      }
+    }
     return null;
   }
   // Sentence one is unchanged (every anchor is absent whenever this rejects).

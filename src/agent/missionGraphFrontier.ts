@@ -1,10 +1,5 @@
 import type { ModelToolDefinition } from "../model/types";
-import {
-  getCurrentMissionCompositeLifecycleActionV1,
-  getMissionCompositeLifecycleSpecV1,
-  getMissionCompositeLifecycleStateV1,
-  type MissionGraphV3,
-} from "../../packages/headless-runtime/src/missionGraphV3";
+import { type MissionGraphV3 } from "../../packages/headless-runtime/src/missionGraphV3";
 import {
   mapRunRouteToSchemaRoute,
   schemasForLifecycleStage,
@@ -25,6 +20,16 @@ import {
   findFinalMissionGraphNode,
   isOptionalMissionGraphNode,
 } from "./missionGraphAuthority";
+// Shared selector authorities — these MUST come from missionGraphSelectors,
+// never re-inlined here: private copies of the frontier-tool and lifecycle
+// selectors are exactly the second-authority drift the shared-classifier
+// convention exists to prevent.
+import {
+  getMissionGraphNodeFrontierToolNames,
+  getSafeMissionCompositeLifecycleSpecV1,
+  getSafeMissionCompositeLifecycleStateV1,
+  missionGraphOnlyFinalSynthesisRemainsV1,
+} from "./missionGraphSelectors";
 import {
   flattenMissionPlanTasks,
   type MissionPlanLike,
@@ -376,37 +381,6 @@ function isRequiredCodeWorkflowToolName(toolName: string): boolean {
   );
 }
 
-function getSafeMissionCompositeLifecycleSpecV1(
-  node: MissionGraphV3["nodes"][string],
-) {
-  return isRecord(node.inputs) && node.inputs.lifecycle
-    ? getMissionCompositeLifecycleSpecV1(node)
-    : null;
-}
-
-function getSafeMissionCompositeLifecycleStateV1(
-  node: MissionGraphV3["nodes"][string],
-) {
-  return getSafeMissionCompositeLifecycleSpecV1(node) && isRecord(node.outputs)
-    ? getMissionCompositeLifecycleStateV1(node)
-    : null;
-}
-
-function getSafeMissionCompositeLifecycleActionV1(
-  node: MissionGraphV3["nodes"][string],
-) {
-  return getSafeMissionCompositeLifecycleSpecV1(node) && isRecord(node.outputs)
-    ? getCurrentMissionCompositeLifecycleActionV1(node)
-    : null;
-}
-
-function getMissionGraphNodeFrontierToolNames(
-  node: MissionGraphV3["nodes"][string],
-): string[] {
-  const action = getSafeMissionCompositeLifecycleActionV1(node);
-  return action ? [action.toolName] : [...node.allowedTools];
-}
-
 function shouldSuppressOptionalMissionGraphFrontier(
   graph: MissionGraphV3,
 ): boolean {
@@ -480,6 +454,9 @@ const RESUME_EMPTY_FRONTIER_WRITE_TOOLS = new Set([
  * True when a required (non-optional, non-final) node already paid a tool.
  * A streaming writeback stub is only `final` (and maybe a tool-less dispatch),
  * so this stays false and resume can still offer current-note writes.
+ * "Paid" demands proof, not just a status flip: a node marked complete with
+ * neither evidence nor receipts proved nothing, so it cannot stand in for the
+ * mission's required work.
  *
  * Exported as the ONE shared answer to "did the resumed graph already pay its
  * required work?": the empty-frontier fallback below and the resume splice
@@ -496,11 +473,43 @@ export function graphHasCompletedRequiredMutation(
     if (node.status !== "complete") {
       return false;
     }
+    if (
+      (node.evidence?.length ?? 0) === 0 &&
+      (node.receipts?.length ?? 0) === 0
+    ) {
+      return false;
+    }
     return (
       node.allowedTools.length > 0 ||
       getMissionGraphNodeFrontierToolNames(node).length > 0
     );
   });
+}
+
+/**
+ * ONE shared answer to "may a final-only graph stand in for proven work?" —
+ * inverted: true when it may NOT. A graph whose only open node is the
+ * tool-less `final` while no completed required node carries real
+ * receipts/evidence is a crash/stub shape that still OWES its mission's
+ * work. Three seats must consult this same predicate or they deadlock each
+ * other (two-subsystems-disagree #14/#16, proof-matrix
+ * interrupted-continuation 2026-08-25):
+ *  1. the loop decision must NOT treat the graph as "required tools
+ *     satisfied" and force tool-less final synthesis;
+ *  2. the resume splice heal must add the owed write node into the
+ *     authority; and
+ *  3. the empty-frontier fallback below may surface current-note writes
+ *     ONLY in exactly this shape, so the offered menu never advertises a
+ *     tool the graph authority would refuse.
+ */
+export function missionGraphFinalOnlyStubOwesRequiredWorkV1(
+  graph: MissionGraphV3 | null | undefined,
+): boolean {
+  if (!graph) return false;
+  return (
+    missionGraphOnlyFinalSynthesisRemainsV1(graph) &&
+    !graphHasCompletedRequiredMutation(graph)
+  );
 }
 
 function graphHasCompletedCodeWorkspaceCreation(
@@ -941,9 +950,13 @@ export function constrainToolsToMissionGraphFrontier(
   // frontier before schemasForStep makes route-base writes unreachable — the
   // model is offered nothing and the two-append continuation dies in two
   // empty turns (proof-matrix interrupted-continuation, 2026-08-25).
+  // Gated on the SHARED stub-owes-work predicate: any other empty frontier
+  // (for example a blocked write node) must stay empty here, because the
+  // graph authority would refuse the resurrected tool and the offered menu
+  // must never disagree with the authority's verdict.
   if (
     frontierConstrained.length === 0 &&
-    !graphHasCompletedRequiredMutation(graph)
+    missionGraphFinalOnlyStubOwesRequiredWorkV1(graph)
   ) {
     // The fallback exists ONLY to surface current-note writes on the resumed
     // streaming stub. schemasForStep can widen past its frontier input (route
@@ -1050,6 +1063,31 @@ export function getPendingMissionGraphWriteToolNames(
         .filter((toolName) => toolName !== "append_research_memory"),
     ),
   ];
+}
+
+/**
+ * Nonterminal owed-write nodes the resume heal spliced into the graph
+ * (`resume-current-note-write`, `resume-current-note-write-N`). A healed
+ * multi-append continuation carries one such node per still-missing required
+ * marker; the write mission must not close while any remains open, or the
+ * accepted final would cancel it over unpaid work. Deliberately narrower
+ * than getPendingMissionGraphWriteToolNames: planned workflows keep their
+ * historical completion semantics (a satisfied required write may close the
+ * mission with optional steps unread), only the heal's exactly-once nodes
+ * hold it open.
+ */
+export function getPendingResumeOwedWriteNodeIds(
+  graph: MissionGraphV3 | null | undefined,
+): string[] {
+  if (!graph) return [];
+  return Object.values(graph.nodes)
+    .filter(
+      (node) =>
+        node.id.startsWith("resume-current-note-write") &&
+        node.status !== "complete" &&
+        node.status !== "cancelled",
+    )
+    .map((node) => node.id);
 }
 
 export function buildMissionGraphFrontierTurnContext(

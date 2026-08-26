@@ -552,3 +552,42 @@ test("completion evaluator accepts broad unscoped mutation as a safety blocker",
     "broad_unscoped_mutation_requires_explicit_scope",
   );
 });
+
+test("completion evaluator does not demand research a mission explicitly forswears", () => {
+  // Proof-matrix interrupted-continuation, 2026-08-26 02:16Z: the lane
+  // mission ends with "This task needs no web, memory, or vault research."
+  // — a sentence whose own tokens match \bweb\b and \bvault\b (and its
+  // ordered write contract's "verify that write" matches \bverify\b). The
+  // negation-blind triggers demanded web_evidence + vault_evidence forever,
+  // burning every continuation step in completion corrections and then
+  // terminal-failing an acceptance-passing run.
+  const forswearing = evaluateCompletion(
+    input({
+      prompt:
+        "Perform exactly two ordered durable appends to the current note, then finish. " +
+        "First append exactly one line containing MARKER_A1 and verify that write. " +
+        "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+        "Two appends total, in that order. This task needs no web, memory, or vault research.",
+    }),
+  );
+  assert.equal(
+    forswearing.missing.includes("web_evidence"),
+    false,
+    JSON.stringify(forswearing),
+  );
+  assert.equal(
+    forswearing.missing.includes("vault_evidence"),
+    false,
+    JSON.stringify(forswearing),
+  );
+
+  // Without the forswearing clause the triggers keep their teeth.
+  const demanding = evaluateCompletion(
+    input({
+      prompt: "Verify this with web sources and check my vault notes.",
+      allowedToolNames: new Set(["web_search", "web_fetch"]),
+    }),
+  );
+  assert.equal(demanding.missing.includes("web_evidence"), true);
+  assert.equal(demanding.missing.includes("vault_evidence"), true);
+});

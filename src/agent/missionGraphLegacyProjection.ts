@@ -39,6 +39,7 @@ import {
   normalizeOrchestratorSnapshot,
 } from "../orchestrator/orchestratorStore";
 import { partitionGraphNodes } from "./missionGraphAuthority";
+import { getMissionGraphNodeFrontierToolNames } from "./missionGraphSelectors";
 import {
   ORCHESTRATOR_SNAPSHOT_VERSION,
   type AgentParticipantStatus,
@@ -1479,8 +1480,22 @@ function selectActiveGraphNode(nodes: MissionNodeV3[]): MissionNodeV3 | null {
     "queued",
   ];
   for (const status of priority) {
-    const node = nodes.find((candidate) => candidate.status === status);
-    if (node) return node;
+    const candidates = nodes.filter(
+      (candidate) => candidate.status === status,
+    );
+    if (candidates.length === 0) continue;
+    // A tool-less synthesis node (`final`) can share a status tier with real
+    // tool work only when explicit edges are missing — e.g. the resume splice
+    // on a crash-restored stub whose `final` was persisted ready, where
+    // ready->queued is not a legal transition. The projected ACTIVE task
+    // must be the tool work: making `final` active would let the plan
+    // dependency gate defer the very write the graph authority authorizes.
+    return (
+      candidates.find(
+        (candidate) =>
+          getMissionGraphNodeFrontierToolNames(candidate).length > 0,
+      ) ?? candidates[0]
+    );
   }
   return null;
 }

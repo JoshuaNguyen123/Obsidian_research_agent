@@ -26665,6 +26665,56 @@ test("the required-literal write contract is step-scoped, not mission-scoped", (
     ),
     /missing 1 literal value\(s\) explicitly required by the mission/u,
   );
+
+  // Anti-duplication redirect (the flip side of the step-scoped contract,
+  // proof-matrix duplication failure): an append that only repeats a marker
+  // the note already contains, while the other marker is still missing, must
+  // be redirected to the missing one — it would pay no new work.
+  const redirect = validateRequiredLiteralWriteArguments(
+    prompt,
+    {
+      name: "append_to_current_file",
+      arguments: { text: `line with ${markerA} again` },
+    },
+    `Initial note\n${markerA}`,
+  );
+  assert.match(String(redirect), /already contains/u);
+  assert.ok(String(redirect).includes(markerB));
+  // The append that carries the still-missing marker passes with the same
+  // note context.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(
+      prompt,
+      {
+        name: "append_to_current_file",
+        arguments: { text: `line with ${markerB}` },
+      },
+      `Initial note\n${markerA}`,
+    ),
+    null,
+  );
+  // Once every mission literal is durably present, repeats stay allowed —
+  // terminal completeness belongs to acceptance, and a mission may
+  // legitimately repeat a line.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(
+      prompt,
+      {
+        name: "append_to_current_file",
+        arguments: { text: `line with ${markerA} again` },
+      },
+      `Initial note\n${markerA}\n${markerB}`,
+    ),
+    null,
+  );
+  // Callers that cannot observe the note keep the plain progress contract.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(prompt, {
+      name: "append_to_current_file",
+      arguments: { text: `line with ${markerA}` },
+    }),
+    null,
+  );
 });
 
 test("the pre-write proof gate does not govern a mission that declared no pre-write proof", () => {

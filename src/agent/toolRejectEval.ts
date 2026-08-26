@@ -239,6 +239,15 @@ export function buildOffFrontierToolRejectionMessage(input: {
   preferredNextTool?: string | null;
   category?: ToolRejectCategoryV1 | string | null;
   /**
+   * The refusing subsystem's real reason text. Classification must read
+   * THIS, not a hardcoded stand-in: an authority refusal saying "not ready
+   * in the authoritative mission graph" is `invalid_state`, and stamping it
+   * `unknown_tool` mislabels every authority refusal of a tool the model
+   * was correctly offered (proof-matrix interrupted-continuation,
+   * 2026-08-25).
+   */
+  reasonMessage?: string | null;
+  /**
    * Write tools currently held by proof verification. A held tool may sit on
    * the ready frontier (the graph considers it ready), but the proof gate
    * will hold it again on the very next call -- so this message must never
@@ -259,9 +268,11 @@ export function buildOffFrontierToolRejectionMessage(input: {
     mapToolRejectCategory({
       toolName: input.toolName,
       pendingGraphNodeId: input.pendingGraphNodeId,
-      message: input.pendingGraphNodeId
-        ? "off-frontier"
-        : "not available for this prompt",
+      message:
+        input.reasonMessage?.trim() ||
+        (input.pendingGraphNodeId
+          ? "off-frontier"
+          : "not available for this prompt"),
     });
   const heldWriteTools = new Set(
     (input.heldWriteToolNames ?? []).filter(Boolean),
