@@ -308,7 +308,15 @@ import {
   recordContinue,
   recordProseSteeringInjection,
   recordToolsOffered,
+  recordUnproductiveModelResponse,
 } from "./agent/autonomyRunStats";
+import {
+  buildUnproductiveModelResponseMetricV1,
+  classifyUnproductiveModelResponseV1,
+  formatUnproductiveModelResponseMessage,
+  UNPRODUCTIVE_MODEL_RESPONSE_METRIC_NAME_V1,
+  UNPRODUCTIVE_MODEL_RESPONSE_STOP_THRESHOLD_V1,
+} from "./model/degenerateStreamGuard";
 import {
   createRunPlan,
   resolveThinkingMode,
@@ -1255,6 +1263,21 @@ export interface AgentRunMetricEvent {
   totalTokens?: number;
   /** Prompt tokens the provider served from cache; absent when it never says. */
   cachedPromptTokens?: number;
+  /**
+   * Consecutive model responses that carried no work, counted UP TO AND
+   * INCLUDING the response this event describes. Present only on
+   * `UNPRODUCTIVE_MODEL_RESPONSE_METRIC_NAME_V1` events, which are emitted
+   * only on unproductive steps -- so a healthy run carries none of them and
+   * `Math.max(0, ...)` observes 0.
+   *
+   * Because each step emits its own running streak value, the max over a
+   * run IS the peak streak. A gate must therefore compare STRICTLY GREATER
+   * than `UNPRODUCTIVE_MODEL_RESPONSE_STOP_THRESHOLD_V1`: a peak equal to the
+   * threshold is the guard firing correctly and stopping the run, while a
+   * peak above it means the streak ran past the point where the guard should
+   * have intervened and did not.
+   */
+  unproductiveStreak?: number;
 }
 
 export type {
@@ -3388,6 +3411,15 @@ export async function runAgentMission({
   let lastProgressSignature = "";
   let lastNoToolFrontierFingerprint = "";
   let unchangedNoToolResponseCount = 0;
+  /**
+   * Model responses that carried no work at all (no tool call, no prose).
+   * Distinct from `unchangedNoToolResponseCount`, which counts prose-only
+   * replies against an unchanged frontier: that ladder assumes there is prose
+   * to steer. A model returning zero bytes cannot be steered, so the streak is
+   * counted separately and stops the run instead of re-asking to the step cap.
+   */
+  let consecutiveUnproductiveModelResponses = 0;
+  let observedModelResponses = 0;
   /**
    * Armed by the universal no-tool correction: the next model call escalates
    * (tool_choice=required where the provider supports it, thinking off) so
@@ -19130,6 +19162,99 @@ export async function runAgentMission({
           }
         : {}),
     });
+
+    // The provider can bill a call as a SUCCESS and still hand back nothing the
+    // mission can use. Every downstream ladder in this loop answers "the model
+    // said the wrong thing" and re-asks; none of them noticed "the model said
+    // nothing", so an unanswering model was re-asked until the step budget was
+    // gone (proof-matrix interrupted-continuation, 2026-08-26: eleven billed
+    // successes, content_chars=0 throughout, terminal error with the owed write
+    // unpaid). Emptiness is judged by the SHARED guard, not by content.length —
+    // `responseToolCalls` (tool calls recovered from text included) is passed
+    // in, so a tool-call-only reply can never be read as silence.
+    observedModelResponses += 1;
+    const unproductiveResponse = classifyUnproductiveModelResponseV1({
+      message: response.message,
+      toolCalls: responseToolCalls,
+    });
+    if (!unproductiveResponse) {
+      consecutiveUnproductiveModelResponses = 0;
+    } else {
+      consecutiveUnproductiveModelResponses += 1;
+      recordUnproductiveModelResponse(
+        autonomyRunStats,
+        consecutiveUnproductiveModelResponses,
+      );
+      const unproductiveMetric = buildUnproductiveModelResponseMetricV1({
+        verdict: unproductiveResponse,
+        consecutive: consecutiveUnproductiveModelResponses,
+        total: autonomyRunStats.unproductive_model_responses ?? 0,
+        observed: observedModelResponses,
+        step,
+        stepLimit,
+      });
+      events.onTrace?.({
+        id: `unproductive-model-response-${step}`,
+        kind: unproductiveMetric.atStopThreshold ? "error" : "status",
+        step,
+        message: [
+          `unproductive_model_response=${unproductiveMetric.kind}`,
+          `consecutive=${unproductiveMetric.consecutive}`,
+          `threshold=${UNPRODUCTIVE_MODEL_RESPONSE_STOP_THRESHOLD_V1}`,
+          `payload_chars=${unproductiveMetric.payloadChars}`,
+          `remaining_steps=${unproductiveMetric.remainingSteps}`,
+        ].join("; "),
+        outputPreview: unproductiveMetric,
+      });
+      // Same statement block, same source variable as the run-stats record
+      // above: the gate array and the run record can only ever report one
+      // number for this question. Emitted ONLY on unproductive steps -- the
+      // gate reads `Math.max(0, ...)`, so a run with no such event observes 0
+      // without a per-step zero-valued event to carry it.
+      emitMetricEvent(events, {
+        kind: "run",
+        name: UNPRODUCTIVE_MODEL_RESPONSE_METRIC_NAME_V1,
+        step,
+        // A count, not a timing. Kept 0 rather than borrowed for the value so
+        // nothing downstream can read a streak as milliseconds.
+        durationMs: 0,
+        unproductiveStreak: consecutiveUnproductiveModelResponses,
+      });
+      if (unproductiveMetric.atStopThreshold) {
+        // Stop, do not steer. The existing correctives (frontier nudge, prose
+        // steering, reflex completion) are the seats that re-ask, and they are
+        // exactly what burned the budget here; adding a fourth voice telling
+        // the same silent model something different would be a second steering
+        // authority, not a fix. Below the threshold this block changes nothing
+        // and those seats keep their turns.
+        const unproductiveMessage =
+          formatUnproductiveModelResponseMessage(unproductiveMetric);
+        recordLedgerBlocker(
+          `model_returned_no_output: ${unproductiveMessage}`,
+        );
+        events.onStatus?.(unproductiveMessage);
+        events.onTrace?.({
+          id: `model-returned-no-output-${step}`,
+          kind: "error",
+          step,
+          message: unproductiveMessage,
+          outputPreview: {
+            code: "model_returned_no_output",
+            metric: unproductiveMetric,
+            nextAction:
+              "Retry the mission, or continue it with a model that answers.",
+          },
+          error: {
+            code: "model_returned_no_output",
+            message: unproductiveMessage,
+          },
+        });
+        lastFinalOutput = unproductiveMessage;
+        emitDirectAssistantAnswer(unproductiveMessage, events, true);
+        await finishRun("error", step, stepLimit, unproductiveMessage, true);
+        return;
+      }
+    }
 
     const missingRequiredWebToolsBeforeToolUse = getMissingRequiredWebToolNames({
       prompt: activeIntentPrompt,

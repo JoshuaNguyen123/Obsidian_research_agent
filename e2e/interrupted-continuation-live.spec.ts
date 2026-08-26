@@ -2,6 +2,13 @@ import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+
+// Counting survives this lane's mid-mission restartCorePlugin: the harness
+// re-arms a new collector segment after the plugin comes back, each segment is
+// folded on its own, and a segment that cannot prove it saw the resumed run's
+// prefix makes the whole answer UNKNOWN rather than a short count.
+recordToolCallOutcomesAfterEach();
 
 /**
  * Interrupt-and-COMPLETE continuation proof.

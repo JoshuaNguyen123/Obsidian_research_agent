@@ -51,11 +51,15 @@ export const TOOL_EVENT_SOURCE_SUMMARY: "summary";
 export const TOOL_EVENT_SOURCE_GRAPHS: "graphs";
 export const TOOL_EVENT_SOURCE_NONE: "none";
 export interface SummaryToolEventTotals {
-  observed: number;
+  /** Null when no record knew a real call count — unknown, never zero. */
+  observed: number | null;
   failed: number | null;
   vacuous: number | null;
   intentionalNoOp: number | null;
-  buckets: Record<string, number>;
+  /** Started-and-never-terminated calls; subtracted from succeeded, not credited. */
+  undetermined: number | null;
+  /** Only contributed vocabulary keys; null when no record carried buckets. */
+  buckets: Record<string, number> | null;
 }
 export function summaryToolEventTotals(
   summary: unknown,
@@ -66,6 +70,7 @@ export interface AttemptToolEvents {
   failed: number | null;
   vacuous: number | null;
   intentionalNoOp: number | null;
+  undetermined: number | null;
   succeeded: number | null;
   buckets: Record<string, number> | null;
 }
@@ -78,6 +83,16 @@ export function resolveAttemptToolEvents(input: {
     buckets: Record<string, number> | null;
   } | null;
 }): AttemptToolEvents;
+export function fileMtimeMs(file: string): number | null;
+/**
+ * Strict attempt-window freshness: the summary exists now and is strictly
+ * newer than the exact pre-spawn mtime snapshot (or was absent then). No
+ * wall-clock grace — see the implementation comment.
+ */
+export function summaryWrittenSince(
+  file: string,
+  mtimeBeforeLaunchMs: number | null,
+): boolean;
 export function attemptLogExcerpt(
   logText: string,
   endIndex?: number | null,

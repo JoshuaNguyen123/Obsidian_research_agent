@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
 import { assertApprovalSurfaceUsableV1 } from "./fixtures/uiSurfaceAssertions";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import { resolveMissionEffortDecisionV1 } from "../src/agent/missionEffortDecision";
@@ -23,6 +24,11 @@ import {
   startAuthenticatedOllamaProxyV1,
   type AuthenticatedOllamaProxyV1,
 } from "./fixtures/authenticatedOllamaProxy";
+
+// The fingerprinted `toolCalls` counter this lane annotates is an EVIDENCE
+// count (missionEvidence.length, successes only). This records the real
+// per-call counters beside it, from the shared collector the harness arms.
+recordToolCallOutcomesAfterEach();
 
 const ORCHESTRATION_GUIDE_PROMPT =
   "I want you to write me an in depth guide/report to agent orchestration. What is it, why is it important, and then finally how to execute agent orcehstration sucessfully.";

@@ -30,14 +30,18 @@ import {
   DAILY_USE_METRICS_ANNOTATION,
   DAILY_USE_OBSERVED_ANNOTATION,
   DAILY_USE_SCORECARD_ANNOTATION,
+  DAILY_USE_TOOL_OUTCOMES_ANNOTATION,
   E2E_PROOF_CLASS_ANNOTATION,
   type E2EProofClassV1,
 } from "../fixtures/dailyUseAcceptance";
+// Type-only: erased at compile time, so the fold's runtime import FROM this
+// module (classifyToolReceiptWork, TOOL_REFUSAL_MARKER_BUCKETS) never forms a
+// cycle.
+import type { ToolCallOutcomeCountsV1 } from "../fixtures/toolCallOutcomes";
 
-interface DailyUseRunRecord extends Pick<
+export interface DailyUseRunRecord extends Pick<
   DailyUseRunMetricsV1,
   | "modelCalls"
-  | "toolCalls"
   | "continuations"
   | "approvals"
   | "approvalBoundaryProofCount"
@@ -62,6 +66,24 @@ interface DailyUseRunRecord extends Pick<
   proofClass: E2EProofClassV1 | null;
   /** Explicit alias for the legacy `approvals` interaction counter. */
   interactiveApprovals: number;
+  /**
+   * The DU-acceptance tool-call counter — the quantity the record FINGERPRINT
+   * was computed over, so its meaning is frozen: whatever the spec annotated
+   * (daily-use-research feeds `missionEvidence.length`, an evidence count that
+   * sees successes only). Null — never 0 — when the spec annotated nothing:
+   * three of the four proof lanes have no DailyUseScenarioId, and the previous
+   * `metrics?.toolCalls ?? 0` here manufactured the explicit observed=0 rows in
+   * docs/eval/playwright-run-metrics.csv for lanes that certainly called tools.
+   * The real per-call count lives in `toolCallsAttempted`; the two legitimately
+   * disagree and must never be "fixed" into agreement.
+   */
+  toolCalls: number | null;
+  /**
+   * Full folded outcome counts from the shared collector seam, for provenance
+   * (coverage, undetermined, atLeast bounds). Null when the test carried no
+   * outcomes annotation.
+   */
+  toolCallOutcomes: ToolCallOutcomeCountsV1 | null;
   /**
    * ATTEMPTED tool calls for this record, or null when UNKNOWN. This is the
    * denominator the success rate always lacked: `toolCalls` above is fed
@@ -101,17 +123,27 @@ interface DailyUseRunRecord extends Pick<
    */
   toolCallsIntentionalNoOp: number | null;
   /**
+   * Calls that started and never produced a terminal event, or null when
+   * UNKNOWN. Kept EXPLICIT rather than folded into either side: an interrupted
+   * run genuinely does not know how those calls ended, and a consumer that
+   * computes `succeeded = attempted - failed` would silently score every one of
+   * them as a success. Invariant when all four are known:
+   * succeeded + failed + undetermined === attempted.
+   */
+  toolCallsUndetermined: number | null;
+  /**
    * Refusal-marker sightings, keyed by the same six bucket names the proof
    * matrix's graph mining uses. Provenance is explicit in
    * `refusalBucketsSource`: "annotation" means the spec counted them from
-   * traces it observed; "error_messages" means they were mined from this
-   * record's Playwright error text (sightings, NOT per-event counts — a
-   * retried refusal that never failed the test is invisible here); null
-   * means there was nothing to mine (no annotation, no errors), which is
-   * unknown, not zero.
+   * traces it observed; "outcomes" means a COMPLETE fold from the shared
+   * collector counted every refusal live (so its zeros are explicit);
+   * "error_messages" means they were mined from this record's Playwright error
+   * text (sightings, NOT per-event counts — a retried refusal that never
+   * failed the test is invisible here); null means there was nothing to mine
+   * (no annotation, no fold, no errors), which is unknown, not zero.
    */
   refusalBuckets: Record<string, number> | null;
-  refusalBucketsSource: "annotation" | "error_messages" | null;
+  refusalBucketsSource: "annotation" | "outcomes" | "error_messages" | null;
 }
 
 /**
@@ -164,18 +196,22 @@ export function countRefusalMarkers(
 }
 
 /**
- * Bucket provenance resolution: an annotation the spec counted from live
- * traces always wins; otherwise markers are mined from the record's error
- * text; when there is neither, the answer is null (unknown), never {}.
+ * Bucket provenance resolution, strongest source first: an annotation the spec
+ * counted from live traces always wins; then a COMPLETE fold from the shared
+ * collector, which saw every refusal on the event stream (its zeros are
+ * explicit, unlike mined sightings); then markers mined from the record's
+ * error text. With none of the three, the answer is null (unknown), never {}.
  */
 export function resolveRefusalBuckets(
   annotated: Record<string, number> | null,
   errorMessages: readonly string[],
+  foldedBuckets: Record<string, number> | null = null,
 ): {
   buckets: Record<string, number> | null;
-  source: "annotation" | "error_messages" | null;
+  source: "annotation" | "outcomes" | "error_messages" | null;
 } {
   if (annotated) return { buckets: annotated, source: "annotation" };
+  if (foldedBuckets) return { buckets: foldedBuckets, source: "outcomes" };
   if (errorMessages.some((message) => message.length > 0)) {
     return { buckets: countRefusalMarkers(errorMessages), source: "error_messages" };
   }
@@ -339,10 +375,19 @@ export default class DailyUseReporter implements Reporter {
           observedAt: new Date().toISOString(),
         })
       : null;
+    // Parsed UNCONDITIONALLY, unlike the metrics annotation: four of the five
+    // real-AI proof lanes have no DailyUseScenarioId, and gating this the same
+    // way would silently drop their only real tool-call counters.
+    const outcomes = parseToolCallOutcomesAnnotation(test);
+    // Only a COMPLETE fold speaks. A lossy or unobserved one is unknown, and
+    // unknown must never be read as a number.
+    const foldedComplete = outcomes?.coverage === "complete" ? outcomes : null;
     const refusal = resolveRefusalBuckets(
       annotatedMetrics?.refusalBuckets ?? null,
       errorMessages,
+      foldedComplete?.failureBuckets ?? null,
     );
+    const toolCallCounters = resolveToolCallCounters(annotatedMetrics, foldedComplete);
     this.records.push({
       version: 1,
       scenarioId: typedScenarioId,
@@ -357,15 +402,17 @@ export default class DailyUseReporter implements Reporter {
       observed,
       missionScorecard,
       proofClass,
-      toolCallsAttempted: annotatedMetrics?.toolCallsAttempted ?? null,
-      toolCallsFailed: annotatedMetrics?.toolCallsFailed ?? null,
-      toolCallsVacuous: annotatedMetrics?.toolCallsVacuous ?? null,
-      toolCallsIntentionalNoOp:
-        annotatedMetrics?.toolCallsIntentionalNoOp ?? null,
+      ...toolCallCounters,
+      toolCallOutcomes: outcomes,
       refusalBuckets: refusal.buckets,
       refusalBucketsSource: refusal.source,
       modelCalls: metrics?.modelCalls ?? 0,
-      toolCalls: metrics?.toolCalls ?? 0,
+      // Null — never 0 — when the spec annotated nothing. `metrics` is null for
+      // every record without a typed DailyUseScenarioId, so the old `?? 0`
+      // printed explicit observed=0 CSV rows for lanes that certainly called
+      // tools. The fingerprinted quantity is unchanged; only its unknown
+      // representation is.
+      toolCalls: annotatedMetrics ? metrics?.toolCalls ?? null : null,
       continuations: metrics?.continuations ?? 0,
       approvals: metrics?.approvals ?? 0,
       interactiveApprovals: metrics?.approvals ?? 0,
@@ -410,7 +457,8 @@ export async function writeDailyUseSummaryIfAny(
   return true;
 }
 
-function summarizeRecords(records: readonly DailyUseRunRecord[]) {
+/** Exported for tests: the group rollup where unknown must stay unknown. */
+export function summarizeRecords(records: readonly DailyUseRunRecord[]) {
   const groups = new Map<string, DailyUseRunRecord[]>();
   for (const record of records) {
     const key = `${record.scenarioId ?? "unlabeled"}:${record.taskFamily}`;
@@ -429,7 +477,13 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
             releaseSha: exactReleaseSha(),
             observed,
             modelCalls: sum(group, "modelCalls"),
-            toolCalls: sum(group, "toolCalls"),
+            // undefined (not 0) when no record in the group knew its count:
+            // createDailyUseRunMetricsV1's schema is fixed in src/ and has no
+            // null vocabulary, and passing an invented 0 would fingerprint a
+            // number nobody measured.
+            toolCalls:
+              sumNullableCounters(group.map((record) => record.toolCalls)) ??
+              undefined,
             continuations: sum(group, "continuations"),
             approvals: sum(group, "approvals"),
             observedAt: new Date().toISOString(),
@@ -453,10 +507,12 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         medianDurationMs: percentile(durations, 0.5),
         p95DurationMs: percentile(durations, 0.95),
         modelCalls: metrics?.modelCalls ?? 0,
-        toolCalls: metrics?.toolCalls ?? 0,
-        // Nullable on purpose: null means no record in the group knew its
-        // attempted/failed/vacuous count (unknown ≠ zero); a number is the
-        // sum of the records that did know — an explicit lower bound.
+        // Nullable on purpose: null means no record in the group knew the
+        // count (unknown ≠ zero); a number is the sum of the records that
+        // did know — an explicit lower bound.
+        toolCalls: sumNullableCounters(
+          group.map((record) => record.toolCalls),
+        ),
         toolCallsAttempted: sumNullableCounters(
           group.map((record) => record.toolCallsAttempted),
         ),
@@ -468,6 +524,9 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         ),
         toolCallsIntentionalNoOp: sumNullableCounters(
           group.map((record) => record.toolCallsIntentionalNoOp),
+        ),
+        toolCallsUndetermined: sumNullableCounters(
+          group.map((record) => record.toolCallsUndetermined),
         ),
         continuations: metrics?.continuations ?? 0,
         approvals: metrics?.approvals ?? 0,
@@ -521,6 +580,7 @@ function parseMetricsAnnotation(
   toolCallsFailed: number | null;
   toolCallsVacuous: number | null;
   toolCallsIntentionalNoOp: number | null;
+  toolCallsUndetermined: number | null;
   refusalBuckets: Record<string, number> | null;
 }) | null {
   const raw = [...test.annotations]
@@ -541,11 +601,76 @@ function parseMetricsAnnotation(
       toolCallsFailed: nullableCounter(value.toolCallsFailed),
       toolCallsVacuous: nullableCounter(value.toolCallsVacuous),
       toolCallsIntentionalNoOp: nullableCounter(value.toolCallsIntentionalNoOp),
+      toolCallsUndetermined: nullableCounter(value.toolCallsUndetermined),
       refusalBuckets: counterRecord(value.refusalBuckets),
     };
   } catch {
     return null;
   }
+}
+
+type ToolCallCounterFields = Pick<
+  DailyUseRunRecord,
+  | "toolCallsAttempted"
+  | "toolCallsFailed"
+  | "toolCallsVacuous"
+  | "toolCallsIntentionalNoOp"
+  | "toolCallsUndetermined"
+>;
+
+/**
+ * Choose ONE source for the whole counter set, never a mix.
+ *
+ * A spec's explicit annotation wins whenever it carries any tool-call counter:
+ * it knows its own scoping (DU-06 folds per lifecycle phase, the harness-wide
+ * fold spans the session), and blending one source's `attempted` with another's
+ * `failed` would produce a ratio neither source ever measured. Otherwise a
+ * COMPLETE harness-wide fold speaks. With neither, every field stays null.
+ */
+export function resolveToolCallCounters(
+  annotated: {
+    toolCallsAttempted: number | null;
+    toolCallsFailed: number | null;
+    toolCallsVacuous: number | null;
+    toolCallsIntentionalNoOp: number | null;
+    toolCallsUndetermined: number | null;
+  } | null | undefined,
+  folded: ToolCallOutcomeCountsV1 | null,
+): ToolCallCounterFields {
+  const annotatedAny =
+    annotated &&
+    [
+      annotated.toolCallsAttempted,
+      annotated.toolCallsFailed,
+      annotated.toolCallsVacuous,
+      annotated.toolCallsIntentionalNoOp,
+      annotated.toolCallsUndetermined,
+    ].some((value) => value !== null);
+  if (annotatedAny) {
+    return {
+      toolCallsAttempted: annotated!.toolCallsAttempted,
+      toolCallsFailed: annotated!.toolCallsFailed,
+      toolCallsVacuous: annotated!.toolCallsVacuous,
+      toolCallsIntentionalNoOp: annotated!.toolCallsIntentionalNoOp,
+      toolCallsUndetermined: annotated!.toolCallsUndetermined,
+    };
+  }
+  if (folded) {
+    return {
+      toolCallsAttempted: folded.attempted,
+      toolCallsFailed: folded.failed,
+      toolCallsVacuous: folded.vacuous,
+      toolCallsIntentionalNoOp: folded.intentionalNoOp,
+      toolCallsUndetermined: folded.undetermined,
+    };
+  }
+  return {
+    toolCallsAttempted: null,
+    toolCallsFailed: null,
+    toolCallsVacuous: null,
+    toolCallsIntentionalNoOp: null,
+    toolCallsUndetermined: null,
+  };
 }
 
 /** A non-negative safe integer, else null — unknown is never coerced to 0. */
@@ -563,6 +688,63 @@ function counterRecord(value: unknown): Record<string, number> | null {
     if (parsed !== null && parsed > 0) record[key] = parsed;
   }
   return record;
+}
+
+/**
+ * Bucket parse that KEEPS explicit zeros. A complete fold watched the whole
+ * event stream, so "this bucket saw nothing" is knowledge, not absence — the
+ * sightings-based `counterRecord` above drops zeros precisely because a
+ * mined-from-error-text zero is not knowledge.
+ */
+function explicitCounterRecord(value: unknown): Record<string, number> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record: Record<string, number> = {};
+  for (const [key, count] of Object.entries(value as Record<string, unknown>)) {
+    const parsed = nullableCounter(count);
+    if (parsed !== null) record[key] = parsed;
+  }
+  return record;
+}
+
+/**
+ * Parse the shared collector's folded counts. Deliberately NOT gated on a
+ * typed scenarioId (see the record-builder comment): four of the five real-AI
+ * proof lanes have none. Every counter is re-validated through
+ * `nullableCounter`, so a malformed annotation degrades to unknown — never to
+ * zero — and a coverage value the fold does not define is rejected outright.
+ */
+function parseToolCallOutcomesAnnotation(
+  test: TestCase,
+): ToolCallOutcomeCountsV1 | null {
+  const raw = [...test.annotations]
+    .reverse()
+    .find((annotation) => annotation.type === DAILY_USE_TOOL_OUTCOMES_ANNOTATION)
+    ?.description;
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as ToolCallOutcomeCountsV1;
+    if (
+      value?.version !== 1 ||
+      !["complete", "lossy", "unobserved"].includes(value.coverage)
+    ) {
+      return null;
+    }
+    return {
+      ...value,
+      attempted: nullableCounter(value.attempted),
+      succeeded: nullableCounter(value.succeeded),
+      failed: nullableCounter(value.failed),
+      undetermined: nullableCounter(value.undetermined),
+      vacuous: nullableCounter(value.vacuous),
+      intentionalNoOp: nullableCounter(value.intentionalNoOp),
+      receiptsUnknown: nullableCounter(value.receiptsUnknown),
+      succeededWithWork: nullableCounter(value.succeededWithWork),
+      failureBuckets: explicitCounterRecord(value.failureBuckets),
+      observedEvents: nullableCounter(value.observedEvents) ?? 0,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function parseScorecardAnnotation(test: TestCase): MissionScorecardV1 | null {
@@ -687,7 +869,9 @@ function unitInterval(value: unknown): value is number {
 
 function sum(
   records: readonly DailyUseRunRecord[],
-  key: "modelCalls" | "toolCalls" | "continuations" | "approvals",
+  // toolCalls is deliberately absent: it is nullable now and must go through
+  // sumNullableCounters so unknown never coerces to zero.
+  key: "modelCalls" | "continuations" | "approvals",
 ): number {
   return records.reduce((total, record) => total + record[key], 0);
 }

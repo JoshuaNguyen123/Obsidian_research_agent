@@ -1,6 +1,12 @@
 import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+
+// Every harness this file starts arms the shared tool-call collector; this
+// records the folded counts on whichever test opened them. Multiple tests and
+// multiple harnesses per test are handled by the collector's per-test merge.
+recordToolCallOutcomesAfterEach();
 
 test.describe("real AI autonomy soak", () => {
   test.describe.configure({ mode: "default", timeout: 3_600_000, retries: 0 });

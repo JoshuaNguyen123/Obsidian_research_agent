@@ -31,6 +31,21 @@ export interface AutonomyRunStatsV1 {
    * frontier correction. Census contract field name — do not rename.
    */
   prose_steering_injections?: number;
+  /**
+   * Successful model calls in this run whose response carried no work at all —
+   * no tool call and no renderable prose. Counted because the provider bills
+   * these as successes (11/11 "successful" calls in the run that motivated
+   * this field) and nothing else in the record separates them from real work.
+   * Census contract field name — do not rename.
+   */
+  unproductive_model_responses?: number;
+  /**
+   * Longest streak of CONSECUTIVE unproductive responses. The streak, not the
+   * total, is what distinguishes "the model stopped answering" from "the model
+   * hiccuped twice"; it is the value the stop reads.
+   * Census contract field name — do not rename.
+   */
+  max_consecutive_unproductive_model_responses?: number;
   softOnly: boolean;
   elapsedMs?: number;
   team?: AutonomyRunStatsTeamV1;
@@ -44,6 +59,8 @@ export function createAutonomyRunStats(): AutonomyRunStatsV1 {
     toolsOffered: { avg: 0, max: 0, samples: 0, sum: 0 },
     stageRestartCount: 0,
     prose_steering_injections: 0,
+    unproductive_model_responses: 0,
+    max_consecutive_unproductive_model_responses: 0,
     softOnly: true,
     team: {
       researcherSteps: 0,
@@ -88,6 +105,23 @@ export function recordStageRestart(stats: AutonomyRunStatsV1): void {
 
 export function recordProseSteeringInjection(stats: AutonomyRunStatsV1): void {
   stats.prose_steering_injections = (stats.prose_steering_injections ?? 0) + 1;
+}
+
+/**
+ * Record one model response that carried no work. `consecutive` is the current
+ * streak INCLUDING this response, so the peak is a max, not a sum — the caller
+ * owns the streak counter because only it knows what resets it.
+ */
+export function recordUnproductiveModelResponse(
+  stats: AutonomyRunStatsV1,
+  consecutive: number,
+): void {
+  stats.unproductive_model_responses =
+    (stats.unproductive_model_responses ?? 0) + 1;
+  stats.max_consecutive_unproductive_model_responses = Math.max(
+    stats.max_consecutive_unproductive_model_responses ?? 0,
+    Math.max(0, Math.floor(consecutive)),
+  );
 }
 
 export function recordResearcherStep(stats: AutonomyRunStatsV1): void {

@@ -19,6 +19,9 @@ import {
   type RealAiHarness,
 } from "./fixtures/realAiHarness";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+
+recordToolCallOutcomesAfterEach();
 
 const LANE = "notebook-execution-live";
 // A bare user-shaped prompt: notebook deliverable, executed outputs, desktop

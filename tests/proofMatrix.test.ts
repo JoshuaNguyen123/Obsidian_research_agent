@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -29,8 +29,10 @@ import {
   TOOL_EVENT_SOURCE_NONE,
   TOOL_EVENT_SOURCE_SUMMARY,
   collectMechanicalFailureClasses,
+  fileMtimeMs,
   resolveAttemptToolEvents,
   summaryToolEventTotals,
+  summaryWrittenSince,
   upgradeRunCsvHeader,
   LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
@@ -737,9 +739,10 @@ test("summaryToolEventTotals sums refusal buckets and keeps partial knowledge a 
   // 2 + (unknown, skipped) + 1: a lower bound, not a fake zero for record 2.
   assert.equal(totals.failed, 3);
   assert.equal(totals.vacuous, null, "no record knew vacuous - the total is unknown");
-  assert.equal(totals.buckets.mission_graph_authority_blocked, 2);
-  assert.equal(totals.buckets.tool_not_allowed, 1);
-  assert.equal("bogus_bucket" in totals.buckets, false, "unknown bucket keys are dropped");
+  assert.ok(totals.buckets, "two records contributed vocabulary keys");
+  assert.equal(totals.buckets!.mission_graph_authority_blocked, 2);
+  assert.equal(totals.buckets!.tool_not_allowed, 1);
+  assert.equal("bogus_bucket" in totals.buckets!, false, "unknown bucket keys are dropped");
   // No records: nothing to speak for the attempt.
   assert.equal(summaryToolEventTotals({ records: [] }), null);
   assert.equal(summaryToolEventTotals(null), null);
@@ -1014,4 +1017,154 @@ test("the matrix aborts on environment_not_configured before it records anything
   assert.match(abortBlock, /CELL_STATUS_NOT_RUN/u);
   // And the operator is told exactly which variables to set.
   assert.match(abortBlock, /did NOT RUN — required environment not configured: \$\{missingList\}/u);
+});
+
+test("a summary whose records know nothing falls through instead of reporting zero", () => {
+  // Record EXISTENCE is not knowledge. Before this, any fresh summary with at
+  // least one record returned source="summary" with observed=0 — which is how
+  // the scenario-less proof lanes printed explicit observed=0 CSV rows for
+  // runs that certainly called tools.
+  const silent = {
+    records: [
+      { title: "soak", toolCalls: null, toolCallsAttempted: null },
+      { title: "notebook", toolCalls: null, toolCallsAttempted: null },
+    ],
+  };
+  const totals = summaryToolEventTotals(silent);
+  assert.ok(totals);
+  assert.equal(totals.observed, null, "no record knew: the total is unknown, not zero");
+  assert.equal(totals.buckets, null, "no record contributed buckets: unknown, not six zeros");
+
+  // With graphs available it falls through to mining...
+  const mined = resolveAttemptToolEvents({
+    summary: silent,
+    summaryFresh: true,
+    minedCounts: { observed: 7, failed: 1, buckets: { tool_not_allowed: 1 } },
+  });
+  assert.equal(mined.source, TOOL_EVENT_SOURCE_GRAPHS);
+  assert.equal(mined.observed, 7);
+
+  // ...and with nothing to mine either, all the way to "none".
+  const nothing = resolveAttemptToolEvents({
+    summary: silent,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(nothing.source, TOOL_EVENT_SOURCE_NONE);
+  assert.equal(nothing.observed, null);
+  assert.equal(nothing.buckets, null);
+});
+
+test("refusal-bucket cells stay blank unless a record contributed the key", () => {
+  // The old all-keys-at-0 seed printed six fabricated refusal zeros on EVERY
+  // summary-sourced row, whatever the records actually knew.
+  const partial = summaryToolEventTotals({
+    records: [{ toolCalls: 5, refusalBuckets: { execution_failed: 2 } }],
+  });
+  assert.ok(partial?.buckets);
+  assert.deepEqual(Object.keys(partial.buckets!), ["execution_failed"]);
+  for (const [key] of BLOCKER_BUCKETS) {
+    if (key === "execution_failed") continue;
+    assert.equal(
+      partial.buckets![key],
+      undefined,
+      `${key} was never contributed and must print blank, not 0`,
+    );
+  }
+  // A record that DID watch every bucket (a complete fold) contributes them
+  // all, explicit zeros included — that row's zeros are real knowledge.
+  const watched = summaryToolEventTotals({
+    records: [{
+      toolCalls: 5,
+      refusalBuckets: Object.fromEntries(
+        BLOCKER_BUCKETS.map(([key]) => [key, key === "invalid_arguments" ? 1 : 0]),
+      ),
+    }],
+  });
+  assert.equal(watched?.buckets?.invalid_arguments, 1);
+  assert.equal(watched?.buckets?.tool_not_allowed, 0);
+  // Records with no bucket knowledge at all leave the whole vocabulary unknown.
+  const silent = summaryToolEventTotals({ records: [{ toolCalls: 1 }] });
+  assert.equal(silent?.buckets, null);
+});
+
+test("the folded per-call count outranks the evidence-derived DU counter", () => {
+  // toolCalls is missionEvidence.length (successes only); toolCallsAttempted
+  // comes from the event-stream fold and is the real denominator.
+  const totals = summaryToolEventTotals({
+    records: [
+      { toolCalls: 12, toolCallsAttempted: 19, toolCallsFailed: 7 },
+      { toolCalls: 3, toolCallsAttempted: null },
+    ],
+  });
+  assert.equal(totals?.observed, 22, "19 folded + 3 fallback, never double counted");
+  assert.equal(totals?.failed, 7);
+});
+
+test("summary freshness is an exact pre-spawn mtime comparison, with no grace window", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "proof-matrix-freshness-"));
+  const summary = path.join(root, "daily-use-run-summary.json");
+  try {
+    // Attempt N wrote this summary.
+    writeFileSync(summary, "{}");
+    const previousAttemptMtimeSeconds = Date.now() / 1_000 - 60;
+    utimesSync(summary, previousAttemptMtimeSeconds, previousAttemptMtimeSeconds);
+    const beforeLaunch = fileMtimeMs(summary);
+    assert.ok(typeof beforeLaunch === "number");
+
+    // Attempt N+1 dies in the harness stage without writing anything. The old
+    // rule (mtime >= windowStart - 5s) admitted attempt N's file as fresh
+    // whenever N+1 died inside that 5-second window; the exact snapshot cannot.
+    assert.equal(
+      summaryWrittenSince(summary, beforeLaunch),
+      false,
+      "the PREVIOUS attempt's summary must never label this attempt",
+    );
+
+    // A real write during the attempt is strictly newer.
+    const nowSeconds = Date.now() / 1_000;
+    utimesSync(summary, nowSeconds, nowSeconds);
+    assert.equal(summaryWrittenSince(summary, beforeLaunch), true);
+
+    // Absent before, present now: fresh. Absent now: never fresh.
+    const virgin = path.join(root, "absent.json");
+    assert.equal(fileMtimeMs(virgin), null);
+    assert.equal(summaryWrittenSince(virgin, null), false);
+    writeFileSync(virgin, "{}");
+    assert.equal(summaryWrittenSince(virgin, null), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a call that started and never finished is never scored as a success", () => {
+  // `observed - failed` credits every undetermined call as a success, which is
+  // exactly wrong for an interrupted run (the whole point of the
+  // interrupted-continuation lane). Undetermined is subtracted, not credited.
+  const interrupted = resolveAttemptToolEvents({
+    summary: {
+      records: [{
+        toolCallsAttempted: 10,
+        toolCallsFailed: 2,
+        toolCallsVacuous: 1,
+        toolCallsUndetermined: 3,
+      }],
+    },
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(interrupted.observed, 10);
+  assert.equal(interrupted.failed, 2);
+  assert.equal(interrupted.undetermined, 3);
+  assert.equal(interrupted.succeeded, 4, "10 - 2 failed - 1 vacuous - 3 undetermined");
+
+  // A record that cannot report undetermined contributes null, which leaves
+  // the previous arithmetic untouched rather than assuming anything.
+  const legacy = resolveAttemptToolEvents({
+    summary: { records: [{ toolCalls: 10, toolCallsFailed: 2, toolCallsVacuous: 1 }] },
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(legacy.undetermined, null);
+  assert.equal(legacy.succeeded, 7);
 });

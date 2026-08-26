@@ -53,6 +53,7 @@ import {
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { nullableCount } from "./honest-counts.mjs";
 import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-campaign-sweep.mjs";
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -408,10 +409,8 @@ export const TOOL_EVENT_SOURCE_NONE = "none";
 function safeCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
-
-function nullableCount(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
+// nullableCount is imported from ./honest-counts.mjs — the one shared seat for
+// unknown-preserving count arithmetic. Do not re-inline it here.
 
 /**
  * Sum the tool-call counters across a daily-use run summary's records. The
@@ -425,14 +424,31 @@ export function summaryToolEventTotals(summary) {
   const records = Array.isArray(summary?.records) ? summary.records : null;
   if (!records || records.length === 0) return null;
   const totals = {
-    observed: 0,
+    // Nullable: null when NO record knew a real call count. A record without
+    // counters (a lane that annotated nothing) contributes UNKNOWN, not zero.
+    // The folded per-call count (toolCallsAttempted, from
+    // e2e/fixtures/toolCallOutcomes.ts) outranks the legacy DU-acceptance
+    // counter (toolCalls), which specs feed from missionEvidence lengths.
+    observed: null,
     failed: null,
     vacuous: null,
     intentionalNoOp: null,
-    buckets: Object.fromEntries(BLOCKER_BUCKETS.map(([key]) => [key, 0])),
+    // Calls that started and never terminated. Tracked apart so the success
+    // formula below cannot score them as successes: `observed - failed` would
+    // do exactly that for an interrupted run.
+    undetermined: null,
+    // Only keys some record actually contributed are present; an absent key is
+    // UNKNOWN and prints blank. The previous all-keys-at-0 seed printed six
+    // fabricated refusal zeros on EVERY summary-sourced CSV row. A record whose
+    // buckets came from a complete fold contributes all keys with explicit
+    // zeros, so those rows still make the whole vocabulary known.
+    buckets: null,
   };
   for (const record of records) {
-    totals.observed += safeCount(record?.toolCalls);
+    const observed =
+      nullableCount(record?.toolCallsAttempted) ??
+      nullableCount(record?.toolCalls);
+    if (observed !== null) totals.observed = (totals.observed ?? 0) + observed;
     const failed = nullableCount(record?.toolCallsFailed);
     if (failed !== null) totals.failed = (totals.failed ?? 0) + failed;
     const vacuous = nullableCount(record?.toolCallsVacuous);
@@ -441,10 +457,19 @@ export function summaryToolEventTotals(summary) {
     // tracked, but NEVER subtracted from succeeded like vacuous calls are.
     const noOp = nullableCount(record?.toolCallsIntentionalNoOp);
     if (noOp !== null) totals.intentionalNoOp = (totals.intentionalNoOp ?? 0) + noOp;
+    const undetermined = nullableCount(record?.toolCallsUndetermined);
+    if (undetermined !== null) {
+      totals.undetermined = (totals.undetermined ?? 0) + undetermined;
+    }
     const buckets = record?.refusalBuckets;
     if (buckets && typeof buckets === "object") {
-      for (const key of Object.keys(totals.buckets)) {
-        totals.buckets[key] += safeCount(buckets[key]);
+      // Vocabulary-restricted: keys outside BLOCKER_BUCKETS stay dropped.
+      for (const [key] of BLOCKER_BUCKETS) {
+        const parsed = nullableCount(buckets[key]);
+        if (parsed !== null) {
+          totals.buckets ??= {};
+          totals.buckets[key] = (totals.buckets[key] ?? 0) + parsed;
+        }
       }
     }
   }
@@ -467,17 +492,33 @@ export function summaryToolEventTotals(summary) {
 export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts }) {
   if (summaryFresh) {
     const totals = summaryToolEventTotals(summary);
-    if (totals) {
+    // Records that merely EXIST do not speak. A summary whose records all carry
+    // null counts (a lane with neither a fold nor an annotation) proves nothing
+    // about tool calls and must fall through to graph mining, then to "none" —
+    // treating existence as knowledge is how the scenario-less lanes produced
+    // explicit observed=0 rows.
+    if (totals && totals.observed !== null) {
       return {
         source: TOOL_EVENT_SOURCE_SUMMARY,
         observed: totals.observed,
         failed: totals.failed,
         vacuous: totals.vacuous,
         intentionalNoOp: totals.intentionalNoOp,
+        undetermined: totals.undetermined,
+        // Undetermined calls are subtracted, never credited: a call that
+        // started and never reported an outcome is not a success. Records that
+        // cannot report it contribute null, which leaves the previous
+        // behaviour unchanged for them.
         succeeded:
           totals.failed === null
             ? null
-            : Math.max(0, totals.observed - totals.failed - (totals.vacuous ?? 0)),
+            : Math.max(
+                0,
+                totals.observed -
+                  totals.failed -
+                  (totals.vacuous ?? 0) -
+                  (totals.undetermined ?? 0),
+              ),
         buckets: totals.buckets,
       };
     }
@@ -490,6 +531,7 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
       failed: mined.failed,
       vacuous: null,
       intentionalNoOp: null,
+      undetermined: null,
       succeeded: Math.max(0, mined.observed - mined.failed),
       buckets: mined.buckets,
     };
@@ -500,6 +542,7 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
     failed: null,
     vacuous: null,
     intentionalNoOp: null,
+    undetermined: null,
     succeeded: null,
     buckets: null,
   };
@@ -809,13 +852,31 @@ export function attemptLogExcerptFrom(logText, startIndex = 0) {
   return lines.slice(0, 12).join("\n").slice(0, 1_000);
 }
 
-/** True when the run summary file was (re)written during the attempt window. */
-function summaryWrittenDuring(file, windowStartMs) {
+/** The file's mtime in ms, or null when it does not exist. */
+export function fileMtimeMs(file) {
   try {
-    return statSync(file).mtimeMs >= windowStartMs - 5_000;
+    return statSync(file).mtimeMs;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * True when the run summary was (re)written during THIS attempt: it exists now
+ * and is strictly newer than the exact pre-spawn snapshot (or was absent then
+ * and is present now).
+ *
+ * No wall-clock grace. The old rule (`mtime >= windowStart - 5s`) admitted the
+ * PREVIOUS attempt's summary as fresh for any attempt that died inside the
+ * 5-second harness stage, which then labelled the new attempt with the old
+ * attempt's records — both for classification and for tool-event sourcing. Any
+ * tolerance around an exact before-reference is an admission window for stale
+ * evidence, so there is none.
+ */
+export function summaryWrittenSince(file, mtimeBeforeLaunchMs) {
+  const current = fileMtimeMs(file);
+  if (current === null) return false;
+  return mtimeBeforeLaunchMs === null || current > mtimeBeforeLaunchMs;
 }
 
 function csvField(value) {
@@ -1231,6 +1292,10 @@ async function main() {
         `proof-matrix[${stage}]: node ${runnerArgs.map((a) => path.basename(a)).join(" ")}` +
         ` (output: ${path.relative(REPO_ROOT, attemptLogPath)})`,
       );
+      // Freshness reference for the run summary: its exact mtime BEFORE the
+      // child launches. A summary counts as this attempt's only when it is
+      // strictly newer than this.
+      const summaryMtimeBeforeLaunch = fileMtimeMs(RUN_SUMMARY_PATH);
       const result = spawnSync(process.execPath, runnerArgs, {
         cwd: REPO_ROOT,
         env,
@@ -1267,7 +1332,10 @@ async function main() {
       const summary = readJsonFile(RUN_SUMMARY_PATH);
       // One freshness verdict feeds BOTH classification and tool-event
       // sourcing — two predicates would eventually disagree.
-      const summaryFresh = summaryWrittenDuring(RUN_SUMMARY_PATH, startedAt);
+      const summaryFresh = summaryWrittenSince(
+        RUN_SUMMARY_PATH,
+        summaryMtimeBeforeLaunch,
+      );
       const classification = classifyAttemptOutcome({
         exitCode,
         summary,
@@ -1332,7 +1400,8 @@ async function main() {
         minedCounts: mineToolEvents(startedAt, endedAt),
       });
       const sourceKnown = toolEvents.source !== TOOL_EVENT_SOURCE_NONE;
-      const failedKnown = sourceKnown && toolEvents.failed !== null;
+      const observedKnown = sourceKnown && toolEvents.observed !== null;
+      const failedKnown = observedKnown && toolEvents.failed !== null;
       const pctFailed =
         failedKnown && toolEvents.observed > 0
           ? ((100 * toolEvents.failed) / toolEvents.observed).toFixed(1) + "%"
@@ -1365,7 +1434,7 @@ async function main() {
           ? ""
           : `matrix ${stage} exit ${exitCode}` +
             (failureDetail ? `: ${failureDetail.split(/\r?\n/u).at(-1).slice(0, 160)}` : ""),
-        sourceKnown ? toolEvents.observed : "",
+        observedKnown ? toolEvents.observed : "",
         failedKnown ? toolEvents.failed : "",
         pctFailed,
         bucketCell("tool_not_allowed"),
