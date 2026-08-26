@@ -15,11 +15,29 @@ export interface PerformanceGate {
 
 export interface PerformanceGateResult {
   name: string;
-  status: "pass" | "warn" | "fail";
+  /**
+   * "unwired" is not a pass. A metric this module declares but never computes
+   * observes 0 forever, so a gate on it can only ever be met -- and a threshold
+   * that cannot fail reads as a threshold that passed. Saying so is the whole
+   * point: an unwired gate is a measurement gap, not a clean bill of health.
+   */
+  status: "pass" | "warn" | "fail" | "unwired";
   observed: number;
   threshold: number;
   message: string;
 }
+
+/**
+ * Metrics declared in the union that no branch of `metricValue` computes.
+ *
+ * Kept declared rather than deleted: each was added for a reason, and a
+ * visible gap is more useful than a silent removal. `semantic_decode_ms` is
+ * the one that matters -- decomposing a semantic search into shard decode
+ * versus scoring is what decides whether the vector-scan work is worth doing,
+ * and it needs a metric channel plumbed into the embeddings index first.
+ */
+export const UNWIRED_GATE_METRICS: ReadonlySet<PerformanceGate["metric"]> =
+  new Set(["semantic_decode_ms", "source_cache_lookup_ms"]);
 
 export const DEFAULT_PERFORMANCE_GATES: PerformanceGate[] = [
   { name: "model_call_latency", metric: "model_ms", warnAt: 120000 },
@@ -32,6 +50,15 @@ export function evaluatePerformanceGates(
   gates: PerformanceGate[] = DEFAULT_PERFORMANCE_GATES,
 ): PerformanceGateResult[] {
   return gates.map((gate) => {
+    if (UNWIRED_GATE_METRICS.has(gate.metric)) {
+      return {
+        name: gate.name,
+        status: "unwired" as const,
+        observed: 0,
+        threshold: gate.warnAt,
+        message: `${gate.metric} is declared but never measured, so this gate cannot fail. Treat it as unmeasured, not as passing.`,
+      };
+    }
     const observed = Math.max(0, ...metrics.map((metric) => metricValue(metric, gate.metric)));
     const failed = gate.failAt !== undefined && observed >= gate.failAt;
     const warned = observed >= gate.warnAt;
