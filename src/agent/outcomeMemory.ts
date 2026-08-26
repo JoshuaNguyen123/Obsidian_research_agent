@@ -48,6 +48,28 @@ export const MAX_OUTCOME_RECORDS = 200;
 export const PENALTY_FREE_FAILURES = 1;
 /** Ceiling on the ranking penalty, so history can never dominate live intent. */
 export const MAX_OUTCOME_PENALTY = 3;
+/**
+ * Half-life, in days, for weighting an observation by how recently it was seen.
+ *
+ * Counters are monotonic and the ledger is an exact record of what happened, so
+ * ageing is applied when the ledger is *read*, never by rewriting stored counts.
+ * That keeps `mergeToolOutcomeMemoryV1` exact and leaves every fingerprint
+ * valid. Without this a failure stays as damning the day a fix lands as it was
+ * the day it was observed: after the create-file collision repair landed, the
+ * ledger still carried every pre-fix failure and clearing them cost roughly one
+ * success per historical failure.
+ */
+export const OUTCOME_RECENCY_HALF_LIFE_DAYS = 30;
+/**
+ * Minimum share of attempts that must have failed before a record is described
+ * to the model as a failing approach.
+ *
+ * The ranking penalty has always scaled by failure ratio, but the prompt
+ * projection filtered on the raw failure count alone -- so a tool that failed
+ * three times and succeeded three hundred was still announced as an approach to
+ * avoid. Both readers now derive their counts from `weightedOutcomeCounts`.
+ */
+export const MIN_NOTABLE_FAILURE_RATIO = 0.34;
 
 /**
  * Coarse classification of what a tool was pointed at. Deliberately not the raw
@@ -224,40 +246,145 @@ export function mergeToolOutcomeMemoryV1(
   return { version: 1, records: evictToCap([...byId.values()]) };
 }
 
+/** Milliseconds in a day, for recency weighting. */
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Weight of an observation given how long ago it was last seen. 1 at the moment
+ * of observation, 0.5 after one half-life, never negative. An unparseable or
+ * future timestamp weighs 1: the ledger should not silently discount a record
+ * because a clock disagreed.
+ */
+export function outcomeRecencyWeight(lastSeen: string, now: Date): number {
+  const seenMs = Date.parse(lastSeen);
+  if (!Number.isFinite(seenMs)) return 1;
+  const ageMs = now.getTime() - seenMs;
+  if (!(ageMs > 0)) return 1;
+  return 0.5 ** (ageMs / DAY_MS / OUTCOME_RECENCY_HALF_LIFE_DAYS);
+}
+
+export interface WeightedOutcomeCounts {
+  failures: number;
+  successes: number;
+  attempts: number;
+  failureRatio: number;
+}
+
+/** Recency-weighted counts for a single record. */
+export function weightedOutcomeCounts(
+  record: ToolOutcomeRecordV1,
+  now: Date,
+): WeightedOutcomeCounts {
+  const weight = outcomeRecencyWeight(record.lastSeen, now);
+  const failures = record.failures * weight;
+  const successes = record.successes * weight;
+  const attempts = failures + successes;
+  return {
+    failures,
+    successes,
+    attempts,
+    failureRatio: attempts === 0 ? 0 : failures / attempts,
+  };
+}
+
+/**
+ * Recency-weighted counts for a whole tool, summed across its records.
+ *
+ * The failure ratio has to be computed here rather than per record. A record's
+ * identity includes its error code and a success is recorded with an empty one,
+ * so successes and failures for the same tool always land in *different*
+ * records -- which makes any single failure record's ratio vacuously 1. Only
+ * the tool-level aggregate can tell "this mostly works" from "this is broken".
+ *
+ * This is the single place both readers get their counts: the ranking penalty
+ * scores the aggregate, and the prompt projection gates each record on it. They
+ * previously disagreed -- the penalty scaled by ratio while the prompt filtered
+ * on raw failure count -- so an approach that failed three times and succeeded
+ * three hundred was still announced to the model as one to avoid.
+ */
+export function aggregateWeightedOutcomeCounts(
+  memory: ToolOutcomeMemoryV1,
+  toolName: string,
+  targetKind: ToolOutcomeTargetKind = "none",
+  now: Date = new Date(),
+): WeightedOutcomeCounts {
+  let failures = 0;
+  let successes = 0;
+  for (const record of memory.records) {
+    if (record.toolName !== toolName) continue;
+    // A record for a different target kind still carries signal about the tool
+    // itself, but the matching target kind is what we are actually asking about.
+    if (record.targetKind !== targetKind && targetKind !== "none") continue;
+    const counts = weightedOutcomeCounts(record, now);
+    failures += counts.failures;
+    successes += counts.successes;
+  }
+  const attempts = failures + successes;
+  return {
+    failures,
+    successes,
+    attempts,
+    failureRatio: attempts === 0 ? 0 : failures / attempts,
+  };
+}
+
+/**
+ * Whether a record is worth telling the model to avoid: enough recent failures
+ * of this exact shape to be a pattern, and a tool whose overall record is bad
+ * enough that the approach is not just the occasional miss of one that works.
+ */
+export function isNotablyFailing(
+  memory: ToolOutcomeMemoryV1,
+  record: ToolOutcomeRecordV1,
+  now: Date,
+): boolean {
+  if (weightedOutcomeCounts(record, now).failures <= PENALTY_FREE_FAILURES) {
+    return false;
+  }
+  const aggregate = aggregateWeightedOutcomeCounts(
+    memory,
+    record.toolName,
+    record.targetKind,
+    now,
+  );
+  return aggregate.failureRatio >= MIN_NOTABLE_FAILURE_RATIO;
+}
+
 /**
  * Bounded ranking penalty for one candidate tool.
  *
  * Grows with the log of the failure count so a long tail of failures cannot run
  * away, is scaled by the observed failure ratio, and is clamped to
  * MAX_OUTCOME_PENALTY. Returns 0 for anything with no failure history.
+ *
+ * Counts are aggregated across every matching record rather than gated record
+ * by record: a tool that fails three different ways is a worse bet than the
+ * three records suggest individually, and that aggregate signal is the point of
+ * the penalty. The prompt projection gates per record instead, because it is
+ * naming specific approaches rather than scoring a tool.
  */
 export function outcomePenaltyForAction(
   memory: ToolOutcomeMemoryV1,
   toolName: string,
   targetKind: ToolOutcomeTargetKind = "none",
+  now: Date = new Date(),
 ): number {
   const name = toolName.trim();
   if (!name) {
     return 0;
   }
 
-  let failures = 0;
-  let successes = 0;
-  for (const record of memory.records) {
-    if (record.toolName !== name) continue;
-    // A record for a different target kind still carries signal about the tool
-    // itself, but the matching target kind is what we are actually asking about.
-    if (record.targetKind !== targetKind && targetKind !== "none") continue;
-    failures += record.failures;
-    successes += record.successes;
-  }
+  const { failures, failureRatio } = aggregateWeightedOutcomeCounts(
+    memory,
+    name,
+    targetKind,
+    now,
+  );
 
   if (failures <= PENALTY_FREE_FAILURES) {
     return 0;
   }
 
-  const attempts = failures + successes;
-  const failureRatio = attempts === 0 ? 0 : failures / attempts;
   const magnitude = Math.log2(failures - PENALTY_FREE_FAILURES + 1);
   return Math.min(MAX_OUTCOME_PENALTY, magnitude * failureRatio);
 }
@@ -265,16 +392,23 @@ export function outcomePenaltyForAction(
 /**
  * The repeatedly-failing attempts, worst first. This is the prompt-facing view:
  * tool names and error codes only, never paths, URLs, or vault structure.
+ *
+ * Reported counts are the raw observed ones -- the model is being told what
+ * actually happened -- while selection and ordering use the recency-weighted
+ * counts, so a stale failure stops being announced without the record lying
+ * about its own history.
  */
 export function summarizeOutcomeMemoryForPrompt(
   memory: ToolOutcomeMemoryV1,
   limit = 8,
+  now: Date = new Date(),
 ): string | null {
   const notable = memory.records
-    .filter((record) => record.failures > PENALTY_FREE_FAILURES)
+    .filter((record) => isNotablyFailing(memory, record, now))
     .sort(
       (left, right) =>
-        right.failures - left.failures ||
+        weightedOutcomeCounts(right, now).failures -
+          weightedOutcomeCounts(left, now).failures ||
         right.lastSeen.localeCompare(left.lastSeen),
     )
     .slice(0, Math.max(0, limit));

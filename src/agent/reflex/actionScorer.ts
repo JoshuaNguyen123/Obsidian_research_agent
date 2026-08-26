@@ -23,6 +23,7 @@ export function scoreCandidateActions(
               input.toolOutcomeMemory,
               action.toolName,
               classifyToolTargetKind(action.toolName),
+              input.outcomeMemoryNow ?? new Date(),
             )
           : 0;
       const outcomePenalty = round3(

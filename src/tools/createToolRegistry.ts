@@ -8,6 +8,7 @@ import { createDatasetTools } from "./datasetTools";
 import { createCitationTools } from "./citationTools";
 import { createCompanionTools } from "./companionTools";
 import { createVaultIndexTools } from "./vaultIndexTools";
+import { createRecallTools } from "./recallTools";
 import { createVaultTools } from "./vaultTools";
 import { createWebViewerTools } from "./webViewerTools";
 import { createWebTools } from "./webTools";
@@ -330,6 +331,7 @@ function createCoreOwnedTools(): AgentTool[] {
     createJupyterReflectionTool(),
     createProjectResultsTool(),
     ...createVaultTools(),
+    ...createRecallTools(),
     ...createVaultIndexTools(),
     ...createSemanticSearchTools(),
     ...createWebTools(),

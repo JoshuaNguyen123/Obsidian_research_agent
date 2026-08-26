@@ -172,6 +172,7 @@ export function compactLoopMessages({
   maxPromptChars,
   handoff,
   proofExcerpts,
+  stash,
 }: {
   messages: ModelChatMessage[];
   ledger: MissionLedger;
@@ -179,6 +180,8 @@ export function compactLoopMessages({
   maxPromptChars?: number;
   handoff?: ContinuationHandoffV1;
   proofExcerpts?: CompactionProofExcerpts;
+  /** Omitted keeps the pre-existing destructive behaviour. */
+  stash?: CompactionStashFn;
 }): LoopCompactionResult {
   const estimatedCharsBefore = estimatePromptChars(messages);
   if (handoff && !validateContinuationHandoffV1(handoff).ok) {
@@ -210,6 +213,11 @@ export function compactLoopMessages({
     estimatedCharsAfter < estimatedCharsBefore &&
     (maxPromptChars === undefined || estimatedCharsAfter <= maxPromptChars);
 
+  // Note on stashing: this candidate stashes as it builds, and may then lose to
+  // a turn-drop candidate below. Those entries end up unreachable -- no message
+  // carries their key. The waste is bounded by the store cap and they are the
+  // oldest, so they are the first evicted. Deferring the stash until a winner
+  // is picked would mean building every candidate twice.
   // Payload-first: shrink oversized tool bodies while keeping the full turn
   // structure before dropping older loop steps. Do not append mission state
   // here — that projection is for turn-drop candidates only.
@@ -219,7 +227,7 @@ export function compactLoopMessages({
       if (message.role !== "tool") {
         return message;
       }
-      const shrunk = shrinkToolMessageForCompaction(message, true);
+      const shrunk = shrinkToolMessageForCompaction(message, true, stash);
       if (shrunk.content !== message.content) {
         shrunkToolMessages += 1;
       }
@@ -475,9 +483,17 @@ export function formatProofExcerptsForCompaction(
   return lines.length > 1 ? lines.join("\n") : null;
 }
 
+/**
+ * Hands a full payload to the run's store and returns the key to reach it by.
+ * Absent means compaction stays destructive, which is the pre-existing
+ * behaviour and what unit callers without a store get.
+ */
+export type CompactionStashFn = (content: string) => string | null;
+
 function shrinkToolMessageForCompaction(
   message: ModelChatMessage,
   enabled: boolean,
+  stash?: CompactionStashFn,
 ): ModelChatMessage {
   if (!enabled || message.role !== "tool") {
     return message;
@@ -485,11 +501,19 @@ function shrinkToolMessageForCompaction(
   if (message.content.length <= TOOL_SHRINK_CHAR_BUDGET) {
     return message;
   }
+  // Stashed before the rewrite, so the key names content that still exists.
+  const recallKey = stash?.(message.content) ?? null;
 
   try {
     const parsed: unknown = JSON.parse(message.content);
     if (isRecord(parsed)) {
       const slim: Record<string, unknown> = { truncated: true };
+      if (recallKey) {
+        slim.recallKey = recallKey;
+        // Spelled out rather than left as a bare key. A smaller tool-trained
+        // model will not infer an affordance from an opaque identifier.
+        slim.recallHint = `Full output was set aside. Call recall_tool_result with key "${recallKey}" to read it, optionally passing query to search it.`;
+      }
       for (const key of TOOL_CHAINING_KEYS) {
         if (key in parsed) {
           slim[key] = parsed[key];
@@ -533,9 +557,18 @@ function shrinkToolMessageForCompaction(
     // Fall through to plain truncation.
   }
 
+  // Unparseable payloads are truncated rather than restructured, but the
+  // recall affordance still applies -- the stash holds raw text either way.
+  const truncated = truncateContextLine(
+    message.content,
+    TOOL_SHRINK_CHAR_BUDGET,
+  );
   return {
     ...message,
-    content: truncateContextLine(message.content, TOOL_SHRINK_CHAR_BUDGET),
+    content: recallKey
+      ? `${truncated}
+[recall_tool_result key="${recallKey}" reads the full output]`
+      : truncated,
   };
 }
 
@@ -625,4 +658,68 @@ function findLastIndex<T>(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * How much of a prompt is byte-identical to the previous one.
+ *
+ * On a cloud-billed provider the agent loop resends a long, unchanged prefix --
+ * system prompt, tool policies, authority blocks -- on every one of up to 100
+ * steps. Providers that cache automatically match on an exact byte prefix, so
+ * the only thing that matters is how far the two prompts agree before the first
+ * difference. One changed character near the top costs the whole cache for that
+ * call.
+ *
+ * Appending to the message list preserves that prefix. Compaction does not:
+ * `compactLoopMessages` rebuilds the array as prefix + mission state + recent,
+ * and `keepPrefixMessages` retains a *different* set of authority blocks
+ * depending on how deep the compaction had to go (six, then three, then one).
+ * So the prefix can shrink mid-run, and it does so on long missions -- exactly
+ * the expensive ones. This measures that instead of assuming it.
+ */
+export interface PromptPrefixReuseV1 {
+  /** Characters identical to the previous prompt, counted from the start. */
+  stableChars: number;
+  /** Total characters in the new prompt. */
+  totalChars: number;
+  /** stableChars / totalChars, 1 when nothing before the tail changed. */
+  reuseRatio: number;
+  /** Index of the first message that differs, or null when none does. */
+  firstDivergentIndex: number | null;
+}
+
+export function measurePromptPrefixReuseV1(
+  previous: ModelChatMessage[],
+  next: ModelChatMessage[],
+): PromptPrefixReuseV1 {
+  let stableChars = 0;
+  let firstDivergentIndex: number | null = null;
+
+  const shared = Math.min(previous.length, next.length);
+  for (let index = 0; index < shared; index += 1) {
+    const before = previous[index];
+    const after = next[index];
+    if (before.role === after.role && before.content === after.content) {
+      stableChars += after.content.length;
+      continue;
+    }
+    firstDivergentIndex = index;
+    break;
+  }
+  if (firstDivergentIndex === null && next.length > previous.length) {
+    // Pure append: everything the provider saw last time is still there, and
+    // the new turns are the only uncached part.
+    firstDivergentIndex = previous.length;
+  }
+
+  const totalChars = next.reduce(
+    (total, message) => total + message.content.length,
+    0,
+  );
+  return {
+    stableChars,
+    totalChars,
+    reuseRatio: totalChars === 0 ? 1 : stableChars / totalChars,
+    firstDivergentIndex,
+  };
 }

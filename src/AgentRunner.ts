@@ -12,6 +12,8 @@ import type {
 import type { AgentSettings } from "./settings";
 import type { CapabilityReadinessV2 } from "./agent/capabilityReadiness";
 import { ModelClientError } from "./model/types";
+import { RECALL_TOOL_RESULT_TOOL_NAME } from "./tools/recallTools";
+import { createToolResultStoreV1 } from "./agent/toolResultStore";
 import {
   createSpecialistModelClient,
   resolveAgentModelSlotV2,
@@ -218,7 +220,12 @@ import {
   type PipelineLineageV1,
 } from "./agent/pipelineLineage";
 import { runDependencyPreflight } from "./agent/dependencyPreflight";
-import { evaluatePerformanceGates, type PerformanceGateResult } from "./agent/performanceGates";
+import {
+  evaluatePerformanceGates,
+  formatRunWallClockSummaryV1,
+  summarizeRunWallClockV1,
+  type PerformanceGateResult,
+} from "./agent/performanceGates";
 import {
   analyzeGeneratedOutputPrompt,
   buildWordTargetExpansionResumePrompt,
@@ -1238,6 +1245,8 @@ export interface AgentRunMetricEvent {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  /** Prompt tokens the provider served from cache; absent when it never says. */
+  cachedPromptTokens?: number;
 }
 
 export type {
@@ -3061,6 +3070,14 @@ export async function runAgentMission({
       ? { ...runContextBudget, maxPromptChars: calibrated.maxPromptChars }
       : runContextBudget;
   };
+  /**
+   * Full tool payloads compaction sets aside, so shrinking a result stops
+   * being a one-way door. Run-scoped: recall only ever happens inside the run
+   * that stashed the content.
+   */
+  const toolResultStore = createToolResultStoreV1(runId);
+  runToolContext.toolResultStore = toolResultStore;
+
   /**
    * Cross-run tool outcome ledger. Seeded from the host when it persists one;
    * otherwise a run-local ledger that simply learns nothing across runs, which
@@ -10200,6 +10217,17 @@ export async function runAgentMission({
         : effectiveStopReason === "error"
           ? nextAction?.trim() || null
           : null;
+    // Both halves of the mission's wall clock, side by side. Provider latency
+    // is not ours to optimise; tool latency is. Without the split, a slow run
+    // cannot be attributed and any optimisation is a guess.
+    const wallClock = summarizeRunWallClockV1(metricEvents);
+    events.onTrace?.({
+      id: `run-wall-clock-${step}`,
+      kind: "metric",
+      step,
+      message: `Wall clock: ${formatRunWallClockSummaryV1(wallClock)}`,
+      outputPreview: wallClock,
+    });
     completeRun(
       events,
       effectiveStopReason,
@@ -16173,8 +16201,13 @@ export async function runAgentMission({
   const compactedConversation = compactConversationForPrompt(
     conversationHistory,
     {
+      // Same ceiling the loop compacts against. This read the raw budget while
+      // the loop path used the calibrated one, so on a model whose real
+      // chars-per-token ratio is well below the assumed 4.0 the two halves of
+      // compaction disagreed about how much room there was -- in the direction
+      // of overflow.
       promptCharBudget: resolveConversationPromptCharBudget(
-        runContextBudget.maxPromptChars,
+        resolveEffectiveContextBudget().maxPromptChars,
       ),
     },
   );
@@ -16702,6 +16735,8 @@ export async function runAgentMission({
         reflexOutput.intent,
         getActiveRoutedCodeToolNames(),
         hasActiveCurrentMarkdownFile(runToolContext),
+        undefined,
+        toolResultStore.size().entries > 0,
       );
       tools = constrainOrchestratedHandoffTools(
         tools,
@@ -17579,6 +17614,12 @@ export async function runAgentMission({
             ),
             maxPromptChars: effectiveContextBudget.maxPromptChars,
             handoff,
+            stash: (content) =>
+              toolResultStore.stash({
+                toolName: "compacted_tool_result",
+                step,
+                content,
+              }),
             proofExcerpts: {
               validationDiagnostic:
                 runtimeCache.latestFastValidationDiagnostic,
@@ -27100,6 +27141,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   count_words: "read",
   get_note_graph_context: "read",
   find_related_notes: "read",
+  recall_tool_result: "read",
   suggest_note_links: "read",
   list_folder: "read",
   get_path_info: "read",
@@ -27327,6 +27369,13 @@ function getAllowedToolDefinitions(
    * the section by title would otherwise never be offered the section tools.
    */
   namesActiveNoteSection = false,
+  /**
+   * Whether compaction has set aside any full tool output in this run. The
+   * recall tool is offered only then: before that it can do nothing, and
+   * blanket-offering it would cost every ordinary mission schema space against
+   * the request-compactness budget the AgentRunner suite enforces.
+   */
+  hasRecallableToolResults = false,
 ) {
   const joinedDeveloperLifecycle =
     hasAffirmativeJoinedDeveloperLifecycleIntent(prompt);
@@ -27496,6 +27545,9 @@ function getAllowedToolDefinitions(
     (!allowRetitle || !hasTitleOnlyIntent(prompt));
 
   const filtered = toolRegistry.getDefinitions().filter((definition) => {
+    if (definition.function.name === RECALL_TOOL_RESULT_TOOL_NAME) {
+      return hasRecallableToolResults;
+    }
     const name = definition.function.name;
 
     if (name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME) {
@@ -37856,6 +37908,12 @@ function extractTokenUsageFields(raw: unknown): Partial<AgentRunMetricEvent> {
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         totalTokens: usage.totalTokens,
+        // Only emitted when the provider actually reports caching. Defaulting a
+        // silent provider to 0 would render an unmeasurable setup identical to
+        // a measured cache miss.
+        ...(usage.cachedReported
+          ? { cachedPromptTokens: usage.cachedPromptTokens }
+          : {}),
       }
     : {};
 }

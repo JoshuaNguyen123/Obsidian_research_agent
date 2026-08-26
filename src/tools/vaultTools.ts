@@ -331,14 +331,25 @@ export const listMarkdownFilesTool: AgentTool = {
   async execute(args, context) {
     expectNoArgs(args, "list_markdown_files");
 
-    return context.app.vault
+    // The cap was previously silent, and the bare array it returned was not a
+    // record, so mission evidence extraction skipped this tool entirely. The
+    // envelope fixes both: the listing says when it is partial, and
+    // vaultSearchEvidenceFromToolResult already recognises a "files" array.
+    const all = context.app.vault
       .getFiles()
       .filter((file) => file.extension === "md")
-      .slice(0, MAX_LISTED_FILES)
-      .map((file) => ({
-        path: file.path,
-        basename: file.basename,
-      }));
+      .filter((file) => !isBlockedSystemPath(file.path));
+    const files = all.slice(0, MAX_LISTED_FILES).map((file) => ({
+      path: file.path,
+      basename: file.basename,
+    }));
+
+    return {
+      files,
+      total: all.length,
+      limit: MAX_LISTED_FILES,
+      truncated: all.length > files.length,
+    };
   },
 };
 

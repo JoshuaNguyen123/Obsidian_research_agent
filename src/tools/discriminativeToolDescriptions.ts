@@ -71,6 +71,8 @@ export const DISCRIMINATIVE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> 
     "Purpose: Inspect the semantic vault index for concepts and freshness. Use when: checking index coverage before search. Do not use when: treating index summaries as citable evidence. Required: none. Next: semantic_search_notes or read_file. Side effects: read.",
   rebuild_semantic_index:
     "Purpose: Rebuild derived semantic index files. Use when: the user explicitly asks for index maintenance. Do not use when: ordinary search or note writes. Required: none. Next: semantic_search_notes. Side effects: index rewrite.",
+  recall_tool_result:
+    "Purpose: Re-read the full output of an earlier tool call that was shortened to save space. Use when: a tool result shows truncated:true and a recallKey, and you need detail it dropped. Do not use when: you have not seen a recallKey (nothing was set aside), or the tool can simply be run again more cheaply. Required: key. Next: continue the step that needed the detail. Side effects: read.",
   list_markdown_files:
     "Purpose: List vault markdown paths. Use when: candidate note paths are needed and no exact path is known. Do not use when: reading content (use read_file) or conceptual search (use semantic_search_notes). Required: none. Next: read_file. Side effects: read.",
   get_note_graph_context:

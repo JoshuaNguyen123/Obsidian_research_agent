@@ -179,6 +179,12 @@ export interface AgenticReflexInput {
   embeddingProvider?: SemanticEmbeddingProvider;
   /** Optional cross-run tool history. Absent preserves pre-memory scoring. */
   toolOutcomeMemory?: ToolOutcomeMemoryV1;
+  /**
+   * Instant the ledger is read at. Outcome history is recency-weighted, so a
+   * score depends on *when* it is computed; injecting the clock keeps scoring
+   * deterministic under test instead of drifting with the wall clock.
+   */
+  outcomeMemoryNow?: Date;
   checkpoint?: ReflexCheckpointKind;
   frontierFingerprint?: string | null;
 }

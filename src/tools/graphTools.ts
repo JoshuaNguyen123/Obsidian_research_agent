@@ -1,5 +1,6 @@
 import type { TFile } from "obsidian";
 import { BACKUP_FOLDER, MAX_LISTED_FILES } from "./constants";
+import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import {
   getOptionalInteger,
@@ -139,7 +140,11 @@ export const findRelatedNotesTool: AgentTool = {
       MAX_RELATED_LIMIT,
     );
     const baseFile = path || !query ? resolveMarkdownFile(context, path) : null;
-    const results = await findRelatedNotes(context, { baseFile, query, limit });
+    const { results, profileSet } = await findRelatedNotes(context, {
+      baseFile,
+      query,
+      limit,
+    });
 
     return {
       source: baseFile
@@ -151,6 +156,20 @@ export const findRelatedNotesTool: AgentTool = {
       query: query || null,
       limit,
       results,
+      truncated: profileSet.truncated,
+      considered: profileSet.considered,
+      coverage: buildRetrievalCoverage({
+        mode: profileSet.truncated ? "sampled" : "exact",
+        considered: profileSet.considered,
+        read: profileSet.profiles.size,
+        skipped: Math.max(0, profileSet.considered - profileSet.profiles.size),
+        truncated: profileSet.truncated,
+        reasons: [
+          profileSet.truncated
+            ? "profile_cap_applied_most_recent_first"
+            : "whole_vault_profiled",
+        ],
+      }),
     };
   },
 };
@@ -181,7 +200,10 @@ export const suggestNoteLinksTool: AgentTool = {
       1,
       MAX_RELATED_LIMIT,
     );
-    const related = await findRelatedNotes(context, { baseFile: file, limit });
+    const { results: related } = await findRelatedNotes(context, {
+      baseFile: file,
+      limit,
+    });
 
     return {
       source: {
@@ -246,7 +268,7 @@ export const linkRelatedNotesInCurrentFileTool: AgentTool = {
           );
     const candidates =
       targetPaths === null
-        ? await findRelatedNotes(context, { baseFile: file, limit })
+        ? (await findRelatedNotes(context, { baseFile: file, limit })).results
         : await buildTargetRelatedResults(context, file, targetPaths);
     const edit = applyInlineRelatedLinks(current, candidates);
 
@@ -277,6 +299,11 @@ export const linkRelatedNotesInCurrentFileTool: AgentTool = {
   },
 };
 
+interface RelatedNotesOutcome {
+  results: RelatedNoteResult[];
+  profileSet: VaultProfileSet;
+}
+
 async function findRelatedNotes(
   context: ToolExecutionContext,
   {
@@ -288,8 +315,9 @@ async function findRelatedNotes(
     query?: string;
     limit: number;
   },
-): Promise<RelatedNoteResult[]> {
-  const profiles = await buildVaultProfiles(context);
+): Promise<RelatedNotesOutcome> {
+  const profileSet = await buildVaultProfiles(context);
+  const { profiles } = profileSet;
   const baseProfile = baseFile ? profiles.get(baseFile.path) ?? null : null;
   const queryTerms = new Set(tokenize(query ?? ""));
   const results: RelatedNoteResult[] = [];
@@ -317,9 +345,10 @@ async function findRelatedNotes(
     });
   }
 
-  return results
+  const ranked = results
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
     .slice(0, limit);
+  return { results: ranked, profileSet };
 }
 
 async function buildTargetRelatedResults(
@@ -327,7 +356,7 @@ async function buildTargetRelatedResults(
   file: TFile,
   targetPaths: string[],
 ): Promise<RelatedNoteResult[]> {
-  const profiles = await buildVaultProfiles(context);
+  const { profiles } = await buildVaultProfiles(context);
   const baseProfile = profiles.get(file.path) ?? null;
   const results: RelatedNoteResult[] = [];
 
@@ -442,32 +471,66 @@ function scoreRelatedProfile({
   return { score, reasons: dedupeStrings(reasons), matchedTerms };
 }
 
+/**
+ * Every markdown profile the graph heuristics can see, plus what the cap left
+ * out. The cap is real and was previously silent: on a vault larger than
+ * MAX_LISTED_FILES the notes considered were whichever ones vault order
+ * happened to put first, and nothing in the result said so.
+ */
+interface VaultProfileSet {
+  profiles: Map<string, NoteProfile>;
+  considered: number;
+  truncated: boolean;
+}
+
+function isVaultProfileSet(value: unknown): value is VaultProfileSet {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as VaultProfileSet).profiles instanceof Map &&
+    typeof (value as VaultProfileSet).considered === "number"
+  );
+}
+
 async function buildVaultProfiles(
   context: ToolExecutionContext,
-): Promise<Map<string, NoteProfile>> {
-  const cacheKey = "graph:vault_profiles:v1";
+): Promise<VaultProfileSet> {
+  const cacheKey = "graph:vault_profiles:v2";
   const graphProfiles =
     context.runtimeCache?.graphProfiles ??
     (context.runtimeCache
       ? (context.runtimeCache.graphProfiles = new Map<string, unknown>())
       : undefined);
   const cachedProfiles = graphProfiles?.get(cacheKey);
-  if (cachedProfiles instanceof Map) {
-    return cachedProfiles as Map<string, NoteProfile>;
+  if (isVaultProfileSet(cachedProfiles)) {
+    return cachedProfiles;
   }
 
   const profiles = new Map<string, NoteProfile>();
-  const files = context.app.vault
+  const candidates = context.app.vault
     .getFiles()
-    .filter((file) => file.extension === "md" && !isBlockedSystemPath(file.path))
+    .filter((file) => file.extension === "md" && !isBlockedSystemPath(file.path));
+  // Most-recently-modified first, so that when the cap bites the sample is at
+  // least principled rather than an accident of vault iteration order.
+  const files = [...candidates]
+    .sort(
+      (left, right) =>
+        (right.stat?.mtime ?? 0) - (left.stat?.mtime ?? 0) ||
+        left.path.localeCompare(right.path),
+    )
     .slice(0, MAX_LISTED_FILES);
 
   for (const file of files) {
     profiles.set(file.path, await buildNoteProfile(context, file));
   }
 
-  graphProfiles?.set(cacheKey, profiles);
-  return profiles;
+  const built: VaultProfileSet = {
+    profiles,
+    considered: candidates.length,
+    truncated: candidates.length > files.length,
+  };
+  graphProfiles?.set(cacheKey, built);
+  return built;
 }
 
 async function buildNoteProfile(

@@ -1,5 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
+import type { EmbeddingProbeResultV1 } from "./embeddings/embeddingProbe";
 import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
 import type { ModelProvider } from "./model/types";
 import { normalizeSecureProviderBaseUrlV1 } from "./model/providerEndpointPolicy";
@@ -2079,7 +2080,10 @@ export class AgentSettingTab extends PluginSettingTab {
 
     new Setting(semanticHost)
       .setName("Semantic embedding model")
-      .setDesc("FastEmbed model used for semantic_search_notes.")
+      // The row states the last measured runtime result, not the setting. A
+      // setting that says "on" while every search silently falls back to
+      // keyword matching is how this failure stayed invisible.
+      .setDesc(describeEmbeddingProbe(this.plugin.lastEmbeddingProbe))
       .addText((text) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS.semanticEmbeddingModel)
@@ -2088,6 +2092,19 @@ export class AgentSettingTab extends PluginSettingTab {
             this.plugin.settings.semanticEmbeddingModel =
               value.trim() || DEFAULT_SETTINGS.semanticEmbeddingModel;
             await this.plugin.saveSettings();
+          }),
+      )
+      .addButton((button) =>
+        button
+          .setButtonText(
+            this.plugin.embeddingProbeInFlight ? "Testing..." : "Test embedder",
+          )
+          .setDisabled(this.plugin.embeddingProbeInFlight)
+          .onClick(async () => {
+            const pending = this.plugin.testEmbeddingProvider();
+            this.display();
+            await pending;
+            this.display();
           }),
       );
 
@@ -3775,4 +3792,24 @@ async function copyTextToClipboard(value: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * What the embedding model row says beneath its name.
+ *
+ * Untested is stated as untested rather than implied to be working: claiming a
+ * runtime is healthy because a checkbox is ticked is the exact confusion this
+ * row exists to remove.
+ */
+function describeEmbeddingProbe(
+  probe: EmbeddingProbeResultV1 | null,
+): string {
+  if (!probe) {
+    return "FastEmbed model used for semantic_search_notes. Not yet tested — press Test embedder to check the runtime actually works.";
+  }
+  return probe.ok
+    ? `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms.`
+    : probe.setupAction
+      ? `Not working: ${probe.message} ${probe.setupAction}`
+      : `Not working: ${probe.message}`;
 }

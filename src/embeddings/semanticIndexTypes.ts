@@ -25,6 +25,8 @@ export interface SemanticVaultIndexV1 {
   version: 1;
   model: string;
   dim: 256 | 512;
+  /** Prefix-pair fingerprint the vectors were built under. Absent = legacy. */
+  promptPrefixes?: string;
   chunking: {
     minTokens: number;
     targetTokens: number;
@@ -70,6 +72,8 @@ export interface SemanticIndexShardV2 {
   id: string;
   model: string;
   dim: 256 | 512;
+  /** Prefix-pair fingerprint the vectors were built under. Absent = legacy. */
+  promptPrefixes?: string;
   indexedAt: string;
   rows: SemanticIndexRowMeta[];
   vectorsBase64: string;
@@ -79,6 +83,8 @@ export interface SemanticVaultIndexV2 {
   version: 2;
   model: string;
   dim: 256 | 512;
+  /** Prefix-pair fingerprint the vectors were built under. Absent = legacy. */
+  promptPrefixes?: string;
   chunking: {
     minTokens: number;
     targetTokens: number;

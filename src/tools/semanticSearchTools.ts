@@ -15,6 +15,7 @@ import type {
   SemanticVaultIndex,
 } from "../embeddings/semanticIndexTypes";
 import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
+import { resolveEmbeddingPrefixesV1 } from "../embeddings/embeddingPrefixes";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import { isVaultPathExcluded } from "./vaultExclusions";
 import { resolveSemanticSearchCapsForCompoundRun } from "../agent/setLooseCompoundAutonomy";
@@ -222,12 +223,15 @@ export const semanticSearchNotesTool: AgentTool = {
     let scored: ScoredChunk[] = [];
 
     if (context.semanticEmbeddingProvider && chunks.length > 0) {
+      const livePrefixes = resolveEmbeddingPrefixesV1(getSemanticModel(context));
       const response = await context.semanticEmbeddingProvider.embed({
         model: getSemanticModel(context),
         dim: getSemanticDim(context),
         cacheDir: context.settings.semanticModelCacheDir || undefined,
         documents: chunks.map((chunk) => chunk.embeddingText),
         queries: [query],
+        queryPrefix: livePrefixes.query,
+        documentPrefix: livePrefixes.document,
       });
 
       if (

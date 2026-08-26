@@ -55,6 +55,7 @@ export const READ_ONLY_TOOL_NAMES = new Set([
   "read_template",
   "read_workspace_file",
   "list_workspace_files",
+  "recall_tool_result",
   "search_research_memory",
   "read_research_memory",
 ]) as ReadonlySet<string>;
