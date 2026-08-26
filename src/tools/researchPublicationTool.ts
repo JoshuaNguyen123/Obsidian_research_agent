@@ -22,6 +22,9 @@ import {
   parseAcceptedResearchNotePackageV1,
   parseRenderedCompatibleWorkItemSpec,
   parseResearchPublicationCheckpointV1,
+  PROJECT_IDEA_SEED_BOUND_FIELD_NAMES_V1,
+  projectIdeaSeedBoundFieldProjectionsV1,
+  type ProjectIdeaSeedBoundFieldNameV1,
   type ResearchPublicationCheckpointV1,
   type ResearchPublicationDestinationV1,
   type ResearchPublicationExactApprovalRequestV1,
@@ -573,33 +576,11 @@ export function assertProjectIdeaSeedPublicationBindingV1(
       { mutationState: "not_applied" },
     );
   }
-  const acceptedProjection = {
-    title: package_.title,
-    problemImpact: package_.problemImpact,
-    objective: package_.objective,
-    proposedWork: package_.proposedWork,
-    nonGoals: package_.nonGoals,
-    acceptanceCriteria: package_.acceptanceCriteria,
-    evidence: package_.evidence.map(
-      ({ id, kind, reference, contentSha256 }) => ({
-        id,
-        kind,
-        reference,
-        contentSha256,
-      }),
-    ),
-    riskClass: package_.riskClass,
-  };
-  const seedProjection = {
-    title: exactSeed.title,
-    problemImpact: exactSeed.problemImpact,
-    objective: exactSeed.selectedDirection.summary,
-    proposedWork: exactSeed.proposedWork,
-    nonGoals: exactSeed.nonGoals,
-    acceptanceCriteria: exactSeed.acceptanceCriteria,
-    evidence: exactSeed.evidence,
-    riskClass: exactSeed.riskClass,
-  };
+  const { accepted: acceptedProjection, seeded: seedProjection } =
+    projectIdeaSeedBoundFieldProjectionsV1({
+      package_,
+      seed: exactSeed,
+    });
   if (canonicalJson(acceptedProjection) !== canonicalJson(seedProjection)) {
     throw new ToolExecutionError(
       "research_publication_project_idea_drift",
@@ -607,6 +588,93 @@ export function assertProjectIdeaSeedPublicationBindingV1(
       { mutationState: "not_applied" },
     );
   }
+}
+
+/**
+ * While a durable project idea seed exists, the seed-bound accepted research
+ * fields have exactly one admissible value each and the drift guard rejects
+ * every other. A model paraphrase of those fields can therefore only fail, so
+ * the host substitutes the seeded values instead of spending bounded node
+ * attempts on paraphrase repair — the publish-seat mirror of
+ * canonicalExactLinearIssueReadIdV1. Two seats consume this one predicate:
+ * the AgentRunner execution boundary (which journals the substitution on the
+ * trace, exactly as the linear precedent records itself) and this tool's own
+ * argument parsing (so non-runner callers get the same exactness). The
+ * model's package is advisory for seed-bound fields; the host-owned seed is
+ * the truth.
+ *
+ * Deliberately narrow, so the drift guard keeps its teeth everywhere else:
+ * - no seed (or any invalid/partial ideation cache) → null, byte-identical
+ *   downstream behavior including the guard's own cache errors;
+ * - only fields present on the provided package are substituted (a missing
+ *   required field still fails schema validation exactly as before);
+ * - evidence identity subfields are substituted per entry only when the
+ *   package carries the same number of evidence records as the seed — a
+ *   structurally different evidence list still fails the drift guard;
+ * - which fields are seed-bound comes from the drift guard's own list
+ *   (PROJECT_IDEA_SEED_BOUND_FIELD_NAMES_V1), never a second enumeration.
+ */
+export function canonicalSeedExactAcceptedResearchPackageV1(input: {
+  toolName: string;
+  packageValue: unknown;
+  runtimeCache: ToolExecutionContext["runtimeCache"];
+}): {
+  packageValue: Record<string, unknown>;
+  substitutedFields: ProjectIdeaSeedBoundFieldNameV1[];
+} | null {
+  if (input.toolName.trim() !== PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) {
+    return null;
+  }
+  const packageRecord = asRecord(input.packageValue);
+  if (!packageRecord) return null;
+  let seed: ProjectIdeaAcceptedResearchSeedV1 | null;
+  try {
+    seed = resolveCachedProjectIdeaSeedV1(input.runtimeCache);
+  } catch {
+    // Invalid or partial ideation cache states must surface their existing
+    // in-tool errors unchanged; substitution never masks them.
+    return null;
+  }
+  if (!seed) return null;
+  const { accepted, seeded } = projectIdeaSeedBoundFieldProjectionsV1({
+    package_: packageRecord as {
+      [key in ProjectIdeaSeedBoundFieldNameV1]: unknown;
+    },
+    seed,
+  });
+  const next: Record<string, unknown> = { ...packageRecord };
+  const substitutedFields: ProjectIdeaSeedBoundFieldNameV1[] = [];
+  for (const key of PROJECT_IDEA_SEED_BOUND_FIELD_NAMES_V1) {
+    if (!Object.prototype.hasOwnProperty.call(packageRecord, key)) continue;
+    if (JSON.stringify(accepted[key]) === JSON.stringify(seeded[key])) {
+      continue;
+    }
+    if (key === "evidence") {
+      const provided = packageRecord.evidence;
+      if (
+        !Array.isArray(provided) ||
+        provided.length !== seed.evidence.length ||
+        !provided.every((entry) => asRecord(entry))
+      ) {
+        continue;
+      }
+      next.evidence = provided.map((entry, index) => ({
+        ...(entry as Record<string, unknown>),
+        id: seed.evidence[index].id,
+        kind: seed.evidence[index].kind,
+        reference: seed.evidence[index].reference,
+        contentSha256: seed.evidence[index].contentSha256,
+      }));
+      substitutedFields.push(key);
+      continue;
+    }
+    // Deep-clone so downstream in-place canonicalization of the package can
+    // never mutate the cached seed it was substituted from.
+    next[key] = JSON.parse(JSON.stringify(seeded[key])) as unknown;
+    substitutedFields.push(key);
+  }
+  if (substitutedFields.length === 0) return null;
+  return { packageValue: next, substitutedFields };
 }
 
 /**
@@ -970,6 +1038,20 @@ async function parseToolArguments(input: {
   const { value, runId } = input;
   assertExactKeys(value, ["mode", "package"], ["notePath", "baseHash"]);
   const packageRecord = expectRecord(value.package, "accepted research package");
+  // Host seed substitution runs before objective hydration and the drift
+  // guard: paraphrased seed-bound fields are rewritten to the durable seed
+  // (live compound-flow failure shape) so the guard sees only admissible
+  // values when seed authority exists.
+  const seedExact = canonicalSeedExactAcceptedResearchPackageV1({
+    toolName: PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+    packageValue: packageRecord,
+    runtimeCache: input.runtimeCache,
+  });
+  if (seedExact) {
+    for (const key of Object.keys(seedExact.packageValue)) {
+      packageRecord[key] = seedExact.packageValue[key];
+    }
+  }
   const projectIdeaSeed = resolveCachedProjectIdeaSeedV1(input.runtimeCache);
   hydratePackageObjective(packageRecord, projectIdeaSeed);
   assertExactKeys(
