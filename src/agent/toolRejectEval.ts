@@ -266,14 +266,48 @@ export function mapToolRejectCategory(input: {
   ) {
     return "frontier_narrowed";
   }
+  // A pending mission-graph node is POSITIVE evidence that the tool exists and
+  // is planned: the caller located that node by looking this exact name up in
+  // the graph's own `allowedTools`. `unknown_tool` means "the model named a
+  // tool that does not exist", so reading a pending node as unknown_tool
+  // inverts the evidence -- and because that read sat inside the unknown_tool
+  // arm, IN FRONT of `invalid_state`, every mission-graph AUTHORITY refusal
+  // ("the node is real, it is simply not ready yet") was stamped as a model
+  // naming error. Observed live: 7 consecutive `mission_graph_authority_blocked`
+  // refusals, all `category=unknown_tool` (proof-matrix
+  // interrupted-continuation, 2026-08-25).
+  //
+  // The deferral is the DEFAULT diagnosis for a pending node, not an override:
+  // a refusal that also carries a specific reason (missing argument, approval
+  // denial, rate limit) is still that reason, so the specific arms are
+  // consulted first through the SAME predicate the no-node path uses. One
+  // vocabulary, one place to change it.
+  if (input.pendingGraphNodeId) {
+    return classifySpecificToolRejectReasonV1(blob) ?? "invalid_state";
+  }
   if (
     /unknown tool|not available for this prompt|off-frontier|tool_not_allowed/i.test(
       blob,
-    ) ||
-    input.pendingGraphNodeId
+    )
   ) {
     return "unknown_tool";
   }
+  return classifySpecificToolRejectReasonV1(blob) ?? "other";
+}
+
+/**
+ * The reason-text arms of `mapToolRejectCategory`, shared by the
+ * pending-graph-node path and the plain path so the two can never disagree
+ * about what a given refusal sentence means. Returns null when no specific
+ * reason matches; each caller supplies its own default.
+ *
+ * Order is significance order and is load-bearing: an argument fault is more
+ * specific than the workflow state it happened inside, and an approval denial
+ * is more specific than "blocked".
+ */
+function classifySpecificToolRejectReasonV1(
+  blob: string,
+): ToolRejectCategoryV1 | null {
   if (/missing.*argument|required.*(field|literal)|omitted/i.test(blob)) {
     return "missing_argument";
   }
@@ -306,7 +340,7 @@ export function mapToolRejectCategory(input: {
   if (/rate.?limit|transient|timeout|econnreset|503|429/i.test(blob)) {
     return "rate_limit_or_transient";
   }
-  return "other";
+  return null;
 }
 
 export function describeOffFrontierToolNearMiss(
@@ -533,6 +567,10 @@ export function buildOffFrontierToolRejectionMessage(input: {
               ? "off-frontier"
               : "not available for this prompt"),
         }));
+  // True when the refusing subsystem supplied a real reason and that reason
+  // did NOT come back as "this name does not exist".
+  const authorityDeferred =
+    Boolean(input.reasonMessage?.trim()) && category !== "unknown_tool";
   const heldWriteTools = new Set(
     (input.heldWriteToolNames ?? []).filter(Boolean),
   );
@@ -557,7 +595,15 @@ export function buildOffFrontierToolRejectionMessage(input: {
         `withheld since.`
       : input.pendingGraphNodeId
         ? `Deferred ${input.toolName}: authoritative mission node ${input.pendingGraphNodeId} is not on the ready frontier.`
-        : `Tool is not available for this prompt: ${input.toolName}`;
+        : // A refusal that carries the refusing subsystem's own reason AND does
+          // not classify as unknown_tool is a state refusal, not an unavailable
+          // name. Saying "not available for this prompt" there contradicts the
+          // `category=` this same message prints one clause later, and leaves
+          // the exact substring the shared refusal vocabulary buckets as
+          // "the model named a tool it was never offered".
+          authorityDeferred
+          ? `Deferred ${input.toolName}: the name is valid and the call was well-formed; the subsystem that owns it refused on state, not on the name.`
+          : `Tool is not available for this prompt: ${input.toolName}`;
   // The model can see it was offered this name moments ago. Telling it the
   // name is unavailable invites a retry loop against a contradiction it
   // cannot resolve. Name the real state and the real remedy instead.

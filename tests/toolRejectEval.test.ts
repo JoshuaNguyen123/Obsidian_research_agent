@@ -14,6 +14,7 @@ import {
   isHostWithheldOffFrontierRefusalV1,
   looksLikeUnfilledToolNamePlaceholderV1,
   mapToolRejectCategory,
+  type ToolRejectCategoryV1,
 } from "../src/agent/toolRejectEval";
 
 test("maps invented commit/git_add to code_commit_verified when listed", () => {
@@ -813,4 +814,139 @@ test("the runner records the offered-menu history the decay class depends on", (
   // Both known withholders name themselves, so the refusal can say why.
   assert.match(runnerSource, /"proof_gate_containment: /u);
   assert.match(runnerSource, /`phase_menu_ceiling: /u);
+});
+
+// ---------------------------------------------------------------------------
+// pending mission-graph node: a REAL tool that is not ready, not an unknown one
+// ---------------------------------------------------------------------------
+
+test("a pending mission-graph node classifies invalid_state, never unknown_tool", () => {
+  // The node was located by looking this exact name up in the graph's own
+  // allowedTools, so its existence PROVES the tool is real and planned.
+  // `unknown_tool` means "the model named a tool that does not exist"; the old
+  // arm returned it on the mere presence of a node id, in front of the
+  // invalid_state arm, so every authority deferral read as a model naming
+  // error (proof-matrix interrupted-continuation, 2026-08-25: 7 consecutive
+  // mission_graph_authority_blocked refusals, all category=unknown_tool).
+  assert.equal(
+    mapToolRejectCategory({
+      toolName: "code_commit_verified",
+      pendingGraphNodeId: "tool-11-code_commit_verified",
+      message: "Tool code_commit_verified is not ready in the authoritative mission graph.",
+    }),
+    "invalid_state",
+  );
+  // The exact inputs the step-menu gate builds: a hardcoded "off-frontier"
+  // stand-in plus the plan-dependency code. "off-frontier" matches the
+  // unknown_tool text arm, so ordering alone decides this one.
+  assert.equal(
+    mapToolRejectCategory({
+      toolName: "code_commit_verified",
+      pendingGraphNodeId: "tool-11-code_commit_verified",
+      message: "off-frontier",
+      code: "plan_dependency_violation",
+    }),
+    "invalid_state",
+  );
+});
+
+test("a genuinely unknown tool still classifies unknown_tool", () => {
+  // No pending node: the graph reserves no slot for this name at all.
+  assert.equal(
+    mapToolRejectCategory({
+      toolName: "git_commit",
+      message: "off-frontier",
+      code: "tool_not_allowed",
+    }),
+    "unknown_tool",
+  );
+  assert.equal(
+    mapToolRejectCategory({
+      toolName: "$TOOL_NAME",
+      message: "Tool is not available for this prompt",
+    }),
+    "unknown_tool",
+  );
+  assert.equal(
+    mapToolRejectCategory({ toolName: "verify_all", message: "unknown tool" }),
+    "unknown_tool",
+  );
+});
+
+test("a specific refusal reason still outranks the pending-node default", () => {
+  // The node deferral is the DEFAULT diagnosis for a pending node, not an
+  // override. A refusal that names a real fault is still that fault.
+  assert.equal(
+    mapToolRejectCategory({
+      toolName: "code_commit_verified",
+      pendingGraphNodeId: "tool-11-code_commit_verified",
+      message: "Approval denied by the user.",
+    }),
+    "unauthorized",
+  );
+  assert.equal(
+    mapToolRejectCategory({
+      toolName: "append_to_current_file",
+      pendingGraphNodeId: "tool-4-append_to_current_file",
+      message: "missing required argument: content",
+    }),
+    "missing_argument",
+  );
+  assert.equal(
+    mapToolRejectCategory({
+      toolName: "web_fetch",
+      pendingGraphNodeId: "tool-2-web_fetch",
+      code: "rate_limit",
+    }),
+    "rate_limit_or_transient",
+  );
+});
+
+test("classification without a pending node is unchanged", () => {
+  // The specific arms were extracted into one shared predicate so the two
+  // paths cannot drift. This pins that the extraction moved no behaviour.
+  const cases: Array<[string, ToolRejectCategoryV1]> = [
+    ["missing required argument", "missing_argument"],
+    ["invalid argument: wrong type", "invalid_argument"],
+    ["extra argument supplied", "extra_argument"],
+    ["approval expired", "unauthorized"],
+    ["ambiguous target note", "ambiguous_target"],
+    ["plan_dependency not satisfied", "invalid_state"],
+    ["blocked by safety policy", "policy_rejection"],
+    ["econnreset while calling provider", "rate_limit_or_transient"],
+    ["something nobody has a bucket for", "other"],
+  ];
+  for (const [message, expected] of cases) {
+    assert.equal(
+      mapToolRejectCategory({ toolName: "any_tool", message }),
+      expected,
+      message,
+    );
+  }
+});
+
+test("an authority deferral stops claiming the tool is unavailable", () => {
+  // The prose and the category printed one clause apart used to contradict
+  // each other: "Tool is not available for this prompt: X category=invalid_state".
+  // "not available for this prompt" is also the exact substring the shared
+  // refusal vocabulary buckets as "the model named a tool it was never
+  // offered", so the false sentence also mis-bucketed the census.
+  const message = buildOffFrontierToolRejectionMessage({
+    toolName: "append_to_current_file",
+    readyFrontierToolNames: ["web_search"],
+    reasonMessage:
+      "Tool append_to_current_file is not ready in the authoritative mission graph.",
+  });
+  assert.match(message, /category=invalid_state/u);
+  assert.doesNotMatch(message, /not available for this prompt/u);
+  assert.match(message, /the name is valid and the call was well-formed/u);
+  // A refusal whose own reason says the name is unknown keeps the old text.
+  assert.match(
+    buildOffFrontierToolRejectionMessage({
+      toolName: "git_commit",
+      readyFrontierToolNames: ["code_commit_verified"],
+      reasonMessage: "unknown tool git_commit",
+    }),
+    /Tool is not available for this prompt: git_commit/u,
+  );
 });
