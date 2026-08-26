@@ -5,6 +5,7 @@ import {
 } from "@agentic-researcher/core-api";
 import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
 import {
+  canonicalGitCommitShaV1,
   createProjectRunReportV1,
   createProjectStageEventV1,
   deriveProjectPhaseLimitationsV1,
@@ -21,7 +22,6 @@ import {
   parseProjectLineageV1,
 } from "../agent/projectLifecycle";
 import {
-  canonicalGitCommitShaV1,
   mergeProjectStageEventsPreferExactWorkUnitScopeV1,
   projectLinearBindingsFromProjectLineageV1,
   projectStageEventsFromProjectLineageV1,

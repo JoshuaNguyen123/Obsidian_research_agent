@@ -322,7 +322,15 @@ test("Results reads the verified commit SHA from the durable lineage, never from
     },
   );
   assert.equal(execution.receipt.readback.status, "verified");
-  assert.match(vault.files.get(path) ?? "", /## Verified code examples/u);
+  const markdown = vault.files.get(path) ?? "";
+  assert.match(markdown, /## Verified code examples/u);
+  // The delivered artifact must name the commit, not the checkpoint sequence.
+  assert.match(
+    markdown,
+    new RegExp(`- Verified commit: \`${examples.commitSha}\``, "u"),
+  );
+  assert.doesNotMatch(markdown, /- Verified commit: `1`/u);
+  assert.doesNotMatch(markdown, /bound to commit `1`/u);
 });
 
 test("Results still refuses when the only commit evidence is a checkpoint that names no Git object id", async () => {

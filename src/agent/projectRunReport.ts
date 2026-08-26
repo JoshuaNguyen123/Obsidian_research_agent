@@ -801,18 +801,15 @@ export function renderProjectRunReportMarkdownV1(
     }
   }
 
-  const commit = findLastEventMatching(
-    report.evidence,
-    (event) => event.evidenceKind === "commit_readback",
-  );
+  const commitSha = verifiedCommitShaFromReportEvidenceV1(report.evidence);
   const pullRequest = findLastEventMatching(
     report.evidence,
     (event) => event.evidenceKind === "github_draft_pr_readback",
   );
   lines.push("", "## Publication", "");
   lines.push(
-    commit
-      ? `- Verified commit: \`${commit.resource.revision ?? commit.resource.id}\``
+    commitSha
+      ? `- Verified commit: \`${commitSha}\``
       : "- Verified commit: unavailable",
   );
   lines.push(
@@ -1055,18 +1052,15 @@ function renderPhaseReflectionV1(
     }
     case "test": {
       const kinds = new Set(verified.map((event) => event.evidenceKind));
-      const commit = findLastEventMatching(
-        verified,
-        (event) => event.evidenceKind === "commit_readback",
-      );
+      const commitSha = verifiedCommitShaFromReportEvidenceV1(verified);
       return [
         `- ${kinds.has("targeted_validation") ? "Targeted validation passed" : "Targeted validation is not recorded"}; ${
           kinds.has("full_validation")
             ? "fresh full validation passed"
             : "fresh full validation is not recorded"
         }${
-          commit
-            ? `; the verified result is bound to commit \`${commit.resource.revision ?? commit.resource.id}\``
+          commitSha
+            ? `; the verified result is bound to commit \`${commitSha}\``
             : ""
         }.`,
       ];
@@ -1364,6 +1358,36 @@ function compareProjectEvents(
     left.occurredAt.localeCompare(right.occurredAt) ||
     left.eventId.localeCompare(right.eventId)
   );
+}
+
+/** Git object ids are 40-hex (SHA-1) or 64-hex (SHA-256 repositories). */
+const GIT_COMMIT_SHA_V1 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+
+/** A Git object id, or null for any value that is not one. */
+export function canonicalGitCommitShaV1(value: unknown): string | null {
+  const text = typeof value === "string" ? value.trim() : "";
+  return GIT_COMMIT_SHA_V1.test(text) ? text : null;
+}
+
+/**
+ * Name the commit the report may print. A commit_readback event projected from
+ * the code_commit_verified receipt addresses the durable repair checkpoint, so
+ * its revision is that checkpoint's sequence number; printing it would put
+ * "Verified commit: `1`" in the delivered artifact. Prefer the evidence that
+ * actually names a Git object id, and say nothing rather than say "1".
+ */
+export function verifiedCommitShaFromReportEvidenceV1(
+  events: readonly ProjectStageEventV1[],
+): string | null {
+  const commits = events.filter(
+    (event) => event.evidenceKind === "commit_readback",
+  );
+  for (let index = commits.length - 1; index >= 0; index -= 1) {
+    const resource = commits[index]!.resource;
+    const sha = canonicalGitCommitShaV1(resource.revision ?? resource.id);
+    if (sha) return sha;
+  }
+  return null;
 }
 
 function findLastEventMatching(

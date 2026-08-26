@@ -4,6 +4,7 @@ import {
   type ProjectLineageV1,
 } from "./projectLifecycle";
 import {
+  canonicalGitCommitShaV1,
   createProjectPriorPhaseAttestationV1,
   createProjectStageEventV1,
   projectPhaseCompletionSatisfiedV1,
@@ -286,14 +287,6 @@ function lineageProvesAcceptedResearchArtifactV1(
       commit.proof.stage === "accepted_research" &&
       commit.proof.artifactFingerprint === fingerprint,
   );
-}
-
-const GIT_COMMIT_SHA_V1 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
-
-/** A Git object id, or null for any value that is not one. */
-export function canonicalGitCommitShaV1(value: unknown): string | null {
-  const text = typeof value === "string" ? value.trim() : "";
-  return GIT_COMMIT_SHA_V1.test(text) ? text : null;
 }
 
 export interface VerifiedCommitEvidenceV1 {
