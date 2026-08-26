@@ -39,6 +39,7 @@ import {
   parseProjectIdeaAcceptedResearchSeedV1,
   type ProjectIdeaAcceptedResearchSeedV1,
 } from "../../../packages/core-api/src/projectIdeaBriefV1";
+import { normalizeAcceptanceCriterionIdV1 } from "./acceptanceCriterionIdV1";
 
 const MAX_SECTION_CHARS = 8_000;
 const MAX_LIST_ENTRIES = 50;
@@ -1143,19 +1144,20 @@ function parseAcceptedResearchCriteria(
     const label = `accepted research criterion ${index + 1}`;
     const record = expectPlainRecord(entry, label);
     assertExactKeys(record, ["id", "text"], [], label);
-    if (typeof record.id !== "string" || !/^AC-[1-9][0-9]?$/u.test(record.id)) {
+    const id = normalizeAcceptanceCriterionIdV1(record.id);
+    if (!id) {
       throw new DurableLinearContractError(
         `${label} id must match AC-1 through AC-99.`,
       );
     }
-    if (ids.has(record.id)) {
+    if (ids.has(id)) {
       throw new DurableLinearContractError(
-        `Accepted research criterion id ${record.id} is duplicated.`,
+        `Accepted research criterion id ${id} is duplicated.`,
       );
     }
-    ids.add(record.id);
+    ids.add(id);
     return {
-      id: record.id,
+      id,
       text: expectPackageText(record.text, `${label} text`, 500),
     };
   });

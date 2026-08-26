@@ -17,6 +17,10 @@ import type {
   ToolExecutionResult,
 } from "./types";
 import { ToolExecutionError } from "./types";
+import {
+  ACCEPTANCE_CRITERION_ID_DESCRIPTION_V1,
+  ACCEPTANCE_CRITERION_ID_PATTERN_V1,
+} from "../integrations/linear/acceptanceCriterionIdV1";
 
 export const CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME =
   "create_project_idea_brief" as const;
@@ -461,7 +465,19 @@ const PROJECT_IDEA_BRIEF_PARAMETERS: JsonSchemaObject = {
         type: "object",
         additionalProperties: false,
         required: ["id", "text"],
-        properties: { id: STRING, text: STRING },
+        // The id contract is PUBLISHED here, not merely enforced later. It was
+        // previously a bare string with no pattern and no description, while
+        // three validators rejected anything but `AC-<n>` -- so a real run
+        // burned a tool call discovering by failure a rule the schema could
+        // have stated. A contract the caller cannot see is not a contract.
+        properties: {
+          id: {
+            ...STRING,
+            pattern: ACCEPTANCE_CRITERION_ID_PATTERN_V1,
+            description: ACCEPTANCE_CRITERION_ID_DESCRIPTION_V1,
+          },
+          text: STRING,
+        },
       },
     },
     riskClass: { type: "string", enum: ["low", "medium", "high"] },

@@ -23,6 +23,7 @@ import {
   parseProjectIdeaAcceptedResearchSeedV1,
   type ProjectIdeaAcceptedResearchSeedV1,
 } from "../../../packages/core-api/src/projectIdeaBriefV1";
+import { normalizeAcceptanceCriterionIdV1 } from "./acceptanceCriterionIdV1";
 
 export const ACCEPTED_RESEARCH_ARTIFACT_SCHEMA_VERSION = 1 as const;
 
@@ -184,22 +185,27 @@ function parseAcceptanceCriteria(value: unknown): WorkItemAcceptanceCriterionV1[
   return value.map((raw, index) => {
     const record = expectPlainRecord(raw, `acceptance criterion ${index + 1}`);
     assertExactKeys(record, ["id", "text"], [], `acceptance criterion ${index + 1}`);
-    if (typeof record.id !== "string" || !/^AC-[1-9][0-9]?$/.test(record.id)) {
+    const id = normalizeAcceptanceCriterionIdV1(record.id);
+    if (!id) {
       throw new DurableLinearContractError(
         `Acceptance criterion ${index + 1} id must match AC-1 through AC-99.`,
       );
     }
-    if (ids.has(record.id)) {
-      throw new DurableLinearContractError(`Acceptance criterion id ${record.id} is duplicated.`);
+    // Duplicate detection runs over CANONICAL ids, so "AC-1" and "ac-01" now
+    // collide as the same criterion instead of both being accepted.
+    if (ids.has(id)) {
+      throw new DurableLinearContractError(`Acceptance criterion id ${id} is duplicated.`);
     }
-    ids.add(record.id);
+    ids.add(id);
     const text = expectString(record.text, `acceptance criterion ${index + 1} text`, 1, 500, {
       allowNewlines: true,
       secretFree: true,
     });
     assertNoRawAuthority(text, `acceptance criterion ${index + 1} text`);
     return {
-      id: record.id,
+      // Canonical form is what persists; a tolerated variant never reaches
+      // storage, a receipt, or a rendered issue body.
+      id,
       text,
     };
   });

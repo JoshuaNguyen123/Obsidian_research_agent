@@ -2,6 +2,7 @@ import {
   canonicalJsonStringify,
   fingerprintCanonicalJson,
 } from "../../agent/queue/fingerprint";
+import { normalizeAcceptanceCriterionIdV1 } from "./acceptanceCriterionIdV1";
 
 export const WORK_ITEM_SPEC_SCHEMA_VERSION = 1 as const;
 
@@ -181,12 +182,12 @@ function parseAcceptanceCriteria(value: unknown): WorkItemAcceptanceCriterionV1[
   return value.map((rawCriterion, index) => {
     const criterion = expectRecord(rawCriterion, `acceptance criterion ${index + 1}`);
     assertExactKeys(criterion, ["id", "text"], `acceptance criterion ${index + 1}`);
-    if (typeof criterion.id !== "string" || !/^AC-[1-9][0-9]?$/.test(criterion.id)) {
+    const id = normalizeAcceptanceCriterionIdV1(criterion.id);
+    if (!id) {
       throw new WorkItemContractError(
         `Acceptance criterion ${index + 1} id must match AC-1 through AC-99.`,
       );
     }
-    const id = criterion.id;
     if (ids.has(id)) {
       throw new WorkItemContractError(`Acceptance criterion id ${id} is duplicated.`);
     }
