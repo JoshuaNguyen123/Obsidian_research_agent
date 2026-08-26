@@ -32,10 +32,7 @@ import {
   hasExplicitNoHostDirectoryExportIntent,
   hasRepositoryCodeEditIntent,
 } from "./promptIntentClassifiers";
-import {
-  deriveRepeatedOperationTargetsV1,
-  repeatedOperationNodeObjectiveV1,
-} from "./repeatedOperationTargets";
+import { deriveRepeatedOperationNodesV1 } from "./repeatedOperationTargets";
 import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTool";
 import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
 import { extractExplicitJupyterNotebookPathsV1 } from "./jupyterReflectionIntent";
@@ -196,12 +193,18 @@ export async function buildHostMissionGraphPlanV1(
    * The three host-bound families keep their exact prior behavior — a
    * host-allocated no-overwrite vault path stays exactly one destination
    * because the HOST allocated exactly one. Everything else defers to the
-   * shared prompt-derived derivation, which returns nothing unless the
-   * request itself names two or more distinct destinations.
+   * shared prompt-derived derivation, which returns nothing unless the request
+   * itself either names two or more distinct destinations OR orders two or
+   * more separate writes to a single one.
+   *
+   * A same-target ordered write returns NO selector on purpose: the exact
+   * destination is still the note the host would have resolved anyway, and
+   * every such node must keep it or the exact-path guard would refuse the very
+   * calls these nodes exist to admit.
    */
   const resolveExactEffectfulDestinations = (
     name: string,
-  ): Array<{ selector: string; objective: string }> => {
+  ): Array<{ selector?: string; objective: string }> => {
     if (name === "create_file" && input.plannedVaultCreatePath) {
       return [
         {
@@ -222,13 +225,10 @@ export async function buildHostMissionGraphPlanV1(
         objective: `Hash-bound rewrite the exact workspace file ${path}.`,
       }));
     }
-    return deriveRepeatedOperationTargetsV1({
+    return deriveRepeatedOperationNodesV1({
       toolName: name,
       objective: input.objective,
-    }).map((target) => ({
-      selector: target,
-      objective: repeatedOperationNodeObjectiveV1(name, target),
-    }));
+    });
   };
   let explicitVaultReadFileIndex = 0;
   let explicitWorkspaceReadFileIndex = 0;
