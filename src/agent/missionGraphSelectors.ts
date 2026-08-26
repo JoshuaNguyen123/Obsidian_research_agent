@@ -171,6 +171,97 @@ export function readyMissionGraphFrontierToolNamesV1(
   ];
 }
 
+/**
+ * THE one answer to "which tool names may a host MESSAGE name, given that the
+ * mission-graph authority will judge whatever the model calls next?".
+ *
+ * Every message that tells a model what to call — an off-frontier refusal, an
+ * authority rejection, a repeated-invalid-call corrective, the routing card's
+ * `preferredNext` — must build its list from here and from nothing else.
+ *
+ * Why this exists (instance #17 of "two subsystems disagree", live compound
+ * run on main @3860ee6):
+ *
+ *   step 21  the step-menu gate refused `append_file` and advertised
+ *            "Ready frontier tool(s) now: read_current_file,
+ *             list_markdown_files, read_file, read_template, web_search,
+ *             web_fetch. Preferred next: read_current_file. Call that exact
+ *             name."
+ *   step 22  the model called `read_current_file` — the exact name it was
+ *            ordered to call — and the mission-graph authority refused it with
+ *            `mission_graph_authority_blocked` and
+ *            "Ready frontier tool(s) now: none."
+ *
+ * The refusal had printed `stepAllowedToolNames`, which is the OFFERED menu:
+ * `constrainToolsToMissionGraphFrontier` unions every read-effect grant in
+ * `graph.capabilityEnvelope.tools` into it whenever `includeCapabilityReads`
+ * is set (AgentRunner passes `setLooseCompoundEnabled || dynamicRead...`),
+ * while the authority that admits the call passes only
+ * `allowDynamicReadContinuation: dynamicReadContinuationAllowed()`. On a
+ * set-loose run over an exact planned frontier those two disagree by exactly
+ * the capability-read set, so the host advertised a six-item menu on which
+ * nothing was callable and then blamed the model for calling from it.
+ *
+ * Fail closed: when the graph admits nothing, this returns `[]` and the
+ * message seats must say so rather than name a tool. Under-reporting a name
+ * the authority would in fact have admitted is safe — the model is told less;
+ * over-reporting is the defect, because everything the model is told must be
+ * true.
+ *
+ * `candidateToolNames` (optional) is the seat's own menu. When supplied the
+ * result is the intersection in MENU order, so a seat never names a tool the
+ * model has no schema for; when omitted the result is the bare authority list.
+ */
+export function authoritativeRefusalFrontierToolNamesV1(input: {
+  graph: MissionGraphV3 | null | undefined;
+  candidateToolNames?: readonly string[] | null;
+  excludeToolNames?: readonly string[] | null;
+  /**
+   * Exactly AgentRunner's `dynamicReadContinuationAllowed()`, i.e. the
+   * `allowDynamicReadContinuation` the runner hands `beginToolExecution`.
+   * When it is true the authority materializes a bounded dynamic read node
+   * for any read-effect grant, so those names really are callable and omitting
+   * them would starve the message. When it is false — an exact planned
+   * frontier — `beginToolExecution` refuses them with "not ready in the exact
+   * authoritative mission graph", which is precisely the step-22 refusal
+   * above. Default false: a seat that does not know fails closed.
+   */
+  allowDynamicReadContinuation?: boolean;
+}): string[] {
+  const clean = (names: readonly string[] | null | undefined): string[] => [
+    ...new Set((names ?? []).map((name) => name.trim()).filter(Boolean)),
+  ];
+  const excluded = new Set(clean(input.excludeToolNames));
+  const candidates =
+    input.candidateToolNames == null ? null : clean(input.candidateToolNames);
+  const graph = input.graph;
+  if (!graph) {
+    // No graph means no MissionGraphSession, so `beginMissionGraphTool` returns
+    // null and refuses nothing. There is no second authority to contradict, and
+    // the seat's own menu IS the truth.
+    return (candidates ?? []).filter((name) => !excluded.has(name));
+  }
+  const admitsDynamicRead = (name: string): boolean =>
+    input.allowDynamicReadContinuation === true &&
+    graph.capabilityEnvelope.tools[name]?.effect === "read";
+  const readySet = new Set(readyMissionGraphFrontierToolNamesV1(graph));
+  const admits = (name: string): boolean =>
+    !excluded.has(name) && (readySet.has(name) || admitsDynamicRead(name));
+  if (candidates === null) {
+    return [
+      ...new Set([
+        ...readySet,
+        ...(input.allowDynamicReadContinuation === true
+          ? Object.entries(graph.capabilityEnvelope.tools)
+              .filter(([, grant]) => grant.effect === "read")
+              .map(([name]) => name)
+          : []),
+      ]),
+    ].filter((name) => !excluded.has(name));
+  }
+  return candidates.filter(admits);
+}
+
 export function findExactGraphBoundToolCallIndex(
   toolCalls: readonly ModelToolCall[],
   startIndex: number,

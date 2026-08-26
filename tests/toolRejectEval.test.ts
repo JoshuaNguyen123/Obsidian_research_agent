@@ -576,7 +576,7 @@ test("the runner's step-menu gate consumes the shared predicate, not a private c
     "if (!stepAllowedToolNames.has(toolCall.name)) {",
   );
   assert.ok(gateAt > 0, "step-menu gate not found");
-  const window = runnerSource.slice(gateAt, gateAt + 6600);
+  const window = runnerSource.slice(gateAt, gateAt + 9000);
   assert.match(window, /classifyOffFrontierRefusalV1\(\{/u);
   assert.match(window, /isHostNarrowedOffFrontierRefusalV1\(/u);
   assert.match(window, /FRONTIER_NARROWED_REFUSAL_CODE_V1/u);
@@ -948,5 +948,175 @@ test("an authority deferral stops claiming the tool is unavailable", () => {
       reasonMessage: "unknown tool git_commit",
     }),
     /Tool is not available for this prompt: git_commit/u,
+  );
+});
+
+// --- Instance #17: the refusal must not name what the authority will refuse --
+// Live compound run on main @3860ee6, verbatim:
+//
+//   step 21  model calls `append_file`; the host refuses AND instructs:
+//            "Tool is not available for this prompt: append_file
+//             category=unknown_tool
+//             Ready frontier tool(s) now: read_current_file,
+//             list_markdown_files, read_file, read_template, web_search,
+//             web_fetch. Preferred next: read_current_file. Call that exact
+//             name."
+//   step 22  model obeys EXACTLY and calls `read_current_file`:
+//            "code: mission_graph_authority_blocked ... Ready frontier tool(s)
+//             now: none. No tool is ready to call; return your best final
+//             answer instead."
+//
+// The step-21 list is `stepAllowedToolNames` — the OFFERED menu, into which
+// `constrainToolsToMissionGraphFrontier` unions every read-effect capability
+// grant. The authority that judged step 22 reads the graph's ready nodes and
+// had none. Two definitions of "ready frontier", one turn apart.
+
+test("an empty authoritative frontier never yields a call directive", () => {
+  // The discriminating case. On the unfixed tree `preferredNextTool` was
+  // printed verbatim whatever the frontier said, so an empty frontier still
+  // produced "Preferred next: read_current_file. Call that exact name." — the
+  // step-21 sentence, with the step-22 frontier.
+  const message = buildOffFrontierToolRejectionMessage({
+    toolName: "append_file",
+    readyFrontierToolNames: [],
+    preferredNextTool: "read_current_file",
+  });
+  assert.match(message, /Ready frontier tool\(s\) now: none\./u);
+  assert.match(
+    message,
+    /No tool is ready to call; return your best final answer instead\./u,
+  );
+  assert.doesNotMatch(message, /Call that exact name/u);
+  assert.doesNotMatch(message, /Preferred next:/u);
+  // Not one tool name may appear anywhere in the message, near-miss coaching
+  // included: a message that names a tool the authority will refuse is the
+  // defect, whether it commands the call or merely suggests it.
+  for (const name of [
+    "read_current_file",
+    "list_markdown_files",
+    "read_file",
+    "read_template",
+    "web_search",
+    "web_fetch",
+    "append_to_current_file",
+  ]) {
+    assert.doesNotMatch(
+      message,
+      new RegExp(name, "u"),
+      `${name} must not be named when nothing is ready`,
+    );
+  }
+  // Near-miss coaching has an unconditional hedged arm ("use X when listed on
+  // the frontier") that fires even for an empty frontier. Hedged or not, it
+  // names a tool, and on an empty authoritative frontier there is none to name.
+  const coached = buildOffFrontierToolRejectionMessage({
+    toolName: "git_commit",
+    readyFrontierToolNames: [],
+  });
+  assert.doesNotMatch(coached, /Near-miss/u);
+  assert.doesNotMatch(coached, /code_commit_verified/u);
+  assert.match(
+    coached,
+    /No tool is ready to call; return your best final answer instead\./u,
+  );
+});
+
+test("a preferred tool the frontier does not list is never commanded", () => {
+  // Same invariant one notch weaker: the frontier is non-empty, but the
+  // caller's preferred hint came from a different (wider) authority. The
+  // message may only command a name it has just listed as ready.
+  const message = buildOffFrontierToolRejectionMessage({
+    toolName: "append_file",
+    readyFrontierToolNames: ["code_commit_verified"],
+    preferredNextTool: "read_current_file",
+  });
+  assert.doesNotMatch(message, /Preferred next: read_current_file/u);
+  assert.match(message, /Preferred next: code_commit_verified\./u);
+  assert.match(message, /Call that exact name/u);
+});
+
+test("the repeated-invalid corrective stays silent when nothing is admissible", () => {
+  // The other directive seat. "Either change the arguments, or call one of
+  // these exact names instead: ..." is the same order in different words.
+  const corrective = buildRepeatedInvalidToolCallCorrectiveV1({
+    toolName: "code_workspace_create_file",
+    failureCode: "invalid_arguments",
+    readyFrontierToolNames: [],
+  });
+  assert.match(corrective, /No other tool is ready/u);
+  assert.doesNotMatch(corrective, /call one of these exact names/u);
+});
+
+test("the step-menu refusal seat reads the authority, not the offered menu", () => {
+  // Source-level guard, same convention as the predicate guard above: the
+  // behavioural assertions cannot see which list the runner hands the builder,
+  // and handing it `stepAllowedToolNames` is exactly the bug. `liveReadyTool-
+  // Names` must KEEP reading the offered menu — that argument answers "did the
+  // host's own menu change?", a different question from "what will authority
+  // admit?", and pointing it at the graph would silently reclassify every
+  // capability-read refusal as menu decay.
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const gateAt = runnerSource.indexOf(
+    "if (!stepAllowedToolNames.has(toolCall.name)) {",
+  );
+  assert.ok(gateAt > 0, "step-menu gate not found");
+  const window = runnerSource.slice(gateAt, gateAt + 9000);
+  assert.match(window, /authoritativeRefusalFrontierToolNamesV1\(\{/u);
+  assert.match(window, /readyFrontierToolNames: authoritativeRejectFrontier/u);
+  assert.match(window, /readyFrontier: authoritativeRejectFrontier/u);
+  assert.match(window, /liveReadyToolNames: \[\.\.\.stepAllowedToolNames\]/u);
+  // The refused name itself must never be advertised back at the model.
+  assert.match(window, /excludeToolNames: \[toolCall\.name\]/u);
+  // The offered menu must not reach any of the three message-facing fields.
+  assert.doesNotMatch(
+    window,
+    /readyFrontierToolNames: \[\.\.\.stepAllowedToolNames\]/u,
+    "the refusal message must not advertise the offered menu",
+  );
+  assert.doesNotMatch(
+    window,
+    /readyFrontier: \[\.\.\.stepAllowedToolNames\]/u,
+    "the eval record must not report the offered menu as the frontier",
+  );
+});
+
+test("every message seat that names a tool consumes the one shared predicate", () => {
+  // Four seats can put a tool name in front of the model as something to call
+  // next. All four must read the same authority; a fifth copy is how this
+  // repo's recurring failure reproduces.
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const consumers = runnerSource.match(
+    /authoritativeRefusalFrontierToolNamesV1\(\{/gu,
+  );
+  assert.ok(
+    consumers && consumers.length >= 6,
+    `expected every naming seat to consume the shared predicate, saw ${
+      consumers?.length ?? 0
+    }`,
+  );
+  // No seat may hand the model a menu straight from the offered catalog or the
+  // step menu. These are the exact shapes that shipped the contradiction.
+  assert.doesNotMatch(
+    runnerSource,
+    /Choose one exact name from: \$\{tools\.map\(/u,
+    "the schema correction must not offer the whole catalog as callable",
+  );
+  // pickPreferredNextTool is pure ordering over whatever list it is handed, so
+  // the routing card's `preferredNext` is only as honest as its input.
+  const cardAt = runnerSource.indexOf("const preferredNext = pickPreferredNextTool({");
+  assert.ok(cardAt > 0, "routing-card preferredNext not found");
+  const cardWindow = runnerSource.slice(cardAt, cardAt + 700);
+  assert.match(cardWindow, /authoritativeRefusalFrontierToolNamesV1\(\{/u);
+  // The offered list itself stays the true offered menu -- narrowing what the
+  // model MAY call is a different change with a different blast radius.
+  assert.match(
+    runnerSource.slice(cardAt, cardAt + 1400),
+    /offeredToolLines: buildOfferedToolLines\(\{\s*readyFrontierToolNames: readyToolNames,/u,
   );
 });

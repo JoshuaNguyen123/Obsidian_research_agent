@@ -10,6 +10,7 @@ import {
 } from "../src/agent/missionGraphFrontier";
 import { missionGraphOnlyFinalSynthesisRemainsV1 } from "../src/agent/missionGraphSelectors";
 import {
+  authoritativeRefusalFrontierToolNamesV1,
   countReadyMissionGraphToolSlots,
   readyMissionGraphFrontierToolNamesV1,
 } from "../src/agent/missionGraphSelectors";
@@ -665,5 +666,173 @@ test("the final-only stub-owes predicate answers the crash shape and its proven 
       capabilityEnvelope: { tools: {} },
     } as any),
     false,
+  );
+});
+
+// --- Instance #17: one authority for every message that names a tool -------
+
+test("the end-of-mission capability-read menu is not an authoritative frontier", () => {
+  // Reproduces the exact live shape (main @3860ee6). `write_project_results`
+  // had already paid at step 20; every node is terminal and the graph's ready
+  // frontier is empty. The OFFERED menu is still six names, because
+  // `includeCapabilityReads` unions every read-effect capability grant into it
+  // (AgentRunner passes `setLooseCompoundEnabled || dynamicRead...`) while the
+  // authority is handed only `allowDynamicReadContinuation:
+  // dynamicReadContinuationAllowed()`. Those two booleans disagree by exactly
+  // this set, which is why step 21's refusal advertised it and step 22 refused
+  // the first name on it.
+  const offered = [
+    "read_current_file",
+    "list_markdown_files",
+    "read_file",
+    "read_template",
+    "web_search",
+    "web_fetch",
+  ];
+  const graph = {
+    nodes: {
+      "tool-20-write_project_results": {
+        id: "tool-20-write_project_results",
+        status: "complete",
+        allowedTools: ["write_project_results"],
+        inputs: {},
+        outputs: {},
+      },
+      // Queued, not complete: the mission had not emitted its final answer
+      // yet, which is why the run was still calling tools at step 21 — and why
+      // `shouldSuppressOptionalMissionGraphFrontier` does NOT fire and the
+      // capability reads reach the offered menu.
+      final: {
+        id: "final",
+        status: "queued",
+        allowedTools: [],
+        inputs: {},
+        outputs: {},
+      },
+    },
+    capabilityEnvelope: {
+      tools: Object.fromEntries(
+        offered.map((name) => [name, { effect: "read" }]),
+      ),
+    },
+  } as any;
+
+  assert.deepEqual(
+    readyMissionGraphFrontierToolNamesV1(graph),
+    [],
+    "the authoritative frontier really is empty here",
+  );
+  // The menu the refusal used to print.
+  const offeredUnderCapabilityReads = constrainToolsToMissionGraphFrontier(
+    offered.map(tool),
+    graph,
+    { includeCapabilityReads: true },
+  ).map((definition) => definition.function.name);
+  assert.deepEqual(
+    offeredUnderCapabilityReads,
+    offered,
+    "the offered menu is the six capability reads, exactly as observed live",
+  );
+  // The list any message is allowed to name, under the same flag the authority
+  // was given. Empty: nothing here is callable.
+  assert.deepEqual(
+    authoritativeRefusalFrontierToolNamesV1({
+      graph,
+      candidateToolNames: offeredUnderCapabilityReads,
+      allowDynamicReadContinuation: false,
+    }),
+    [],
+  );
+  // Flip only the authority's own flag and the same names become callable,
+  // because `beginToolExecution` will materialize a bounded dynamic read node.
+  // The predicate tracks the authority in both directions; it is not a blanket
+  // "reads are never allowed" rule.
+  assert.deepEqual(
+    authoritativeRefusalFrontierToolNamesV1({
+      graph,
+      candidateToolNames: offeredUnderCapabilityReads,
+      allowDynamicReadContinuation: true,
+    }),
+    offered,
+  );
+});
+
+test("the shared predicate never widens past the authority", () => {
+  const graph = {
+    nodes: {
+      a: {
+        id: "a",
+        status: "ready",
+        allowedTools: ["code_validate_fast"],
+        inputs: {},
+        outputs: {},
+      },
+      b: {
+        id: "b",
+        status: "queued",
+        allowedTools: ["code_commit_verified"],
+        inputs: {},
+        outputs: {},
+      },
+      c: {
+        id: "c",
+        status: "complete",
+        allowedTools: ["code_workspace_create"],
+        inputs: {},
+        outputs: {},
+      },
+    },
+    capabilityEnvelope: { tools: { read_file: { effect: "read" } } },
+  } as any;
+  const menu = [
+    "code_validate_fast",
+    "code_commit_verified",
+    "code_workspace_create",
+    "read_file",
+  ];
+  // Queued and complete nodes are not ready; a read grant is admitted only
+  // under the authority's own continuation flag.
+  assert.deepEqual(
+    authoritativeRefusalFrontierToolNamesV1({
+      graph,
+      candidateToolNames: menu,
+    }),
+    ["code_validate_fast"],
+  );
+  assert.deepEqual(
+    authoritativeRefusalFrontierToolNamesV1({
+      graph,
+      candidateToolNames: menu,
+      allowDynamicReadContinuation: true,
+    }),
+    ["code_validate_fast", "read_file"],
+  );
+  // The refused name is never advertised back at the model that just tried it.
+  assert.deepEqual(
+    authoritativeRefusalFrontierToolNamesV1({
+      graph,
+      candidateToolNames: menu,
+      excludeToolNames: ["code_validate_fast"],
+    }),
+    [],
+  );
+  // A candidate the model has no schema for is never named, even when the
+  // graph would admit it: the intersection runs both ways.
+  assert.deepEqual(
+    authoritativeRefusalFrontierToolNamesV1({
+      graph,
+      candidateToolNames: ["read_file"],
+    }),
+    [],
+  );
+  // No graph means no MissionGraphSession and therefore no authority to
+  // contradict; the seat's own menu is the truth.
+  assert.deepEqual(
+    authoritativeRefusalFrontierToolNamesV1({
+      graph: null,
+      candidateToolNames: menu,
+      excludeToolNames: ["read_file"],
+    }),
+    ["code_validate_fast", "code_commit_verified", "code_workspace_create"],
   );
 });
