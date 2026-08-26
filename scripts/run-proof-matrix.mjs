@@ -659,6 +659,53 @@ export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS = "environment_not_configu
 export const HARNESS_CLEANUP_FAILURE_CLASS = "harness:cleanup_failed";
 
 /**
+ * The model provider refused to serve the run — quota, monthly cap, or rate
+ * limit — so the product was never exercised.
+ *
+ * `harness:` prefixed so the ONE shared predicate (isInfrastructureFailureClass)
+ * exempts it from attempt budget and the consecutive-green streak, and so it
+ * writes no run-metrics CSV row. Burning a 5-attempt budget against an
+ * exhausted account teaches nothing, and recording it as a product red is a
+ * lie about a run the product never got to attempt.
+ *
+ * It stays LOUD: an operator whose quota is spent must be told plainly, and
+ * the consecutive-harness-failure valve still aborts rather than looping.
+ */
+export const PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS = "harness:provider_quota_exhausted";
+
+/**
+ * Provider refusals, keyed on the stable operator-facing sentences the model
+ * clients already distinguish (`rate_limit` / `provider_budget_exhausted` in
+ * src/model/OllamaClient.ts and src/model/OpenAICompatibleClient.ts, both from
+ * HTTP 429).
+ *
+ * Deliberately NOT keyed on a bare "limit", "quota", or "429": a product
+ * assertion can easily contain any of those in an expected/received diff. Each
+ * pattern below is a whole provider sentence.
+ */
+const PROVIDER_QUOTA_PATTERNS = Object.freeze([
+  /Cloud model rate limit reached[^\r\n]*/u,
+  /extra usage auto reload monthly max reached[^\r\n]*/u,
+  /\brate limit reached\b[^\r\n]*/u,
+  /\bprovider_budget_exhausted\b[^\r\n]*/u,
+]);
+
+/**
+ * The provider sentence that refused this run, or null when the log carries
+ * none.
+ */
+export function detectProviderQuotaExhaustion(logText) {
+  const text = typeof logText === "string" ? logText : "";
+  for (const pattern of PROVIDER_QUOTA_PATTERNS) {
+    const match = pattern.exec(text);
+    if (match) {
+      return { detail: match[0].trim(), index: match.index };
+    }
+  }
+  return null;
+}
+
+/**
  * The lane's own contract sentence, composed in exactly one place
  * (e2e/fixtures/externalCleanup.ts composeMandatoryCleanupError). Detection
  * keys on the "assertions passed" half, which the composer emits ONLY when the
@@ -838,6 +885,36 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
         (cls) => cls !== LANE_ASSERTION_FAILURE_CLASS,
       ),
       cleanupFailure: { lane: cleanupFailure.lane, detail: cleanupFailure.detail },
+    };
+  }
+  // Settled THIRD, for the same reason as the two above: the model provider
+  // refused to serve the run at all, so nothing downstream is product
+  // evidence. On 2026-08-26 five of six compound attempts died on
+  // "Cloud model rate limit reached ... extra usage auto reload monthly max
+  // reached" — including one that had already reached five lifecycle stages in
+  // 1044s before the quota cut it off mid-mission. Every one was filed as
+  // `lane_assertion_failed`, and the cell recorded 0/3 greens as though the
+  // product had regressed. It had not: the account's monthly cap was spent.
+  //
+  // This is the third direction of the same lie. `environment_not_configured`
+  // covers "the cell never ran"; `harness:cleanup_failed` covers "the product
+  // passed and the harness leaked"; this covers "an external provider refused
+  // to serve us". None of the three is product evidence, and only the product
+  // belongs in a pass-rate denominator.
+  const providerQuota = detectProviderQuotaExhaustion(text);
+  if (providerQuota) {
+    return {
+      failureClass: PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS,
+      detail:
+        `Model provider refused the run: ${providerQuota.detail}\n` +
+        attemptLogExcerptFrom(text, providerQuota.index),
+      confidence: CLASSIFICATION_CONFIRMED,
+      // Same reasoning as the cleanup class: Playwright prints a numbered
+      // failing-test header for any thrown error, so the lane-assertion
+      // signature co-matches and must not ride along.
+      secondaryClasses: secondaryFor(PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS).filter(
+        (cls) => cls !== LANE_ASSERTION_FAILURE_CLASS,
+      ),
     };
   }
   if (summaryFresh) {
@@ -1529,7 +1606,17 @@ async function main() {
       // a row would read as a product red, which is the exact
       // misattribution this class exists to end. The manifest attempt record
       // below keeps the event durable and greppable.
-      if (failureClass !== HARNESS_CLEANUP_FAILURE_CLASS) appendRunCsvRow([
+      //
+      // Generalized to the ONE shared predicate rather than naming each class:
+      // the reasoning is identical for every infrastructure outcome, and a
+      // per-class list is how the third one (provider quota) got missed. A
+      // measurement of 102 recorded rows found 23 that were `harness:*`,
+      // `process:*` or `environment_not_configured` and every one of them was
+      // counted as a product red — 41/102 = 40.2% reported, 41/79 = 51.9%
+      // once infrastructure is excluded. Green runs always write their row;
+      // only non-product failures are withheld, so this can never inflate a
+      // pass rate by hiding a product red.
+      if (green || !isInfrastructureFailureClass(failureClass)) appendRunCsvRow([
         new Date(startedAt).toISOString(),
         cell.project,
         PROOF_MATRIX_MODEL,

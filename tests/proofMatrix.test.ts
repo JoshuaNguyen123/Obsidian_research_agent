@@ -17,6 +17,7 @@ import {
   CELL_STATUS_NOT_RUN,
   ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
   HARNESS_CLEANUP_FAILURE_CLASS,
+  PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS,
   detectLaneCleanupFailure,
   IN_FLIGHT_FAILURE_CLASS,
   LANE_ASSERTION_FAILURE_CLASS,
@@ -1130,10 +1131,16 @@ test("a harness cleanup failure writes no run-metrics row but keeps its attempt 
     path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "run-proof-matrix.mjs"),
     "utf8",
   );
+  // Generalized from `failureClass !== HARNESS_CLEANUP_FAILURE_CLASS` to the
+  // ONE shared predicate. The intent is unchanged and strictly widened: the
+  // reasoning is identical for EVERY infrastructure outcome, and a per-class
+  // list is exactly how the third such class (provider quota exhaustion) was
+  // missed. `green ||` keeps a passing run's row unconditional, so this can
+  // never inflate a pass rate by withholding a product red.
   assert.match(
     source,
-    /if \(failureClass !== HARNESS_CLEANUP_FAILURE_CLASS\) appendRunCsvRow\(\[/u,
-    "the run-metrics row must be skipped for a harness cleanup failure",
+    /if \(green \|\| !isInfrastructureFailureClass\(failureClass\)\) appendRunCsvRow\(\[/u,
+    "the run-metrics row must be skipped for every infrastructure failure",
   );
   const csvRow = source.indexOf("appendRunCsvRow([");
   const attemptPush = source.indexOf("manifest.attempts.push({");
@@ -1294,4 +1301,75 @@ test("a call that started and never finished is never scored as a success", () =
   });
   assert.equal(legacy.undetermined, null);
   assert.equal(legacy.succeeded, 7);
+});
+
+test("an exhausted provider quota is not a product failure", () => {
+  // 2026-08-26: five of six compound attempts died on the provider's monthly
+  // cap -- including one that had already reached five lifecycle stages in
+  // 1044s before the quota cut it off. All five were filed as
+  // `lane_assertion_failed` and the cell recorded 0/3 greens as though the
+  // product had regressed. It had not; the account's cap was spent.
+  const log = [
+    "  1) [compound-flow-real-live] > FLOW-REAL-01 COMPOUND-REAL",
+    '    Error: {"status":"error","message":"Connection failed: What: Cloud model rate limit reached.',
+    "    Why: extra usage auto reload monthly max reached, increase your monthly max",
+    "    expect(received).toMatchObject(expected)",
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false, logText: log });
+  assert.equal(outcome.failureClass, PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS);
+  // The lane-assertion signature genuinely co-matches (Playwright prints a
+  // numbered failing-test header for any throw). It must not ride along as a
+  // secondary, or the same lie reappears in another column.
+  assert.ok(!outcome.secondaryClasses.includes("lane_assertion_failed"));
+  // Budget-exempt and streak-neutral through the ONE shared predicate.
+  assert.ok(isInfrastructureFailureClass(outcome.failureClass));
+  assert.equal(
+    attemptConsumesBudget({ green: false, failureClass: outcome.failureClass }),
+    false,
+  );
+});
+
+test("a product assertion mentioning a limit is still a product failure", () => {
+  // The anti-false-positive half: detection keys on whole provider sentences,
+  // never on a bare "limit", "quota" or "429", any of which a real
+  // expected/received diff can contain.
+  for (const text of [
+    '  1) lane > test\n    Error: expect(received).toEqual(expected)\n    Received: "budget limit reached for the mission"',
+    '  1) lane > test\n    AssertionError: rate limiting policy note was not written to the vault',
+    '  1) lane > test\n    Error: expected 429 to equal 200',
+  ]) {
+    const outcome = classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false, logText: text });
+    assert.notEqual(
+      outcome.failureClass,
+      PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS,
+      `must not classify as provider quota: ${text.slice(0, 60)}`,
+    );
+  }
+});
+
+test("no infrastructure outcome writes a pass-rate row, by one shared predicate", async () => {
+  // A per-class list is how the third infrastructure class got missed, so the
+  // CSV gate consumes isInfrastructureFailureClass rather than naming classes.
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(
+    new URL("../scripts/run-proof-matrix.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /if \(green \|\| !isInfrastructureFailureClass\(failureClass\)\) appendRunCsvRow\(/u,
+    "the CSV row gate must consume the shared infrastructure predicate",
+  );
+  // A green run always records, so this can never inflate a pass rate.
+  for (const cls of [
+    "harness:cleanup_failed",
+    "harness:provider_quota_exhausted",
+    "harness:preflight_refused",
+    "process:host_death",
+    "environment_not_configured",
+  ]) {
+    assert.ok(isInfrastructureFailureClass(cls), `${cls} must be infrastructure`);
+  }
+  assert.ok(!isInfrastructureFailureClass("lane_assertion_failed"));
+  assert.ok(!isInfrastructureFailureClass("product_assertion"));
 });
