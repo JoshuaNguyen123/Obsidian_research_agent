@@ -24,6 +24,13 @@ export interface AutonomyRunStatsV1 {
   };
   toolsOffered: { avg: number; max: number; samples: number; sum: number };
   stageRestartCount: number;
+  /**
+   * Reactive prose-steering escalations injected by the step loop after
+   * consecutive prose-only responses left required frontier work unpaid.
+   * Counts only the bounded pre-breaker escalation seat, not the first-strike
+   * frontier correction. Census contract field name — do not rename.
+   */
+  prose_steering_injections?: number;
   softOnly: boolean;
   elapsedMs?: number;
   team?: AutonomyRunStatsTeamV1;
@@ -36,6 +43,7 @@ export function createAutonomyRunStats(): AutonomyRunStatsV1 {
     approvalCountByEffectClass: { soft: 0, bound: 0, hard: 0 },
     toolsOffered: { avg: 0, max: 0, samples: 0, sum: 0 },
     stageRestartCount: 0,
+    prose_steering_injections: 0,
     softOnly: true,
     team: {
       researcherSteps: 0,
@@ -76,6 +84,10 @@ export function recordContinue(stats: AutonomyRunStatsV1): void {
 
 export function recordStageRestart(stats: AutonomyRunStatsV1): void {
   stats.stageRestartCount += 1;
+}
+
+export function recordProseSteeringInjection(stats: AutonomyRunStatsV1): void {
+  stats.prose_steering_injections = (stats.prose_steering_injections ?? 0) + 1;
 }
 
 export function recordResearcherStep(stats: AutonomyRunStatsV1): void {

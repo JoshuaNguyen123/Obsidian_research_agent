@@ -7,6 +7,7 @@ import {
   recordContinue,
   recordHandoffAccepted,
   recordLeadStep,
+  recordProseSteeringInjection,
   recordResearcherStep,
   recordToolsOffered,
   recordUsableSources,
@@ -32,4 +33,23 @@ test("autonomy run stats aggregate tools approvals continues and team", () => {
   assert.equal(final.elapsedMs, 1500);
   assert.equal(final.team?.usableSourceCount, 2);
   assert.equal(final.team?.handoffAccepted, true);
+});
+
+test("prose steering injections start at zero and count per record", () => {
+  const stats = createAutonomyRunStats();
+  assert.equal(stats.prose_steering_injections, 0);
+  recordProseSteeringInjection(stats);
+  recordProseSteeringInjection(stats);
+  const final = finalizeAutonomyRunStats(stats);
+  // Census contract field name (prose_steering_injections) — do not rename.
+  assert.equal(final.prose_steering_injections, 2);
+});
+
+test("prose steering recorder tolerates stats restored without the field", () => {
+  const restored = {
+    ...createAutonomyRunStats(),
+    prose_steering_injections: undefined,
+  };
+  recordProseSteeringInjection(restored);
+  assert.equal(restored.prose_steering_injections, 1);
 });

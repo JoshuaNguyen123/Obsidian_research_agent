@@ -1473,7 +1473,7 @@ test("exact pipeline-difficulty question stays one-call direct chat", async () =
   );
 });
 
-test("unchanged executable frontier blocks after two no-tool model responses", async () => {
+test("unchanged executable frontier steers twice after the first correction then blocks", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const deltas: string[] = [];
@@ -1484,6 +1484,8 @@ test("unchanged executable frontier blocks after two no-tool model responses", a
     chatResponders: [
       () => responseWithContent("I should search, but I did not call the tool."),
       () => responseWithContent("I still did not call the required tool."),
+      () => responseWithContent("More planning prose without any call."),
+      () => responseWithContent("Final prose, still no call."),
     ],
   });
 
@@ -1502,7 +1504,9 @@ test("unchanged executable frontier blocks after two no-tool model responses", a
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  // Strike 1: first-strike correction. Strikes 2-3: bounded prose-steering
+  // escalations (the small-model variance absorber). Strike 4: breaker.
+  assert.equal(chatRequests.length, 4);
   assert.equal(chatRequests[1]?.toolChoice, "required");
   assert.equal(chatRequests[1]?.think, false);
   assert.match(
@@ -1511,16 +1515,96 @@ test("unchanged executable frontier blocks after two no-tool model responses", a
       .join("\n") ?? "",
     /prior response contained prose but no tool call[\s\S]*Call the single most relevant tool now[\s\S]*Return the tool call only/iu,
   );
+  const thirdRequestText =
+    chatRequests[2]?.messages
+      .map((message) => String(message.content ?? ""))
+      .join("\n") ?? "";
+  assert.match(
+    thirdRequestText,
+    /Prose without a tool call cannot advance this mission[\s\S]*required tool work is still owed/iu,
+  );
+  assert.match(
+    thirdRequestText,
+    /ready frontier tool\(s\):.*web_search/iu,
+    "the steering escalation must name the exact frontier tool(s)",
+  );
+  assert.match(
+    thirdRequestText,
+    /or state in one sentence why you cannot/iu,
+  );
+  assert.equal(chatRequests[2]?.toolChoice, "required");
+  assert.equal(chatRequests[3]?.toolChoice, "required");
+  // The stale-correction pruner must keep exactly one correction in history,
+  // so the steering seat cannot bloat requests (30k compactness contract).
+  const finalRequestCorrections = (chatRequests[3]?.messages ?? []).filter(
+    (message) =>
+      message.role === "system" &&
+      String(message.content ?? "").startsWith("FRONTIER CORRECTION"),
+  );
+  assert.equal(finalRequestCorrections.length, 1);
   assert.deepEqual(executedCalls, []);
   assert.match(deltas.join(""), /twice returned no tool call/iu);
   assert.ok(
     traces.some(
       (event) =>
         event.error?.code === "model_tool_noncompliance" &&
-        (event.outputPreview as { attempts?: number } | undefined)?.attempts === 2,
+        (event.outputPreview as { attempts?: number } | undefined)?.attempts === 4,
     ),
   );
+  assert.equal(
+    traces.filter((event) => event.id.startsWith("prose-steering-injection-"))
+      .length,
+    2,
+    "the steering cap is two injections per segment",
+  );
   assert.equal(completions[0]?.stopReason, "error");
+  assert.equal(completions[0]?.autonomyStats?.prose_steering_injections, 2);
+});
+
+test("a single prose stall recovers without spending a prose-steering injection", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("Let me think about the search first."),
+      () => responseWithToolCall("web_search", { query: "Obsidian release" }),
+      () => responseWithToolCall("web_fetch", { url: "https://example.com/rel" }),
+      (request) =>
+        responseWithContent(
+          `The latest release is documented at https://example.com/rel ${getPassageCitationIds(request)[0] ?? ""}`.trim(),
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Search the web for the latest Obsidian release and cite the source.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {
+      settings: createRunnerSettings(),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  // The first prose response is legitimate thinking: the first-strike
+  // correction may fire, but the bounded steering escalation must not.
+  assert.ok(
+    executedCalls.some((call) => call.name === "web_search"),
+    "the corrected model resumed the required tool ladder",
+  );
+  assert.equal(
+    traces.filter((event) => event.id.startsWith("prose-steering-injection-"))
+      .length,
+    0,
+  );
+  assert.equal(completions[0]?.autonomyStats?.prose_steering_injections, 0);
 });
 
 test("observes the current note before the first model planning step", async () => {
@@ -15974,7 +16058,7 @@ test("a host-linked wall-clock abort remains a budget rather than a user stop", 
   assert.deepEqual(completions, ["budget"]);
 });
 
-test("write-required no-tool answers stop after two unchanged-frontier responses", async () => {
+test("write-required no-tool answers steer twice then stop against the unchanged frontier", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const deltas: string[] = [];
@@ -16000,7 +16084,14 @@ test("write-required no-tool answers stop after two unchanged-frontier responses
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  // First-strike correction, then two bounded prose-steering escalations,
+  // then the noncompliance breaker: four requests total.
+  assert.equal(chatRequests.length, 4);
+  assert.ok(
+    statuses.some((message) =>
+      /Prose without a tool call cannot advance the mission/iu.test(message),
+    ),
+  );
   assert.ok(
     statuses.some((message) => /twice returned no tool call/iu.test(message)),
   );
@@ -16011,6 +16102,7 @@ test("web research can search then fetch a source before answering", async () =>
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const deltas: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
   const client = createClient({
     chatRequests,
     chatResponders: [
@@ -16031,6 +16123,7 @@ test("web research can search then fetch a source before answering", async () =>
     enableStreaming: false,
     events: {
       onAssistantDelta: (delta) => deltas.push(delta),
+      onRunComplete: (event) => completions.push(event),
     },
   });
 
@@ -16045,6 +16138,9 @@ test("web research can search then fetch a source before answering", async () =>
   assert.equal(deltas.length, 1);
   assert.match(deltas[0], /Cited answer with https:\/\/example\.com\/mcp/);
   assert.match(deltas[0], /source:[a-z0-9]+:passage:\d+-\d+/i);
+  // The prose final synthesis owes no further frontier work, so the reactive
+  // prose-steering seat must never fire on it.
+  assert.equal(completions[0]?.autonomyStats?.prose_steering_injections, 0);
 });
 
 test("low-cap sourced generated essay finalizes with note writeback", async () => {

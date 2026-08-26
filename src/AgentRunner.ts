@@ -294,6 +294,7 @@ import {
   finalizeAutonomyRunStats,
   recordApproval,
   recordContinue,
+  recordProseSteeringInjection,
   recordToolsOffered,
 } from "./agent/autonomyRunStats";
 import {
@@ -19053,6 +19054,48 @@ export async function runAgentMission({
           );
           return;
         }
+        const proseSteeringInjectionsSoFar =
+          autonomyRunStats.prose_steering_injections ?? 0;
+        if (
+          proseCannotFinishMission &&
+          proseSteeringInjectionsSoFar < MAX_PROSE_STEERING_INJECTIONS &&
+          step < stepLimit
+        ) {
+          // Reactive prose steering: the mission still owes required tool work
+          // (the same predicate that gated the first-strike correction above),
+          // so a repeated prose-only response gets a bounded steering
+          // escalation instead of the terminal noncompliance breaker.
+          // Small/variable models recover on a re-ask more often than not
+          // (2026-08-26 campaign: 3 of 6 notebook runs at the same HEAD
+          // engaged the identical frontier perfectly while the others
+          // prose-stalled at step 2), and killing the run at strike two
+          // forfeited 13 remaining budgeted steps. The cap keeps this from
+          // becoming an infinite nudge loop: once spent, the breaker below
+          // decides exactly as before.
+          const readySteeringToolNames = stepTools.map(
+            (tool) => tool.function.name,
+          );
+          recordProseSteeringInjection(autonomyRunStats);
+          events.onStatus?.(
+            `Prose without a tool call cannot advance the mission; steering the model back to ${readySteeringToolNames.join(", ")}...`,
+          );
+          events.onTrace?.({
+            id: `prose-steering-injection-${step}`,
+            kind: "status",
+            step,
+            message: [
+              `prose_steering_injections=${autonomyRunStats.prose_steering_injections ?? 0}`,
+              `frontier=${readySteeringToolNames.join(",") || "none"}`,
+              `attempts=${unchangedNoToolResponseCount}`,
+            ].join("; "),
+          });
+          messages.push({
+            role: "system" as const,
+            content: buildProseSteeringEscalation(readySteeringToolNames),
+          });
+          noToolEscalationActive = true;
+          continue;
+        }
         const rejectedFrontier = stepTools
           .map((tool) => tool.function.name)
           .sort();
@@ -28974,6 +29017,35 @@ function buildGenericNoToolCorrection(
     `The tools available this step are: ${readyToolNames.join(", ")}.`,
     "Call the single most relevant tool now using its offered schema, or the run will stop as blocked.",
     "Return the tool call only. Do not explain, summarize, or claim completion.",
+  ].join(" ");
+}
+
+/**
+ * Reactive prose-steering budget: after the first-strike correction above, at
+ * most this many escalations per segment before the two-strike noncompliance
+ * breaker decides. Bounded so a model that never calls tools cannot turn the
+ * steering seat into an infinite nudge loop.
+ */
+const MAX_PROSE_STEERING_INJECTIONS = 2;
+
+/**
+ * Escalated sibling of the no-tool corrections above, issued only after a
+ * first correction already failed (two-plus consecutive prose-only responses
+ * while required frontier work is still owed). Same sentinel, so the stale-
+ * correction pruner keeps exactly one correction in history.
+ */
+function buildProseSteeringEscalation(
+  readyToolNames: readonly string[],
+): string {
+  const exactInstruction =
+    readyToolNames.length === 1
+      ? `Call ${readyToolNames[0]} now using its offered schema, or state in one sentence why you cannot.`
+      : `Call exactly one ready tool now — ${readyToolNames.join(", ")} — or state in one sentence why you cannot.`;
+  return [
+    FRONTIER_CORRECTION_SENTINEL,
+    "Prose without a tool call cannot advance this mission; required tool work is still owed.",
+    `The ready frontier tool(s): ${readyToolNames.join(", ")}.`,
+    exactInstruction,
   ].join(" ");
 }
 
