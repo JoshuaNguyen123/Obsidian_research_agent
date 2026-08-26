@@ -465,6 +465,200 @@ test("host substitution repairs a paraphrased seed-bound package so publication 
   assert.equal(fixture.publisher.publishCount, 1);
 });
 
+// The live compound-flow seed shape. A brief written for a code mission names
+// the file it pins, so its selected direction and acceptance criteria carry a
+// repository path — text `assertNoRawAuthority` refuses as queue execution
+// authority and the publication tool silently rewrites into host-owned
+// language. This is the discriminating case between "substitution never
+// fired" and "substitution fired and was overwritten before the guard ran".
+const UNSAFE_SEED_OBJECTIVE =
+  "Minimal marker export: pin src/flow_real.ts to a single export const marker line and publish to a private GitHub repo with a draft PR; no other files touched.";
+const UNSAFE_SEED_CRITERIA = [
+  { id: "AC-1", text: "The exported marker in src/flow_real.ts matches the brief." },
+];
+
+test("seed-bound fields the host must sanitize survive substitution all the way to the drift guard", async () => {
+  const cache = ideationRuntimeCacheFixture({
+    selectedDirectionSummary: UNSAFE_SEED_OBJECTIVE,
+    acceptanceCriteria: UNSAFE_SEED_CRITERIA,
+  });
+  const seed = cache.projectIdeaAcceptedResearchSeed as {
+    selectedDirection: { summary: string };
+    acceptanceCriteria: { id: string; text: string }[];
+  };
+  // Precondition: the seed really does carry text the publication contract
+  // refuses, so the host canonicalizer is guaranteed to rewrite it.
+  assert.equal(seed.selectedDirection.summary, UNSAFE_SEED_OBJECTIVE);
+  assert.deepEqual(seed.acceptanceCriteria, UNSAFE_SEED_CRITERIA);
+
+  const args = argsFixture();
+  const packageRecord = args.package as Record<string, unknown>;
+  (packageRecord.evidence as Array<Record<string, unknown>>)[0].id =
+    `evidence-${"a".repeat(64)}`;
+  packageRecord.objective = "Export a marker constant from the flow module.";
+  packageRecord.acceptanceCriteria = [
+    { id: "AC-1", text: "A marker constant is exported and reviewed." },
+  ];
+
+  // Seat 1 — substitution fires on the raw package and names both fields.
+  const substitution = canonicalSeedExactAcceptedResearchPackageV1({
+    toolName: "publish_research_to_linear",
+    packageValue: packageRecord,
+    runtimeCache: cache,
+  });
+  assert.ok(substitution, "a paraphrased seed-bound package must be substituted");
+  assert.deepEqual(substitution.substitutedFields, [
+    "objective",
+    "acceptanceCriteria",
+  ]);
+
+  // Seat 2 — the drift guard, reached through the real tool. Before the fix
+  // the host's provider-safety canonicalizer overwrote both substituted
+  // fields between the two seats and the guard reported exactly the fields
+  // substitution had just repaired.
+  const fixture = createFixture("created", { resumeCheckpoints: true });
+  const context = contextFixture(
+    "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.",
+    "run-ideation-unsafe-seed",
+    "call-ideation-unsafe-seed",
+  );
+  context.runtimeCache = cache;
+  context.requestNestedApproval = approveNested;
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+  assert.equal(
+    result.ok,
+    true,
+    `publication must not block on seed-bound fields the host itself rewrote: ${
+      result.ok ? "" : result.error?.message
+    }`,
+  );
+  assert.equal(fixture.publisher.publishCount, 1);
+
+  // The published values are the host's own safe language for both fields —
+  // the seed's raw path never becomes queue execution authority — and the
+  // durable seed itself is still stored verbatim.
+  const written = fixture.noteWrites[0]?.package;
+  assert.ok(written);
+  assert.equal(
+    written.objective,
+    "Deliver the accepted research through trusted repository profile trusted-repo.",
+  );
+  assert.deepEqual(written.acceptanceCriteria, [
+    {
+      id: "AC-1",
+      text:
+        "The trusted validation requirement trusted.validation passes for the verified repository change.",
+    },
+  ]);
+  assert.equal(
+    written.projectIdeaSeed?.selectedDirection.summary,
+    UNSAFE_SEED_OBJECTIVE,
+  );
+  assert.deepEqual(
+    written.projectIdeaSeed?.acceptanceCriteria,
+    UNSAFE_SEED_CRITERIA,
+  );
+});
+
+test("an unsafe seed still publishes when the host resolves the repository key after substitution", async () => {
+  // The host's rewrite is phrased with the repository profile, and the model
+  // may omit repositoryKey entirely — the host defaults it from the trusted
+  // catalog, but only after the substitution seat has already run. Substitution
+  // must therefore write the seed verbatim and leave the rewrite to the one
+  // seat that has the resolved profile, or the two would disagree again.
+  const fixture = createFixture("created", {
+    resumeCheckpoints: true,
+    describeTrustedRepositoryCatalog: () => ({
+      repositoryKeys: ["trusted-repo"],
+      validationKeysByRepository: { "trusted-repo": ["trusted.validation"] },
+    }),
+  });
+  const cache = ideationRuntimeCacheFixture({
+    selectedDirectionSummary: UNSAFE_SEED_OBJECTIVE,
+    acceptanceCriteria: UNSAFE_SEED_CRITERIA,
+  });
+  const args = argsFixture();
+  const packageRecord = args.package as Record<string, unknown>;
+  (packageRecord.evidence as Array<Record<string, unknown>>)[0].id =
+    `evidence-${"a".repeat(64)}`;
+  delete packageRecord.repositoryKey;
+  packageRecord.objective = "Export a marker constant from the flow module.";
+
+  const context = contextFixture(
+    "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.",
+    "run-ideation-late-repo-key",
+    "call-ideation-late-repo-key",
+  );
+  context.runtimeCache = cache;
+  context.requestNestedApproval = approveNested;
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+  assert.equal(
+    result.ok,
+    true,
+    `a late-resolved repository key must not split the two seats: ${
+      result.ok ? "" : result.error?.message
+    }`,
+  );
+  assert.equal(
+    fixture.noteWrites[0]?.package.objective,
+    "Deliver the accepted research through trusted repository profile trusted-repo.",
+  );
+});
+
+test("a paraphrase of a seed-bound field the host does not rewrite still fails closed", async () => {
+  // Same unsafe seed, but the model paraphrases a field whose seeded value is
+  // safe (nonGoals). Substitution repairs it; if it could not, the guard must
+  // still refuse. This keeps the sanitized-comparison lens from becoming a
+  // blanket exemption.
+  const cache = ideationRuntimeCacheFixture({
+    selectedDirectionSummary: UNSAFE_SEED_OBJECTIVE,
+    acceptanceCriteria: UNSAFE_SEED_CRITERIA,
+  });
+  const args = argsFixture();
+  const packageRecord = args.package as Record<string, unknown>;
+  (packageRecord.evidence as Array<Record<string, unknown>>)[0].id =
+    `evidence-${"a".repeat(64)}`;
+  packageRecord.nonGoals = ["Something the brief never said."];
+  const substitution = canonicalSeedExactAcceptedResearchPackageV1({
+    toolName: "publish_research_to_linear",
+    packageValue: packageRecord,
+    runtimeCache: cache,
+  });
+  assert.ok(substitution);
+  assert.deepEqual(substitution.substitutedFields, [
+    "objective",
+    "nonGoals",
+    "acceptanceCriteria",
+  ]);
+  assert.deepEqual(substitution.packageValue.nonGoals, ["Automatic merge."]);
+
+  // Without substitution authority the same paraphrase must still drift: the
+  // safe seeded value is compared byte-for-byte, sanitization or not.
+  const paraphrasedPackage = {
+    ...(substitution.packageValue as Record<string, unknown>),
+    projectIdeaSeed: cache.projectIdeaAcceptedResearchSeed,
+    nonGoals: ["Something the brief never said."],
+  };
+  assert.throws(
+    () =>
+      assertProjectIdeaSeedPublicationBindingV1(
+        paraphrasedPackage as never,
+        cache,
+        "Brainstorm, evaluate, and select a project idea, then publish it to Linear.",
+      ),
+    (error: unknown) =>
+      error instanceof Error &&
+      (error as Error & { code?: string }).code ===
+        "research_publication_project_idea_drift",
+  );
+});
+
 test("canonicalSeedExactAcceptedResearchPackageV1 substitutes only under durable seed authority", () => {
   const cache = ideationRuntimeCacheFixture();
   const paraphrased = () => {
@@ -2075,9 +2269,13 @@ function contextFixture(
   } as unknown as ToolExecutionContext;
 }
 
-function ideationRuntimeCacheFixture(): NonNullable<
-  ToolExecutionContext["runtimeCache"]
-> {
+function ideationRuntimeCacheFixture(
+  overrides: {
+    selectedDirectionSummary?: string;
+    acceptanceCriteria?: { id: string; text: string }[];
+    proposedWork?: string[];
+  } = {},
+): NonNullable<ToolExecutionContext["runtimeCache"]> {
   const evidenceId = `evidence-${"a".repeat(64)}`;
   const brief = createProjectIdeaBriefV1({
     ideaId: "idea-accepted-research",
@@ -2087,14 +2285,16 @@ function ideationRuntimeCacheFixture(): NonNullable<
     options: [{
       id: "option-a",
       title: "Persist the exact handoff",
-      summary: "Implement the accepted work item.",
+      summary:
+        overrides.selectedDirectionSummary ?? "Implement the accepted work item.",
     }],
     selectedOptionId: "option-a",
-    proposedWork: ["Implement the accepted work."],
+    proposedWork: overrides.proposedWork ?? ["Implement the accepted work."],
     nonGoals: ["Automatic merge."],
     constraints: [],
     risks: [],
-    acceptanceCriteria: [{ id: "AC-1", text: "The handoff is verified." }],
+    acceptanceCriteria: overrides.acceptanceCriteria ??
+      [{ id: "AC-1", text: "The handoff is verified." }],
     evidenceStatus: "grounded",
     evidence: [{
       id: evidenceId,

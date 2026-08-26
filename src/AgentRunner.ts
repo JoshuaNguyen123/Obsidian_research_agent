@@ -147,6 +147,7 @@ import {
   hasExplicitPermanentLinearDeleteIntent,
 } from "./agent/linearIntent";
 import {
+  canonicalSeedExactAcceptedResearchPackageV1,
   hasExplicitResearchPublicationIntent,
   PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
 } from "./tools/researchPublicationTool";
@@ -11261,6 +11262,38 @@ export async function runAgentMission({
           outputPreview: {
             echoedIssueId,
             exactIssueIdentity: canonicalLinearReadId,
+          },
+        });
+      }
+    }
+    if (toolCall.name === PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) {
+      // The publish-seat mirror of the linear_get_issue canonicalization
+      // above. While a durable project idea seed exists, the seed-bound
+      // accepted-research fields have exactly one admissible value each, so a
+      // model paraphrase can only fail the drift guard. The host substitutes
+      // the seeded values rather than spending bounded node attempts on
+      // paraphrase repair, and journals which fields it took over: this trace
+      // is the only place a host paraphrase-correction becomes measurable,
+      // and without it a drift blocker cannot be told apart from a
+      // substitution that never fired.
+      const seedExact = canonicalSeedExactAcceptedResearchPackageV1({
+        toolName: toolCall.name,
+        packageValue: toolCall.arguments.package,
+        runtimeCache,
+      });
+      if (seedExact) {
+        toolCall.arguments = {
+          ...toolCall.arguments,
+          package: seedExact.packageValue,
+        };
+        events.onTrace?.({
+          id: `${step}:${PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME}:seed-exact-substituted`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message: `Host replaced ${seedExact.substitutedFields.length} paraphrased seed-bound accepted-research field(s) with their durable project idea seed values: ${seedExact.substitutedFields.join(", ")}.`,
+          outputPreview: {
+            substitutedFields: seedExact.substitutedFields,
           },
         });
       }
