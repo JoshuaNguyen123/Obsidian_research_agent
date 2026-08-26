@@ -63,6 +63,17 @@ interface DailyUseRunRecord extends Pick<
   /** Explicit alias for the legacy `approvals` interaction counter. */
   interactiveApprovals: number;
   /**
+   * ATTEMPTED tool calls for this record, or null when UNKNOWN. This is the
+   * denominator the success rate always lacked: `toolCalls` above is fed
+   * from `missionEvidence.length` / `usage.toolCalls`, and
+   * `evidenceFromToolResult` (src/agent/missionEvidence.ts:43) yields
+   * nothing for `!result.ok`, so failed calls never reached that counter and
+   * the attempt itself went uncounted. A spec supplies this by folding the
+   * mission event stream through e2e/fixtures/toolCallOutcomes.ts. Null —
+   * never 0 — when no spec counted.
+   */
+  toolCallsAttempted: number | null;
+  /**
    * Failed-tool-call count for this record, or null when UNKNOWN. The
    * counters the specs feed today (missionEvidence lengths, usage.toolCalls)
    * do not distinguish failed tool events — missionEvidence records
@@ -327,6 +338,7 @@ export default class DailyUseReporter implements Reporter {
       observed,
       missionScorecard,
       proofClass,
+      toolCallsAttempted: annotatedMetrics?.toolCallsAttempted ?? null,
       toolCallsFailed: annotatedMetrics?.toolCallsFailed ?? null,
       toolCallsVacuous: annotatedMetrics?.toolCallsVacuous ?? null,
       toolCallsIntentionalNoOp:
@@ -424,8 +436,11 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         modelCalls: metrics?.modelCalls ?? 0,
         toolCalls: metrics?.toolCalls ?? 0,
         // Nullable on purpose: null means no record in the group knew its
-        // failed/vacuous count (unknown ≠ zero); a number is the sum of the
-        // records that did know — an explicit lower bound.
+        // attempted/failed/vacuous count (unknown ≠ zero); a number is the
+        // sum of the records that did know — an explicit lower bound.
+        toolCallsAttempted: sumNullableCounters(
+          group.map((record) => record.toolCallsAttempted),
+        ),
         toolCallsFailed: sumNullableCounters(
           group.map((record) => record.toolCallsFailed),
         ),
@@ -483,6 +498,7 @@ function parseMetricsAnnotation(
   DailyUseRunMetricsV1,
   "modelCalls" | "toolCalls" | "continuations" | "approvals"
 > & {
+  toolCallsAttempted: number | null;
   toolCallsFailed: number | null;
   toolCallsVacuous: number | null;
   toolCallsIntentionalNoOp: number | null;
@@ -502,6 +518,7 @@ function parseMetricsAnnotation(
       continuations: safeCounter(value.continuations),
       approvals: safeCounter(value.approvals),
       // Absent or malformed stays null (unknown), never zero.
+      toolCallsAttempted: nullableCounter(value.toolCallsAttempted),
       toolCallsFailed: nullableCounter(value.toolCallsFailed),
       toolCallsVacuous: nullableCounter(value.toolCallsVacuous),
       toolCallsIntentionalNoOp: nullableCounter(value.toolCallsIntentionalNoOp),

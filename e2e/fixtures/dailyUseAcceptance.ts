@@ -37,6 +37,16 @@ export async function recordDailyUseAcceptance(
     approvals?: number;
     missionScorecard?: MissionScorecardV1 | null;
     /**
+     * ATTEMPTED tool calls — the denominator for tool-call success. Supply it
+     * by folding the mission event stream through
+     * `foldToolCallOutcomesV1` (e2e/fixtures/toolCallOutcomes.ts), which is
+     * the only counter that sees failed calls at all: `toolCalls` above is
+     * fed from missionEvidence, and evidenceFromToolResult drops every
+     * `!result.ok`. Leave undefined when the spec did not observe the
+     * stream — the reporter records null (unknown), never zero.
+     */
+    toolCallsAttempted?: number | null;
+    /**
      * Failed-tool-call count when the spec's own trace observation can
      * distinguish failures (tool_result with error / onToolDone ok:false /
      * tool_rejected). Leave undefined when it cannot: the reporter records
@@ -71,6 +81,7 @@ export async function recordDailyUseAcceptance(
   const releaseSha = process.env.E2E_RELEASE_COMMIT_SHA?.trim() || null;
   const {
     missionScorecard = null,
+    toolCallsAttempted = null,
     toolCallsFailed = null,
     toolCallsVacuous = null,
     toolCallsIntentionalNoOp = null,
@@ -95,6 +106,7 @@ export async function recordDailyUseAcceptance(
       // Appended OUTSIDE createDailyUseRunMetricsV1 (its schema is fixed in
       // src/): unknown counts serialize as null so the reporter can keep
       // unknown ≠ zero explicit.
+      toolCallsAttempted,
       toolCallsFailed,
       toolCallsVacuous,
       toolCallsIntentionalNoOp,
