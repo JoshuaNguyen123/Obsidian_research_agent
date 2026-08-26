@@ -1,7 +1,7 @@
 import { chromium, type Browser, type Page } from "@playwright/test";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
+import { createWriteStream, mkdirSync, readFileSync, type WriteStream } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +10,14 @@ import {
   terminateControlledObsidian,
   waitForWindowsProcessExit,
 } from "../../scripts/obsidian-process-lifecycle";
+import {
+  appendHostEventV1,
+  describeWindowsExitCodeV1,
+  enumerateObsidianProcessesV1,
+  hostEventJournalPath,
+  selectOwnedObsidianPidsV1,
+  sweepOwnedObsidianSurvivorsV1,
+} from "../../scripts/e2e-obsidian-sweep.mjs";
 import {
   restoreOwnedE2EArtifacts,
   snapshotOwnedE2EArtifacts,
@@ -197,9 +205,11 @@ export async function startNativeObsidianHarness(
   let browser: Browser | null = null;
   let page: Page | null = null;
   let closed = false;
+  let rootCreatedAtMs: number | null = null;
   const launchOwnedProcess = async (
     allowTrustRestart = true,
   ): Promise<Page> => {
+    rootCreatedAtMs = Date.now();
     processHandle = spawn(
       obsidianExe,
       [
@@ -228,9 +238,16 @@ export async function startNativeObsidianHarness(
       },
     );
     drainObsidianStdio(processHandle, options.label);
+    recordOwnedHostLifecycle(processHandle, {
+      label: options.label,
+      cdpPort,
+      vaultRoot,
+      spawnedAtMs: rootCreatedAtMs,
+    });
     await waitForCdp(cdpPort, processHandle, 45_000);
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     page = await findOnlyVaultPage(browser, vaultRoot);
+    watchRendererLiveness(browser, page, options.label, cdpPort);
     const trustChanged = await trustDisposableVaultIfPrompted(page);
     if (trustChanged) {
       if (!allowTrustRestart) {
@@ -931,6 +948,148 @@ function drainObsidianStdio(
   });
 }
 
+/**
+ * Record the owned host's whole lifecycle into the DURABLE journal.
+ *
+ * The stdio log this sits beside lives in test-results/, which Playwright
+ * wipes at the start of every run — so the evidence from a death was routinely
+ * destroyed by the next attempt. Everything written here survives that wipe.
+ *
+ * The decisive field is the decoded exit: 4294967295 means an external
+ * `Stop-Process -Force`, 1 with no signal means `taskkill /F`. A death that
+ * carries either is a KILL, not a crash and not an OOM, and the journal names
+ * which sweep did it.
+ */
+function recordOwnedHostLifecycle(
+  processHandle: ChildProcessWithoutNullStreams,
+  context: {
+    label: string;
+    cdpPort: number;
+    vaultRoot: string;
+    spawnedAtMs: number | null;
+  },
+): void {
+  const spawnedAtMs = context.spawnedAtMs ?? Date.now();
+  appendHostEventV1({
+    kind: "host_spawned",
+    label: context.label,
+    pid: processHandle.pid ?? null,
+    cdpPort: context.cdpPort,
+    vaultRoot: context.vaultRoot,
+  });
+  processHandle.once("exit", (code, signal) => {
+    const decoded = describeWindowsExitCodeV1(code, signal);
+    appendHostEventV1({
+      kind: "host_exited",
+      label: context.label,
+      pid: processHandle.pid ?? null,
+      cdpPort: context.cdpPort,
+      exitCode: code,
+      signal,
+      lifetimeMs: Date.now() - spawnedAtMs,
+      exitKind: decoded.kind,
+      forcedExternally: decoded.forcedExternally,
+      diagnosis: decoded.summary,
+      // Baseline from the 2026-08-26 run-8 control: in an ORDERLY teardown the
+      // host exits ~1s before the runner finalizes, and teardownRequested is
+      // true. A host_exited record with teardownRequested false is a death.
+      teardownRequested: hostTeardownRequested,
+    });
+  });
+}
+
+/**
+ * True once the harness has asked Obsidian to stop. Any host exit observed
+ * while this is false is by definition unrequested — which is the single fact
+ * that separates "the product/host died" from "we closed it", and the fact the
+ * old artifacts never recorded.
+ */
+let hostTeardownRequested = false;
+
+/**
+ * Distinguish a RENDERER death from a BROWSER-process death from a harness
+ * timeout. Playwright surfaces all three differently and the harness listened
+ * for none of them, which is why every death was reported as whichever poll
+ * happened to be in flight ("closed while clicking prepared approval") even
+ * when the mission was doing something else entirely.
+ */
+function watchRendererLiveness(
+  browser: Browser,
+  page: Page,
+  label: string,
+  cdpPort: number,
+): void {
+  page.on("crash", () => {
+    appendHostEventV1({
+      kind: "renderer_crashed",
+      label,
+      cdpPort,
+      diagnosis:
+        "Playwright reported page.on('crash'): the RENDERER process died while " +
+        "the browser process stayed up. This is a genuine renderer crash (OOM " +
+        "or fatal), not an external sweep kill.",
+      teardownRequested: hostTeardownRequested,
+    });
+  });
+  page.on("close", () => {
+    appendHostEventV1({
+      kind: "page_closed",
+      label,
+      cdpPort,
+      teardownRequested: hostTeardownRequested,
+    });
+  });
+  browser.on("disconnected", () => {
+    appendHostEventV1({
+      kind: "browser_disconnected",
+      label,
+      cdpPort,
+      diagnosis:
+        "The CDP connection dropped. Paired with a host_exited record this " +
+        "names the killer; with no host_exited record the browser process is " +
+        "still alive and the transport failed instead.",
+      teardownRequested: hostTeardownRequested,
+    });
+  });
+}
+
+/**
+ * Read back what the journal says about this run's host, so a failing poll can
+ * report the REAL cause instead of the poll it happened to die in.
+ */
+export function summarizeRecentHostDeathV1(
+  sinceMs: number,
+  repoRoot?: string,
+): string | null {
+  let lines: string[];
+  try {
+    lines = readFileSync(hostEventJournalPath(repoRoot), "utf8")
+      .split(/\r?\n/u)
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+  for (const line of lines.reverse()) {
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const at = Date.parse(String(event.ts ?? ""));
+    if (!Number.isFinite(at) || at < sinceMs) continue;
+    if (event.kind === "host_exited" || event.kind === "renderer_crashed") {
+      return (
+        `${String(event.kind)}: ${String(event.diagnosis ?? "")} ` +
+        `(exitCode=${String(event.exitCode ?? "n/a")}, ` +
+        `signal=${String(event.signal ?? "n/a")}, ` +
+        `teardownRequested=${String(event.teardownRequested ?? "n/a")})`
+      );
+    }
+  }
+  return null;
+}
+
 async function waitForCdp(
   port: number,
   processHandle: ChildProcessWithoutNullStreams,
@@ -952,8 +1111,12 @@ async function waitForCdp(
 async function terminateObsidian(
   processHandle: ChildProcessWithoutNullStreams | null,
   cdpPort: number,
+  rootCreatedAtMs: number | null = null,
 ): Promise<void> {
   if (!processHandle?.pid) return;
+  const rootPid = processHandle.pid;
+  // Mark BEFORE dispatching the kill so the exit record cannot race the flag.
+  hostTeardownRequested = true;
   await terminateControlledObsidian(processHandle, {
     terminateOwnedTree: async (pid) => {
       await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"]).catch(
@@ -965,9 +1128,11 @@ async function terminateObsidian(
         handle: processHandle,
         expectedImageName: obsidianImageName(),
       }),
-    waitForNoRunningProcess: () => waitForNoObsidian(45_000),
+    waitForNoRunningProcess: () =>
+      waitForOwnedObsidianDrain(cdpPort, rootPid, rootCreatedAtMs, 45_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
-    sweepSurvivingProcesses: () => sweepObsidianSurvivors(),
+    sweepSurvivingProcesses: () =>
+      sweepObsidianSurvivors(cdpPort, rootPid, rootCreatedAtMs),
   });
 }
 
@@ -976,27 +1141,31 @@ function obsidianImageName(): string {
 }
 
 /**
- * Kill surviving Obsidian processes by their own PIDs. taskkill /T misses
+ * Kill surviving Obsidian processes THIS harness owns. taskkill /T misses
  * grandchildren whose parent already exited, and a self-exited root skips the
  * tree kill entirely, so orphaned Electron children need a direct sweep.
+ *
+ * Ownership scoping is load-bearing, not tidiness. This sweep previously
+ * enumerated with `tasklist /FI` (a filter documented to lie on this machine)
+ * and force-killed EVERY Obsidian PID it saw, with no parentage, port, session
+ * or start-time check. It therefore killed a concurrent harness instance's
+ * live run — and would equally have killed the user's own Obsidian window had
+ * one been open. It fires only on the "CDP closed but Obsidian still running"
+ * branch of the teardown probes, which is exactly the shape two coexisting
+ * instances produce, so the damage was invisible in single-instance runs.
  */
-async function sweepObsidianSurvivors(): Promise<void> {
-  const image = obsidianImageName();
-  const { stdout } = await execFileAsync("tasklist", [
-    "/FI",
-    `IMAGENAME eq ${image}`,
-    "/FO",
-    "CSV",
-    "/NH",
-  ]).catch(() => ({ stdout: "" }));
-  const pids = [...String(stdout).matchAll(/^"[^"]+","(\d+)",/gimu)].map(
-    (match) => Number(match[1]),
-  );
-  for (const pid of pids) {
-    await execFileAsync("taskkill", ["/PID", String(pid), "/F"]).catch(
-      () => undefined,
-    );
-  }
+async function sweepObsidianSurvivors(
+  cdpPort: number,
+  rootPid: number | null,
+  rootCreatedAtMs: number | null,
+): Promise<void> {
+  await sweepOwnedObsidianSurvivorsV1({
+    stage: "nativeObsidianHarness teardown",
+    rootPid,
+    cdpPort,
+    rootCreatedAtMs,
+    imageName: obsidianImageName(),
+  });
 }
 
 async function assertNoRunningObsidian(): Promise<void> {
@@ -1004,6 +1173,37 @@ async function assertNoRunningObsidian(): Promise<void> {
   throw new Error(
     "Obsidian is already running. Close it before native desktop e2e.",
   );
+}
+
+/**
+ * Teardown asks a narrower question than startup: "are MY processes gone?",
+ * not "is any Obsidian running?". Using the global check here was the trigger
+ * for the survivor sweep — a foreign Obsidian (another harness instance, or
+ * the user's own window) kept the drain probe failing forever, and the sweep
+ * that fired in response used to kill it. Scoping the probe removes the
+ * trigger; scoping the sweep removes the damage.
+ */
+async function waitForOwnedObsidianDrain(
+  cdpPort: number,
+  rootPid: number | null,
+  rootCreatedAtMs: number | null,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const ownedRemain = async () =>
+    (
+      selectOwnedObsidianPidsV1({
+        processes: await enumerateObsidianProcessesV1(obsidianImageName()),
+        rootPid,
+        cdpPort,
+        rootCreatedAtMs,
+      })
+    ).length > 0;
+  while (Date.now() < deadline) {
+    if (!(await ownedRemain())) return true;
+    await delay(250);
+  }
+  return !(await ownedRemain());
 }
 
 async function waitForNoObsidian(timeoutMs: number): Promise<boolean> {
@@ -1015,17 +1215,14 @@ async function waitForNoObsidian(timeoutMs: number): Promise<boolean> {
   return !(await obsidianRunning());
 }
 
+/**
+ * CIM, not `tasklist /FI` — that filter is documented to lie on this machine,
+ * and this is the single-instance gate. A false negative here lets a SECOND
+ * harness boot alongside a live one, and two coexisting instances are what
+ * made teardown sweeps kill each other's hosts.
+ */
 async function obsidianRunning(): Promise<boolean> {
-  const image = obsidianImageName();
-  const { stdout } = await execFileAsync("tasklist", [
-    "/FI",
-    `IMAGENAME eq ${image}`,
-    "/FO",
-    "CSV",
-    "/NH",
-  ]);
-  const escapedImage = image.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^"${escapedImage}"`, "imu").test(stdout);
+  return (await enumerateObsidianProcessesV1(obsidianImageName())).length > 0;
 }
 
 async function assertPortFree(port: number): Promise<void> {

@@ -9,6 +9,7 @@ import {
   containsSensitiveProofText,
   proofDirectoryForSha,
 } from "./run-targeted-protected-release.mjs";
+import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-sweep.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(import.meta.url);
@@ -169,7 +170,7 @@ export async function runWorkflowAuditE2eV1(options = {}) {
   let auditError = null;
   try {
     for (const stage of WORKFLOW_AUDIT_STAGES) {
-      await sweepTestVaultObsidianZombiesV1(stage.id);
+      await sweepTestVaultObsidianZombies(stage.id);
       const boundary = await gitState();
       assertExactCleanHeadV1(boundary, expectedHead, `before ${stage.id}`);
       const startedAt = now().toISOString();
@@ -462,26 +463,14 @@ function boundedEvidenceCount(value, label) {
  * Obsidian the user has open on a real vault is never touched, which is also
  * why this sweep cannot replace the preflight assertion.
  */
-async function sweepTestVaultObsidianZombiesV1(stageId) {
-  if (process.platform !== "win32") {
-    return;
-  }
-  const psScript =
-    "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Obsidian.exe'\" | " +
-    "Where-Object { $_.CommandLine -match 'test_vault_obsidian_ai' }); " +
-    "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; " +
-    "Write-Output $procs.Count";
+async function sweepTestVaultObsidianZombies(stageId) {
   try {
-    const { stdout } = await execFileAsync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", psScript],
-      { windowsHide: true, timeout: 30_000, encoding: "utf8" },
-    );
-    const sweptCount = Number.parseInt(stdout.trim(), 10) || 0;
-    if (sweptCount > 0) {
-      console.log(
-        `Swept ${sweptCount} test-vault Obsidian zombie process(es) before ${stageId}.`,
-      );
+    const { swept, skipped } = await sweepTestVaultObsidianZombiesV1({
+      stage: `workflow-audit[${stageId}]`,
+      env: process.env,
+      repoRoot,
+    });
+    if (swept > 0 && !skipped) {
       await new Promise((resolve) => setTimeout(resolve, 3_000));
     }
   } catch (error) {

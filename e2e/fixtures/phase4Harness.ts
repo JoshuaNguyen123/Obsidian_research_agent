@@ -10,6 +10,11 @@ import {
   waitForWindowsProcessExit,
 } from "../../scripts/obsidian-process-lifecycle";
 import {
+  enumerateObsidianProcessesV1,
+  selectOwnedObsidianPidsV1,
+  sweepOwnedObsidianSurvivorsV1,
+} from "../../scripts/e2e-obsidian-sweep.mjs";
+import {
   restoreOwnedE2EArtifacts,
   snapshotOwnedE2EArtifacts,
 } from "./ownedE2EArtifacts";
@@ -1208,10 +1213,38 @@ async function terminateObsidian(
         handle: processHandle,
         expectedImageName: phase4ObsidianImageName(),
       }),
-    waitForNoRunningProcess: () => waitForNoObsidian(30_000),
+    waitForNoRunningProcess: () =>
+      waitForOwnedObsidianDrainPhase4(cdpPort, processHandle.pid ?? null, 30_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
-    sweepSurvivingProcesses: () => sweepObsidianSurvivorsPhase4(),
+    sweepSurvivingProcesses: () =>
+      sweepObsidianSurvivorsPhase4(cdpPort, processHandle.pid ?? null, null),
   });
+}
+
+/**
+ * Teardown asks "are MY processes gone?", not "is any Obsidian running?" — the
+ * global question kept the drain probe failing whenever a foreign Obsidian was
+ * up, which is precisely what used to trigger the unscoped survivor sweep.
+ */
+async function waitForOwnedObsidianDrainPhase4(
+  cdpPort: number,
+  rootPid: number | null,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const ownedRemain = async () =>
+    (
+      selectOwnedObsidianPidsV1({
+        processes: await enumerateObsidianProcessesV1(phase4ObsidianImageName()),
+        rootPid,
+        cdpPort,
+      })
+    ).length > 0;
+  while (Date.now() < deadline) {
+    if (!(await ownedRemain())) return true;
+    await delay(250);
+  }
+  return !(await ownedRemain());
 }
 
 function phase4ObsidianImageName(): string {
@@ -1219,27 +1252,26 @@ function phase4ObsidianImageName(): string {
 }
 
 /**
- * Kill surviving Obsidian processes by their own PIDs. taskkill /T misses
+ * Kill surviving Obsidian processes THIS harness owns. taskkill /T misses
  * grandchildren whose parent already exited, and a self-exited root skips
  * the tree kill entirely, so orphaned Electron children need a direct sweep.
+ *
+ * See nativeObsidianHarness.sweepObsidianSurvivors: the unscoped image-name
+ * form this replaces killed every Obsidian on the machine, including a
+ * concurrent harness's live run and the user's own window.
  */
-async function sweepObsidianSurvivorsPhase4(): Promise<void> {
-  const image = phase4ObsidianImageName();
-  const { stdout } = await execFileAsync("tasklist", [
-    "/FI",
-    `IMAGENAME eq ${image}`,
-    "/FO",
-    "CSV",
-    "/NH",
-  ]).catch(() => ({ stdout: "" }));
-  const pids = [...String(stdout).matchAll(/^"[^"]+","(\d+)",/gimu)].map(
-    (match) => Number(match[1]),
-  );
-  for (const pid of pids) {
-    await execFileAsync("taskkill", ["/PID", String(pid), "/F"]).catch(
-      () => undefined,
-    );
-  }
+async function sweepObsidianSurvivorsPhase4(
+  cdpPort: number,
+  rootPid: number | null,
+  rootCreatedAtMs: number | null,
+): Promise<void> {
+  await sweepOwnedObsidianSurvivorsV1({
+    stage: "phase4Harness teardown",
+    rootPid,
+    cdpPort,
+    rootCreatedAtMs,
+    imageName: phase4ObsidianImageName(),
+  });
 }
 
 async function waitForCdp(
@@ -1303,15 +1335,12 @@ async function waitForNoObsidian(timeoutMs: number): Promise<boolean> {
   return !(await obsidianRunning());
 }
 
+/**
+ * CIM, not `tasklist /FI` — see nativeObsidianHarness.obsidianRunning: the
+ * filter lies on this machine and this is the single-instance gate.
+ */
 async function obsidianRunning(): Promise<boolean> {
-  const { stdout } = await execFileAsync("tasklist", [
-    "/FI",
-    "IMAGENAME eq Obsidian.exe",
-    "/FO",
-    "CSV",
-    "/NH",
-  ]);
-  return /^"Obsidian\.exe"/imu.test(stdout);
+  return (await enumerateObsidianProcessesV1(phase4ObsidianImageName())).length > 0;
 }
 
 async function forceOnlyVaultOpen(
