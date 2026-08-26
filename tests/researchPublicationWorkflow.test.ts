@@ -7,6 +7,8 @@ import {
   AcceptedResearchNoteWriter,
   ResearchPublicationWorkflow,
   createWorkItemSpecV2,
+  researchPublicationCheckpointLinearIssueIdV1,
+  researchPublicationCheckpointOwnsLinearIssueV1,
   type AcceptedResearchNotePackageV1,
   type ResearchPublicationApprovalPortV1,
   type ResearchPublicationCheckpointV1,
@@ -206,7 +208,13 @@ test("a retry adopts the exact pending issue through fresh duplicate readback wi
     "linear_verified",
     "complete",
   ]);
-  assert.equal(fixture.approvalRequests.at(-1)?.proposedAction, "reuse_duplicate");
+  // The adoption rides the ONE approval the user already granted. Asking again
+  // was how a single segment produced two prepared `publish_research_to_linear`
+  // approvals.
+  assert.deepEqual(
+    fixture.approvalRequests.map((request) => request.proposedAction),
+    ["create"],
+  );
   assert.equal(
     fixture.publisher.lastPreviewSections?.title,
     "Agent platform gap closure",
@@ -214,6 +222,127 @@ test("a retry adopts the exact pending issue through fresh duplicate readback wi
   assert.match(
     fixture.vault.files.get("Research/Agent platform.md") ?? "",
     /https:\/\/linear\.app\/acme\/issue\/ENG-42/u,
+  );
+});
+
+test("a dispatched publication prepares exactly one approval across both calls of one run segment", async () => {
+  // Reproduces the flagship compound lane at unit level. Call 1: Linear
+  // acknowledges `issues.create`, the independent readback disagrees, the
+  // checkpoint lands on `reconcile_required` carrying the dispatched issue id in
+  // `pendingAction` and `issue: null`. Call 2 (SAME run, same segment — the
+  // mission-graph node is still ready, so the model calls the tool again) used
+  // to re-enter the approval seat and prepare a SECOND exact approval, with a
+  // different payload fingerprint because the second preview proposes
+  // `reuse_duplicate` where the first proposed `create`.
+  const fixture = workflowFixture("reconcile_required");
+  const first = await fixture.workflow.execute(requestFixture());
+  assert.equal(first.status, "reconcile_required");
+  const dispatched = fixture.checkpoints.at(-1);
+  assert.equal(dispatched?.status, "reconcile_required");
+  assert.equal(dispatched?.issue, null);
+  assert.equal(dispatched?.pendingAction?.issueId, "issue-42");
+  assert.equal(fixture.approvalRequests.length, 1);
+
+  fixture.publisher.mode = "deduplicated";
+  const second = await fixture.workflow.execute(requestFixture());
+
+  assert.equal(second.ok, true);
+  assert.equal(
+    fixture.approvalRequests.length,
+    1,
+    "one publication spends exactly one exact approval",
+  );
+  assert.equal(fixture.publisher.mutationCount, 1);
+  assert.equal(fixture.checkpoints.at(-1)?.status, "complete");
+  // The settle adopts the exact dispatched issue and carries no authority, so a
+  // second create is impossible rather than merely unrequested.
+  assert.equal(
+    fixture.publisher.lastPublishActiveGrants?.length,
+    0,
+  );
+  assert.equal(fixture.publisher.lastPublishPreferredGrantId, undefined);
+});
+
+test("a dispatched publication that cannot read its issue back fails closed instead of asking again", async () => {
+  // Same dispatched-but-unverified checkpoint, but the resume's duplicate
+  // lookup comes back empty. Preparing a second approval here is exactly what
+  // would create the second real Linear issue, so the settle refuses.
+  const fixture = workflowFixture("reconcile_required");
+  const first = await fixture.workflow.execute(requestFixture());
+  assert.equal(first.status, "reconcile_required");
+
+  const second = await fixture.workflow.execute(requestFixture());
+
+  assert.equal(second.ok, false);
+  assert.equal(second.status, "reconcile_required");
+  if (second.status !== "reconcile_required") return;
+  assert.equal(
+    second.error.code,
+    "research_publication_dispatched_issue_unsettled",
+  );
+  assert.equal(second.pendingAction.issueId, "issue-42");
+  assert.equal(
+    fixture.approvalRequests.length,
+    1,
+    "a resume that would have to create must never prepare a second approval",
+  );
+  assert.equal(fixture.publisher.mutationCount, 1);
+});
+
+test("the dispatched Linear issue id is one shared accessor over both durable fields", () => {
+  // The defect was two fields holding one fact and only one of them being read.
+  assert.equal(
+    researchPublicationCheckpointLinearIssueIdV1({
+      issue: null,
+      pendingAction: {
+        provider: "linear",
+        operation: "publish_research_ticket",
+        actionId: null,
+        issueId: "issue-42",
+        grantId: null,
+        workItemFingerprint: HASH,
+        error: { code: "linear_readback_failed", message: "ambiguous" },
+      },
+    }),
+    "issue-42",
+  );
+  assert.equal(
+    researchPublicationCheckpointLinearIssueIdV1({
+      issue: {
+        id: "issue-42",
+        identifier: "ENG-42",
+        url: "https://linear.app/acme/issue/ENG-42",
+        updatedAt: NOW,
+        snapshotHash: HASH,
+      },
+      pendingAction: null,
+    }),
+    "issue-42",
+  );
+  assert.equal(
+    researchPublicationCheckpointLinearIssueIdV1({
+      issue: null,
+      pendingAction: null,
+    }),
+    null,
+  );
+  // `reconcile_required` still is not an owning status: its settle path has to
+  // stay alive, and only the approval boundary consults the accessor directly.
+  assert.equal(
+    researchPublicationCheckpointOwnsLinearIssueV1({
+      status: "reconcile_required",
+      issue: null,
+      pendingAction: {
+        provider: "linear",
+        operation: "publish_research_ticket",
+        actionId: null,
+        issueId: "issue-42",
+        grantId: null,
+        workItemFingerprint: HASH,
+        error: { code: "linear_readback_failed", message: "ambiguous" },
+      },
+    }),
+    false,
   );
 });
 
@@ -464,6 +593,9 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
   failPreview = false;
   private ticket: ReturnType<typeof ticketFromRequest> | null = null;
   lastPreviewSections: ResearchTicketPreviewRequest["sections"] | null = null;
+  lastPublishActiveGrants: ResearchTicketPublishRequest["activeGrants"] | null =
+    null;
+  lastPublishPreferredGrantId: string | undefined = undefined;
 
   constructor(
     public mode: "created" | "deduplicated" | "reconcile_required",
@@ -489,6 +621,8 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
 
   async publish(request: ResearchTicketPublishRequest) {
     this.publishCount += 1;
+    this.lastPublishActiveGrants = request.activeGrants;
+    this.lastPublishPreferredGrantId = request.preferredGrantId;
     const ticket = ticketFromRequest(request);
     assert.equal(ticket.spec.fingerprint, this.ticket?.spec.fingerprint);
     const issue_ = issue(ticket.description);

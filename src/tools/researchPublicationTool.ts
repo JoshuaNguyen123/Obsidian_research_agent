@@ -789,6 +789,12 @@ export function createResearchPublicationTool(
       // that owns an issue without being complete falls through to
       // ResearchPublicationWorkflow, which consumes the SAME predicate and
       // refuses to request another approval or issue another mutation.
+      //
+      // A `reconcile_required` checkpoint deliberately falls through too — its
+      // settle path has to stay alive. Do NOT add a second approval guard here:
+      // the approval boundary is the workflow's, and it reads the same
+      // `researchPublicationCheckpointLinearIssueIdV1` this predicate is built
+      // on, so a dispatched-but-unverified issue can never buy a second prepare.
       const priorPublicationOwnsLinearIssue =
         researchPublicationCheckpointOwnsLinearIssueV1(priorCheckpoint);
       if (priorPublicationOwnsLinearIssue && priorCheckpoint?.status === "complete") {

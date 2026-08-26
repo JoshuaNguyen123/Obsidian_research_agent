@@ -76,21 +76,65 @@ export function researchPublicationStatusOwnsLinearIssueV1(
 }
 
 /**
+ * THE single accessor for "which Linear issue has this publication already put
+ * on the provider?".
+ *
+ * TWO durable checkpoint fields can carry that id and both are authoritative:
+ *
+ *  - `issue` — the readback-verified reference, written once the provider
+ *    returned the issue that was asked for.
+ *  - `pendingAction.issueId` — written when the approved mutation was
+ *    DISPATCHED and the provider outcome came back `may_have_applied`: Linear
+ *    acknowledged `issues.create` and only the independent readback disagreed
+ *    (for example on `description`). That id is the deterministic issue uuid the
+ *    create was pinned to (`ResearchTicketPublisher.deterministicIssueId`), so
+ *    it names a real, provider-visible issue whenever the create applied at all.
+ *
+ * Reading only `issue` is what let ONE run prepare TWO
+ * `publish_research_to_linear` approvals inside a SINGLE segment: the readback
+ * failure persisted `issue: null` with the dispatched id parked in
+ * `pendingAction`, every ownership question answered "no issue yet", and the
+ * model's next call re-entered the workflow and requested a SECOND exact
+ * approval against a live workspace. One field held the fact; the other was the
+ * only one anybody read.
+ *
+ * Folding `pendingAction` in cannot change any issue-owning answer: the
+ * checkpoint store admits `pendingAction` only on `reconcile_required`, and
+ * forbids it on `linear_verified`, `waiting_obsidian` and `complete`
+ * (`ResearchPublicationCheckpointStore.ts` status invariants).
+ */
+export function researchPublicationCheckpointLinearIssueIdV1(
+  checkpoint:
+    | (Pick<ResearchPublicationCheckpointV1, "issue"> &
+        Partial<Pick<ResearchPublicationCheckpointV1, "pendingAction">>)
+    | null
+    | undefined,
+): string | null {
+  if (!checkpoint) return null;
+  return (
+    checkpoint.issue?.id?.trim() ||
+    checkpoint.pendingAction?.issueId?.trim() ||
+    null
+  );
+}
+
+/**
  * Checkpoint-shaped wrapper over the status rule above. A checkpoint only
  * counts as owning an issue when it carries the issue identity that proves it;
- * a status without an `issue` reference cannot bind a later resume and must
- * fail closed rather than authorize a second mutation.
+ * a status without a provider-visible issue id cannot bind a later resume and
+ * must fail closed rather than authorize a second mutation.
  */
 export function researchPublicationCheckpointOwnsLinearIssueV1(
   checkpoint:
-    | Pick<ResearchPublicationCheckpointV1, "status" | "issue">
+    | (Pick<ResearchPublicationCheckpointV1, "status" | "issue"> &
+        Partial<Pick<ResearchPublicationCheckpointV1, "pendingAction">>)
     | null
     | undefined,
 ): boolean {
   return Boolean(
     checkpoint &&
       researchPublicationStatusOwnsLinearIssueV1(checkpoint.status) &&
-      checkpoint.issue?.id?.trim(),
+      researchPublicationCheckpointLinearIssueIdV1(checkpoint),
   );
 }
 
@@ -478,10 +522,91 @@ export class ResearchPublicationWorkflow {
     this.trace("note_lineage_persisted", publicationId);
 
     const approvalRequest = await buildExactApprovalRequest(boundRequest, artifact, preview);
-    this.trace("approval_requested", publicationId, {
-      approvalFingerprint: approvalRequest.approvalFingerprint,
-    });
-    const decision = await this.options.approval.requestExactApproval(approvalRequest);
+    // APPROVAL BOUNDARY. One publication spends exactly ONE exact approval.
+    //
+    // The gate above stops a second Linear MUTATION once the checkpoint owns a
+    // verified issue. It cannot stop a second exact APPROVAL, because a
+    // dispatch whose provider outcome was `may_have_applied` parks its issue id
+    // in `pendingAction` and lands on `reconcile_required` — deliberately not an
+    // owning status, so its settle path stays alive. Falling straight into
+    // `requestExactApproval` from that settle path is what put TWO
+    // `publish_research_to_linear` approvals in one run segment (the first a
+    // `create`, the second a `reuse_duplicate` of the issue the first one had
+    // already created), and a lost duplicate race would have made them two real
+    // issues.
+    //
+    // So: once the ONE shared accessor says this publication already put an
+    // issue on the provider, the settle may only ADOPT that exact issue, and it
+    // does so under the approval the user already granted. Fail closed
+    // otherwise — a settle that would have to create is not a settle.
+    const dispatchedIssueId =
+      researchPublicationCheckpointLinearIssueIdV1(priorCheckpoint);
+    let decision: ResearchPublicationApprovalDecisionV1;
+    if (dispatchedIssueId) {
+      if (
+        approvalRequest.proposedAction !== "reuse_duplicate" ||
+        approvalRequest.duplicate?.id !== dispatchedIssueId
+      ) {
+        const error: ResearchPublicationErrorV1 = {
+          code: "research_publication_dispatched_issue_unsettled",
+          message:
+            `This run already dispatched an approved Linear publication for issue ` +
+            `${dispatchedIssueId}, and that issue did not read back as the exact ` +
+            `duplicate of the accepted research. Settle it by reading the issue ` +
+            `back; a second approval here could create a duplicate issue.`,
+        };
+        const pendingAction: ResearchPublicationPendingActionV1 = {
+          provider: "linear",
+          operation: "publish_research_ticket",
+          actionId: priorCheckpoint?.pendingAction?.actionId ?? null,
+          issueId: dispatchedIssueId,
+          grantId: priorCheckpoint?.pendingAction?.grantId ?? null,
+          workItemFingerprint: preview.ticket.spec.fingerprint,
+          error,
+        };
+        this.trace("already_owns_linear_issue", publicationId, {
+          issueId: dispatchedIssueId,
+          checkpointStatus: priorCheckpoint?.status ?? null,
+          settledWithoutSecondApproval: false,
+        });
+        // No persist. Reaching here means the checkpoint is `reconcile_required`
+        // (the owning statuses returned at the idempotence boundary above, and
+        // the store forbids an `issue` on every other status), so
+        // `resumesReconciliation` already suppressed this attempt's writes and
+        // the durable record still names the dispatched issue for a later settle.
+        return {
+          ok: false,
+          status: "reconcile_required",
+          error,
+          note,
+          artifact,
+          lineage,
+          approvalFingerprint:
+            priorCheckpoint?.approvalFingerprint ??
+            approvalRequest.approvalFingerprint,
+          pendingAction,
+        };
+      }
+      this.trace("already_owns_linear_issue", publicationId, {
+        issueId: dispatchedIssueId,
+        checkpointStatus: priorCheckpoint?.status ?? null,
+        settledWithoutSecondApproval: true,
+      });
+      // No `activeGrants` and no `preferredGrantId`: the adoption is a readback,
+      // and withholding authority makes a second create impossible by
+      // construction rather than by another guard agreeing to behave.
+      decision = {
+        approved: true,
+        approvalId: `research-publication-settle:${dispatchedIssueId}`,
+        approvalFingerprint: approvalRequest.approvalFingerprint,
+        activeGrants: [],
+      };
+    } else {
+      this.trace("approval_requested", publicationId, {
+        approvalFingerprint: approvalRequest.approvalFingerprint,
+      });
+      decision = await this.options.approval.requestExactApproval(approvalRequest);
+    }
     if (!decision.approved) {
       const error = {
         code: "research_publication_approval_denied",
@@ -631,9 +756,11 @@ export class ResearchPublicationWorkflow {
       published.issue,
       boundRequest.destination,
     );
+    // Same shared accessor as the approval boundary and the ownership gate: the
+    // issue this publication already put on the provider is one fact, read one
+    // way, wherever it is asked for.
     const reconciliationIssueMismatch =
-      priorCheckpoint?.pendingAction?.issueId &&
-      priorCheckpoint.pendingAction.issueId !== published.issue.id
+      dispatchedIssueId && dispatchedIssueId !== published.issue.id
         ? "The reconciled Linear issue differs from the pending action target."
         : null;
     if (drift || destinationMismatch || reconciliationIssueMismatch) {
