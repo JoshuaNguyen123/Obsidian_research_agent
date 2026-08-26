@@ -2629,6 +2629,25 @@ test("a resumed graph whose required mutation already completed gets no splice",
     null,
     "A graph whose required mutation already completed owes nothing: splicing here would replay a paid write (the over-splicing guard).",
   );
+
+  // The between-writes exception: a caller that content-verified the owed
+  // count against the live note's required literals (marker A landed, marker
+  // B still absent) may splice exactly the remaining owed write past the
+  // completed proven node.
+  const contentVerified = await session.spliceResumeCurrentNoteWriteNode({
+    objective: "Pay the remaining owed current-note append.",
+    currentNotePath: "Research/Brief.md",
+    wallClockMs: 30_000,
+    minimumReceipts: 1,
+    requiredReceiptKinds: ["vault_write"],
+    owedWriteCount: 1,
+    contentVerifiedOwedWork: true,
+  });
+  assert.equal(
+    contentVerified.splicedNodeId,
+    "resume-current-note-write",
+    "A content-verified owed count is the sanctioned way past the over-splicing guard (between-writes interruption).",
+  );
 });
 
 test("the reducer refuses a splice-shaped write node on any graph that is not the stub", async () => {

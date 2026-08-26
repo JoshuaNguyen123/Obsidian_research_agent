@@ -1236,6 +1236,457 @@ test("continue of a crash-restored tool-less final stub splices the owed write a
   assert.match(noteContent, /MARKER_HEALED_APPEND/u);
 });
 
+test("continue of a stub graph with streaming off and only the durable anchor heals and pays the append", async () => {
+  // Proof-matrix interrupted-continuation, 2026-08-25 22:41Z: the lane runs
+  // with streamWritebackMode "off" and the kill predates the first runtime
+  // checkpoint, so the continuation resumes from the pre-planning anchor
+  // alone — no snapshot, no missionGraphRef — while the graph store still
+  // holds the crash-persisted tool-less `final` stub under the run's
+  // canonical mission id. The streamed-append resume flag can never be set
+  // on this path, so the splice heal must key on the graph's own state plus
+  // the restored mission's write contract. Unhealed, every continuation
+  // segment burned its budget: the loop forced tool-less synthesis
+  // (graph_final_only=true with zero receipts) while the frontier fallback
+  // offered append_to_current_file and the graph authority rejected all
+  // seven attempts as category=unknown_tool.
+  const vault = createVaultHarness();
+  // The lane's mission verbatim, steer sentence included: it is what keeps
+  // the deterministic research classifiers from planting web-evidence
+  // pre-write debt on the continuation. The word "memory" also routes the
+  // structured-intent preflight through semantic search, which the live
+  // lane enables — mirror that here.
+  vault.context.settings.semanticSearchEnabled = true;
+  const originalMission =
+    "Perform exactly two ordered durable appends to the current note, then finish. " +
+    "First append exactly one line containing MARKER_A1 and verify that write. " +
+    "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+
+  // Segment 1: the buffered two-append mission dies at its first model call.
+  // The graph store has already persisted the product's own planned graph and
+  // envelope; reuse that envelope verbatim when rebuilding the crash stub so
+  // the continuation exercises the same envelope-fingerprint gate as the
+  // live resume.
+  const configs: AgentRunConfigEvent[] = [];
+  const interruptedClient: ModelClient = {
+    async chat() {
+      throw new Error("Simulated kill before the first buffered model reply.");
+    },
+    async streamChat() {
+      throw new Error("Simulated kill before the first streamed byte.");
+    },
+  };
+  await runAgentMission({
+    prompt: originalMission,
+    modelClient: interruptedClient,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: { onRunConfig: (event) => configs.push(event) },
+  }).catch(() => {
+    // The simulated kill may surface as a rejected run or a completed error
+    // run depending on the terminal path; only the durable artifacts matter.
+  });
+  const interruptedRunId = configs.at(-1)?.runId;
+  assert.ok(interruptedRunId);
+  const interruptedStore = await readMissionGraphStoreRecord(
+    vault.context,
+    canonicalMissionGraphId(interruptedRunId),
+  );
+  assert.ok(
+    interruptedStore,
+    "Segment 1 must persist the mission graph store; without it this fixture no longer reproduces the crash-restored stub.",
+  );
+  const interruptedGraph = interruptedStore.record.graph;
+  const finalNode = interruptedGraph.nodes.final;
+  assert.ok(finalNode);
+  const graphStorePath = [...vault.files.keys()].find((path) =>
+    path.startsWith("Agent Runs/Mission Graphs/"),
+  );
+  assert.ok(graphStorePath);
+  vault.files.delete(graphStorePath);
+  await persistInitialMissionGraph(vault.context, {
+    ...interruptedGraph,
+    revision: 0,
+    journalHeadFingerprint: null,
+    continuationCheckpoint: null,
+    nodes: {
+      final: {
+        ...finalNode,
+        dependencyIds: [],
+        status: "ready",
+        allowedTools: [],
+        evidence: [],
+        receipts: [],
+      },
+    },
+  });
+  // The kill predates mission-ledger-start AND the first checkpoint: replace
+  // the run note with ONLY the pre-planning anchor, exactly what the durable
+  // anchor seam had persisted, and leave no runtime snapshot at all.
+  vault.files.delete(`Agent Runs/${interruptedRunId}.md`);
+  await writeMissionLedger(
+    vault.context,
+    createPrePlanningAnchorLedger({
+      runId: interruptedRunId,
+      mission: originalMission,
+      targetNotePath: "Current.md",
+      now: new Date("2026-08-25T22:41:00.000Z"),
+    }),
+  );
+
+  // Segment 2: `continue run <id>` must heal the restored stub before the
+  // loop starts even though no streamed-writeback context exists.
+  const resumeRequests: ModelChatRequest[] = [];
+  const toolStarts: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const seg2Configs: AgentRunConfigEvent[] = [];
+  await runAgentMission({
+    prompt: `continue run ${interruptedRunId}`,
+    modelClient: createModelClient(
+      [
+        responseWithToolCall("append_to_current_file", {
+          text: "MARKER_A1",
+        }),
+        responseWithToolCall("append_to_current_file", {
+          text: "MARKER_B2",
+        }),
+        {
+          message: {
+            role: "assistant",
+            content:
+              "Both ordered appends are durably recorded with verified receipts.",
+            toolCalls: [],
+          },
+          toolCalls: [],
+        },
+      ],
+      resumeRequests,
+    ),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onRunConfig: (event) => seg2Configs.push(event),
+      onToolStart: (event) => toolStarts.push(event.name),
+      onRunComplete: (event) => completions.push(event),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  assert.ok(
+    traces.some((event) => event.id === "mission-graph-resume-writeback-splice"),
+    JSON.stringify({
+      rule: "The splice heal must fire from the graph's own owes-work state; the streamed-append resume flag cannot exist on a streaming-off anchor-only continuation.",
+      traceIds: traces.map((event) => event.id).slice(0, 60),
+      failures: traces
+        .filter((event) => /failed|error/iu.test(event.id))
+        .map((event) => event.message)
+        .slice(0, 5),
+    }),
+  );
+  // The frontier and the authority must agree: the offered append is the one
+  // the graph session admits, so no call may be rejected as an unknown or
+  // not-ready graph tool.
+  const graphRejections = traces.filter((event) =>
+    /graph-rejected/u.test(event.id),
+  );
+  assert.deepEqual(
+    graphRejections.map((event) => event.message),
+    [],
+    "The graph authority rejected a tool the offered frontier advertised — the two subsystems disagree again.",
+  );
+  const firstTools =
+    resumeRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(
+    firstTools.includes("append_to_current_file"),
+    JSON.stringify({
+      rule: "The healed graph must expose append_to_current_file through the normal frontier on the very first resumed step.",
+      requests: resumeRequests.map(
+        (request) => request.tools?.map((tool) => tool.function.name) ?? [],
+      ),
+    }),
+  );
+  assert.ok(
+    toolStarts.includes("append_to_current_file"),
+    JSON.stringify({
+      rule: "The graph session must authorize the spliced tool instead of refusing its own required write.",
+      toolStarts,
+      completions,
+    }),
+  );
+  // The continuation with ZERO paid receipts must never be steered into
+  // tool-less final synthesis by the final-only stub.
+  const forcedFinalBeforeAnyReceipt = traces.find(
+    (event) =>
+      event.id.startsWith("loop-decision-") &&
+      /action=force_final_no_tools/u.test(event.message ?? "") &&
+      /graph_stub_owes_work=true/u.test(event.message ?? ""),
+  );
+  assert.equal(
+    forcedFinalBeforeAnyReceipt,
+    undefined,
+    JSON.stringify({
+      rule: "A final-only graph counts as satisfied only when its completed nodes carry real receipts/evidence.",
+      decision: forcedFinalBeforeAnyReceipt?.message,
+    }),
+  );
+  // The heal splices ONE owed node PER still-missing required marker (a
+  // node's completion contract closes at its first satisfied receipt, so a
+  // single node cannot carry the second append across segments).
+  const healedStub = await readMissionGraphStoreRecord(
+    vault.context,
+    canonicalMissionGraphId(interruptedRunId),
+  );
+  assert.ok(healedStub);
+  assert.ok(
+    healedStub.record.graph.nodes["resume-current-note-write-2"],
+    JSON.stringify({
+      rule: "A two-marker mission with neither marker landed owes TWO spliced write nodes.",
+      nodeIds: Object.keys(healedStub.record.graph.nodes),
+    }),
+  );
+  // The owed work actually lands: the first ordered append is paid exactly
+  // once in this segment (the second may fall to a later segment when the
+  // spliced budget ends the loop first, and the run must say so).
+  const note = vault.files.get("Current.md") ?? "";
+  assert.equal(
+    note.split("MARKER_A1").length - 1,
+    1,
+    JSON.stringify({ note, completion: completions.at(-1) }),
+  );
+  const lastCompletion = completions.at(-1);
+  assert.ok(lastCompletion);
+  if (!note.includes("MARKER_B2")) {
+    assert.equal(lastCompletion.stopReason, "budget");
+    assert.equal(lastCompletion.autoContinueRecommended, true);
+    // Segment 3 — the lane's next explicit continuation. The restored graph
+    // now holds a PAID spliced node (complete, receipt-backed) beside the
+    // still-owed second node: the "graph outranks segment accounting"
+    // shortcut must not read the paid node as "all satisfied", and the
+    // second owed append must be offered, authorized, and land.
+    const seg2RunId = seg2Configs.at(-1)?.runId;
+    assert.ok(seg2RunId, "segment 2 must publish its run id for continuation");
+    const seg3Traces: AgentTraceEvent[] = [];
+    const seg3Completions: AgentRunCompleteEvent[] = [];
+    await runAgentMission({
+      prompt: `continue run ${seg2RunId}`,
+      modelClient: createModelClient([
+        responseWithToolCall("append_to_current_file", {
+          text: "MARKER_B2",
+        }),
+        {
+          message: {
+            role: "assistant",
+            content:
+              "Both ordered appends are durably recorded with verified receipts.",
+            toolCalls: [],
+          },
+          toolCalls: [],
+        },
+      ]),
+      toolRegistry: createDefaultToolRegistry(),
+      toolContext: vault.context,
+      enableStreaming: false,
+      events: {
+        onTrace: (event) => seg3Traces.push(event),
+        onRunComplete: (event) => seg3Completions.push(event),
+      },
+    });
+    assert.deepEqual(
+      seg3Traces
+        .filter((event) => /graph-rejected/u.test(event.id))
+        .map((event) => event.message),
+      [],
+      "Segment 3 must not have the authority refuse the second owed append.",
+    );
+    const seg3Note = vault.files.get("Current.md") ?? "";
+    assert.equal(
+      seg3Note.split("MARKER_B2").length - 1,
+      1,
+      JSON.stringify({
+        note: seg3Note,
+        completion: seg3Completions.at(-1),
+        traceIds: seg3Traces.map((event) => event.id).slice(0, 60),
+      }),
+    );
+    assert.equal(seg3Note.split("MARKER_A1").length - 1, 1, seg3Note);
+  } else {
+    assert.equal(note.split("MARKER_B2").length - 1, 1, note);
+  }
+});
+
+test("a between-writes continuation splices only the remaining owed append and never duplicates the landed one", async () => {
+  // The lane's OTHER interrupt branch: marker A landed with a receipt-backed
+  // graph node before the kill, marker B is still owed. The restored graph
+  // shows PROVEN completed work, so the bare-stub heal must not be the gate:
+  // the owed count is content-checked against the live note — one missing
+  // marker, one spliced node — and re-appending the landed marker is
+  // redirected by the literal write contract instead of duplicating it.
+  const vault = createVaultHarness();
+  vault.context.settings.semanticSearchEnabled = true;
+  const originalMission =
+    "Perform exactly two ordered durable appends to the current note, then finish. " +
+    "First append exactly one line containing MARKER_A1 and verify that write. " +
+    "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+
+  const configs: AgentRunConfigEvent[] = [];
+  await runAgentMission({
+    prompt: originalMission,
+    modelClient: {
+      async chat() {
+        throw new Error("Simulated kill after the first append committed.");
+      },
+      async streamChat() {
+        throw new Error("Simulated kill after the first append committed.");
+      },
+    },
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: { onRunConfig: (event) => configs.push(event) },
+  }).catch(() => {});
+  const interruptedRunId = configs.at(-1)?.runId;
+  assert.ok(interruptedRunId);
+  const interruptedStore = await readMissionGraphStoreRecord(
+    vault.context,
+    canonicalMissionGraphId(interruptedRunId),
+  );
+  assert.ok(interruptedStore);
+  const interruptedGraph = interruptedStore.record.graph;
+  const appendNodeEntry = Object.values(interruptedGraph.nodes).find((node) =>
+    node.allowedTools.includes("append_to_current_file"),
+  );
+  const finalNode = interruptedGraph.nodes.final;
+  assert.ok(appendNodeEntry && finalNode);
+  const graphStorePath = [...vault.files.keys()].find((path) =>
+    path.startsWith("Agent Runs/Mission Graphs/"),
+  );
+  assert.ok(graphStorePath);
+  vault.files.delete(graphStorePath);
+  // Rebuild the between-writes artifact: the append node completed WITH its
+  // receipt (marker A landed), `final` is ready, and the note carries A.
+  await persistInitialMissionGraph(vault.context, {
+    ...interruptedGraph,
+    revision: 0,
+    journalHeadFingerprint: null,
+    continuationCheckpoint: null,
+    nodes: {
+      [appendNodeEntry.id]: {
+        ...appendNodeEntry,
+        status: "complete",
+        evidence: [
+          {
+            id: "evidence-append-a",
+            kind:
+              appendNodeEntry.completionContract.requiredEvidenceKinds[0] ??
+              "tool-result",
+            fingerprint: `sha256:${"c".repeat(64)}`,
+            observedAt: "2026-08-25T22:41:00.000Z",
+          },
+        ],
+        receipts: [
+          {
+            id: "receipt-append-a",
+            kind:
+              appendNodeEntry.completionContract.requiredReceiptKinds[0] ??
+              "action-receipt",
+            fingerprint: `sha256:${"d".repeat(64)}`,
+            committedAt: "2026-08-25T22:41:00.000Z",
+          },
+        ],
+      },
+      final: {
+        ...finalNode,
+        dependencyIds: [],
+        status: "ready",
+        allowedTools: [],
+        evidence: [],
+        receipts: [],
+      },
+    },
+  });
+  vault.files.set("Current.md", "Initial note\nMARKER_A1");
+  vault.files.delete(`Agent Runs/${interruptedRunId}.md`);
+  await writeMissionLedger(
+    vault.context,
+    createPrePlanningAnchorLedger({
+      runId: interruptedRunId,
+      mission: originalMission,
+      targetNotePath: "Current.md",
+      now: new Date("2026-08-25T22:41:00.000Z"),
+    }),
+  );
+
+  const traces: AgentTraceEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  await runAgentMission({
+    prompt: `continue run ${interruptedRunId}`,
+    modelClient: createModelClient([
+      // A confused model first re-carries the landed marker; the literal
+      // contract must redirect (not execute) it, then the corrected append
+      // pays exactly the missing marker.
+      responseWithToolCall("append_to_current_file", { text: "MARKER_A1" }),
+      responseWithToolCall("append_to_current_file", { text: "MARKER_B2" }),
+      {
+        message: {
+          role: "assistant",
+          content:
+            "Both ordered appends are durably recorded with verified receipts.",
+          toolCalls: [],
+        },
+        toolCalls: [],
+      },
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  const splice = traces.find(
+    (event) => event.id === "mission-graph-resume-writeback-splice",
+  );
+  assert.ok(
+    splice,
+    JSON.stringify({
+      rule: "A proven-but-incomplete final-only graph still owes the note-checked missing marker.",
+      traceIds: traces.map((event) => event.id).slice(0, 60),
+    }),
+  );
+  assert.equal(
+    (splice.outputPreview as { owedWriteCount?: number })?.owedWriteCount,
+    1,
+    "only the marker missing from the live note is owed",
+  );
+  assert.deepEqual(
+    traces
+      .filter((event) => /graph-rejected/u.test(event.id))
+      .map((event) => event.message),
+    [],
+  );
+  const note = vault.files.get("Current.md") ?? "";
+  assert.equal(
+    note.split("MARKER_A1").length - 1,
+    1,
+    JSON.stringify({
+      rule: "The landed marker must never be re-appended.",
+      note,
+      completion: completions.at(-1),
+    }),
+  );
+  assert.equal(
+    note.split("MARKER_B2").length - 1,
+    1,
+    JSON.stringify({ note, completion: completions.at(-1) }),
+  );
+});
+
 test("a live mission publishes its run identity before the pre-config router call", async () => {
   // Regression: proof-matrix lane interrupted-continuation-live, phase 1.
   // RunCoordinator.start() reports `running` synchronously, but the run id

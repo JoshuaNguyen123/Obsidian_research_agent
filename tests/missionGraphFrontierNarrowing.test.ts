@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   constrainToolsToMissionGraphFrontier,
+  missionGraphFinalOnlyStubOwesRequiredWorkV1,
   narrowAdaptiveCodeMutationsToPlannedWritesV1,
   pinnedAppendFrontierRequiresSeededFilePatchV1,
   workspaceCreateReceiptProvesSeededFilesV1,
   type WorkspaceCreateReceiptShapeV1,
 } from "../src/agent/missionGraphFrontier";
+import { missionGraphOnlyFinalSynthesisRemainsV1 } from "../src/agent/missionGraphSelectors";
 import {
   countReadyMissionGraphToolSlots,
   readyMissionGraphFrontierToolNamesV1,
@@ -527,6 +529,10 @@ test("a tool-less ready final still offers current-note writes when no mutation 
   assert.equal(offered.includes("linear_create_issue"), false);
   assert.equal(offered.includes("web_search"), false);
 
+  // "Paid" requires proof: only a completed write node CARRYING its receipt
+  // closes the fallback. A status flip alone proves nothing (a crash can
+  // persist `complete` without the receipt), and the graph authority would
+  // still authorize the re-offered append through a dynamic continuation.
   const afterPaidWrite = {
     nodes: {
       write: {
@@ -535,6 +541,14 @@ test("a tool-less ready final still offers current-note writes when no mutation 
         allowedTools: ["append_to_current_file"],
         inputs: {},
         outputs: {},
+        receipts: [
+          {
+            id: "receipt-append-1",
+            kind: "action-receipt",
+            fingerprint: `sha256:${"a".repeat(64)}`,
+            observedAt: "2026-08-25T22:41:00.000Z",
+          },
+        ],
       },
       final: {
         id: "final",
@@ -553,5 +567,103 @@ test("a tool-less ready final still offers current-note writes when no mutation 
     }).map((definition) => definition.function.name),
     [],
     "paid current-note writes must not re-open append on the final node",
+  );
+
+  const completeWithoutProof = {
+    ...afterPaidWrite,
+    nodes: {
+      ...afterPaidWrite.nodes,
+      write: { ...afterPaidWrite.nodes.write, receipts: [] },
+    },
+  } as any;
+  assert.ok(
+    constrainToolsToMissionGraphFrontier(definitions, completeWithoutProof, {
+      route: "single_model_writeback",
+    })
+      .map((definition) => definition.function.name)
+      .includes("append_to_current_file"),
+    "a completed write node with neither receipts nor evidence proved nothing; the owed current-note write must stay offered",
+  );
+});
+
+test("the final-only stub-owes predicate answers the crash shape and its proven complement", () => {
+  const finalReady = {
+    id: "final",
+    status: "ready",
+    allowedTools: [],
+    inputs: {},
+    outputs: {},
+    completionContract: { requiredEvidenceKinds: ["final-output"] },
+  };
+  // The exact deadlock artifact: ONE ready tool-less `final`, nothing else.
+  // missionGraphOnlyFinalSynthesisRemainsV1 is satisfied VACUOUSLY here (no
+  // non-final node exists to check) — pin both halves so neither predicate
+  // can silently stop covering the shape that burned the continuation budget
+  // (proof-matrix interrupted-continuation, 2026-08-25 22:41Z).
+  const bareStub = {
+    nodes: { final: finalReady },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+  assert.equal(missionGraphOnlyFinalSynthesisRemainsV1(bareStub), true);
+  assert.equal(missionGraphFinalOnlyStubOwesRequiredWorkV1(bareStub), true);
+
+  // Same shape reached by the second path — a replan whose append node was
+  // filtered because a goal was marked done WITHOUT a receipt — must answer
+  // identically: a goal flag is not proof.
+  const receipt = {
+    id: "receipt-1",
+    kind: "action-receipt",
+    fingerprint: `sha256:${"b".repeat(64)}`,
+    observedAt: "2026-08-25T22:41:00.000Z",
+  };
+  const paidStub = {
+    nodes: {
+      final: finalReady,
+      write: {
+        id: "write",
+        status: "complete",
+        allowedTools: ["append_to_current_file"],
+        inputs: {},
+        outputs: {},
+        receipts: [receipt],
+      },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+  assert.equal(missionGraphFinalOnlyStubOwesRequiredWorkV1(paidStub), false);
+
+  const unprovenComplete = {
+    ...paidStub,
+    nodes: {
+      ...paidStub.nodes,
+      write: { ...paidStub.nodes.write, receipts: [], evidence: [] },
+    },
+  } as any;
+  assert.equal(
+    missionGraphFinalOnlyStubOwesRequiredWorkV1(unprovenComplete),
+    true,
+    "a completed node carrying neither receipts nor evidence proved nothing",
+  );
+
+  const liveFrontier = {
+    ...paidStub,
+    nodes: {
+      ...paidStub.nodes,
+      write: { ...paidStub.nodes.write, status: "ready", receipts: [] },
+    },
+  } as any;
+  assert.equal(
+    missionGraphFinalOnlyStubOwesRequiredWorkV1(liveFrontier),
+    false,
+    "a real ready frontier is not the stub shape; the graph serves the tool itself",
+  );
+
+  assert.equal(missionGraphFinalOnlyStubOwesRequiredWorkV1(null), false);
+  assert.equal(
+    missionGraphFinalOnlyStubOwesRequiredWorkV1({
+      nodes: {},
+      capabilityEnvelope: { tools: {} },
+    } as any),
+    false,
   );
 });

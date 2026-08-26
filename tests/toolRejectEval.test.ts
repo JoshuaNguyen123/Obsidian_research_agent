@@ -171,3 +171,27 @@ test("an empty ready frontier never instructs the model to call a tool named non
     /No tool is ready to call; return your best final answer instead\./u,
   );
 });
+
+test("an authority refusal's real reason classifies as invalid_state, not unknown_tool", () => {
+  // The builder used to classify a hardcoded "not available for this prompt"
+  // stand-in, stamping every mission-graph authority refusal unknown_tool —
+  // for a tool the model was correctly OFFERED (proof-matrix
+  // interrupted-continuation, 2026-08-25). Classification must read the
+  // refusing subsystem's actual message.
+  const message = buildOffFrontierToolRejectionMessage({
+    toolName: "append_to_current_file",
+    readyFrontierToolNames: [],
+    reasonMessage:
+      "Tool append_to_current_file is not ready in the authoritative mission graph.",
+  });
+  assert.match(message, /category=invalid_state/u);
+  assert.doesNotMatch(message, /category=unknown_tool/u);
+  // Without a real reason the historical default stands.
+  assert.match(
+    buildOffFrontierToolRejectionMessage({
+      toolName: "append_to_current_file",
+      readyFrontierToolNames: [],
+    }),
+    /category=unknown_tool/u,
+  );
+});
