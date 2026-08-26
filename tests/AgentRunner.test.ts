@@ -26991,3 +26991,169 @@ test("the pre-write proof gate does not govern a mission that declared no pre-wr
     true,
   );
 });
+
+test("a mid-response menu rebuild is recorded as host-caused, not as an unoffered tool name", async () => {
+  // The prime suspect, reproduced. AgentRunner clears and rebuilds
+  // `stepAllowedToolNames` after every committed call in a multi-call
+  // response. Here the step-start menu offers create_folder, the model asks
+  // for the two folders the user named plus the note, and call 1 completes
+  // the graph's only create_folder node -- which drops create_folder from the
+  // menu BEFORE call 2 is validated against it.
+  //
+  // The refusal itself is correct (the graph has no second folder slot and
+  // the authority seats behind this gate refuse the call regardless). What
+  // was wrong is the ATTRIBUTION: this was recorded as `tool_not_allowed`,
+  // the bucket whose meaning is "the model named a tool it was never
+  // offered", and the rejection told the model the tool was "not available
+  // for this prompt" moments after offering it.
+  const prompt =
+    "Create folder Projects/Alpha, create folder Projects/Beta, and create note Projects/Alpha/Brief.md.";
+  const executedCalls: ModelToolCall[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const rejectedTraces: AgentTraceEvent[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.researchMemoryEnabled = false;
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCalls([
+          { name: "create_folder", arguments: { path: "Projects/Alpha" } },
+          { name: "create_folder", arguments: { path: "Projects/Beta" } },
+          {
+            name: "create_file",
+            arguments: {
+              path: "Projects/Alpha/Brief.md",
+              content: "# Brief",
+            },
+          },
+        ]),
+      () => responseWithContent("Created what the mission graph had slots for."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 2,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => {
+        if (event.kind === "tool_rejected") rejectedTraces.push(event);
+      },
+    },
+  });
+
+  // Precondition: the model really was offered create_folder at step start.
+  // Without this the rest of the test proves nothing.
+  const stepStartMenu =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(
+    stepStartMenu.includes("create_folder"),
+    `step-start menu must offer create_folder: ${JSON.stringify(stepStartMenu)}`,
+  );
+
+  const narrowed = rejectedTraces.find(
+    (event) => event.toolName === "create_folder",
+  );
+  assert.ok(
+    narrowed,
+    `expected a create_folder refusal: ${JSON.stringify(
+      rejectedTraces.map((event) => [event.id, event.error?.code]),
+    )}`,
+  );
+  // The refusal is attributed to the host, and NOT to the tool_not_allowed
+  // bucket. This is the assertion that fails on the unfixed tree, where the
+  // code is "tool_not_allowed".
+  assert.equal(narrowed.error?.code, "frontier_narrowed_mid_response");
+  assert.doesNotMatch(String(narrowed.error?.code), /tool_not_allowed/u);
+
+  // The facts reach the trace structurally, so a census never has to parse
+  // the rejection sentence to split host drift from model naming errors.
+  const facts = (narrowed.outputPreview as { offFrontier?: Record<string, unknown> })
+    ?.offFrontier;
+  assert.ok(facts, "refusal trace must carry offFrontier provenance");
+  assert.equal(facts.offeredAtStepStart, true);
+  assert.equal(facts.provenance, "host_narrowed_mid_response");
+  // The multi-call index is what proves the menu changed after the model
+  // answered: index 0 is always validated against the step-start menu.
+  assert.equal(facts.responseCallIndex, 1);
+  assert.equal(facts.responseCallCount, 3);
+  assert.ok(
+    (facts.droppedSinceStepStart as string[]).includes("create_folder"),
+    "the rebuild dropped create_folder and the record must say so",
+  );
+
+  // The model is told the truth rather than a claim it can see is false.
+  assert.doesNotMatch(
+    String(narrowed.message),
+    /not available for this prompt/u,
+  );
+  assert.match(String(narrowed.message), /WAS offered at the start of this step/u);
+
+  // The eval status line carries the same facts for the CSV/census path.
+  const evalLine = statuses.find((message) =>
+    message.startsWith("tool_reject_eval="),
+  );
+  assert.ok(evalLine, "tool_reject_eval status line missing");
+  const evalRecord = JSON.parse(evalLine.slice("tool_reject_eval=".length));
+  assert.equal(evalRecord.errorCategory, "frontier_narrowed");
+  assert.equal(evalRecord.offFrontier.offeredAtStepStart, true);
+  assert.equal(evalRecord.offFrontier.responseCallIndex, 1);
+
+  // Authority is unchanged: the refusal still happened, the unplanned second
+  // folder was NOT created, and the calls the graph did authorize still ran.
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["create_folder", "create_file"],
+  );
+});
+
+test("a genuinely unoffered tool name stays in the tool_not_allowed bucket", async () => {
+  // The other half of the split: if the instrumentation reclassified every
+  // off-frontier refusal, it would drain tool_not_allowed to zero and be
+  // just as wrong as before. A name the step-start menu never carried must
+  // keep its model-side attribution.
+  const prompt = "Summarize the current note.";
+  const executedCalls: ModelToolCall[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const rejectedTraces: AgentTraceEvent[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.researchMemoryEnabled = false;
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("git_commit", { message: "wip" }),
+      () => responseWithContent("Summarized."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 2,
+    events: {
+      onTrace: (event) => {
+        if (event.kind === "tool_rejected") rejectedTraces.push(event);
+      },
+    },
+  });
+
+  const stepStartMenu =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(!stepStartMenu.includes("git_commit"));
+  const refusal = rejectedTraces.find((event) => event.toolName === "git_commit");
+  assert.ok(refusal, "expected git_commit to be refused");
+  assert.notEqual(refusal.error?.code, "frontier_narrowed_mid_response");
+  const facts = (refusal.outputPreview as { offFrontier?: Record<string, unknown> })
+    ?.offFrontier;
+  assert.equal(facts?.offeredAtStepStart, false);
+  assert.equal(facts?.provenance, "model_named_unoffered_tool");
+});

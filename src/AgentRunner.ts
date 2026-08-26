@@ -689,7 +689,12 @@ import {
   buildProofGatedWritebackHoldV1,
   buildRepeatedInvalidToolCallCorrectiveV1,
   buildToolRejectEvalV1,
+  classifyOffFrontierRefusalV1,
   describeOffFrontierToolNearMiss as describeOffFrontierToolNearMissImpl,
+  FRONTIER_NARROWED_REFUSAL_CODE_V1,
+  FRONTIER_WITHHELD_REFUSAL_CODE_V1,
+  isHostNarrowedOffFrontierRefusalV1,
+  isHostWithheldOffFrontierRefusalV1,
   mapToolRejectCategory,
 } from "./agent/toolRejectEval";
 import { selectCodeWorkspaceEditToolName } from "./agent/codeWorkflowPlanner";
@@ -3293,6 +3298,24 @@ export async function runAgentMission({
    * site stays in place as the backstop for hallucinated calls.
    */
   const proofGateWriteRejectionCountsByTool = new Map<string, number>();
+  /**
+   * Offered-menu history for this run: tool name -> the most recent step whose
+   * offered menu carried it.
+   *
+   * The offered menu DECAYS across a segment (proof-gate containment, the
+   * phase ceiling, and graph advance all withhold names between steps). A
+   * model that was shown `append_to_current_file` at steps 1-4 and keeps
+   * pursuing it at step 6 did not pick a wrong name -- it picked the name it
+   * was taught, and the host stopped offering it. Refusing that with "not
+   * available for this prompt" is actively misleading, and counting it as
+   * `tool_not_allowed` attributes a host-side menu change to the model.
+   */
+  const offeredToolNameLastStep = new Map<string, number>();
+  /**
+   * Which transform last withheld a name from the offered menu, so the
+   * refusal can say WHY the menu changed instead of only that it did.
+   */
+  const toolMenuWithholdReasonByTool = new Map<string, string>();
   const recordProofGateWriteRejection = (toolName: string): void => {
     proofGateWriteRejectionCountsByTool.set(
       toolName,
@@ -17914,6 +17937,13 @@ export async function runAgentMission({
           .filter(
             (name) => !stepTools.some((tool) => tool.function.name === name),
           );
+        for (const name of withheld) {
+          toolMenuWithholdReasonByTool.set(
+            name,
+            "proof_gate_containment: withheld after repeated proof-gated rejections; " +
+              "restores once the blocking pre-write proofs are satisfied",
+          );
+        }
         events.onTrace?.({
           id: `proof-gate-frontier-containment-${step}`,
           kind: "allowed_tools",
@@ -17950,6 +17980,14 @@ export async function runAgentMission({
           .filter(
             (name) => !stepTools.some((tool) => tool.function.name === name),
           );
+        for (const name of dropped) {
+          toolMenuWithholdReasonByTool.set(
+            name,
+            `phase_menu_ceiling: dropped by the ${
+              researchPhaseDescriptor?.phase ?? "unknown"
+            } phase tool-menu ceiling`,
+          );
+        }
         events.onTrace?.({
           id: `phase-tool-menu-ceiling-${step}`,
           kind: "allowed_tools",
@@ -17964,6 +18002,12 @@ export async function runAgentMission({
     const stepAllowedToolNames = new Set(
       stepTools.map((tool) => tool.function.name),
     );
+    // Offered-menu history, recorded once the step menu is final. A name that
+    // is offered again is no longer withheld, so its stale reason is cleared.
+    for (const name of stepAllowedToolNames) {
+      offeredToolNameLastStep.set(name, step);
+      toolMenuWithholdReasonByTool.delete(name);
+    }
     recordToolsOffered(autonomyRunStats, stepTools.length);
     events.onTrace?.({
       id: `mission-graph-tool-frontier-${step}`,
@@ -20961,9 +21005,45 @@ export async function runAgentMission({
                 node.allowedTools.includes(toolCall.name),
             )
           : null;
-        const rejectionCode = pendingGraphNode
-          ? "plan_dependency_violation"
-          : "tool_not_allowed";
+        // `stepAllowedToolNames` is cleared and rebuilt after every committed
+        // call in a multi-call response, so calls 2..N are validated against a
+        // menu that changed AFTER the model answered. Record whether the name
+        // was on the menu the model actually saw, so a host-caused refusal is
+        // never again indistinguishable from the model naming a tool it was
+        // never offered. `stepTools` is the step-start menu and is not
+        // reassigned inside the call loop.
+        const offFrontierFacts = classifyOffFrontierRefusalV1({
+          toolName: toolCall.name,
+          offeredAtStepStartToolNames: stepTools.map(
+            (candidate) => candidate.function.name,
+          ),
+          liveReadyToolNames: [...stepAllowedToolNames],
+          responseCallIndex: toolIndex,
+          responseCallCount: responseToolCalls.length,
+          // Only steps STRICTLY BEFORE this one count as menu decay; the
+          // current step's names were just written into the same history.
+          lastOfferedAtStep:
+            (offeredToolNameLastStep.get(toolCall.name) ?? step) < step
+              ? offeredToolNameLastStep.get(toolCall.name)!
+              : null,
+          withheldBy: toolMenuWithholdReasonByTool.get(toolCall.name) ?? null,
+        });
+        const hostNarrowedRefusal =
+          isHostNarrowedOffFrontierRefusalV1(offFrontierFacts);
+        const hostWithheldRefusal =
+          isHostWithheldOffFrontierRefusalV1(offFrontierFacts);
+        // Authority is unchanged: this only stops host-side menu drift from
+        // being counted in the bucket that means "the model named a tool it
+        // was never offered". The call is still refused, and the seats behind
+        // this gate (mission-graph authority, plan dependency, approval) are
+        // untouched.
+        const rejectionCode = hostNarrowedRefusal
+          ? FRONTIER_NARROWED_REFUSAL_CODE_V1
+          : hostWithheldRefusal
+            ? FRONTIER_WITHHELD_REFUSAL_CODE_V1
+            : pendingGraphNode
+              ? "plan_dependency_violation"
+              : "tool_not_allowed";
         const preferredNextOnReject = pickPreferredNextTool({
           unpaidDeliveryTools: pendingToolsForUnpaidSetLooseDelivery(
             setLooseDeliveryComplete({
@@ -20973,20 +21053,27 @@ export async function runAgentMission({
           ),
           readyFrontierToolNames: [...stepAllowedToolNames],
         });
-        const rejectCategory = mapToolRejectCategory({
-          toolName: toolCall.name,
-          pendingGraphNodeId: pendingGraphNode?.id ?? null,
-          code: rejectionCode,
-          message: pendingGraphNode
-            ? "off-frontier"
-            : "not available for this prompt",
-        });
+        const rejectCategory = hostNarrowedRefusal
+          ? "frontier_narrowed"
+          : hostWithheldRefusal
+          ? "frontier_withheld"
+          : offFrontierFacts.provenance === "model_emitted_placeholder_name"
+          ? "placeholder_tool_name"
+          : mapToolRejectCategory({
+              toolName: toolCall.name,
+              pendingGraphNodeId: pendingGraphNode?.id ?? null,
+              code: rejectionCode,
+              message: pendingGraphNode
+                ? "off-frontier"
+                : "not available for this prompt",
+            });
         const rejectionMessage = buildOffFrontierToolRejectionMessage({
           toolName: toolCall.name,
           pendingGraphNodeId: pendingGraphNode?.id ?? null,
           readyFrontierToolNames: [...stepAllowedToolNames],
           preferredNextTool: preferredNextOnReject,
           category: rejectCategory,
+          offFrontier: offFrontierFacts,
           heldWriteToolNames: lastProofGatedHoldToolName
             ? [lastProofGatedHoldToolName]
             : [],
@@ -20997,13 +21084,14 @@ export async function runAgentMission({
           expectedPrerequisite: preferredNextOnReject,
           errorCategory: rejectCategory,
           readyFrontier: [...stepAllowedToolNames],
+          offFrontier: offFrontierFacts,
         });
         events.onStatus?.(
           `tool_reject_eval=${JSON.stringify(rejectEval)}`,
         );
         lastUnavailableToolName = toolCall.name;
         events.onStatus?.(
-          pendingGraphNode
+          pendingGraphNode || hostNarrowedRefusal || hostWithheldRefusal
             ? rejectionMessage
             : `Rejected unavailable tool: ${toolCall.name}`,
         );
@@ -21014,6 +21102,10 @@ export async function runAgentMission({
           toolName: toolCall.name,
           message: rejectionMessage,
           inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
+          // Structured provenance, not only prose: a census reading traces
+          // must be able to split host-side menu drift from model-side naming
+          // errors without parsing the rejection sentence.
+          outputPreview: { offFrontier: offFrontierFacts },
           error: {
             code: rejectionCode,
             message: rejectionMessage,
@@ -36926,14 +37018,13 @@ export function describeOffFrontierToolNearMiss(
   );
 }
 
-export function buildOffFrontierToolRejectionMessage(input: {
-  toolName: string;
-  pendingGraphNodeId?: string | null;
-  readyFrontierToolNames: readonly string[];
-  preferredNextTool?: string | null;
-  category?: string | null;
-  heldWriteToolNames?: readonly string[];
-}): string {
+export function buildOffFrontierToolRejectionMessage(
+  // Parameters flow straight through: a hand-restated shape here would drop
+  // any field the implementation later gains (it silently dropped
+  // `reasonMessage` and `offFrontier` when those were added), and the
+  // rejection text would quietly diverge between the two callers.
+  input: Parameters<typeof buildOffFrontierToolRejectionMessageImpl>[0],
+): string {
   return buildOffFrontierToolRejectionMessageImpl(input);
 }
 

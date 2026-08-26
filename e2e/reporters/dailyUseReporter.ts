@@ -116,14 +116,33 @@ interface DailyUseRunRecord extends Pick<
 
 /**
  * Refusal-marker vocabulary shared with the proof matrix's BLOCKER_BUCKETS
- * (scripts/run-proof-matrix.mjs): the same six bucket keys, so
+ * (scripts/run-proof-matrix.mjs): the same seven bucket keys, so
  * summary-sourced and graph-mined rows in
  * docs/eval/playwright-run-metrics.csv stay comparable. Entries are regex
  * SOURCES so counting can always build a fresh global regex (no lastIndex
  * state).
+ *
+ * Two of these are HOST-caused refusals split out of `tool_not_allowed`,
+ * whose meaning is the opposite -- "the model named a tool it was never
+ * offered":
+ *   frontier_narrowed_mid_response    the tool was on the menu the model
+ *                                     answered, and AgentRunner rebuilt the
+ *                                     menu after an earlier call in the SAME
+ *                                     response;
+ *   frontier_withheld_since_earlier_step
+ *                                     the tool was offered in an EARLIER step
+ *                                     of the run and withheld since (proof-gate
+ *                                     containment, phase ceiling, graph
+ *                                     advance), so the model was pursuing a
+ *                                     name it had been taught.
+ * Buckets stay disjoint: neither code carries a `tool_not_allowed` substring
+ * nor each other's, and the rejection text they produce never uses that
+ * phrase either.
  */
 export const TOOL_REFUSAL_MARKER_BUCKETS: ReadonlyArray<readonly [string, string]> = [
   ["tool_not_allowed", "tool_not_allowed"],
+  ["frontier_narrowed_mid_response", "frontier_narrowed_mid_response"],
+  ["frontier_withheld_since_earlier_step", "frontier_withheld_since_earlier_step"],
   ["mission_graph_authority_blocked", "mission_graph_authority_blocked"],
   ["invalid_arguments", "invalid_argument"],
   ["execution_failed", "execution_failed"],
