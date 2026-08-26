@@ -1687,6 +1687,237 @@ test("a between-writes continuation splices only the remaining owed append and n
   );
 });
 
+test("a continuation of a killed run whose graph already completed everything terminates promptly", async () => {
+  // Proof-matrix interrupted-continuation, 2026-08-26 02:16Z: the kill can
+  // land AFTER the graph finished everything (append paid with a receipt,
+  // `final` complete) but before the run's terminal persist. The restored
+  // segment had nothing left to do — acceptance PASSED on the restored
+  // receipts — yet it burned ELEVEN tool-less model calls and ended
+  // classified "error": the REFLEX completion gate (enabled in the live
+  // lane harness) kept demanding research evidence the mission's own prompt
+  // forswears, pushed a correction on every step, and at the step cap
+  // terminal-failed the acceptance-passing run. The reflex heuristic must
+  // defer to mission acceptance, and the loop's final-synthesis shortcut
+  // must also arm on a fully-terminal restored graph (final complete is not
+  // the final-only-remains ready/queued shape).
+  const vault = createVaultHarness();
+  vault.context.settings.semanticSearchEnabled = true;
+  vault.context.settings.agenticReflexEnabled = true;
+  const originalMission =
+    "Perform exactly two ordered durable appends to the current note, then finish. " +
+    "First append exactly one line containing MARKER_A1 and verify that write. " +
+    "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+
+  const configs: AgentRunConfigEvent[] = [];
+  await runAgentMission({
+    prompt: originalMission,
+    modelClient: {
+      async chat() {
+        throw new Error("Simulated kill.");
+      },
+      async streamChat() {
+        throw new Error("Simulated kill.");
+      },
+    },
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: { onRunConfig: (event) => configs.push(event) },
+  }).catch(() => {});
+  const interruptedRunId = configs.at(-1)?.runId;
+  assert.ok(interruptedRunId);
+  const interruptedStore = await readMissionGraphStoreRecord(
+    vault.context,
+    canonicalMissionGraphId(interruptedRunId),
+  );
+  assert.ok(interruptedStore);
+  const interruptedGraph = interruptedStore.record.graph;
+  const appendNodeEntry = Object.values(interruptedGraph.nodes).find((node) =>
+    node.allowedTools.includes("append_to_current_file"),
+  );
+  const finalNode = interruptedGraph.nodes.final;
+  assert.ok(appendNodeEntry && finalNode);
+  const graphStorePath = [...vault.files.keys()].find((path) =>
+    path.startsWith("Agent Runs/Mission Graphs/"),
+  );
+  assert.ok(graphStorePath);
+  vault.files.delete(graphStorePath);
+  await persistInitialMissionGraph(vault.context, {
+    ...interruptedGraph,
+    revision: 0,
+    journalHeadFingerprint: null,
+    continuationCheckpoint: null,
+    nodes: {
+      [appendNodeEntry.id]: {
+        ...appendNodeEntry,
+        status: "complete",
+        evidence: [
+          {
+            id: "evidence-append",
+            kind:
+              appendNodeEntry.completionContract.requiredEvidenceKinds[0] ??
+              "tool-result",
+            fingerprint: `sha256:${"c".repeat(64)}`,
+            observedAt: "2026-08-26T02:15:00.000Z",
+          },
+        ],
+        receipts: [
+          {
+            id: "receipt-append",
+            kind:
+              appendNodeEntry.completionContract.requiredReceiptKinds[0] ??
+              "action-receipt",
+            fingerprint: `sha256:${"d".repeat(64)}`,
+            committedAt: "2026-08-26T02:15:00.000Z",
+          },
+        ],
+      },
+      final: {
+        ...finalNode,
+        dependencyIds: [appendNodeEntry.id],
+        status: "complete",
+        allowedTools: [],
+        evidence: [
+          {
+            id: "evidence-final",
+            kind:
+              finalNode.completionContract.requiredEvidenceKinds[0] ??
+              "final-output",
+            fingerprint: `sha256:${"e".repeat(64)}`,
+            observedAt: "2026-08-26T02:15:30.000Z",
+          },
+        ],
+        receipts: [],
+        verification: finalNode.completionContract.verifierId
+          ? {
+              verifierId: finalNode.completionContract.verifierId,
+              status: "passed",
+              fingerprint: `sha256:${"e".repeat(64)}`,
+              verifiedAt: "2026-08-26T02:15:30.000Z",
+            }
+          : null,
+      },
+    },
+  });
+  vault.files.set("Current.md", "Initial note\nMARKER_A1\nMARKER_B2");
+  vault.files.delete(`Agent Runs/${interruptedRunId}.md`);
+  await writeMissionLedger(
+    vault.context,
+    createPrePlanningAnchorLedger({
+      runId: interruptedRunId,
+      mission: originalMission,
+      targetNotePath: "Current.md",
+      now: new Date("2026-08-26T02:15:40.000Z"),
+    }),
+  );
+  // The lane's interrupted segment got far enough for checkpoints: the
+  // runtime snapshot carries the paid, readback-verified append receipt and
+  // the done note-content goal — which is exactly what let the live
+  // continuation's ACCEPTANCE pass while the reflex gate still failed it.
+  await writeMissionRuntimeSnapshot(
+    vault.context,
+    createMissionRuntimeSnapshot({
+      runId: interruptedRunId,
+      originalMission,
+      currentNotePath: "Current.md",
+      status: "paused",
+      missionGraphRef: {
+        version: 1,
+        missionId: canonicalMissionGraphId(interruptedRunId),
+        path: `Agent Runs/Mission Graphs/${canonicalMissionGraphId(interruptedRunId)}.md`,
+        storeRevision: 1,
+        graphRevision: 0,
+        recordFingerprint: `sha256:${"a".repeat(64)}`,
+        journalHeadFingerprint: null,
+      },
+      operationGoals: { current_note_content: "done" },
+      receipts: [
+        {
+          id: "receipt-append-paid",
+          runId: interruptedRunId,
+          toolName: "append_to_current_file",
+          operation: "append",
+          message: "Appended result to Current.md.",
+          path: "Current.md",
+          createdAt: "2026-08-26T02:15:10.000Z",
+          readback: {
+            status: "verified",
+            checkedAt: "2026-08-26T02:15:10.000Z",
+            observedRevision: "fnv1a32:01234567",
+            observedFingerprint: "fnv1a32:89abcdef",
+          },
+        },
+      ],
+      lastSafeStep: 3,
+      createdAt: new Date("2026-08-26T02:15:00.000Z"),
+      updatedAt: new Date("2026-08-26T02:15:30.000Z"),
+    }),
+  );
+
+  const completions: AgentRunCompleteEvent[] = [];
+  let modelCalls = 0;
+  const thinThenRealFinal = () => {
+    modelCalls += 1;
+    return {
+      message: {
+        role: "assistant" as const,
+        content:
+          modelCalls < 3
+            ? "The mission is already complete."
+            : "Both ordered durable appends are recorded: MARKER_A1 and MARKER_B2 landed with verified receipts. The mission is complete.",
+        toolCalls: [],
+      },
+      toolCalls: [],
+    };
+  };
+  await runAgentMission({
+    prompt: `continue run ${interruptedRunId}`,
+    modelClient: {
+      async chat() {
+        return thinThenRealFinal() as never;
+      },
+      async streamChat() {
+        throw new Error("buffered-only fixture");
+      },
+    },
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  const completion = completions.at(-1);
+  assert.ok(completion);
+  // The reflex gate must defer to passing acceptance instead of burning
+  // every remaining step in completion corrections; the run must terminate
+  // within a few model calls and never as an error.
+  assert.ok(
+    modelCalls <= 5,
+    JSON.stringify({
+      rule: "A restored acceptance-passing mission must terminate promptly, not wander the reflex completion loop to the step cap.",
+      modelCalls,
+      completion,
+    }),
+  );
+  assert.notEqual(
+    completion.stopReason,
+    "error",
+    JSON.stringify({
+      rule: "The reflex heuristic may not terminal-fail an acceptance-passing run; acceptance owns the hard stop.",
+      completion,
+    }),
+  );
+  // Exactly-once holds: the continuation adds nothing to the note.
+  assert.equal(
+    vault.files.get("Current.md"),
+    "Initial note\nMARKER_A1\nMARKER_B2",
+    "the completed mission's note must not gain another append",
+  );
+});
+
 test("a live mission publishes its run identity before the pre-config router call", async () => {
   // Regression: proof-matrix lane interrupted-continuation-live, phase 1.
   // RunCoordinator.start() reports `running` synchronously, but the run id

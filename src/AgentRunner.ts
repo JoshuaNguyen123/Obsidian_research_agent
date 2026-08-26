@@ -19976,11 +19976,26 @@ export async function runAgentMission({
         }
 
         // Item 15: do not terminal-fail reflex when write recovery is still
-        // available; let mission acceptance decide the hard stop.
+        // available; let mission acceptance decide the hard stop. The same
+        // rule governs the no-recovery arm (proof-matrix
+        // interrupted-continuation, 2026-08-26 02:16Z): the reflex is a
+        // heuristic checkpoint, and terminal-failing a run whose MISSION
+        // ACCEPTANCE passes turned a fully-paid resumed segment into an
+        // "error" at the step cap. One acceptance evaluation at this
+        // terminal seat only — never per step.
         if (writeRecoveryAvailable) {
           events.onStatus?.(
             `Reflex still missing ${reflexOutput.completion.missing.join(", ")}; deferring to acceptance.`,
           );
+        } else if (evaluateCurrentAcceptance().status === "pass") {
+          events.onTrace?.({
+            id: `reflex-completion-deferred-${step}`,
+            kind: "verification",
+            step,
+            message:
+              "Reflex completion gate deferred at the terminal step: mission acceptance passes, and acceptance owns the hard stop.",
+            outputPreview: { missing: reflexOutput.completion.missing },
+          });
         } else {
           const message = `I could not complete the mission because required evidence is missing: ${reflexOutput.completion.missing.join(", ")}. No additional vault files were changed.`;
           emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
@@ -21970,11 +21985,24 @@ export async function runAgentMission({
     // required tools, and treating it as satisfied forces tool-less final
     // synthesis against an acceptance that can never pass. Shared predicate
     // with the resume splice heal and the empty-frontier fallback.
+    // The ACCEPTABLY-COMPLETE arm covers the continuation of a run killed
+    // AFTER its graph finished everything (final complete included): the
+    // final-only-remains shape check requires `final` ready/queued, so a
+    // fully terminal restored graph armed nothing, the frontier was
+    // rightly empty, and the segment burned every step asking a tool-less
+    // model to do work the graph had already proved (proof-matrix
+    // interrupted-continuation, 2026-08-26 02:16Z — eleven tool-less calls
+    // ending in an error instead of the final answer).
     const loopDecisionMissionGraph = missionGraphSession?.graph ?? null;
     const missionGraphStubOwesRequiredWork =
       missionGraphFinalOnlyStubOwesRequiredWorkV1(loopDecisionMissionGraph);
     const missionGraphFinalSynthesisOnly =
-      missionGraphOnlyFinalSynthesisRemainsV1(loopDecisionMissionGraph) &&
+      (missionGraphOnlyFinalSynthesisRemainsV1(loopDecisionMissionGraph) ||
+        // isMissionGraphAcceptablyComplete treats a NULL graph as complete
+        // (graphless legacy paths own their accounting); this arm may only
+        // fire for a real, fully-terminal restored graph.
+        (loopDecisionMissionGraph !== null &&
+          isMissionGraphAcceptablyComplete(loopDecisionMissionGraph))) &&
       !missionGraphStubOwesRequiredWork;
     const setLooseDeliveryStillUnpaid =
       setLooseCompoundEnabled &&
