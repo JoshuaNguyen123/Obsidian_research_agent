@@ -2,6 +2,10 @@ import type { App, TFile } from "obsidian";
 import { cosineSimilarity, normalizeCosine } from "../utils/vectorMath";
 import type { AgentSettings } from "../settings";
 import {
+  embeddingPrefixFingerprintV1,
+  resolveEmbeddingPrefixesV1,
+} from "./embeddingPrefixes";
+import {
   chunkMarkdownForSemanticSearch,
   type SemanticChunkingOptions,
 } from "../tools/semanticSearchTools";
@@ -338,11 +342,14 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       return makeSearchFailure(model, dim, "empty_query", "Query is required.", index.indexedAt);
     }
 
+    const prefixes = resolveEmbeddingPrefixesV1(model);
     const response = await this.getEmbeddingProvider().embed({
       model,
       dim,
       documents: [],
       queries: [query],
+      queryPrefix: prefixes.query,
+      documentPrefix: prefixes.document,
     });
     if (!response.ok || response.queries?.length !== 1) {
       return makeSearchFailure(
@@ -570,6 +577,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
             version: LEGACY_INDEX_VERSION,
             model: getSemanticModel(settings),
             dim: getSemanticDim(settings),
+            promptPrefixes: embeddingPrefixFingerprintV1(getSemanticModel(settings)),
             chunking,
             indexedAt: this.now().toISOString(),
             notes,
@@ -626,6 +634,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
         version: INDEX_VERSION,
         model: getSemanticModel(settings),
         dim,
+        promptPrefixes: embeddingPrefixFingerprintV1(getSemanticModel(settings)),
         chunking,
         indexedAt,
         notes,
@@ -831,12 +840,15 @@ export async function embedIndexDocuments({
   const vectors: number[][] = [];
   for (let start = 0; start < documents.length; start += boundedBatchSize) {
     const batch = documents.slice(start, start + boundedBatchSize);
+    const indexPrefixes = resolveEmbeddingPrefixesV1(getSemanticModel(settings));
     const response = await provider.embed({
       model: getSemanticModel(settings),
       dim: getSemanticDim(settings),
       cacheDir: settings.semanticModelCacheDir || undefined,
       documents: batch,
       queries: [],
+      queryPrefix: indexPrefixes.query,
+      documentPrefix: indexPrefixes.document,
     });
     if (!response.ok || response.documents?.length !== batch.length) {
       return {
@@ -1393,10 +1405,27 @@ export function getSemanticIndexFreshness(
   return { fresh: true };
 }
 
+/**
+ * Effective prefixes of an index written before prefixes were per-model.
+ *
+ * Every embedding produced by the old provider carried nomic's pair, whatever
+ * the configured model was, because the helper hardcoded it. Treating a stored
+ * index as having been built that way is what makes the invalidation below
+ * exact: an index for a nomic model stays valid, and one for any other model --
+ * whose documents really were embedded with the wrong prefix -- rebuilds once.
+ */
+const LEGACY_HARDCODED_PREFIX_FINGERPRINT = "search_query: |search_document: ";
+
 function isIndexCompatible(index: SemanticVaultIndex, settings: AgentSettings): boolean {
   const chunking = getChunking(settings);
+  const storedPrefixes =
+    index.promptPrefixes ?? LEGACY_HARDCODED_PREFIX_FINGERPRINT;
   return (
     (index.version === INDEX_VERSION || index.version === LEGACY_INDEX_VERSION) &&
+    // Embeddings built under one prefix pair are not comparable with those
+    // built under another, so this invalidates a stored index exactly the way a
+    // model change does.
+    storedPrefixes === embeddingPrefixFingerprintV1(getSemanticModel(settings)) &&
     index.model === getSemanticModel(settings) &&
     index.dim === getSemanticDim(settings) &&
     index.chunking.minTokens === chunking.minTokens &&

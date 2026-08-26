@@ -503,13 +503,18 @@ def get_model(model_name, cache_dir):
         instance = TextEmbedding(model_name=model_name, cache_dir=cache_dir or None)
     except TypeError:
         instance = TextEmbedding(model_name=model_name)
-    list(instance.embed(["search_query: warmup"], batch_size=1))
+    list(instance.embed(["warmup"], batch_size=1))
     MODELS[key] = instance
     return instance
 
 def handle(request):
     rid = str(request.get("id") or "")
     model = str(request.get("model") or "nomic-ai/nomic-embed-text-v1.5-Q")
+    # Supplied per request from the caller's model table. Absent means no
+    # prefix, which is the correct default for every model that was not trained
+    # with one.
+    query_prefix = str(request.get("queryPrefix") or "")
+    document_prefix = str(request.get("documentPrefix") or "")
     dim = int(request.get("dim") or 512)
     cache_dir = str(request.get("cacheDir") or "").strip()
     documents = request.get("documents") or []
@@ -529,8 +534,8 @@ def handle(request):
         return
 
     try:
-        document_inputs = ["search_document: " + str(item) for item in documents]
-        query_inputs = ["search_query: " + str(item) for item in queries]
+        document_inputs = [document_prefix + str(item) for item in documents]
+        query_inputs = [query_prefix + str(item) for item in queries]
         document_vectors = []
         query_vectors = []
         if document_inputs:

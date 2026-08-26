@@ -6,6 +6,14 @@ export interface SemanticEmbeddingRequest {
   cacheDir?: string;
   documents: string[];
   queries: string[];
+  /**
+   * Instruction prefixes this model expects. Resolved by the caller from
+   * embeddingPrefixes.ts rather than assumed by the provider, because the
+   * convention is per model and applying the wrong one silently costs recall.
+   * Omitted means no prefix.
+   */
+  queryPrefix?: string;
+  documentPrefix?: string;
 }
 
 export interface SemanticEmbeddingResponse {
