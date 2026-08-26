@@ -337,6 +337,81 @@ export function evidenceFromToolResult(
   return null;
 }
 
+export interface QuotablePassageFormatOptions {
+  /** Citation-authority ids; when present, only these passages are rendered. */
+  allowedPassageIds?: readonly string[];
+  maxPassages?: number;
+  maxCharsPerPassage?: number;
+  maxTotalChars?: number;
+}
+
+const QUOTABLE_PASSAGE_HEADER = [
+  "QUOTABLE SOURCE PASSAGES (verbatim bytes, keyed by citation identifier).",
+  "If the final output quotes anything, copy it character-for-character from inside one block below and cite that block's identifier on the same sentence. Never quote from evidence summaries or memory — they are not source bytes. Paraphrased claims still cite the passage identifier that supports them. Quoting is optional.",
+].join("\n");
+
+/**
+ * Render accepted passage BYTES for the writer prompt, keyed by passage id.
+ *
+ * The writer historically received only evidence summaries plus bare citation
+ * identifiers, so every quotation was the model's own transcription — which
+ * the write-time verifier (`quoteAppearsVerbatim`) then refused, spending the
+ * mission window rediscovering bytes the host had all along. This block is
+ * the claim-first half of that contract: the model is shown the exact bytes
+ * it is allowed to quote before any prose exists.
+ *
+ * Truncation slices at a whitespace boundary and adds NO ellipsis — every
+ * rendered block must remain a verbatim substring of its passage so copying
+ * from it can never fail the verbatim check.
+ */
+export function formatQuotablePassagesForWriteback(
+  passages: readonly ClaimPassageRef[],
+  options: QuotablePassageFormatOptions = {},
+): string | null {
+  const maxPassages = Math.max(1, options.maxPassages ?? 12);
+  const maxCharsPerPassage = Math.max(120, options.maxCharsPerPassage ?? 600);
+  const maxTotalChars = Math.max(
+    maxCharsPerPassage,
+    options.maxTotalChars ?? 6_000,
+  );
+  const allowed =
+    options.allowedPassageIds && options.allowedPassageIds.length > 0
+      ? new Set(options.allowedPassageIds)
+      : null;
+  const usable = passages.filter(
+    (passage) =>
+      passage.id &&
+      passage.text?.trim() &&
+      (allowed === null || allowed.has(passage.id)),
+  );
+  if (usable.length === 0) {
+    return null;
+  }
+  // Newest last: later captures usually carry the mission's focal sources, so
+  // keep the tail when the passage store exceeds the block budget.
+  const selected = usable.slice(-maxPassages);
+  const blocks: string[] = [];
+  let totalChars = 0;
+  for (const passage of selected) {
+    const trimmed = passage.text.trim();
+    let body = trimmed;
+    if (body.length > maxCharsPerPassage) {
+      const cut = body.lastIndexOf(" ", maxCharsPerPassage);
+      body = body.slice(0, cut > maxCharsPerPassage / 2 ? cut : maxCharsPerPassage).trimEnd();
+    }
+    const block = `[${passage.id}]\n${body}`;
+    if (totalChars + block.length > maxTotalChars && blocks.length > 0) {
+      break;
+    }
+    blocks.push(block);
+    totalChars += block.length;
+  }
+  if (blocks.length === 0) {
+    return null;
+  }
+  return [QUOTABLE_PASSAGE_HEADER, ...blocks].join("\n\n");
+}
+
 /**
  * Prefer dossier passage texts from tool output for claim grounding.
  * Re-extracts from content when contentEvidence is absent.

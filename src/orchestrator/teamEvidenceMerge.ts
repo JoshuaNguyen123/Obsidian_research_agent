@@ -3,7 +3,6 @@ import {
   detectEvidenceConflicts,
   listOpenEvidenceConflicts,
 } from "../agent/evidenceConflicts";
-import { sanitizeHandoffQuotes } from "../agent/handoffQuoteSanitizer";
 import {
   mergeMissionEvidence,
   type MissionEvidence,
@@ -64,20 +63,14 @@ export function mergeResearchWorkerResult(input: {
       })),
     ),
   ).length;
-  // The worker's summary is model prose; a quoted span in it attributed to a
-  // source is unverified transcription until checked against the cached
-  // passage bytes. Verify here — the composition point where researcher prose
-  // becomes writer-consumed evidence — with the same predicate the write-time
-  // claim ledger enforces, so the Lead never inherits a quote the ledger
-  // would refuse and burns the mission window rediscovering the true bytes.
-  const sanitizedSummary = sanitizeHandoffQuotes({
-    text: input.worker.handoff.summary,
-    passages: claimPassages,
-    evidence,
-  }).text;
+  // Quote verification happens INSIDE the worker (runResearchWorker), before
+  // the handoff is built and fingerprinted — the merge must not re-edit
+  // specialist prose, or the persisted progressFingerprint would attest text
+  // the Lead never saw. Byte-identity here is pinned by test; a future
+  // producer that skips worker-side sanitation must add its own rather than
+  // reviving a second sanitize authority at the merge.
   const handoff: WorkerHandoff = {
     ...input.worker.handoff,
-    summary: sanitizedSummary,
     // Accept only a worker handoff that satisfied its own proof contract.
     // Usable partial evidence remains available to the Lead for recovery, but
     // it must not silently convert a rejected handoff into accepted proof.

@@ -1827,7 +1827,32 @@ export class AgentView extends ItemView {
         `Lifecycle: ${formatCompoundLifecycleStageStrip(lifecycleReadiness.stages)}`,
       );
     }
-    const userLogItem = this.appendLog("user", prompt);
+    // One mission, one visible prompt: a resume renders as a compact attempt
+    // marker instead of re-printing the machine-shaped continuation command
+    // (which can carry proof-debt claim ids the user never typed). The full
+    // command still reaches the model and conversation history unchanged —
+    // only the rendered transcript row differs. Same predicate the resume
+    // router uses (extractRequestedRunId), so the two can never disagree
+    // about what counts as a continuation.
+    const continuationRunId = extractRequestedRunId(prompt);
+    let userLogItem: HTMLElement | null;
+    if (continuationRunId) {
+      const attempt =
+        (this.continuationAttemptCounts.get(continuationRunId) ?? 1) + 1;
+      this.continuationAttemptCounts.set(continuationRunId, attempt);
+      userLogItem = this.appendLog(
+        "user",
+        `Resuming mission — attempt ${attempt}`,
+      );
+      if (userLogItem) {
+        userLogItem.addClass("agentic-researcher-log-resume");
+        userLogItem.setAttribute("data-testid", "chat-resume-attempt");
+        userLogItem.setAttribute("data-resume-run-id", continuationRunId);
+        userLogItem.setAttribute("data-resume-attempt", String(attempt));
+      }
+    } else {
+      userLogItem = this.appendLog("user", prompt);
+    }
     this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
     // Quiet start: user bubble + subtle agent working indicator (no "Starting
     // mission..." status box or CRT LOAD chrome).
@@ -5275,6 +5300,15 @@ export class AgentView extends ItemView {
       );
     }
   }
+
+  /**
+   * Visible resume attempts per requested run id. Attempt 1 is the original
+   * mission bubble; the first Continue renders as attempt 2. Keyed by the id
+   * the continuation command names — a mission whose segments mint child run
+   * ids restarts the count per segment, which still collapses the repeated
+   * full-command bubbles this exists to remove.
+   */
+  private continuationAttemptCounts = new Map<string, number>();
 
   private nextChatMessageId(): string {
     this.chatMessageSequence += 1;

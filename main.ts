@@ -9607,6 +9607,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         missionGraphId: runId,
         specialistMode: specialistModes[0],
         missionInput: { prompt: input.prompt, specialistModes },
+        quoteSanitation: workerResult.quoteSanitation,
         acceptanceCriteria: [
           "Every referenced evidence id resolves to host-observed mission evidence.",
           "Lead independently verifies acceptance before any mutation.",
@@ -9682,6 +9683,20 @@ export default class AgenticResearcherPlugin extends Plugin {
             ? "Handoff ready."
             : "Handoff rejected.",
       );
+      {
+        const sanitation = workerResult.quoteSanitation;
+        if (
+          sanitation.verifiedCount +
+            sanitation.reattributedCount +
+            sanitation.downgradedCount >
+          0
+        ) {
+          input.events.onStatus?.(
+            `Handoff quote verification: ${sanitation.verifiedCount} verified, ` +
+              `${sanitation.reattributedCount} reattributed, ${sanitation.downgradedCount} downgraded.`,
+          );
+        }
+      }
       input.events.onStatus?.("Lead synthesizing from Adaptive Specialist evidence.");
       await runtime.setSourceLedgerSummary(
         summarizeSourceLedger(workerResult.sourceLedger),

@@ -13,6 +13,7 @@ import {
   type NativeObsidianHarness,
 } from "./nativeObsidianHarness";
 import { clearChatInline } from "./chatCleanup";
+import { extractRequestedRunId } from "../../src/agent/missionResume";
 import { sandboxProbeProvenInSessionV1 } from "./sandboxProbeSessionFreshness";
 import {
   HOST_PROVISIONED_SANDBOX_READINESS_TIMEOUT_MS_V1,
@@ -2109,14 +2110,28 @@ async function submitMission(
     prompt.match(/\bOBS_HELLO_[A-Za-z0-9_]+\b/u)?.[0] ??
     prompt.match(/\bE2E Agent Tests\/[^\s]+\.md\b/u)?.[0] ??
     prompt.slice(0, 96);
+  // A continuation command renders as a compact "Resuming mission" attempt
+  // row, not a full prompt bubble — same predicate as the product's resume
+  // router (extractRequestedRunId).
+  const continuationRunId = extractRequestedRunId(prompt);
   await expect(runButton).toBeEnabled({ timeout: 30_000 });
   await input.fill(prompt);
   await runButton.click();
-  await expect(
-    page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
-      hasText: marker,
-    }).last(),
-  ).toBeVisible({ timeout: 30_000 });
+  if (continuationRunId) {
+    await expect(
+      page
+        .locator(
+          `[data-testid="chat-resume-attempt"][data-resume-run-id="${continuationRunId}"]`,
+        )
+        .last(),
+    ).toBeVisible({ timeout: 30_000 });
+  } else {
+    await expect(
+      page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
+        hasText: marker,
+      }).last(),
+    ).toBeVisible({ timeout: 30_000 });
+  }
   try {
     await expect
       .poll(

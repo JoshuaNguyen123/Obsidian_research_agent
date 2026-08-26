@@ -2,12 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildClaimLedger,
+  claimIdFromGroundingToken,
   normalizeClaimLedger,
   serializeClaimLedger,
   shouldRequireClaimGrounding,
   shouldRequireQuoteSpans,
 } from "../src/agent/claimLedger";
 import { mergeClaimGroundingIntoAcceptance } from "../src/agent/missionAcceptance";
+import { quoteAppearsVerbatim } from "../src/agent/quoteMatch";
 import {
   claimPassagesFromToolResult,
   evidenceFromToolResult,
@@ -238,6 +240,178 @@ test("a quote differing only in smart quotes or spacing still verifies", () => {
   assert.equal(ledger.status, "pass", ledger.missing.join(", "));
 });
 
+test("draft offsets slice back to each claim's sentence, and are never serialized", () => {
+  const source = fetchedSource();
+  // Bullets, CRLF line endings, and a two-sentence line in one draft.
+  const draft =
+    `## Findings\r\n` +
+    `- Quantum battery evidence compares independent laboratory sources [${source.passageId}].\r\n` +
+    `The follow-up study replicates the measurement protocol [${source.passageId}]. ` +
+    `The calibration series confirms the reported retention window [${source.passageId}].\r\n`;
+  const ledger = buildClaimLedger({
+    draft,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Research quantum batteries with cited passages.",
+  });
+  assert.ok(ledger.claims.length >= 3, `claims: ${ledger.claims.length}`);
+  for (const claim of ledger.claims) {
+    assert.equal(typeof claim.draftStart, "number");
+    assert.equal(typeof claim.draftEnd, "number");
+    const sliced = draft
+      .slice(claim.draftStart, claim.draftEnd)
+      .replace(/\s+/gu, " ")
+      .trim();
+    assert.equal(sliced, claim.text);
+  }
+  const serialized = serializeClaimLedger(ledger) as {
+    claims: Array<Record<string, unknown>>;
+  };
+  for (const claim of serialized.claims) {
+    assert.ok(!("draftStart" in claim), "draftStart must not persist");
+    assert.ok(!("draftEnd" in claim), "draftEnd must not persist");
+  }
+});
+
+test("claimIdFromGroundingToken partitions every mintable token shape", () => {
+  // One entry per push site in validateClaimGrounding. A new token shape added
+  // there without a row here (or a row misclassified) fails this table.
+  const table: Array<{ token: string; claimId: string | null }> = [
+    { token: "claim_grounding:fabricated_passage_id", claimId: null },
+    { token: "claim_grounding:missing_quote_span", claimId: null },
+    { token: "claim_grounding:ungrounded:claim:s-0123456789", claimId: "claim:s-0123456789" },
+    { token: "claim_grounding:fabricated:claim:s-abcdef0123-2", claimId: "claim:s-abcdef0123-2" },
+    { token: "claim_grounding:quote_passage:claim:1", claimId: "claim:1" },
+    { token: "claim_grounding:quote_mismatch:claim:7", claimId: "claim:7" },
+    // Document-scoped acceptance tokens from outside the ledger stay null.
+    { token: "limitations_section", claimId: null },
+    { token: "confidence_section", claimId: null },
+    { token: "verifier:final_relevance", claimId: null },
+  ];
+  for (const row of table) {
+    assert.equal(
+      claimIdFromGroundingToken(row.token),
+      row.claimId,
+      row.token,
+    );
+  }
+});
+
+test("claim ids are content-derived: stable across regeneration, changed only by edits", () => {
+  const source = fetchedSource();
+  const draftA =
+    `Quantum battery evidence compares independent laboratory sources [${source.passageId}]. ` +
+    `The follow-up study replicates the measurement protocol [${source.passageId}].`;
+  const first = buildClaimLedger({
+    draft: draftA,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Research quantum batteries with cited passages.",
+  });
+  const second = buildClaimLedger({
+    draft: draftA,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Research quantum batteries with cited passages.",
+  });
+  assert.ok(first.claims.length >= 2);
+  assert.deepEqual(
+    first.claims.map((claim) => claim.id),
+    second.claims.map((claim) => claim.id),
+  );
+  assert.ok(first.claims.every((claim) => /^claim:s-[0-9a-f]{10}(-\d+)?$/u.test(claim.id)));
+
+  // Editing one sentence changes only that sentence's id.
+  const draftB = draftA.replace(
+    "replicates the measurement protocol",
+    "replicates the calibration protocol",
+  );
+  const third = buildClaimLedger({
+    draft: draftB,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Research quantum batteries with cited passages.",
+  });
+  assert.equal(third.claims[0].id, first.claims[0].id);
+  assert.notEqual(third.claims[1].id, first.claims[1].id);
+
+  // Duplicate sentences stay distinguishable via occurrence suffixes.
+  const duplicated = buildClaimLedger({
+    draft:
+      `Quantum battery evidence compares independent laboratory sources [${source.passageId}]. ` +
+      `Quantum battery evidence compares independent laboratory sources [${source.passageId}].`,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Research quantum batteries with cited passages.",
+  });
+  const ids = duplicated.claims.map((claim) => claim.id);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.ok(ids[1].endsWith("-2"));
+});
+
+test("a quote from the second cited passage pins to that passage, not passageIds[0]", () => {
+  // Every quote used to be pinned to the claim's FIRST bound passage, so a
+  // correct verbatim quote drawn from the second cited passage failed as
+  // quote_mismatch. The pin must follow containment; the verbatim standard
+  // itself is unchanged.
+  const source = fetchedSource();
+  const betaId = "source:beta99:passage:0-80";
+  const betaText =
+    "The beta passage carries the decisive phrasing for the follow-up study.";
+  const ledger = buildClaimLedger({
+    draft:
+      `Quantum battery lab reports state "beta passage carries the decisive phrasing for the follow-up" ` +
+      `[${source.passageId}] [${betaId}].`,
+    evidence: [source],
+    passages: [
+      { id: source.passageId!, text: PASSAGE_TEXT },
+      { id: betaId, text: betaText },
+    ],
+    prompt: "Verify and quote the source text for quantum battery claims.",
+    requireQuoteSpans: true,
+  });
+  assert.equal(ledger.status, "pass", ledger.missing.join(", "));
+  const spans = ledger.claims[0].quoteSpans ?? [];
+  assert.equal(spans.length, 1);
+  assert.equal(spans[0].passageId, betaId);
+  assert.equal(typeof spans[0].startChar, "number");
+  assert.equal(typeof spans[0].endChar, "number");
+  assert.ok(
+    quoteAppearsVerbatim(
+      spans[0].quote,
+      betaText.slice(spans[0].startChar, spans[0].endChar),
+    ),
+    "recovered raw span must contain the quote verbatim",
+  );
+});
+
+test("a nowhere-verbatim quote still reports against the cited primary passage", () => {
+  const source = fetchedSource();
+  const betaId = "source:beta99:passage:0-80";
+  const ledger = buildClaimLedger({
+    draft:
+      `Quantum battery lab reports state "phrasing that appears in neither cited window" ` +
+      `[${source.passageId}] [${betaId}].`,
+    evidence: [source],
+    passages: [
+      { id: source.passageId!, text: PASSAGE_TEXT },
+      {
+        id: betaId,
+        text: "Quantum battery reporting in the beta window carries different phrasing entirely.",
+      },
+    ],
+    prompt: "Verify and quote the source text for quantum battery claims.",
+    requireQuoteSpans: true,
+  });
+  assert.equal(ledger.status, "needs_more_work");
+  assert.ok(
+    ledger.missing.some((item) => item.includes("quote_mismatch")),
+    ledger.missing.join(", "),
+  );
+  const spans = ledger.claims[0].quoteSpans ?? [];
+  assert.equal(spans[0]?.passageId, source.passageId);
+});
+
 test("a paraphrase presented as a quote is still rejected", () => {
   // Normalization folds only case, smart quotes, and whitespace. Anything that
   // changes a word must still fail, or the check stops catching invention.
@@ -294,6 +468,51 @@ test("serialize and normalize claim ledger round-trip", () => {
   assert.equal(normalized.status, ledger.status);
   assert.equal(normalized.claims.length, ledger.claims.length);
   assert.deepEqual(normalized.knownPassageIds, ledger.knownPassageIds);
+});
+
+test("verifyQuoteSpans and quoteCorrections survive the ledger round-trip", () => {
+  const source = fetchedSource();
+  // A quote-verify mission whose quote mismatches produces corrections
+  // carrying the passage bytes — exactly what a post-resume correction prompt
+  // needs and what the old serializer silently dropped.
+  const ledger = buildClaimLedger({
+    draft:
+      `Lab reports state "Quantum battery findings contrast several independent laboratories" [${source.passageId}].`,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Verify and quote the source text for quantum battery claims.",
+    requireQuoteSpans: true,
+  });
+  assert.equal(ledger.status, "needs_more_work");
+  assert.ok((ledger.quoteCorrections?.length ?? 0) > 0, "fixture must produce corrections");
+  const normalized = normalizeClaimLedger(serializeClaimLedger(ledger));
+  assert.ok(normalized);
+  assert.equal(normalized.verifyQuoteSpans, ledger.verifyQuoteSpans);
+  assert.deepEqual(normalized.quoteCorrections, ledger.quoteCorrections);
+});
+
+test("legacy ledger records without the verification fields still normalize", () => {
+  const legacy = {
+    version: 1,
+    status: "pass",
+    claims: [
+      {
+        id: "claim:1",
+        text: "Legacy ordinal-id claim persisted before the content-hash scheme.",
+        status: "grounded",
+        passageIds: ["source:abc:passage:0-40"],
+      },
+    ],
+    knownPassageIds: ["source:abc:passage:0-40"],
+    missing: [],
+    reasons: [],
+    requireQuoteSpans: false,
+  };
+  const normalized = normalizeClaimLedger(legacy);
+  assert.ok(normalized);
+  assert.equal(normalized.claims[0].id, "claim:1");
+  assert.equal(normalized.verifyQuoteSpans, undefined);
+  assert.equal(normalized.quoteCorrections, undefined);
 });
 
 test("claim_grounding verifier integrates with runMissionVerifiers", () => {
