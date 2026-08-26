@@ -67,6 +67,11 @@ skills/
 # which Playwright wipes at every attempt start)
 /proof-matrix-state/
 
+# Durable host-death journal. Same reason: a host death recorded under
+# test-results/ is destroyed by the next attempt's wipe, which is exactly why
+# the 2026-08-26 silent deaths left no evidence.
+/e2e-host-diagnostics/
+
 # Playwright
 /test-results/
 /playwright-report/

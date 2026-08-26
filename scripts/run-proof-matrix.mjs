@@ -50,6 +50,8 @@ import {
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-campaign-sweep.mjs";
+
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
 const RUN_CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
@@ -272,26 +274,25 @@ function assertExactCleanHead(expectedHead, stage) {
 }
 
 /**
- * Kill leaked test-vault Obsidian processes between cells. Copied from
- * sweepTestVaultObsidianZombiesV1 (scripts/run-workflow-audit-e2e.mjs) — the
- * command-line filter guarantees a user's real-vault Obsidian is untouched.
+ * Kill leaked test-vault Obsidian processes between cells.
+ *
+ * The sweep body now lives in scripts/e2e-obsidian-campaign-sweep.mjs (over the
+ * shared CommonJS core in scripts/e2e-obsidian-sweep.js) and is shared
+ * with run-workflow-audit-e2e.mjs. The previously duplicated copies selected
+ * by command-line vault match and force-killed with `Stop-Process -Force`,
+ * with NO consultation of the exclusive e2e lock — and they ran here in the
+ * campaign PARENT, before the child runner acquires that lock. A campaign
+ * starting while another session's lane was mid-mission therefore force-killed
+ * that lane's live Obsidian, producing exit 4294967295 with no Windows Error
+ * Reporting event and no crash dump: the "silent host death". The shared
+ * helper defers to a live lock holder and journals every decision.
  */
-function sweepTestVaultObsidianZombies(stage) {
-  if (process.platform !== "win32") return;
-  const script =
-    "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Obsidian.exe'\" | " +
-    "Where-Object { $_.CommandLine -match 'test_vault_obsidian_ai' }); " +
-    "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; " +
-    "Write-Output $procs.Count";
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", timeout: 30_000, windowsHide: true },
-  );
-  const count = Number.parseInt(String(result.stdout ?? "").trim(), 10);
-  if (Number.isFinite(count) && count > 0) {
-    console.log(`proof-matrix[${stage}]: swept ${count} test-vault Obsidian zombie(s).`);
-  }
+async function sweepTestVaultObsidianZombies(stage) {
+  await sweepTestVaultObsidianZombiesV1({
+    stage: `proof-matrix[${stage}]`,
+    env: process.env,
+    repoRoot: REPO_ROOT,
+  });
 }
 
 function listWorkspaceEntries() {
@@ -1052,7 +1053,7 @@ async function main() {
       const attemptIndex = totalAttemptCount(manifest, cell.id) + 1;
       const stage = `${cell.id}#${attemptIndex}`;
       assertExactCleanHead(expectedHead, `${stage} pre`);
-      sweepTestVaultObsidianZombies(stage);
+      await sweepTestVaultObsidianZombies(stage);
       const workspacesBefore = listWorkspaceEntries();
 
       const env = {
@@ -1124,7 +1125,7 @@ async function main() {
         // The excerpt is best-effort; classification falls back to the tail rule.
       }
 
-      sweepTestVaultObsidianZombies(`${stage} post`);
+      await sweepTestVaultObsidianZombies(`${stage} post`);
       removeCampaignWorkspaceDebris(workspacesBefore, stage);
       assertExactCleanHead(expectedHead, `${stage} post`);
 

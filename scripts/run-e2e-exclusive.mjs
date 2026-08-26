@@ -209,14 +209,23 @@ export async function acquireE2eLock(options = {}) {
   }
 }
 
+/**
+ * Mutual exclusion is MACHINE-wide, not per-CDP-port.
+ *
+ * Keying the default lock on the CDP port meant two sessions choosing
+ * different ports never shared a lock and both booted happily — which is how
+ * two harness instances came to coexist on one machine, and coexistence is
+ * what let one instance's teardown sweep force-kill the other's live Obsidian.
+ * There is only ever ONE Obsidian installation and ONE test vault here, so
+ * there is only ever one thing to be exclusive about. The port still travels
+ * in the lock metadata for diagnosis, and OBSIDIAN_E2E_LOCK_PATH still
+ * overrides everything (tests rely on that).
+ */
 export function resolveE2eLockPath(env = process.env) {
   if (env.OBSIDIAN_E2E_LOCK_PATH) {
     return path.resolve(env.OBSIDIAN_E2E_LOCK_PATH);
   }
-  return path.join(
-    os.tmpdir(),
-    `agentic-researcher-obsidian-e2e-cdp-${parseCdpPort(env)}.lock`,
-  );
+  return path.join(os.tmpdir(), "agentic-researcher-obsidian-e2e.lock");
 }
 
 export async function readLockOwner(lockPath) {
