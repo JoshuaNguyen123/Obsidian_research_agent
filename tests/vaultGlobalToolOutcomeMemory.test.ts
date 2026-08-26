@@ -9,6 +9,13 @@ import {
   recordToolOutcome,
 } from "../src/agent/outcomeMemory";
 
+/**
+ * Read instant for this file's fixtures (2026-08-01..03). Outcome history is
+ * recency-weighted, so a penalty depends on when it is read; pinning the
+ * instant keeps these assertions about merging rather than about today's date.
+ */
+const JUST_AFTER = new Date("2026-08-04T00:00:00.000Z");
+
 test("the tool outcome ledger is vault-wide while the rest of memory stays project-scoped", () => {
   const research = getProjectMemoryLocation("Projects/CRDT/Design.md");
   const coding = getProjectMemoryLocation("Desktop notes/Scratch.md");
@@ -79,8 +86,13 @@ test("merging folder ledgers into the vault ledger keeps every observation", () 
   // The point of promoting the ledger: a mission in one folder is now warned
   // by what a mission in another folder learned.
   assert.ok(
-    outcomePenaltyForAction(merged, "web_fetch", "web_resource") >
-      outcomePenaltyForAction(fromCoding, "web_fetch", "web_resource"),
+    outcomePenaltyForAction(merged, "web_fetch", "web_resource", JUST_AFTER) >
+      outcomePenaltyForAction(
+        fromCoding,
+        "web_fetch",
+        "web_resource",
+        JUST_AFTER,
+      ),
   );
 });
 

@@ -16258,7 +16258,11 @@ export async function runAgentMission({
     // Approaches that repeatedly failed in earlier runs on this project. Tool
     // names, target kinds, and error codes only — never paths or URLs.
     ...((): { role: "system"; content: string }[] => {
-      const learned = summarizeOutcomeMemoryForPrompt(toolOutcomeMemory);
+      const learned = summarizeOutcomeMemoryForPrompt(
+        toolOutcomeMemory,
+        8,
+        runToolContext.now?.() ?? new Date(),
+      );
       return learned ? [{ role: "system" as const, content: learned }] : [];
     })(),
     {

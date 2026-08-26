@@ -113,6 +113,7 @@ test("penalty grows monotonically with repeated failures and stays bounded", () 
       memory,
       "code_workspace_create",
       "code_workspace",
+      JUST_AFTER,
     );
 
     assert.ok(
@@ -143,8 +144,22 @@ test("a mostly-successful tool is penalized far less than a mostly-failing one",
     targetKind: "vault_note",
   });
 
-  const forgiving = outcomePenaltyForAction(mostlyWorks, "read_file", "vault_note");
-  const harsh = outcomePenaltyForAction(alwaysFails, "read_file", "vault_note");
+  // This is the test that detonated. Unpinned, it read the wall clock, and
+  // three failures dated 2026-07-10 decay under PENALTY_FREE_FAILURES at about
+  // 47.5 days -- so it passed for weeks and then failed mid-session when that
+  // boundary was crossed, with nothing about the code having changed.
+  const forgiving = outcomePenaltyForAction(
+    mostlyWorks,
+    "read_file",
+    "vault_note",
+    JUST_AFTER,
+  );
+  const harsh = outcomePenaltyForAction(
+    alwaysFails,
+    "read_file",
+    "vault_note",
+    JUST_AFTER,
+  );
 
   assert.ok(
     forgiving < harsh,
@@ -154,8 +169,11 @@ test("a mostly-successful tool is penalized far less than a mostly-failing one",
 
 test("an unknown tool carries no penalty", () => {
   const memory = failNTimes(createToolOutcomeMemory(), 5);
-  assert.equal(outcomePenaltyForAction(memory, "never_seen_tool"), 0);
-  assert.equal(outcomePenaltyForAction(memory, "   "), 0);
+  assert.equal(
+    outcomePenaltyForAction(memory, "never_seen_tool", "none", JUST_AFTER),
+    0,
+  );
+  assert.equal(outcomePenaltyForAction(memory, "   ", "none", JUST_AFTER), 0);
 });
 
 test("records are capped and evicted by least-recently-seen", () => {
