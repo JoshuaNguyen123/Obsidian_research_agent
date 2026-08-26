@@ -20,6 +20,11 @@ import {
   type ToolExecutionContext,
 } from "../../tools/types";
 import {
+  canonicalizeLinearMarkdownV1,
+  firstLinearMarkdownDivergenceV1,
+  type LinearMarkdownCanonicalOptionsV1,
+} from "./linearMarkdownCanonicalV1";
+import {
   getLinearOperationDefinition,
   type LinearOperationKey,
 } from "./operations";
@@ -1274,6 +1279,10 @@ function issueInputMismatchFields(
  * retaining the exact description content. Compare only after applying those
  * rewrites symmetrically; token overlap is not sufficient evidence that the
  * approved payload was persisted intact.
+ *
+ * The rewrite set is `canonicalizeLinearMarkdownV1` — the one shared canonical
+ * form, also used by the ticket publisher's readback. Mutation readback pins
+ * `preserve_check_state` so a provider check-state flip stays a real mismatch.
  */
 function descriptionsCompatiblyMatch(
   actual: unknown,
@@ -1295,69 +1304,20 @@ function describeDescriptionDivergence(
   actual: unknown,
   expected: unknown,
 ): { line: number; actual: string; expected: string } | undefined {
-  const actualLines = canonicalizeLinearDescription(actual).split("\n");
-  const expectedLines = canonicalizeLinearDescription(expected).split("\n");
-  const max = Math.max(actualLines.length, expectedLines.length);
-  for (let index = 0; index < max; index += 1) {
-    if ((actualLines[index] ?? "") !== (expectedLines[index] ?? "")) {
-      return {
-        line: index + 1,
-        actual: (actualLines[index] ?? "").slice(0, 160),
-        expected: (expectedLines[index] ?? "").slice(0, 160),
-      };
-    }
-  }
-  return undefined;
+  return firstLinearMarkdownDivergenceV1(actual, expected, READBACK_MARKDOWN_OPTIONS);
 }
+
+/**
+ * Mutation readback verifies an exact approved payload, so `- [x]` and `- [ ]`
+ * must stay distinguishable here even though ticket dedupe folds them.
+ */
+const READBACK_MARKDOWN_OPTIONS = {
+  taskList: "preserve_check_state",
+} as const satisfies LinearMarkdownCanonicalOptionsV1;
 
 /** Canonicalize only provider-observed Markdown presentation rewrites. */
 function canonicalizeLinearDescription(value: unknown): string {
-  return String(value ?? "")
-    .replace(/\r\n?/gu, "\n")
-    .split("\n")
-    .map((line) => {
-      let normalized = line.replace(/[ \t]+$/u, "");
-      // Linear serializes bare URLs back as self-links with angle-bracket
-      // destinations: "[url](<url>)". Collapse only true self-links so a
-      // deliberate "[text](url)" mismatch still fails verification.
-      normalized = normalized.replace(
-        /\[([^\]\n]+)\]\(<?([^)>\s]+)>?\)/gu,
-        (match, text, destination) => (text === destination ? text : match),
-      );
-      normalized = normalized.replace(/<(https?:\/\/[^>\s]+)>/gu, "$1");
-      // The serializer rewrites inline `__strong__` as `**strong**` anywhere
-      // in a line (observed live: `__init__(replica_id)` came back as
-      // `**init**(replica_id)`). Converge both sides on the asterisk form so
-      // an emphasis-only spelling difference is presentation, not content;
-      // a genuinely different token still fails closed. Same rule as
-      // normalizeComparableTicketText (ResearchTicketPublisher.ts).
-      normalized = normalized.replace(
-        /__([^\s_](?:[^_\r\n]*?[^\s_])?)__/gu,
-        "**$1**",
-      );
-      normalized = normalized.replace(
-        /^([ \t]*)#{1,6}[ \t]+/u,
-        "$1",
-      );
-      normalized = normalized.replace(
-        /^([ \t]*)[-*+][ \t]+\[[xX]\][ \t]+/u,
-        "$1- [x] ",
-      );
-      normalized = normalized.replace(
-        /^([ \t]*)[-*+][ \t]+\[ \][ \t]+/u,
-        "$1- [ ] ",
-      );
-      normalized = normalized.replace(
-        /^([ \t]*)[-*+][ \t]+/u,
-        "$1- ",
-      );
-      if (!/^[ \t]*- /u.test(normalized)) {
-        normalized = normalized.replace(/:[ \t]*$/u, "");
-      }
-      return normalized;
-    })
-    .join("\n")
-    .trimEnd();
+  return canonicalizeLinearMarkdownV1(value, READBACK_MARKDOWN_OPTIONS);
 }
 
 function describePostconditionMismatch(

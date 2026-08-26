@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { verifyPreparedActionFingerprint } from "../src/agent/actions";
 import {
   consumeAuthorityGrant,
@@ -25,6 +26,7 @@ import {
   type LinearResourceType,
   type LinearToolClient,
 } from "../src/integrations/linear";
+import { renderLinearIssueBodyV1 } from "../src/integrations/linear/LinearIssueFormatV1";
 
 const HASH_A = `sha256:${"a".repeat(64)}`;
 const HASH_B = `sha256:${"b".repeat(64)}`;
@@ -746,6 +748,122 @@ test("issue create accepts Linear's bare-URL self-link rewrite", async () => {
   });
   assert.equal(result.ok, true);
   assert.equal(result.receipt?.readback.status, "verified");
+});
+
+/**
+ * The exact body a compound run publishes. `renderLinearIssueBodyV1` renders
+ * every EMPTY section as `_No ... recorded._`, so a real publication always
+ * carries whole-line emphasis spans — the rewrite that made the first Linear
+ * publication of every compound run fail readback.
+ */
+const PUBLICATION_BODY = renderLinearIssueBodyV1({
+  problemImpact: "Readback rejects a faithful publish.",
+  evidence: ["https://example.test/run-note"],
+  proposedWork: ["Share one canonical form across both readback seats."],
+  acceptanceCriteria: [{ id: "AC-1", text: "First publish verifies." }],
+  validation: ["npm run test:linear"],
+  // confidence / non-goals / scope / dependencies deliberately absent, exactly
+  // as a real compound publication leaves them.
+});
+
+/** Linear's observed re-serialization of the body above. */
+function asLinearSerializesIt(body: string): string {
+  return body
+    .replace(/^_([^\r\n]+)_$/gmu, "*$1*")
+    .replace(
+      /^- (https?:\/\/\S+)$/gmu,
+      (_match, url: string) => `- [${url}](<${url}>)`,
+    );
+}
+
+async function publishAndReadBack(
+  readbackDescription: string,
+  grantId: string,
+): Promise<{ ok: boolean; code?: string; fields?: unknown }> {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          description: readbackDescription,
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description: PUBLICATION_BODY,
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) throw new Error("preparation failed");
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId,
+  });
+  return {
+    ok: result.ok,
+    code: result.error?.code,
+    fields: result.error?.details?.mismatchFields,
+  };
+}
+
+test("a faithfully published research body verifies on the first readback", async () => {
+  // Regression: Linear rewrites the whole-line `_No non-goals recorded._`
+  // section filler as `*No non-goals recorded.*`. Only the ticket publisher's
+  // copy of the canonicalizer folded that rewrite; the mutation-readback copy
+  // did not, so the FIRST publish of every compound run failed with
+  // `linear_readback_failed` on `description` even though the issue was
+  // created correctly, and the retry then found its own issue as a duplicate.
+  const serialized = asLinearSerializesIt(PUBLICATION_BODY);
+  assert.notEqual(serialized, PUBLICATION_BODY, "fixture must exercise a rewrite");
+  assert.match(serialized, /^\*No non-goals recorded\.\*$/mu);
+  assert.match(serialized, /- \[https:\/\/example\.test\/run-note\]\(</u);
+
+  const result = await publishAndReadBack(serialized, "grant-linear-publication-roundtrip");
+  assert.equal(result.ok, true, `expected first publish to verify, got ${result.code}`);
+});
+
+test("a truncated published research body still fails readback", async () => {
+  // Same provider rewrites, but Linear stored only part of the body. Absorbing
+  // presentation must not blind the instrument to a dropped section.
+  const truncated = asLinearSerializesIt(PUBLICATION_BODY).split("## Validation")[0];
+  const result = await publishAndReadBack(truncated, "grant-linear-publication-truncated");
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "linear_readback_failed");
+  assert.deepEqual(result.fields, ["description"]);
+});
+
+test("a substantively altered published research body still fails readback", async () => {
+  // The altered line is itself an emphasis span, so it is folded by the same
+  // rule that makes the faithful case pass -- the words still have to match.
+  const altered = asLinearSerializesIt(PUBLICATION_BODY).replace(
+    "*No non-goals recorded.*",
+    "*Non-goals were rewritten by a third party.*",
+  );
+  const result = await publishAndReadBack(altered, "grant-linear-publication-altered");
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "linear_readback_failed");
+  assert.deepEqual(result.fields, ["description"]);
 });
 
 test("issue create still refuses a link whose text and destination differ", async () => {
@@ -1668,3 +1786,71 @@ test("a fully-vacuous update still fails closed at preparation", async () => {
   if (!prepared.ok) assert.equal(prepared.error.code, "linear_no_changes");
 });
 
+
+/**
+ * Every seat that compares a submitted Linear body against a provider readback
+ * must fold the SAME provider rewrites. This existed as two independent copies
+ * -- LinearTools' `canonicalizeLinearDescription` and the publisher's
+ * `normalizeComparableTicketText` -- and they drifted: only the publisher copy
+ * learned that Linear re-spells a whole-line `_text_` span as `*text*`. Because
+ * every host-rendered body renders its empty sections as `_No ... recorded._`,
+ * that one missing rule failed the first Linear publication of every compound
+ * run, then drove a retry against a live workspace.
+ *
+ * Source-level guard rather than behavioural, on purpose: drift is only
+ * observable once the two copies disagree, which is exactly too late.
+ */
+test("no Linear readback seat keeps a private description canonicalizer", () => {
+  const seats = [
+    "../src/integrations/linear/LinearTools.ts",
+    "../src/integrations/linear/ResearchTicketPublisher.ts",
+  ];
+  // Rewrites that belong to the shared canonical form. A seat that spells any
+  // of them out again has re-inlined a second, driftable authority.
+  // Literal source fragments, via String.raw so no escape-level ambiguity can
+  // silently defuse the probe. Each one appears only inside a hand-rolled
+  // markdown canonicalizer, never in ordinary seat code.
+  const FENCE = "```";
+  const providerRewrites: Array<[string, string]> = [
+    ["whole-line emphasis", "^([*_])"],
+    ["bullet normalization", String.raw`[ \t]+/gmu, "- "`],
+    ["heading strip", String.raw`#{1,6}[ \t]+`],
+    ["strong-emphasis fold", String.raw`__([^\s_]`],
+    ["fenced-block reflow", `(?=${FENCE})`],
+  ];
+
+  // Self-check: the probes must actually fire on a known-offending sample, or
+  // this guard is a green light that measures nothing.
+  const offendingSample = [
+    String.raw`.replace(/^([*_])([^\s*_])\1$/gmu, "_$1_")`,
+    String.raw`.replace(/^[ \t]*[-*][ \t]+/gmu, "- ")`,
+    String.raw`.replace(/^([ \t]*)#{1,6}[ \t]+/u, "$1")`,
+    String.raw`.replace(/__([^\s_])__/gu, "**$1**")`,
+    `.replace(/(${FENCE})\\n\\n+(?=${FENCE})/gu, "$1\\n")`,
+  ].join("\n");
+  for (const [label, fragment] of providerRewrites) {
+    assert.ok(
+      offendingSample.includes(fragment),
+      `Guard probe "${label}" no longer matches a hand-rolled canonicalizer; ` +
+        "it would pass regardless of what the seats contain.",
+    );
+  }
+
+  const offenders: string[] = [];
+  for (const seat of seats) {
+    const source = readFileSync(new URL(seat, import.meta.url), "utf8");
+    for (const [label, fragment] of providerRewrites) {
+      if (source.includes(fragment)) offenders.push(`${seat}: ${label}`);
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `A private copy of a Linear provider rewrite was reintroduced: ${offenders.join(", ")}. ` +
+      "Call canonicalizeLinearMarkdownV1 instead, or extend the shared form so " +
+      "both readback seats gain the rule. The two seats may differ ONLY in the " +
+      "declared LinearTaskListPolicyV1: mutation readback must catch a " +
+      "check-state flip, ticket dedupe must adopt the retired checkbox render.",
+  );
+});
