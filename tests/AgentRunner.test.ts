@@ -27091,9 +27091,19 @@ test("a mid-response menu rebuild is recorded as host-caused, not as an unoffere
   // The prime suspect, reproduced. AgentRunner clears and rebuilds
   // `stepAllowedToolNames` after every committed call in a multi-call
   // response. Here the step-start menu offers create_folder, the model asks
-  // for the two folders the user named plus the note, and call 1 completes
-  // the graph's only create_folder node -- which drops create_folder from the
-  // menu BEFORE call 2 is validated against it.
+  // for the folder the user named plus one the user never named, and call 1
+  // completes the graph's only create_folder node -- which drops create_folder
+  // from the menu BEFORE call 2 is validated against it.
+  //
+  // FIXTURE NOTE: this originally exhausted the folder node by naming TWO
+  // folders and calling create_folder twice. That is no longer an
+  // under-provisioned mission -- the repeated-operation derivation gives a
+  // two-folder request one node per named folder, so both calls are now
+  // admitted and no refusal occurs. The subject of this test is the
+  // ATTRIBUTION of a mid-response refusal, not the shortfall that used to
+  // cause one, so the mission now names ONE folder and the model asks for a
+  // second the user never named. That call genuinely has no node under
+  // correct provisioning, which is the durable way to reach this seat.
   //
   // The refusal itself is correct (the graph has no second folder slot and
   // the authority seats behind this gate refuse the call regardless). What
@@ -27102,7 +27112,7 @@ test("a mid-response menu rebuild is recorded as host-caused, not as an unoffere
   // offered", and the rejection told the model the tool was "not available
   // for this prompt" moments after offering it.
   const prompt =
-    "Create folder Projects/Alpha, create folder Projects/Beta, and create note Projects/Alpha/Brief.md.";
+    "Create folder Projects/Alpha and create note Projects/Alpha/Brief.md.";
   const executedCalls: ModelToolCall[] = [];
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];

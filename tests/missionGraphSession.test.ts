@@ -3122,6 +3122,188 @@ async function deduplicatedPublicationReceiptFor(input: {
   };
 }
 
+test("both folders of a two-folder mission are admitted tool calls", async () => {
+  // The end-to-end shape of the under-provisioning defect: the model called
+  // create_folder twice (correctly), the plan held ONE node, and the second
+  // admission was refused by the seat behind the tool-menu gate. The refusal
+  // was right; the plan was short. With one node per named folder both calls
+  // are admitted, and each lands on its own exact destination.
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-two-folder-admission",
+    allowedTools: ["create_folder"],
+    plannedTools: ["create_folder"],
+    objective:
+      "Create a folder Projects/Alpha and a folder Projects/Beta for the new work.",
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+
+  const admittedSelectors: (string | null)[] = [];
+  for (let index = 0; index < 2; index += 1) {
+    const start = await session.beginToolExecution("create_folder");
+    assert.equal(
+      start.ok,
+      true,
+      `create_folder call ${index + 1} must be admitted, got ${
+        start.ok ? "ok" : start.reason
+      }`,
+    );
+    const execution = requireExecution(start);
+    const node = session.graph.nodes[execution.nodeId]!;
+    admittedSelectors.push(node.destination?.selector ?? null);
+    await session.finishToolExecution(execution, {
+      ok: true,
+      evidence: evidenceFor(node, String(index + 1), harness.nextTimestamp()),
+      receipt: {
+        id: `receipt-${execution.nodeId}`.slice(0, 128),
+        kind: node.completionContract.requiredReceiptKinds[0] ?? "action-receipt",
+        fingerprint: fp(String(index + 1)),
+        committedAt: harness.nextTimestamp(),
+      },
+    });
+    assert.equal(session.graph.nodes[execution.nodeId]?.status, "complete");
+  }
+
+  assert.deepEqual(admittedSelectors.sort(), [
+    "Projects/Alpha",
+    "Projects/Beta",
+  ]);
+});
+
+test("each named note of a two-note mission carries its own exact destination", async () => {
+  // AgentRunner's exact-vault-path guard (the `exactVaultPathGraphTool` branch)
+  // authorizes create_file/append_file/replace_file/move_path/delete_path only
+  // when the executing node's destination selector EQUALS the prepared target
+  // path. Under-provisioning gave the second note a cloned continuation of the
+  // first node, so its destination named the FIRST note and the guard refused
+  // the call. One node per named destination is what makes the second call
+  // authorizable at all.
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-two-note-destinations",
+    allowedTools: ["create_file"],
+    plannedTools: ["create_file"],
+    objective:
+      "Create Projects/One.md and Projects/Two.md with a short brief in each.",
+  });
+  const selectors = Object.values(graph.nodes)
+    .filter((node) => node.allowedTools.includes("create_file"))
+    .map((node) => node.destination?.selector ?? null)
+    .sort();
+  assert.deepEqual(selectors, ["Projects/One.md", "Projects/Two.md"]);
+  // Both are real .md destinations, so both satisfy the guard's precondition.
+  assert.equal(
+    selectors.every(
+      (selector) => typeof selector === "string" && selector.endsWith(".md"),
+    ),
+    true,
+  );
+
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const admitted: (string | null)[] = [];
+  for (let index = 0; index < 2; index += 1) {
+    const execution = requireExecution(
+      await session.beginToolExecution("create_file"),
+    );
+    const node = session.graph.nodes[execution.nodeId]!;
+    admitted.push(node.destination?.selector ?? null);
+    await session.finishToolExecution(execution, {
+      ok: true,
+      evidence: evidenceFor(node, String(index + 1), harness.nextTimestamp()),
+      receipt: {
+        id: `receipt-${execution.nodeId}`.slice(0, 128),
+        kind: node.completionContract.requiredReceiptKinds[0] ?? "action-receipt",
+        fingerprint: fp(String(index + 1)),
+        committedAt: harness.nextTimestamp(),
+      },
+    });
+  }
+  // Distinct destinations, not a clone of the first: this is the difference
+  // between one accepted call and two.
+  assert.deepEqual(admitted.sort(), ["Projects/One.md", "Projects/Two.md"]);
+});
+
+test("both ordered appends of a two-marker mission are admitted tool calls", async () => {
+  // PAYABILITY PROOF for the same-destination expansion. On the unfixed tree
+  // this mission holds ONE append_to_current_file node: the first call is
+  // admitted, the second finds no node and the seat behind the tool-menu gate
+  // refuses it — the live shape in which a two-marker mission paid one marker
+  // and stopped. This test is the other half of the contract: the extra node
+  // must also be one that something can actually PAY, so it drives both calls
+  // all the way to a receipt and asserts the graph reaches a fully complete
+  // state with no node left owing.
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-two-ordered-appends",
+    allowedTools: ["append_to_current_file"],
+    plannedTools: ["append_to_current_file"],
+    objective:
+      "Perform exactly two ordered durable appends to the current note, then finish. " +
+      "First append exactly one line containing MARKER_A1 and verify that write. " +
+      "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+      "Two appends total, in that order.",
+  });
+  const appendNodes = Object.values(graph.nodes).filter((node) =>
+    node.allowedTools.includes("append_to_current_file"),
+  );
+  assert.equal(appendNodes.length, 2);
+  // Every node names the SAME real destination, so the exact-path guard can
+  // authorize both calls. A marker-shaped selector here would be unpayable.
+  assert.deepEqual(
+    appendNodes.map((node) => node.destination?.selector),
+    ["Research/Brief.md", "Research/Brief.md"],
+  );
+
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const paidObjectives: string[] = [];
+  for (let index = 0; index < 2; index += 1) {
+    const start = await session.beginToolExecution("append_to_current_file");
+    assert.equal(
+      start.ok,
+      true,
+      `ordered append ${index + 1} must be admitted, got ${
+        start.ok ? "ok" : start.reason
+      }`,
+    );
+    const execution = requireExecution(start);
+    const node = session.graph.nodes[execution.nodeId]!;
+    paidObjectives.push(node.objective);
+    await session.finishToolExecution(execution, {
+      ok: true,
+      evidence: evidenceFor(node, String(index + 1), harness.nextTimestamp()),
+      receipt: {
+        id: `receipt-${execution.nodeId}`.slice(0, 128),
+        kind: node.completionContract.requiredReceiptKinds[0] ?? "action-receipt",
+        fingerprint: fp(String(index + 1)),
+        committedAt: harness.nextTimestamp(),
+      },
+    });
+    assert.equal(session.graph.nodes[execution.nodeId]?.status, "complete");
+  }
+
+  // Each admitted node carried its own marker, in the mission's stated order.
+  assert.deepEqual(paidObjectives, [
+    "Append to the current note exactly one separate line containing MARKER_A1.",
+    "Append to the current note exactly one separate line containing MARKER_B2.",
+  ]);
+  // NOTHING UNPAYABLE: every append node the expansion created is discharged.
+  assert.deepEqual(
+    Object.values(session.graph.nodes)
+      .filter((node) => node.allowedTools.includes("append_to_current_file"))
+      .map((node) => node.status),
+    ["complete", "complete"],
+  );
+});
+
 async function graphFor(input: {
   missionId: string;
   allowedTools: string[];
@@ -3129,11 +3311,14 @@ async function graphFor(input: {
   postAcceptanceTools?: string[];
   maxToolCalls?: number;
   maxWallClockMs?: number;
+  objective?: string;
 }): Promise<MissionGraphV3> {
   const registry = registryFor(input.allowedTools);
+  const objective =
+    input.objective ?? "Execute the bounded session fixture mission.";
   const host = await buildHostMissionGraphPlanV1({
     missionId: input.missionId,
-    objective: "Execute the bounded session fixture mission.",
+    objective,
     toolRegistry: registry,
     allowedToolNames: input.allowedTools,
     plannedToolNames: input.plannedTools,
@@ -3147,7 +3332,7 @@ async function graphFor(input: {
     await planMissionGraphV3({
       mission: {
         missionId: input.missionId,
-        objective: "Execute the bounded session fixture mission.",
+        objective,
       },
       routerMode: "off",
       capabilityEnvelope: host.capabilityEnvelope,

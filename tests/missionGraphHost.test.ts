@@ -2021,3 +2021,243 @@ test("a scratch ladder with no binding-requiring tools plans no promotion", asyn
     .flatMap((node) => node.allowedTools);
   assert.equal(order.includes("code_workspace_init_repository"), false);
 });
+
+test("a two-folder request receives one graph node per named folder", async () => {
+  // Discriminating repro: before the shared repeated-operation derivation the
+  // host deduplicated every effectful tool by NAME, so this mission got ONE
+  // create_folder node with no bound destination. The model correctly called
+  // create_folder a second time, no node existed for it, and every seat behind
+  // the tool-menu gate refused the call. A node's completion contract closes
+  // at its first receipt, so one node could never have paid both folders.
+  const names = ["create_folder", "create_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-two-folders",
+    objective:
+      "Create a folder Projects/Alpha and a folder Projects/Beta, then create a note Projects/Alpha/Index.md summarizing them.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+
+  const folderNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_folder"),
+  );
+  assert.equal(folderNodes.length, 2);
+  assert.deepEqual(
+    folderNodes.map((node) => node.destination?.selector).sort(),
+    ["Projects/Alpha", "Projects/Beta"],
+  );
+  // Each folder is a separately budgeted, serialized effectful node.
+  assert.deepEqual(
+    folderNodes.map((node) => node.budget.toolCalls),
+    [1, 1],
+  );
+  const noteNode = Object.values(host.deterministicProposal.nodes).find((node) =>
+    node.allowedTools.includes("create_file"),
+  );
+  assert.equal(noteNode?.destination?.selector, "Projects/Alpha/Index.md");
+});
+
+test("two named notes receive one create_file node each", async () => {
+  const names = ["create_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-two-notes",
+    objective:
+      "Create Projects/One.md and Projects/Two.md with a short brief in each.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+  const createNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_file"),
+  );
+  assert.deepEqual(
+    createNodes.map((node) => node.destination?.selector).sort(),
+    ["Projects/One.md", "Projects/Two.md"],
+  );
+});
+
+test("a single named destination keeps its exact one-node plan", async () => {
+  const names = ["create_folder"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-one-folder",
+    objective: "Create a folder Projects/Alpha.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+  const folderNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_folder"),
+  );
+  assert.equal(folderNodes.length, 1);
+  // Unchanged from before the derivation: one folder still resolves through
+  // the prompt-scoped vault fallback, not a derived destination.
+  assert.equal(
+    folderNodes[0].destination?.selector,
+    "prompt-scoped-vault-target",
+  );
+});
+
+test("a host-allocated no-overwrite vault path is never expanded", async () => {
+  // The host allocated exactly one destination, so prompt vocabulary must not
+  // add a second node behind it.
+  const names = ["create_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-host-allocated-create",
+    objective:
+      "Create Projects/One.md and Projects/Two.md with a short brief in each.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    plannedVaultCreatePath: "Generated/Brief 1.md",
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+  const createNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_file"),
+  );
+  assert.equal(createNodes.length, 1);
+  assert.equal(createNodes[0].destination?.selector, "Generated/Brief 1.md");
+});
+
+/**
+ * The live interrupted-continuation mission, verbatim: TWO ordered appends to
+ * ONE note. A multi-destination sweep scores this shape as zero, which is why
+ * the first measurement of the provisioning defect found no prize.
+ */
+const TWO_ORDERED_APPENDS =
+  "Perform exactly two ordered durable appends to the current note, then finish. " +
+  "First append exactly one line containing MARKER_A1 and verify that write. " +
+  "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+  "Two appends total, in that order. This task needs no web, memory, or vault research.";
+
+test("a two-marker ordered append mission provisions one write node per marker", async () => {
+  // Discriminating repro of the SAME-DESTINATION half of the dedupe defect.
+  // On the unfixed tree this mission gets ONE append_to_current_file node with
+  // budget.toolCalls 1: the run pays marker one, and the frontier then has
+  // nothing to offer for marker two. Acceptance now catches that honestly, but
+  // failing honestly is not passing — greening it needs the second node.
+  const names = ["read_current_file", "append_to_current_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-two-ordered-appends",
+    objective: TWO_ORDERED_APPENDS,
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: "Daily/Today.md",
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+
+  const appendNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("append_to_current_file"),
+  );
+  assert.equal(appendNodes.length, 2);
+  // Distinct literal contracts: one marker each, in the order the mission
+  // states them. A node's contract closes at its first receipt, so this is the
+  // only shape that can pay both.
+  assert.deepEqual(
+    appendNodes.map((node) => node.objective),
+    [
+      "Append to the current note exactly one separate line containing MARKER_A1.",
+      "Append to the current note exactly one separate line containing MARKER_B2.",
+    ],
+  );
+  // PAYABILITY: both nodes keep the SAME real destination — the current note.
+  // Binding an ordered append to its marker instead of its note would make the
+  // node unsatisfiable at the exact-path guard, which is the
+  // `product:unpayable_debt` failure this expansion must not cause.
+  assert.deepEqual(
+    appendNodes.map((node) => node.destination?.selector),
+    ["Daily/Today.md", "Daily/Today.md"],
+  );
+  assert.deepEqual(
+    appendNodes.map((node) => node.budget.toolCalls),
+    [1, 1],
+  );
+  // Ordered, not parallel: the second append depends on the first.
+  const [first, second] = appendNodes;
+  assert.ok(second!.dependencyIds.includes(first!.id));
+});
+
+test("a one-marker append mission keeps its exact single-node plan", async () => {
+  // Byte-identical to the unfixed tree, ordering vocabulary included: "then"
+  // must never expand a contract that owes exactly one write.
+  const names = ["read_current_file", "append_to_current_file"];
+  for (const objective of [
+    "Append one line containing MARKER_A1 to the current note.",
+    "Search my vault, then append exactly one line containing MARKER_A1 to the current note.",
+  ]) {
+    const host = await buildHostMissionGraphPlanV1({
+      missionId: "run-one-ordered-append",
+      objective,
+      toolRegistry: registryFor(names),
+      allowedToolNames: names,
+      modelVisibleToolNames: names,
+      plannedToolNames: names,
+      currentNotePath: "Daily/Today.md",
+      maxToolCalls: 10,
+      maxWallClockMs: 120_000,
+      now: NOW,
+    });
+    const appendNodes = Object.values(host.deterministicProposal.nodes).filter(
+      (node) => node.allowedTools.includes("append_to_current_file"),
+    );
+    assert.equal(appendNodes.length, 1, objective);
+    assert.equal(
+      appendNodes[0]!.objective,
+      "Append the bounded markdown resource using append_to_current_file.",
+      objective,
+    );
+    assert.equal(appendNodes[0]!.destination?.selector, "Daily/Today.md");
+  }
+});
+
+test("a sourced writeback that commits at finalization gets no extra turn", async () => {
+  // These missions hold the write for passage verification and commit all of
+  // their literals in ONE write at the end. A pre-emptive second write node
+  // adds a turn they cannot spend — the failure mode that broke three
+  // fixtures when acceptance first levied literal debt unscoped.
+  const names = ["web_search", "read_current_file", "append_to_current_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-sourced-writeback",
+    objective:
+      "Research the topic on the web, then rewrite the current note with a sourced synthesis containing MARKER_A1 and containing MARKER_B2, citing each passage.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: "Daily/Today.md",
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+  const appendNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("append_to_current_file"),
+  );
+  assert.equal(appendNodes.length, 1);
+  assert.equal(
+    appendNodes[0]!.objective,
+    "Append the bounded markdown resource using append_to_current_file.",
+  );
+});

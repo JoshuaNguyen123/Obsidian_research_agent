@@ -32,6 +32,7 @@ import {
   hasExplicitNoHostDirectoryExportIntent,
   hasRepositoryCodeEditIntent,
 } from "./promptIntentClassifiers";
+import { deriveRepeatedOperationNodesV1 } from "./repeatedOperationTargets";
 import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTool";
 import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
 import { extractExplicitJupyterNotebookPathsV1 } from "./jupyterReflectionIntent";
@@ -183,6 +184,52 @@ export async function buildHostMissionGraphPlanV1(
   // accidental duplicate introduced by overlapping host/router requirements.
   const seenEffectfulPlannedNames = new Set<string>();
   const basePlannedSteps: PlannedToolStepV1[] = [];
+  /**
+   * THE per-tool destination list. It answers "which exact destinations does
+   * this mission owe for this tool", and its LENGTH is therefore the node
+   * count: a node's completion contract closes at its first receipt, so one
+   * node per destination is the only shape that can pay them all.
+   *
+   * The three host-bound families keep their exact prior behavior — a
+   * host-allocated no-overwrite vault path stays exactly one destination
+   * because the HOST allocated exactly one. Everything else defers to the
+   * shared prompt-derived derivation, which returns nothing unless the request
+   * itself either names two or more distinct destinations OR orders two or
+   * more separate writes to a single one.
+   *
+   * A same-target ordered write returns NO selector on purpose: the exact
+   * destination is still the note the host would have resolved anyway, and
+   * every such node must keep it or the exact-path guard would refuse the very
+   * calls these nodes exist to admit.
+   */
+  const resolveExactEffectfulDestinations = (
+    name: string,
+  ): Array<{ selector?: string; objective: string }> => {
+    if (name === "create_file" && input.plannedVaultCreatePath) {
+      return [
+        {
+          selector: input.plannedVaultCreatePath,
+          objective: `Create the exact new vault note ${input.plannedVaultCreatePath} without overwrite.`,
+        },
+      ];
+    }
+    if (name === "code_workspace_create_file") {
+      return boundNewWorkspaceFilePaths.map((path) => ({
+        selector: path,
+        objective: `Create the exact new workspace file ${path} without overwrite.`,
+      }));
+    }
+    if (name === "code_workspace_write_expected") {
+      return explicitWorkspaceWriteExpectedFilePaths.map((path) => ({
+        selector: path,
+        objective: `Hash-bound rewrite the exact workspace file ${path}.`,
+      }));
+    }
+    return deriveRepeatedOperationNodesV1({
+      toolName: name,
+      objective: input.objective,
+    });
+  };
   let explicitVaultReadFileIndex = 0;
   let explicitWorkspaceReadFileIndex = 0;
   for (const name of plannedToolNames) {
@@ -231,45 +278,22 @@ export async function buildHostMissionGraphPlanV1(
     const isVerifiedMermaidRevision =
       name === "upsert_mermaid_block" &&
       basePlannedSteps.at(-1)?.name === "read_mermaid_block";
+    // ONE expansion seat decides how many nodes an effectful tool owes. Every
+    // destination-bearing family resolves through
+    // resolveExactEffectfulDestinations below; a second private "how many
+    // instances" rule here is exactly the drift that left a two-folder request
+    // holding one node.
+    const exactDestinations = resolveExactEffectfulDestinations(name);
     if (
-      name === "create_file" &&
-      input.plannedVaultCreatePath &&
-      !seenEffectfulPlannedNames.has(name)
-    ) {
-      seenEffectfulPlannedNames.add(name);
-      basePlannedSteps.push({
-        name,
-        selector: input.plannedVaultCreatePath,
-        objective: `Create the exact new vault note ${input.plannedVaultCreatePath} without overwrite.`,
-      });
-      continue;
-    }
-    if (
-      name === "code_workspace_create_file" &&
-      boundNewWorkspaceFilePaths.length > 0 &&
+      exactDestinations.length > 0 &&
       !seenEffectfulPlannedNames.has(name)
     ) {
       seenEffectfulPlannedNames.add(name);
       basePlannedSteps.push(
-        ...boundNewWorkspaceFilePaths.map((path) => ({
+        ...exactDestinations.map((destination) => ({
           name,
-          selector: path,
-          objective: `Create the exact new workspace file ${path} without overwrite.`,
-        })),
-      );
-      continue;
-    }
-    if (
-      name === "code_workspace_write_expected" &&
-      explicitWorkspaceWriteExpectedFilePaths.length > 0 &&
-      !seenEffectfulPlannedNames.has(name)
-    ) {
-      seenEffectfulPlannedNames.add(name);
-      basePlannedSteps.push(
-        ...explicitWorkspaceWriteExpectedFilePaths.map((path) => ({
-          name,
-          selector: path,
-          objective: `Hash-bound rewrite the exact workspace file ${path}.`,
+          selector: destination.selector,
+          objective: destination.objective,
         })),
       );
       continue;
