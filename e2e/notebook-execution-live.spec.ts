@@ -26,8 +26,17 @@ const LANE = "notebook-execution-live";
 // scratch sandbox validation when the staged workspace holds an .ipynb
 // (CodeExtensionRuntimeV2 attaches the notebook runtime to the scratch
 // profile), so the ordinary validate ladder is the execution proof.
+// The seed convention is pinned ("starting from 0 and 1") because the
+// assertions are deterministic: the first live run (2026-08-25) delivered a
+// fully executed notebook answering [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+// — a correct reading of the bare prompt — and failed only a hardcoded "144"
+// that assumed the 1,1-start convention. Deterministic assertions need
+// deterministic prompts. This exact string is pinned by the routing unit
+// tests (tests/fixtures/routingGoldenCorpus.ts, tests/AgentRunner.test.ts,
+// tests/jupyterReflectionIntent.test.ts, tests/projectLifecycle.test.ts);
+// change them together.
 const EXACT_PROMPT =
-  "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers, " +
+  "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
   "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it";
 
 test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandbox and delivers outputs", async (
@@ -147,8 +156,16 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
       (cell?.outputs ?? []).filter((output: any) => output?.output_type === "error"),
     );
     expect(errorOutputs, safeState).toHaveLength(0);
-    // F(12) = 144 must appear in a real output payload, not just in source.
-    expect(JSON.stringify(codeCells.map((cell: any) => cell.outputs)), safeState).toContain("144");
+    // The prompt pins the seed convention (starting from 0 and 1), so the
+    // first 12 numbers are F(0)..F(11) and the sequence ends at 89. The
+    // computed tail — and specifically that pinned last term — must appear in
+    // real output payloads, not just in source. Assert the contract the
+    // prompt states, not one implementation of it.
+    const outputsJson = JSON.stringify(codeCells.map((cell: any) => cell.outputs));
+    for (const term of [13, 21, 34, 55]) {
+      expect(outputsJson, safeState).toMatch(new RegExp(`\\b${term}\\b`));
+    }
+    expect(outputsJson, safeState).toMatch(/\b89\b/);
   } finally {
     if (harness) {
       if (exportPath) {

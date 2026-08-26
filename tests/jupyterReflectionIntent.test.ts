@@ -4,6 +4,7 @@ import {
   extractExplicitJupyterNotebookPathsV1,
   hasJupyterReflectionIntentV1,
 } from "../src/agent/jupyterReflectionIntent";
+import { hasExecutableNotebookDeliverableIntent } from "../src/agent/codeDeliverableIntent";
 
 test("extracts safe explicit notebook targets without widening to unsafe paths", () => {
   assert.deepEqual(
@@ -86,5 +87,54 @@ test("requires affirmative reflection language and rejects negation", () => {
       "Write the final reflection to a Jupyter notebook; do not execute cells.",
     ),
     true,
+  );
+});
+
+test("stands down for executable-notebook deliverables (shared predicate, not a re-detection)", () => {
+  // The notebook-execution-live lane's exact prompt: the notebook is the CODE
+  // deliverable (authored, executed, delivered to the Desktop). Before the
+  // shared executable-notebook predicate, this classified as a reflection
+  // write and the mission planned a one-node vault append instead of the
+  // sandbox ladder.
+  assert.equal(
+    hasExecutableNotebookDeliverableIntent(
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
+        "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
+    ),
+    true,
+  );
+  assert.equal(
+    hasJupyterReflectionIntentV1(
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
+        "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
+    ),
+    false,
+  );
+  // Reflection prompts carry no execution/computation authority and keep the
+  // reflection write path.
+  assert.equal(
+    hasExecutableNotebookDeliverableIntent(
+      "Write the final reflection to a Jupyter notebook.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasExecutableNotebookDeliverableIntent(
+      "Run the project and append a reflection to Results.ipynb.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasJupyterReflectionIntentV1(
+      "Run the project and append a reflection to Results.ipynb.",
+    ),
+    true,
+  );
+  // Bare "notebook" prose without Jupyter flavor stays a vault noun.
+  assert.equal(
+    hasExecutableNotebookDeliverableIntent(
+      "create a notebook that computes my monthly budget totals",
+    ),
+    false,
   );
 });

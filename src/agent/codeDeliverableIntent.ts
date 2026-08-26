@@ -57,9 +57,77 @@ export function hasExplicitCodeExecutionProhibition(prompt: string): boolean {
     });
 }
 
+/**
+ * Executable-notebook deliverable: a Jupyter/IPython notebook the user wants
+ * AUTHORED and EXECUTED as an artifact — "create a Jupyter notebook … run its
+ * cells … deliver it". This is THE shared notebook predicate: it feeds
+ * hasCodeDeliverableIntent positively (so the route, the required code
+ * ladder, mission-intent classification, and the streamed-writeback fast path
+ * all inherit notebook recognition through the predicate they already share),
+ * and hasJupyterReflectionIntentV1 / the lifecycle reflection stage consume it
+ * negatively (a notebook that must execute is Code-workspace territory, not a
+ * prose reflection appended to a vault notebook). Before it existed, the
+ * notebook-execution lane's mission carried no recognized code vocabulary at
+ * all and completed vacuously as a single current-note append.
+ *
+ * Deliberately narrow: the notebook must be explicitly Jupyter-flavored
+ * (jupyter / ipython / .ipynb — bare "notebook" prose stays a vault noun),
+ * the notebook itself must be the created object (reflection verbs such as
+ * append/record and reflection objects such as "write the final reflection to
+ * a Jupyter notebook" do not match), and the prompt must carry an execution
+ * or computational-content signal.
+ */
+export function hasExecutableNotebookDeliverableIntent(
+  prompt: string,
+): boolean {
+  if (hasCurrentNoteCodeSampleWriteSurface(prompt)) {
+    return false;
+  }
+  if (hasExplicitCodeExecutionProhibition(prompt)) {
+    return false;
+  }
+  if (!/\b(?:jupyter|ipython)\b|\.ipynb\b/iu.test(prompt)) {
+    return false;
+  }
+  // The notebook (not a reflection/summary written INTO one) is the direct
+  // object of a creation/delivery verb.
+  const notebookIsCreatedObject =
+    /\b(?:build|implement|create|write|make|generate|produce|author|deliver)\s+(?:(?:a|an|the|this|that|one|new|fresh|small|simple|full|complete|working|executable|python)\s+){0,4}(?:jupyter|ipython)\s+notebooks?\b/iu.test(
+      prompt,
+    ) ||
+    /\b(?:build|implement|create|write|make|generate|produce|author|deliver)\b[^.!?;\r\n]{0,40}\.ipynb\b/iu.test(
+      prompt,
+    );
+  if (!notebookIsCreatedObject) {
+    return false;
+  }
+  return (
+    // "run its cells", "execute the notebook", "re-run the kernel" …
+    /\b(?:run|running|re-?run|execute[ds]?|executing)\b[^.!?;\r\n]{0,80}\b(?:cells?|notebooks?|kernels?)\b/iu.test(
+      prompt,
+    ) ||
+    /\b(?:cells?|kernels?)\b[^.!?;\r\n]{0,80}\b(?:run|running|re-?run|execute[ds]?|executing|outputs?)\b/iu.test(
+      prompt,
+    ) ||
+    // "… that computes the first 12 Fibonacci numbers"
+    /\b(?:that|which|to|and)\s+(?:computes?|calculates?|plots?|prints?|solves?|simulates?|trains?|analy[sz]es?)\b/iu.test(
+      prompt,
+    ) ||
+    // "the saved notebook contains … real outputs / executed outputs"
+    /\b(?:executed|real|computed|cell)\s+outputs?\b|\bexecution\s+counts?\b/iu.test(
+      prompt,
+    )
+  );
+}
+
 export function hasCodeDeliverableIntent(prompt: string): boolean {
   if (hasCurrentNoteCodeSampleWriteSurface(prompt)) {
     return false;
+  }
+  // An executable notebook is a standalone code deliverable even though it
+  // names no language, no code file extension, and no game/app/script noun.
+  if (hasExecutableNotebookDeliverableIntent(prompt)) {
+    return true;
   }
   // A later clause can describe the future executable artifact, repository
   // binding, or validation profile without authorizing Code work in this turn.

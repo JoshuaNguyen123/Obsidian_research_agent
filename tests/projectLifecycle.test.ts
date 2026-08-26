@@ -412,6 +412,27 @@ test("validation and reflection are independently routable lifecycle stages", ()
   ]);
 });
 
+test("an executable notebook deliverable does not manufacture a reflection stage from notebook nouns", () => {
+  // The notebook-execution-live lane's exact prompt: "create … a Jupyter
+  // notebook" matched the reflection stage's notebook-noun vocabulary even
+  // though the notebook is the CODE deliverable, which would have planted a
+  // write_project_results reflection node in a desktop-delivery mission.
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
+        "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
+    ),
+    [],
+  );
+  // A reflection written INTO a notebook keeps its stage.
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Run the project and append a reflection to Results.ipynb.",
+    ),
+    ["reflection"],
+  );
+});
+
 test("a natural developer mission infers all six delivery stages without a checkbox", () => {
   const prompt =
     "Investigate conflict-free counters, turn the findings into Linear work, " +
