@@ -414,6 +414,33 @@ export function buildProofGatedWritebackHoldV1(input: {
   };
 }
 
+/**
+ * The corrective for a call that failed twice with identical arguments.
+ *
+ * The FIRST such failure has always received a rich corrective (a schema, a
+ * named prerequisite tool, an exact section list). The repeat received a
+ * ledger blocker and a trace and nothing else — the host decided to stop
+ * retrying and never told the model, so the model's next turn is spent
+ * guessing against a decision it cannot see. Both repeat seats now say the
+ * same thing, once.
+ */
+export function buildRepeatedInvalidToolCallCorrectiveV1(input: {
+  toolName: string;
+  failureCode: string;
+  readyFrontierToolNames: readonly string[];
+}): string {
+  const alternatives = input.readyFrontierToolNames
+    .map((name) => name.trim())
+    .filter((name) => Boolean(name) && name !== input.toolName);
+  return [
+    `Blocked ${input.toolName}: the same arguments failed twice (${input.failureCode}), so this exact call will not be attempted again.`,
+    alternatives.length > 0
+      ? `Either change the arguments, or call one of these exact names instead: ${alternatives.join(", ")}.`
+      : `No other tool is ready. Either change the arguments, or return your best final answer and state in one sentence that ${input.toolName} could not be completed.`,
+    "Do not repeat this exact call.",
+  ].join(" ");
+}
+
 export function buildToolRejectEvalV1(input: {
   userIntentExcerpt: string;
   selectedTool: string;

@@ -687,6 +687,7 @@ import {
 import {
   buildOffFrontierToolRejectionMessage as buildOffFrontierToolRejectionMessageImpl,
   buildProofGatedWritebackHoldV1,
+  buildRepeatedInvalidToolCallCorrectiveV1,
   buildToolRejectEvalV1,
   describeOffFrontierToolNearMiss as describeOffFrontierToolNearMissImpl,
   mapToolRejectCategory,
@@ -15753,6 +15754,17 @@ export async function runAgentMission({
             message: blocker,
             error: { code: "repeated_invalid_tool_call", message: blocker },
           });
+          // The first failure taught; the repeat used to say nothing at all.
+          messages.push({
+            role: "system" as const,
+            content: buildRepeatedInvalidToolCallCorrectiveV1({
+              toolName: toolCall.name,
+              failureCode: failureCode || "invalid_arguments",
+              readyFrontierToolNames: tools.map(
+                (candidate) => candidate.function.name,
+              ),
+            }),
+          });
         } else {
           invalidToolCallFailureSignatures.add(failureSignature);
           const definition = tools.find(
@@ -21271,6 +21283,17 @@ export async function runAgentMission({
             toolName: toolCall.name,
             message: blocker,
             error: { code: "repeated_invalid_tool_call", message: blocker },
+          });
+          // The first failure taught; the repeat used to say nothing at all.
+          messages.push({
+            role: "system" as const,
+            content: buildRepeatedInvalidToolCallCorrectiveV1({
+              toolName: toolCall.name,
+              failureCode: "invalid_arguments",
+              readyFrontierToolNames: stepTools.map(
+                (candidate) => candidate.function.name,
+              ),
+            }),
           });
         } else {
           invalidToolCallFailureSignatures.add(failureSignature);

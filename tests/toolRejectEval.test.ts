@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   buildOffFrontierToolRejectionMessage,
   buildProofGatedWritebackHoldV1,
+  buildRepeatedInvalidToolCallCorrectiveV1,
   buildToolRejectEvalV1,
   describeOffFrontierToolNearMiss,
   mapToolRejectCategory,
@@ -330,4 +331,75 @@ test("both AgentRunner proof-gate seats consume the shared hold builder", () => 
     /Do not request a current-note write tool again/u,
     "the proof-gate system corrective must not be re-inlined in AgentRunner",
   );
+});
+
+// ---------------------------------------------------------------------------
+// repeated invalid tool call: the repeat must not go silent
+// ---------------------------------------------------------------------------
+
+test("a twice-failed call gets a terminal corrective naming what to do instead", () => {
+  // The bug: the FIRST identical failure received a rich corrective (schema,
+  // prerequisite tool, exact section list); the repeat received a ledger
+  // blocker and a trace and nothing the model could read. The host stopped
+  // retrying without telling the model it had.
+  const withAlternatives = buildRepeatedInvalidToolCallCorrectiveV1({
+    toolName: "code_validate_fast",
+    failureCode: "workspace_not_found",
+    readyFrontierToolNames: [
+      "code_workspace_create",
+      "code_validate_fast",
+      "code_workspace_read",
+    ],
+  });
+  assert.match(withAlternatives, /Blocked code_validate_fast/u);
+  assert.match(withAlternatives, /workspace_not_found/u);
+  assert.match(
+    withAlternatives,
+    /call one of these exact names instead: code_workspace_create, code_workspace_read\./u,
+  );
+  // The blocked tool must never be offered back as its own alternative.
+  assert.doesNotMatch(
+    withAlternatives,
+    /instead: [^.]*code_validate_fast/u,
+  );
+  assert.match(withAlternatives, /Do not repeat this exact call\./u);
+
+  // With nothing else ready the corrective must name the final-answer exit
+  // rather than leaving the model with no legal move.
+  const noAlternatives = buildRepeatedInvalidToolCallCorrectiveV1({
+    toolName: "append_to_current_file",
+    failureCode: "invalid_arguments",
+    readyFrontierToolNames: ["append_to_current_file"],
+  });
+  assert.match(
+    noAlternatives,
+    /return your best final answer and state in one sentence that append_to_current_file could not be completed\./u,
+  );
+});
+
+test("both AgentRunner repeat-blocker seats deliver the corrective", () => {
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  assert.equal(
+    runnerSource.match(/buildRepeatedInvalidToolCallCorrectiveV1\(\{/gu)?.length,
+    2,
+    "both repeated_invalid_tool_call seats must push the shared corrective",
+  );
+  // Each repeat seat must push it, not merely trace it: the corrective is
+  // only useful if it reaches the transcript.
+  for (const marker of [
+    "repeated-invalid-tool-call",
+    "repeated-invalid-required-literal",
+  ]) {
+    const seatAt = runnerSource.indexOf(marker);
+    assert.ok(seatAt > 0, `missing repeat seat ${marker}`);
+    const window = runnerSource.slice(seatAt, seatAt + 900);
+    assert.match(
+      window,
+      /messages\.push\(\{[\s\S]*buildRepeatedInvalidToolCallCorrectiveV1/u,
+      `repeat seat ${marker} must push the corrective into the transcript`,
+    );
+  }
 });
