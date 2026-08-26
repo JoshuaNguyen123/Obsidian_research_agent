@@ -1095,10 +1095,17 @@ test("every message seat that names a tool consumes the one shared predicate", (
     /authoritativeRefusalFrontierToolNamesV1\(\{/gu,
   );
   assert.ok(
-    consumers && consumers.length >= 5,
+    consumers && consumers.length >= 6,
     `expected every naming seat to consume the shared predicate, saw ${
       consumers?.length ?? 0
     }`,
+  );
+  // No seat may hand the model a menu straight from the offered catalog or the
+  // step menu. These are the exact shapes that shipped the contradiction.
+  assert.doesNotMatch(
+    runnerSource,
+    /Choose one exact name from: \$\{tools\.map\(/u,
+    "the schema correction must not offer the whole catalog as callable",
   );
   // pickPreferredNextTool is pure ordering over whatever list it is handed, so
   // the routing card's `preferredNext` is only as honest as its input.

@@ -16164,6 +16164,19 @@ export async function runAgentMission({
                   (heading) => `## ${heading}`,
                 ).join(", ")}. Keep the prose user-facing; do not add other sections.`
               : null;
+          // "Choose one exact name from: ..." is the same directive as the
+          // refusal seat's "Call that exact name", and it used to hand over the
+          // entire offered catalog -- a strict superset of what the mission
+          // graph will admit. Same shared predicate, same fail-closed ending.
+          const schemaCorrectionFrontier =
+            authoritativeRefusalFrontierToolNamesV1({
+              graph: missionGraphSession?.graph ?? missionGraph,
+              candidateToolNames: tools.map(
+                (candidate) => candidate.function.name,
+              ),
+              excludeToolNames: [toolCall.name],
+              allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+            });
           messages.push({
             role: "system" as const,
             content: workspaceCorrection
@@ -16172,7 +16185,11 @@ export async function runAgentMission({
               ? linearTemplateCorrection
               : definition
                 ? `Tool-call schema correction: ${toolCall.name} rejected the supplied arguments. Return one corrected call using exactly this JSON Schema and do not infer omitted mutation values: ${JSON.stringify(definition.function.parameters)}`
-                : `Tool-call schema correction: ${toolCall.name} is not an allowed tool. Choose one exact name from: ${tools.map((candidate) => candidate.function.name).join(", ")}.`,
+                : `Tool-call schema correction: ${toolCall.name} is not an allowed tool. ${
+                    schemaCorrectionFrontier.length > 0
+                      ? `Choose one exact name from: ${schemaCorrectionFrontier.join(", ")}.`
+                      : "No tool is ready to call; return your best final answer instead."
+                  }`,
           });
         }
       }
