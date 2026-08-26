@@ -80,6 +80,12 @@ const RUNTIME_ABSENT_CODES = new Set([
   "node_runtime_unavailable",
 ]);
 
+export function setupActionForCauseV1(
+  cause: SemanticRetrievalCauseV1,
+): string | null {
+  return SETUP_ACTIONS[cause] ?? null;
+}
+
 const SETUP_ACTIONS: Readonly<Record<string, string>> = Object.freeze({
   embeddings_not_installed:
     "Install FastEmbed with: python -m pip install fastembed",
@@ -191,7 +197,12 @@ export function semanticModeSatisfiedV1(mode: string | null): boolean {
   return mode !== null && SEMANTIC_MODES.has(mode);
 }
 
-function classifyFallbackCause(
+/**
+ * Exported so a proactive probe classifies a provider failure the same way a
+ * mid-run fallback does. Two vocabularies for one condition would let settings
+ * and the runner disagree about what is wrong.
+ */
+export function classifyFallbackCause(
   reason: string | null,
 ): SemanticRetrievalCauseV1 {
   if (reason === "missing_fastembed") return "embeddings_not_installed";

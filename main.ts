@@ -45,6 +45,11 @@ import {
 } from "./src/embeddings/semanticIndex";
 import type { SemanticIndexService } from "./src/embeddings/semanticIndexTypes";
 import {
+  formatEmbeddingProbeResultV1,
+  probeEmbeddingProviderV1,
+  type EmbeddingProbeResultV1,
+} from "./src/embeddings/embeddingProbe";
+import {
   computeSemanticIndexRetryDelayMs,
   SEMANTIC_INDEX_MAX_AUTO_RETRIES,
 } from "./src/embeddings/semanticIndexRetry";
@@ -782,6 +787,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   private projectMemoryLoadGeneration = 0;
   private lastActiveMarkdownFile: TFile | null = null;
   private semanticEmbeddingProvider: SemanticEmbeddingProvider | null = null;
+  /** Last embedder probe, so settings can show a runtime fact instead of a setting. */
+  lastEmbeddingProbe: EmbeddingProbeResultV1 | null = null;
+  embeddingProbeInFlight = false;
   private semanticIndexService: SemanticIndexService | null = null;
   private activeAgentView: AgentView | null = null;
   private agentSettingTab: AgentSettingTab | null = null;
@@ -1474,6 +1482,27 @@ export default class AgenticResearcherPlugin extends Plugin {
       provider: resolution.slot.provider,
       model: resolution.slot.model,
     };
+  }
+
+  /**
+   * Prove the embedding runtime works, rather than reporting that it is
+   * enabled. `semanticSearchEnabled` records an intent; this records a fact.
+   */
+  async testEmbeddingProvider(): Promise<EmbeddingProbeResultV1> {
+    this.embeddingProbeInFlight = true;
+    try {
+      const result = await probeEmbeddingProviderV1({
+        provider: this.getSemanticEmbeddingProvider(),
+        model: this.settings.semanticEmbeddingModel,
+        dim: this.settings.semanticEmbeddingDim,
+        cacheDir: this.settings.semanticModelCacheDir || undefined,
+      });
+      this.lastEmbeddingProbe = result;
+      new Notice(formatEmbeddingProbeResultV1(result));
+      return result;
+    } finally {
+      this.embeddingProbeInFlight = false;
+    }
   }
 
   async testModelConnection(options?: {
