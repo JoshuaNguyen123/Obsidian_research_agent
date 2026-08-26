@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   categorizeModelEndpoint,
   createObservableModelClient,
+  cachedPromptTokenRatio,
   extractProviderTokenUsage,
   measureAssistantPayloadChars,
   type ModelCallEvidenceV1,
@@ -18,13 +19,13 @@ test("categorizes endpoints without retaining raw URLs", () => {
 test("extracts Ollama and OpenAI-compatible token usage", () => {
   assert.deepEqual(
     extractProviderTokenUsage({ prompt_eval_count: 10, eval_count: 4 }),
-    { promptTokens: 10, completionTokens: 4, totalTokens: 14, reported: true },
+    { promptTokens: 10, completionTokens: 4, totalTokens: 14, cachedPromptTokens: 0, cachedReported: false, reported: true },
   );
   assert.deepEqual(
     extractProviderTokenUsage({
       usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
     }),
-    { promptTokens: 8, completionTokens: 3, totalTokens: 11, reported: true },
+    { promptTokens: 8, completionTokens: 3, totalTokens: 11, cachedPromptTokens: 0, cachedReported: false, reported: true },
   );
 });
 
@@ -169,4 +170,114 @@ test("distinguishes an invoked-client quota failure from a local observer-budget
   assert.equal(evidence[0].clientInvoked, true);
   assert.equal(observed.getUsage().modelCallCount, 1);
   assert.equal(observed.getUsage().failedCallCount, 1);
+});
+
+/*
+ * Provider-served prompt cache accounting.
+ *
+ * An agent loop resends a byte-identical system prompt and tool schema on every
+ * step, so on a cloud-billed provider that prefix is the single largest
+ * recurring cost. Nothing read the cached-token counters back, which made cache
+ * effectiveness unmeasurable and therefore unimprovable.
+ */
+
+test("reads provider-served cached prompt tokens in all three reported shapes", () => {
+  // OpenAI-compatible: nested under prompt_tokens_details.
+  assert.equal(
+    extractProviderTokenUsage({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        prompt_tokens_details: { cached_tokens: 80 },
+      },
+    }).cachedPromptTokens,
+    80,
+  );
+  // Flat cached_tokens.
+  assert.equal(
+    extractProviderTokenUsage({ usage: { prompt_tokens: 50, cached_tokens: 20 } })
+      .cachedPromptTokens,
+    20,
+  );
+  // Anthropic-shaped cache-read counter.
+  assert.equal(
+    extractProviderTokenUsage({
+      usage: { prompt_tokens: 60, cache_read_input_tokens: 45 },
+    }).cachedPromptTokens,
+    45,
+  );
+});
+
+test("a silent provider is not recorded as a measured cache miss", () => {
+  const silent = extractProviderTokenUsage({ prompt_eval_count: 10, eval_count: 4 });
+  assert.equal(silent.cachedReported, false);
+  assert.equal(silent.cachedPromptTokens, 0);
+  // Unknown and zero must stay distinguishable: reporting a provider that never
+  // mentions caching as 0% would make an unmeasurable setup look like a broken
+  // one, and would send someone optimizing a cache that does not exist.
+  assert.equal(
+    cachedPromptTokenRatio({
+      promptTokens: silent.promptTokens,
+      cachedPromptTokens: silent.cachedPromptTokens,
+      cachedTokensReported: silent.cachedReported,
+    }),
+    null,
+  );
+
+  const measuredMiss = extractProviderTokenUsage({
+    usage: { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 0 } },
+  });
+  assert.equal(measuredMiss.cachedReported, true);
+  assert.equal(
+    cachedPromptTokenRatio({
+      promptTokens: measuredMiss.promptTokens,
+      cachedPromptTokens: measuredMiss.cachedPromptTokens,
+      cachedTokensReported: measuredMiss.cachedReported,
+    }),
+    0,
+  );
+});
+
+test("a reported cache hit reaches the evidence record and its ratio", async () => {
+  const evidence: ModelCallEvidenceV1[] = [];
+  const underlying: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "gpt-oss:120b-cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+    },
+    chat: async () => ({
+      message: { role: "assistant", content: "text" },
+      toolCalls: [],
+      raw: {
+        usage: {
+          prompt_tokens: 200,
+          completion_tokens: 5,
+          prompt_tokens_details: { cached_tokens: 150 },
+        },
+      },
+    }),
+    streamChat: async () => {
+      throw new Error("unused");
+    },
+  };
+  const observed = createObservableModelClient({
+    client: underlying,
+    budget: { schemaVersion: 1, maxCalls: 4, maxTokens: 100_000, maxWallClockMs: 10_000 },
+    onEvidence: (record) => evidence.push(record),
+  });
+
+  await observed.client.chat({
+    messages: [{ role: "user", content: "go" }],
+  });
+
+  const record = evidence.at(-1);
+  assert.ok(record);
+  assert.equal(record.cachedPromptTokens, 150);
+  assert.equal(record.cachedTokensReported, true);
+  assert.equal(
+    cachedPromptTokenRatio(record),
+    0.75,
+  );
 });

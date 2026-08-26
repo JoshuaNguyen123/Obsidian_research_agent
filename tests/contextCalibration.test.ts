@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import {
   CALIBRATION_SMOOTHING,
   MAX_CHARS_PER_TOKEN,
@@ -201,4 +202,47 @@ test("the Run Details projection reports state without leaking prompt content", 
   );
   assert.match(active, /context_calibration=active/);
   assert.match(active, /tightened/);
+});
+
+/*
+ * Both compaction paths must price the context window the same way.
+ *
+ * The loop path has read the calibrated ceiling since G1 landed, but the chat
+ * path kept passing the raw runContextBudget straight into
+ * resolveConversationPromptCharBudget. On a model whose real chars-per-token
+ * ratio sits well under the assumed 4.0, that made the two halves of compaction
+ * disagree about how much room existed -- and disagree in the direction of
+ * overflow, which is the direction that truncates a prompt mid-run.
+ *
+ * This is a source-level guard because the seam is a single call site inside a
+ * 37k-line module with no injectable boundary. It blocks the exact regression:
+ * reintroducing a raw-budget read at a compaction call.
+ */
+test("neither compaction path reads the uncalibrated budget", () => {
+  const source = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+
+  const conversationBudgetCalls = source.matchAll(
+    /resolveConversationPromptCharBudget\(\s*([^)]*?)\s*,?\s*\)/gu,
+  );
+  const argued = [...conversationBudgetCalls].map((match) =>
+    match[1].replace(/\s+/gu, " ").trim(),
+  );
+
+  assert.ok(argued.length > 0, "expected at least one chat-compaction budget call");
+  for (const argument of argued) {
+    assert.doesNotMatch(
+      argument,
+      /\brunContextBudget\.maxPromptChars\b/u,
+      `chat compaction must use the calibrated ceiling, got: ${argument}`,
+    );
+  }
+
+  // And the loop path still reads the calibrated one.
+  assert.match(
+    source,
+    /shouldCompactLoopMessages\(\s*messages,\s*effectiveContextBudget\s*\)/u,
+  );
 });

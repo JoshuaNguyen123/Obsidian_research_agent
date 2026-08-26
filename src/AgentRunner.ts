@@ -214,7 +214,12 @@ import {
   type PipelineLineageV1,
 } from "./agent/pipelineLineage";
 import { runDependencyPreflight } from "./agent/dependencyPreflight";
-import { evaluatePerformanceGates, type PerformanceGateResult } from "./agent/performanceGates";
+import {
+  evaluatePerformanceGates,
+  formatRunWallClockSummaryV1,
+  summarizeRunWallClockV1,
+  type PerformanceGateResult,
+} from "./agent/performanceGates";
 import {
   analyzeGeneratedOutputPrompt,
   buildWordTargetExpansionResumePrompt,
@@ -1221,6 +1226,8 @@ export interface AgentRunMetricEvent {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  /** Prompt tokens the provider served from cache; absent when it never says. */
+  cachedPromptTokens?: number;
 }
 
 export type {
@@ -9869,6 +9876,17 @@ export async function runAgentMission({
         : effectiveStopReason === "error"
           ? nextAction?.trim() || null
           : null;
+    // Both halves of the mission's wall clock, side by side. Provider latency
+    // is not ours to optimise; tool latency is. Without the split, a slow run
+    // cannot be attributed and any optimisation is a guess.
+    const wallClock = summarizeRunWallClockV1(metricEvents);
+    events.onTrace?.({
+      id: `run-wall-clock-${step}`,
+      kind: "metric",
+      step,
+      message: `Wall clock: ${formatRunWallClockSummaryV1(wallClock)}`,
+      outputPreview: wallClock,
+    });
     completeRun(
       events,
       effectiveStopReason,
@@ -15780,8 +15798,13 @@ export async function runAgentMission({
   const compactedConversation = compactConversationForPrompt(
     conversationHistory,
     {
+      // Same ceiling the loop compacts against. This read the raw budget while
+      // the loop path used the calibrated one, so on a model whose real
+      // chars-per-token ratio is well below the assumed 4.0 the two halves of
+      // compaction disagreed about how much room there was -- in the direction
+      // of overflow.
       promptCharBudget: resolveConversationPromptCharBudget(
-        runContextBudget.maxPromptChars,
+        resolveEffectiveContextBudget().maxPromptChars,
       ),
     },
   );
@@ -37002,6 +37025,12 @@ function extractTokenUsageFields(raw: unknown): Partial<AgentRunMetricEvent> {
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         totalTokens: usage.totalTokens,
+        // Only emitted when the provider actually reports caching. Defaulting a
+        // silent provider to 0 would render an unmeasurable setup identical to
+        // a measured cache miss.
+        ...(usage.cachedReported
+          ? { cachedPromptTokens: usage.cachedPromptTokens }
+          : {}),
       }
     : {};
 }

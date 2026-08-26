@@ -25,6 +25,15 @@ export interface ModelCallEvidenceV1 {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /**
+   * Prompt tokens the provider served from its own cache, and whether it said
+   * anything at all. Both optional: this is a v1 record and evidence persisted
+   * before caching was measured genuinely lacks them, so absent means "never
+   * reported" rather than "measured zero". A silent provider and a real cache
+   * miss are different facts and must not collapse into the same number.
+   */
+  cachedPromptTokens?: number;
+  cachedTokensReported?: boolean;
   tokenUsageReported: boolean;
   errorCategory?: string;
 }
@@ -83,12 +92,15 @@ export function extractProviderTokenUsage(raw: unknown): {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedPromptTokens: number;
+  cachedReported: boolean;
   reported: boolean;
 } {
   const records = Array.isArray(raw) ? raw : [raw];
   let promptTokens: number | undefined;
   let completionTokens: number | undefined;
   let totalTokens: number | undefined;
+  let cachedPromptTokens: number | undefined;
   for (const value of records) {
     if (!isRecord(value)) continue;
     const usage = isRecord(value.usage) ? value.usage : value;
@@ -97,6 +109,19 @@ export function extractProviderTokenUsage(raw: unknown): {
       usage.completion_tokens ?? usage.eval_count,
     );
     totalTokens ??= finiteNumber(usage.total_tokens);
+    // Cached prompt tokens are reported in three shapes across the providers
+    // this plugin talks to: nested under prompt_tokens_details (OpenAI), flat
+    // as cached_tokens, or as Anthropic's separate cache-read counter. An agent
+    // loop resends a byte-identical prefix every step, so this is the number
+    // that says whether that prefix is being re-billed.
+    const details = isRecord(usage.prompt_tokens_details)
+      ? usage.prompt_tokens_details
+      : null;
+    cachedPromptTokens ??= finiteNumber(
+      details?.cached_tokens ??
+        usage.cached_tokens ??
+        usage.cache_read_input_tokens,
+    );
   }
   const reported =
     promptTokens !== undefined ||
@@ -106,8 +131,28 @@ export function extractProviderTokenUsage(raw: unknown): {
     promptTokens: promptTokens ?? 0,
     completionTokens: completionTokens ?? 0,
     totalTokens: totalTokens ?? (promptTokens ?? 0) + (completionTokens ?? 0),
+    cachedPromptTokens: cachedPromptTokens ?? 0,
+    cachedReported: cachedPromptTokens !== undefined,
     reported,
   };
+}
+
+/**
+ * Share of the prompt the provider served from cache, or null when it never
+ * said. Null and 0 mean different things: null is "unknown", 0 is a measured
+ * miss, and reporting a silent provider as 0% would make an unmeasurable
+ * setup look like a broken one.
+ */
+export function cachedPromptTokenRatio(record: {
+  promptTokens: number;
+  cachedPromptTokens?: number;
+  cachedTokensReported?: boolean;
+}): number | null {
+  if (!record.cachedTokensReported || record.promptTokens <= 0) return null;
+  return Math.min(
+    1,
+    Math.max(0, (record.cachedPromptTokens ?? 0) / record.promptTokens),
+  );
 }
 
 /**
@@ -279,6 +324,8 @@ function buildEvidence({
   promptTokens = 0,
   completionTokens = 0,
   totalTokens = 0,
+  cachedPromptTokens = 0,
+  cachedReported = false,
   reported = false,
   errorCategory,
   attempt = 1,
@@ -294,6 +341,8 @@ function buildEvidence({
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cachedPromptTokens?: number;
+  cachedReported?: boolean;
   reported?: boolean;
   errorCategory?: string;
   attempt?: number;
@@ -314,6 +363,8 @@ function buildEvidence({
     promptTokens,
     completionTokens,
     totalTokens,
+    cachedPromptTokens,
+    cachedTokensReported: cachedReported,
     tokenUsageReported: reported,
     ...(errorCategory ? { errorCategory } : {}),
   };
