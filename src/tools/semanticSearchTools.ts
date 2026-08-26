@@ -481,6 +481,11 @@ async function searchSemanticIndexFirst({
       fallbackUsed: false,
       reasons: ["fresh_persisted_semantic_index"],
     }),
+    // Where this search's wall clock actually went. The tool metric records a
+    // single duration; only this split says whether it was shard decode or
+    // scoring, which is what decides whether optimising the scan is worth
+    // building. Absent on the in-memory v1 index, which has no decode step.
+    ...(search.timings ? { timings: search.timings } : {}),
   };
 }
 

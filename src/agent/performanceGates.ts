@@ -37,7 +37,7 @@ export interface PerformanceGateResult {
  * and it needs a metric channel plumbed into the embeddings index first.
  */
 export const UNWIRED_GATE_METRICS: ReadonlySet<PerformanceGate["metric"]> =
-  new Set(["semantic_decode_ms", "source_cache_lookup_ms"]);
+  new Set(["source_cache_lookup_ms"]);
 
 export const DEFAULT_PERFORMANCE_GATES: PerformanceGate[] = [
   { name: "model_call_latency", metric: "model_ms", warnAt: 120000 },
@@ -79,6 +79,11 @@ function metricValue(event: AgentRunMetricEvent, metric: PerformanceGate["metric
   }
   if (metric === "tool_ms") {
     return event.kind === "tool" ? event.durationMs : 0;
+  }
+  if (metric === "semantic_decode_ms") {
+    // Only a search that actually decoded contributes. A tool with no timings
+    // returns 0 and cannot drag the peak down, because Math.max ignores it.
+    return event.kind === "tool" ? event.decodeMs ?? 0 : 0;
   }
   if (metric === "payload_chars") {
     return event.outputChars ?? event.responseChars ?? 0;

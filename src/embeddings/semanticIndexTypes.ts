@@ -131,6 +131,15 @@ export interface SemanticIndexSearchRequest {
   seedPaths?: string[];
 }
 
+export interface SemanticIndexSearchTimingsV1 {
+  /** Base64 decode of shard vectors, excluding vault file reads. */
+  decodeMs: number;
+  /** Cosine scoring plus lexical blending over the decoded rows. */
+  scoreMs: number;
+  /** Rows actually scored, so a duration can be read per row. */
+  rowsScored: number;
+}
+
 export interface SemanticIndexSearchResult {
   ok: boolean;
   operation: "semantic_index_search";
@@ -144,6 +153,13 @@ export interface SemanticIndexSearchResult {
   nextCursor?: string | null;
   resultCount: number;
   results: SemanticIndexSearchHit[];
+  /**
+   * Where the wall clock of one indexed search actually went. A tool-level
+   * duration says a search took 400ms; it cannot say whether that was base64
+   * shard decode or vector scoring, which is exactly the split that decides
+   * whether optimising the scan is worth doing.
+   */
+  timings?: SemanticIndexSearchTimingsV1;
   code?: string;
   message?: string;
 }

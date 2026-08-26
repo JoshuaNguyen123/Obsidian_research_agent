@@ -25,6 +25,7 @@ import type {
   SemanticIndexRowMeta,
   SemanticIndexShardV2,
   SemanticIndexSearchHit,
+  SemanticIndexSearchTimingsV1,
   SemanticIndexSearchRequest,
   SemanticIndexSearchResult,
   SemanticIndexService,
@@ -407,6 +408,10 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       nextCursor: searchResult.nextCursor,
       resultCount: searchResult.hits.length,
       results: searchResult.hits,
+      // Absent on the v1 path, which scores in memory and has no decode step.
+      ...("timings" in searchResult && searchResult.timings
+        ? { timings: searchResult.timings }
+        : {}),
     };
   }
 
@@ -991,9 +996,12 @@ async function searchIndexShards({
   hits: SemanticIndexSearchHit[];
   candidateCount: number;
   nextCursor: string | null;
+  timings: SemanticIndexSearchTimingsV1;
 }> {
   const scored: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
   let candidateCount = 0;
+  let decodeMs = 0;
+  let scoreMs = 0;
   const noteByPath = new Map(index.notes.map((note) => [note.path, note]));
 
   for (const ref of index.shards) {
@@ -1001,7 +1009,10 @@ async function searchIndexShards({
     if (!shard || shard.dim !== index.dim) {
       continue;
     }
+    const decodeStartedAt = Date.now();
     const vectors = decodeFloat32Base64(shard.vectorsBase64);
+    decodeMs += Math.max(0, Date.now() - decodeStartedAt);
+    const scoreStartedAt = Date.now();
     for (let rowIndex = 0; rowIndex < shard.rows.length; rowIndex += 1) {
       const row = shard.rows[rowIndex];
       if (folder && !row.notePath.startsWith(`${folder}/`)) {
@@ -1041,6 +1052,7 @@ async function searchIndexShards({
       }
       pushBoundedHit(scored, hit, candidateLimit);
     }
+    scoreMs += Math.max(0, Date.now() - scoreStartedAt);
   }
 
   const byPath = new Map<string, SemanticIndexSearchHit & { sortPath: string }>();
@@ -1057,6 +1069,7 @@ async function searchIndexShards({
     hits: page.map(({ sortPath, ...hit }) => hit),
     candidateCount,
     nextCursor: nextOffset < allHits.length ? String(nextOffset) : null,
+    timings: { decodeMs, scoreMs, rowsScored: candidateCount },
   };
 }
 
