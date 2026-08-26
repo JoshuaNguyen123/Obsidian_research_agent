@@ -16,6 +16,7 @@ import {
   assertNoRawAuthority,
   assertSecretFree,
 } from "./LinearContractSupport";
+import { canonicalizeLinearMarkdownV1 } from "./linearMarkdownCanonicalV1";
 import {
   createWorkItemSpecV1,
   parseWorkItemSpecV1,
@@ -950,35 +951,19 @@ function ownedDeterministicIssueMismatch(
   );
 }
 
+/**
+ * Ticket dedupe/readback comparison. Delegates to the one shared canonical
+ * form (`canonicalizeLinearMarkdownV1`) so this seat and the mutation-readback
+ * seat in LinearTools cannot drift apart again — the drift between the two
+ * copies is what rejected the first Linear publication of every compound run.
+ *
+ * This seat pins `fold_legacy_checkboxes`: an issue created under the retired
+ * `- [ ] **AC-1**` criteria render must be ADOPTED, not duplicated.
+ */
 export function normalizeComparableTicketText(value: string | undefined): string {
-  return (value ?? "")
-    .replace(/\r\n?/g, "\n")
-    .replace(
-      /\[([^\]\r\n]+)\]\(<(https?:\/\/[^>\r\n]+)>\)/gu,
-      (match, label: string, target: string) => label === target ? target : match,
-    )
-    // Linear's Markdown serializer canonically rewrites whole-line `_text_`
-    // emphasis as `*text*`. These forms carry the same visible text and
-    // emphasis semantics; normalize only a complete, non-list line so actual
-    // content changes still fail closed.
-    .replace(
-      /^([*_])([^\s*_\r\n](?:[^\r\n]*?[^\s*_\r\n])?)\1$/gmu,
-      "_$2_",
-    )
-    // The serializer also rewrites inline `__strong__` as `**strong**`
-    // anywhere in a line (observed live: `__init__(replica_id)` came back as
-    // `**init**(replica_id)`). Both sides converge on the asterisk form; a
-    // genuinely different token still fails closed.
-    .replace(
-      /__([^\s_](?:[^_\r\n]*?[^\s_])?)__/gu,
-      "**$1**",
-    )
-    .replace(/(<!--[^>\r\n]+-->)[ \t]*\n(?:[ \t]*\n)+(?=```)/gu, "$1\n")
-    .replace(/(```)[ \t]*\n(?:[ \t]*\n)+(?=<!--)/gu, "$1\n")
-    .replace(/^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+/gmu, "- ")
-    .replace(/^[ \t]*[-*][ \t]+/gmu, "- ")
-    .replace(/[ \t]+$/gmu, "")
-    .trim();
+  return canonicalizeLinearMarkdownV1(value, {
+    taskList: "fold_legacy_checkboxes",
+  });
 }
 
 function comparableTicketDifferenceDiagnostic(
