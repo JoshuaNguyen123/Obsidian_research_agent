@@ -2021,3 +2021,119 @@ test("a scratch ladder with no binding-requiring tools plans no promotion", asyn
     .flatMap((node) => node.allowedTools);
   assert.equal(order.includes("code_workspace_init_repository"), false);
 });
+
+test("a two-folder request receives one graph node per named folder", async () => {
+  // Discriminating repro: before the shared repeated-operation derivation the
+  // host deduplicated every effectful tool by NAME, so this mission got ONE
+  // create_folder node with no bound destination. The model correctly called
+  // create_folder a second time, no node existed for it, and every seat behind
+  // the tool-menu gate refused the call. A node's completion contract closes
+  // at its first receipt, so one node could never have paid both folders.
+  const names = ["create_folder", "create_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-two-folders",
+    objective:
+      "Create a folder Projects/Alpha and a folder Projects/Beta, then create a note Projects/Alpha/Index.md summarizing them.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+
+  const folderNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_folder"),
+  );
+  assert.equal(folderNodes.length, 2);
+  assert.deepEqual(
+    folderNodes.map((node) => node.destination?.selector).sort(),
+    ["Projects/Alpha", "Projects/Beta"],
+  );
+  // Each folder is a separately budgeted, serialized effectful node.
+  assert.deepEqual(
+    folderNodes.map((node) => node.budget.toolCalls),
+    [1, 1],
+  );
+  const noteNode = Object.values(host.deterministicProposal.nodes).find((node) =>
+    node.allowedTools.includes("create_file"),
+  );
+  assert.equal(noteNode?.destination?.selector, "Projects/Alpha/Index.md");
+});
+
+test("two named notes receive one create_file node each", async () => {
+  const names = ["create_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-two-notes",
+    objective:
+      "Create Projects/One.md and Projects/Two.md with a short brief in each.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+  const createNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_file"),
+  );
+  assert.deepEqual(
+    createNodes.map((node) => node.destination?.selector).sort(),
+    ["Projects/One.md", "Projects/Two.md"],
+  );
+});
+
+test("a single named destination keeps its exact one-node plan", async () => {
+  const names = ["create_folder"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-one-folder",
+    objective: "Create a folder Projects/Alpha.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+  const folderNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_folder"),
+  );
+  assert.equal(folderNodes.length, 1);
+  // Unchanged from before the derivation: one folder still resolves through
+  // the prompt-scoped vault fallback, not a derived destination.
+  assert.equal(
+    folderNodes[0].destination?.selector,
+    "prompt-scoped-vault-target",
+  );
+});
+
+test("a host-allocated no-overwrite vault path is never expanded", async () => {
+  // The host allocated exactly one destination, so prompt vocabulary must not
+  // add a second node behind it.
+  const names = ["create_file"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-host-allocated-create",
+    objective:
+      "Create Projects/One.md and Projects/Two.md with a short brief in each.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    plannedVaultCreatePath: "Generated/Brief 1.md",
+    currentNotePath: null,
+    maxToolCalls: 10,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+  const createNodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools.includes("create_file"),
+  );
+  assert.equal(createNodes.length, 1);
+  assert.equal(createNodes[0].destination?.selector, "Generated/Brief 1.md");
+});
