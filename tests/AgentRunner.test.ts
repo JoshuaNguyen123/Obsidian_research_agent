@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   MAX_AGENT_STEPS,
   attachGroundedPassageCitations,
@@ -68,6 +69,7 @@ import {
   restrictCompoundResearchClosureToolsV1,
   containProofGateRejectedWriteToolsV1,
   PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
+  canonicalRequiredLiteralWriteContentV1,
   validateRequiredLiteralWriteArguments,
   preWriteProofGateAppliesV1,
   resolveThinkingMode,
@@ -22690,12 +22692,18 @@ test("repository read intent exposes only safe workspace bootstrap and inspectio
   assert.equal(names.has("code_commit_verified"), false);
 });
 
-test("missing required literal rejects a write before mutation and accepts one corrected payload", async () => {
+test("a dropped required literal is restored before mutation instead of refusing the write", async () => {
+  // CONTRACT CHANGE (deliberate). This seat used to reject the first payload,
+  // spend a bounded safeFailureRetry attempt, and require a second model turn
+  // to land the marker — while the final-answer path restored the identical
+  // marker deterministically. The host knows the exact literal, so it now
+  // makes the edit and the call does its work on the first attempt.
   const marker = "E2E_MARKER_1784066436149_631764";
   const prompt = `Append two findings to the current note. Include the marker ${marker}.`;
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const statuses: string[] = [];
+  const traceMessages: string[] = [];
   const vault = createRunnerVaultContext({
     prompt,
     content: "# Existing\n",
@@ -22723,28 +22731,39 @@ test("missing required literal rejects a write before mutation and accepts one c
     enableStreaming: false,
     events: {
       onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traceMessages.push(event.message ?? ""),
     },
   });
 
-  assert.ok(chatRequests.length >= 2);
+  // One model turn, one executed call, mission satisfied.
+  assert.equal(chatRequests.length, 1);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
     ["append_to_current_file"],
     statuses.join("\n"),
   );
-  assert.equal(
-    vault.content.get("Current.md"),
-    `# Existing\n- Finding Alpha\n- Finding Beta\n- ${marker}\n`,
-  );
+  const written = vault.content.get("Current.md") ?? "";
+  assert.match(written, /- Finding Alpha/u);
+  assert.match(written, /- Finding Beta/u);
+  assert.ok(written.includes(marker), written);
   assert.ok(
-    statuses.some((message) =>
+    traceMessages.some((message) =>
+      /Deterministically restored the exact user-required literal marker/iu.test(
+        message,
+      ),
+    ),
+    "the restore must be journalled on the trace",
+  );
+  // The refusal and its retry-burning corrective must no longer occur.
+  assert.ok(
+    !statuses.some((message) =>
       /missing 1 literal value\(s\) explicitly required by the mission/iu.test(
         message,
       ),
     ),
   );
   assert.ok(
-    chatRequests.some((request) =>
+    !chatRequests.some((request) =>
       /Tool-call schema correction: append_to_current_file rejected the supplied arguments/iu.test(
         request.messages.at(-1)?.content ?? "",
       ),
@@ -26810,6 +26829,136 @@ test("the required-literal write contract is step-scoped, not mission-scoped", (
       arguments: { text: `line with ${markerA}` },
     }),
     null,
+  );
+});
+
+test("a paraphrased required literal is repaired, not refused", () => {
+  // The asymmetry this closes: the final-answer path restored a missing
+  // user-required marker deterministically
+  // (attachMissingRequiredLiteralAnchors), while the tool-call path refused
+  // the identical failure and spent a bounded retry asking the model for an
+  // edit the host already knew how to make. Live evidence: the current
+  // byok-autonomous-journey baseline's primary failure class is
+  // harness:marker_literal_pin.
+  const markerA = "E2E_MARKER_1787685662535_651586A1";
+  const markerB = "E2E_MARKER_1787685662535_651586B2";
+  const singlePrompt = `Append one line containing ${markerA} to the current note.`;
+
+  const repaired = canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+    name: "append_to_current_file",
+    arguments: { text: "Some prose that carries no required marker at all." },
+  });
+  assert.ok(repaired, "a droppped marker must be repairable");
+  assert.equal(repaired.field, "text");
+  assert.equal(repaired.insertedAnchor, markerA);
+  assert.equal(
+    repaired.content,
+    `Some prose that carries no required marker at all.\n\n${markerA}`,
+  );
+  // The repaired payload satisfies the validator for the same reason any
+  // compliant call does — the validator stays the single authority.
+  assert.equal(
+    validateRequiredLiteralWriteArguments(singlePrompt, {
+      name: "append_to_current_file",
+      arguments: { text: repaired.content },
+    }),
+    null,
+  );
+
+  // Step-scoped, so exactly ONE anchor is restored: inserting both is what
+  // collapses a mission's two ordered appends into a single write.
+  const orderedPrompt =
+    `Perform exactly two ordered durable appends to the current note, then finish. ` +
+    `First append exactly one line containing ${markerA} and verify that write. ` +
+    `Then append exactly one separate line containing ${markerB} and verify that write.`;
+  const firstAppend = canonicalRequiredLiteralWriteContentV1(orderedPrompt, {
+    name: "append_to_current_file",
+    arguments: { text: "prose with no marker" },
+  });
+  assert.equal(firstAppend?.insertedAnchor, markerA);
+  assert.doesNotMatch(String(firstAppend?.content), new RegExp(markerB, "u"));
+  // With the note observable, the anchor restored is the one the note still
+  // lacks, so an ordered mission progresses in its stated order.
+  const secondAppend = canonicalRequiredLiteralWriteContentV1(
+    orderedPrompt,
+    {
+      name: "append_to_current_file",
+      arguments: { text: "prose with no marker" },
+    },
+    `Initial note\n${markerA}\n`,
+  );
+  assert.equal(secondAppend?.insertedAnchor, markerB);
+
+  // Declines wherever refusal is the right answer.
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+      name: "append_to_current_file",
+      arguments: { text: `already carries ${markerA}` },
+    }),
+    null,
+    "content that already carries an anchor is never rewritten",
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(
+      orderedPrompt,
+      {
+        name: "append_to_current_file",
+        arguments: { text: `line with ${markerA} again` },
+      },
+      `Initial note\n${markerA}\n`,
+    ),
+    null,
+    "the anti-duplication redirect must keep its teeth",
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(
+      "Append a summary to the current note.",
+      { name: "append_to_current_file", arguments: { text: "no contract" } },
+    ),
+    null,
+    "a mission demanding no literals is untouched",
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+      name: "semantic_search_notes",
+      arguments: { text: "not a write tool" },
+    }),
+    null,
+  );
+  assert.equal(
+    canonicalRequiredLiteralWriteContentV1(singlePrompt, {
+      name: "append_to_current_file",
+      arguments: { path: "Note.md" },
+    }),
+    null,
+    "a call with no text/content string has nothing to repair",
+  );
+});
+
+test("the AgentRunner literal seat repairs before it validates", () => {
+  // Source-level ordering guard: the repair must run against the same
+  // toolCall the validator then reads, or the refusal it was meant to remove
+  // fires anyway.
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const repairAt = runnerSource.indexOf(
+    "const literalRepair = canonicalRequiredLiteralWriteContentV1(",
+  );
+  const validateAt = runnerSource.indexOf(
+    "const literalContractError = validateRequiredLiteralWriteArguments(",
+  );
+  assert.ok(repairAt > 0, "the literal seat must consume the repair predicate");
+  assert.ok(validateAt > 0);
+  assert.ok(
+    repairAt < validateAt,
+    "the repair must be applied before the validator reads the call",
+  );
+  assert.equal(
+    runnerSource.match(/canonicalRequiredLiteralWriteContentV1\(/gu)?.length,
+    2,
+    "one definition and exactly one consuming seat",
   );
 });
 

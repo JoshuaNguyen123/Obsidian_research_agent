@@ -21159,6 +21159,36 @@ export async function runAgentMission({
           literalContractNoteText = null;
         }
       }
+      // Repair before validate. The host knows the exact literal this step
+      // owes and the final-answer path already restores it deterministically;
+      // refusing here only spent a bounded retry to ask the model for an edit
+      // the host could make itself. The validator below stays the single
+      // authority: a repaired payload now carries an anchor, so it passes for
+      // the same reason any compliant call does.
+      const literalRepair = canonicalRequiredLiteralWriteContentV1(
+        activeIntentPrompt,
+        toolCall,
+        literalContractNoteText,
+      );
+      if (literalRepair) {
+        proposedWriteText = literalRepair.content;
+        toolCall.arguments = {
+          ...toolCall.arguments,
+          [literalRepair.field]: literalRepair.content,
+        };
+        events.onTrace?.({
+          id: `${toolEventBase.id}:required-literal-restored`,
+          kind: "verification",
+          step,
+          toolName: toolCall.name,
+          message:
+            `Deterministically restored the exact user-required literal marker "${literalRepair.insertedAnchor}" before executing ${toolCall.name}.`,
+          outputPreview: {
+            insertedAnchor: literalRepair.insertedAnchor,
+            payloadFingerprint: hashOperationInput(literalRepair.content),
+          },
+        });
+      }
       const literalContractError = validateRequiredLiteralWriteArguments(
         activeIntentPrompt,
         toolCall,
@@ -35002,6 +35032,78 @@ const LITERAL_CONTENT_WRITE_TOOLS = new Set([
   "replace_file",
   "create_file",
 ]);
+
+/**
+ * The final-answer path has always REPAIRED a missing user-required literal
+ * (attachMissingRequiredLiteralAnchors, consumed above); the tool-call path
+ * REFUSED the identical failure, spent a bounded safeFailureRetry attempt on
+ * it, and blocked the node on the repeat. Same prompt, same
+ * extractRequiredLiteralAnchors, two verdicts -- and the refusal's own advice
+ * ("return one corrected call whose content preserves this step's required
+ * literal exactly") describes a deterministic edit the host can simply make.
+ * A model that paraphrases a marker on its write is the same model that would
+ * have had it restored for free one code path over.
+ *
+ * Restores exactly ONE anchor, because this contract is step-scoped, not
+ * mission-scoped (see validateRequiredLiteralWriteArguments below): inserting
+ * every missing marker is precisely what collapses a mission's ordered
+ * appends into a single write. The anchor chosen is the first the live note
+ * still lacks, so ordered multi-append missions keep progressing in their
+ * stated order; with no observable note the first anchor is used.
+ *
+ * Deliberately declines wherever refusal is the right answer, leaving
+ * validateRequiredLiteralWriteArguments the sole authority on whether a call
+ * satisfies the contract -- this only removes the cases where the host knew
+ * the exact fix and refused anyway:
+ * - not a literal-content write tool, no demanded literals, or no text /
+ *   content string to repair;
+ * - content already carries an anchor, which includes the anti-duplication
+ *   case where the model re-carries a marker the note already landed and the
+ *   validator's redirect must keep its teeth.
+ */
+export function canonicalRequiredLiteralWriteContentV1(
+  prompt: string,
+  toolCall: ModelToolCall,
+  currentNoteText?: string | null,
+): { field: "text" | "content"; content: string; insertedAnchor: string } | null {
+  if (!LITERAL_CONTENT_WRITE_TOOLS.has(toolCall.name)) {
+    return null;
+  }
+  const anchors = extractRequiredLiteralAnchors(prompt);
+  if (anchors.length === 0) {
+    return null;
+  }
+  const field: "text" | "content" | null =
+    typeof toolCall.arguments.text === "string"
+      ? "text"
+      : typeof toolCall.arguments.content === "string"
+        ? "content"
+        : null;
+  if (field === null) {
+    return null;
+  }
+  const content = toolCall.arguments[field] as string;
+  const normalizedContent = content.toLowerCase();
+  if (
+    anchors.some((anchor) => normalizedContent.includes(anchor.toLowerCase()))
+  ) {
+    return null;
+  }
+  const normalizedNote =
+    typeof currentNoteText === "string" ? currentNoteText.toLowerCase() : null;
+  const insertedAnchor =
+    (normalizedNote === null
+      ? undefined
+      : anchors.find(
+          (anchor) => !normalizedNote.includes(anchor.toLowerCase()),
+        )) ?? anchors[0];
+  const separator = content === "" ? "" : content.endsWith("\n") ? "\n" : "\n\n";
+  return {
+    field,
+    content: `${content}${separator}${insertedAnchor}`,
+    insertedAnchor,
+  };
+}
 
 export function validateRequiredLiteralWriteArguments(
   prompt: string,
