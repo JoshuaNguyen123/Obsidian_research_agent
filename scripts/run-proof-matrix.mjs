@@ -127,11 +127,29 @@ export const LEGACY_RUN_CSV_HEADER =
  *                               summaries with receipt-counting specs know).
  * Rows written before this wave are shorter than the header — readers must
  * treat the missing cells as blank/unknown.
+ *
+ * Appended (2026-08-26, off-frontier gate wave):
+ *   frontier_narrowed_mid_response
+ *                               HOST-caused off-frontier refusals: the tool was
+ *                               on the menu the model answered, and AgentRunner
+ *                               rebuilt the menu after an earlier call in the
+ *                               same response. Split out of tool_not_allowed,
+ *                               which means the opposite ("the model named a
+ *                               tool it was never offered"). It is APPENDED
+ *                               rather than slotted beside the other bucket
+ *                               columns because every existing row indexes the
+ *                               legacy block by position.
+ *   frontier_withheld_since_earlier_step
+ *                               HOST-caused off-frontier refusals of a tool the
+ *                               run offered in an EARLIER step and withheld
+ *                               since. Also split out of tool_not_allowed; the
+ *                               model was pursuing a name it had been taught.
  */
 export const RUN_CSV_HEADER =
   LEGACY_RUN_CSV_HEADER +
   ",tool_events_source,tool_calls_succeeded,pct_tool_calls_succeeded," +
-  "secondary_failure_classes,classification_confidence,tool_calls_vacuous";
+  "secondary_failure_classes,classification_confidence,tool_calls_vacuous," +
+  "frontier_narrowed_mid_response,frontier_withheld_since_earlier_step";
 
 /**
  * Upgrade an existing CSV's header line in place when it is a strict
@@ -315,8 +333,14 @@ function runTimestampMs(missionId) {
   return Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`);
 }
 
-const BLOCKER_BUCKETS = [
+// Must stay key-for-key with TOOL_REFUSAL_MARKER_BUCKETS in
+// e2e/reporters/dailyUseReporter.ts, or graph-mined and summary-sourced rows
+// in docs/eval/playwright-run-metrics.csv stop being comparable.
+// tests/proofMatrix.test.ts asserts the two lists agree.
+export const BLOCKER_BUCKETS = [
   ["tool_not_allowed", /tool_not_allowed/iu],
+  ["frontier_narrowed_mid_response", /frontier_narrowed_mid_response/iu],
+  ["frontier_withheld_since_earlier_step", /frontier_withheld_since_earlier_step/iu],
   ["mission_graph_authority_blocked", /mission_graph_authority_blocked/iu],
   ["invalid_arguments", /invalid_argument/iu],
   ["execution_failed", /execution_failed/iu],
@@ -1181,6 +1205,8 @@ async function main() {
         secondaryClasses.join(";"),
         confidence,
         toolEvents.vacuous ?? "",
+        bucketCell("frontier_narrowed_mid_response"),
+        bucketCell("frontier_withheld_since_earlier_step"),
       ]);
 
       // The attempt finished (green or red) — the in-flight marker is now

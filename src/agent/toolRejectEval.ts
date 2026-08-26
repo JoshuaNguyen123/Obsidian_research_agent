@@ -12,7 +12,222 @@ export type ToolRejectCategoryV1 =
   | "ambiguous_target"
   | "policy_rejection"
   | "rate_limit_or_transient"
+  | "frontier_narrowed"
+  | "frontier_withheld"
+  | "placeholder_tool_name"
   | "other";
+
+/**
+ * Refusal code for a call the host DID offer at step start and then refused
+ * because the menu was rebuilt mid-response. Deliberately carries no
+ * `tool_not_allowed` substring: the shared refusal vocabulary buckets by
+ * substring match, and this case must not keep inflating the bucket that
+ * means "the model named a tool it was never offered".
+ */
+export const FRONTIER_NARROWED_REFUSAL_CODE_V1 = "frontier_narrowed_mid_response";
+
+/**
+ * Refusal code for a call the host offered in an EARLIER step of this run and
+ * has since withheld. Like the mid-response code, it deliberately shares no
+ * substring with `tool_not_allowed`, and none with the mid-response code
+ * either, so the three populations stay separately countable.
+ */
+export const FRONTIER_WITHHELD_REFUSAL_CODE_V1 =
+  "frontier_withheld_since_earlier_step";
+
+/**
+ * Why a call name was not on the live menu when the host validated it.
+ *
+ * `AgentRunner` clears and rebuilds `stepAllowedToolNames` after every
+ * committed call in a multi-call response, so calls 2..N are validated
+ * against a menu that changed AFTER the model answered. Without this fact
+ * recorded, a host-caused refusal is indistinguishable in the run record
+ * from a model naming a tool it never saw -- both surfaced as
+ * `tool_not_allowed`, and the census attributed both to the model.
+ */
+export type OffFrontierRefusalProvenanceV1 =
+  /**
+   * The name is an unfilled function-calling template (`$TOOL_NAME` and
+   * friends), not a tool selection at all. Model-side, but a FORMATTING
+   * failure: the model never chose a wrong tool, it failed to substitute.
+   * Observed live in a compound-flow trace, 2026-08-26.
+   */
+  | "model_emitted_placeholder_name"
+  /** The step-start menu never carried this name. Genuine misselection. */
+  | "model_named_unoffered_tool"
+  /** Offered at step start; refused only because an earlier call in the SAME response rebuilt the menu. */
+  | "host_narrowed_mid_response"
+  /**
+   * Offered in an EARLIER step of this run and withheld since. The model's
+   * selection was correct at the moment it learned it; the host changed the
+   * menu underneath. Distinct from every other class because the remedy is
+   * not name resolution -- it is telling the model the menu changed and why.
+   */
+  | "host_withheld_since_earlier_step"
+  /**
+   * Offered at step start and refused at index 0, before any rebuild could
+   * run. Unreachable through the step-menu gate by construction; recorded
+   * rather than folded into either bucket so that if the offered menu and
+   * the validating menu ever disagree at the first call, it shows up as
+   * data instead of silently reading as a model error.
+   */
+  | "host_narrowed_before_first_call";
+
+/** Recorded facts behind one off-frontier refusal. */
+export interface OffFrontierRefusalFactsV1 {
+  /** Was this name on the menu the model actually answered? */
+  offeredAtStepStart: boolean;
+  /** 0-based position of this call inside the provider response. */
+  responseCallIndex: number;
+  /** How many tool calls that one provider response carried. */
+  responseCallCount: number;
+  /** Names offered at step start that the live menu no longer carries. */
+  droppedSinceStepStart: string[];
+  /** Was this name offered in an EARLIER step of this run? */
+  offeredInEarlierStep: boolean;
+  /** The most recent earlier step that offered it, when known. */
+  lastOfferedAtStep: number | null;
+  /** Which menu transform last withheld it, when known. */
+  withheldBy: string | null;
+  provenance: OffFrontierRefusalProvenanceV1;
+}
+
+const cleanNames = (names: readonly string[]): string[] =>
+  names.map((name) => name.trim()).filter(Boolean);
+
+/**
+ * CLASSIFICATION ONLY -- this never rewrites or repairs a call.
+ *
+ * A model that emits `$TOOL_NAME` did not choose the wrong tool; it failed to
+ * substitute into its own template. That is a different diagnosis with a
+ * different fix from naming a real-but-unoffered tool, and lumping the two
+ * into one bucket hides both. Detection is syntactic, never "this name is
+ * unfamiliar" -- an unfamiliar name is exactly what genuine misselection looks
+ * like, and must stay in its own class.
+ *
+ * MERGE NOTE. `AgentRunner.isPlaceholderToolNameV1` (595075e, on main) answers
+ * this same question for the REPAIR path, which rewrites a placeholder to the
+ * offered tool when exactly one read-effect tool is offered. Two predicates
+ * for one question is how classifiers drift here, so this body is deliberately
+ * the SAME logic, not a second opinion: when the branches merge, delete one and
+ * have the other import it. `toolRejectEval` is the correct home -- AgentRunner
+ * already imports this module, so the dependency only points one way.
+ */
+export function looksLikeUnfilledToolNamePlaceholderV1(
+  toolName: string | null | undefined,
+): boolean {
+  const value = String(toolName ?? "").trim();
+  if (!value) return false;
+  return (
+    /^\$\{?\s*[a-z0-9_]*tool[a-z0-9_]*\s*\}?$/iu.test(value) ||
+    /^<+\s*\/?\s*(?:tool|tool[_\s-]?name|name)\s*>+$/iu.test(value) ||
+    /^\{\{\s*(?:tool|tool[_\s-]?name)\s*\}\}$/iu.test(value) ||
+    /^(?:tool[_\s-]?name|toolname|your[_\s-]?tool(?:[_\s-]?name)?|name[_\s-]?of[_\s-]?tool|exact[_\s-]?tool[_\s-]?name)$/iu.test(
+      value,
+    )
+  );
+}
+
+/**
+ * The one answer to "was this refused name on the step-start offered menu,
+ * and did the host narrow it away mid-response?". Every seat that reports an
+ * off-frontier refusal reads this; none re-derives it.
+ */
+export function classifyOffFrontierRefusalV1(input: {
+  toolName: string;
+  /** The menu offered to the model at the start of this step. */
+  offeredAtStepStartToolNames: readonly string[];
+  /** The menu the call was actually validated against. */
+  liveReadyToolNames: readonly string[];
+  responseCallIndex: number;
+  responseCallCount: number;
+  /**
+   * The most recent EARLIER step of this run whose offered menu carried this
+   * name, or null when no earlier step did. The caller owns the history and
+   * the "earlier than now" comparison; this predicate only reads the answer.
+   */
+  lastOfferedAtStep?: number | null;
+  /** Which menu transform last withheld it, when the caller knows. */
+  withheldBy?: string | null;
+}): OffFrontierRefusalFactsV1 {
+  const toolName = input.toolName.trim();
+  const offered = new Set(cleanNames(input.offeredAtStepStartToolNames));
+  const live = new Set(cleanNames(input.liveReadyToolNames));
+  const offeredAtStepStart = offered.has(toolName);
+  const responseCallIndex = Number.isFinite(input.responseCallIndex)
+    ? Math.max(0, Math.trunc(input.responseCallIndex))
+    : 0;
+  const responseCallCount = Number.isFinite(input.responseCallCount)
+    ? Math.max(0, Math.trunc(input.responseCallCount))
+    : 0;
+  const lastOfferedAtStep =
+    typeof input.lastOfferedAtStep === "number" &&
+    Number.isFinite(input.lastOfferedAtStep)
+      ? input.lastOfferedAtStep
+      : null;
+  const offeredInEarlierStep = lastOfferedAtStep !== null;
+  return {
+    offeredAtStepStart,
+    responseCallIndex,
+    responseCallCount,
+    droppedSinceStepStart: [...offered].filter((name) => !live.has(name)),
+    offeredInEarlierStep,
+    lastOfferedAtStep,
+    withheldBy: input.withheldBy?.trim() || null,
+    // Precedence is by strength of evidence about WHO changed what:
+    //  1. the host offered it this very step  -> a rebuild took it away;
+    //  2. the host offered it in an earlier step -> the menu decayed under
+    //     a model that had already been taught the name;
+    //  3. otherwise the model produced a name the host never offered, which
+    //     splits again into an unfilled template and a real misselection.
+    // A name the host DID offer is never a placeholder, whatever it looks
+    // like: the menu is the authority on what is a real tool here.
+    provenance: offeredAtStepStart
+      ? responseCallIndex > 0
+        ? "host_narrowed_mid_response"
+        : "host_narrowed_before_first_call"
+      : offeredInEarlierStep
+        ? "host_withheld_since_earlier_step"
+        : looksLikeUnfilledToolNamePlaceholderV1(toolName)
+          ? "model_emitted_placeholder_name"
+          : "model_named_unoffered_tool",
+  };
+}
+
+/**
+ * True when the refusal is host-caused menu drift WITHIN one response rather
+ * than the model naming a tool it was never shown.
+ */
+export function isHostNarrowedOffFrontierRefusalV1(
+  facts: OffFrontierRefusalFactsV1,
+): boolean {
+  return facts.provenance === "host_narrowed_mid_response";
+}
+
+/**
+ * True when the refusal is host-caused menu decay ACROSS steps: the model was
+ * taught this name earlier in the same run and the host stopped offering it.
+ */
+export function isHostWithheldOffFrontierRefusalV1(
+  facts: OffFrontierRefusalFactsV1,
+): boolean {
+  return facts.provenance === "host_withheld_since_earlier_step";
+}
+
+/**
+ * True when the refusal is host-caused at all -- the union of menu drift
+ * within a response and menu decay across steps. This is the share of the
+ * `tool_not_allowed` population that no amount of model improvement can fix.
+ */
+export function isHostCausedOffFrontierRefusalV1(
+  facts: OffFrontierRefusalFactsV1,
+): boolean {
+  return (
+    isHostNarrowedOffFrontierRefusalV1(facts) ||
+    isHostWithheldOffFrontierRefusalV1(facts) ||
+    facts.provenance === "host_narrowed_before_first_call"
+  );
+}
 
 export type ToolRejectEvalV1 = {
   userIntentExcerpt: string;
@@ -23,6 +238,12 @@ export type ToolRejectEvalV1 = {
   errorCategory: ToolRejectCategoryV1 | string;
   retryCount: number;
   readyFrontier: string[];
+  /**
+   * Off-frontier provenance, when the refusal came from the step-menu gate.
+   * This is what converts "26 tool_not_allowed" from an ambiguity into a
+   * split between model-side naming errors and host-side menu drift.
+   */
+  offFrontier?: OffFrontierRefusalFactsV1;
 };
 
 export function mapToolRejectCategory(input: {
@@ -35,6 +256,16 @@ export function mapToolRejectCategory(input: {
   const code = String(input.code ?? "").toLowerCase();
   const blob = `${message} ${code}`;
 
+  // Host-side menu drift is not the model naming an unknown tool: the host
+  // offered this exact name at the start of the step. It must be checked
+  // first, or the unknown_tool arm below claims it and the eval record
+  // repeats the misattribution this code exists to end.
+  if (
+    new RegExp(FRONTIER_NARROWED_REFUSAL_CODE_V1, "i").test(blob) ||
+    /offered at the start of this step/i.test(blob)
+  ) {
+    return "frontier_narrowed";
+  }
   if (
     /unknown tool|not available for this prompt|off-frontier|tool_not_allowed/i.test(
       blob,
@@ -254,26 +485,54 @@ export function buildOffFrontierToolRejectionMessage(input: {
    * advise it, or the rejection commands the call another subsystem forbids.
    */
   heldWriteToolNames?: readonly string[];
+  /**
+   * Off-frontier provenance from `classifyOffFrontierRefusalV1`. When it
+   * reports host-side menu drift, "Tool is not available for this prompt" is
+   * simply false -- the host listed this exact name in the menu the model
+   * answered -- and a model that can see the contradiction has no correction
+   * to make. Say what actually happened instead.
+   */
+  offFrontier?: OffFrontierRefusalFactsV1 | null;
 }): string {
   const frontier =
     input.readyFrontierToolNames.length > 0
       ? input.readyFrontierToolNames.join(", ")
       : "none";
-  const nearMiss = describeOffFrontierToolNearMiss(
-    input.toolName,
-    input.readyFrontierToolNames,
-  );
+  const hostNarrowed =
+    input.offFrontier != null &&
+    isHostNarrowedOffFrontierRefusalV1(input.offFrontier);
+  const hostWithheld =
+    input.offFrontier != null &&
+    isHostWithheldOffFrontierRefusalV1(input.offFrontier);
+  const placeholderName =
+    input.offFrontier?.provenance === "model_emitted_placeholder_name";
+  const nearMiss =
+    hostNarrowed || hostWithheld || placeholderName
+      ? // Near-miss teaching maps one INTENDED name onto the right one. A
+        // host-narrowed or host-withheld call already had the right name, and
+        // a placeholder never expressed an intent to map.
+        null
+      : describeOffFrontierToolNearMiss(
+          input.toolName,
+          input.readyFrontierToolNames,
+        );
   const category =
     input.category ??
-    mapToolRejectCategory({
-      toolName: input.toolName,
-      pendingGraphNodeId: input.pendingGraphNodeId,
-      message:
-        input.reasonMessage?.trim() ||
-        (input.pendingGraphNodeId
-          ? "off-frontier"
-          : "not available for this prompt"),
-    });
+    (hostNarrowed
+      ? "frontier_narrowed"
+      : hostWithheld
+        ? "frontier_withheld"
+        : placeholderName
+        ? "placeholder_tool_name"
+        : mapToolRejectCategory({
+          toolName: input.toolName,
+          pendingGraphNodeId: input.pendingGraphNodeId,
+          message:
+            input.reasonMessage?.trim() ||
+            (input.pendingGraphNodeId
+              ? "off-frontier"
+              : "not available for this prompt"),
+        }));
   const heldWriteTools = new Set(
     (input.heldWriteToolNames ?? []).filter(Boolean),
   );
@@ -285,9 +544,37 @@ export function buildOffFrontierToolRejectionMessage(input: {
       .filter(Boolean)
       .join(", ") ||
     "none";
-  const base = input.pendingGraphNodeId
-    ? `Deferred ${input.toolName}: authoritative mission node ${input.pendingGraphNodeId} is not on the ready frontier.`
-    : `Tool is not available for this prompt: ${input.toolName}`;
+  const base = placeholderName
+    ? `Rejected ${input.toolName}: that is an unfilled template placeholder, not a tool name.`
+    : hostNarrowed
+    ? `Deferred ${input.toolName}: it WAS offered at the start of this step. ` +
+      `This was call ${(input.offFrontier?.responseCallIndex ?? 0) + 1} of ` +
+      `${input.offFrontier?.responseCallCount ?? 1} in one response, and an earlier ` +
+      `call in that same response advanced the mission graph past this tool's planned slot.`
+    : hostWithheld
+      ? `Deferred ${input.toolName}: THE MENU CHANGED. It was offered at step ` +
+        `${input.offFrontier?.lastOfferedAtStep ?? "an earlier step"} of this run and has been ` +
+        `withheld since.`
+      : input.pendingGraphNodeId
+        ? `Deferred ${input.toolName}: authoritative mission node ${input.pendingGraphNodeId} is not on the ready frontier.`
+        : `Tool is not available for this prompt: ${input.toolName}`;
+  // The model can see it was offered this name moments ago. Telling it the
+  // name is unavailable invites a retry loop against a contradiction it
+  // cannot resolve. Name the real state and the real remedy instead.
+  const narrowedNote = hostNarrowed
+    ? `${input.toolName} is not an invalid name and nothing about this call was malformed; ` +
+      `the mission graph simply has no remaining ready slot for it. Nothing was executed for this call.`
+    : "";
+  // A refusal that says only "not offered" after having offered the tool for
+  // several steps teaches the model nothing it can act on. Say WHY the menu
+  // changed whenever the withholding transform is known.
+  const withheldNote = hostWithheld
+    ? `Your name selection was correct when you learned it; the offered menu has since changed. ` +
+      (input.offFrontier?.withheldBy
+        ? `Reason: ${input.offFrontier.withheldBy}. `
+        : "") +
+      `Do not keep re-issuing ${input.toolName}; work from the ready frontier above or return your final answer.`
+    : "";
   // "Preferred next" is ordering, not dependency reasoning: pickPreferredNextTool
   // returns the first unpaid delivery tool that happens to be ready, otherwise
   // the first ready name. It has never known what unblocks the deferred node.
@@ -324,8 +611,14 @@ export function buildOffFrontierToolRejectionMessage(input: {
     `Ready frontier tool(s) now: ${frontier}.`,
     preferredLine,
     deferredNote,
+    narrowedNote,
+    withheldNote,
     nearMiss ?? "",
-    "Correct only that issue; do not repeat this exact call.",
+    hostNarrowed
+      ? "Continue from the ready frontier; do not re-issue this call in this turn."
+      : hostWithheld
+        ? ""
+        : "Correct only that issue; do not repeat this exact call.",
   ]
     .filter(Boolean)
     .join(" ");
@@ -449,6 +742,7 @@ export function buildToolRejectEvalV1(input: {
   errorCategory: ToolRejectCategoryV1 | string;
   retryCount?: number;
   readyFrontier: readonly string[];
+  offFrontier?: OffFrontierRefusalFactsV1 | null;
 }): ToolRejectEvalV1 {
   return {
     userIntentExcerpt: String(input.userIntentExcerpt ?? "").slice(0, 400),
@@ -461,5 +755,16 @@ export function buildToolRejectEvalV1(input: {
     errorCategory: input.errorCategory,
     retryCount: input.retryCount ?? 0,
     readyFrontier: [...input.readyFrontier].slice(0, 24),
+    ...(input.offFrontier
+      ? {
+          offFrontier: {
+            ...input.offFrontier,
+            droppedSinceStepStart: input.offFrontier.droppedSinceStepStart.slice(
+              0,
+              24,
+            ),
+          },
+        }
+      : {}),
   };
 }

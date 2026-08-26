@@ -97,6 +97,10 @@ test("a known stream folds to exact counts, and attempted includes failures", ()
   );
   assert.deepEqual(counts.failureBuckets, {
     tool_not_allowed: 1,
+    // Host-caused off-frontier refusals split out of tool_not_allowed. Like
+    // every other bucket, an untouched one is an EXPLICIT 0, never absent.
+    frontier_narrowed_mid_response: 0,
+    frontier_withheld_since_earlier_step: 0,
     mission_graph_authority_blocked: 0,
     invalid_arguments: 1,
     execution_failed: 1,
