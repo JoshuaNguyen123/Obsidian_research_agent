@@ -12,6 +12,8 @@ import type {
 import type { AgentSettings } from "./settings";
 import type { CapabilityReadinessV2 } from "./agent/capabilityReadiness";
 import { ModelClientError } from "./model/types";
+import { RECALL_TOOL_RESULT_TOOL_NAME } from "./tools/recallTools";
+import { createToolResultStoreV1 } from "./agent/toolResultStore";
 import {
   createSpecialistModelClient,
   resolveAgentModelSlotV2,
@@ -3051,6 +3053,14 @@ export async function runAgentMission({
       ? { ...runContextBudget, maxPromptChars: calibrated.maxPromptChars }
       : runContextBudget;
   };
+  /**
+   * Full tool payloads compaction sets aside, so shrinking a result stops
+   * being a one-way door. Run-scoped: recall only ever happens inside the run
+   * that stashed the content.
+   */
+  const toolResultStore = createToolResultStoreV1(runId);
+  runToolContext.toolResultStore = toolResultStore;
+
   /**
    * Cross-run tool outcome ledger. Seeded from the host when it persists one;
    * otherwise a run-local ledger that simply learns nothing across runs, which
@@ -16332,6 +16342,8 @@ export async function runAgentMission({
         reflexOutput.intent,
         getActiveRoutedCodeToolNames(),
         hasActiveCurrentMarkdownFile(runToolContext),
+        undefined,
+        toolResultStore.size().entries > 0,
       );
       tools = constrainOrchestratedHandoffTools(
         tools,
@@ -17209,6 +17221,12 @@ export async function runAgentMission({
             ),
             maxPromptChars: effectiveContextBudget.maxPromptChars,
             handoff,
+            stash: (content) =>
+              toolResultStore.stash({
+                toolName: "compacted_tool_result",
+                step,
+                content,
+              }),
             proofExcerpts: {
               validationDiagnostic:
                 runtimeCache.latestFastValidationDiagnostic,
@@ -26414,6 +26432,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   count_words: "read",
   get_note_graph_context: "read",
   find_related_notes: "read",
+  recall_tool_result: "read",
   suggest_note_links: "read",
   list_folder: "read",
   get_path_info: "read",
@@ -26641,6 +26660,13 @@ function getAllowedToolDefinitions(
    * the section by title would otherwise never be offered the section tools.
    */
   namesActiveNoteSection = false,
+  /**
+   * Whether compaction has set aside any full tool output in this run. The
+   * recall tool is offered only then: before that it can do nothing, and
+   * blanket-offering it would cost every ordinary mission schema space against
+   * the request-compactness budget the AgentRunner suite enforces.
+   */
+  hasRecallableToolResults = false,
 ) {
   const joinedDeveloperLifecycle =
     hasAffirmativeJoinedDeveloperLifecycleIntent(prompt);
@@ -26810,6 +26836,9 @@ function getAllowedToolDefinitions(
     (!allowRetitle || !hasTitleOnlyIntent(prompt));
 
   const filtered = toolRegistry.getDefinitions().filter((definition) => {
+    if (definition.function.name === RECALL_TOOL_RESULT_TOOL_NAME) {
+      return hasRecallableToolResults;
+    }
     const name = definition.function.name;
 
     if (name === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME) {

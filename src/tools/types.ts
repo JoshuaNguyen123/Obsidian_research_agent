@@ -1,3 +1,4 @@
+import type { ToolResultStoreV1 } from "../agent/toolResultStore";
 import type { App, TFile } from "obsidian";
 import type { AgentSettings } from "../settings";
 import type {
@@ -133,6 +134,12 @@ export interface ToolExecutionContext {
   deadlineAt?: number;
   httpTransport: HttpTransport;
   runtimeCache?: AgentRuntimeCache;
+  /**
+   * Full tool payloads compaction set aside in this run. Absent means nothing
+   * was set aside, which recall_tool_result reports rather than treating as an
+   * error.
+   */
+  toolResultStore?: ToolResultStoreV1;
   reportProgress?: (message: string) => void;
   reportCodeOutput?: (event: {
     runId: string;

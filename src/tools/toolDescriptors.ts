@@ -59,7 +59,9 @@ const WORKSPACE_READS = new Set([
   "preview_workspace_html",
   "read_workspace_file",
 ]);
-const MEMORY_READS = new Set(["memory_search"]);
+// recall_tool_result reads back output this run already produced -- closest to
+// a memory read, and read-only either way.
+const MEMORY_READS = new Set(["memory_search", "recall_tool_result"]);
 const MEMORY_DELETES = new Set(["memory_forget", "memory_clear_experience"]);
 const CREATE_TOOLS = new Set([
   "create_design_canvas",

@@ -24,6 +24,7 @@ const SOFT_FORCE = new Set([
   "read_file",
   "read_source_section",
   "list_markdown_files",
+  "recall_tool_result",
   "list_folder",
   "search_markdown_files",
   "count_words",

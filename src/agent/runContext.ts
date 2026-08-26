@@ -172,6 +172,7 @@ export function compactLoopMessages({
   maxPromptChars,
   handoff,
   proofExcerpts,
+  stash,
 }: {
   messages: ModelChatMessage[];
   ledger: MissionLedger;
@@ -179,6 +180,8 @@ export function compactLoopMessages({
   maxPromptChars?: number;
   handoff?: ContinuationHandoffV1;
   proofExcerpts?: CompactionProofExcerpts;
+  /** Omitted keeps the pre-existing destructive behaviour. */
+  stash?: CompactionStashFn;
 }): LoopCompactionResult {
   const estimatedCharsBefore = estimatePromptChars(messages);
   if (handoff && !validateContinuationHandoffV1(handoff).ok) {
@@ -210,6 +213,11 @@ export function compactLoopMessages({
     estimatedCharsAfter < estimatedCharsBefore &&
     (maxPromptChars === undefined || estimatedCharsAfter <= maxPromptChars);
 
+  // Note on stashing: this candidate stashes as it builds, and may then lose to
+  // a turn-drop candidate below. Those entries end up unreachable -- no message
+  // carries their key. The waste is bounded by the store cap and they are the
+  // oldest, so they are the first evicted. Deferring the stash until a winner
+  // is picked would mean building every candidate twice.
   // Payload-first: shrink oversized tool bodies while keeping the full turn
   // structure before dropping older loop steps. Do not append mission state
   // here — that projection is for turn-drop candidates only.
@@ -219,7 +227,7 @@ export function compactLoopMessages({
       if (message.role !== "tool") {
         return message;
       }
-      const shrunk = shrinkToolMessageForCompaction(message, true);
+      const shrunk = shrinkToolMessageForCompaction(message, true, stash);
       if (shrunk.content !== message.content) {
         shrunkToolMessages += 1;
       }
@@ -475,9 +483,17 @@ export function formatProofExcerptsForCompaction(
   return lines.length > 1 ? lines.join("\n") : null;
 }
 
+/**
+ * Hands a full payload to the run's store and returns the key to reach it by.
+ * Absent means compaction stays destructive, which is the pre-existing
+ * behaviour and what unit callers without a store get.
+ */
+export type CompactionStashFn = (content: string) => string | null;
+
 function shrinkToolMessageForCompaction(
   message: ModelChatMessage,
   enabled: boolean,
+  stash?: CompactionStashFn,
 ): ModelChatMessage {
   if (!enabled || message.role !== "tool") {
     return message;
@@ -485,11 +501,19 @@ function shrinkToolMessageForCompaction(
   if (message.content.length <= TOOL_SHRINK_CHAR_BUDGET) {
     return message;
   }
+  // Stashed before the rewrite, so the key names content that still exists.
+  const recallKey = stash?.(message.content) ?? null;
 
   try {
     const parsed: unknown = JSON.parse(message.content);
     if (isRecord(parsed)) {
       const slim: Record<string, unknown> = { truncated: true };
+      if (recallKey) {
+        slim.recallKey = recallKey;
+        // Spelled out rather than left as a bare key. A smaller tool-trained
+        // model will not infer an affordance from an opaque identifier.
+        slim.recallHint = `Full output was set aside. Call recall_tool_result with key "${recallKey}" to read it, optionally passing query to search it.`;
+      }
       for (const key of TOOL_CHAINING_KEYS) {
         if (key in parsed) {
           slim[key] = parsed[key];
@@ -533,9 +557,18 @@ function shrinkToolMessageForCompaction(
     // Fall through to plain truncation.
   }
 
+  // Unparseable payloads are truncated rather than restructured, but the
+  // recall affordance still applies -- the stash holds raw text either way.
+  const truncated = truncateContextLine(
+    message.content,
+    TOOL_SHRINK_CHAR_BUDGET,
+  );
   return {
     ...message,
-    content: truncateContextLine(message.content, TOOL_SHRINK_CHAR_BUDGET),
+    content: recallKey
+      ? `${truncated}
+[recall_tool_result key="${recallKey}" reads the full output]`
+      : truncated,
   };
 }
 

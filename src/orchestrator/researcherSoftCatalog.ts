@@ -20,6 +20,7 @@ export const RESEARCHER_SOFT_TOOL_NAMES: readonly string[] = [
   "search_markdown_files",
   "read_markdown_files",
   "read_file",
+  "recall_tool_result",
   "inspect_vault_context",
   "list_folder",
   "get_path_info",
