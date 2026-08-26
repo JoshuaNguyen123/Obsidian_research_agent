@@ -46,6 +46,7 @@ import {
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
   getRequiredWriteToolNamesForTests,
+  missionRequiresSandboxValidationV1,
   getDurablyProvenCompletedGraphToolNames,
   getRestorableCompletedGraphToolNames,
   insertExplicitLinearReadbacksIntoLifecycleToolNames,
@@ -791,6 +792,59 @@ test("bare Python Desktop delivery requires scratch creation, validation, and ex
       "code_validate_full",
       "code_workspace_export_directory",
     ],
+  );
+});
+
+test("an executable notebook mission plans the sandbox code ladder, not a current-note append or a reflection", () => {
+  // The EXACT prompt e2e/notebook-execution-live.spec.ts submits. It names no
+  // language, no code extension, and no game/app/script noun, so before the
+  // shared executable-notebook predicate the planner authored a single
+  // append_to_current_file node and the mission completed vacuously with no
+  // sandbox, no cell execution, and no Desktop export receipt.
+  const prompt =
+    "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers, " +
+    "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it";
+  const desktopLadder = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_workspace_export_directory",
+  ];
+  assert.deepEqual(getRequiredCodeWorkflowToolNames(prompt), desktopLadder);
+  // Cell execution happens inside scratch sandbox validation, so the mission
+  // must fail fast at submit time when no sandbox is available — exactly like
+  // every other code-delivery mission.
+  assert.equal(missionRequiresSandboxValidationV1(prompt), true);
+  // Even when the catalog offers the current-note append and the jupyter
+  // reflection write, the required ladder is the code ladder alone: the write
+  // seats and the route must not disagree about which mission shape owns a
+  // notebook prompt.
+  assert.deepEqual(
+    getRequiredWriteToolNamesForTests(prompt, [
+      "append_to_current_file",
+      "append_file",
+      "create_file",
+      "append_jupyter_reflection",
+      "write_project_results",
+      ...desktopLadder,
+    ]),
+    desktopLadder,
+  );
+  // A plain current-note append prompt keeps its append requirement — the
+  // notebook predicate must not widen ordinary note writes into code missions.
+  assert.deepEqual(
+    getRequiredWriteToolNamesForTests(
+      "append a short summary of today's meeting to my current note",
+      [
+        "append_to_current_file",
+        "append_jupyter_reflection",
+        ...desktopLadder,
+      ],
+    ),
+    ["append_to_current_file"],
   );
 });
 

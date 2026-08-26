@@ -67,9 +67,11 @@ export const FULL_DESKTOP_LADDER = [
  * guard-desk-notes, whose route false-positive lives in the shared design
  * gate (`codeDesignIntent.ts` DESIGN_INTENT matching topical "game design");
  * narrowing it risks real design missions, so it waits for the semantic
- * shadow tier evidence.
+ * shadow tier evidence. 64/65 after the executable-notebook deliverable
+ * predicate landed (notebook-execution-live lane prompt, fast-path deferral,
+ * and the jupyter-reflection guard all pass).
  */
-export const ROUTING_BASELINE_ACCURACY = 61 / 62;
+export const ROUTING_BASELINE_ACCURACY = 64 / 65;
 
 export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
   // --- The two live-reported desktop prompts and near variants ---
@@ -564,6 +566,59 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     prompt:
       "create a photo renaming script and save it to my dowloads folder",
     expected: { speechAct: "execute", executionTier: "bounded_tool" },
+    status: "pass",
+  },
+  // --- Executable notebook deliverables (notebook-execution-live lane) ---
+  {
+    // The EXACT prompt e2e/notebook-execution-live.spec.ts submits. Before
+    // hasExecutableNotebookDeliverableIntent existed, this mission carried no
+    // recognized code vocabulary (no language, no extension, no game/app/script
+    // noun), routed as a current-note append, and completed vacuously in ~70s
+    // with no sandbox, no execution, and no Desktop delivery.
+    id: "desktop-notebook-execution-lane",
+    prompt:
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers, " +
+      "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
+    expected: {
+      speechAct: "execute",
+      executionTier: "bounded_tool",
+      route: "grounded_workflow",
+      reasonsInclude: ["code_execution_intent"],
+      requiredCodeToolNames: FULL_DESKTOP_LADDER,
+    },
+    status: "pass",
+  },
+  {
+    // The current-note streamed-append fast path must defer on notebook
+    // vocabulary: even when a stale precomputed writeback kind claims "append",
+    // the code route outranks it so the mission still plans the sandbox ladder.
+    id: "notebook-fast-path-defers",
+    prompt:
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers, " +
+      "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
+    streamingWritebackKind: "append",
+    intent: {
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    },
+    expected: {
+      route: "grounded_workflow",
+      reasonsInclude: ["code_execution_intent"],
+      requiredCodeToolNames: FULL_DESKTOP_LADDER,
+    },
+    status: "pass",
+  },
+  {
+    // Reflection writes into a notebook stay on the jupyter-reflection write
+    // path: no code ladder may be manufactured from reflection vocabulary.
+    id: "guard-jupyter-reflection-write",
+    prompt: "Write the final reflection to a Jupyter notebook.",
+    expected: {
+      speechAct: "persist",
+      requiredCodeToolNames: [],
+    },
     status: "pass",
   },
 ];

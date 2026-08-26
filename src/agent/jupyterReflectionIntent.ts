@@ -1,3 +1,5 @@
+import { hasExecutableNotebookDeliverableIntent } from "./codeDeliverableIntent";
+
 const NOTEBOOK_PATH_PATTERN =
   String.raw`[A-Za-z0-9@()[\]_.-]+(?:\/[A-Za-z0-9 @()[\]_.-]+)*\.ipynb`;
 
@@ -55,6 +57,13 @@ export function isSafeVaultJupyterNotebookPathV1(value: string): boolean {
  * the host to derive a safe no-overwrite Results path.
  */
 export function hasJupyterReflectionIntentV1(prompt: string): boolean {
+  // One predicate, two seams: a notebook the user wants authored AND executed
+  // belongs to the Code workspace (route, ladder, and fast-path deferral all
+  // key off hasCodeDeliverableIntent). The reflection write path must stand
+  // down for exactly that prompt shape, or the planner routes the whole
+  // mission as a one-node reflection/append and it completes vacuously with
+  // no notebook execution and no delivery.
+  if (hasExecutableNotebookDeliverableIntent(prompt)) return false;
   if (hasJupyterReflectionNegationV1(prompt)) return false;
   const clauses = prompt
     .replace(/\r\n?/gu, "\n")

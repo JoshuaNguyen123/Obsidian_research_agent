@@ -22,6 +22,7 @@ import {
   type AcceptedResearchArtifactV1,
 } from "../integrations/linear/AcceptedResearchArtifactV1";
 import type { RepositoryVisibility } from "../integrations/github/RepositoryVisibility";
+import { hasExecutableNotebookDeliverableIntent } from "./codeDeliverableIntent";
 
 export const RESEARCHER_HANDOFF_SCHEMA_VERSION = 1 as const;
 export const RESEARCH_PROJECT_PLAN_SCHEMA_VERSION = 1 as const;
@@ -1023,9 +1024,18 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   if (positive(/\b(?:publish|push|open|create)\b[^.\n]{0,140}\b(?:github|draft\s+(?:pr|pull request)|pull request|private\s+repository)\b/u, "github|publish(?:ing|ation)?|push|pull request|draft pr|private repository")) {
     stages.push("private_github_publication");
   }
+  // "create … a Jupyter notebook" is reflection vocabulary ONLY when the
+  // notebook is a reflection destination. When the shared executable-notebook
+  // predicate says the notebook IS the code deliverable ("create a Jupyter
+  // notebook … run its cells … deliver it"), the notebook nouns must not
+  // manufacture a reflection stage; explicit reflection/results/retrospective
+  // wording still does.
+  const reflectionStageTargets = hasExecutableNotebookDeliverableIntent(command)
+    ? /\b(?:write|append|create|record|summari[sz]e|produce)\b[^.\n]{0,140}\b(?:reflection|results?(?: note| page| report)?|retrospective|postmortem)\b/u
+    : /\b(?:write|append|create|record|summari[sz]e|produce)\b[^.\n]{0,140}\b(?:reflection|results?(?: note| page| report)?|retrospective|postmortem|jupyter\s+notebook|notebook)\b/u;
   if (
     positive(
-      /\b(?:write|append|create|record|summari[sz]e|produce)\b[^.\n]{0,140}\b(?:reflection|results?(?: note| page| report)?|retrospective|postmortem|jupyter\s+notebook|notebook)\b/u,
+      reflectionStageTargets,
       "reflect(?:ion)?|report|results?(?: note| page| report)?|retrospective|postmortem|jupyter|notebook",
     ) ||
     positive(
