@@ -96,51 +96,36 @@ const cleanNames = (names: readonly string[]): string[] =>
   names.map((name) => name.trim()).filter(Boolean);
 
 /**
- * Explicit placeholder tokens seen in unfilled function-calling templates.
- * Every real tool in this product is lower_snake_case and none of these is a
- * registered name, so matching them cannot shadow a genuine selection.
- */
-const UNFILLED_TOOL_NAME_PLACEHOLDER_TOKENS = new Set([
-  "tool_name",
-  "toolname",
-  "tool",
-  "function_name",
-  "functionname",
-  "your_tool_name",
-  "name",
-]);
-
-/**
  * CLASSIFICATION ONLY -- this never rewrites or repairs a call.
  *
  * A model that emits `$TOOL_NAME` did not choose the wrong tool; it failed to
  * substitute into its own template. That is a different diagnosis with a
  * different fix from naming a real-but-unoffered tool, and lumping the two
- * into one bucket hides both. Detection is syntactic (template sigils) plus a
- * closed token list, never "this name is unfamiliar" -- an unfamiliar name is
- * exactly what genuine misselection looks like, and must stay in its own
- * class.
+ * into one bucket hides both. Detection is syntactic, never "this name is
+ * unfamiliar" -- an unfamiliar name is exactly what genuine misselection looks
+ * like, and must stay in its own class.
  *
- * Repairing a placeholder into the offered tool is a separate, narrower
- * concern owned elsewhere (prod/continuation-final-only-heal): it only rewrites
- * when exactly one read-effect tool is offered. This predicate deliberately
- * does not duplicate that decision -- it only labels what reached the gate.
+ * MERGE NOTE. `AgentRunner.isPlaceholderToolNameV1` (595075e, on main) answers
+ * this same question for the REPAIR path, which rewrites a placeholder to the
+ * offered tool when exactly one read-effect tool is offered. Two predicates
+ * for one question is how classifiers drift here, so this body is deliberately
+ * the SAME logic, not a second opinion: when the branches merge, delete one and
+ * have the other import it. `toolRejectEval` is the correct home -- AgentRunner
+ * already imports this module, so the dependency only points one way.
  */
 export function looksLikeUnfilledToolNamePlaceholderV1(
   toolName: string | null | undefined,
 ): boolean {
-  const raw = String(toolName ?? "").trim();
-  if (!raw) return false;
-  // Template sigils: $TOOL, ${tool}, {{tool}}, <tool_name>, [tool], %tool%.
-  if (/^[$%]/u.test(raw)) return true;
-  if (/^\{\{.*\}\}$/u.test(raw)) return true;
-  if (/^\{.*\}$/u.test(raw)) return true;
-  if (/^<.*>$/u.test(raw)) return true;
-  if (/^\[.*\]$/u.test(raw)) return true;
-  if (/%$/u.test(raw) && raw.includes("%")) return true;
-  // Bare template words, with or without separators/case decoration.
-  const bare = raw.replace(/[^A-Za-z0-9]+/gu, "_").replace(/^_+|_+$/gu, "");
-  return UNFILLED_TOOL_NAME_PLACEHOLDER_TOKENS.has(bare.toLowerCase());
+  const value = String(toolName ?? "").trim();
+  if (!value) return false;
+  return (
+    /^\$\{?\s*[a-z0-9_]*tool[a-z0-9_]*\s*\}?$/iu.test(value) ||
+    /^<+\s*\/?\s*(?:tool|tool[_\s-]?name|name)\s*>+$/iu.test(value) ||
+    /^\{\{\s*(?:tool|tool[_\s-]?name)\s*\}\}$/iu.test(value) ||
+    /^(?:tool[_\s-]?name|toolname|your[_\s-]?tool(?:[_\s-]?name)?|name[_\s-]?of[_\s-]?tool|exact[_\s-]?tool[_\s-]?name)$/iu.test(
+      value,
+    )
+  );
 }
 
 /**

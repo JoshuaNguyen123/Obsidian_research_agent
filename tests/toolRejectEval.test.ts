@@ -596,14 +596,19 @@ test("an unfilled function-calling template is a formatting failure, not a misse
   // Observed live: a model emitted a call literally named `$TOOL_NAME`. It did
   // not choose the wrong tool -- it failed to substitute into its own
   // template. Counting that as wrong-tool-selection hides a formatting bug.
+  // These shapes are pinned so that when this predicate and AgentRunner's
+  // `isPlaceholderToolNameV1` (595075e) are collapsed into one, any behavioral
+  // difference between them fails here instead of drifting silently.
   for (const placeholder of [
     "$TOOL_NAME",
     "${tool_name}",
     "{{tool}}",
     "<tool_name>",
-    "[TOOL]",
+    "</tool>",
     "tool_name",
-    "function_name",
+    "toolname",
+    "your_tool_name",
+    "exact tool name",
   ]) {
     assert.equal(
       looksLikeUnfilledToolNamePlaceholderV1(placeholder),
