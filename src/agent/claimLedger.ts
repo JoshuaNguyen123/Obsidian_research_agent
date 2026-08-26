@@ -174,8 +174,84 @@ const CLAIM_STOP_TERMS = new Set([
  * still returns true for unit tests and forced ledger builds; AgentRunner must
  * gate on the user prompt, not researchPlan.mode alone.
  */
+/**
+ * GUARD RULE — read before adding any lexical trigger that levies research,
+ * evidence, citation, or quotation debt from prompt text.
+ *
+ * A keyword trigger cannot see NEGATION or CONTRACT CONTEXT, and a mission
+ * prompt routinely contains the very words that describe what it is NOT
+ * doing, or what it is verifying about its own WRITE. Three separate seats
+ * in this codebase shipped the same defect within 24 hours, each stranding
+ * live missions:
+ *   1. quote-span requirement armed by "no verbatim quotations" (fixed with
+ *      a negation strip in shouldRequireQuoteSpans below);
+ *   2. reflex web/vault evidence armed by "needs no web, memory, or vault
+ *      research" (fixed with missionForswearsResearchEvidence);
+ *   3. claim grounding armed by "append one line ... and verify that write"
+ *      (fixed with stripWriteVerificationPhrasesV1 here).
+ *
+ * The rule: STRIP-THEN-TEST. Remove negated and self-referential-contract
+ * phrasings from the text FIRST, then run the trigger over the remainder,
+ * and pin a truth table that includes at least one MIXED prompt (real
+ * research demand + write-verification clause) so the strip cannot silently
+ * disarm a legitimate requirement. Export the strip so every seat asking the
+ * same question consumes one predicate rather than re-deriving it.
+ *
+ * That rule cures one family of a broader defect — a checker fooled by
+ * self-reference. The sibling family is SELF-DETECTION: a detector matching
+ * a pattern against text that necessarily contains the pattern (a process
+ * scanner whose own command line carries the search string and so detects
+ * itself), or a readiness probe whose signal can appear mid-operation (a
+ * package probe that reports "installed" from a file written 2% into the
+ * install). Cure those by excluding self from the scan and by choosing a
+ * completion signal that cannot exist before completion — an exit code plus
+ * independent verification, a count threshold, or a sentinel written last.
+ * Both families share one question: can the thing I am testing produce my
+ * evidence for a reason other than the one I mean?
+ *
+ * For family 2, prefer an END-TO-END FUNCTIONAL PROBE over any structural
+ * proxy. Tonight three different readiness checks for one toolchain — a
+ * file-presence probe, an entry-count threshold, and a process-exit check —
+ * each reported a state that was not true (a partially written tree read as
+ * ready; a fully repaired 19-entry tree read as broken against an invented
+ * >100 threshold; a dying installer read as a healthy one). The question
+ * "does the toolchain work?" has exactly one trustworthy answer: run it —
+ * and run the part you are about to depend on. A probe that exercises an
+ * unrelated path is real but irrelevant: a suite importing no workspace
+ * package certified a tree whose workspace links were missing, so every
+ * suite that did import them failed at load and read as a product
+ * regression. Prefer the probe that would FAIL if the thing you just fixed
+ * were still broken.
+ */
+
+/**
+ * "Verify that write" is DURABLE-WRITE proof, not factual-source
+ * verification. The bare `\bverify\b` trigger read an ordered write contract
+ * ("append one line containing X and verify that write") as a demand for
+ * persisted passage citations, so a mission that gathers no sources — and
+ * says so outright — could never satisfy its own final-output gate: the
+ * answer was blocked with "Ground each material claim with a persisted
+ * passage citation", the run ended budget/blocked instead of final, and the
+ * interrupted-continuation proof lane could never reach a terminal state
+ * (2026-08-26 06:41Z). Same context-blind-trigger disease as the
+ * negation-aware quote-span strip below and the reflex evidence triggers,
+ * which share this predicate.
+ *
+ * Exported so the reflex completion evaluator strips the same phrases: two
+ * seats asking "does this prompt demand research verification?" must not
+ * answer differently.
+ */
+export function stripWriteVerificationPhrasesV1(text: string): string {
+  return text.replace(
+    /\bverif(?:y|ies|ied|ying)\s+(?:that|the|this|each|every|both|its?|your)?\s*(?:durable\s+|note\s+|vault\s+|file\s+|exact\s+)?(?:write|writes|append|appends|edit|edits|mutation|mutations|save|saves|receipt|receipts)\b/gi,
+    " ",
+  );
+}
+
 export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
-  const value = promptOrMode.replace(/\s+/g, " ").trim();
+  const value = stripWriteVerificationPhrasesV1(promptOrMode)
+    .replace(/\s+/g, " ")
+    .trim();
   if (!value) {
     return false;
   }

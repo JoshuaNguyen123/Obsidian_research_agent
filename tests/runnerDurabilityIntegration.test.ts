@@ -1236,6 +1236,190 @@ test("continue of a crash-restored tool-less final stub splices the owed write a
   assert.match(noteContent, /MARKER_HEALED_APPEND/u);
 });
 
+test("a restored stub whose envelope cannot grant the required write is abandoned for a fresh plan", async () => {
+  // Proof-matrix interrupted-continuation run 7 (2026-08-26 07:55Z): the
+  // heal refused three times with the named guard envelope_grant_missing.
+  // A crash can persist a tool-less `final` stub whose capability envelope
+  // never granted append_to_current_file — the segment that planted it
+  // planned no write node, so no grant was ever minted. Adopting that
+  // record makes the mission's required write STRUCTURALLY impossible: the
+  // heal cannot splice a node the envelope does not authorize, the frontier
+  // fallback still offers the tool, and the authority refuses every call
+  // until the budget dies. The continuation must refuse the adoption and
+  // replan, which mints a real append node and a matching grant.
+  const vault = createVaultHarness();
+  vault.context.settings.semanticSearchEnabled = true;
+  const originalMission =
+    "Perform exactly two ordered durable appends to the current note, then finish. " +
+    "First append exactly one line containing MARKER_A1 and verify that write. " +
+    "Then append exactly one separate line containing MARKER_B2 and verify that write. " +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+  const interruptedRunId = "run-stub-envelope-unusable";
+  const missionId = canonicalMissionGraphId(interruptedRunId);
+
+  // A stub graph whose envelope grants only a READ tool: exactly the shape
+  // whose heal refusal named envelope_grant_missing.
+  const createdAt = "2026-08-26T07:50:00.000Z";
+  const capabilityEnvelope = await buildMissionCapabilityEnvelopeV1({
+    missionId,
+    issuedAt: createdAt,
+    expiresAt: null,
+    capabilities: ["vault.read"],
+    executionHosts: ["obsidian_core"],
+    executors: {
+      core: {
+        id: "core",
+        executionHosts: ["obsidian_core"],
+        allowedEffects: ["read"],
+      },
+    },
+    verifiers: ["artifact-verifier"],
+    tools: {
+      read_current_file: {
+        name: "read_current_file",
+        effect: "read",
+        capabilityIds: ["vault.read"],
+        executionHosts: ["obsidian_core"],
+        bindingKinds: [],
+      },
+    },
+    bindings: {},
+    budgets: {
+      maxNodes: 8,
+      maxDepth: 1,
+      maxConcurrentReadNodes: 2,
+      maxTotalToolCalls: 8,
+      maxExternalActions: 0,
+      maxWallClockMs: 120_000,
+      maxAttemptsPerNode: 2,
+    },
+  });
+  await persistInitialMissionGraph(vault.context, {
+    schemaVersion: 3,
+    missionId,
+    objective: originalMission,
+    revision: 0,
+    journalHeadFingerprint: null,
+    createdAt,
+    updatedAt: createdAt,
+    routing: {
+      source: "deterministic",
+      fallbackFrom: null,
+      fallbackReason: null,
+      confidence: 1,
+      decidedAt: createdAt,
+      decisionFingerprint: `sha256:${"2".repeat(64)}`,
+    },
+    continuationCheckpoint: null,
+    capabilityEnvelope,
+    nodes: {
+      final: {
+        id: "final",
+        dependencyIds: [],
+        objective: "Deliver a verified final result.",
+        executorId: "core",
+        executionHost: "obsidian_core",
+        effect: "read",
+        inputs: {},
+        outputs: {},
+        requiredCapabilities: [],
+        allowedTools: [],
+        destination: null,
+        resourceLocks: [],
+        budget: { toolCalls: 0, externalActions: 0, wallClockMs: 30_000 },
+        retries: {
+          maxAttempts: 2,
+          attempts: 0,
+          failureFingerprints: [],
+          consecutiveFailureFingerprint: null,
+          consecutiveFailureCount: 0,
+        },
+        status: "ready",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        completionContract: {
+          criteria: ["A final answer is delivered."],
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["final-output"],
+          minimumReceipts: 0,
+          requiredReceiptKinds: [],
+          verifierId: null,
+        },
+        blocker: null,
+      },
+    },
+  });
+  await writeMissionLedger(
+    vault.context,
+    createPrePlanningAnchorLedger({
+      runId: interruptedRunId,
+      mission: originalMission,
+      targetNotePath: "Current.md",
+      now: new Date("2026-08-26T07:50:30.000Z"),
+    }),
+  );
+
+  const traces: AgentTraceEvent[] = [];
+  const toolStarts: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  await runAgentMission({
+    prompt: `continue run ${interruptedRunId}`,
+    modelClient: createModelClient([
+      responseWithToolCall("append_to_current_file", { text: "MARKER_A1" }),
+      responseWithToolCall("append_to_current_file", { text: "MARKER_B2" }),
+      {
+        message: {
+          role: "assistant",
+          content: "Both ordered appends are durably recorded.",
+          toolCalls: [],
+        },
+        toolCalls: [],
+      },
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onTrace: (event) => traces.push(event),
+      onToolStart: (event) => toolStarts.push(event.name),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.ok(
+    traces.some(
+      (event) => event.id === "mission-graph-resume-stub-envelope-unusable",
+    ),
+    JSON.stringify({
+      rule: "An unpaid final-only stub whose envelope cannot grant the required write must be refused, not adopted.",
+      traceIds: traces.map((event) => event.id).slice(0, 40),
+    }),
+  );
+  // The replan must produce a real, authorized write — no heal refusal, no
+  // authority rejection, and the owed marker actually lands.
+  assert.deepEqual(
+    traces
+      .filter((event) => /graph-rejected|splice-refused/u.test(event.id))
+      .map((event) => event.id),
+    [],
+    JSON.stringify({
+      rule: "After refusing the unusable stub the replanned graph must authorize the write outright.",
+      completion: completions.at(-1),
+    }),
+  );
+  assert.ok(
+    toolStarts.includes("append_to_current_file"),
+    JSON.stringify({ toolStarts, completion: completions.at(-1) }),
+  );
+  const note = vault.files.get("Current.md") ?? "";
+  assert.equal(
+    note.split("MARKER_A1").length - 1,
+    1,
+    JSON.stringify({ note, completion: completions.at(-1) }),
+  );
+});
+
 test("continue of a stub graph with streaming off and only the durable anchor heals and pays the append", async () => {
   // Proof-matrix interrupted-continuation, 2026-08-25 22:41Z: the lane runs
   // with streamWritebackMode "off" and the kill predates the first runtime
