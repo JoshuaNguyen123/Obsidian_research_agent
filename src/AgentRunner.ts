@@ -184,6 +184,7 @@ import {
   estimateProjectLifecycleForSetLooseV1,
   estimateProjectLifecycleV1,
   getProjectLineageFingerprintHistoryV1,
+  projectLineageCarriesLinearHierarchyV1,
   type ProjectLifecycleEstimateV1,
   type ProjectLineageV1,
   type ProjectLifecycleStageV1,
@@ -9488,21 +9489,21 @@ export async function runAgentMission({
         },
       });
     }
+    const acceptedReflectionRunIds = new Set(
+      [
+        runtimeSnapshot?.lineage.rootRunId,
+        runToolContext.rootMissionId,
+        runToolContext.runId,
+        runId,
+      ]
+        .filter((value): value is string => Boolean(value?.trim()))
+        .map((value) => value.trim()),
+    );
     const canonicalLifecycleReflectionPaid = (() => {
       const durableReflectionReceiptIds = new Set([
         ...(missionLedger?.receipts ?? []),
         ...(resumeLedger?.receipts ?? []),
       ]);
-      const acceptedReflectionRunIds = new Set(
-        [
-          runtimeSnapshot?.lineage.rootRunId,
-          runToolContext.rootMissionId,
-          runToolContext.runId,
-          runId,
-        ]
-          .filter((value): value is string => Boolean(value?.trim()))
-          .map((value) => value.trim()),
-      );
       const durableLifecycleReflectionPaid = (
         runToolContext.getProjectLineages?.() ?? []
       ).some(
@@ -9521,9 +9522,25 @@ export async function runAgentMission({
       );
     })();
     let projectLifecycleCompletionFailure: string | null = null;
+    // Demand the terminal Linear project drain only when this run's durable
+    // lineage actually carries the `linear_hierarchy` commit the drain reads.
+    //
+    // Arming this off `compoundLifecycleStages` (prompt-detected words) made
+    // the demander and the satisfier disagree: "full pipeline" wording detects
+    // the `linear_hierarchy` STAGE, but the work-unit bindings the host drain
+    // requires exist only when `publish_research_project_to_linear` wrote a
+    // hierarchy COMMIT. A single-issue mission pays the stage with
+    // linear_create_issue/linear_get_issue and never writes that commit, so
+    // acceptance demanded a readback nothing in the ladder could ever
+    // provision. The stage itself stays gated by unpaidSetLooseDeliveryStages;
+    // this predicate governs only the post-completion progress projection.
     const requiresTerminalProjectLinearDrain =
-      compoundLifecycleStages.includes("linear_hierarchy") &&
-      compoundLifecycleStages.includes("reflection");
+      compoundLifecycleStages.includes("reflection") &&
+      (runToolContext.getProjectLineages?.() ?? []).some(
+        (candidate) =>
+          acceptedReflectionRunIds.has(candidate.runId) &&
+          projectLineageCarriesLinearHierarchyV1({ lineage: candidate }),
+      );
     if (
       canonicalLifecycleReflectionPaid &&
       requiresTerminalProjectLinearDrain &&
@@ -22549,7 +22566,16 @@ export async function runAgentMission({
         `successful_tools=${currentSegmentSuccessfulToolNames.length}`,
         `failed_tools=${failedToolNames.length}`,
         `repeated_responses=${consecutiveNoProgressSteps}`,
-        `required_tools_satisfied=${requiredLoopToolsSatisfied}`,
+        // Print the value the decision actually consumed. The raw
+        // segment-local measure is reported under its honest name: it is
+        // expected-tool coverage only, and `areLoopRequiredToolsSatisfied`
+        // also returns false when no expected tools are configured at all.
+        // Emitting it as `required_tools_satisfied` made every graph-authority
+        // force-final look self-contradictory ("reason=required_tools_satisfied;
+        // required_tools_satisfied=false") and cost real diagnosis time.
+        `expected_tools_covered=${requiredLoopToolsSatisfied}`,
+        `set_loose_delivery_unpaid=${setLooseDeliveryStillUnpaid}`,
+        `required_tools_satisfied=${loopLedger.requiredToolsSatisfied}`,
         `graph_final_only=${missionGraphFinalSynthesisOnly}`,
         `graph_stub_owes_work=${missionGraphStubOwesRequiredWork}`,
       ].join("; "),

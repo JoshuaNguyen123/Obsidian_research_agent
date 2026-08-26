@@ -192,6 +192,70 @@ test("final output cancels every non-terminal node outside the required closure"
   );
 });
 
+test("a cancelled final dependency does not strand the final output unrecorded", async () => {
+  // The steering predicate and the recording path must agree on what "this
+  // node no longer owes work" means. missionGraphOnlyFinalSynthesisRemainsV1
+  // treats cancelled as terminal, so the runner forces a final-only synthesis
+  // (graph_final_only=true) on exactly this shape. completeFinalOutput used to
+  // demand `complete` for every dependency and silently returned the graph
+  // unchanged, so the final-output evidence was never appended and
+  // plan:final:final_relevance / verifier:final:final_relevance stayed missing
+  // no matter what the model wrote. completeFinalOutput cancels non-required
+  // dependencies itself, so a persisted graph resumes straight into this state.
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-cancelled-final-dependency",
+    allowedTools: ["replace_current_file", "web_search"],
+    plannedTools: ["replace_current_file", "web_search"],
+  });
+  const readNode = toolNode(graph, "web_search");
+  assert.ok(
+    graph.nodes.final.dependencyIds.includes(readNode.id),
+    "fixture requires the read node to be a declared final dependency",
+  );
+  // A dependency that was abandoned in an earlier segment. It will never
+  // produce evidence, so waiting on it is waiting forever.
+  graph.nodes[readNode.id]!.status = "cancelled";
+  graph.nodes[readNode.id]!.blocker = null;
+
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const write = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  const writeNode = session.graph.nodes[write.nodeId]!;
+  await session.finishToolExecution(write, {
+    ok: true,
+    evidence: evidenceFor(writeNode, "d", harness.nextTimestamp()),
+    receipt: receiptFor(writeNode, "e", harness.nextTimestamp()),
+  });
+
+  // The runner steers to the final answer on this graph...
+  assert.equal(
+    missionGraphOnlyFinalSynthesisRemainsV1(session.graph),
+    true,
+    "the cancelled dependency must still report only-final-synthesis-remains",
+  );
+
+  // ...so the session must be willing to bank the answer it steered for.
+  const terminal = await session.completeFinalOutput({
+    outputFingerprint: fp("f"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(
+    terminal.nodes.final.status,
+    "complete",
+    "a cancelled dependency must not silently no-op the final output record",
+  );
+  assert.ok(
+    terminal.nodes.final.evidence.length > 0,
+    "the final node must carry its final-output evidence",
+  );
+  assert.equal(terminal.nodes[readNode.id]?.status, "cancelled");
+});
+
 test("final output preserves the canonical host post-acceptance action until it runs", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({

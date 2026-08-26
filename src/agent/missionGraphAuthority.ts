@@ -1,4 +1,5 @@
 import type { MissionGraphV3, MissionNodeV3 } from "../../packages/headless-runtime/src/missionGraphV3";
+import { missionGraphNodeStatusIsTerminalV1 } from "../../packages/headless-runtime/src/missionGraphV3";
 
 /**
  * Runtime authority helpers: MissionGraph is the source of truth.
@@ -85,6 +86,17 @@ export function findFinalMissionGraphNode(
       ),
   );
   return entry ? { id: entry[0], node: entry[1] } : null;
+}
+
+/**
+ * Node-shaped wrapper over the runtime's single terminal-status definition.
+ * Re-exported here only so graph-authority callers keep one import site; the
+ * rule itself lives in `missionGraphV3` and is shared with the validator.
+ */
+export function missionGraphNodeIsTerminalV1(
+  node: { status: MissionNodeV3["status"] } | null | undefined,
+): boolean {
+  return missionGraphNodeStatusIsTerminalV1(node?.status);
 }
 
 /**
