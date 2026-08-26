@@ -29,6 +29,7 @@ import { parseAcceptedResearchArtifactV1 } from "../integrations/linear/Accepted
 import { parseExternalWorkItemBindingV1 } from "../integrations/linear/ExternalWorkItemBindingV1";
 import { parseWorkItemLineageV1 } from "../integrations/linear/WorkItemLineageV1";
 import { parseRenderedCompatibleWorkItemSpec } from "../integrations/linear/WorkItemParser";
+import { researchPublicationStatusOwnsLinearIssueV1 } from "../integrations/linear/ResearchPublicationWorkflow";
 import { resolveExplicitRepositoryVisibilityChoiceV1 } from "../integrations/github/RepositoryVisibility";
 import { hasMeaningfulReflectionContentV1 } from "../../packages/core-api/src/reflectionContentV1";
 import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
@@ -902,15 +903,58 @@ function nestedProviderReceiptMatchesOuter(
   );
 }
 
+type AcceptedResearchPublicationReceiptProofV1 = {
+  /** This run already owns a provider-visible Linear issue for this publication. */
+  ownsLinearIssue: boolean;
+  /** …and the vault-side backlink is verified and bound to it. */
+  complete: boolean;
+};
+
+const NO_ACCEPTED_RESEARCH_PUBLICATION_PROOF: AcceptedResearchPublicationReceiptProofV1 =
+  { ownsLinearIssue: false, complete: false };
+
 /**
+ * Receipt-shaped wrapper over `researchPublicationStatusOwnsLinearIssueV1`, the
+ * one definition of "this publication already owns a provider-visible Linear
+ * issue".
+ *
  * Canonical research publication receipts intentionally retain the provider
- * action name (`linear_create_issue` / `linear_read_issue`). Restore the outer
- * composite proof only from its committed, verified, fingerprint-linked
- * publication result; a generic Linear create/read must never pay this stage.
+ * action name (`linear_create_issue` / `linear_read_issue`), so the composite is
+ * restored only from its committed, verified, fingerprint-linked publication
+ * result; a generic Linear create/read must never pay this stage.
+ *
+ * `complete` is NOT the question this answers. The Linear issue becomes durable
+ * at `linear_verified`, and `waiting_obsidian` is exactly "the issue exists,
+ * only the note backlink is outstanding" — a shape that carries no
+ * `output.publication` field at all. Demanding `status === "complete"` plus that
+ * field is what made the resume seat forget a publication this run had already
+ * made, re-derive `accepted_research` as unpaid, and re-offer
+ * `publish_research_to_linear` against a live workspace. `reconcile_required`
+ * stays excluded by the shared status rule, so an ambiguous provider outcome
+ * remains settleable rather than silently counted as published.
+ */
+export function acceptedResearchPublicationReceiptOwnsLinearIssueV1(
+  receipt: SetLooseDeliveryReceiptLikeV1,
+): boolean {
+  return evaluateAcceptedResearchPublicationReceiptV1(receipt).ownsLinearIssue;
+}
+
+/**
+ * The publication is finished end to end: it owns its Linear issue AND the
+ * verified vault backlink is bound to it. Mission acceptance, completion, and
+ * graph-reconciliation seats ask this. A seat deciding whether the Linear
+ * mutation may be offered or paid again must ask
+ * `acceptedResearchPublicationReceiptOwnsLinearIssueV1` instead.
  */
 export function isCompletedAcceptedResearchPublicationReceipt(
   receipt: SetLooseDeliveryReceiptLikeV1,
 ): boolean {
+  return evaluateAcceptedResearchPublicationReceiptV1(receipt).complete;
+}
+
+function evaluateAcceptedResearchPublicationReceiptV1(
+  receipt: SetLooseDeliveryReceiptLikeV1,
+): AcceptedResearchPublicationReceiptProofV1 {
   const output = isRecordLike(receipt.output) ? receipt.output : null;
   const issue = isRecordLike(output?.issue)
     ? (output.issue as Record<string, unknown>)
@@ -952,20 +996,47 @@ export function isCompletedAcceptedResearchPublicationReceipt(
       ? receipt.payloadFingerprint.trim()
       : null;
   const approvalFingerprint = stringField(output, "approvalFingerprint");
-  const createdPublication =
-    output?.publication === "created" &&
+  const status = typeof output?.status === "string" ? output.status : null;
+  const completeStatus = status === "complete";
+  // The one shared question, asked here exactly as the tool's replay gate and
+  // ResearchPublicationWorkflow ask it.
+  const ownsIssueStatus = researchPublicationStatusOwnsLinearIssueV1(status);
+  const publicationField =
+    typeof output?.publication === "string" ? output.publication : null;
+  const createdReceiptShape =
     receipt.toolName === "linear_create_issue" &&
     receipt.operation === "create" &&
     receipt.commitKind === "committed";
-  const deduplicatedPublication =
-    output?.publication === "deduplicated" &&
+  const deduplicatedReceiptShape =
     receipt.toolName === "linear_read_issue" &&
     receipt.operation === "read" &&
     receipt.commitKind === "committed";
+  // A `complete` result always states the create/dedup outcome; a publication
+  // still owing its vault backlink carries no `publication` field at all. When
+  // stated it must agree with the provider receipt, and it may never be absent
+  // on `complete` — so the discriminator is read from the receipt itself and
+  // merely cross-checked against the result.
+  const publicationAgreesWithReceipt =
+    publicationField === null
+      ? ownsIssueStatus && !completeStatus
+      : (publicationField === "created" && createdReceiptShape) ||
+        (publicationField === "deduplicated" && deduplicatedReceiptShape);
+  const createdPublication = createdReceiptShape && publicationAgreesWithReceipt;
+  const deduplicatedPublication =
+    deduplicatedReceiptShape && publicationAgreesWithReceipt;
+  // `ok` is exactly the completion flag: a `complete` publication is ok, one
+  // still owing its backlink is not. Neither may borrow the other's flag.
+  const okMatchesStatus = output?.ok === completeStatus;
+  const backlinkRecorded =
+    output !== null &&
+    output.backlink !== undefined &&
+    output.backlink !== null;
 
   if (
-    output?.ok !== true ||
-    output?.status !== "complete" ||
+    !output ||
+    !ownsIssueStatus ||
+    !okMatchesStatus ||
+    (completeStatus ? !backlinkRecorded : backlinkRecorded) ||
     (!createdPublication && !deduplicatedPublication) ||
     receipt.version !== 1 ||
     !receiptId ||
@@ -1017,7 +1088,7 @@ export function isCompletedAcceptedResearchPublicationReceipt(
     (!createdPublication &&
       receipt.readback.observedFingerprint !== issueSnapshotHash)
   ) {
-    return false;
+    return NO_ACCEPTED_RESEARCH_PUBLICATION_PROOF;
   }
 
   let artifact;
@@ -1032,7 +1103,7 @@ export function isCompletedAcceptedResearchPublicationReceipt(
     lineage = parseWorkItemLineageV1(output.lineage);
     workItem = parseRenderedCompatibleWorkItemSpec(issueDescription).spec;
   } catch {
-    return false;
+    return NO_ACCEPTED_RESEARCH_PUBLICATION_PROOF;
   }
 
   const notePath = stringField(note, "path");
@@ -1055,14 +1126,6 @@ export function isCompletedAcceptedResearchPublicationReceipt(
       ? binding.issueUpdatedAt === issueUpdatedAt
       : Number.isFinite(Date.parse(binding.issueUpdatedAt)) &&
         Date.parse(issueUpdatedAt!) >= Date.parse(binding.issueUpdatedAt);
-  const originalPublicationNoteBinding =
-    noteAfterSha256 === artifact.noteSha256 &&
-    backlinkBeforeSha256 === noteAfterSha256;
-  const completedCheckpointReplayNoteBinding =
-    noteOperation === "no_op" &&
-    noteBeforeSha256 === noteAfterSha256 &&
-    noteAfterSha256 === backlinkAfterSha256 &&
-    backlinkBeforeSha256 === artifact.noteSha256;
 
   if (
     notePath !== artifact.notePath ||
@@ -1071,15 +1134,6 @@ export function isCompletedAcceptedResearchPublicationReceipt(
     !isSha256(noteAfterSha256) ||
     !["create", "append", "no_op"].includes(noteOperation ?? "") ||
     (noteOperation === "no_op" && noteBeforeSha256 !== noteAfterSha256) ||
-    backlinkPath !== artifact.notePath ||
-    stringField(backlink, "issueUrl") !== issueUrl ||
-    !isSha256(backlinkBeforeSha256) ||
-    !isSha256(backlinkAfterSha256) ||
-    (!originalPublicationNoteBinding &&
-      !completedCheckpointReplayNoteBinding) ||
-    !["append", "no_op"].includes(backlinkOperation ?? "") ||
-    (backlinkOperation === "no_op" &&
-      backlinkAfterSha256 !== backlinkBeforeSha256) ||
     binding.provider !== "linear" ||
     binding.originRunId !== artifact.originRunId ||
     binding.teamId !== issueTeamId ||
@@ -1108,29 +1162,62 @@ export function isCompletedAcceptedResearchPublicationReceipt(
     lastLineageEvent?.state !== "linear_verified" ||
     lastLineageEvent.evidenceFingerprint !== binding.bindingFingerprint
   ) {
-    return false;
+    return NO_ACCEPTED_RESEARCH_PUBLICATION_PROOF;
   }
 
-  if (createdPublication) {
-    return Boolean(
-      hasProductionCreateOperationKey(receipt.idempotencyKey, receiptRunId) &&
-        nestedProviderReceiptMatchesOuter(receipt, nestedReceipt) &&
-        receipt.readback?.observedRevision ===
-          receipt.readback?.observedFingerprint &&
-        Date.parse(binding.verifiedAt) >= Date.parse(receipt.committedAt!) &&
-        lastLineageEvent.receiptId === receiptId,
-    );
+  const providerProofHolds = createdPublication
+    ? Boolean(
+        hasProductionCreateOperationKey(receipt.idempotencyKey, receiptRunId) &&
+          nestedProviderReceiptMatchesOuter(receipt, nestedReceipt) &&
+          receipt.readback?.observedRevision ===
+            receipt.readback?.observedFingerprint &&
+          Date.parse(binding.verifiedAt) >= Date.parse(receipt.committedAt!) &&
+          lastLineageEvent.receiptId === receiptId,
+      )
+    : Boolean(
+        receipt.idempotencyKey ===
+          `research-publication:${workItem.fingerprint}` &&
+          receipt.grantId === "linear-deduplicated-readback" &&
+          output.receipt === null &&
+          receiptPayloadFingerprint === approvalFingerprint &&
+          receipt.resource.revision === issueUpdatedAt &&
+          receipt.readback?.observedRevision === issueUpdatedAt,
+      );
+  if (!providerProofHolds) return NO_ACCEPTED_RESEARCH_PUBLICATION_PROOF;
+
+  if (!completeStatus) {
+    // The Linear issue is owned but no backlink has been appended, so the note
+    // must still be the exact accepted-research bytes the artifact fingerprints.
+    // Anything else is a note that drifted and cannot bind this publication.
+    return {
+      ownsLinearIssue: noteAfterSha256 === artifact.noteSha256,
+      complete: false,
+    };
   }
 
-  return Boolean(
-    receipt.idempotencyKey ===
-      `research-publication:${workItem.fingerprint}` &&
-      receipt.grantId === "linear-deduplicated-readback" &&
-      output.receipt === null &&
-      receiptPayloadFingerprint === approvalFingerprint &&
-      receipt.resource.revision === issueUpdatedAt &&
-      receipt.readback?.observedRevision === issueUpdatedAt,
+  const originalPublicationNoteBinding =
+    noteAfterSha256 === artifact.noteSha256 &&
+    backlinkBeforeSha256 === noteAfterSha256;
+  const completedCheckpointReplayNoteBinding =
+    noteOperation === "no_op" &&
+    noteBeforeSha256 === noteAfterSha256 &&
+    noteAfterSha256 === backlinkAfterSha256 &&
+    backlinkBeforeSha256 === artifact.noteSha256;
+  const backlinkBound = Boolean(
+    backlinkPath === artifact.notePath &&
+      stringField(backlink, "issueUrl") === issueUrl &&
+      isSha256(backlinkBeforeSha256) &&
+      isSha256(backlinkAfterSha256) &&
+      (originalPublicationNoteBinding || completedCheckpointReplayNoteBinding) &&
+      ["append", "no_op"].includes(backlinkOperation ?? "") &&
+      !(
+        backlinkOperation === "no_op" &&
+        backlinkAfterSha256 !== backlinkBeforeSha256
+      ),
   );
+  // A `complete` receipt whose backlink does not bind proves nothing about
+  // either question, so it fails closed on both.
+  return { ownsLinearIssue: backlinkBound, complete: backlinkBound };
 }
 
 /** Exact cross-system markers required before final set-loose note reflection pays. */
@@ -1185,7 +1272,20 @@ export function applySetLooseDeliveryProofFromSuccessfulTool(input: {
   const outputRecord = isRecordLike(input.output) ? input.output : null;
   const next: SetLooseDeliveryProofsV1 = { ...input.proofs };
 
-  if (toolName === "publish_research_to_linear") {
+  // LIVE seat for "did this run already publish?". It asks the same shared
+  // question as the resume seat in `seedSetLooseDeliveryStateFromReceipts`,
+  // which reads it off a durable receipt via
+  // `acceptedResearchPublicationReceiptOwnsLinearIssueV1`. Paying on the tool
+  // name alone left the two seats with different answers: the tool only ever
+  // returns `complete` or `waiting_obsidian`, so stating the status rule here
+  // costs nothing and stops the agreement from depending on a throw contract in
+  // another module.
+  if (
+    toolName === "publish_research_to_linear" &&
+    researchPublicationStatusOwnsLinearIssueV1(
+      typeof outputRecord?.status === "string" ? outputRecord.status : null,
+    )
+  ) {
     next.acceptedResearchPublication = true;
   }
   if (
@@ -1280,7 +1380,13 @@ export function seedSetLooseDeliveryStateFromReceipts(
     const toolName =
       typeof receipt.toolName === "string" ? receipt.toolName.trim() : "";
     if (!toolName) continue;
-    if (isCompletedAcceptedResearchPublicationReceipt(receipt)) {
+    // RESUME seat for "did this run already publish?". Owning the Linear issue
+    // is the whole question: a publication parked at `waiting_obsidian` has the
+    // issue and owes only the vault backlink, and demanding `complete` here made
+    // a continuation re-derive `accepted_research` as unpaid and re-offer the
+    // mutation. Mission completion is a different question and still asks
+    // `isCompletedAcceptedResearchPublicationReceipt`.
+    if (acceptedResearchPublicationReceiptOwnsLinearIssueV1(receipt)) {
       paidStages.add("accepted_research");
       paidStages.add("linear_hierarchy");
       proofs.acceptedResearchPublication = true;
