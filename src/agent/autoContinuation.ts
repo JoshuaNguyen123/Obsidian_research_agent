@@ -122,6 +122,46 @@ export interface AutoContinuationDecision {
   reason: AutoContinuationReason;
 }
 
+/** Ledger blocker prefix for a budget terminal that forbids its own resume. */
+export const SUPPRESSED_BUDGET_TERMINAL_BLOCKER_V1 =
+  "auto_continuation_suppressed";
+
+/**
+ * THE one statement of "this terminal claims to be resumable and is not".
+ *
+ * `resolveEffectiveTerminalStopReasonV1` deliberately downgrades soft
+ * terminals to `budget` so an unpaid set-loose delivery STAYS resumable. A
+ * seat that then passes `suppressAutoContinuation` overrules that decision:
+ * the run reports `stopReason: "budget"` but `recommended: false`, and every
+ * host continues only on `budget` AND `autoContinueRecommended === true`
+ * (`main.ts` multi-segment loop; `shouldContinueResearchLead` refuses anything
+ * that is not a plain budget stop). The two seats therefore disagree, and the
+ * mission is terminal in fact while advertising itself as resumable.
+ *
+ * That disagreement is legitimate — some stops genuinely must not retry
+ * automatically. What is NOT legitimate is making it SILENTLY. Without a
+ * durable blocker the run leaves an Idle UI, ready graph nodes, unspent
+ * budget, `blockedGraph: []`, and no recorded reason, which is precisely the
+ * silent drop this codebase keeps paying for in diagnosis hours.
+ *
+ * Every seat that suppresses auto-continuation on a budget stop must record
+ * what this returns. A private "my stop is obviously self-explanatory" rule at
+ * one seat is the two-subsystems-disagree shape all over again.
+ */
+export function suppressedBudgetTerminalBlockerV1(input: {
+  stopReason: string;
+  suppressAutoContinuation: boolean;
+  reason: string;
+}): string | null {
+  if (input.stopReason !== "budget" || input.suppressAutoContinuation !== true) {
+    return null;
+  }
+  const reason = input.reason.trim();
+  return reason
+    ? `${SUPPRESSED_BUDGET_TERMINAL_BLOCKER_V1}: ${reason}`
+    : SUPPRESSED_BUDGET_TERMINAL_BLOCKER_V1;
+}
+
 export interface AutoContinuationDecisionInput {
   stopReason: string;
   acceptance?: {
