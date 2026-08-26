@@ -198,6 +198,69 @@ test("mission scorecard gate skips unscored guard records and compares scored on
   );
 });
 
+test("a lane that did not pass is excused from comparison and named in the result", () => {
+  // `test-results/` is gitignored runtime residue that nothing cleans. Before
+  // this branch existed, one failed e2e lane made every later `npm run test:ci`
+  // on that machine die at this gate before a single unit test ran, reporting
+  // the failed run as a structurally invalid scorecard. The lane's own exit
+  // code is the failure signal; this gate measures scorecard regressions.
+  const result = assertMissionScorecardRegressions({
+    summary: {
+      version: 1,
+      status: "failed",
+      records: [{ ...identity, status: "failed", missionScorecard: null }],
+    },
+    baseline: baseline(),
+    selectedProjects: [identity.project],
+  });
+  assert.equal(result.skipped, false);
+  assert.equal(result.checkedRecords, 0);
+  assert.deepEqual(result.unscoredNonPassing, [
+    `${missionScorecardRecordKey(identity)} (status=failed)`,
+  ]);
+  // Excused is not silent: the CLI line has to name the red lane.
+  const line = formatMissionScorecardCliResult(result);
+  assert.match(line, /NOT COMPARED/u);
+  assert.match(line, /status=failed/u);
+});
+
+test("a PASSING record that dropped its scorecard is still fatal proof debt", () => {
+  // The anti-gaming half of the pair above. Excusing non-passing records must
+  // not open a door where a lane goes green while emitting nothing to score --
+  // that is precisely the silent-weakening shape this gate exists to catch.
+  assert.throws(
+    () =>
+      assertMissionScorecardRegressions({
+        summary: {
+          version: 1,
+          status: "passed",
+          records: [{ ...identity, status: "passed", missionScorecard: null }],
+        },
+        baseline: baseline(),
+        selectedProjects: [identity.project],
+      }),
+    /current scorecard .* is invalid/u,
+  );
+});
+
+test("a record with no status at all keeps the strict pre-existing behaviour", () => {
+  // Absent status must not opt itself into the excuse: older summaries and
+  // hand-written fixtures carry no status field, and they stay strict.
+  assert.throws(
+    () =>
+      assertMissionScorecardRegressions({
+        summary: {
+          version: 1,
+          status: "passed",
+          records: [{ ...identity, missionScorecard: null }],
+        },
+        baseline: baseline(),
+        selectedProjects: [identity.project],
+      }),
+    /current scorecard .* is invalid/u,
+  );
+});
+
 test("mission scorecard gate skips projects with no committed baseline", () => {
   assert.deepEqual(
     assertMissionScorecardRegressions({

@@ -8,6 +8,13 @@ export interface MissionScorecardRegressionResult {
   reason?: string;
   /** Records validated when no run was available to compare against. */
   validatedBaselineRecords?: number;
+  /**
+   * Baselined records excused from comparison because the lane did not pass and
+   * therefore emitted no scorecard. Each entry is `<key> (status=<status>)`.
+   * The lane's own exit code reports that failure; this gate only measures
+   * scorecard regressions, so it names them and compares the rest.
+   */
+  unscoredNonPassing?: readonly string[];
 }
 
 export const DEFAULT_MISSION_SCORECARD_BASELINE_PATH: string;
