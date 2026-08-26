@@ -482,6 +482,16 @@ export interface CreateResearchPublicationToolOptionsV1 {
     parserStatus?: string;
   }[]>;
   isAvailable?: () => boolean;
+  /**
+   * Re-resolves availability when {@link isAvailable} says no, and resolves
+   * true only if the tool became available again. A mission legitimately runs
+   * longer than the host's Linear capability snapshot stays fresh, so a node
+   * the planner already owes must not fail closed just because the snapshot
+   * aged out between tool construction and this call. The host decides which
+   * unavailable verdicts are recoverable; a missing credential or a disabled
+   * integration is not, and this is never called when availability holds.
+   */
+  recoverAvailability?: () => Promise<boolean>;
   now?: () => Date;
   /**
    * Host-owned view of the trusted repository catalog, used to make package
@@ -735,7 +745,10 @@ export function createResearchPublicationTool(
     parameters: RESEARCH_PUBLICATION_PARAMETERS,
     descriptor: RESEARCH_PUBLICATION_DESCRIPTOR,
     async execute(args, context) {
-      if (options.isAvailable?.() === false) {
+      if (
+        options.isAvailable?.() === false &&
+        (await options.recoverAvailability?.()) !== true
+      ) {
         throw new ToolExecutionError(
           "research_publication_unavailable",
           "Research publication is unavailable because the integrations extension, credential, or discovered Linear destination is no longer available.",
