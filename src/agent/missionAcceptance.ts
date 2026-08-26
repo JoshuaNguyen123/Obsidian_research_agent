@@ -28,6 +28,7 @@ import {
   requiresWebEvidenceProof,
 } from "./evidenceIntent";
 import { isCompletedAcceptedResearchPublicationReceipt } from "./setLooseCompoundAutonomy";
+import { LINEAR_HIERARCHY_STAGE_DISCHARGE_V1 } from "./projectLifecycle";
 
 export {
   DAILY_USE_ACCEPTANCE_V1,
@@ -259,14 +260,23 @@ function receiptsSatisfyMatchingNonVaultProof(
   const successfulTools = new Set(input.successfulTools);
   return input.receipts.some(
     (receipt) => {
+      const singleIssuePublication =
+        LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.singleIssueToolName;
       if (
-        requiredTools.has("publish_research_to_linear") &&
-        successfulTools.has("publish_research_to_linear") &&
+        requiredTools.has(singleIssuePublication) &&
+        successfulTools.has(singleIssuePublication) &&
         isCompletedAcceptedResearchPublicationReceipt(receipt)
       ) {
         // The canonical receipt retains the provider action name, but its
-        // strict artifact/binding/lineage proof covers both the accepted note
-        // write and the Linear publication performed by the outer composite.
+        // strict artifact/binding proof covers both the accepted note write
+        // and the Linear publication performed by the outer composite.
+        //
+        // "lineage" used to be claimed here too, and it was the wrong half of
+        // the shared answer: this tool discharges the linear_hierarchy STAGE
+        // but writes no linear_hierarchy lineage COMMIT, because it creates no
+        // initiative and no project to prove. projectLifecycle owns that
+        // distinction now and makes the stage's commit optional, so a
+        // single-issue mission's later stages can still record.
         return true;
       }
       const toolName = receipt.toolName?.trim() ?? "";

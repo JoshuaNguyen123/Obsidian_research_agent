@@ -13,6 +13,11 @@ import {
   shouldDeferAdditionalProjectLifecycleMutation,
   toolsAllowedForLifecycleStage,
 } from "../src/agent/lifecycleStagePolicy";
+import {
+  LINEAR_HIERARCHY_STAGE_DISCHARGE_V1,
+  LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES,
+  toolCommitsLinearHierarchyLineageV1,
+} from "../src/agent/projectLifecycle";
 import { toolsAllowedForEnvelopeStage } from "../src/agent/missionStageEnvelope";
 import {
   SET_LOOSE_BOUND_TOOL_NAMES,
@@ -23,6 +28,38 @@ import { CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME } from "../src/tools/githubP
 import { PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME } from "../src/tools/githubPublicationTool";
 import { PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME } from "../src/tools/researchProjectHierarchyTool";
 import { PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME } from "../src/tools/researchPublicationTool";
+
+test("the linear_hierarchy allowlist is the shared answer, not a second copy of it", () => {
+  // projectLifecycle names both tools as literals so the lowest lifecycle
+  // layer stays free of tool imports. This is the guard that keeps those
+  // literals equal to the tools' own exported names -- and keeps the stage
+  // allowlist derived from them rather than re-listed here.
+  assert.equal(
+    LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.hierarchyToolName,
+    PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+  );
+  assert.equal(
+    LINEAR_HIERARCHY_STAGE_DISCHARGE_V1.singleIssueToolName,
+    PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+  );
+  const hierarchy = toolsAllowedForLifecycleStage("linear_hierarchy");
+  for (const name of LINEAR_HIERARCHY_STAGE_DISCHARGING_TOOL_NAMES) {
+    assert.ok(
+      hierarchy.includes(name),
+      `${name} must remain allowed in linear_hierarchy`,
+    );
+  }
+  // The prior diagnosis proposed dropping publish_research_to_linear from this
+  // allowlist. That would forbid the only publication tool the single-issue
+  // lane may call (its FLOW_REAL_ALLOWED_PREPARED_APPROVAL_TOOLS omits the
+  // hierarchy tool), leaving the mission unable to ever discharge the stage.
+  // The optionality lives in the lineage instead.
+  assert.ok(hierarchy.includes(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME));
+  assert.equal(
+    toolCommitsLinearHierarchyLineageV1(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME),
+    false,
+  );
+});
 
 test("toolsAllowedForLifecycleStage returns stage-scoped tool names", () => {
   const research = toolsAllowedForLifecycleStage("accepted_research");
