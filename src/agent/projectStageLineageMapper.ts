@@ -294,7 +294,11 @@ export interface VerifiedCommitEvidenceV1 {
   commitEvent: ProjectStageEventV1 | null;
   /** The durable lineage code commit that owns the verified SHA, if any. */
   lineageCommit: ProjectLifecycleStageCommitV1 | null;
-  /** Canonical Git object id naming the verified commit, or null. */
+  /**
+   * Canonical Git object id naming the verified commit, or null. Resolved from
+   * the durable lineage when it has a code stage, otherwise from the commit the
+   * receipt itself named. Never a checkpoint sequence number.
+   */
   commitSha: string | null;
   /** Trusted repository profile the lineage bound that commit to, or null. */
   repositoryProfileKey: string | null;
@@ -309,22 +313,27 @@ export interface VerifiedCommitEvidenceV1 {
  * Two independent subsystems record one verified local commit, and they do NOT
  * put the Git object id in the same place:
  *
- *  - The `code_commit_verified` ActionReceipt targets the durable repair
+ *  - The `code_commit_verified` ActionReceipt TARGETS the durable repair
  *    CHECKPOINT. Its `resource.id` is the checkpoint id and its
  *    `resource.revision` is that checkpoint's SEQUENCE NUMBER ("1"), because
- *    the checkpoint is what reconciliation must address. The receipt proves a
- *    commit happened and carries its receipt identity; it never carries the
- *    commit SHA.
+ *    the checkpoint is what reconciliation, the idempotency key, and the
+ *    prepared-action id all key on. That identity is fixed. The receipt does
+ *    NAME its commit, as a `{system:"git", resourceType:"commit"}` related
+ *    resource, and `projectResourceFromReceiptResourcesV1` projects that named
+ *    commit into the stage event when the receipt's own target is not itself a
+ *    Git object id.
  *  - The durable project lineage records the SHA itself, on the
  *    `code_execution`/`code_validation` proof, and `assertLineageContinuity`
  *    refuses a GitHub publication commit whose remote SHA does not equal it.
  *
- * So reading the event resource as a commit id yields a checkpoint sequence
- * number, and any consumer that then demands a canonical SHA from it blocks
- * the final node of the journey. Only a value that IS a Git object id may name
- * the commit; the durable lineage is the authority otherwise. Callers decide
- * whether a run with no attested commit is acceptable — this projection never
- * invents one, and it refuses outright when the two subsystems disagree.
+ * So a verified commit receipt is self-sufficient: a Phase-B-style run whose
+ * lineage begins at `accepted_research` and has no code stage can still name
+ * its own commit. Only a value that IS a Git object id may name the commit —
+ * an older receipt projection that carries no related commit still yields a
+ * checkpoint sequence number, and this projection reports no SHA rather than
+ * "1". Callers decide whether a run with no attested commit is acceptable;
+ * this projection never invents one, and it refuses outright when the two
+ * subsystems disagree.
  */
 export function resolveVerifiedCommitEvidenceV1(input: {
   /** Run ids whose evidence the caller has already accepted. */

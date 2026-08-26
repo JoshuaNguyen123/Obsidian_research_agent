@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import type {
+  ActionReceiptV1,
   PreparedActionV1,
   ScopedExtensionContextV1,
 } from "@agentic-researcher/core-api";
@@ -47,6 +48,53 @@ const COMMIT_IDENTITY = {
   committerName: AGENT_GIT_COMMIT_NAME_V1,
   committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
 };
+
+/**
+ * The verified-commit ActionReceipt must be readable on its own. It keeps
+ * ADDRESSING the durable repair checkpoint — reconciliation, the idempotency
+ * key, and the prepared-action id all derive from that identity — and it NAMES
+ * the Git object id it verified as a related resource, so a consumer no longer
+ * has to consult the durable project lineage to learn which commit this run
+ * produced.
+ */
+function assertVerifiedCommitReceiptNamesCommit(
+  receipt: ActionReceiptV1,
+  action: PreparedActionV1,
+): void {
+  assert.equal(receipt.operation, "commit");
+  // Checkpoint identity is untouched.
+  assert.deepEqual(receipt.resource, action.target);
+  assert.equal(
+    receipt.resource.id,
+    codeRepairCheckpointIdV1({
+      id: SCOPE.requestId,
+      runId: SCOPE.runId,
+      worktree: { id: SCOPE.workspaceId },
+    } as NormalizedCodeRepairRequestV1),
+  );
+  assert.equal(receipt.resource.resourceType, "verified_local_commit");
+  assert.equal(receipt.resource.revision, action.expectedTargetRevision);
+  assert.equal(receipt.readback.observedRevision, action.expectedTargetRevision);
+  assert.equal(receipt.idempotencyKey, action.idempotencyKey);
+  assert.notEqual(
+    receipt.resource.revision,
+    COMMIT_SHA,
+    "the checkpoint sequence number is not the commit SHA",
+  );
+  // The commit rides along, additively.
+  assert.deepEqual(
+    receipt.relatedResources?.slice(0, action.relatedResources.length),
+    action.relatedResources,
+    "prepared related resources must survive unchanged",
+  );
+  const commit = receipt.relatedResources?.find(
+    (resource) => resource.system === "git" && resource.resourceType === "commit",
+  );
+  assert.ok(commit, "the verified-commit receipt must name its commit");
+  assert.equal(commit.id, COMMIT_SHA);
+  assert.equal(commit.revision, COMMIT_SHA);
+  assert.equal(commit.workspaceId, SCOPE.workspaceId);
+}
 
 test("normal exact repair proof commits only after fresh proof readback", async (t) => {
   const harness = await createHarness(t, "src/index.ts");
@@ -96,19 +144,22 @@ test("normal exact repair proof commits only after fresh proof readback", async 
   assert.equal(result.domainReceipt.kind, "verified_local_commit");
   assert.equal(result.domainReceipt.commitSha, COMMIT_SHA);
   assert.equal(result.domainReceipt.parentSha, BASE_SHA);
-  assert.equal(result.actionReceipt.operation, "commit");
+  assertVerifiedCommitReceiptNamesCommit(result.actionReceipt, prepared.action);
   assert.equal(harness.gateway.commitCalls, 1);
   assert.equal(harness.gateway.readbackCalls, 1);
   const status = await harness.handlers.readStatus(SCOPE, context());
   assert.equal(status.terminalStatus, "complete");
   assert.equal(status.publicationEligible, true);
-  assert.equal(
-    (await harness.handlers.reconcileVerifiedCommit(
-      prepared.action,
-      authorizedContext(prepared.action),
-    )).outcome,
-    "committed",
+  const replayed = await harness.handlers.reconcileVerifiedCommit(
+    prepared.action,
+    authorizedContext(prepared.action),
   );
+  assert.equal(replayed.outcome, "committed");
+  const replayedReceipt = replayed.outcome === "committed" ? replayed.receipt : null;
+  assert.ok(replayedReceipt, "a committed reconciliation must carry its receipt");
+  // A reconciled receipt is the same evidence, so it names the same commit.
+  assertVerifiedCommitReceiptNamesCommit(replayedReceipt, prepared.action);
+  assert.equal(replayedReceipt.commitKind, "reconciled");
 });
 
 test("read-only reconciliation completes a crash-after-commit without duplicate commit", async (t) => {
@@ -144,6 +195,12 @@ test("read-only reconciliation completes a crash-after-commit without duplicate 
     authorizedContext(prepared.action),
   );
   assert.equal(reconciled.outcome, "committed", reconciled.message);
+  const reconciledReceipt =
+    reconciled.outcome === "committed" ? reconciled.receipt : null;
+  assert.ok(reconciledReceipt, "a committed reconciliation must carry its receipt");
+  // Reconciled from Git objects, with no prior receipt to copy: the SHA is
+  // named here too, or a crash-recovered run could not report its own commit.
+  assertVerifiedCommitReceiptNamesCommit(reconciledReceipt, prepared.action);
   assert.equal(harness.gateway.commitCalls, 1, "reconciliation must never create a second commit");
   const status = await harness.handlers.readStatus(SCOPE, context());
   assert.equal(status.terminalStatus, "complete");

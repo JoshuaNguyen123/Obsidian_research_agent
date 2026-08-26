@@ -359,10 +359,10 @@ export function developerMissionCompletionFromProjectRunReportV1(
     report,
     "commit_readback",
   );
-  // The commit_readback projected from the code_commit_verified receipt
-  // addresses the repair checkpoint, so its revision is that checkpoint's
-  // sequence number. Use the same selection the Results Markdown uses so the
-  // chip and the artifact never name different commits — and never "Commit 1".
+  // A commit_readback event need not name a Git object id: a code_commit_verified
+  // receipt targets the repair checkpoint, whose revision is a sequence number.
+  // Use the same selection the Results Markdown uses so the chip and the
+  // artifact never name different commits — and never "Commit 1".
   const commitSha = verifiedCommitShaFromReportEvidenceV1(report.evidence);
   if (commit && commitSha) {
     artifacts.push({

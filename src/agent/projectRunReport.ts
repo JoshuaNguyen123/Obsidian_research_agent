@@ -1370,11 +1370,11 @@ export function canonicalGitCommitShaV1(value: unknown): string | null {
 }
 
 /**
- * Name the commit the report may print. A commit_readback event projected from
- * the code_commit_verified receipt addresses the durable repair checkpoint, so
- * its revision is that checkpoint's sequence number; printing it would put
- * "Verified commit: `1`" in the delivered artifact. Prefer the evidence that
- * actually names a Git object id, and say nothing rather than say "1".
+ * Name the commit the report may print. A code_commit_verified receipt targets
+ * the durable repair checkpoint, so an event projected from its target alone
+ * carries that checkpoint's sequence number; printing it would put "Verified
+ * commit: `1`" in the delivered artifact. Prefer the evidence that actually
+ * names a Git object id, and say nothing rather than say "1".
  */
 export function verifiedCommitShaFromReportEvidenceV1(
   events: readonly ProjectStageEventV1[],
