@@ -13,6 +13,13 @@ export const DAILY_USE_OBSERVED_ANNOTATION = "daily-use-observed-v1";
 export const DAILY_USE_METRICS_ANNOTATION = "daily-use-metrics-v1";
 export const DAILY_USE_SCORECARD_ANNOTATION = "daily-use-scorecard-v1";
 export const E2E_PROOF_CLASS_ANNOTATION = "e2e-proof-class-v1";
+/**
+ * Tool-call census annotation (see e2e/fixtures/toolCallCensus.ts). Parsed by
+ * the reporter UNCONDITIONALLY — unlike the metrics annotation, it must work
+ * for lanes with no DailyUseScenarioId (real-ai-soak, code-delivery,
+ * interrupted-continuation), whose records would otherwise stay counterless.
+ */
+export const DAILY_USE_TOOL_CENSUS_ANNOTATION = "daily-use-tool-census-v1";
 
 export type E2EProofClassV1 = "mission" | "contract";
 

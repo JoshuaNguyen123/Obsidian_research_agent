@@ -237,6 +237,38 @@ test("protected summary projection drops observations and provider metadata", ()
   assert.equal((projected as any).records[0].toolCalls, 3);
 });
 
+test("protected proof keeps an unknown tool-call count unknown, never a public zero", () => {
+  // A lane that never counted tool calls reports toolCalls: null. The public
+  // projection must preserve that unknown — boundedPublicInteger's null→0
+  // here was the last seat re-manufacturing the false zero this wave removed.
+  const projected = projectDailyUseSummaryForPublicProof({
+    version: 1,
+    status: "passed",
+    records: [{
+      version: 1,
+      scenarioId: "DU-06",
+      taskFamily: "compound",
+      project: "daily-use-compound",
+      file: "e2e/daily-use-compound.spec.ts",
+      title: "DU-06 checkers exact-SHA lifecycle restarts safely",
+      status: "passed",
+      durationMs: 10,
+      retry: 0,
+      failureCategory: null,
+      acceptanceStatus: "pass",
+      missingAcceptanceCriteria: [],
+      fingerprint: `sha256:${"a".repeat(64)}`,
+      modelCalls: 2,
+      toolCalls: null,
+      continuations: 1,
+      approvals: 1,
+      artifactProofCount: 4,
+      cleanupProofCount: 2,
+    }],
+  });
+  assert.equal((projected as any).records[0].toolCalls, null);
+});
+
 test("protected proof preserves bounded failed-run metrics without accepting the lane", () => {
   const failed = {
     version: 1,

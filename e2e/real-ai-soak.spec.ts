@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import { recordToolCallCensusAfterEach } from "./fixtures/toolCallCensus";
+
+recordToolCallCensusAfterEach();
 
 test.describe("real AI autonomy soak", () => {
   test.describe.configure({ mode: "default", timeout: 3_600_000, retries: 0 });

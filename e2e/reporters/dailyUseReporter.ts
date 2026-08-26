@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   FullResult,
@@ -30,14 +30,17 @@ import {
   DAILY_USE_METRICS_ANNOTATION,
   DAILY_USE_OBSERVED_ANNOTATION,
   DAILY_USE_SCORECARD_ANNOTATION,
+  DAILY_USE_TOOL_CENSUS_ANNOTATION,
   E2E_PROOF_CLASS_ANNOTATION,
   type E2EProofClassV1,
 } from "../fixtures/dailyUseAcceptance";
+// Type-only: erased at compile time, so the census fixture's runtime imports
+// from this module never form a cycle.
+import type { ToolCallCensusSummaryV1 } from "../fixtures/toolCallCensus";
 
 interface DailyUseRunRecord extends Pick<
   DailyUseRunMetricsV1,
   | "modelCalls"
-  | "toolCalls"
   | "continuations"
   | "approvals"
   | "approvalBoundaryProofCount"
@@ -62,6 +65,26 @@ interface DailyUseRunRecord extends Pick<
   proofClass: E2EProofClassV1 | null;
   /** Explicit alias for the legacy `approvals` interaction counter. */
   interactiveApprovals: number;
+  /**
+   * The DU-acceptance tool-call counter, or null when UNKNOWN. This is the
+   * counter the record fingerprint was computed over, so it keeps whatever
+   * quantity the spec annotated (daily-use-research feeds missionEvidence
+   * lengths — an evidence count, successes only). Null — never 0 — when the
+   * spec annotated nothing: three of the four proof lanes have no
+   * DailyUseScenarioId, and the previous `?? 0` here manufactured the
+   * explicit observed=0 rows in docs/eval/playwright-run-metrics.csv.
+   * The census's true call count lives in `toolCallsObserved` beside it; the
+   * two legitimately disagree and must not be "fixed" into agreement.
+   */
+  toolCalls: number | null;
+  /**
+   * Model-visible attempted tool calls counted live by the tool-call census
+   * (e2e/fixtures/toolCallCensus.ts), or null when the census did not prove a
+   * complete count. Unlike `toolCalls`, this is a real per-call count.
+   */
+  toolCallsObserved: number | null;
+  /** Full census summary for provenance; null when no census annotation. */
+  toolCallCensus: ToolCallCensusSummaryV1 | null;
   /**
    * Failed-tool-call count for this record, or null when UNKNOWN. The
    * counters the specs feed today (missionEvidence lengths, usage.toolCalls)
@@ -100,7 +123,7 @@ interface DailyUseRunRecord extends Pick<
    * unknown, not zero.
    */
   refusalBuckets: Record<string, number> | null;
-  refusalBucketsSource: "annotation" | "error_messages" | null;
+  refusalBucketsSource: "census" | "annotation" | "error_messages" | null;
 }
 
 /**
@@ -134,17 +157,23 @@ export function countRefusalMarkers(
 }
 
 /**
- * Bucket provenance resolution: an annotation the spec counted from live
- * traces always wins; otherwise markers are mined from the record's error
- * text; when there is neither, the answer is null (unknown), never {}.
+ * Bucket provenance resolution, strongest source first: a complete tool-call
+ * census counted every refusal live (its zeros are explicit); then an
+ * annotation the spec counted from traces; then markers mined from the
+ * record's error text (sightings only); with none of the three, the answer
+ * is null (unknown), never {}.
  */
 export function resolveRefusalBuckets(
+  census: ToolCallCensusSummaryV1 | null,
   annotated: Record<string, number> | null,
   errorMessages: readonly string[],
 ): {
   buckets: Record<string, number> | null;
-  source: "annotation" | "error_messages" | null;
+  source: "census" | "annotation" | "error_messages" | null;
 } {
+  if (census?.coverage === "complete" && census.buckets) {
+    return { buckets: census.buckets, source: "census" };
+  }
   if (annotated) return { buckets: annotated, source: "annotation" };
   if (errorMessages.some((message) => message.length > 0)) {
     return { buckets: countRefusalMarkers(errorMessages), source: "error_messages" };
@@ -309,7 +338,13 @@ export default class DailyUseReporter implements Reporter {
           observedAt: new Date().toISOString(),
         })
       : null;
+    // The census annotation is parsed UNCONDITIONALLY: three of the four
+    // proof lanes have no DailyUseScenarioId, and gating it like the metrics
+    // annotation would silently drop their only real tool-call counters.
+    const census = parseCensusAnnotation(test);
+    const censusComplete = census?.coverage === "complete" ? census : null;
     const refusal = resolveRefusalBuckets(
+      census,
       annotatedMetrics?.refusalBuckets ?? null,
       errorMessages,
     );
@@ -327,14 +362,25 @@ export default class DailyUseReporter implements Reporter {
       observed,
       missionScorecard,
       proofClass,
-      toolCallsFailed: annotatedMetrics?.toolCallsFailed ?? null,
-      toolCallsVacuous: annotatedMetrics?.toolCallsVacuous ?? null,
+      // A complete census outranks the spec's annotation; both null stays
+      // null (unknown ≠ zero).
+      toolCallsFailed:
+        censusComplete?.failed ?? annotatedMetrics?.toolCallsFailed ?? null,
+      toolCallsVacuous:
+        censusComplete?.vacuous ?? annotatedMetrics?.toolCallsVacuous ?? null,
       toolCallsIntentionalNoOp:
-        annotatedMetrics?.toolCallsIntentionalNoOp ?? null,
+        censusComplete?.intentionalNoOp ??
+        annotatedMetrics?.toolCallsIntentionalNoOp ??
+        null,
       refusalBuckets: refusal.buckets,
       refusalBucketsSource: refusal.source,
       modelCalls: metrics?.modelCalls ?? 0,
-      toolCalls: metrics?.toolCalls ?? 0,
+      // Null — never 0 — when the spec annotated nothing: the previous `?? 0`
+      // here manufactured the CSV's explicit observed=0 rows for the three
+      // scenario-less proof lanes.
+      toolCalls: annotatedMetrics ? metrics?.toolCalls ?? null : null,
+      toolCallsObserved: censusComplete?.observed ?? null,
+      toolCallCensus: census,
       continuations: metrics?.continuations ?? 0,
       approvals: metrics?.approvals ?? 0,
       interactiveApprovals: metrics?.approvals ?? 0,
@@ -365,6 +411,21 @@ export default class DailyUseReporter implements Reporter {
       this.records.length,
       payload,
     );
+    // Durable mirror: test-results/ is wiped by Playwright at the start of
+    // every run, so tool-event evidence would be unauditable after the fact.
+    // The mirror lives beside the proof-matrix manifest (gitignored) and is
+    // NEVER consulted by the matrix's freshness gate — summaryWrittenSince
+    // reads only the canonical path, so a stale mirror can never label a
+    // later attempt.
+    await writeDailyUseSummaryIfAny(
+      path.resolve(
+        process.cwd(),
+        "proof-matrix-state",
+        "daily-use-run-summary.latest.json",
+      ),
+      this.records.length,
+      payload,
+    ).catch(() => false);
   }
 }
 
@@ -375,7 +436,11 @@ export async function writeDailyUseSummaryIfAny(
 ): Promise<boolean> {
   if (!shouldWriteDailyUseSummary(recordCount)) return false;
   await mkdir(path.dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  // Temp-then-rename: a reader (the proof matrix, mid-attempt) never sees a
+  // half-written summary.
+  const tempPath = `${outputPath}.tmp-${process.pid.toString(36)}`;
+  await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  await rename(tempPath, outputPath);
   return true;
 }
 
@@ -398,7 +463,11 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
             releaseSha: exactReleaseSha(),
             observed,
             modelCalls: sum(group, "modelCalls"),
-            toolCalls: sum(group, "toolCalls"),
+            // undefined (not 0) when no record in the group knew its count —
+            // createDailyUseRunMetricsV1's schema has no null vocabulary.
+            toolCalls:
+              sumNullableCounters(group.map((record) => record.toolCalls)) ??
+              undefined,
             continuations: sum(group, "continuations"),
             approvals: sum(group, "approvals"),
             observedAt: new Date().toISOString(),
@@ -422,10 +491,15 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         medianDurationMs: percentile(durations, 0.5),
         p95DurationMs: percentile(durations, 0.95),
         modelCalls: metrics?.modelCalls ?? 0,
-        toolCalls: metrics?.toolCalls ?? 0,
-        // Nullable on purpose: null means no record in the group knew its
-        // failed/vacuous count (unknown ≠ zero); a number is the sum of the
-        // records that did know — an explicit lower bound.
+        // Nullable on purpose: null means no record in the group knew the
+        // count (unknown ≠ zero); a number is the sum of the records that
+        // did know — an explicit lower bound.
+        toolCalls: sumNullableCounters(
+          group.map((record) => record.toolCalls),
+        ),
+        toolCallsObserved: sumNullableCounters(
+          group.map((record) => record.toolCallsObserved),
+        ),
         toolCallsFailed: sumNullableCounters(
           group.map((record) => record.toolCallsFailed),
         ),
@@ -527,6 +601,55 @@ function counterRecord(value: unknown): Record<string, number> | null {
     if (parsed !== null && parsed > 0) record[key] = parsed;
   }
   return record;
+}
+
+/**
+ * Census annotation parse — deliberately NOT gated on a typed scenarioId
+ * (see the record-builder comment). Counter fields are re-validated through
+ * nullableCounter so a malformed summary degrades to unknown, never zero.
+ */
+function parseCensusAnnotation(
+  test: TestCase,
+): ToolCallCensusSummaryV1 | null {
+  const raw = [...test.annotations]
+    .reverse()
+    .find(
+      (annotation) => annotation.type === DAILY_USE_TOOL_CENSUS_ANNOTATION,
+    )?.description;
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as ToolCallCensusSummaryV1;
+    if (
+      value?.version !== 1 ||
+      !["complete", "lossy", "unarmed", "harvest_failed"].includes(
+        value.coverage,
+      )
+    ) {
+      return null;
+    }
+    return {
+      ...value,
+      observed: nullableCounter(value.observed),
+      executed: nullableCounter(value.executed),
+      refused: nullableCounter(value.refused),
+      failed: nullableCounter(value.failed),
+      succeeded: nullableCounter(value.succeeded),
+      vacuous: nullableCounter(value.vacuous),
+      intentionalNoOp: nullableCounter(value.intentionalNoOp),
+      receiptsUnknown: nullableCounter(value.receiptsUnknown),
+      buckets:
+        value.buckets && typeof value.buckets === "object"
+          ? Object.fromEntries(
+              Object.entries(value.buckets).flatMap(([key, count]) => {
+                const parsed = nullableCounter(count);
+                return parsed === null ? [] : [[key, parsed] as const];
+              }),
+            )
+          : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function parseScorecardAnnotation(test: TestCase): MissionScorecardV1 | null {
@@ -651,7 +774,9 @@ function unitInterval(value: unknown): value is number {
 
 function sum(
   records: readonly DailyUseRunRecord[],
-  key: "modelCalls" | "toolCalls" | "continuations" | "approvals",
+  // toolCalls is deliberately absent: it is nullable now and must go through
+  // sumNullableCounters so unknown never coerces to zero.
+  key: "modelCalls" | "continuations" | "approvals",
 ): number {
   return records.reduce((total, record) => total + record[key], 0);
 }

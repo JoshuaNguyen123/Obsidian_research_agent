@@ -1,7 +1,10 @@
 import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import { recordToolCallCensusAfterEach } from "./fixtures/toolCallCensus";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
+
+recordToolCallCensusAfterEach();
 
 /**
  * Interrupt-and-COMPLETE continuation proof.

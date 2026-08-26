@@ -19,18 +19,33 @@ export type ClassificationConfidence =
   | "confirmed"
   | "mechanical"
   | "unclassified";
-export function collectMechanicalFailureClasses(logText: string): string[];
+export function collectMechanicalFailureClasses(
+  logText: string,
+  sidecarText?: string,
+): string[];
 export function classifyAttemptOutcome(input: {
   exitCode: number;
   summary?: unknown;
   summaryFresh?: boolean;
   logText?: string;
+  sidecarText?: string;
 }): {
   failureClass: string;
   detail: string;
   confidence: ClassificationConfidence;
   secondaryClasses: string[];
 };
+export function extractPlaywrightReportErrorText(report: unknown): string;
+export function summaryWrittenSince(
+  file: string,
+  mtimeBeforeLaunchMs: number | null,
+): boolean;
+export function mineToolEvents(
+  windowStartMs: number,
+  windowEndMs: number,
+): { observed: number; failed: number; buckets: Record<string, number> | null };
+export function readJsonFile(file: string): unknown;
+export function appendRunCsvRow(row: readonly unknown[]): void;
 export const LEGACY_RUN_CSV_HEADER: string;
 export const RUN_CSV_HEADER: string;
 export function upgradeRunCsvHeader(
@@ -41,11 +56,13 @@ export const TOOL_EVENT_SOURCE_SUMMARY: "summary";
 export const TOOL_EVENT_SOURCE_GRAPHS: "graphs";
 export const TOOL_EVENT_SOURCE_NONE: "none";
 export interface SummaryToolEventTotals {
-  observed: number;
+  /** Null when no record knew a real call count — unknown, never zero. */
+  observed: number | null;
   failed: number | null;
   vacuous: number | null;
   intentionalNoOp: number | null;
-  buckets: Record<string, number>;
+  /** Only contributed vocabulary keys; null when no record carried buckets. */
+  buckets: Record<string, number> | null;
 }
 export function summaryToolEventTotals(
   summary: unknown,

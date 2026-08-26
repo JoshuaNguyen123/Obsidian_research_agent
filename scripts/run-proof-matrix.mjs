@@ -50,6 +50,8 @@ import {
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { nullableCount, sumNullable } from "./honest-counts.mjs";
+
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
 const RUN_CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
@@ -330,7 +332,7 @@ const BLOCKER_BUCKETS = [
  * this attempt's wall-clock window so serialized same-model cells attribute
  * exactly instead of via the 45-minute nearest-row heuristic).
  */
-function mineToolEvents(windowStartMs, windowEndMs) {
+export function mineToolEvents(windowStartMs, windowEndMs) {
   const counts = {
     observed: 0,
     failed: 0,
@@ -380,10 +382,8 @@ export const TOOL_EVENT_SOURCE_NONE = "none";
 function safeCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
-
-function nullableCount(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
+// nullableCount/sumNullable are imported from ./honest-counts.mjs — the one
+// shared seat for unknown-preserving count arithmetic.
 
 /**
  * Sum the tool-call counters across a daily-use run summary's records. The
@@ -397,14 +397,26 @@ export function summaryToolEventTotals(summary) {
   const records = Array.isArray(summary?.records) ? summary.records : null;
   if (!records || records.length === 0) return null;
   const totals = {
-    observed: 0,
+    // Nullable: null when NO record knew a real call count — a record without
+    // counters (a lane that never annotated) contributes unknown, not zero.
+    // The census's per-call count (toolCallsObserved) outranks the legacy
+    // DU-acceptance counter (toolCalls), which specs feed evidence lengths.
+    observed: null,
     failed: null,
     vacuous: null,
     intentionalNoOp: null,
-    buckets: Object.fromEntries(BLOCKER_BUCKETS.map(([key]) => [key, 0])),
+    // Only keys some record actually contributed are present; an absent key
+    // is UNKNOWN and prints blank. (The previous all-keys-at-0 seed printed
+    // six fabricated refusal zeros on every summary-sourced row.) A census
+    // record contributes all six keys with explicit zeros, so census rows
+    // make the whole vocabulary known.
+    buckets: null,
   };
   for (const record of records) {
-    totals.observed += safeCount(record?.toolCalls);
+    const observed =
+      nullableCount(record?.toolCallsObserved) ??
+      nullableCount(record?.toolCalls);
+    if (observed !== null) totals.observed = (totals.observed ?? 0) + observed;
     const failed = nullableCount(record?.toolCallsFailed);
     if (failed !== null) totals.failed = (totals.failed ?? 0) + failed;
     const vacuous = nullableCount(record?.toolCallsVacuous);
@@ -415,8 +427,14 @@ export function summaryToolEventTotals(summary) {
     if (noOp !== null) totals.intentionalNoOp = (totals.intentionalNoOp ?? 0) + noOp;
     const buckets = record?.refusalBuckets;
     if (buckets && typeof buckets === "object") {
-      for (const key of Object.keys(totals.buckets)) {
-        totals.buckets[key] += safeCount(buckets[key]);
+      // Vocabulary-restricted (unknown keys stay dropped — the census routes
+      // novel codes through its own unbucketedCodes instead).
+      for (const [key] of BLOCKER_BUCKETS) {
+        const parsed = nullableCount(buckets[key]);
+        if (parsed !== null) {
+          totals.buckets ??= {};
+          totals.buckets[key] = (totals.buckets[key] ?? 0) + parsed;
+        }
       }
     }
   }
@@ -439,7 +457,11 @@ export function summaryToolEventTotals(summary) {
 export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts }) {
   if (summaryFresh) {
     const totals = summaryToolEventTotals(summary);
-    if (totals) {
+    // Records that merely EXIST do not speak: a summary whose records all
+    // carry null counts (a lane without census or annotation) proves nothing
+    // about tool calls and must fall through — record existence was how the
+    // scenario-less lanes produced explicit observed=0 rows.
+    if (totals && totals.observed !== null) {
       return {
         source: TOOL_EVENT_SOURCE_SUMMARY,
         observed: totals.observed,
@@ -477,7 +499,7 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
   };
 }
 
-function readJsonFile(file) {
+export function readJsonFile(file) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
   } catch {
@@ -529,10 +551,62 @@ const LANE_ASSERTION_PATTERNS = [
   /expect\(received\)/u,
   /Test timeout of \d+\s*ms exceeded/u,
   /^\s*\d+\)\s+\[[^\]\n]+\]\s+›\s/mu,
+  // The real-AI harness's own completion-wait throw: the mission errored out
+  // under the test. Model: vs product: cannot be decided mechanically — the
+  // stop diagnostic rides along in failureDetail — but the red consumed a
+  // real attempt and must spend budget (it sat unclassified before, which is
+  // budget-EXEMPT, so the cell looped).
+  /Mission stopped before acceptance/u,
 ];
 
 export const LANE_ASSERTION_FAILURE_CLASS = "lane_assertion_failed";
 export const RENDERER_DEATH_FAILURE_CLASS = "harness:renderer_death";
+
+/**
+ * Product signatures matched against the attempt's Playwright JSON report
+ * (the sidecar this runner already copies beside each attempt log). The
+ * launcher log cannot carry these: the runner's --reporter flag replaces the
+ * config's reporter list, so assertion/diagnostic text never reaches stdout
+ * and every product red used to fall through to process:matrix_unclassified —
+ * which is budget-EXEMPT, so a red cell looped past its attempt budget (the
+ * 7x interrupted-continuation loop at 7944971). Entries here must be
+ * signatures confirmed as product classes, not guesses: an unmatched red
+ * still classifies as a lane assertion or stays unclassified.
+ */
+const SIDECAR_PRODUCT_SIGNATURES = [
+  [
+    // The continuation final-only-graph deadlock: the loop reports required
+    // tools satisfied by graph shape alone while acceptance still demands the
+    // write (force_final_no_tools + graph_final_only in one stop diagnostic).
+    /(?:force_final_no_tools[\s\S]{0,400}?graph_final_only=true)|(?:graph_final_only=true[\s\S]{0,400}?force_final_no_tools)/u,
+    "product:final_only_graph_deadlock",
+  ],
+];
+
+/**
+ * Every error message in a Playwright JSON report, flattened for signature
+ * scans. Bounded: reports can carry huge context blocks.
+ */
+export function extractPlaywrightReportErrorText(report) {
+  const chunks = [];
+  const pushError = (error) => {
+    if (typeof error?.message === "string") chunks.push(error.message);
+  };
+  const walkSuite = (suite) => {
+    for (const spec of suite?.specs ?? []) {
+      for (const testEntry of spec?.tests ?? []) {
+        for (const result of testEntry?.results ?? []) {
+          pushError(result?.error);
+          for (const error of result?.errors ?? []) pushError(error);
+        }
+      }
+    }
+    for (const child of suite?.suites ?? []) walkSuite(child);
+  };
+  for (const suite of report?.suites ?? []) walkSuite(suite);
+  for (const error of report?.errors ?? []) pushError(error);
+  return chunks.join("\n").slice(0, 200_000);
+}
 
 /** Earliest match of any pattern in the text, or null. */
 function firstPatternMatch(text, patterns) {
@@ -573,24 +647,36 @@ export const CLASSIFICATION_UNCLASSIFIED = "unclassified";
  * log also carries an assertion diff); the primary classifier picks one, and
  * the others become secondary classes instead of being silently dropped.
  */
-export function collectMechanicalFailureClasses(logText) {
+export function collectMechanicalFailureClasses(logText, sidecarText = "") {
   const text = typeof logText === "string" ? logText : "";
+  const combined = `${text}\n${typeof sidecarText === "string" ? sidecarText : ""}`;
   const classes = [];
   for (const [pattern, failureClass] of HARNESS_LOG_SIGNATURES) {
     if (pattern.test(text) && !classes.includes(failureClass)) {
       classes.push(failureClass);
     }
   }
-  if (firstPatternMatch(text, RENDERER_DEATH_PATTERNS)) {
+  if (firstPatternMatch(combined, RENDERER_DEATH_PATTERNS)) {
     classes.push(RENDERER_DEATH_FAILURE_CLASS);
   }
-  if (firstPatternMatch(text, LANE_ASSERTION_PATTERNS)) {
+  for (const [pattern, failureClass] of SIDECAR_PRODUCT_SIGNATURES) {
+    if (pattern.test(combined) && !classes.includes(failureClass)) {
+      classes.push(failureClass);
+    }
+  }
+  if (firstPatternMatch(combined, LANE_ASSERTION_PATTERNS)) {
     classes.push(LANE_ASSERTION_FAILURE_CLASS);
   }
   return classes;
 }
 
-export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logText }) {
+export function classifyAttemptOutcome({
+  exitCode,
+  summary,
+  summaryFresh,
+  logText,
+  sidecarText = "",
+}) {
   if (exitCode === 0) {
     return {
       failureClass: "none",
@@ -600,7 +686,9 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
     };
   }
   const text = typeof logText === "string" ? logText : "";
-  const mechanical = collectMechanicalFailureClasses(text);
+  const sidecar = typeof sidecarText === "string" ? sidecarText : "";
+  const combined = `${text}\n${sidecar}`;
+  const mechanical = collectMechanicalFailureClasses(text, sidecar);
   const secondaryFor = (primary) => mechanical.filter((cls) => cls !== primary);
   if (summaryFresh) {
     const records = Array.isArray(summary?.records)
@@ -631,20 +719,34 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
       };
     }
   }
-  const rendererDeath = firstPatternMatch(text, RENDERER_DEATH_PATTERNS);
+  // Renderer/driver deaths and everything below scan the sidecar report too:
+  // the runner's reporter override keeps assertion and diagnostic text out of
+  // the launcher log, so the sidecar is where the real failure usually lives.
+  const rendererDeath = firstPatternMatch(combined, RENDERER_DEATH_PATTERNS);
   if (rendererDeath) {
     return {
       failureClass: RENDERER_DEATH_FAILURE_CLASS,
-      detail: attemptLogExcerptFrom(text, rendererDeath.index),
+      detail: attemptLogExcerptFrom(combined, rendererDeath.index),
       confidence: CLASSIFICATION_MECHANICAL,
       secondaryClasses: secondaryFor(RENDERER_DEATH_FAILURE_CLASS),
     };
   }
-  const laneAssertion = firstPatternMatch(text, LANE_ASSERTION_PATTERNS);
+  for (const [pattern, failureClass] of SIDECAR_PRODUCT_SIGNATURES) {
+    const match = pattern.exec(combined);
+    if (match) {
+      return {
+        failureClass,
+        detail: attemptLogExcerptFrom(combined, match.index),
+        confidence: CLASSIFICATION_MECHANICAL,
+        secondaryClasses: secondaryFor(failureClass),
+      };
+    }
+  }
+  const laneAssertion = firstPatternMatch(combined, LANE_ASSERTION_PATTERNS);
   if (laneAssertion) {
     return {
       failureClass: LANE_ASSERTION_FAILURE_CLASS,
-      detail: attemptLogExcerptFrom(text, laneAssertion.index),
+      detail: attemptLogExcerptFrom(combined, laneAssertion.index),
       confidence: CLASSIFICATION_MECHANICAL,
       secondaryClasses: secondaryFor(LANE_ASSERTION_FAILURE_CLASS),
     };
@@ -696,13 +798,25 @@ export function attemptLogExcerptFrom(logText, startIndex = 0) {
   return lines.slice(0, 12).join("\n").slice(0, 1_000);
 }
 
-/** True when the run summary file was (re)written during the attempt window. */
-function summaryWrittenDuring(file, windowStartMs) {
+/** The file's mtime in ms, or null when it does not exist. */
+function fileMtimeMs(file) {
   try {
-    return statSync(file).mtimeMs >= windowStartMs - 5_000;
+    return statSync(file).mtimeMs;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * True when the run summary was (re)written during THIS attempt: it exists
+ * now and is strictly newer than the pre-launch snapshot (or absent then,
+ * present now). No wall-clock grace — an exact before-reference makes any
+ * tolerance an admission window for the PREVIOUS attempt's summary.
+ */
+export function summaryWrittenSince(file, mtimeBeforeLaunchMs) {
+  const current = fileMtimeMs(file);
+  if (current === null) return false;
+  return mtimeBeforeLaunchMs === null || current > mtimeBeforeLaunchMs;
 }
 
 function csvField(value) {
@@ -710,7 +824,7 @@ function csvField(value) {
   return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-function appendRunCsvRow(row) {
+export function appendRunCsvRow(row) {
   mkdirSync(EVAL_DIR, { recursive: true });
   if (!existsSync(RUN_CSV)) {
     writeFileSync(RUN_CSV, RUN_CSV_HEADER + "\n");
@@ -1071,6 +1185,11 @@ async function main() {
         `proof-matrix[${stage}]: node ${runnerArgs.map((a) => path.basename(a)).join(" ")}` +
         ` (output: ${path.relative(REPO_ROOT, attemptLogPath)})`,
       );
+      // Freshness reference for the run summary: its exact mtime BEFORE the
+      // child launches. A summary is fresh only when strictly newer — the old
+      // wall-clock grace admitted attempt N's summary as fresh for a fast
+      // harness-stage death in attempt N+1.
+      const summaryMtimeBeforeLaunch = fileMtimeMs(RUN_SUMMARY_PATH);
       const result = spawnSync(process.execPath, runnerArgs, {
         cwd: REPO_ROOT,
         env,
@@ -1107,7 +1226,20 @@ async function main() {
       const summary = readJsonFile(RUN_SUMMARY_PATH);
       // One freshness verdict feeds BOTH classification and tool-event
       // sourcing — two predicates would eventually disagree.
-      const summaryFresh = summaryWrittenDuring(RUN_SUMMARY_PATH, startedAt);
+      const summaryFresh = summaryWrittenSince(
+        RUN_SUMMARY_PATH,
+        summaryMtimeBeforeLaunch,
+      );
+      // The Playwright JSON sidecar carries the assertion/diagnostic text the
+      // launcher log cannot (reporter override): classification reads it too.
+      let sidecarText = "";
+      try {
+        sidecarText = extractPlaywrightReportErrorText(
+          readJsonFile(`${attemptLogPath}.playwright-report.json`),
+        );
+      } catch {
+        // Best-effort: a missing or malformed report falls back to the log.
+      }
       const {
         failureClass,
         detail: failureDetail,
@@ -1118,6 +1250,7 @@ async function main() {
         summary,
         summaryFresh,
         logText: attemptLogText,
+        sidecarText,
       });
       if (!green) {
         console.error(
@@ -1131,7 +1264,8 @@ async function main() {
         minedCounts: mineToolEvents(startedAt, endedAt),
       });
       const sourceKnown = toolEvents.source !== TOOL_EVENT_SOURCE_NONE;
-      const failedKnown = sourceKnown && toolEvents.failed !== null;
+      const observedKnown = sourceKnown && toolEvents.observed !== null;
+      const failedKnown = observedKnown && toolEvents.failed !== null;
       const pctFailed =
         failedKnown && toolEvents.observed > 0
           ? ((100 * toolEvents.failed) / toolEvents.observed).toFixed(1) + "%"
@@ -1164,7 +1298,7 @@ async function main() {
           ? ""
           : `matrix ${stage} exit ${exitCode}` +
             (failureDetail ? `: ${failureDetail.split(/\r?\n/u).at(-1).slice(0, 160)}` : ""),
-        sourceKnown ? toolEvents.observed : "",
+        observedKnown ? toolEvents.observed : "",
         failedKnown ? toolEvents.failed : "",
         pctFailed,
         bucketCell("tool_not_allowed"),

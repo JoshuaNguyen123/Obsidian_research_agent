@@ -22,6 +22,7 @@ import {
   RealAiConnectionAttestationRegistry,
   verifyWithWorkerConnectionAttestation,
 } from "./realAiConnectionAttestation";
+import { armToolCallCensus, harvestToolCallCensus } from "./toolCallCensus";
 
 export { clearChatInline } from "./chatCleanup";
 
@@ -319,12 +320,23 @@ export async function startRealAiHarness(
     ...(nativeOptions.retainVaultPaths
       ? { retainVaultPaths: nativeOptions.retainVaultPaths }
       : {}),
-    setup: (context) =>
-      installRealAiPageHarness(context, {
+    setup: async (context) => {
+      await installRealAiPageHarness(context, {
         placeholderCurrentNote:
           nativeOptions.placeholderCurrentNote === true,
-      }),
-    beforeClose: async ({ page }) => restoreOwnedWebBackend(page),
+      });
+      // Tool-call census arms before any mission so segment 0 observes the
+      // run from its first event (armedWhileRunning=false ⇒ provably
+      // complete). See e2e/fixtures/toolCallCensus.ts.
+      await armToolCallCensus(context.page);
+    },
+    beforeClose: async ({ page }) => {
+      // Harvest first: never throws, and the census must be read before any
+      // teardown that could disturb the page. The whole hook shares
+      // nativeObsidianHarness's bounded beforeClose budget.
+      await harvestToolCallCensus(page);
+      await restoreOwnedWebBackend(page);
+    },
   });
   let recordedApprovals = 0;
   let recordedContinuations = 0;
@@ -502,6 +514,10 @@ async function restartCorePlugin(
     timeout: 30_000,
   });
   await assertProductionClientReady(page, config, provider);
+  // The disable/enable cycle destroyed the old coordinator subscription, so
+  // re-arm the tool-call census as a new segment. Replay + per-segment id
+  // de-dup make this idempotent even when a run resumed before we re-armed.
+  await armToolCallCensus(page);
 }
 
 async function waitUntilIdleOrComplete(

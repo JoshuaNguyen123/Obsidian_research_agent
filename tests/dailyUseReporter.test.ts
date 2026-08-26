@@ -125,20 +125,52 @@ test("refusal markers are counted per bucket from error text; zero buckets are o
   assert.deepEqual(countRefusalMarkers(["clean failure text"]), {});
 });
 
-test("refusal bucket provenance: annotation wins, error text is mined, nothing stays null", () => {
+test("refusal bucket provenance: census, then annotation, then mined error text", () => {
   const annotated = { mission_graph_authority_blocked: 4 };
-  assert.deepEqual(resolveRefusalBuckets(annotated, ["tool_not_allowed"]), {
+  assert.deepEqual(resolveRefusalBuckets(null, annotated, ["tool_not_allowed"]), {
     buckets: annotated,
     source: "annotation",
   });
-  assert.deepEqual(resolveRefusalBuckets(null, ["saw tool_not_allowed twice: tool_not_allowed"]), {
+  assert.deepEqual(resolveRefusalBuckets(null, null, ["saw tool_not_allowed twice: tool_not_allowed"]), {
     buckets: { tool_not_allowed: 2 },
     source: "error_messages",
   });
   // A record with neither annotation nor error text was never inspected:
   // null (unknown), NOT an empty object pretending zero refusals happened.
-  assert.deepEqual(resolveRefusalBuckets(null, []), { buckets: null, source: null });
-  assert.deepEqual(resolveRefusalBuckets(null, [""]), { buckets: null, source: null });
+  assert.deepEqual(resolveRefusalBuckets(null, null, []), { buckets: null, source: null });
+  assert.deepEqual(resolveRefusalBuckets(null, null, [""]), { buckets: null, source: null });
+});
+
+test("a complete census outranks both the annotation and mined error text", () => {
+  const censusComplete = {
+    version: 1 as const,
+    coverage: "complete" as const,
+    observed: 9,
+    executed: 7,
+    refused: 2,
+    failed: 3,
+    succeeded: 6,
+    vacuous: 0,
+    intentionalNoOp: 1,
+    receiptsUnknown: 0,
+    // Explicit zeros: the census watched the run, so an untouched bucket
+    // really means zero — unlike mined sightings.
+    buckets: { mission_graph_authority_blocked: 2, tool_not_allowed: 0 },
+    unbucketedCodes: {},
+    unbucketedCodeOverflow: 0,
+    atLeast: null,
+    segments: 1,
+  };
+  assert.deepEqual(
+    resolveRefusalBuckets(censusComplete, { tool_not_allowed: 9 }, ["tool_not_allowed"]),
+    { buckets: censusComplete.buckets, source: "census" },
+  );
+  // A lossy census proves nothing; the weaker sources take over.
+  const lossy = { ...censusComplete, coverage: "lossy" as const, buckets: null };
+  assert.deepEqual(
+    resolveRefusalBuckets(lossy, { tool_not_allowed: 9 }, []),
+    { buckets: { tool_not_allowed: 9 }, source: "annotation" },
+  );
 });
 
 test("a vacuous success is a mutation receipt that explicitly reports zero delta", () => {
@@ -235,4 +267,203 @@ test("nullable counters never coerce unknown into zero", () => {
   assert.equal(sumNullableCounters([]), null);
   assert.equal(sumNullableCounters([2, null, 3]), 5);
   assert.equal(sumNullableCounters([0, null]), 0, "a known zero is zero, not unknown");
+});
+
+// ---------------------------------------------------------------------------
+// Tool-call census wave (2026-08-25): the reporter's record builder must
+// never manufacture a zero, must parse the census annotation without a
+// scenario id, and must write the durable summary mirror.
+// ---------------------------------------------------------------------------
+
+function fakeTestCase(overrides: {
+  title: string;
+  project: string;
+  file?: string;
+  annotations?: { type: string; description?: string }[];
+}) {
+  return {
+    title: overrides.title,
+    parent: { project: () => ({ name: overrides.project }) },
+    location: { file: overrides.file ?? `e2e/${overrides.project}.spec.ts` },
+    annotations: overrides.annotations ?? [],
+  } as never;
+}
+
+const passedResult = {
+  errors: [],
+  status: "passed",
+  duration: 1234,
+  retry: 0,
+} as never;
+
+test("a lane that annotates nothing reports UNKNOWN tool calls, not zero", async () => {
+  // The exact regression behind the CSV's observed=0 rows: real-ai-soak,
+  // desktop-code-delivery-real-live, and interrupted-continuation-live have
+  // no DailyUseScenarioId, so `metrics` is null and the old `?? 0` wrote a
+  // hard zero into a genuinely fresh summary.
+  const { default: DailyUseReporter } = await import(
+    "../e2e/reporters/dailyUseReporter"
+  );
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(
+    fakeTestCase({
+      title: "deep vault retrieval and semantic expansion",
+      project: "real-ai-soak",
+    }),
+    passedResult,
+  );
+  const root = await mkdtemp(path.join(os.tmpdir(), "daily-use-census-"));
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(root);
+    await reporter.onEnd({ status: "passed" } as never);
+  } finally {
+    process.chdir(previousCwd);
+  }
+  try {
+    const summary = JSON.parse(
+      await readFile(path.join(root, "test-results", "daily-use-run-summary.json"), "utf8"),
+    );
+    assert.equal(summary.records.length, 1);
+    assert.equal(summary.records[0].toolCalls, null);
+    assert.equal(summary.records[0].toolCallsObserved, null);
+    assert.equal(summary.records[0].toolCallsFailed, null);
+    // The durable mirror landed beside the proof-matrix state with the same
+    // payload; the canonical path stays where its four consumers expect it.
+    const mirror = JSON.parse(
+      await readFile(
+        path.join(root, "proof-matrix-state", "daily-use-run-summary.latest.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(mirror.records[0].toolCalls, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a census annotation is honored for a lane with no DailyUseScenarioId and outranks the metrics annotation", async () => {
+  const { default: DailyUseReporter } = await import(
+    "../e2e/reporters/dailyUseReporter"
+  );
+  const census = {
+    version: 1,
+    coverage: "complete",
+    observed: 9,
+    executed: 8,
+    refused: 1,
+    failed: 2,
+    succeeded: 6,
+    vacuous: 1,
+    intentionalNoOp: 1,
+    receiptsUnknown: 0,
+    buckets: {
+      tool_not_allowed: 0,
+      mission_graph_authority_blocked: 1,
+      invalid_arguments: 0,
+      execution_failed: 0,
+      authority_grant_invalid: 0,
+      tool_failure_terminal: 0,
+    },
+    unbucketedCodes: {},
+    unbucketedCodeOverflow: 0,
+    atLeast: null,
+    segments: 2,
+  };
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(
+    fakeTestCase({
+      title: "a mission killed mid-flight resumes and completes the remaining work",
+      project: "interrupted-continuation-live",
+      annotations: [
+        { type: "daily-use-tool-census-v1", description: JSON.stringify(census) },
+      ],
+    }),
+    passedResult,
+  );
+  const root = await mkdtemp(path.join(os.tmpdir(), "daily-use-census-"));
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(root);
+    await reporter.onEnd({ status: "passed" } as never);
+  } finally {
+    process.chdir(previousCwd);
+  }
+  try {
+    const summary = JSON.parse(
+      await readFile(path.join(root, "test-results", "daily-use-run-summary.json"), "utf8"),
+    );
+    const record = summary.records[0];
+    assert.equal(record.scenarioId, null);
+    // The census speaks even though the metrics annotation cannot (no
+    // scenario id): observed, failed, vacuous, no-op, and buckets all land.
+    assert.equal(record.toolCallsObserved, 9);
+    assert.equal(record.toolCallsFailed, 2);
+    assert.equal(record.toolCallsVacuous, 1);
+    assert.equal(record.toolCallsIntentionalNoOp, 1);
+    assert.equal(record.refusalBucketsSource, "census");
+    assert.equal(record.refusalBuckets.mission_graph_authority_blocked, 1);
+    // Explicit zero, not omitted: the census watched the whole run.
+    assert.equal(record.refusalBuckets.tool_not_allowed, 0);
+    // The fingerprinted DU counter stays unknown — the census never
+    // overwrites the quantity the fingerprint was computed over.
+    assert.equal(record.toolCalls, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a lossy census proves nothing: counters stay unknown rather than partial", async () => {
+  const { default: DailyUseReporter } = await import(
+    "../e2e/reporters/dailyUseReporter"
+  );
+  const reporter = new DailyUseReporter();
+  reporter.onTestEnd(
+    fakeTestCase({
+      title: "deep vault retrieval and semantic expansion",
+      project: "real-ai-soak",
+      annotations: [
+        {
+          type: "daily-use-tool-census-v1",
+          description: JSON.stringify({
+            version: 1,
+            coverage: "lossy",
+            observed: null,
+            executed: null,
+            refused: null,
+            failed: null,
+            succeeded: null,
+            vacuous: null,
+            intentionalNoOp: null,
+            receiptsUnknown: null,
+            buckets: null,
+            unbucketedCodes: {},
+            unbucketedCodeOverflow: 0,
+            atLeast: { observed: 4, failed: 1 },
+            segments: 1,
+          }),
+        },
+      ],
+    }),
+    passedResult,
+  );
+  const root = await mkdtemp(path.join(os.tmpdir(), "daily-use-census-"));
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(root);
+    await reporter.onEnd({ status: "passed" } as never);
+  } finally {
+    process.chdir(previousCwd);
+  }
+  try {
+    const record = JSON.parse(
+      await readFile(path.join(root, "test-results", "daily-use-run-summary.json"), "utf8"),
+    ).records[0];
+    assert.equal(record.toolCallsObserved, null);
+    assert.equal(record.toolCallsFailed, null);
+    // Provenance survives for the uncertainty ledger.
+    assert.equal(record.toolCallCensus.coverage, "lossy");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

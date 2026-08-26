@@ -208,10 +208,25 @@ try {
   // -------------------------------------------------------------------------
   const ROOT = path.join(EVAL_DIR, "..", "..");
   let summaryRecords = null;
-  try {
-    const summary = JSON.parse(readFileSync(path.join(ROOT, "test-results", "daily-use-run-summary.json"), "utf8"));
-    summaryRecords = Array.isArray(summary?.records) ? summary.records : null;
-  } catch {}
+  let summarySource = null;
+  // Canonical first; Playwright wipes test-results/ at run start, so fall
+  // back to the durable mirror the reporter writes into proof-matrix-state/.
+  // Read-only telemetry: gates (scorecard regression, protected release)
+  // deliberately never take this fallback — a stale mirror must not satisfy
+  // an assertion about THIS run.
+  for (const [label, file] of [
+    ["test-results/daily-use-run-summary.json", path.join(ROOT, "test-results", "daily-use-run-summary.json")],
+    ["proof-matrix-state/daily-use-run-summary.latest.json (durable mirror)", path.join(ROOT, "proof-matrix-state", "daily-use-run-summary.latest.json")],
+  ]) {
+    try {
+      const summary = JSON.parse(readFileSync(file, "utf8"));
+      if (Array.isArray(summary?.records)) {
+        summaryRecords = summary.records;
+        summarySource = label;
+        break;
+      }
+    } catch {}
+  }
   const allZeroFingerprint = (fp) => typeof fp === "string" && /^sha256:0+$/u.test(fp);
   const uncertaintyBuckets = [
     ["CSV rows classified mechanically (`classification_confidence` = mechanical: pattern-matched from logs, never root-caused)", records.filter((r) => r.confidence === "mechanical").length],
@@ -231,7 +246,9 @@ try {
   const uncertaintySection = [
     "## Uncertainty ledger",
     "",
-    "Fed by `classification_confidence` and `tool_events_source` in playwright-run-metrics.csv, plus the latest test-results/daily-use-run-summary.json. Rows appended before 2026-08-25 have blank new columns by design (history is never rewritten).",
+    "Fed by `classification_confidence` and `tool_events_source` in playwright-run-metrics.csv, plus the latest run summary" +
+      (summarySource ? ` (read from ${summarySource})` : "") +
+      ". Rows appended before 2026-08-25 have blank new columns by design (history is never rewritten).",
     "",
     "| Uncertainty bucket | Count |",
     "|---|---|",

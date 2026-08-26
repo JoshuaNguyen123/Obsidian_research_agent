@@ -20,8 +20,10 @@ import {
   TOOL_EVENT_SOURCE_NONE,
   TOOL_EVENT_SOURCE_SUMMARY,
   collectMechanicalFailureClasses,
+  extractPlaywrightReportErrorText,
   resolveAttemptToolEvents,
   summaryToolEventTotals,
+  summaryWrittenSince,
   upgradeRunCsvHeader,
   LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
@@ -688,6 +690,7 @@ test("summaryToolEventTotals sums refusal buckets and keeps partial knowledge a 
   // 2 + (unknown, skipped) + 1: a lower bound, not a fake zero for record 2.
   assert.equal(totals.failed, 3);
   assert.equal(totals.vacuous, null, "no record knew vacuous - the total is unknown");
+  assert.ok(totals.buckets, "records contributed buckets");
   assert.equal(totals.buckets.mission_graph_authority_blocked, 2);
   assert.equal(totals.buckets.tool_not_allowed, 1);
   assert.equal("bogus_bucket" in totals.buckets, false, "unknown bucket keys are dropped");
@@ -770,4 +773,154 @@ test("classification confidence: confirmed from summaries, mechanical from logs,
     }).confidence,
     CLASSIFICATION_UNCLASSIFIED,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Tool-call census wave (2026-08-25): record existence is not knowledge, the
+// six fabricated refusal zeros, strict summary freshness, and sidecar
+// classification.
+// ---------------------------------------------------------------------------
+
+test("a fresh summary whose records know no counts is not an observed zero", () => {
+  // The exact false-zero regression: the three scenario-less proof lanes
+  // (real-ai-soak, code-delivery, interrupted-continuation) push records with
+  // null counters. Their mere existence must not become source=summary
+  // observed=0 — it falls through to graphs, then none.
+  const knowNothing = {
+    records: [
+      { toolCalls: null, toolCallsObserved: null, toolCallsFailed: null },
+      { toolCalls: null, toolCallsObserved: null, toolCallsFailed: null },
+    ],
+  };
+  assert.equal(summaryToolEventTotals(knowNothing)?.observed, null);
+  const fellThrough = resolveAttemptToolEvents({
+    summary: knowNothing,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(fellThrough.source, TOOL_EVENT_SOURCE_NONE);
+  assert.equal(fellThrough.observed, null);
+  // With mined evidence available, the mine speaks instead.
+  const mined = resolveAttemptToolEvents({
+    summary: knowNothing,
+    summaryFresh: true,
+    minedCounts: { observed: 5, failed: 1, buckets: null },
+  });
+  assert.equal(mined.source, TOOL_EVENT_SOURCE_GRAPHS);
+  assert.equal(mined.observed, 5);
+});
+
+test("the census per-call count outranks the legacy DU-acceptance counter", () => {
+  // daily-use-research annotates toolCalls from missionEvidence lengths (an
+  // evidence count, successes only); the census counts actual calls. When
+  // both are present the census speaks for observed.
+  const totals = summaryToolEventTotals({
+    records: [{ toolCalls: 7, toolCallsObserved: 11, toolCallsFailed: 2 }],
+  });
+  assert.equal(totals?.observed, 11);
+  assert.equal(totals?.failed, 2);
+});
+
+test("refusal bucket cells are blank when no record contributed them", () => {
+  // The previous all-keys-at-0 seed printed six fabricated refusal zeros on
+  // every summary-sourced row. Unobserved buckets are now null (blank cells).
+  const noBuckets = summaryToolEventTotals({
+    records: [{ toolCalls: 4, toolCallsFailed: 0 }],
+  });
+  assert.equal(noBuckets?.buckets, null);
+  // A record that DID contribute buckets makes exactly its keys known —
+  // census records carry all six with explicit zeros, mined records only the
+  // sighted keys.
+  const censusBuckets = summaryToolEventTotals({
+    records: [{
+      toolCalls: 4,
+      toolCallsFailed: 1,
+      refusalBuckets: { mission_graph_authority_blocked: 1, tool_not_allowed: 0 },
+    }],
+  });
+  assert.deepEqual(censusBuckets?.buckets, {
+    mission_graph_authority_blocked: 1,
+    tool_not_allowed: 0,
+  });
+});
+
+test("summary freshness is strictly newer than the pre-launch snapshot", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "proof-matrix-freshness-"));
+  const file = path.join(root, "daily-use-run-summary.json");
+  try {
+    // Absent before and after: not fresh.
+    assert.equal(summaryWrittenSince(file, null), false);
+    writeFileSync(file, "{}");
+    const mtimeBefore = (() => {
+      const { statSync } = require("node:fs") as typeof import("node:fs");
+      return statSync(file).mtimeMs;
+    })();
+    // Untouched since the snapshot: stale — the old 5s wall-clock grace
+    // admitted attempt N's summary into a fast-failing attempt N+1.
+    assert.equal(summaryWrittenSince(file, mtimeBefore), false);
+    // Strictly newer than the snapshot: fresh.
+    assert.equal(summaryWrittenSince(file, mtimeBefore - 1), true);
+    // Absent at snapshot time, present now: fresh (first-ever summary).
+    assert.equal(summaryWrittenSince(file, null), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sidecar product signatures classify the reds the launcher log cannot", () => {
+  // The runner's --reporter override keeps diagnostics off stdout, so the
+  // deadlock evidence lives only in the Playwright JSON report. Tonight's
+  // interrupted-continuation reds carried exactly this stop diagnostic.
+  const sidecarText = extractPlaywrightReportErrorText({
+    suites: [{
+      specs: [{
+        tests: [{
+          results: [{
+            error: {
+              message:
+                "Mission stopped before acceptance; approved=0; action=force_final_no_tools; " +
+                "reason=required_tools_satisfied; successful_tools=0; " +
+                "required_tools_satisfied=false; graph_final_only=true",
+            },
+          }],
+        }],
+      }],
+      suites: [],
+    }],
+  });
+  assert.match(sidecarText, /force_final_no_tools/u);
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: "nothing recognizable on stdout",
+    sidecarText,
+  });
+  assert.equal(outcome.failureClass, "product:final_only_graph_deadlock");
+  assert.equal(outcome.confidence, CLASSIFICATION_MECHANICAL);
+  // product: consumes attempt budget — the whole point: unclassified reds
+  // were budget-exempt and looped forever.
+  assert.equal(isInfrastructureFailureClass(outcome.failureClass), false);
+  // Harness-stage deaths keep their classification even when a sidecar from
+  // an earlier phase carries product text: harness signatures stay first.
+  const harnessFirst = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: "build exited with code 2.",
+    sidecarText,
+  });
+  assert.equal(harnessFirst.failureClass, "harness:build_failed");
+  assert.deepEqual(
+    harnessFirst.secondaryClasses.includes("product:final_only_graph_deadlock"),
+    true,
+  );
+});
+
+test("an assertion that only the sidecar carries still classifies as a lane assertion", () => {
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summaryFresh: false,
+    logText: "nothing recognizable",
+    sidecarText: "Error: expect(received).toBe(expected)\nexpect(received)",
+  });
+  assert.equal(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
 });

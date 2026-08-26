@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { acquireE2eLock } from "./run-e2e-exclusive.mjs";
+import { nullableCount } from "./honest-counts.mjs";
 import {
   DIMENSION_IDS,
   assertMissionScorecardSummaryFile,
@@ -712,7 +713,10 @@ export function projectDailyUseSummaryForPublicProof(payload) {
         ? null
         : boundedPublicToken(record.failureCategory ?? "unknown", 80),
       modelCalls: boundedPublicInteger(record.modelCalls),
-      toolCalls: boundedPublicInteger(record.toolCalls),
+      // Nullable on purpose (honest-counts): the record reports null when no
+      // spec counted tool calls, and a public proof must not turn unknown
+      // into an explicit zero.
+      toolCalls: nullableCount(record.toolCalls),
       continuations: boundedPublicInteger(record.continuations),
       approvals: boundedPublicInteger(record.approvals),
       artifactProofCount: boundedPublicInteger(record.artifactProofCount),

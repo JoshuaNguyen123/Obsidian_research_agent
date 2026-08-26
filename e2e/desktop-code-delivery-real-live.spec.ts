@@ -25,7 +25,10 @@ import {
   startRealAiHarness,
   type RealAiHarness,
 } from "./fixtures/realAiHarness";
+import { recordToolCallCensusAfterEach } from "./fixtures/toolCallCensus";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
+
+recordToolCallCensusAfterEach();
 
 const LANE = "desktop-code-delivery-real-live";
 const EXACT_PROMPT =
