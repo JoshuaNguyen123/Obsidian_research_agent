@@ -416,8 +416,13 @@ import {
   shouldRequestWordCountCorrection,
 } from "./agent/wordCountCorrectionPolicy";
 import {
+  // The runner reads the graph frontier ONLY through
+  // `authoritativeRefusalFrontierToolNamesV1` now: the bare
+  // `readyMissionGraphFrontierToolNamesV1` was the second of the two
+  // definitions that disagreed, and re-importing it here is how a third seat
+  // would quietly reacquire its own answer.
+  authoritativeRefusalFrontierToolNamesV1,
   countReadyMissionGraphToolSlots,
-  readyMissionGraphFrontierToolNamesV1,
   findExactGraphBoundToolCallIndex,
   findReadyMissionGraphToolNodes,
   getMissionGraphFrontierDestinationSelector,
@@ -13228,9 +13233,15 @@ export async function runAgentMission({
       // only "not ready" and were re-issued for 45 straight steps. Same
       // builder, and the frontier is read from the graph the refusal came
       // from rather than from the offered schema that disagreed with it.
-      const authorityReadyFrontier = readyMissionGraphFrontierToolNamesV1(
-        missionGraphSession?.graph ?? missionGraph,
-      ).filter((name) => name !== toolCall.name);
+      // Same shared predicate as every other message seat. No candidate menu is
+      // in scope here, and `allowDynamicReadContinuation` is deliberately left
+      // false: the authority has just refused this very call, so the message
+      // fails closed to the exact ready frontier rather than speculating that a
+      // dynamic read node would have been materialized for something else.
+      const authorityReadyFrontier = authoritativeRefusalFrontierToolNamesV1({
+        graph: missionGraphSession?.graph ?? missionGraph,
+        excludeToolNames: [toolCall.name],
+      });
       const message = [
         `Rejected ${toolCall.name}: ${getUnknownErrorMessage(error)}`,
         buildOffFrontierToolRejectionMessageImpl({
@@ -16124,9 +16135,18 @@ export async function runAgentMission({
             content: buildRepeatedInvalidToolCallCorrectiveV1({
               toolName: toolCall.name,
               failureCode: failureCode || "invalid_arguments",
-              readyFrontierToolNames: tools.map(
-                (candidate) => candidate.function.name,
-              ),
+              // "call one of these exact names instead" is a directive, so it
+              // owes the same authority the next call will be judged by. This
+              // seat used to hand over the whole offered catalog, which is a
+              // strict superset of what the mission graph will admit.
+              readyFrontierToolNames: authoritativeRefusalFrontierToolNamesV1({
+                graph: missionGraphSession?.graph ?? missionGraph,
+                candidateToolNames: tools.map(
+                  (candidate) => candidate.function.name,
+                ),
+                excludeToolNames: [toolCall.name],
+                allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+              }),
             }),
           });
         } else {
@@ -18721,9 +18741,18 @@ export async function runAgentMission({
         }).unpaid,
       );
       const readyToolNames = stepTools.map((tool) => tool.function.name);
+      // `offered:` below stays the true offered menu — those schemas really are
+      // callable shapes and hiding them would strand the turn. `preferredNext`
+      // is a DIRECTIVE, so it owes the authority that will judge the call:
+      // naming a capability read the exact planned frontier will refuse is the
+      // same lie the refusal seat used to tell, one turn earlier.
       const preferredNext = pickPreferredNextTool({
         unpaidDeliveryTools,
-        readyFrontierToolNames: readyToolNames,
+        readyFrontierToolNames: authoritativeRefusalFrontierToolNamesV1({
+          graph: missionGraphSession?.graph ?? missionGraph,
+          candidateToolNames: readyToolNames,
+          allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+        }),
       });
       const routingCard =
         setLooseCompoundEnabled && stepTools.length > 0
@@ -21501,6 +21530,12 @@ export async function runAgentMission({
           offeredAtStepStartToolNames: stepTools.map(
             (candidate) => candidate.function.name,
           ),
+          // Deliberately the OFFERED menu, not the graph authority: this
+          // classifier's question is "did the host's own menu change under the
+          // model?", and answering it from the authority would make every
+          // capability-read refusal look like menu decay. The authority answer
+          // is computed separately below and drives only what the message
+          // tells the model to call.
           liveReadyToolNames: [...stepAllowedToolNames],
           responseCallIndex: toolIndex,
           responseCallCount: responseToolCalls.length,
@@ -21516,6 +21551,26 @@ export async function runAgentMission({
           isHostNarrowedOffFrontierRefusalV1(offFrontierFacts);
         const hostWithheldRefusal =
           isHostWithheldOffFrontierRefusalV1(offFrontierFacts);
+        // `stepAllowedToolNames` is the OFFERED menu, and on a set-loose run
+        // `constrainToolsToMissionGraphFrontier` unions every read-effect
+        // capability grant into it (`includeCapabilityReads`), while the
+        // authority that judges the model's NEXT call --
+        // `beginMissionGraphTool` -> `beginToolExecution` -- passes only
+        // `allowDynamicReadContinuation: dynamicReadContinuationAllowed()`.
+        // Printing the offered menu here made the host order a call it then
+        // refused one step later: step 21 of the 3860ee6 compound run said
+        // "Preferred next: read_current_file. Call that exact name." and step
+        // 22 answered `mission_graph_authority_blocked` with "Ready frontier
+        // tool(s) now: none." Everything this refusal says about what to call
+        // next now comes from the SAME authority, and fails closed to "no tool
+        // is ready" when that authority admits nothing.
+        const authoritativeRejectFrontier =
+          authoritativeRefusalFrontierToolNamesV1({
+            graph: authoritativeGraph,
+            candidateToolNames: [...stepAllowedToolNames],
+            excludeToolNames: [toolCall.name],
+            allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+          });
         // Authority is unchanged: this only stops host-side menu drift from
         // being counted in the bucket that means "the model named a tool it
         // was never offered". The call is still refused, and the seats behind
@@ -21535,7 +21590,7 @@ export async function runAgentMission({
               proofs: setLooseDeliveryProofs,
             }).unpaid,
           ),
-          readyFrontierToolNames: [...stepAllowedToolNames],
+          readyFrontierToolNames: authoritativeRejectFrontier,
         });
         const rejectCategory = hostNarrowedRefusal
           ? "frontier_narrowed"
@@ -21554,7 +21609,7 @@ export async function runAgentMission({
         const rejectionMessage = buildOffFrontierToolRejectionMessage({
           toolName: toolCall.name,
           pendingGraphNodeId: pendingGraphNode?.id ?? null,
-          readyFrontierToolNames: [...stepAllowedToolNames],
+          readyFrontierToolNames: authoritativeRejectFrontier,
           preferredNextTool: preferredNextOnReject,
           category: rejectCategory,
           offFrontier: offFrontierFacts,
@@ -21567,7 +21622,7 @@ export async function runAgentMission({
           selectedTool: toolCall.name,
           expectedPrerequisite: preferredNextOnReject,
           errorCategory: rejectCategory,
-          readyFrontier: [...stepAllowedToolNames],
+          readyFrontier: authoritativeRejectFrontier,
           offFrontier: offFrontierFacts,
         });
         events.onStatus?.(
@@ -21866,9 +21921,17 @@ export async function runAgentMission({
             content: buildRepeatedInvalidToolCallCorrectiveV1({
               toolName: toolCall.name,
               failureCode: "invalid_arguments",
-              readyFrontierToolNames: stepTools.map(
-                (candidate) => candidate.function.name,
-              ),
+              // Same rule as the other repeat seat: a directive naming tools
+              // must read the authority that will judge the next call, not the
+              // step menu that is a superset of it.
+              readyFrontierToolNames: authoritativeRefusalFrontierToolNamesV1({
+                graph: missionGraphSession?.graph ?? missionGraph,
+                candidateToolNames: stepTools.map(
+                  (candidate) => candidate.function.name,
+                ),
+                excludeToolNames: [toolCall.name],
+                allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+              }),
             }),
           });
         } else {

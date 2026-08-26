@@ -528,10 +528,16 @@ export function buildOffFrontierToolRejectionMessage(input: {
    */
   offFrontier?: OffFrontierRefusalFactsV1 | null;
 }): string {
+  // ONE list, cleaned once. Everything this message says about what to call
+  // next -- the frontier line, the near-miss coaching, the held-tool line and
+  // "Preferred next" -- is derived from it and from nothing else, so the
+  // message cannot name a tool it has not just listed as ready.
+  const advertisedFrontier = input.readyFrontierToolNames
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const advertisedFrontierSet = new Set(advertisedFrontier);
   const frontier =
-    input.readyFrontierToolNames.length > 0
-      ? input.readyFrontierToolNames.join(", ")
-      : "none";
+    advertisedFrontier.length > 0 ? advertisedFrontier.join(", ") : "none";
   const hostNarrowed =
     input.offFrontier != null &&
     isHostNarrowedOffFrontierRefusalV1(input.offFrontier);
@@ -546,10 +552,12 @@ export function buildOffFrontierToolRejectionMessage(input: {
         // host-narrowed or host-withheld call already had the right name, and
         // a placeholder never expressed an intent to map.
         null
-      : describeOffFrontierToolNearMiss(
-          input.toolName,
-          input.readyFrontierToolNames,
-        );
+      : advertisedFrontier.length === 0
+        ? // Nothing is callable. Even the hedged coaching ("use X when listed
+          // on the frontier") names a tool, and on an empty authoritative
+          // frontier the only honest message names none at all.
+          null
+        : describeOffFrontierToolNearMiss(input.toolName, advertisedFrontier);
   const category =
     input.category ??
     (hostNarrowed
@@ -574,12 +582,19 @@ export function buildOffFrontierToolRejectionMessage(input: {
   const heldWriteTools = new Set(
     (input.heldWriteToolNames ?? []).filter(Boolean),
   );
+  // A "preferred next" the frontier line does not contain is exactly the lie
+  // this builder exists to make impossible. Live on main @3860ee6, step 21 of
+  // a compound run ordered "Preferred next: read_current_file. Call that exact
+  // name." from the OFFERED menu, and step 22 refused that exact call because
+  // the authoritative graph frontier was empty. Callers own which authority
+  // they read; this builder guarantees that whatever it names, it has just
+  // listed as ready.
+  const requestedPreferred = input.preferredNextTool?.trim() ?? "";
   const preferred =
-    input.preferredNextTool?.trim() ||
-    input.readyFrontierToolNames
+    (advertisedFrontierSet.has(requestedPreferred) ? requestedPreferred : "") ||
+    advertisedFrontier
       .filter((name) => !heldWriteTools.has(name))
       .slice(0, 3)
-      .filter(Boolean)
       .join(", ") ||
     "none";
   const base = placeholderName
@@ -636,7 +651,7 @@ export function buildOffFrontierToolRejectionMessage(input: {
   // turns reconciling the two. When the frontier offers nothing but held
   // tools, the frontier listing stays (it is factual) but no call directive
   // may appear -- there is nothing safe to call.
-  const heldFrontierTools = input.readyFrontierToolNames.filter((name) =>
+  const heldFrontierTools = advertisedFrontier.filter((name) =>
     heldWriteTools.has(name),
   );
   const heldPreferred = heldWriteTools.has(preferred)
