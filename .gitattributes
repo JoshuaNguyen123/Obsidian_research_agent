@@ -2,6 +2,9 @@
 # (scripts/build-companion-assets.mjs), so every text file must check out with
 # the same bytes on every machine. The index is already 100% LF; this pins the
 # checkout direction that core.autocrlf=true would otherwise vary per-machine.
+# These attributes only apply when git writes a file, so a checkout made
+# before they landed keeps its old endings and git status stays clean about it.
+# npm run check:eol-hygiene reports that drift; --fix re-checks-out the files.
 * text=auto eol=lf
 
 # PowerShell is the one consumer that prefers CRLF on disk.
