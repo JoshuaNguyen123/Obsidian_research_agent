@@ -4337,7 +4337,11 @@ export async function runAgentMission({
       );
     };
     const exactResumeRunId = extractRequestedRunId(prompt);
-    const canonicalResumeGraphId =
+    // Cleared only when the restored record proves unusable for this
+    // mission's required write (see the adoption refusal below): the replan
+    // then persists under this segment's own canonical id instead of
+    // colliding with a stub whose envelope fingerprint can never match.
+    let canonicalResumeGraphId =
       resumeSnapshot?.missionGraphRef?.missionId ??
       (exactResumeRunId ? canonicalMissionGraphId(exactResumeRunId) : null);
     try {
@@ -4348,7 +4352,53 @@ export async function runAgentMission({
             missionId: canonicalResumeGraphId,
             events: { onGraphUpdate: emitMissionGraph },
           });
+          // A restored graph is authority ONLY if its capability envelope can
+          // still serve the restored mission's required write. A crash can
+          // persist a tool-less `final` stub whose envelope never granted
+          // append_to_current_file (the segment that planted it planned no
+          // write node, so no grant was minted): adopting it makes the write
+          // structurally impossible — the heal cannot splice a node the
+          // envelope does not authorize (refusedReason
+          // envelope_grant_missing, observed 3x in one lane run), the
+          // frontier fallback still offers the tool, and the authority
+          // refuses every call until the budget dies. Fail the ADOPTION
+          // instead and fall through to a fresh plan, which mints a real
+          // append node and a matching grant. Scoped hard: only an unpaid
+          // final-only stub qualifies — a graph with real nodes, or one whose
+          // required mutation is already paid, resumes verbatim as always.
+          const restoredGraph = missionGraphSession.graph;
+          const restoredStubCannotServeRequiredWrite =
+            requiredWriteTools.includes("append_to_current_file") &&
+            missionGraphFinalOnlyStubOwesRequiredWorkV1(restoredGraph) &&
+            restoredGraph.capabilityEnvelope.tools["append_to_current_file"] ===
+              undefined;
+          if (restoredStubCannotServeRequiredWrite) {
+            const abandonMessage =
+              "Refused to adopt the restored mission graph: it is an unpaid final-only stub whose capability envelope cannot grant the mission's required current-note write. Replanning this continuation from the restored mission.";
+            missionGraphSession = null;
+            missionGraph = null;
+            missionPlan = null;
+            // The replan mints a fresh envelope, which can never match the
+            // stub's fingerprint — so it must persist under this segment's
+            // own canonical id rather than reopening the stub's record.
+            // The stub stays on disk untouched as forensic residue.
+            canonicalResumeGraphId = null;
+            events.onTrace?.({
+              id: "mission-graph-resume-stub-envelope-unusable",
+              kind: "status",
+              message: abandonMessage,
+              outputPreview: {
+                missionId: canonicalResumeGraphId,
+                nodeIds: Object.keys(restoredGraph.nodes),
+                envelopeToolNames: Object.keys(
+                  restoredGraph.capabilityEnvelope.tools,
+                ).slice(0, 24),
+                requiredWriteTools: [...requiredWriteTools],
+              },
+            });
+          }
           if (
+            missionGraphSession &&
             resumeSnapshot &&
             requiredWriteTools.includes(
               PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
