@@ -957,9 +957,31 @@ export function isFinalOutputRelevant(
     task.completionContract.requiredProof.includes("final_relevance"),
   );
   const tasks = verificationTasks.length > 0 ? verificationTasks : plan.tasks;
-  const requiredLiteralAnchors = dedupeStrings(
-    tasks.flatMap((task) => extractRequiredLiteralAnchors(task.title)),
+  // A required literal marker belongs to whatever the mission promised to
+  // produce. When the mission's contract is a durable WRITE and that write
+  // is receipt-proven, the marker's home is the NOTE — it landed, verified,
+  // and acceptance already counted it. Demanding that the chat answer ALSO
+  // repeat it verbatim judges a write contract by a prose standard: the
+  // interrupted-continuation lane paid both appends, passed every write
+  // proof, and still failed verifier:final_relevance because a 177-character
+  // completion summary did not quote the markers, so acceptance never
+  // reached pass and the run span until the no-progress circuit stopped it
+  // (2026-08-26 08:15Z). The deterministic marker restoration upstream only
+  // runs while a write is still PENDING, so nothing covered this path.
+  // Topical relevance below still applies; only the verbatim-marker demand
+  // is lifted, and only once a write receipt actually exists.
+  const durableWriteProven = plan.tasks.some((task) =>
+    task.completionContract.requiredProof.some(
+      (proof) =>
+        (proof === "write_receipt" || proof === "artifact_receipt") &&
+        taskHasRecordedProof(task, proof),
+    ),
   );
+  const requiredLiteralAnchors = durableWriteProven
+    ? []
+    : dedupeStrings(
+        tasks.flatMap((task) => extractRequiredLiteralAnchors(task.title)),
+      );
   if (
     requiredLiteralAnchors.some(
       (anchor) => !output.includes(anchor.toLowerCase()),

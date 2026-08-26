@@ -7,6 +7,7 @@ import {
   isFinalOutputRelevant,
   isMissionPlanComplete,
   receiptSatisfiesProof,
+  taskHasRecordedProof,
   type MissionPlan,
 } from "../src/agent/missionPlan";
 import {
@@ -1005,5 +1006,69 @@ test("the plan header never names a next tool the current frontier refuses", asy
   assert.match(
     formatMissionPlanForPrompt(plan),
     new RegExp(`Next action:.*\\b${preferred}\\b`),
+  );
+});
+
+
+test("a receipt-proven durable write frees the final answer from repeating its markers", () => {
+  // Proof-matrix interrupted-continuation, 2026-08-26 08:15Z: with the write
+  // path finally green the mission PAID its append (receipt recorded, every
+  // write proof satisfied) and still failed acceptance on
+  // verifier:final_relevance, because a short completion summary did not
+  // quote the marker verbatim. Acceptance never reached pass and the run
+  // spun until the production no-progress circuit stopped it. A marker's
+  // home is the NOTE it landed in; once a write receipt proves that, the
+  // chat answer owes topical relevance, not recitation.
+  const marker = "E2E_MARKER_1787724816286_A1";
+  const plan = createTestPlan(
+    `Search my vault, then append exactly one line containing ${marker} to the current note.`,
+    ["semantic_search_notes", "append_to_current_file"],
+  );
+  const summary =
+    "The requested line was appended to the current note and the write is verified.";
+
+  const withEvidence = advanceMissionPlanFromToolResult({
+    plan,
+    toolName: "semantic_search_notes",
+    result: okResult("semantic_search_notes", {}),
+    evidence: {
+      id: "vault:note",
+      kind: "vault_note",
+      title: "Vault note",
+      summary: "A vault note.",
+      confidence: "high",
+    } as MissionEvidence,
+  }).plan;
+  // No write receipt yet: the marker is still owed in the answer itself.
+  assert.equal(isFinalOutputRelevant(withEvidence, summary), false);
+
+  const withReceipt = advanceMissionPlanFromReceipt({
+    plan: withEvidence,
+    receipt: {
+      toolName: "append_to_current_file",
+      operation: "append",
+      path: "Current.md",
+      message: "Appended the requested marker line.",
+      bytesWritten: 64,
+    },
+  }).plan;
+  assert.ok(
+    withReceipt.tasks.some((task) =>
+      taskHasRecordedProof(task, "write_receipt"),
+    ),
+    "fixture guard: the receipt must actually record write proof",
+  );
+  assert.equal(
+    isFinalOutputRelevant(withReceipt, summary),
+    true,
+    "a receipt-proven write must not also require the marker verbatim in the final answer",
+  );
+  // Topical relevance still governs: unrelated prose stays irrelevant.
+  assert.equal(
+    isFinalOutputRelevant(
+      withReceipt,
+      "Here is a poem about the sea, unrelated to anything requested.",
+    ),
+    false,
   );
 });
