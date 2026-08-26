@@ -32,6 +32,16 @@ import {
 } from "./fixtures/realAiHarness";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
 import { assertVerifiedCommitBoundCodeExamplesV1 } from "./fixtures/reflectionAssertions";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+
+// The compound lane was the ONLY proof lane with no tool-call meter attached,
+// which is why its run records carried `toolCallsFailed: null` /
+// `toolCallsVacuous: null` even on the three consecutive greens that proved
+// the cell. The counters were honest -- unknown is recorded as null, never as
+// a flattering zero -- but the hardest mission in the suite was the one whose
+// tool-call success rate could not be quoted at all. Same one-line wiring the
+// other five lanes already use.
+recordToolCallOutcomesAfterEach();
 
 const LANE = "compound-flow-real-live";
 const PROFILE_KEY = "compound-flow-real-ts";
