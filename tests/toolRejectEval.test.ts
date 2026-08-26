@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import {
   buildOffFrontierToolRejectionMessage,
+  buildProofGatedWritebackHoldV1,
   buildToolRejectEvalV1,
   describeOffFrontierToolNearMiss,
   mapToolRejectCategory,
@@ -193,5 +195,139 @@ test("an authority refusal's real reason classifies as invalid_state, not unknow
       readyFrontierToolNames: [],
     }),
     /category=unknown_tool/u,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// proof-gated writeback hold: one builder, both seats
+// ---------------------------------------------------------------------------
+
+test("the mutation-boundary hold teaches the same remedy as the step-loop hold", () => {
+  // The bug: the same gate held the same write for the same reason at two
+  // seats, and only the step-loop seat told the model what to do instead. The
+  // boundary seat is the LAST gate before bytes land, so a remedy-free hold
+  // there strands the mission's only write.
+  const preMutation = buildProofGatedWritebackHoldV1({
+    toolName: "append_to_current_file",
+    boundary: "pre_mutation",
+    evidenceSatisfied: true,
+    missing: ["passage_quote_exact"],
+  });
+  const commit = buildProofGatedWritebackHoldV1({
+    toolName: "append_to_current_file",
+    boundary: "commit",
+    evidenceSatisfied: true,
+    missing: ["passage_quote_exact"],
+  });
+  const remedy =
+    "Return the complete corrected note content as the final answer without another write tool call;";
+  assert.ok(preMutation.message.includes(remedy));
+  assert.ok(
+    commit.message.includes(remedy),
+    "the mutation-boundary hold must name the same concrete next action",
+  );
+  // The cause clause still differs per seat; only the remedy is shared.
+  assert.match(commit.message, /at the mutation boundary/u);
+  assert.match(commit.message, /No note bytes were changed\./u);
+  assert.match(preMutation.message, /before mutation/u);
+  assert.equal(preMutation.systemCorrective, commit.systemCorrective);
+});
+
+test("the verification arm reports the held tool at both seats", () => {
+  // lastProofGatedHoldToolName feeds heldWriteToolNames on two refusal
+  // builders. Only the step-loop seat ever set it, so an off-frontier
+  // rejection kept advising the exact tool the boundary was holding.
+  for (const boundary of ["pre_mutation", "commit"] as const) {
+    const hold = buildProofGatedWritebackHoldV1({
+      toolName: "append_to_current_file",
+      boundary,
+      evidenceSatisfied: true,
+    });
+    assert.equal(hold.heldWriteToolName, "append_to_current_file");
+    assert.equal(hold.narrowsOfferedFrontier, false);
+  }
+  // The evidence arm makes the opposite pair of decisions at both seats.
+  for (const boundary of ["pre_mutation", "commit"] as const) {
+    const hold = buildProofGatedWritebackHoldV1({
+      toolName: "append_to_current_file",
+      boundary,
+      evidenceSatisfied: false,
+      blockingProofs: ["web_evidence"],
+    });
+    assert.equal(hold.heldWriteToolName, null);
+    assert.equal(hold.narrowsOfferedFrontier, true);
+    assert.match(hold.systemCorrective, /web_evidence/u);
+    assert.ok(
+      hold.message.includes(
+        "Continue with the allowed read and research tools before drafting the final writeback.",
+      ),
+    );
+  }
+});
+
+test("step-loop hold wording is preserved byte-for-byte by the shared builder", () => {
+  // Regression guard on the refactor: the seat that was already correct must
+  // not have its contract reworded while the other seat is brought up to it.
+  assert.equal(
+    buildProofGatedWritebackHoldV1({
+      toolName: "append_to_current_file",
+      boundary: "pre_mutation",
+      evidenceSatisfied: false,
+      missing: ["web_evidence", "vault_evidence"],
+      blockingProofs: ["web_evidence", "vault_evidence"],
+    }).message,
+    "Held append_to_current_file before mutation because required research evidence is still incomplete (web_evidence, vault_evidence). Continue with the allowed read and research tools before drafting the final writeback.",
+  );
+  assert.equal(
+    buildProofGatedWritebackHoldV1({
+      toolName: "append_to_current_file",
+      boundary: "pre_mutation",
+      evidenceSatisfied: true,
+      missing: ["passage_quote_exact"],
+      quoteCorrections: [
+        {
+          passageId: "p1",
+          attempted: "a claim",
+          passageExcerpt: "the real text",
+        },
+      ],
+    }).message,
+    "Held append_to_current_file before mutation because this sourced writeback requires final passage verification (passage_quote_exact). Return the complete corrected note content as the final answer without another write tool call; read tools such as web_search or read_source_section may still be used first to verify exact quotations. The runner will verify and commit the final content exactly once. Quote correction for p1: your draft quoted \"a claim\" but the cited passage actually reads: \"the real text\".",
+  );
+});
+
+test("both AgentRunner proof-gate seats consume the shared hold builder", () => {
+  // Source-level single-authority guard: neither seat may re-inline the
+  // message, the corrective, or the two side-effect decisions.
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const seats = runnerSource.match(/buildProofGatedWritebackHoldV1\(\{/gu) ?? [];
+  assert.equal(
+    seats.length,
+    2,
+    "exactly two seats must call the shared proof-gate hold builder",
+  );
+  assert.equal(
+    runnerSource.match(/boundary: "commit"/gu)?.length,
+    1,
+    "the mutation-boundary seat must declare its boundary through the builder",
+  );
+  assert.equal(
+    runnerSource.match(/boundary: "pre_mutation"/gu)?.length,
+    1,
+    "the step-loop seat must declare its boundary through the builder",
+  );
+  // The remedy and corrective sentences must exist only in toolRejectEval.ts.
+  assert.doesNotMatch(
+    runnerSource,
+    /Held \$\{toolCall\.name\} (?:before mutation|at the mutation boundary)/u,
+    "proof-gate hold wording must not be re-inlined in AgentRunner",
+  );
+  assert.doesNotMatch(
+    runnerSource,
+    /Do not request a current-note write tool again/u,
+    "the proof-gate system corrective must not be re-inlined in AgentRunner",
   );
 });
