@@ -46,6 +46,54 @@ export type ResearchPublicationCheckpointStatusV1 =
   | "waiting_obsidian"
   | "complete";
 
+/**
+ * The single definition of "this publication already owns a provider-visible
+ * Linear issue".
+ *
+ * The durable fact becomes true at `linear_verified` — the moment
+ * `ResearchTicketPublisher.publish` returned a verified issue — not at
+ * `complete`. `complete` additionally requires the *vault-side* backlink, which
+ * is Obsidian work: `waiting_obsidian` is exactly the state "the Linear issue
+ * exists, only the note append is outstanding".
+ *
+ * Every seat that decides whether a research publication may run must ask this
+ * question and no other. They previously each hard-coded `status === "complete"`
+ * and so disagreed with the provider: the tool's idempotence gate
+ * (`researchPublicationTool`) declined to replay, and this workflow then
+ * re-requested an exact approval and called `publish` a SECOND time — creating a
+ * duplicate issue in a real Linear workspace. A publication that owns an issue
+ * must be finished by reading or by vault-side repair, never by another
+ * mutation.
+ */
+export function researchPublicationStatusOwnsLinearIssueV1(
+  status: ResearchPublicationCheckpointStatusV1 | string | null | undefined,
+): boolean {
+  return (
+    status === "linear_verified" ||
+    status === "waiting_obsidian" ||
+    status === "complete"
+  );
+}
+
+/**
+ * Checkpoint-shaped wrapper over the status rule above. A checkpoint only
+ * counts as owning an issue when it carries the issue identity that proves it;
+ * a status without an `issue` reference cannot bind a later resume and must
+ * fail closed rather than authorize a second mutation.
+ */
+export function researchPublicationCheckpointOwnsLinearIssueV1(
+  checkpoint:
+    | Pick<ResearchPublicationCheckpointV1, "status" | "issue">
+    | null
+    | undefined,
+): boolean {
+  return Boolean(
+    checkpoint &&
+      researchPublicationStatusOwnsLinearIssueV1(checkpoint.status) &&
+      checkpoint.issue?.id?.trim(),
+  );
+}
+
 export interface ResearchPublicationDestinationV1 {
   workspaceId: string;
   teamId: string;
@@ -164,6 +212,7 @@ export type ResearchPublicationTraceStageV1 =
   | "note_verified"
   | "linear_preview_started"
   | "linear_preview_verified"
+  | "already_owns_linear_issue"
   | "note_lineage_persisted"
   | "approval_requested"
   | "approval_denied"
@@ -360,6 +409,52 @@ export class ResearchPublicationWorkflow {
       priorCheckpoint.workItemFingerprint !== preview.ticket.spec.fingerprint
     ) {
       throw new Error("The accepted research work item changed during publication resume.");
+    }
+
+    // Idempotence boundary. This run already owns a Linear issue for this exact
+    // publication, so no approval may be requested and no mutation may be
+    // issued: the outstanding work is vault-side (the backlink) or a readback.
+    // Falling through here is what created a SECOND `publish_research_to_linear`
+    // approval — with a different fingerprint, because the resume re-reads the
+    // note after the first attempt already appended the backlink — and a
+    // duplicate issue in a real workspace.
+    //
+    // `reconcile_required` is deliberately NOT included by
+    // `researchPublicationStatusOwnsLinearIssueV1`: that status means the
+    // provider outcome was ambiguous, and its existing resume path must stay
+    // able to settle it.
+    if (researchPublicationCheckpointOwnsLinearIssueV1(priorCheckpoint)) {
+      const ownedIssue = priorCheckpoint!.issue!;
+      const error: ResearchPublicationErrorV1 = {
+        code: "research_publication_already_owns_linear_issue",
+        message:
+          `This run already published its accepted research as Linear issue ` +
+          `${ownedIssue.identifier}. Finish the outstanding note backlink or read ` +
+          `the issue back; a second publication would duplicate it.`,
+      };
+      const pendingAction: ResearchPublicationPendingActionV1 = {
+        provider: "linear",
+        operation: "publish_research_ticket",
+        actionId: priorCheckpoint!.pendingAction?.actionId ?? null,
+        issueId: ownedIssue.id,
+        grantId: priorCheckpoint!.pendingAction?.grantId ?? null,
+        workItemFingerprint: preview.ticket.spec.fingerprint,
+        error,
+      };
+      this.trace("already_owns_linear_issue", publicationId, {
+        issueIdentifier: ownedIssue.identifier,
+        checkpointStatus: priorCheckpoint!.status,
+      });
+      return {
+        ok: false,
+        status: "reconcile_required",
+        error,
+        note,
+        artifact,
+        lineage: priorCheckpoint!.lineage,
+        approvalFingerprint: priorCheckpoint!.approvalFingerprint,
+        pendingAction,
+      };
     }
 
     let lineage = priorCheckpoint?.lineage ??

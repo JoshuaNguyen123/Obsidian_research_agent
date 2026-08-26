@@ -23,6 +23,7 @@ import {
   parseAcceptedResearchNotePackageV1,
   parseRenderedCompatibleWorkItemSpec,
   parseResearchPublicationCheckpointV1,
+  researchPublicationCheckpointOwnsLinearIssueV1,
   PROJECT_IDEA_SEED_BOUND_FIELD_NAMES_V1,
   projectIdeaSeedBoundFieldProjectionsV1,
   type ProjectIdeaSeedBoundFieldNameV1,
@@ -783,7 +784,14 @@ export function createResearchPublicationTool(
       );
       const publicationId = `publication-${artifactId}`;
       const priorCheckpoint = await options.lineage.get?.(publicationId) ?? null;
-      if (priorCheckpoint?.status === "complete") {
+      // Both seats that decide "has this run already published?" read the one
+      // shared definition. A `complete` checkpoint replays here; a checkpoint
+      // that owns an issue without being complete falls through to
+      // ResearchPublicationWorkflow, which consumes the SAME predicate and
+      // refuses to request another approval or issue another mutation.
+      const priorPublicationOwnsLinearIssue =
+        researchPublicationCheckpointOwnsLinearIssueV1(priorCheckpoint);
+      if (priorPublicationOwnsLinearIssue && priorCheckpoint?.status === "complete") {
         if (priorCheckpoint.acceptedPackage) {
           assertProjectIdeaSeedPublicationBindingV1(
             priorCheckpoint.acceptedPackage,

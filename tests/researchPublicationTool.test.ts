@@ -948,6 +948,88 @@ test("continuation segments replay one root-bound completed publication without 
   assert.equal(fixture.persistedReceipts.length, 2);
 });
 
+test("a publication that already owns a Linear issue is never re-approved or re-published", async () => {
+  // FLOW-REAL-01 regression: the single-issue lane observed TWO
+  // publish_research_to_linear prepared approvals in one run, with different
+  // payload fingerprints, and two real Linear issues.
+  //
+  // The durable fact "this run owns a Linear issue" becomes true at
+  // `linear_verified`; `complete` additionally requires the vault-side backlink.
+  // Every seat used to hard-code `status === "complete"`, so a publication that
+  // created its issue but never landed the backlink (`waiting_obsidian`) looked
+  // unpublished to the idempotence gate — and the workflow happily requested a
+  // second exact approval and issued a second mutation.
+  const fixture = createFixture("created", { resumeCheckpoints: true });
+  const registry = new DefaultToolRegistry([fixture.tool]);
+  const rootRunId = "run-publication-owns-issue-root";
+
+  const firstContext = contextFixture(
+    "Publish this accepted research to one Linear issue in Published.md.",
+    "run-owns-issue-segment-1",
+    "call-owns-issue-segment-1",
+  );
+  firstContext.rootMissionId = rootRunId;
+  firstContext.requestNestedApproval = approveNested;
+
+  const first = await registry.execute(
+    { name: "publish_research_to_linear", arguments: argsFixture() },
+    firstContext,
+  );
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(fixture.publisher.publishCount, 1);
+  const completed = fixture.checkpoints.at(-1);
+  assert.equal(completed?.status, "complete");
+  assert.ok(completed?.issue?.id, "the publication must own a durable issue reference");
+
+  // Model the real failure state: Linear accepted the mutation, the vault
+  // backlink never landed. This is exactly what `waiting_obsidian` records.
+  fixture.checkpoints.push({
+    ...structuredClone(completed!),
+    status: "waiting_obsidian",
+    backlink: null,
+    error: {
+      code: "research_publication_backlink_waiting_obsidian",
+      message: "The Obsidian note backlink append did not land.",
+    },
+  });
+
+  let approvalRequests = 0;
+  const secondContext = contextFixture(
+    "Continue the same mission and publish the accepted research to exactly one Linear issue.",
+    "run-owns-issue-segment-2",
+    "call-owns-issue-segment-2",
+  );
+  secondContext.rootMissionId = rootRunId;
+  secondContext.requestNestedApproval = async (request) => {
+    approvalRequests += 1;
+    return approveNested(request);
+  };
+
+  const second = await registry.execute(
+    { name: "publish_research_to_linear", arguments: argsFixture() },
+    secondContext,
+  );
+
+  // The safety property: one run, one Linear mutation. Approving twice against a
+  // real workspace creates a duplicate issue.
+  assert.equal(
+    approvalRequests,
+    0,
+    "a run that already owns a Linear issue must not request a second exact approval",
+  );
+  assert.equal(
+    fixture.publisher.publishCount,
+    1,
+    "a run that already owns a Linear issue must not issue a second Linear mutation",
+  );
+  assert.equal(second.ok, false);
+  assert.equal(
+    second.error?.code,
+    "research_publication_already_owns_linear_issue",
+  );
+  assert.equal(fixture.grants.length, 1, "no second one-action grant may be minted");
+});
+
 test("advancing-time same-call dedup replay emits distinct ledger-safe receipt ids", async () => {
   const fixture = createFixture("deduplicated", { resumeCheckpoints: true });
   const registry = new DefaultToolRegistry([fixture.tool]);
