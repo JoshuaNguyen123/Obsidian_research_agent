@@ -8,15 +8,17 @@ import { promisify } from "node:util";
 
 import {
   terminateControlledObsidian,
-  waitForWindowsProcessExit,
+  type TeardownProbePhase,
 } from "../../scripts/obsidian-process-lifecycle";
 import {
   appendHostEventV1,
+  describeSweepOutcomeV1,
   describeWindowsExitCodeV1,
   enumerateObsidianProcessesV1,
   selectOwnedObsidianPidsV1,
   summarizeRecentHostDeathV1,
   sweepOwnedObsidianSurvivorsV1,
+  waitForOwnedRootExitV1,
 } from "../../scripts/e2e-obsidian-sweep";
 
 /**
@@ -262,7 +264,7 @@ export async function startNativeObsidianHarness(
           "Obsidian still requested disposable-vault trust after the controlled restart.",
         );
       }
-      await terminateObsidian(processHandle, cdpPort);
+      await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
       await withTimeout(browser.close(), 5_000, "Disposable-vault trust restart close")
         .catch(() => undefined);
       processHandle = null;
@@ -312,7 +314,7 @@ export async function startNativeObsidianHarness(
         if (closed) {
           throw new Error("Cannot relaunch a closed native Obsidian harness.");
         }
-        await terminateObsidian(processHandle, cdpPort);
+        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
         if (browser) {
           await withTimeout(browser.close(), 5_000, "Playwright CDP relaunch close")
             .catch(() => undefined);
@@ -347,7 +349,7 @@ export async function startNativeObsidianHarness(
             },
           );
         }
-        await terminateObsidian(processHandle, cdpPort).catch((error) => {
+        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch((error) => {
           teardownError ??= error;
         });
         if (browser) {
@@ -407,7 +409,7 @@ export async function startNativeObsidianHarness(
         "Native Obsidian failed-start beforeClose hook",
       ).catch(() => undefined);
     }
-    await terminateObsidian(processHandle, cdpPort).catch(() => undefined);
+    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch(() => undefined);
     if (failedBrowser) {
       await withTimeout(failedBrowser.close(), 5_000, "Playwright failed-start CDP close")
         .catch(() => undefined);
@@ -1078,13 +1080,41 @@ async function waitForCdp(
   throw new Error(`Timed out waiting for Obsidian CDP on port ${port}.`);
 }
 
+/**
+ * Probe budgets.
+ *
+ * INITIAL passes are unchanged: they bound how long the OS may legitimately
+ * take to unwind an Electron tree after the kill dispatch.
+ *
+ * The RECHECK pass runs immediately after the survivor sweep, whose kills are
+ * `taskkill /F` — TerminateProcess, reflected in the process table in
+ * milliseconds. 10s is roughly three CIM enumerations on a loaded machine, so
+ * it absorbs one slow PowerShell spawn and nothing more. It is deliberately
+ * SHORTER than the initial wait, not longer: the previous code re-ran the full
+ * initial timeout, which is why worst-case teardown was ~160s. It is now ~105s.
+ * Raising a timeout would have hidden this bug; the fix has to make the answer
+ * true, not the wait longer.
+ */
+const OWNED_EXIT_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  initial: 30_000,
+  recheck: 10_000,
+};
+const PROCESS_DRAIN_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  initial: 45_000,
+  recheck: 10_000,
+};
+
 async function terminateObsidian(
   processHandle: ChildProcessWithoutNullStreams | null,
   cdpPort: number,
-  rootCreatedAtMs: number | null = null,
+  rootCreatedAtMs: number | null,
 ): Promise<void> {
   if (!processHandle?.pid) return;
   const rootPid = processHandle.pid;
+  // Our root's PID cannot be recycled until our root dies, and our root dies
+  // during teardown — so this instant is the upper bound that makes "PID N,
+  // image Obsidian.exe" an identity instead of a coincidence.
+  const teardownStartedAtMs = Date.now();
   // Mark BEFORE dispatching the kill so the exit record cannot race the flag.
   hostTeardownRequested = true;
   await terminateControlledObsidian(processHandle, {
@@ -1093,16 +1123,26 @@ async function terminateObsidian(
         () => processHandle.kill(),
       );
     },
-    waitForOwnedExit: () =>
-      waitForWindowsProcessExit(processHandle.pid!, 30_000, {
+    waitForOwnedExit: (phase) =>
+      waitForOwnedRootExitV1({
         handle: processHandle,
-        expectedImageName: obsidianImageName(),
+        rootPid,
+        rootCreatedAtMs,
+        teardownStartedAtMs,
+        imageName: obsidianImageName(),
+        timeoutMs: OWNED_EXIT_TIMEOUT_MS[phase],
       }),
-    waitForNoRunningProcess: () =>
-      waitForOwnedObsidianDrain(cdpPort, rootPid, rootCreatedAtMs, 45_000),
+    waitForNoRunningProcess: (phase) =>
+      waitForOwnedObsidianDrain(
+        cdpPort,
+        rootPid,
+        rootCreatedAtMs,
+        teardownStartedAtMs,
+        PROCESS_DRAIN_TIMEOUT_MS[phase],
+      ),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
     sweepSurvivingProcesses: () =>
-      sweepObsidianSurvivors(cdpPort, rootPid, rootCreatedAtMs),
+      sweepObsidianSurvivors(cdpPort, rootPid, rootCreatedAtMs, teardownStartedAtMs),
   });
 }
 
@@ -1128,14 +1168,18 @@ async function sweepObsidianSurvivors(
   cdpPort: number,
   rootPid: number | null,
   rootCreatedAtMs: number | null,
-): Promise<void> {
-  await sweepOwnedObsidianSurvivorsV1({
-    stage: "nativeObsidianHarness teardown",
-    rootPid,
-    cdpPort,
-    rootCreatedAtMs,
-    imageName: obsidianImageName(),
-  });
+  teardownStartedAtMs: number | null,
+): Promise<string> {
+  return describeSweepOutcomeV1(
+    await sweepOwnedObsidianSurvivorsV1({
+      stage: "nativeObsidianHarness teardown",
+      rootPid,
+      cdpPort,
+      rootCreatedAtMs,
+      teardownStartedAtMs,
+      imageName: obsidianImageName(),
+    }),
+  );
 }
 
 async function assertNoRunningObsidian(): Promise<void> {
@@ -1157,23 +1201,34 @@ async function waitForOwnedObsidianDrain(
   cdpPort: number,
   rootPid: number | null,
   rootCreatedAtMs: number | null,
+  teardownStartedAtMs: number | null,
   timeoutMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  const ownedRemain = async () =>
-    (
-      selectOwnedObsidianPidsV1({
-        processes: await enumerateObsidianProcessesV1(obsidianImageName()),
-        rootPid,
-        cdpPort,
-        rootCreatedAtMs,
-      })
-    ).length > 0;
+  const ownedRemaining = async () =>
+    selectOwnedObsidianPidsV1({
+      processes: await enumerateObsidianProcessesV1(obsidianImageName()),
+      rootPid,
+      cdpPort,
+      rootCreatedAtMs,
+      teardownStartedAtMs,
+    });
   while (Date.now() < deadline) {
-    if (!(await ownedRemain())) return true;
+    if ((await ownedRemaining()).length === 0) return true;
     await delay(250);
   }
-  return !(await ownedRemain());
+  const survivors = await ownedRemaining();
+  if (survivors.length > 0) {
+    // Name the survivors. A teardown that only reports "the drain failed"
+    // cannot be diagnosed after the fact: a leaked child and a probe lying
+    // about a recycled PID produce the identical sentence, and they need
+    // opposite fixes.
+    console.warn(
+      `[obsidian-lifecycle] owned Obsidian processes still present after ${timeoutMs}ms: ` +
+        `${survivors.join(", ")} (root ${rootPid}, port ${cdpPort}).`,
+    );
+  }
+  return survivors.length === 0;
 }
 
 async function waitForNoObsidian(timeoutMs: number): Promise<boolean> {

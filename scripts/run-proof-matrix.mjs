@@ -12,7 +12,11 @@
 // a regression alarm, not a statistic. A lane that refuses to start because a
 // variable it requires is unset is `environment_not_configured`: terminal for
 // the cell, budget-exempt, and stamped `not_run` in the manifest — it is not a
-// red, because the product was never exercised (see that class below).
+// red, because the product was never exercised (see that class below). The
+// mirror case is `harness:cleanup_failed`: every product assertion PASSED and
+// only mandatory harness teardown failed. Loud, still a failed run, still
+// counted by the harness-failure valve — but budget-exempt, streak-neutral and
+// written to no run-metrics row, because the product succeeded.
 //
 // Environment (PowerShell only — Git Bash mangles AGENTIC_SANDBOX_CI_RUNTIME_ROOT):
 //   PROOF_MATRIX_EXPECTED_HEAD   exact 40-char lowercase sha this campaign pins
@@ -624,6 +628,59 @@ export const RENDERER_DEATH_FAILURE_CLASS = "harness:renderer_death";
 export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS = "environment_not_configured";
 
 /**
+ * The lane's product assertions ALL PASSED and only its mandatory harness
+ * cleanup failed.
+ *
+ * On 2026-08-26 a compound-linear-github attempt did its entire job in 1120s —
+ * web research, Linear issue, code workspace, three validations, a verified
+ * commit, a private GitHub repo, a draft PR and the Results note — and then
+ * failed on a teardown process probe:
+ *
+ *   COMPOUND-REAL assertions passed; mandatory cleanup failed:
+ *   Harness cleanup: Controlled Obsidian teardown did not drain cleanly
+ *   (owned process exit; Obsidian process drain).
+ *
+ * Playwright still printed a numbered failing-test header, so it matched
+ * LANE_ASSERTION_PATTERNS and was filed as `lane_assertion_failed` — the bucket
+ * a genuine product failure lands in. It spent attempt budget and reset a
+ * consecutive-green streak that needs 3 in a row. That is the same lie
+ * `environment_not_configured` was added to end, in a different direction: this
+ * time the product WAS exercised and it SUCCEEDED, and the instrument recorded
+ * a product failure.
+ *
+ * It stays loud and it stays a failure — a leaked Obsidian is real, and it
+ * poisons the next lane's already-running check. But it is harness evidence,
+ * not product evidence: `harness:` prefixed, so isInfrastructureFailureClass
+ * exempts it from budget and streak through the one shared predicate, the
+ * consecutive-harness-failure valve still aborts a persistently broken teardown,
+ * and it writes NO run-metrics CSV row (every eval reader counts each row in its
+ * pass-rate denominator and only classifies green/not-green).
+ */
+export const HARNESS_CLEANUP_FAILURE_CLASS = "harness:cleanup_failed";
+
+/**
+ * The lane's own contract sentence, composed in exactly one place
+ * (e2e/fixtures/externalCleanup.ts composeMandatoryCleanupError). Detection
+ * keys on the "assertions passed" half, which the composer emits ONLY when the
+ * test body threw nothing: a lane whose assertions failed says
+ * "<LANE> failed: ..." instead and can never reach this class.
+ */
+const LANE_CLEANUP_CONTRACT =
+  /(?:^|\s)([A-Z][A-Z0-9-]{2,}) assertions passed; mandatory cleanup failed: ([^\r\n]*)/u;
+
+/**
+ * The lane that reported passing assertions with failing cleanup, and what
+ * cleanup said, or null when the log carries no such sentence.
+ */
+export function detectLaneCleanupFailure(logText) {
+  const match = LANE_CLEANUP_CONTRACT.exec(
+    typeof logText === "string" ? logText : "",
+  );
+  if (!match) return null;
+  return { lane: match[1], detail: match[2].trim(), index: match.index };
+}
+
+/**
  * The live lanes guard their required environment with a `requiredEnvironment()`
  * (or `requiredSecret()`) helper that throws a DELIBERATE, fixed, greppable
  * sentence NAMING the variable. Detection keys on those whole sentences plus an
@@ -756,6 +813,31 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
       // the same lie into a different column of the report.
       secondaryClasses: [],
       missingEnvironment,
+    };
+  }
+  // Settled SECOND, ahead of the lane's own proof class and every log scan, for
+  // the same reason as the environment refusal: the lane has stated a fact
+  // about ITSELF — that every product assertion passed — so nothing further
+  // down the log is evidence of a product failure. The precedence can only
+  // refuse to score a red, never invent a green.
+  const cleanupFailure = detectLaneCleanupFailure(text);
+  if (cleanupFailure) {
+    return {
+      failureClass: HARNESS_CLEANUP_FAILURE_CLASS,
+      detail:
+        `${cleanupFailure.lane} product assertions passed; mandatory harness cleanup failed: ` +
+        `${cleanupFailure.detail}\n` +
+        attemptLogExcerptFrom(text, cleanupFailure.index),
+      confidence: CLASSIFICATION_CONFIRMED,
+      // `lane_assertion_failed` is dropped deliberately — Playwright prints a
+      // numbered failing-test header for ANY thrown error, including this one,
+      // and carrying it would smuggle the product-failure reading into a
+      // different column of the same report. Other signatures are real and ride
+      // along as secondaries.
+      secondaryClasses: secondaryFor(HARNESS_CLEANUP_FAILURE_CLASS).filter(
+        (cls) => cls !== LANE_ASSERTION_FAILURE_CLASS,
+      ),
+      cleanupFailure: { lane: cleanupFailure.lane, detail: cleanupFailure.detail },
     };
   }
   if (summaryFresh) {
@@ -1388,7 +1470,22 @@ async function main() {
         );
       }
 
-      if (!green) {
+      // METRIC INTEGRITY: the product was exercised and every assertion passed;
+      // only mandatory harness cleanup failed. Loud, and still a failed run —
+      // a leaked Obsidian is real and poisons the NEXT lane's already-running
+      // check — but it is NOT product-assertion evidence, so it must not be
+      // recorded as one. It is `harness:` prefixed (budget-exempt and
+      // streak-neutral through isInfrastructureFailureClass) and it writes no
+      // CSV row below.
+      if (failureClass === HARNESS_CLEANUP_FAILURE_CLASS) {
+        console.error(
+          `proof-matrix[${stage}]: HARNESS CLEANUP FAILED after PASSING assertions — ` +
+          `${classification.cleanupFailure?.detail ?? ""}\n` +
+          `  The mission succeeded; the harness could not tear itself down. Check for a leaked ` +
+          `Obsidian process before the next lane runs (it will fail its already-running gate). ` +
+          `Not scored as a product failure: no attempt budget spent, streak preserved, no run-metrics row.`,
+        );
+      } else if (!green) {
         console.error(
           `proof-matrix[${stage}]: red (exit ${exitCode}, ${failureClass}). Attempt log tail:\n` +
           attemptLogExcerpt(attemptLogText),
@@ -1422,7 +1519,17 @@ async function main() {
       // Unknown vs zero is explicit: a fresh summary that said zero writes an
       // explicit 0; blank means NO source was available (tool_events_source
       // says which case a row is).
-      appendRunCsvRow([
+      //
+      // A harness-cleanup failure writes NO row at all, for the same reason
+      // `environment_not_configured` writes none: every reader of
+      // playwright-run-metrics.csv (eval-kpis, eval-dashboard and the notebook
+      // it generates, eval-tool-events) counts each row in its pass-rate
+      // denominator and classifies only green/not-green. There is no way to
+      // spell "the product passed but the harness leaked" in that vocabulary —
+      // a row would read as a product red, which is the exact
+      // misattribution this class exists to end. The manifest attempt record
+      // below keeps the event durable and greppable.
+      if (failureClass !== HARNESS_CLEANUP_FAILURE_CLASS) appendRunCsvRow([
         new Date(startedAt).toISOString(),
         cell.project,
         PROOF_MATRIX_MODEL,

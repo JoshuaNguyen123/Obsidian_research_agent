@@ -1,26 +1,37 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
-
 export interface ControlledProcessHandle {
   readonly pid?: number;
   readonly exitCode: number | null;
 }
 
+/**
+ * Which pass a process readback is running in.
+ *
+ *   initial — nothing has been done since the kill was dispatched, so the probe
+ *             must allow the OS the full unwind time it may legitimately need.
+ *   recheck — the survivor sweep has just run. It force-kills with
+ *             TerminateProcess, which the kernel reflects in the process table
+ *             within milliseconds, so this pass is a CONFIRMATION, not another
+ *             open-ended wait. Re-running the full initial timeout here was
+ *             pure duplication: it repeated a wait that had already expired
+ *             with no remediation in between.
+ */
+export type TeardownProbePhase = "initial" | "recheck";
+
 export interface ControlledObsidianTeardownOperations {
   terminateOwnedTree(pid: number): Promise<void>;
-  waitForOwnedExit(): Promise<boolean>;
-  waitForNoRunningProcess(): Promise<boolean>;
+  waitForOwnedExit(phase: TeardownProbePhase): Promise<boolean>;
+  waitForNoRunningProcess(phase: TeardownProbePhase): Promise<boolean>;
   waitForCdpClose(): Promise<boolean>;
   /**
    * Optional targeted kill of surviving application processes. Orphaned
    * Electron children outlive a self-exited root (the owned tree kill is
-   * skipped once exitCode is set) and a parentage-gapped taskkill /T; the
-   * sweep runs before the terminal drain recheck so they cannot fail the
-   * teardown or poison the next lane's already-running check.
+   * skipped once exitCode is set) and a parentage-gapped taskkill /T, and a
+   * hung root can outlive its own kill dispatch. The sweep runs before EVERY
+   * remaining readback so it can actually rescue the teardown, and may return a
+   * one-line summary of what it saw versus what it managed to reap — that line
+   * is what tells a lying probe apart from a genuine leak.
    */
-  sweepSurvivingProcesses?(): Promise<void>;
+  sweepSurvivingProcesses?(): Promise<string | void>;
 }
 
 interface TeardownProbeResult {
@@ -47,33 +58,48 @@ export async function terminateControlledObsidian(
   }
 
   const probes = [
-    await runProbe("owned process exit", operations.waitForOwnedExit),
-    await runProbe("Obsidian process drain", operations.waitForNoRunningProcess),
+    await runProbe("owned process exit", () =>
+      operations.waitForOwnedExit("initial"),
+    ),
+    await runProbe("Obsidian process drain", () =>
+      operations.waitForNoRunningProcess("initial"),
+    ),
     await runProbe("CDP port close", operations.waitForCdpClose),
   ];
   // The probes are intentionally serial because process drain and CDP closure
-  // can take longer than the owned-root handle to settle on Windows. Once CDP
-  // is confirmed closed, reconcile one boundary race on either earlier process
-  // readback before deciding teardown failed. A still-live PID or application
-  // process remains a hard failure after this terminal recheck.
-  if (probes[2].passed) {
+  // can take longer than the owned-root handle to settle on Windows.
+  //
+  // ORDERING IS LOAD-BEARING. The sweep is the ONLY remediation this teardown
+  // has, so it must precede every readback it could rescue. It used to run
+  // between the two drain checks but AFTER the owned-exit recheck had already
+  // returned its final verdict — so a surviving root, which the sweep does
+  // reap, still failed the teardown, and the owned-exit "recheck" was a verbatim
+  // repeat of a wait that had just timed out. It is also no longer gated on CDP
+  // closure: a still-open CDP port means the app is MORE alive, not less, and
+  // that is precisely when the machine most needs sweeping before the next lane.
+  // A still-live PID or application process remains a hard failure afterwards.
+  let sweepSummary: string | null = null;
+  if (!probes[0].passed || !probes[1].passed) {
+    if (operations.sweepSurvivingProcesses) {
+      try {
+        const summary = await operations.sweepSurvivingProcesses();
+        if (typeof summary === "string" && summary.trim() !== "") {
+          sweepSummary = summary.trim();
+        }
+      } catch (error) {
+        // The sweep is best-effort recovery; the rechecks below decide. Its
+        // failure is still recorded — a sweep that could not run is evidence.
+        sweepSummary = `sweep failed: ${formatError(error)}`;
+      }
+    }
     if (!probes[0].passed) {
-      probes[0] = await runProbe(
-        "owned process exit",
-        operations.waitForOwnedExit,
+      probes[0] = await runProbe("owned process exit", () =>
+        operations.waitForOwnedExit("recheck"),
       );
     }
     if (!probes[1].passed) {
-      if (operations.sweepSurvivingProcesses) {
-        try {
-          await operations.sweepSurvivingProcesses();
-        } catch {
-          // The sweep is best-effort recovery; the recheck below decides.
-        }
-      }
-      probes[1] = await runProbe(
-        "Obsidian process drain",
-        operations.waitForNoRunningProcess,
+      probes[1] = await runProbe("Obsidian process drain", () =>
+        operations.waitForNoRunningProcess("recheck"),
       );
     }
   }
@@ -88,94 +114,12 @@ export async function terminateControlledObsidian(
   if (dispatchError) {
     details.push(`owned PID-tree termination dispatch: ${dispatchError}`);
   }
+  // The sweep summary rides OUTSIDE the parenthesised probe list: that list is
+  // the stable, matched-against contract naming which readbacks failed.
   throw new Error(
-    `Controlled Obsidian teardown did not drain cleanly (${details.join("; ")}).`,
+    `Controlled Obsidian teardown did not drain cleanly (${details.join("; ")}).` +
+      (sweepSummary ? ` Survivor sweep: ${sweepSummary}` : ""),
   );
-}
-
-export interface WindowsProcessExitProbeOptions {
-  /**
-   * Authoritative exit signal: Node sets exitCode only after the OS reports
-   * the child's exit, so a non-null value ends the wait immediately without
-   * consulting tasklist (whose bare-PID filter can match a recycled PID).
-   */
-  handle?: ControlledProcessHandle;
-  /**
-   * Restrict tasklist matches to this image name so a foreign process that
-   * claimed the recycled PID can never masquerade as the still-live root.
-   */
-  expectedImageName?: string;
-}
-
-export async function waitForWindowsProcessExit(
-  pid: number,
-  timeoutMs: number,
-  options: WindowsProcessExitProbeOptions = {},
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (options.handle && options.handle.exitCode !== null) {
-      return true;
-    }
-    if (!(await isWindowsProcessIdRunning(pid, options.expectedImageName))) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  if (options.handle && options.handle.exitCode !== null) {
-    return true;
-  }
-  const row = await windowsTasklistRow(pid, options.expectedImageName);
-  if (row !== null) {
-    console.warn(
-      `[obsidian-lifecycle] PID ${pid} still matched tasklist after ${timeoutMs}ms: ${row}`,
-    );
-    return false;
-  }
-  return true;
-}
-
-export function tasklistContainsProcessId(
-  output: string,
-  pid: number,
-  expectedImageName?: string,
-): boolean {
-  return tasklistMatchingRow(output, pid, expectedImageName) !== null;
-}
-
-function tasklistMatchingRow(
-  output: string,
-  pid: number,
-  expectedImageName?: string,
-): string | null {
-  const escapedPid = String(pid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const imagePattern = expectedImageName
-    ? expectedImageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    : "[^\"]+";
-  const match = new RegExp(
-    `^"${imagePattern}","${escapedPid}",[^\r\n]*`,
-    "imu",
-  ).exec(output);
-  return match ? match[0] : null;
-}
-
-async function isWindowsProcessIdRunning(
-  pid: number,
-  expectedImageName?: string,
-): Promise<boolean> {
-  return (await windowsTasklistRow(pid, expectedImageName)) !== null;
-}
-
-async function windowsTasklistRow(
-  pid: number,
-  expectedImageName?: string,
-): Promise<string | null> {
-  const { stdout } = await execFileAsync(
-    "tasklist",
-    ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
-    { windowsHide: true },
-  );
-  return tasklistMatchingRow(String(stdout), pid, expectedImageName);
 }
 
 async function runProbe(

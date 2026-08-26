@@ -17,6 +17,7 @@ import {
   preflightDisposableRepositoryDeleteAuthority,
   proveRestCreateAndDeleteProbe,
   orderGitHubHarnessTokensForPush,
+  composeMandatoryCleanupError,
   safeExternalCleanupError,
 } from "./fixtures/externalCleanup";
 import { ensureDurableLinearQueueProject } from "./fixtures/linearQueueProvisioning";
@@ -879,10 +880,7 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     await harness?.close().catch((error) => cleanupErrors.push(`Harness cleanup: ${safeExternalCleanupError(error)}`));
     await fixture.cleanup().catch((error) => cleanupErrors.push(`Fixture cleanup: ${safeExternalCleanupError(error)}`));
     if (cleanupErrors.length > 0) {
-      throw new Error([
-        primaryError ? `COMPOUND-REAL failed: ${safeExternalCleanupError(primaryError)}` : "COMPOUND-REAL assertions passed",
-        `mandatory cleanup failed: ${cleanupErrors.join("; ")}`,
-      ].join("; "));
+      throw composeMandatoryCleanupError("COMPOUND-REAL", primaryError, cleanupErrors);
     }
   }
   if (primaryError) throw primaryError;

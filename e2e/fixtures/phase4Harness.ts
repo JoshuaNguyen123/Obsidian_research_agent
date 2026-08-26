@@ -7,12 +7,14 @@ import { promisify } from "node:util";
 
 import {
   terminateControlledObsidian,
-  waitForWindowsProcessExit,
+  type TeardownProbePhase,
 } from "../../scripts/obsidian-process-lifecycle";
 import {
+  describeSweepOutcomeV1,
   enumerateObsidianProcessesV1,
   selectOwnedObsidianPidsV1,
   sweepOwnedObsidianSurvivorsV1,
+  waitForOwnedRootExitV1,
 } from "../../scripts/e2e-obsidian-sweep";
 import {
   restoreOwnedE2EArtifacts,
@@ -154,6 +156,9 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
   let browser: Browser | null = null;
   let page: Page | null = null;
   let closed = false;
+  // Stamped immediately before spawn(); teardown needs it to tell our root
+  // apart from a later process that inherited its recycled PID.
+  let rootCreatedAtMs: number | null = null;
 
   await assertNoObsidianProcess();
   await assertPortFree(cdpPort);
@@ -168,6 +173,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
     // verified capability whose migration receipt disappears.
     await writeCodeCapabilitySandboxReset(pluginDataPaths[0], pluginDataBefore[0]);
     await ensureCommunityPluginEnabled(communityPluginsPath, PHASE4_CORE_PLUGIN_ID);
+    rootCreatedAtMs = Date.now();
     processHandle = spawn(
       obsidianExe,
       [
@@ -286,7 +292,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
           ).catch(() => false);
         }
         try {
-          await terminateObsidian(processHandle, cdpPort);
+          await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
         } catch (error) {
           teardownError ??= error;
         }
@@ -313,7 +319,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
     };
     return harness;
   } catch (error) {
-    await terminateObsidian(processHandle, cdpPort).catch(() => undefined);
+    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch(() => undefined);
     await browser?.close().catch(() => undefined);
     await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch(() => undefined);
     await removeNewPhase4OwnedWorkspaces(ownedWorkspacesBefore, marker).catch(
@@ -1197,27 +1203,56 @@ async function findVaultPage(browser: Browser, expectedVaultRoot: string): Promi
   throw new Error(`Timed out waiting for Obsidian vault ${expectedVaultRoot}.`);
 }
 
+/** See nativeObsidianHarness: initial passes bound the OS unwind, the
+ *  post-sweep recheck only CONFIRMS a synchronous TerminateProcess. */
+const PHASE4_OWNED_EXIT_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  initial: 30_000,
+  recheck: 10_000,
+};
+const PHASE4_PROCESS_DRAIN_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  initial: 30_000,
+  recheck: 10_000,
+};
+
 async function terminateObsidian(
   processHandle: ChildProcessWithoutNullStreams | null,
   cdpPort: number,
+  rootCreatedAtMs: number | null,
 ): Promise<void> {
   if (!processHandle?.pid) return;
+  const rootPid = processHandle.pid;
+  const teardownStartedAtMs = Date.now();
   await terminateControlledObsidian(processHandle, {
     terminateOwnedTree: async (pid) => {
       await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"]).catch(() => {
         processHandle.kill();
       });
     },
-    waitForOwnedExit: () =>
-      waitForWindowsProcessExit(processHandle.pid!, 30_000, {
+    waitForOwnedExit: (phase) =>
+      waitForOwnedRootExitV1({
         handle: processHandle,
-        expectedImageName: phase4ObsidianImageName(),
+        rootPid,
+        rootCreatedAtMs,
+        teardownStartedAtMs,
+        imageName: phase4ObsidianImageName(),
+        timeoutMs: PHASE4_OWNED_EXIT_TIMEOUT_MS[phase],
       }),
-    waitForNoRunningProcess: () =>
-      waitForOwnedObsidianDrainPhase4(cdpPort, processHandle.pid ?? null, 30_000),
+    waitForNoRunningProcess: (phase) =>
+      waitForOwnedObsidianDrainPhase4(
+        cdpPort,
+        rootPid,
+        rootCreatedAtMs,
+        teardownStartedAtMs,
+        PHASE4_PROCESS_DRAIN_TIMEOUT_MS[phase],
+      ),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
     sweepSurvivingProcesses: () =>
-      sweepObsidianSurvivorsPhase4(cdpPort, processHandle.pid ?? null, null),
+      sweepObsidianSurvivorsPhase4(
+        cdpPort,
+        rootPid,
+        rootCreatedAtMs,
+        teardownStartedAtMs,
+      ),
   });
 }
 
@@ -1229,22 +1264,31 @@ async function terminateObsidian(
 async function waitForOwnedObsidianDrainPhase4(
   cdpPort: number,
   rootPid: number | null,
+  rootCreatedAtMs: number | null,
+  teardownStartedAtMs: number | null,
   timeoutMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  const ownedRemain = async () =>
-    (
-      selectOwnedObsidianPidsV1({
-        processes: await enumerateObsidianProcessesV1(phase4ObsidianImageName()),
-        rootPid,
-        cdpPort,
-      })
-    ).length > 0;
+  const ownedRemaining = async () =>
+    selectOwnedObsidianPidsV1({
+      processes: await enumerateObsidianProcessesV1(phase4ObsidianImageName()),
+      rootPid,
+      cdpPort,
+      rootCreatedAtMs,
+      teardownStartedAtMs,
+    });
   while (Date.now() < deadline) {
-    if (!(await ownedRemain())) return true;
+    if ((await ownedRemaining()).length === 0) return true;
     await delay(250);
   }
-  return !(await ownedRemain());
+  const survivors = await ownedRemaining();
+  if (survivors.length > 0) {
+    console.warn(
+      `[obsidian-lifecycle] owned Obsidian processes still present after ${timeoutMs}ms: ` +
+        `${survivors.join(", ")} (root ${rootPid}, port ${cdpPort}).`,
+    );
+  }
+  return survivors.length === 0;
 }
 
 function phase4ObsidianImageName(): string {
@@ -1264,14 +1308,18 @@ async function sweepObsidianSurvivorsPhase4(
   cdpPort: number,
   rootPid: number | null,
   rootCreatedAtMs: number | null,
-): Promise<void> {
-  await sweepOwnedObsidianSurvivorsV1({
-    stage: "phase4Harness teardown",
-    rootPid,
-    cdpPort,
-    rootCreatedAtMs,
-    imageName: phase4ObsidianImageName(),
-  });
+  teardownStartedAtMs: number | null,
+): Promise<string> {
+  return describeSweepOutcomeV1(
+    await sweepOwnedObsidianSurvivorsV1({
+      stage: "phase4Harness teardown",
+      rootPid,
+      cdpPort,
+      rootCreatedAtMs,
+      teardownStartedAtMs,
+      imageName: phase4ObsidianImageName(),
+    }),
+  );
 }
 
 async function waitForCdp(

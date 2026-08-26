@@ -735,6 +735,34 @@ export async function readExactRepositoryState(
   }
 }
 
+/**
+ * The ONE way a lane reports "mandatory cleanup failed", so the two halves of
+ * that report stay distinguishable forever.
+ *
+ * `<LANE> assertions passed; mandatory cleanup failed: ...` is a CONTRACT
+ * SENTENCE, not prose. scripts/run-proof-matrix.mjs keys the
+ * `harness:cleanup_failed` class on it, exactly as the required-environment
+ * guards' fixed sentences key `environment_not_configured`. Before it existed,
+ * a mission that did its entire job and then tripped over a teardown probe was
+ * filed as `lane_assertion_failed` — the bucket a genuine product failure lands
+ * in — spending attempt budget and resetting a consecutive-green streak. That
+ * capped the measured pass rate with runs in which the product had done
+ * everything asked of it.
+ *
+ * A lane that invents its own wording silently falls back to the product
+ * bucket, which is why this is centralised rather than written out per spec.
+ */
+export function composeMandatoryCleanupError(
+  lane: string,
+  primaryError: unknown,
+  cleanupErrors: readonly string[],
+): Error {
+  const head = primaryError
+    ? `${lane} failed: ${safeExternalCleanupError(primaryError)}`
+    : `${lane} assertions passed`;
+  return new Error(`${head}; mandatory cleanup failed: ${cleanupErrors.join("; ")}`);
+}
+
 export function safeExternalCleanupError(error: unknown): string {
   return String(error instanceof Error ? error.message : error)
     .replace(/(?:github_pat_|gh[opusr]_)[A-Za-z0-9_-]+/gu, "[REDACTED]")

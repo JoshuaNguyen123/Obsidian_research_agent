@@ -7,6 +7,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import {
   appendHostEventV1,
+  createdWithinRootLifetimeV1,
+  describeSweepOutcomeV1,
   describeWindowsExitCodeV1,
   selectOwnedObsidianPidsV1,
   summarizeRecentHostDeathV1,
@@ -135,6 +137,106 @@ test("without a known root creation time no orphan is claimed on suspicion", () 
     rootCreatedAtMs: null,
   });
   assert.deepEqual(killed, []);
+});
+
+test("a RECYCLED root PID is not our root — same pid, later creation time", () => {
+  // THE FALSE-RED THIS FIXES. Our root exits during teardown, Windows hands its
+  // PID straight back out, and the claimant is very often another Obsidian.exe
+  // (every Electron process shares the image name, so matching on PID + image
+  // is not an identity). Both teardown process probes then reported a dead root
+  // as still-alive until they timed out, and a mission whose every assertion
+  // passed was recorded red.
+  const teardownStartedAtMs = 600_000;
+  const recycled = {
+    pid: ourRoot.pid, // the very same number
+    parentPid: 9,
+    // A different Obsidian entirely: no --type= helper marker, and crucially
+    // NOT carrying our unique CDP port.
+    commandLine: "C:\\Obsidian.exe",
+    createdAtMs: teardownStartedAtMs + 5_000, // born after our root died
+  };
+  const killed = selectOwnedObsidianPidsV1({
+    processes: [recycled],
+    rootPid: ourRoot.pid,
+    cdpPort: OUR_PORT,
+    rootCreatedAtMs: ourRoot.createdAtMs,
+    teardownStartedAtMs,
+  });
+  assert.deepEqual(
+    killed,
+    [],
+    "a process that merely inherited our PID is neither ours to report nor ours to kill",
+  );
+
+  // And the reverse must still hold: the genuine root, created inside the
+  // window it occupied, stays owned. Disowning a real survivor would turn this
+  // false red into a silent leak that poisons the next lane.
+  assert.deepEqual(
+    selectOwnedObsidianPidsV1({
+      processes: [ourRoot, ourRenderer, ourGpu],
+      rootPid: ourRoot.pid,
+      cdpPort: OUR_PORT,
+      rootCreatedAtMs: ourRoot.createdAtMs,
+      teardownStartedAtMs,
+    }),
+    [100, 101, 102],
+  );
+});
+
+test("an orphan born after teardown began is not claimable either", () => {
+  const teardownStartedAtMs = 600_000;
+  const lateStranger = {
+    pid: 700,
+    parentPid: 999, // orphan: parent absent from the enumeration
+    commandLine: 'C:\\Obsidian.exe --type=renderer --user-data-dir="C:\\obsidian"',
+    createdAtMs: teardownStartedAtMs + 1,
+  };
+  assert.deepEqual(
+    selectOwnedObsidianPidsV1({
+      processes: [lateStranger],
+      rootPid: ourRoot.pid,
+      cdpPort: OUR_PORT,
+      rootCreatedAtMs: ourRoot.createdAtMs,
+      teardownStartedAtMs,
+    }),
+    [],
+    "we spawn nothing once teardown starts, so nothing born after it is ours",
+  );
+});
+
+test("an unknown creation time degrades to PID-only ownership, never to disowned", () => {
+  // Fail-safe direction: a missing bound must not silently un-own a real
+  // survivor. A false red is recoverable; a leaked process is not.
+  assert.equal(createdWithinRootLifetimeV1(null, 5_000, 600_000), true);
+  assert.equal(createdWithinRootLifetimeV1(9_999_999, null, null), true);
+  assert.equal(createdWithinRootLifetimeV1(5_000, 5_000, 600_000), true);
+  assert.equal(createdWithinRootLifetimeV1(4_999, 5_000, 600_000), false);
+  assert.equal(createdWithinRootLifetimeV1(600_001, 5_000, 600_000), false);
+});
+
+test("the sweep's account tells a lying probe apart from a leak it could not reap", () => {
+  const seen = (count: number) =>
+    Array.from({ length: count }, (_unused, index) => ({
+      pid: 900 + index,
+      parentPid: 9,
+      commandLine: "C:\\Obsidian.exe",
+      createdAtMs: 1_000,
+    }));
+  assert.match(
+    describeSweepOutcomeV1({ swept: 0, killedPids: [], killResults: [], observed: seen(4) }),
+    /observed 4 Obsidian process\(es\); claimed 0 as owned/u,
+  );
+  const failedKill = describeSweepOutcomeV1({
+    swept: 1,
+    killedPids: [8412, 8416],
+    killResults: [
+      { pid: 8412, killed: true, error: null },
+      { pid: 8416, killed: false, error: "Access is denied." },
+    ],
+    observed: seen(2),
+  });
+  assert.match(failedKill, /claimed 2 as owned \[8412, 8416\], force-killed 1/u);
+  assert.match(failedKill, /kill FAILED for 8416 \(Access is denied\.\)/u);
 });
 
 test("Windows exit codes name the ACTION that produced them", () => {
