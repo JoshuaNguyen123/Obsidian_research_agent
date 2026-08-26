@@ -577,7 +577,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     // with no sandbox, no execution, and no Desktop delivery.
     id: "desktop-notebook-execution-lane",
     prompt:
-      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers, " +
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
       "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
     expected: {
       speechAct: "execute",
@@ -594,7 +594,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     // the code route outranks it so the mission still plans the sandbox ladder.
     id: "notebook-fast-path-defers",
     prompt:
-      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers, " +
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
       "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
     streamingWritebackKind: "append",
     intent: {

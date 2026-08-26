@@ -419,7 +419,7 @@ test("an executable notebook deliverable does not manufacture a reflection stage
   // write_project_results reflection node in a desktop-delivery mission.
   assert.deepEqual(
     detectProjectLifecycleStagesV1(
-      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers, " +
+      "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
         "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it",
     ),
     [],
