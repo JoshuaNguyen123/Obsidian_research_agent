@@ -15,6 +15,7 @@ import {
 } from "./AcceptedResearchArtifactV1";
 import {
   assertExactKeys,
+  canonicalizeProviderSafeAcceptedResearchTextV1,
   DurableLinearContractError,
   expectEnum,
   expectLogicalKey,
@@ -1268,16 +1269,28 @@ export type ProjectIdeaSeedBoundFieldNameV1 =
  * Accepts loosely-typed package fields so the execution-boundary substitution
  * seat can evaluate raw provider arguments with the exact same projection the
  * durable guard enforces.
+ *
+ * Both sides are read through
+ * {@link canonicalizeProviderSafeAcceptedResearchTextV1}, the one host-owned
+ * rewrite the publication tool applies to the outgoing package. Without it the
+ * seed and the package were compared through different lenses: the host
+ * rewrote a seed-bound field that named a repository path, and the guard then
+ * reported that very field as drifted from the seed it had just been
+ * substituted from. The transform is identity on safe text, so a genuine
+ * paraphrase of a safe seeded value still drifts exactly as before; it relaxes
+ * only where exactness was unreachable because the host — not the model —
+ * authored the published value.
  */
 export function projectIdeaSeedBoundFieldProjectionsV1(input: {
   package_: Pick<
     { [key in ProjectIdeaSeedBoundFieldNameV1]: unknown },
     ProjectIdeaSeedBoundFieldNameV1
-  >;
+  > & { validationRequirementKeys?: unknown; repositoryKey?: unknown };
   seed: ProjectIdeaAcceptedResearchSeedV1;
 }): {
   accepted: Record<ProjectIdeaSeedBoundFieldNameV1, unknown>;
   seeded: Record<ProjectIdeaSeedBoundFieldNameV1, unknown>;
+  seededVerbatim: Record<ProjectIdeaSeedBoundFieldNameV1, unknown>;
 } {
   const rawEvidence = input.package_.evidence;
   const accepted: Record<ProjectIdeaSeedBoundFieldNameV1, unknown> = {
@@ -1313,7 +1326,54 @@ export function projectIdeaSeedBoundFieldProjectionsV1(input: {
     evidence: input.seed.evidence,
     riskClass: input.seed.riskClass,
   };
-  return { accepted, seeded };
+  // What the substitution seat writes into the package: the seed exactly as
+  // stored. It must stay un-rewritten because that seat runs before the host
+  // has resolved the repository profile and validation keys the rewrite is
+  // phrased with — writing a rewrite computed from half-resolved inputs would
+  // reintroduce the very disagreement this projection exists to close. The
+  // package is rewritten once, later, by the tool.
+  const seededVerbatim: Record<ProjectIdeaSeedBoundFieldNameV1, unknown> =
+    cloneJsonValue(seeded) as Record<ProjectIdeaSeedBoundFieldNameV1, unknown>;
+  // The host's rewrite is driven by fields that are not themselves seed-bound
+  // (the requested validation keys and repository profile). Both projections
+  // must be canonicalized against the same ones, so they come from the package
+  // in both cases — the seed never carries them.
+  const hostRewriteInputs = {
+    validationRequirementKeys: input.package_.validationRequirementKeys,
+    repositoryKey: input.package_.repositoryKey,
+  };
+  for (const projection of [accepted, seeded]) {
+    const canonicalized: Record<string, unknown> = {
+      ...hostRewriteInputs,
+      title: projection.title,
+      problemImpact: projection.problemImpact,
+      objective: projection.objective,
+      proposedWork: cloneJsonValue(projection.proposedWork),
+      nonGoals: cloneJsonValue(projection.nonGoals),
+      acceptanceCriteria: cloneJsonValue(projection.acceptanceCriteria),
+    };
+    canonicalizeProviderSafeAcceptedResearchTextV1(canonicalized);
+    projection.title = canonicalized.title;
+    projection.problemImpact = canonicalized.problemImpact;
+    projection.objective = canonicalized.objective;
+    projection.proposedWork = canonicalized.proposedWork;
+    projection.nonGoals = canonicalized.nonGoals;
+    projection.acceptanceCriteria = canonicalized.acceptanceCriteria;
+  }
+  return { accepted, seeded, seededVerbatim };
+}
+
+/**
+ * Structural clone that leaves non-JSON values untouched, so canonicalizing a
+ * projection can never mutate the durable seed or the caller's package.
+ */
+function cloneJsonValue(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  try {
+    return JSON.parse(JSON.stringify(value)) as unknown;
+  } catch {
+    return value;
+  }
 }
 
 function assertProjectIdeaSeedMatchesAcceptedPackage(

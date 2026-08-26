@@ -246,6 +246,115 @@ export function assertNoRawAuthority(value: string, label: string): void {
   }
 }
 
+/**
+ * The single host-owned rewrite of accepted-research prose that cannot become
+ * queue execution authority. Model prose may describe the requested validator
+ * as a shell command or raw path; those strings are useful planning hints but
+ * are replaced with host-owned logical language before publication. Safe text
+ * is returned untouched, and every fallback is itself safe, so the transform
+ * is idempotent.
+ *
+ * Two seats must read seed-bound fields through this one lens or they will
+ * disagree about the same bytes:
+ *  - the publication tool, which applies it to the outgoing package; and
+ *  - {@link projectIdeaSeedBoundFieldProjectionsV1}, which must compare the
+ *    package against a seed projected through the identical transform.
+ * Comparing a sanitized package against a raw seed made every durable seed
+ * whose brief named a repository path permanently unpublishable: the drift
+ * guard reported exactly the fields the host itself had just rewritten.
+ */
+export function canonicalizeProviderSafeAcceptedResearchTextV1(
+  packageRecord: Record<string, unknown>,
+): void {
+  const validationKeys = Array.isArray(packageRecord.validationRequirementKeys)
+    ? packageRecord.validationRequirementKeys.filter(
+        (value): value is string =>
+          typeof value === "string" &&
+          /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value),
+      )
+    : [];
+  if (Array.isArray(packageRecord.acceptanceCriteria)) {
+    packageRecord.acceptanceCriteria = packageRecord.acceptanceCriteria.map(
+      (candidate, index) => {
+        const criterion =
+          candidate && typeof candidate === "object" && !Array.isArray(candidate)
+            ? (candidate as Record<string, unknown>)
+            : null;
+        if (!criterion || typeof criterion.text !== "string") return candidate;
+        try {
+          assertNoRawAuthority(
+            criterion.text,
+            `acceptance criterion ${index + 1} text`,
+          );
+          return candidate;
+        } catch {
+          const validationKey =
+            validationKeys[index % Math.max(validationKeys.length, 1)];
+          return {
+            ...criterion,
+            text: validationKey
+              ? `The trusted validation requirement ${validationKey} passes for the verified repository change.`
+              : `The verified implementation satisfies accepted behavioral criterion ${index + 1}.`,
+          };
+        }
+      },
+    );
+  }
+  if (typeof packageRecord.objective === "string") {
+    try {
+      assertNoRawAuthority(packageRecord.objective, "objective");
+    } catch {
+      const repositoryKey =
+        typeof packageRecord.repositoryKey === "string" &&
+        /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(packageRecord.repositoryKey)
+          ? packageRecord.repositoryKey
+          : "";
+      packageRecord.objective = repositoryKey
+        ? `Deliver the accepted research through trusted repository profile ${repositoryKey}.`
+        : "Deliver the accepted research work item through trusted host bindings.";
+    }
+  }
+  const scalarFallbacks: Record<string, string> = {
+    title: "Accepted research implementation",
+    problemImpact:
+      "The accepted research identifies an implementation gap that requires a verified repository change.",
+    confidenceLimitations:
+      "Implementation and provider behavior remain subject to trusted validation readback.",
+  };
+  for (const [field, fallback] of Object.entries(scalarFallbacks)) {
+    const value = packageRecord[field];
+    if (typeof value !== "string") continue;
+    try {
+      assertNoRawAuthority(value, field);
+    } catch {
+      packageRecord[field] = fallback;
+    }
+  }
+  const listFallbacks: Record<string, (index: number) => string> = {
+    proposedWork: (index) =>
+      `Implement accepted work item ${index + 1} through the trusted repository profile.`,
+    nonGoals: (index) =>
+      `Unapproved provider or repository change ${index + 1} remains outside scope.`,
+    scope: (index) =>
+      `Accepted scope item ${index + 1} remains inside the trusted repository profile.`,
+    dependencies: (index) =>
+      `Dependency ${index + 1} is resolved through trusted host bindings.`,
+  };
+  for (const [field, fallback] of Object.entries(listFallbacks)) {
+    const values = packageRecord[field];
+    if (!Array.isArray(values)) continue;
+    packageRecord[field] = values.map((value, index) => {
+      if (typeof value !== "string") return value;
+      try {
+        assertNoRawAuthority(value, `${field} ${index + 1}`);
+        return value;
+      } catch {
+        return fallback(index);
+      }
+    });
+  }
+}
+
 export function assertCanonicalContract(
   rawUnsigned: unknown,
   parsedUnsigned: unknown,
