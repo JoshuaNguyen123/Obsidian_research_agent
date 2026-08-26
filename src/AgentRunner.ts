@@ -4973,14 +4973,24 @@ export async function runAgentMission({
       if (resumedGraphForWritebackHealCandidate) {
         // One gate verdict per continuation: three live lane reds could not
         // distinguish "the gate never armed" from "the splice refused", so
-        // the gate states its inputs even when it skips.
+        // the gate states its inputs even when it skips. A stub that OWES
+        // work with an unarmed gate is error-coded so the run-record
+        // diagnostics retain it past recency eviction.
+        const writebackHealStubOwesWork =
+          missionGraphFinalOnlyStubOwesRequiredWorkV1(
+            resumedGraphForWritebackHealCandidate,
+          );
+        const writebackHealGateMessage = `Resume writeback heal gate: missionRequiresAppend=${writebackHealMissionRequiresAppend}; graphFinalOnly=${writebackHealShapeFinalOnly}; stubOwesWork=${writebackHealStubOwesWork}.`;
+        const writebackHealGateUnarmedOverOwedWork =
+          writebackHealStubOwesWork && !writebackHealMissionRequiresAppend;
         events.onTrace?.({
           id: "mission-graph-resume-writeback-heal-gate",
-          kind: "status",
-          message: `Resume writeback heal gate: missionRequiresAppend=${writebackHealMissionRequiresAppend}; graphFinalOnly=${writebackHealShapeFinalOnly}; stubOwesWork=${missionGraphFinalOnlyStubOwesRequiredWorkV1(resumedGraphForWritebackHealCandidate)}.`,
+          kind: writebackHealGateUnarmedOverOwedWork ? "error" : "status",
+          message: writebackHealGateMessage,
           outputPreview: {
             missionRequiresAppend: writebackHealMissionRequiresAppend,
             graphFinalOnly: writebackHealShapeFinalOnly,
+            stubOwesWork: writebackHealStubOwesWork,
             streamedResumeFlag: resumeContinuesStreamedCurrentNoteAppend,
             requiredWriteTools: [...requiredWriteTools],
             envelopeGrantsAppend: Boolean(
@@ -4990,6 +5000,14 @@ export async function runAgentMission({
             ),
             nodeIds: Object.keys(resumedGraphForWritebackHealCandidate.nodes),
           },
+          ...(writebackHealGateUnarmedOverOwedWork
+            ? {
+                error: {
+                  code: "resume_writeback_heal_gate_unarmed",
+                  message: writebackHealGateMessage,
+                },
+              }
+            : {}),
         });
       }
       const resumedGraphForWritebackHeal =
@@ -5085,18 +5103,49 @@ export async function runAgentMission({
             },
           });
         } else {
-          events.onTrace?.({
-            id: "mission-graph-resume-writeback-splice-refused",
-            kind: "status",
-            message: `Resume writeback heal did not splice: ${
-              writebackSplice.refusedReason ?? "unspecified"
-            }.`,
-            outputPreview: {
-              missionId: missionGraphSession.graph.missionId,
-              refusedReason: writebackSplice.refusedReason ?? null,
-              owedWriteCount,
-            },
-          });
+          // A refused heal on a stub that provably owes work is an ERROR:
+          // the segment will burn its budget against a graph nothing can
+          // pay. Error-coded so the run-record diagnostics RETAIN it (the
+          // run-5 sidecar evicted the status-kind verdicts as recency
+          // rolled) and the census can count refusals by reason. The
+          // owed_write_count_zero skip stays a status — nothing is owed.
+          const refusalReason =
+            writebackSplice.refusedReason ?? "unspecified";
+          const refusalOutputPreview = {
+            missionId: missionGraphSession.graph.missionId,
+            refusedReason: writebackSplice.refusedReason ?? null,
+            owedWriteCount,
+            missionRequiresAppend: writebackHealMissionRequiresAppend,
+            streamedResumeFlag: resumeContinuesStreamedCurrentNoteAppend,
+            requiredWriteTools: [...requiredWriteTools],
+            envelopeGrantsAppend: Boolean(
+              resumedGraphForWritebackHeal.capabilityEnvelope.tools[
+                "append_to_current_file"
+              ],
+            ),
+            nodeIds: Object.keys(resumedGraphForWritebackHeal.nodes),
+          };
+          if (refusalReason === "owed_write_count_zero") {
+            events.onTrace?.({
+              id: "mission-graph-resume-writeback-splice-refused",
+              kind: "status",
+              message:
+                "Resume writeback heal did not splice: owed_write_count_zero (every required literal already landed in the note).",
+              outputPreview: refusalOutputPreview,
+            });
+          } else {
+            const refusalMessage = `Resume writeback heal refused: ${refusalReason}. The resumed graph still owes its required current-note write and nothing in this segment can pay it.`;
+            events.onTrace?.({
+              id: "mission-graph-resume-writeback-splice-refused",
+              kind: "error",
+              message: refusalMessage,
+              outputPreview: refusalOutputPreview,
+              error: {
+                code: "resume_writeback_heal_refused",
+                message: refusalMessage,
+              },
+            });
+          }
         }
       }
       if (missionGraphSession && backgroundContinuation) {
