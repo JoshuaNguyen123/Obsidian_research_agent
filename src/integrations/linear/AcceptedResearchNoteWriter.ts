@@ -1238,57 +1238,107 @@ function normalizePackage(input: AcceptedResearchNotePackageV1): AcceptedResearc
   return normalized;
 }
 
+/**
+ * The single authoritative list of accepted-research fields the durable
+ * project idea seed pins byte-for-byte. Every seat that reasons about
+ * seed-bound exactness — this writer's drift guard, the publication tool's
+ * binding guard, and the host's execution-boundary seed substitution — must
+ * consume this list and {@link projectIdeaSeedBoundFieldProjectionsV1}
+ * rather than re-enumerating the fields.
+ */
+export const PROJECT_IDEA_SEED_BOUND_FIELD_NAMES_V1 = [
+  "title",
+  "problemImpact",
+  "objective",
+  "proposedWork",
+  "nonGoals",
+  "acceptanceCriteria",
+  "evidence",
+  "riskClass",
+] as const;
+
+export type ProjectIdeaSeedBoundFieldNameV1 =
+  (typeof PROJECT_IDEA_SEED_BOUND_FIELD_NAMES_V1)[number];
+
+/**
+ * Projects the seed-bound fields of an accepted research package and its
+ * durable project idea seed into directly comparable shapes. Evidence is
+ * reduced to its identity subfields ({id, kind, reference, contentSha256});
+ * model-authored presentation fields (label, summary) are never seed-bound.
+ * Accepts loosely-typed package fields so the execution-boundary substitution
+ * seat can evaluate raw provider arguments with the exact same projection the
+ * durable guard enforces.
+ */
+export function projectIdeaSeedBoundFieldProjectionsV1(input: {
+  package_: Pick<
+    { [key in ProjectIdeaSeedBoundFieldNameV1]: unknown },
+    ProjectIdeaSeedBoundFieldNameV1
+  >;
+  seed: ProjectIdeaAcceptedResearchSeedV1;
+}): {
+  accepted: Record<ProjectIdeaSeedBoundFieldNameV1, unknown>;
+  seeded: Record<ProjectIdeaSeedBoundFieldNameV1, unknown>;
+} {
+  const rawEvidence = input.package_.evidence;
+  const accepted: Record<ProjectIdeaSeedBoundFieldNameV1, unknown> = {
+    title: input.package_.title,
+    problemImpact: input.package_.problemImpact,
+    objective: input.package_.objective,
+    proposedWork: input.package_.proposedWork,
+    nonGoals: input.package_.nonGoals,
+    acceptanceCriteria: input.package_.acceptanceCriteria,
+    evidence: Array.isArray(rawEvidence)
+      ? rawEvidence.map((entry) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            return entry;
+          }
+          const { id, kind, reference, contentSha256 } = entry as {
+            id?: unknown;
+            kind?: unknown;
+            reference?: unknown;
+            contentSha256?: unknown;
+          };
+          return { id, kind, reference, contentSha256 };
+        })
+      : rawEvidence,
+    riskClass: input.package_.riskClass,
+  };
+  const seeded: Record<ProjectIdeaSeedBoundFieldNameV1, unknown> = {
+    title: input.seed.title,
+    problemImpact: input.seed.problemImpact,
+    objective: input.seed.selectedDirection.summary,
+    proposedWork: input.seed.proposedWork,
+    nonGoals: input.seed.nonGoals,
+    acceptanceCriteria: input.seed.acceptanceCriteria,
+    evidence: input.seed.evidence,
+    riskClass: input.seed.riskClass,
+  };
+  return { accepted, seeded };
+}
+
 function assertProjectIdeaSeedMatchesAcceptedPackage(
   package_: AcceptedResearchNotePackageV1,
 ): void {
   const seed = package_.projectIdeaSeed;
   if (!seed) return;
-  const acceptedProjection = {
-    title: package_.title,
-    problemImpact: package_.problemImpact,
-    objective: package_.objective,
-    proposedWork: package_.proposedWork,
-    nonGoals: package_.nonGoals,
-    acceptanceCriteria: package_.acceptanceCriteria,
-    evidence: package_.evidence.map(
-      ({ id, kind, reference, contentSha256 }) => ({
-        id,
-        kind,
-        reference,
-        contentSha256,
-      }),
-    ),
-    riskClass: package_.riskClass,
-  };
-  const seedProjection = {
-    title: seed.title,
-    problemImpact: seed.problemImpact,
-    objective: seed.selectedDirection.summary,
-    proposedWork: seed.proposedWork,
-    nonGoals: seed.nonGoals,
-    acceptanceCriteria: seed.acceptanceCriteria,
-    evidence: seed.evidence,
-    riskClass: seed.riskClass,
-  };
-  if (JSON.stringify(acceptedProjection) !== JSON.stringify(seedProjection)) {
-    // Name the drifted fields and echo their exact seed values: a provider
-    // whose context no longer holds the brief verbatim cannot repair an
-    // exact-copy contract from the field name alone. The seed is the
-    // provider's own authored brief, so echoing it leaks nothing new.
-    const driftedFields = (
-      Object.keys(seedProjection) as Array<keyof typeof seedProjection>
-    ).filter(
-      (key) =>
-        JSON.stringify(acceptedProjection[key]) !==
-        JSON.stringify(seedProjection[key]),
-    );
-    const expectations = driftedFields
-      .map((key) => `${key}=${JSON.stringify(seedProjection[key])}`)
-      .join("; ");
-    throw new DurableLinearContractError(
-      `Accepted research fields drifted from their durable project idea seed. Drifted fields: ${driftedFields.join(", ") || "unknown"}. Repair by passing each field exactly as seeded: ${expectations || "re-read the created project idea brief"}.`,
-    );
-  }
+  const { accepted, seeded } = projectIdeaSeedBoundFieldProjectionsV1({
+    package_,
+    seed,
+  });
+  // Name the drifted fields and echo their exact seed values: a provider
+  // whose context no longer holds the brief verbatim cannot repair an
+  // exact-copy contract from the field name alone. The seed is the
+  // provider's own authored brief, so echoing it leaks nothing new.
+  const driftedFields = PROJECT_IDEA_SEED_BOUND_FIELD_NAMES_V1.filter(
+    (key) => JSON.stringify(accepted[key]) !== JSON.stringify(seeded[key]),
+  );
+  if (driftedFields.length === 0) return;
+  const expectations = driftedFields
+    .map((key) => `${key}=${JSON.stringify(seeded[key])}`)
+    .join("; ");
+  throw new DurableLinearContractError(
+    `Accepted research fields drifted from their durable project idea seed. Drifted fields: ${driftedFields.join(", ") || "unknown"}. Repair by passing each field exactly as seeded: ${expectations || "re-read the created project idea brief"}.`,
+  );
 }
 
 function normalizeEvidence(
