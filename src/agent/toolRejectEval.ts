@@ -331,6 +331,116 @@ export function buildOffFrontierToolRejectionMessage(input: {
     .join(" ");
 }
 
+export type ProofGatedWritebackBoundaryV1 = "pre_mutation" | "commit";
+
+export type ProofGatedWritebackQuoteCorrectionV1 = {
+  passageId: string;
+  attempted: string;
+  passageExcerpt: string;
+};
+
+export type ProofGatedWritebackHoldV1 = {
+  /** Tool-result message the model reads. */
+  message: string;
+  /** System corrective pushed after the tool result. */
+  systemCorrective: string;
+  /**
+   * Non-null only on the verification-required arm, whose message promises
+   * "return the content as the final answer". Refusal builders consume it as
+   * `heldWriteToolNames` so they stop advising the very tool this hold keeps
+   * holding.
+   */
+  heldWriteToolName: string | null;
+  /** True only on the evidence-incomplete arm, which narrows the frontier. */
+  narrowsOfferedFrontier: boolean;
+};
+
+/**
+ * ONE implementation of the proof-gated writeback hold, consumed by both
+ * seats that can hold the same write for the same reason.
+ *
+ * The two seats had drifted: the step-loop hold taught a remedy, remembered
+ * the held tool name, and pushed a corrective; the mutation-boundary hold —
+ * the LAST gate before bytes land — said only "the final payload does not
+ * satisfy the closed fetched-source proof contract" and stopped. A model held
+ * there is told a contract was violated and never told what to do instead, so
+ * it retries, and the evidence arm narrows the frontier for retrying. It also
+ * never fed `heldWriteToolName`, so off-frontier refusals kept advising the
+ * exact tool the boundary was holding.
+ *
+ * `boundary` selects only the cause clause, so each seat's existing wording is
+ * preserved byte-for-byte; the remedy, the corrective, and the two side-effect
+ * decisions are shared. `missing` is the message's own detail list;
+ * `blockingProofs` is the corrective's, because the two seats compute them
+ * from different acceptance snapshots.
+ */
+export function buildProofGatedWritebackHoldV1(input: {
+  toolName: string;
+  boundary: ProofGatedWritebackBoundaryV1;
+  /** `durablePreWriteProofSatisfied` — false selects the evidence arm. */
+  evidenceSatisfied: boolean;
+  missing?: readonly string[];
+  blockingProofs?: readonly string[];
+  quoteCorrections?: readonly ProofGatedWritebackQuoteCorrectionV1[];
+}): ProofGatedWritebackHoldV1 {
+  const missingDetail = input.missing?.length
+    ? ` (${input.missing.join(", ")})`
+    : "";
+  const quoteCorrectionTail = (input.quoteCorrections ?? [])
+    .map(
+      (correction) =>
+        ` Quote correction for ${correction.passageId}: your draft quoted "${correction.attempted}" but the cited passage actually reads: "${correction.passageExcerpt}".`,
+    )
+    .join("");
+  const cause =
+    input.boundary === "commit"
+      ? `Held ${input.toolName} at the mutation boundary because the final payload does not satisfy the closed fetched-source proof contract${missingDetail}. No note bytes were changed.`
+      : input.evidenceSatisfied
+        ? `Held ${input.toolName} before mutation because this sourced writeback requires final passage verification${missingDetail}.`
+        : `Held ${input.toolName} before mutation because required research evidence is still incomplete${missingDetail}.`;
+  const remedy = input.evidenceSatisfied
+    ? `Return the complete corrected note content as the final answer without another write tool call; read tools such as web_search or read_source_section may still be used first to verify exact quotations. The runner will verify and commit the final content exactly once.${quoteCorrectionTail}`
+    : "Continue with the allowed read and research tools before drafting the final writeback.";
+  const systemCorrective = input.evidenceSatisfied
+    ? "Do not request a current-note write tool again. Return the complete sourced markdown as your final answer. The runner will hold it, verify passage ids and quotation spans, and perform the single authorized note mutation only after verification passes."
+    : `Do not request a current-note write tool again yet. Continue with allowed read or research tools until these blocking proof requirements are satisfied: ${
+        input.blockingProofs?.join(", ") || "required research evidence"
+      }. Only then return the complete sourced markdown for final verification.`;
+  return {
+    message: `${cause} ${remedy}`,
+    systemCorrective,
+    heldWriteToolName: input.evidenceSatisfied ? input.toolName : null,
+    narrowsOfferedFrontier: !input.evidenceSatisfied,
+  };
+}
+
+/**
+ * The corrective for a call that failed twice with identical arguments.
+ *
+ * The FIRST such failure has always received a rich corrective (a schema, a
+ * named prerequisite tool, an exact section list). The repeat received a
+ * ledger blocker and a trace and nothing else — the host decided to stop
+ * retrying and never told the model, so the model's next turn is spent
+ * guessing against a decision it cannot see. Both repeat seats now say the
+ * same thing, once.
+ */
+export function buildRepeatedInvalidToolCallCorrectiveV1(input: {
+  toolName: string;
+  failureCode: string;
+  readyFrontierToolNames: readonly string[];
+}): string {
+  const alternatives = input.readyFrontierToolNames
+    .map((name) => name.trim())
+    .filter((name) => Boolean(name) && name !== input.toolName);
+  return [
+    `Blocked ${input.toolName}: the same arguments failed twice (${input.failureCode}), so this exact call will not be attempted again.`,
+    alternatives.length > 0
+      ? `Either change the arguments, or call one of these exact names instead: ${alternatives.join(", ")}.`
+      : `No other tool is ready. Either change the arguments, or return your best final answer and state in one sentence that ${input.toolName} could not be completed.`,
+    "Do not repeat this exact call.",
+  ].join(" ");
+}
+
 export function buildToolRejectEvalV1(input: {
   userIntentExcerpt: string;
   selectedTool: string;

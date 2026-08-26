@@ -686,6 +686,8 @@ import {
 } from "./agent/hostRoutingToolCard";
 import {
   buildOffFrontierToolRejectionMessage as buildOffFrontierToolRejectionMessageImpl,
+  buildProofGatedWritebackHoldV1,
+  buildRepeatedInvalidToolCallCorrectiveV1,
   buildToolRejectEvalV1,
   describeOffFrontierToolNearMiss as describeOffFrontierToolNearMissImpl,
   mapToolRejectCategory,
@@ -12611,12 +12613,23 @@ export async function runAgentMission({
         (!durablePreWriteProofSatisfied ||
           finalPayloadAcceptance?.status !== "pass")
       ) {
-        const missingDetail = finalPayloadAcceptance?.missing.length
-          ? ` (${finalPayloadAcceptance.missing.join(", ")})`
-          : "";
-        const message =
-          `Held ${toolCall.name} at the mutation boundary because the final payload does not satisfy the closed fetched-source proof contract${missingDetail}. No note bytes were changed.`;
-        if (!durablePreWriteProofSatisfied) {
+        // Same hold, same builder as the step-loop seat. This boundary used to
+        // state the violated contract and stop: no remedy, no corrective, and
+        // no `lastProofGatedHoldToolName`, so off-frontier refusals kept
+        // advising the very tool this gate was holding.
+        const boundaryHold = buildProofGatedWritebackHoldV1({
+          toolName: toolCall.name,
+          boundary: "commit",
+          evidenceSatisfied: durablePreWriteProofSatisfied,
+          missing: finalPayloadAcceptance?.missing ?? [],
+          blockingProofs: boundaryBlockingPreWriteMissing,
+          quoteCorrections: lastClaimLedger?.quoteCorrections ?? [],
+        });
+        const message = boundaryHold.message;
+        if (boundaryHold.heldWriteToolName) {
+          lastProofGatedHoldToolName = boundaryHold.heldWriteToolName;
+        }
+        if (boundaryHold.narrowsOfferedFrontier) {
           // Same evidence-incomplete signal as the step-loop hold: repeated
           // re-tries narrow the offered frontier until the proofs clear.
           recordProofGateWriteRejection(toolCall.name);
@@ -12663,6 +12676,10 @@ export async function runAgentMission({
               toolIndex,
               toolCall.name,
             ),
+          });
+          messages.push({
+            role: "system" as const,
+            content: boundaryHold.systemCorrective,
           });
         }
         return blockedResult;
@@ -15736,6 +15753,17 @@ export async function runAgentMission({
             toolName: toolCall.name,
             message: blocker,
             error: { code: "repeated_invalid_tool_call", message: blocker },
+          });
+          // The first failure taught; the repeat used to say nothing at all.
+          messages.push({
+            role: "system" as const,
+            content: buildRepeatedInvalidToolCallCorrectiveV1({
+              toolName: toolCall.name,
+              failureCode: failureCode || "invalid_arguments",
+              readyFrontierToolNames: tools.map(
+                (candidate) => candidate.function.name,
+              ),
+            }),
           });
         } else {
           invalidToolCallFailureSignatures.add(failureSignature);
@@ -21143,6 +21171,36 @@ export async function runAgentMission({
           literalContractNoteText = null;
         }
       }
+      // Repair before validate. The host knows the exact literal this step
+      // owes and the final-answer path already restores it deterministically;
+      // refusing here only spent a bounded retry to ask the model for an edit
+      // the host could make itself. The validator below stays the single
+      // authority: a repaired payload now carries an anchor, so it passes for
+      // the same reason any compliant call does.
+      const literalRepair = canonicalRequiredLiteralWriteContentV1(
+        activeIntentPrompt,
+        toolCall,
+        literalContractNoteText,
+      );
+      if (literalRepair) {
+        proposedWriteText = literalRepair.content;
+        toolCall.arguments = {
+          ...toolCall.arguments,
+          [literalRepair.field]: literalRepair.content,
+        };
+        events.onTrace?.({
+          id: `${toolEventBase.id}:required-literal-restored`,
+          kind: "verification",
+          step,
+          toolName: toolCall.name,
+          message:
+            `Deterministically restored the exact user-required literal marker "${literalRepair.insertedAnchor}" before executing ${toolCall.name}.`,
+          outputPreview: {
+            insertedAnchor: literalRepair.insertedAnchor,
+            payloadFingerprint: hashOperationInput(literalRepair.content),
+          },
+        });
+      }
       const literalContractError = validateRequiredLiteralWriteArguments(
         activeIntentPrompt,
         toolCall,
@@ -21225,6 +21283,17 @@ export async function runAgentMission({
             toolName: toolCall.name,
             message: blocker,
             error: { code: "repeated_invalid_tool_call", message: blocker },
+          });
+          // The first failure taught; the repeat used to say nothing at all.
+          messages.push({
+            role: "system" as const,
+            content: buildRepeatedInvalidToolCallCorrectiveV1({
+              toolName: toolCall.name,
+              failureCode: "invalid_arguments",
+              readyFrontierToolNames: stepTools.map(
+                (candidate) => candidate.function.name,
+              ),
+            }),
           });
         } else {
           invalidToolCallFailureSignatures.add(failureSignature);
@@ -21343,31 +21412,25 @@ export async function runAgentMission({
         (!durablePreWriteProofSatisfied ||
           proposedWriteAcceptance?.status !== "pass")
       ) {
-        const message = !durablePreWriteProofSatisfied
-          ? `Held ${toolCall.name} before mutation because required research evidence is still incomplete${
-              blockingPreWriteMissing.length
-                ? ` (${blockingPreWriteMissing.join(", ")})`
-                : ""
-            }. Continue with the allowed read and research tools before drafting the final writeback.`
-          : `Held ${toolCall.name} before mutation because this sourced writeback requires final passage verification${
-              proposedWriteAcceptance?.missing.length
-                ? ` (${proposedWriteAcceptance.missing.join(", ")})`
-                : ""
-            }. Return the complete corrected note content as the final answer without another write tool call; read tools such as web_search or read_source_section may still be used first to verify exact quotations. The runner will verify and commit the final content exactly once.${
-              (lastClaimLedger?.quoteCorrections ?? [])
-                .map(
-                  (correction) =>
-                    ` Quote correction for ${correction.passageId}: your draft quoted "${correction.attempted}" but the cited passage actually reads: "${correction.passageExcerpt}".`,
-                )
-                .join("")
-            }`;
-        if (durablePreWriteProofSatisfied) {
+        const hold = buildProofGatedWritebackHoldV1({
+          toolName: toolCall.name,
+          boundary: "pre_mutation",
+          evidenceSatisfied: durablePreWriteProofSatisfied,
+          missing: durablePreWriteProofSatisfied
+            ? (proposedWriteAcceptance?.missing ?? [])
+            : blockingPreWriteMissing,
+          blockingProofs: blockingPreWriteMissing,
+          quoteCorrections: lastClaimLedger?.quoteCorrections ?? [],
+        });
+        const message = hold.message;
+        if (hold.heldWriteToolName) {
           // Only the verification-required arm promised "return the content
           // as the final answer". Remember which write tool that promise
           // held so frontier rejections stop advising the same name while
           // the hold stands.
-          lastProofGatedHoldToolName = toolCall.name;
-        } else {
+          lastProofGatedHoldToolName = hold.heldWriteToolName;
+        }
+        if (hold.narrowsOfferedFrontier) {
           // Evidence-incomplete arm: repeated re-tries of the same held tool
           // narrow the offered frontier until the blocking proofs clear.
           recordProofGateWriteRejection(toolCall.name);
@@ -21414,11 +21477,7 @@ export async function runAgentMission({
         });
         messages.push({
           role: "system" as const,
-          content: durablePreWriteProofSatisfied
-            ? "Do not request a current-note write tool again. Return the complete sourced markdown as your final answer. The runner will hold it, verify passage ids and quotation spans, and perform the single authorized note mutation only after verification passes."
-            : `Do not request a current-note write tool again yet. Continue with allowed read or research tools until these blocking proof requirements are satisfied: ${
-                blockingPreWriteMissing.join(", ") || "required research evidence"
-              }. Only then return the complete sourced markdown for final verification.`,
+          content: hold.systemCorrective,
         });
         shouldReplanAfterProofGatedWriteTool = true;
         toolIndex += 1;
@@ -34996,6 +35055,78 @@ const LITERAL_CONTENT_WRITE_TOOLS = new Set([
   "replace_file",
   "create_file",
 ]);
+
+/**
+ * The final-answer path has always REPAIRED a missing user-required literal
+ * (attachMissingRequiredLiteralAnchors, consumed above); the tool-call path
+ * REFUSED the identical failure, spent a bounded safeFailureRetry attempt on
+ * it, and blocked the node on the repeat. Same prompt, same
+ * extractRequiredLiteralAnchors, two verdicts -- and the refusal's own advice
+ * ("return one corrected call whose content preserves this step's required
+ * literal exactly") describes a deterministic edit the host can simply make.
+ * A model that paraphrases a marker on its write is the same model that would
+ * have had it restored for free one code path over.
+ *
+ * Restores exactly ONE anchor, because this contract is step-scoped, not
+ * mission-scoped (see validateRequiredLiteralWriteArguments below): inserting
+ * every missing marker is precisely what collapses a mission's ordered
+ * appends into a single write. The anchor chosen is the first the live note
+ * still lacks, so ordered multi-append missions keep progressing in their
+ * stated order; with no observable note the first anchor is used.
+ *
+ * Deliberately declines wherever refusal is the right answer, leaving
+ * validateRequiredLiteralWriteArguments the sole authority on whether a call
+ * satisfies the contract -- this only removes the cases where the host knew
+ * the exact fix and refused anyway:
+ * - not a literal-content write tool, no demanded literals, or no text /
+ *   content string to repair;
+ * - content already carries an anchor, which includes the anti-duplication
+ *   case where the model re-carries a marker the note already landed and the
+ *   validator's redirect must keep its teeth.
+ */
+export function canonicalRequiredLiteralWriteContentV1(
+  prompt: string,
+  toolCall: ModelToolCall,
+  currentNoteText?: string | null,
+): { field: "text" | "content"; content: string; insertedAnchor: string } | null {
+  if (!LITERAL_CONTENT_WRITE_TOOLS.has(toolCall.name)) {
+    return null;
+  }
+  const anchors = extractRequiredLiteralAnchors(prompt);
+  if (anchors.length === 0) {
+    return null;
+  }
+  const field: "text" | "content" | null =
+    typeof toolCall.arguments.text === "string"
+      ? "text"
+      : typeof toolCall.arguments.content === "string"
+        ? "content"
+        : null;
+  if (field === null) {
+    return null;
+  }
+  const content = toolCall.arguments[field] as string;
+  const normalizedContent = content.toLowerCase();
+  if (
+    anchors.some((anchor) => normalizedContent.includes(anchor.toLowerCase()))
+  ) {
+    return null;
+  }
+  const normalizedNote =
+    typeof currentNoteText === "string" ? currentNoteText.toLowerCase() : null;
+  const insertedAnchor =
+    (normalizedNote === null
+      ? undefined
+      : anchors.find(
+          (anchor) => !normalizedNote.includes(anchor.toLowerCase()),
+        )) ?? anchors[0];
+  const separator = content === "" ? "" : content.endsWith("\n") ? "\n" : "\n\n";
+  return {
+    field,
+    content: `${content}${separator}${insertedAnchor}`,
+    insertedAnchor,
+  };
+}
 
 export function validateRequiredLiteralWriteArguments(
   prompt: string,
