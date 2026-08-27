@@ -18,6 +18,7 @@ import {
   ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
   HARNESS_CLEANUP_FAILURE_CLASS,
   PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS,
+  SANDBOX_UNAVAILABLE_FAILURE_CLASS,
   detectLaneCleanupFailure,
   IN_FLIGHT_FAILURE_CLASS,
   LANE_ASSERTION_FAILURE_CLASS,
@@ -1372,4 +1373,52 @@ test("no infrastructure outcome writes a pass-rate row, by one shared predicate"
   }
   assert.ok(!isInfrastructureFailureClass("lane_assertion_failed"));
   assert.ok(!isInfrastructureFailureClass("product_assertion"));
+});
+
+test("a sandbox that never attested is not a product failure", () => {
+  // 2026-08-27: two compound attempts died on the WSL2 boundary probe timing
+  // out under 100% host CPU, each burning ~40 minutes of a pinned premium
+  // model, and both were filed as lane_assertion_failed. The same lane had
+  // proven 3 consecutive greens hours earlier on a quiet machine.
+  const log = [
+    "  1) [compound-flow-real-live] > FLOW-REAL-01 COMPOUND-REAL",
+    '    Error: Mission stopped before acceptance; approved=1; blockerMessage":"No sandbox provider has passed its boundary probe. wsl2 rejected: Sandbox provider process exceeded its fixed timeout."',
+  ].join("\n");
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: null,
+    summaryFresh: false,
+    logText: log,
+  });
+  assert.equal(outcome.failureClass, SANDBOX_UNAVAILABLE_FAILURE_CLASS);
+  assert.ok(!outcome.secondaryClasses.includes("lane_assertion_failed"));
+  assert.ok(isInfrastructureFailureClass(outcome.failureClass));
+  assert.equal(
+    attemptConsumesBudget({ green: false, failureClass: outcome.failureClass }),
+    false,
+  );
+});
+
+test("a sandbox that RAN and failed its boundary stays a product failure", () => {
+  // The safety half, and the reason detection requires the timeout clause. A
+  // probe that executed and reported the boundary did not hold means code was
+  // not confined -- a severe product finding. Letting it hide behind an
+  // infrastructure label would be far worse than any mis-scored lane.
+  for (const text of [
+    '  1) lane > test\n    Error: No sandbox provider has passed its boundary probe. wsl2 rejected: boundary escape observed in probe output.',
+    '  1) lane > test\n    Error: sandbox_boundary_probe_failed: attestation fingerprint mismatch',
+    '  1) lane > test\n    Error: No sandbox provider has passed its boundary probe. wsl2 rejected: probe wrote outside the staging root.',
+  ]) {
+    const outcome = classifyAttemptOutcome({
+      exitCode: 1,
+      summary: null,
+      summaryFresh: false,
+      logText: text,
+    });
+    assert.notEqual(
+      outcome.failureClass,
+      SANDBOX_UNAVAILABLE_FAILURE_CLASS,
+      `a real boundary violation must not be excused: ${text.slice(30, 90)}`,
+    );
+  }
 });

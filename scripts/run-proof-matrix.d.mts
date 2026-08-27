@@ -119,6 +119,10 @@ export const HARNESS_CLEANUP_FAILURE_CLASS: "harness:cleanup_failed";
  * limit. The product was never exercised, so it is not a product red.
  */
 export const PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS: "harness:provider_quota_exhausted";
+export const SANDBOX_UNAVAILABLE_FAILURE_CLASS: "harness:sandbox_unavailable";
+export function detectSandboxNoVerdict(
+  logText: string,
+): { detail: string; index: number } | null;
 export function detectProviderQuotaExhaustion(
   logText: string,
 ): { detail: string; index: number } | null;

@@ -706,6 +706,46 @@ export function detectProviderQuotaExhaustion(logText) {
 }
 
 /**
+ * No sandbox provider could ATTEST — the boundary probe never returned a
+ * verdict — so the product's code-execution stages were never exercised.
+ *
+ * Measured 2026-08-27: two compound attempts died on
+ *   "No sandbox provider has passed its boundary probe.
+ *    wsl2 rejected: Sandbox provider process exceeded its fixed timeout."
+ * with the host at 100% CPU and 56-63 competing node processes. The same lane
+ * had proven 3 consecutive greens hours earlier on a quiet machine, and the
+ * WSL2 probe budget's own comment scopes it to "normal workstation load". Both
+ * attempts were filed as `lane_assertion_failed` — the product bucket — and
+ * each one burned ~40 minutes of a pinned premium model.
+ *
+ * CRITICAL DISTINCTION, and the reason this keys on the timeout sentence
+ * rather than on "boundary probe" alone: a probe that RAN and returned a
+ * verdict of FAIL means the sandbox did not confine code. That is a real,
+ * severe product finding and must stay in the product bucket. Only "the probe
+ * never answered" is infrastructure. Conflating them would let a genuine
+ * containment failure hide behind an infrastructure label, which would be far
+ * worse than any mis-scored lane.
+ */
+export const SANDBOX_UNAVAILABLE_FAILURE_CLASS = "harness:sandbox_unavailable";
+
+/**
+ * A boundary probe that produced NO VERDICT. Both clauses are required: the
+ * "no provider passed" sentence AND an explicit timeout, so a probe that ran
+ * and reported a violation can never match.
+ */
+const SANDBOX_NO_VERDICT_CONTRACT =
+  /No sandbox provider has passed its boundary probe\.[^\r\n]*?(?:exceeded its fixed timeout|provider_timeout)[^\r\n]*/u;
+
+/** The no-verdict sentence, or null when the log carries none. */
+export function detectSandboxNoVerdict(logText) {
+  const match = SANDBOX_NO_VERDICT_CONTRACT.exec(
+    typeof logText === "string" ? logText : "",
+  );
+  if (!match) return null;
+  return { detail: match[0].trim(), index: match.index };
+}
+
+/**
  * The lane's own contract sentence, composed in exactly one place
  * (e2e/fixtures/externalCleanup.ts composeMandatoryCleanupError). Detection
  * keys on the "assertions passed" half, which the composer emits ONLY when the
@@ -901,6 +941,24 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
   // passed and the harness leaked"; this covers "an external provider refused
   // to serve us". None of the three is product evidence, and only the product
   // belongs in a pass-rate denominator.
+  // Settled alongside the provider-quota case and for the same reason: the
+  // sandbox never attested, so the code-execution stages were never exercised
+  // and nothing downstream is product evidence. Keyed on the NO-VERDICT
+  // sentence only -- a probe that ran and reported a boundary violation is a
+  // genuine product finding and deliberately does not match.
+  const sandboxNoVerdict = detectSandboxNoVerdict(text);
+  if (sandboxNoVerdict) {
+    return {
+      failureClass: SANDBOX_UNAVAILABLE_FAILURE_CLASS,
+      detail:
+        `Sandbox never attested (no verdict): ${sandboxNoVerdict.detail}\n` +
+        attemptLogExcerptFrom(text, sandboxNoVerdict.index),
+      confidence: CLASSIFICATION_CONFIRMED,
+      secondaryClasses: secondaryFor(SANDBOX_UNAVAILABLE_FAILURE_CLASS).filter(
+        (cls) => cls !== LANE_ASSERTION_FAILURE_CLASS,
+      ),
+    };
+  }
   const providerQuota = detectProviderQuotaExhaustion(text);
   if (providerQuota) {
     return {
