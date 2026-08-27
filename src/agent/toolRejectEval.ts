@@ -240,6 +240,75 @@ export function isHostCausedOffFrontierRefusalV1(
   );
 }
 
+/**
+ * Failure codes the host decided from the tool NAME ALONE, before it ever
+ * looked at an argument.
+ *
+ * `tool_not_allowed` is produced by the step-menu gate
+ * (`!stepAllowedToolNames.has(toolCall.name)`), which runs before argument
+ * validation and reads nothing but the name; `unknown_tool` means the registry
+ * has no such definition at all. For both, the arguments played no causal part
+ * in the refusal, so two calls of the same name are the SAME failure however
+ * differently they are parameterised.
+ *
+ * This exists because the repeat guard disagreed with the gate that feeds it.
+ * The gate refuses on the name; the guard keyed its "have I seen this failure
+ * before?" signature on name + code + `stableStringify(arguments)`. A model
+ * that varies its arguments between attempts -- which is exactly what a model
+ * does when it is told to correct something -- minted a fresh signature every
+ * time, so `repeated_invalid_tool_call` never fired and the futile call was
+ * re-issued for as long as the step budget lasted. Measured live in the
+ * interrupted-continuation lane: `append_to_current_file` refused at steps 1,
+ * 2, 4, 5, 6, 8 and 9 of one run, every one at call index 0, never once
+ * blocked. AgentRunner's own comment beside that signature already records the
+ * symptom -- "a live run burned 14 of its 30 steps re-requesting the same
+ * unavailable tool" -- and was written to justify routing `tool_not_allowed`
+ * into this guard; the argument-keyed signature silently defeated the fix for
+ * the very case it was added for.
+ *
+ * Deliberately NOT included:
+ *  - `workspace_not_found`, which IS an argument fault (the `workspaceId`
+ *    argument names nothing), so a different argument genuinely can succeed;
+ *  - `plan_dependency_violation`, where the node exists and is merely not
+ *    ready yet, so the same call can legitimately succeed at a later step;
+ *  - the frontier drift codes, which are host-caused and already carry their
+ *    own "the menu changed" coaching.
+ */
+export function isNameOnlyToolFailureCodeV1(
+  failureCode: string | null | undefined,
+): boolean {
+  const code = String(failureCode ?? "").trim().toLowerCase();
+  return code === "tool_not_allowed" || code === "unknown_tool";
+}
+
+/** How a repeat was recognised, so the corrective can say something true. */
+export type InvalidToolCallRepeatKeyV1 = "name" | "arguments";
+
+export function invalidToolCallRepeatKeyV1(
+  failureCode: string | null | undefined,
+): InvalidToolCallRepeatKeyV1 {
+  return isNameOnlyToolFailureCodeV1(failureCode) ? "name" : "arguments";
+}
+
+/**
+ * THE signature the repeat guard remembers a rejected call by. One builder, so
+ * the seat that decides a call is futile and the seat that remembers it cannot
+ * disagree about what "the same failure" means.
+ *
+ * Name-only codes drop the arguments from the key; every other code keeps
+ * them, preserving the existing behaviour exactly for genuine argument faults.
+ */
+export function buildInvalidToolCallFailureSignatureV1(input: {
+  toolName: string;
+  failureCode: string;
+  /** `stableStringify(toolCall.arguments)` from the caller. */
+  argumentsSignature: string;
+}): string {
+  return isNameOnlyToolFailureCodeV1(input.failureCode)
+    ? `${input.toolName}:${input.failureCode}`
+    : `${input.toolName}:${input.failureCode}:${input.argumentsSignature}`;
+}
+
 export type ToolRejectEvalV1 = {
   userIntentExcerpt: string;
   selectedTool: string;
@@ -793,10 +862,30 @@ export function buildRepeatedInvalidToolCallCorrectiveV1(input: {
   toolName: string;
   failureCode: string;
   readyFrontierToolNames: readonly string[];
+  /**
+   * Which signature recognised this repeat. Defaults to `"arguments"`, the
+   * historical behaviour.
+   *
+   * On a name-keyed repeat the arguments DIFFERED between the two attempts, so
+   * "the same arguments failed twice" is simply false and "either change the
+   * arguments" advises the one move that provably cannot work -- the name was
+   * refused before an argument was read. Telling a model to fix what it
+   * already varied is how a futile call becomes a futile loop.
+   */
+  repeatKey?: InvalidToolCallRepeatKeyV1;
 }): string {
   const alternatives = input.readyFrontierToolNames
     .map((name) => name.trim())
     .filter((name) => Boolean(name) && name !== input.toolName);
+  if ((input.repeatKey ?? "arguments") === "name") {
+    return [
+      `Blocked ${input.toolName}: that name has now been refused twice (${input.failureCode}). It is not on the offered menu, and the refusal is decided by the name alone — changing the arguments cannot put it there.`,
+      alternatives.length > 0
+        ? `Call one of these exact names instead: ${alternatives.join(", ")}.`
+        : `No other tool is ready. Return your best final answer and state in one sentence that ${input.toolName} could not be completed.`,
+      `Do not call ${input.toolName} again unless a later frontier lists it.`,
+    ].join(" ");
+  }
   return [
     `Blocked ${input.toolName}: the same arguments failed twice (${input.failureCode}), so this exact call will not be attempted again.`,
     alternatives.length > 0

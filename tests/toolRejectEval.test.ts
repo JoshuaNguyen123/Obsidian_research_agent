@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import {
+  buildInvalidToolCallFailureSignatureV1,
   buildOffFrontierToolRejectionMessage,
   buildProofGatedWritebackHoldV1,
   buildRepeatedInvalidToolCallCorrectiveV1,
@@ -9,7 +10,10 @@ import {
   classifyOffFrontierRefusalV1,
   describeOffFrontierToolNearMiss,
   FRONTIER_NARROWED_REFUSAL_CODE_V1,
+  FRONTIER_WITHHELD_REFUSAL_CODE_V1,
+  invalidToolCallRepeatKeyV1,
   isHostCausedOffFrontierRefusalV1,
+  isNameOnlyToolFailureCodeV1,
   isHostNarrowedOffFrontierRefusalV1,
   isHostWithheldOffFrontierRefusalV1,
   looksLikeUnfilledToolNamePlaceholderV1,
@@ -1143,4 +1147,201 @@ test("every message seat that names a tool consumes the one shared predicate", (
     /offeredToolLines: buildOfferedToolLines\(\{\s*readyFrontierToolNames: offeredToolsAreAuthoritative\s*\?\s*authoritativeOfferedToolNames\s*:\s*readyToolNames,/u,
   );
   assert.match(cardBody, /offeredToolsAreAuthoritative,/u);
+});
+// ---------------------------------------------------------------------------
+// Name-only refusal signatures.
+//
+// Measured cause (2026-08-27 census; all 39 `tool_not_allowed` came from one
+// lane): every recovered refusal named a REAL product tool, at call index 0,
+// against an authoritative frontier holding 0-1 tools -- and the same name came
+// back step after step because the repeat guard keyed its signature on the
+// arguments the step-menu gate never read.
+// ---------------------------------------------------------------------------
+
+test("a name-only refusal ignores the arguments, so varied retries collide", () => {
+  // The exact live shape: interrupted-continuation refused
+  // `append_to_current_file` at steps 1, 2, 4, 5, 6, 8 and 9 of one run. The
+  // model varied the content it tried to append every time, so an
+  // argument-keyed signature was fresh on every attempt and
+  // `repeated_invalid_tool_call` never fired.
+  const first = buildInvalidToolCallFailureSignatureV1({
+    toolName: "append_to_current_file",
+    failureCode: "tool_not_allowed",
+    argumentsSignature: JSON.stringify({ content: "first reflection draft" }),
+  });
+  const second = buildInvalidToolCallFailureSignatureV1({
+    toolName: "append_to_current_file",
+    failureCode: "tool_not_allowed",
+    argumentsSignature: JSON.stringify({ content: "a totally different draft" }),
+  });
+  assert.equal(first, second, "the same refused name must be one signature");
+  assert.doesNotMatch(
+    first,
+    /reflection draft/u,
+    "arguments must not appear in a name-only signature",
+  );
+  // ...and it must still separate two DIFFERENT names, or the guard would
+  // block a name the model has only just started getting wrong.
+  assert.notEqual(
+    first,
+    buildInvalidToolCallFailureSignatureV1({
+      toolName: "create_file",
+      failureCode: "tool_not_allowed",
+      argumentsSignature: JSON.stringify({ content: "first reflection draft" }),
+    }),
+  );
+  // ...and two different CODES for one name stay distinct, so a name later
+  // refused for a real reason still earns its own first-failure teaching.
+  assert.notEqual(
+    first,
+    buildInvalidToolCallFailureSignatureV1({
+      toolName: "append_to_current_file",
+      failureCode: "invalid_arguments",
+      argumentsSignature: JSON.stringify({ content: "first reflection draft" }),
+    }),
+  );
+});
+
+test("genuine argument faults stay argument-keyed", () => {
+  // The other half of the discrimination. `invalid_arguments` and
+  // `workspace_not_found` ARE decided by the arguments, so a corrected call
+  // must read as a new failure and earn its own schema correction rather than
+  // being blocked as a repeat.
+  for (const failureCode of ["invalid_arguments", "workspace_not_found"]) {
+    assert.equal(isNameOnlyToolFailureCodeV1(failureCode), false, failureCode);
+    assert.notEqual(
+      buildInvalidToolCallFailureSignatureV1({
+        toolName: "code_validate_fast",
+        failureCode,
+        argumentsSignature: JSON.stringify({ workspaceId: "ws-typo" }),
+      }),
+      buildInvalidToolCallFailureSignatureV1({
+        toolName: "code_validate_fast",
+        failureCode,
+        argumentsSignature: JSON.stringify({ workspaceId: "ws-correct" }),
+      }),
+      failureCode + " must keep its arguments in the signature",
+    );
+  }
+});
+
+test("plan_dependency_violation is deliberately NOT name-only", () => {
+  // A deferred node EXISTS and is merely not ready yet, so the identical call
+  // can legitimately succeed once its dependency completes. Name-keying it
+  // would blocklist a call the graph is about to authorise. Observed live in
+  // the compound lane as `create_project_idea_brief` deferred at steps 4 and 6
+  // -- a real loop, but one whose cure is dependency ordering, not a name ban.
+  assert.equal(isNameOnlyToolFailureCodeV1("plan_dependency_violation"), false);
+  assert.equal(
+    invalidToolCallRepeatKeyV1("plan_dependency_violation"),
+    "arguments",
+  );
+  // The host-caused frontier drift codes are likewise excluded: they carry
+  // their own "the menu changed" coaching and are not the model's error.
+  assert.equal(
+    isNameOnlyToolFailureCodeV1(FRONTIER_NARROWED_REFUSAL_CODE_V1),
+    false,
+  );
+  assert.equal(
+    isNameOnlyToolFailureCodeV1(FRONTIER_WITHHELD_REFUSAL_CODE_V1),
+    false,
+  );
+  assert.equal(isNameOnlyToolFailureCodeV1(null), false);
+  assert.equal(isNameOnlyToolFailureCodeV1(""), false);
+  // Both name-only codes, and the key they select.
+  assert.equal(isNameOnlyToolFailureCodeV1("tool_not_allowed"), true);
+  assert.equal(isNameOnlyToolFailureCodeV1("unknown_tool"), true);
+  assert.equal(invalidToolCallRepeatKeyV1("tool_not_allowed"), "name");
+  assert.equal(invalidToolCallRepeatKeyV1("unknown_tool"), "name");
+});
+
+test("a name-keyed repeat corrective never blames the arguments", () => {
+  const nameKeyed = buildRepeatedInvalidToolCallCorrectiveV1({
+    toolName: "append_to_current_file",
+    failureCode: "tool_not_allowed",
+    readyFrontierToolNames: ["web_search", "read_current_file"],
+    repeatKey: "name",
+  });
+  // The two attempts carried DIFFERENT arguments, so the historical sentence
+  // would be a plain falsehood, and its remedy would advise the one move that
+  // provably cannot work.
+  assert.doesNotMatch(nameKeyed, /same arguments failed twice/u);
+  assert.doesNotMatch(nameKeyed, /change the arguments/u);
+  assert.match(nameKeyed, /refused twice \(tool_not_allowed\)/u);
+  assert.match(nameKeyed, /decided by the name alone/u);
+  assert.match(
+    nameKeyed,
+    /Call one of these exact names instead: web_search, read_current_file\./u,
+  );
+  // The blocked tool must never be advertised back as its own alternative.
+  assert.doesNotMatch(nameKeyed, /instead: [^.]*append_to_current_file/u);
+
+  // Empty authoritative frontier -- the measured case -- must name the exit
+  // rather than leaving the model with no legal move.
+  const stranded = buildRepeatedInvalidToolCallCorrectiveV1({
+    toolName: "append_to_current_file",
+    failureCode: "tool_not_allowed",
+    readyFrontierToolNames: [],
+    repeatKey: "name",
+  });
+  assert.match(stranded, /No other tool is ready\./u);
+  assert.match(
+    stranded,
+    /Return your best final answer and state in one sentence that append_to_current_file could not be completed\./u,
+  );
+  assert.doesNotMatch(stranded, /change the arguments/u);
+});
+
+test("the argument-keyed corrective is unchanged when no repeatKey is given", () => {
+  // Default must stay byte-identical to the historical wording: this change
+  // adds an arm, it does not reword the existing one.
+  const explicit = buildRepeatedInvalidToolCallCorrectiveV1({
+    toolName: "code_validate_fast",
+    failureCode: "workspace_not_found",
+    readyFrontierToolNames: ["code_workspace_create"],
+    repeatKey: "arguments",
+  });
+  const defaulted = buildRepeatedInvalidToolCallCorrectiveV1({
+    toolName: "code_validate_fast",
+    failureCode: "workspace_not_found",
+    readyFrontierToolNames: ["code_workspace_create"],
+  });
+  assert.equal(defaulted, explicit);
+  assert.match(defaulted, /the same arguments failed twice/u);
+  assert.match(defaulted, /Do not repeat this exact call\./u);
+});
+
+test("AgentRunner mints every repeat signature through the shared builder", () => {
+  // Source-level single-authority guard. The bug this fixes was two seats
+  // disagreeing about what "the same failure" means: the step-menu gate
+  // refused on the NAME while the repeat guard remembered name + arguments.
+  // Re-inlining a template literal here would silently restore it.
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const seats =
+    runnerSource.match(/buildInvalidToolCallFailureSignatureV1\(\{/gu) ?? [];
+  assert.equal(
+    seats.length,
+    2,
+    "both repeat-signature seats must call the shared builder",
+  );
+  // No seat may rebuild the signature by hand.
+  assert.doesNotMatch(
+    runnerSource,
+    /\$\{toolCall\.name\}:\$\{failureCode\}:\$\{stableStringify/u,
+    "the argument-keyed signature must not be re-inlined",
+  );
+  assert.doesNotMatch(
+    runnerSource,
+    /\$\{toolCall\.name\}:invalid_arguments:\$\{stableStringify/u,
+    "the literal-contract seat must not re-inline its signature either",
+  );
+  // The corrective must be told which key caught the repeat, or it reverts to
+  // claiming the arguments matched.
+  assert.match(
+    runnerSource,
+    /repeatKey: invalidToolCallRepeatKeyV1\(failureCode\)/u,
+  );
 });

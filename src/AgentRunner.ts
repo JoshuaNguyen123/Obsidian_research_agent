@@ -713,11 +713,13 @@ import {
   pickPreferredNextTool,
 } from "./agent/hostRoutingToolCard";
 import {
+  buildInvalidToolCallFailureSignatureV1,
   buildOffFrontierToolRejectionMessage as buildOffFrontierToolRejectionMessageImpl,
   buildProofGatedWritebackHoldV1,
   buildRepeatedInvalidToolCallCorrectiveV1,
   buildToolRejectEvalV1,
   classifyOffFrontierRefusalV1,
+  invalidToolCallRepeatKeyV1,
   describeOffFrontierToolNearMiss as describeOffFrontierToolNearMissImpl,
   FRONTIER_NARROWED_REFUSAL_CODE_V1,
   FRONTIER_WITHHELD_REFUSAL_CODE_V1,
@@ -15963,8 +15965,17 @@ export async function runAgentMission({
           failureCode === "workspace_not_found" ||
           failureCode === "tool_not_allowed" ||
           failureCode === "plan_dependency_violation");
+      // Name-only refusals (`tool_not_allowed`, `unknown_tool`) are decided by
+      // the step-menu gate BEFORE any argument is read, so keying their repeat
+      // signature on the arguments let a model mint a fresh signature on every
+      // attempt and re-issue a provably futile call until the step budget ran
+      // out. One shared builder now owns what "the same failure" means.
       const argumentFailureSignature = modelArgumentFailure && failureCode
-        ? `${toolCall.name}:${failureCode}:${stableStringify(toolCall.arguments)}`
+        ? buildInvalidToolCallFailureSignatureV1({
+            toolName: toolCall.name,
+            failureCode,
+            argumentsSignature: stableStringify(toolCall.arguments),
+          })
         : null;
       const schemaCorrectionQueued = Boolean(
         argumentFailureSignature &&
@@ -16178,6 +16189,9 @@ export async function runAgentMission({
             content: buildRepeatedInvalidToolCallCorrectiveV1({
               toolName: toolCall.name,
               failureCode: failureCode || "invalid_arguments",
+              // Say which signature caught the repeat, so the corrective never
+              // claims the arguments matched when the name alone did.
+              repeatKey: invalidToolCallRepeatKeyV1(failureCode),
               // "call one of these exact names instead" is a directive, so it
               // owes the same authority the next call will be judged by. This
               // seat used to hand over the whole offered catalog, which is a
@@ -21935,7 +21949,15 @@ export async function runAgentMission({
             message: literalContractError,
           },
         };
-        const failureSignature = `${toolCall.name}:invalid_arguments:${stableStringify(toolCall.arguments)}`;
+        // Same builder as the main seat. `invalid_arguments` is a genuine
+        // argument fault, so this stays argument-keyed -- but it stays that way
+        // because ONE predicate says so, not because two seats independently
+        // happen to agree today.
+        const failureSignature = buildInvalidToolCallFailureSignatureV1({
+          toolName: toolCall.name,
+          failureCode: "invalid_arguments",
+          argumentsSignature: stableStringify(toolCall.arguments),
+        });
         const repeated = invalidToolCallFailureSignatures.has(failureSignature);
         const safeRetry = decideSafeFailureRetry({
           failure: {
