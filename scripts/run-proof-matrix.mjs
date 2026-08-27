@@ -59,6 +59,17 @@ import path from "node:path";
 
 import { nullableCount } from "./honest-counts.mjs";
 import { sweepTestVaultObsidianZombiesV1 } from "./e2e-obsidian-campaign-sweep.mjs";
+import {
+  ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
+  isInfrastructureFailureClass,
+  measuresProduct,
+} from "./product-evidence.mjs";
+
+// Re-exported so this script stays the campaign's single entry point while the
+// DEFINITION lives in scripts/product-evidence.mjs — the same module every eval
+// reader consumes, so the writer's exclusion rule and the readers' pass-rate
+// denominators cannot drift apart.
+export { ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS, isInfrastructureFailureClass };
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
@@ -657,24 +668,6 @@ const LANE_ASSERTION_PATTERNS = [
 
 export const LANE_ASSERTION_FAILURE_CLASS = "lane_assertion_failed";
 export const RENDERER_DEATH_FAILURE_CLASS = "harness:renderer_death";
-
-/**
- * The lane refused to start because a variable IT requires is absent (or
- * unusable) in the process environment. Nothing about the product was
- * exercised, so this is not a red, not a green, and not an attempt: it is
- * terminal for the cell, spends no budget, and is never scored.
- *
- * On 2026-08-26 08:49 `--cells=compound-linear-github` burned all five
- * attempts in three minutes, every one of them dying instantly at
- * compound-flow-real-live.spec.ts:116 on an unset LINEAR_LIVE_TEST_TEAM_ID.
- * Because Playwright still printed a numbered failing-test header, each death
- * matched LANE_ASSERTION_PATTERNS and was filed as `lane_assertion_failed` —
- * the bucket a genuine product failure lands in — and the cell was recorded as
- * "exhausted 5 attempts with streak 0/3". That record is indistinguishable
- * from "the product failed five times" when the truth is that the cell never
- * ran. An instrument must not misreport what it measured.
- */
-export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS = "environment_not_configured";
 
 /**
  * The lane's product assertions ALL PASSED and only its mandatory harness
@@ -1382,6 +1375,8 @@ export function reconcileInFlightAttempt(manifest) {
 }
 
 /**
+ * True when the attempt spends budget and can move the streak.
+ *
  * Attempts exist to measure the PRODUCT. A death in the harness or the matrix
  * process itself (harness:*, process:*) is not evidence about the product, so
  * it must neither spend the cell's attempt budget nor reset its
@@ -1394,16 +1389,14 @@ export function reconcileInFlightAttempt(manifest) {
  * before any attempt record is written, so this exemption is defense in depth
  * — one shared predicate, so budget, streak and counts can never disagree
  * about it if such a record ever reaches the manifest another way.
+ *
+ * That predicate is `measuresProduct` in scripts/product-evidence.mjs, and it
+ * is the same expression every eval reader applies to this campaign's CSV
+ * rows: an attempt that cannot spend budget here cannot enter a pass-rate
+ * denominator there.
  */
-export function isInfrastructureFailureClass(failureClass) {
-  const cls = String(failureClass ?? "");
-  if (cls === ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS) return true;
-  return /^(?:harness|process):/u.test(cls);
-}
-
-/** True when the attempt spends budget and can move the streak. */
 export function attemptConsumesBudget(attempt) {
-  return Boolean(attempt?.green) || !isInfrastructureFailureClass(attempt?.failureClass);
+  return measuresProduct(attempt);
 }
 
 export function consecutiveGreens(manifest, cellId) {
