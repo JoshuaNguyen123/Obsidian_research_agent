@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   constrainToolsToMissionGraphFrontier,
   missionGraphFinalOnlyStubOwesRequiredWorkV1,
@@ -12,6 +13,7 @@ import { missionGraphOnlyFinalSynthesisRemainsV1 } from "../src/agent/missionGra
 import {
   authoritativeRefusalFrontierToolNamesV1,
   countReadyMissionGraphToolSlots,
+  missionGraphRunAdmitsDynamicReadContinuationV1,
   readyMissionGraphFrontierToolNamesV1,
 } from "../src/agent/missionGraphSelectors";
 import type { ModelToolDefinition } from "../src/model/types";
@@ -834,5 +836,133 @@ test("the shared predicate never widens past the authority", () => {
       excludeToolNames: ["read_file"],
     }),
     ["code_validate_fast", "code_commit_verified", "code_workspace_create"],
+  );
+});
+
+// --- Instance #17, OFFER side: one predicate for menu and authority ---------
+
+test("the dynamic-read predicate answers for both seats at once", () => {
+  // Non-exact plans have always minted bounded dynamic reads.
+  for (const setLooseCompoundEnabled of [true, false]) {
+    assert.equal(
+      missionGraphRunAdmitsDynamicReadContinuationV1({
+        usesExactPlannedFrontier: false,
+        setLooseCompoundEnabled,
+      }),
+      true,
+    );
+  }
+  // The case that used to disagree: the menu builder said yes
+  // (`setLooseCompoundEnabled ||`), the authority said no. One answer now, and
+  // it is the menu's, because the menu's was the deliberate one.
+  assert.equal(
+    missionGraphRunAdmitsDynamicReadContinuationV1({
+      usesExactPlannedFrontier: true,
+      setLooseCompoundEnabled: true,
+    }),
+    true,
+  );
+  // And an exact planned frontier outside set-loose still admits nothing
+  // unplanned: this is agreement, not a blanket widening.
+  assert.equal(
+    missionGraphRunAdmitsDynamicReadContinuationV1({
+      usesExactPlannedFrontier: true,
+      setLooseCompoundEnabled: false,
+    }),
+    false,
+  );
+});
+
+test("the offered menu and the authority read the same predicate", () => {
+  // The end state the two booleans must reach: whatever the predicate says,
+  // `includeCapabilityReads` and `allowDynamicReadContinuation` agree, so the
+  // menu can never advertise a read the authority refuses.
+  const offered = ["read_current_file", "read_file", "web_search"];
+  const graph = {
+    nodes: {
+      "tool-01-append_to_current_file": {
+        id: "tool-01-append_to_current_file",
+        status: "ready",
+        allowedTools: ["append_to_current_file"],
+        inputs: {},
+        outputs: {},
+      },
+      final: { id: "final", status: "queued", allowedTools: [], inputs: {}, outputs: {} },
+    },
+    capabilityEnvelope: {
+      tools: Object.fromEntries(
+        offered.map((name) => [name, { effect: "read" }]),
+      ),
+    },
+  } as any;
+  const menu = ["append_to_current_file", ...offered].map(tool);
+
+  for (const usesExactPlannedFrontier of [true, false]) {
+    for (const setLooseCompoundEnabled of [true, false]) {
+      const admits = missionGraphRunAdmitsDynamicReadContinuationV1({
+        usesExactPlannedFrontier,
+        setLooseCompoundEnabled,
+      });
+      const names = constrainToolsToMissionGraphFrontier(menu, graph, {
+        includeCapabilityReads: admits,
+        allowDynamicReadContinuation: admits,
+      }).map((definition) => definition.function.name);
+      const admitted = new Set(
+        authoritativeRefusalFrontierToolNamesV1({
+          graph,
+          candidateToolNames: names,
+          allowDynamicReadContinuation: admits,
+        }),
+      );
+      assert.deepEqual(
+        names.filter((name) => !admitted.has(name)),
+        [],
+        `offered-but-refused names for exact=${usesExactPlannedFrontier} setLoose=${setLooseCompoundEnabled}`,
+      );
+      assert.equal(names.includes("read_current_file"), admits);
+    }
+  }
+});
+
+test("no AgentRunner menu seat re-inlines its own capability-read answer", () => {
+  // Source-level guard, the same shape that stopped runPlan re-inlining shared
+  // classifiers. Both `includeCapabilityReads` seats in AgentRunner (step start
+  // and the mid-response refresh) once carried their own
+  // `setLooseCompoundEnabled || ...` copy while the authority got
+  // `dynamicReadContinuationAllowed()` alone. A future edit that re-inlines
+  // either copy silently reopens instance #17, and no behavioural test can see
+  // it until a live run enumerates the menu one `tool_not_allowed` at a time.
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const seats = [
+    ...runnerSource.matchAll(/includeCapabilityReads:\s*([^,\n]*(?:\n\s*[^,\n]*)?)/gu),
+  ].map((match) => match[1]!.trim());
+  assert.ok(seats.length >= 2, "both menu-builder seats must be found");
+  for (const expression of seats) {
+    assert.equal(
+      expression,
+      "dynamicReadContinuationAllowed()",
+      "every offered-menu seat must read the shared predicate verbatim",
+    );
+  }
+  // ...and every seat that reads it must sit beside an authority field reading
+  // the identical call, so the pair cannot drift apart again.
+  assert.equal(
+    runnerSource.split("includeCapabilityReads: dynamicReadContinuationAllowed(),")
+      .length - 1,
+    seats.length,
+  );
+  assert.ok(
+    runnerSource.includes("missionGraphRunAdmitsDynamicReadContinuationV1"),
+    "dynamicReadContinuationAllowed must delegate to the shared predicate",
+  );
+  assert.equal(
+    /const dynamicReadContinuationAllowed = \(\): boolean =>\s*!missionGraphUsesExactPlannedFrontier/u.test(
+      runnerSource,
+    ),
+    false,
+    "the authority must not go back to answering this on its own",
   );
 });

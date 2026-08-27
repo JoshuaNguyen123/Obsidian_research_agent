@@ -172,6 +172,68 @@ export function readyMissionGraphFrontierToolNamesV1(
 }
 
 /**
+ * THE one answer to "may this run materialize a bounded dynamic read node for a
+ * read-effect capability grant that has no ready node?".
+ *
+ * Both sides of that question must read this and nothing else:
+ *   OFFER     `constrainToolsToMissionGraphFrontier`'s `includeCapabilityReads`
+ *             (which unions every read-effect grant in
+ *             `graph.capabilityEnvelope.tools` into the offered menu) and its
+ *             `allowDynamicReadContinuation`.
+ *   AUTHORITY `MissionGraphSession.beginToolExecution`'s
+ *             `allowDynamicReadContinuation`, via AgentRunner's
+ *             `beginMissionGraphTool`.
+ *
+ * They used to compute it separately and differed by exactly one disjunct
+ * (`setLooseCompoundEnabled ||`, present only on the offer side), so a set-loose
+ * run over an exact planned frontier advertised capability reads and then
+ * refused every one of them. That is the OFFER-side half of instance #17; the
+ * refusal-side half is `authoritativeRefusalFrontierToolNamesV1` below.
+ *
+ * Why the AUTHORITY was the side out of step, not the offer:
+ *
+ *   `setLooseCompoundEnabled` entered the menu builder in 3fbe93e, in the same
+ *   edit that stopped handing the exact `stepGraph` to
+ *   `bindExactWorkspaceDestinationToolSchemas` under set-loose
+ *   (`missionGraphUsesExactPlannedFrontier && !setLooseCompoundEnabled`). Both
+ *   halves of that edit say one thing: a set-loose compound run deliberately
+ *   opts out of exact-planned-frontier narrowing and expands to the stage
+ *   Soft-union. So the wider offer was the deliberate side.
+ *
+ *   The authority was never taught any of it. A set-loose run does have one
+ *   tolerance for unplanned work — `mayBypassMissionGraphStartForSetLoose-
+ *   SoftCompanion`, whose refusal AgentRunner swallows so the call still runs —
+ *   but its allowlist is the stage ladder (`toolsOfferedForSetLooseTurn`), not
+ *   `capabilityEnvelope.tools`. The reads unioned in here are in the envelope
+ *   and NOT on that ladder, so they got no bypass and hard-refused. The offer
+ *   grew a set-loose case; the authority kept answering `!exact`.
+ *
+ * Fail closed, by construction — this can never make an unplanned MUTATION
+ * ready:
+ *   - It unlocks exactly one branch of `beginToolExecution`: the one reached
+ *     only after `grant.effect === "read"`. A grant with any other effect is
+ *     judged by a different branch (completed template + continuation reserve
+ *     node) that never reads this flag.
+ *   - A tool absent from `graph.capabilityEnvelope.tools` is refused before
+ *     this flag is consulted, so "set loose" widens nothing beyond the envelope
+ *     the mission's own plan authored.
+ *   - The node it permits is bounded: one tool call, zero external actions,
+ *     envelope-derived wall clock, envelope retry ceiling.
+ */
+export function missionGraphRunAdmitsDynamicReadContinuationV1(input: {
+  /** AgentRunner's `missionGraphUsesExactPlannedFrontier`. */
+  usesExactPlannedFrontier: boolean;
+  /** AgentRunner's `setLooseCompoundEnabled`. */
+  setLooseCompoundEnabled: boolean;
+}): boolean {
+  // A non-exact plan has always materialized bounded dynamic reads.
+  if (input.usesExactPlannedFrontier !== true) return true;
+  // An exact planned frontier admits them only on the set-loose compound runs
+  // whose menu builder has offered them since 3fbe93e.
+  return input.setLooseCompoundEnabled === true;
+}
+
+/**
  * THE one answer to "which tool names may a host MESSAGE name, given that the
  * mission-graph authority will judge whatever the model calls next?".
  *

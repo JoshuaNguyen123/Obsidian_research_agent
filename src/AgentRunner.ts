@@ -434,6 +434,10 @@ import {
   isMissionGraphAcceptablyComplete,
   isReceiptBackedFinalProjectionReady,
   missionGraphOnlyFinalSynthesisRemainsV1,
+  // The OFFER-side half of the same rule: the menu builder and the authority
+  // that judges calls from it must read ONE predicate, or the menu advertises
+  // capability reads the graph then refuses.
+  missionGraphRunAdmitsDynamicReadContinuationV1,
   reconcileOutstandingMissionGraphToolStepBudget,
   resolveMissionGraphExecutionProofContractV1,
   toMissionEvidenceAttestation,
@@ -5489,16 +5493,21 @@ export async function runAgentMission({
   }
 
   /**
-   * The base answer to "will MissionGraphSession materialize a bounded dynamic
-   * node for a tool that has no ready node?". An exact planned frontier says
-   * no. The offered menu must be built from this same answer: when it is not,
-   * the run advertises capability reads and then refuses every one of them,
-   * and a model whose only way to discover that is to call them enumerates the
-   * whole list. `allowExactBootstrapRead` is a deliberate per-call exception
-   * the offer cannot anticipate, so it stays at the call site.
+   * The ONE answer to "will MissionGraphSession materialize a bounded dynamic
+   * node for a tool that has no ready node?" — for the offered menu and for the
+   * authority alike. Both read this same call, so the menu cannot advertise a
+   * capability read `beginToolExecution` will refuse (and a model whose only
+   * way to discover that is to call them cannot enumerate the whole list, one
+   * `tool_not_allowed` at a time). The `setLooseCompoundEnabled` disjunct used
+   * to live only in the menu builder; it is inside the shared predicate now.
+   * `allowExactBootstrapRead` is a deliberate per-call exception the offer
+   * cannot anticipate, so it stays at the call site.
    */
   const dynamicReadContinuationAllowed = (): boolean =>
-    !missionGraphUsesExactPlannedFrontier;
+    missionGraphRunAdmitsDynamicReadContinuationV1({
+      usesExactPlannedFrontier: missionGraphUsesExactPlannedFrontier,
+      setLooseCompoundEnabled,
+    });
 
   const beginMissionGraphTool = async (
     toolName: string,
@@ -18297,8 +18306,15 @@ export async function runAgentMission({
                 // MissionGraphSession materializes each such call as a bounded dynamic
                 // node. Explicit ordered workflows expose the exact ready node only.
                 // Set-loose compound expands to the stage Soft-union instead.
-                includeCapabilityReads:
-                  setLooseCompoundEnabled || dynamicReadContinuationAllowed(),
+                //
+                // ONE predicate, both fields, same call the authority gets in
+                // `beginMissionGraphTool`. `setLooseCompoundEnabled ||` used to
+                // sit on the first field alone, which is precisely the boolean
+                // of disagreement that made this menu advertise capability
+                // reads `beginToolExecution` then refused. It now lives inside
+                // `dynamicReadContinuationAllowed()`, so widening the offer is
+                // impossible without widening the authority by the same edit.
+                includeCapabilityReads: dynamicReadContinuationAllowed(),
                 allowDynamicReadContinuation:
                   dynamicReadContinuationAllowed(),
                 // Shrink schemas for cloud tool-calling models by route bucket.
@@ -18759,18 +18775,29 @@ export async function runAgentMission({
         }).unpaid,
       );
       const readyToolNames = stepTools.map((tool) => tool.function.name);
-      // `offered:` below stays the true offered menu — those schemas really are
-      // callable shapes and hiding them would strand the turn. `preferredNext`
-      // is a DIRECTIVE, so it owes the authority that will judge the call:
-      // naming a capability read the exact planned frontier will refuse is the
-      // same lie the refusal seat used to tell, one turn earlier.
-      const preferredNext = pickPreferredNextTool({
-        unpaidDeliveryTools,
-        readyFrontierToolNames: authoritativeRefusalFrontierToolNamesV1({
+      // The card's header says "authoritative; call only listed tools", so the
+      // `offered:` list under it is a DIRECTIVE exactly like `preferredNext`
+      // and owes the same authority. With the menu builder and
+      // `beginToolExecution` now reading one predicate the two agree on
+      // capability reads by construction; what remains is host-side menu drift
+      // the authority never saw (schemasForStep route bases, and running nodes
+      // that the ready-frontier selector deliberately under-reports). List the
+      // authority-admitted intersection and claim authority in the header only
+      // then. When that intersection is empty the card falls back to the raw
+      // offered menu and DROPS the claim rather than printing an empty
+      // "call only listed tools" directive: an honest menu beats a true but
+      // unusable one, and the schemas were offered either way.
+      const authoritativeOfferedToolNames =
+        authoritativeRefusalFrontierToolNamesV1({
           graph: missionGraphSession?.graph ?? missionGraph,
           candidateToolNames: readyToolNames,
           allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
-        }),
+        });
+      const offeredToolsAreAuthoritative =
+        authoritativeOfferedToolNames.length > 0;
+      const preferredNext = pickPreferredNextTool({
+        unpaidDeliveryTools,
+        readyFrontierToolNames: authoritativeOfferedToolNames,
       });
       const routingCard =
         setLooseCompoundEnabled && stepTools.length > 0
@@ -18784,8 +18811,11 @@ export async function runAgentMission({
               setLoose: true,
               unpaidDelivery: unpaidDelivery.map(String),
               preferredNextTool: preferredNext,
+              offeredToolsAreAuthoritative,
               offeredToolLines: buildOfferedToolLines({
-                readyFrontierToolNames: readyToolNames,
+                readyFrontierToolNames: offeredToolsAreAuthoritative
+                  ? authoritativeOfferedToolNames
+                  : readyToolNames,
               }),
             })
           : null;
@@ -21263,8 +21293,15 @@ export async function runAgentMission({
                 tools,
                 refreshedGraph,
                 {
-                  includeCapabilityReads:
-                    setLooseCompoundEnabled || !missionGraphUsesExactPlannedFrontier,
+                  // The mid-response refresh is the SAME offered menu one turn
+                  // later, so it owes the same authority. It carried its own
+                  // inlined copy of the disagreeing disjunct and passed no
+                  // `allowDynamicReadContinuation` at all, which let the
+                  // set-loose Soft-companion filter default open. One predicate,
+                  // both fields, exactly as at step start.
+                  includeCapabilityReads: dynamicReadContinuationAllowed(),
+                  allowDynamicReadContinuation:
+                    dynamicReadContinuationAllowed(),
                   route: runPlan.route,
                   maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
                   setLooseOfferedToolNames: refreshedSetLooseOffered,

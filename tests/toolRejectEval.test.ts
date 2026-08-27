@@ -1109,14 +1109,38 @@ test("every message seat that names a tool consumes the one shared predicate", (
   );
   // pickPreferredNextTool is pure ordering over whatever list it is handed, so
   // the routing card's `preferredNext` is only as honest as its input.
-  const cardAt = runnerSource.indexOf("const preferredNext = pickPreferredNextTool({");
-  assert.ok(cardAt > 0, "routing-card preferredNext not found");
-  const cardWindow = runnerSource.slice(cardAt, cardAt + 700);
-  assert.match(cardWindow, /authoritativeRefusalFrontierToolNamesV1\(\{/u);
-  // The offered list itself stays the true offered menu -- narrowing what the
-  // model MAY call is a different change with a different blast radius.
-  assert.match(
-    runnerSource.slice(cardAt, cardAt + 1400),
-    /offeredToolLines: buildOfferedToolLines\(\{\s*readyFrontierToolNames: readyToolNames,/u,
+  const authorityAt = runnerSource.indexOf(
+    "const authoritativeOfferedToolNames =",
   );
+  assert.ok(authorityAt > 0, "routing-card authority list not found");
+  const cardAt = runnerSource.indexOf(
+    "const preferredNext = pickPreferredNextTool({",
+    authorityAt,
+  );
+  assert.ok(cardAt > authorityAt, "routing-card preferredNext not found");
+  assert.match(
+    runnerSource.slice(authorityAt, cardAt),
+    /authoritativeRefusalFrontierToolNamesV1\(\{/u,
+  );
+  assert.match(
+    runnerSource.slice(cardAt, cardAt + 400),
+    /readyFrontierToolNames: authoritativeOfferedToolNames,/u,
+  );
+  // OFFER-side half. This guard used to pin the residual instead: the card's
+  // `offered:` list stayed the raw step menu, on the reasoning that narrowing
+  // what the model MAY call has a different blast radius. It still does -- and
+  // this is not that change. `stepTools` is untouched, so every schema stays
+  // callable; only the card's TEXT narrows. That matters because the header
+  // over it says "authoritative; call only listed tools", which promises
+  // callability the raw menu could not keep on a set-loose run over an exact
+  // planned frontier. The list is now the authority-admitted intersection, and
+  // the header claims authority only when it is (fail-closed: an empty
+  // intersection falls back to the raw menu AND drops the claim, because an
+  // empty "call only listed tools" directive is a deadlock, not a truth).
+  const cardBody = runnerSource.slice(cardAt, cardAt + 1400);
+  assert.match(
+    cardBody,
+    /offeredToolLines: buildOfferedToolLines\(\{\s*readyFrontierToolNames: offeredToolsAreAuthoritative\s*\?\s*authoritativeOfferedToolNames\s*:\s*readyToolNames,/u,
+  );
+  assert.match(cardBody, /offeredToolsAreAuthoritative,/u);
 });

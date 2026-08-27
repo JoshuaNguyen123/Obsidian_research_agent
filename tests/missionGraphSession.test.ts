@@ -3,7 +3,10 @@ import test from "node:test";
 import { buildHostMissionGraphPlanV1 } from "../src/agent/missionGraphHost";
 import { getRuntimeFrontierToolNames } from "../src/agent/missionGraphAuthority";
 import { constrainToolsToMissionGraphFrontier } from "../src/agent/missionGraphFrontier";
-import { missionGraphOnlyFinalSynthesisRemainsV1 } from "../src/agent/missionGraphSelectors";
+import {
+  missionGraphOnlyFinalSynthesisRemainsV1,
+  missionGraphRunAdmitsDynamicReadContinuationV1,
+} from "../src/agent/missionGraphSelectors";
 import { planMissionGraphV3 } from "../src/agent/missionGraphPlanner";
 import {
   MissionGraphSession,
@@ -2262,6 +2265,184 @@ test("exact workflow authority refuses to mint a dynamic read continuation", asy
     Object.keys(session.graph.nodes).some((id) => id.startsWith("retry-")),
     false,
   );
+});
+
+test("a set-loose exact-frontier run admits every capability read it offers", async () => {
+  // OFFER-side half of instance #17 (the refusal-side half landed in d1bed4c).
+  // A live compound run refused `append_file`, ordered "Preferred next:
+  // read_current_file. Call that exact name.", and then refused
+  // `read_current_file` too — because the offered menu was built with
+  // `setLooseCompoundEnabled || dynamicReadContinuationAllowed()` while
+  // `beginToolExecution` was handed `dynamicReadContinuationAllowed()` alone.
+  // On a set-loose run over an exact planned frontier those differ by exactly
+  // the capability-read set, so every read on that menu was a guaranteed
+  // failed tool call the host itself caused. The code is
+  // `mission_graph_authority_blocked`, not `tool_not_allowed`: these names ARE
+  // in the offered menu, so they clear the off-frontier gate and die at the
+  // authority behind it. Both count against tool-call success.
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-set-loose-capability-read",
+    // All three are granted, so all three sit in `capabilityEnvelope.tools`...
+    allowedTools: [
+      "append_to_current_file",
+      "read_current_file",
+      "replace_current_file",
+    ],
+    // ...but only the append is PLANNED. This is the exact planned frontier:
+    // one ready node, plus two grants with no node at all — one read, one
+    // mutation.
+    plannedTools: ["append_to_current_file"],
+    maxToolCalls: 6,
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  assert.equal(
+    session.graph.capabilityEnvelope.tools.read_current_file?.effect,
+    "read",
+  );
+  assert.notEqual(
+    session.graph.capabilityEnvelope.tools.replace_current_file?.effect,
+    "read",
+    "the negative below is only meaningful if this grant is a mutation",
+  );
+
+  // The ONE predicate AgentRunner now hands to BOTH seats. Set-loose over an
+  // exact planned frontier is precisely the case that used to disagree.
+  const admitsDynamicRead = missionGraphRunAdmitsDynamicReadContinuationV1({
+    usesExactPlannedFrontier: true,
+    setLooseCompoundEnabled: true,
+  });
+  assert.equal(admitsDynamicRead, true);
+
+  const offered = constrainToolsToMissionGraphFrontier(
+    ["append_to_current_file", "read_current_file", "replace_current_file"].map(
+      (name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object", properties: {} } },
+      }),
+    ),
+    session.graph,
+    {
+      includeCapabilityReads: admitsDynamicRead,
+      allowDynamicReadContinuation: admitsDynamicRead,
+    },
+  ).map((definition) => definition.function.name);
+  assert.ok(
+    offered.includes("read_current_file"),
+    "the capability read really is on the set-loose menu; this is the offer half",
+  );
+
+  // The defect itself, pinned so the discrimination needs no archaeology. This
+  // is the pair the two seats used to compute independently: the menu built
+  // with `setLooseCompoundEnabled || ...` (true) against an authority handed
+  // `dynamicReadContinuationAllowed()` (false, because the frontier is exact).
+  // `missionGraphSession` and `missionGraphFrontier` are untouched by the fix,
+  // so this reproduces the live step-21/step-22 refusal exactly.
+  const underOldPairing = await session.beginToolExecution("read_current_file", {
+    allowDynamicReadContinuation: false,
+  });
+  assert.equal(
+    underOldPairing.ok,
+    false,
+    "the old pairing offered this read and then refused it",
+  );
+  if (!underOldPairing.ok) {
+    assert.match(
+      underOldPairing.reason,
+      /not ready in the exact authoritative mission graph/iu,
+    );
+  }
+  // One predicate cannot produce that pair: both fields are the same call.
+  assert.notEqual(admitsDynamicRead, false);
+
+  // THE contract, and the whole point of the shared predicate: nothing the menu
+  // offers may be refused by the authority that judges the very next call.
+  for (const toolName of offered) {
+    const started = await session.beginToolExecution(toolName, {
+      allowDynamicReadContinuation: admitsDynamicRead,
+    });
+    assert.equal(
+      started.ok,
+      true,
+      `offered ${toolName} must be admitted by the same authority${
+        started.ok ? "" : `: ${started.reason}`
+      }`,
+    );
+  }
+
+  // Fail closed. A granted MUTATION with no planned node is neither offered nor
+  // admitted, and the widened flag does not reach it: `beginToolExecution`
+  // judges non-read grants in a different branch that never consults it. This
+  // is what stops "set loose" from meaning "any tool may run".
+  assert.equal(
+    offered.includes("replace_current_file"),
+    false,
+    "an unplanned mutation is never unioned into the offered menu",
+  );
+  const nodeIdsBeforeMutation = Object.keys(session.graph.nodes);
+  const unplannedMutation = await session.beginToolExecution(
+    "replace_current_file",
+    { allowDynamicReadContinuation: admitsDynamicRead },
+  );
+  assert.equal(unplannedMutation.ok, false);
+  if (!unplannedMutation.ok) {
+    assert.match(
+      unplannedMutation.reason,
+      /not ready in the authoritative mission graph/iu,
+    );
+  }
+  assert.deepEqual(
+    Object.keys(session.graph.nodes),
+    nodeIdsBeforeMutation,
+    "a refused mutation mints no node",
+  );
+});
+
+test("a non-set-loose exact frontier still refuses the capability read it never offers", async () => {
+  // The mirror of the test above: with the shared predicate answering false,
+  // the read is absent from the menu AND refused by the authority. The two
+  // agree in this direction too — the fix is agreement, not a blanket
+  // "capability reads are always allowed".
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-exact-frontier-no-set-loose",
+    allowedTools: ["append_to_current_file", "read_current_file"],
+    plannedTools: ["append_to_current_file"],
+    maxToolCalls: 6,
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const admitsDynamicRead = missionGraphRunAdmitsDynamicReadContinuationV1({
+    usesExactPlannedFrontier: true,
+    setLooseCompoundEnabled: false,
+  });
+  assert.equal(admitsDynamicRead, false);
+
+  const offered = constrainToolsToMissionGraphFrontier(
+    ["append_to_current_file", "read_current_file"].map((name) => ({
+      type: "function" as const,
+      function: { name, parameters: { type: "object", properties: {} } },
+    })),
+    session.graph,
+    {
+      includeCapabilityReads: admitsDynamicRead,
+      allowDynamicReadContinuation: admitsDynamicRead,
+    },
+  ).map((definition) => definition.function.name);
+  assert.deepEqual(offered, ["append_to_current_file"]);
+
+  const denied = await session.beginToolExecution("read_current_file", {
+    allowDynamicReadContinuation: admitsDynamicRead,
+  });
+  assert.equal(denied.ok, false);
+  if (!denied.ok) {
+    assert.match(denied.reason, /exact authoritative mission graph/iu);
+  }
 });
 
 test("a completed effectful template permits a bounded same-authority continuation", async () => {

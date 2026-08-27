@@ -15,6 +15,16 @@ export type HostRoutingToolCardV1 = {
   preferredNextTool: string | null;
   /** Offered tools this turn, max ~12 lines, purpose ≤80 chars each. */
   offeredToolLines: readonly string[];
+  /**
+   * True only when `offeredToolLines` was built from
+   * `authoritativeRefusalFrontierToolNamesV1` — i.e. every listed name is one
+   * the mission-graph authority will admit on the next call. The header claims
+   * "authoritative" only then. Omitted/false means the list is the raw offered
+   * menu, which can still contain a name the graph refuses; a header that
+   * called that authoritative would be the same class of lie the refusal seats
+   * just stopped telling.
+   */
+  offeredToolsAreAuthoritative?: boolean;
 };
 
 /** Fixed short purposes for compound ladder names; fallback = truncated descriptor. */
@@ -118,7 +128,12 @@ export function formatHostRoutingToolCard(card: HostRoutingToolCardV1): string {
       ? card.offeredToolLines.join("\n")
       : "- (none)";
   const text = [
-    "HOST ROUTING CARD (authoritative; call only listed tools):",
+    // "call only listed tools" is a restriction and stays true either way.
+    // "authoritative" additionally promises that every listed name is callable,
+    // so it is claimed only when the list came from the graph authority.
+    card.offeredToolsAreAuthoritative === true
+      ? "HOST ROUTING CARD (authoritative; call only listed tools):"
+      : "HOST ROUTING CARD (offered menu; call only listed tools):",
     `route=${card.route || "unknown"} stages=${stages} currentStage=${card.currentStage ?? "none"} setLoose=${card.setLoose ? "true" : "false"}`,
     `unpaid=${unpaid} preferredNext=${card.preferredNextTool ?? "none"}`,
     "offered:",
