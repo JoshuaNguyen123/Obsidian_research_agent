@@ -25,8 +25,49 @@ const DESIGN_INTENT = new RegExp(
 const EXPLICIT_CANVAS_DESTINATION_INTENT =
   /\b(?:put|place|move|send|turn|convert|transform)\b[\s\S]{0,160}\b(?:on|onto|in|into|as|to)\s+(?:an?\s+)?(?:obsidian\s+)?canvas\b|\b(?:want|need|prefer|would\s+like)\b[\s\S]{0,160}\b(?:on|onto|in|into|as)\s+(?:an?\s+)?(?:obsidian\s+)?canvas\b/i;
 
-const HTML_PREVIEW_INTENT =
-  /\b(html|css|webpage|web\s*page|preview)\b/i;
+// HTML-preview intent had TWO definitions -- this one and a structurally
+// different copy in `promptIntentClassifiers` -- and they INVERTED each other
+// on the two most ordinary phrasings (audited 2026-08-26): "open the html
+// file" was true here and false there, "show me the mockup" was true there and
+// false here. Five of the eight witness prompts in the test split them
+// (re-verified by execution, 2026-08-26, not by reading).
+//
+// The shared copy's SHAPE was the correct one and is adopted here: a viewing
+// verb must sit near an artifact noun. The old local test was two independent
+// unanchored regexes with `preview` in BOTH of them, so a bare "preview it"
+// -- naming no artifact at all -- claimed HTML-preview capability, and any
+// prompt that said "show" anywhere and "css" anywhere matched across
+// unrelated sentences.
+//
+// The vocabulary is the union of the two: this copy's `display`/`open` verbs
+// and one-word `webpage`, plus the shared copy's `mockup`/`prototype` nouns.
+const HTML_PREVIEW_VERB = "preview|render|show|display|open";
+const HTML_PREVIEW_ARTIFACT = "html|css|webpage|web\\s+page|mockup|prototype";
+
+const HTML_PREVIEW_INTENT = new RegExp(
+  `\\b(?:${HTML_PREVIEW_VERB})\\b[\\s\\S]{0,100}\\b(?:${HTML_PREVIEW_ARTIFACT})\\b|` +
+    `\\b(?:${HTML_PREVIEW_ARTIFACT})\\b[\\s\\S]{0,100}\\b(?:${HTML_PREVIEW_VERB})\\b`,
+  "i",
+);
+
+/**
+ * STRIP-THEN-TEST. Both copies answered TRUE to "do not preview the html".
+ * Closed-class fillers only, so an affirmative ask after a negated clause
+ * ("do not edit it, just show the mockup") survives.
+ */
+const NEGATED_HTML_PREVIEW_CLAUSE = new RegExp(
+  "\\b(?:no|not|without|avoid(?:ing)?|skip(?:ping)?|omit(?:ting)?|don'?t|do\\s+not|never)\\s+" +
+    "(?:need\\s+(?:to|for)\\s+)?(?:bother\\s+(?:to|with)\\s+)?" +
+    `(?:${HTML_PREVIEW_VERB}|previewing|rendering|showing|displaying|opening)\\s+` +
+    "(?:the\\s+|a\\s+|an\\s+|any\\s+|it\\s+|me\\s+)*" +
+    `(?:${HTML_PREVIEW_ARTIFACT})\\b`,
+  "gi",
+);
+
+/** Exported for tests and for seats that want to show their work. */
+export function stripNegatedHtmlPreviewClausesV1(value: string): string {
+  return value.replace(NEGATED_HTML_PREVIEW_CLAUSE, " ");
+}
 
 const REVISE_DESIGN_INTENT =
   /\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b[\s\S]{0,80}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|block)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|block)\b[\s\S]{0,80}\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b/i;
@@ -76,9 +117,13 @@ export function hasExplicitCanvasDestinationIntent(prompt: string): boolean {
   return EXPLICIT_CANVAS_DESTINATION_INTENT.test(prompt);
 }
 
+/**
+ * THE html-preview predicate. `promptIntentClassifiers` re-exports this one;
+ * AgentRunner and runPlan reach it through that re-export, so route, frontier
+ * and design tooling cannot disagree about it again.
+ */
 export function hasHtmlPreviewIntent(prompt: string): boolean {
-  return HTML_PREVIEW_INTENT.test(prompt) &&
-    /\b(preview|render|show|display|open)\b/i.test(prompt);
+  return HTML_PREVIEW_INTENT.test(stripNegatedHtmlPreviewClausesV1(prompt));
 }
 
 export function hasReviseDesignIntent(prompt: string): boolean {

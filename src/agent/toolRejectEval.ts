@@ -105,13 +105,24 @@ const cleanNames = (names: readonly string[]): string[] =>
  * unfamiliar" -- an unfamiliar name is exactly what genuine misselection looks
  * like, and must stay in its own class.
  *
- * MERGE NOTE. `AgentRunner.isPlaceholderToolNameV1` (595075e, on main) answers
- * this same question for the REPAIR path, which rewrites a placeholder to the
- * offered tool when exactly one read-effect tool is offered. Two predicates
- * for one question is how classifiers drift here, so this body is deliberately
- * the SAME logic, not a second opinion: when the branches merge, delete one and
- * have the other import it. `toolRejectEval` is the correct home -- AgentRunner
- * already imports this module, so the dependency only points one way.
+ * The shapes covered: `$TOOL_NAME`, `${toolName}`, `<tool_name>`, `{{tool}}`,
+ * `your_tool_name`. Cheap models emit these mid-ladder when they compose the
+ * next call from a remembered function-calling form instead of the offered
+ * schema list (observed live in the compound flow lane, 2026-08-26: a literal
+ * `$TOOL_NAME` call right after a successful read_template).
+ *
+ * No installed tool name can match these shapes -- every real name is
+ * snake_case words without `$`, `<`, or `{` -- so this cannot shadow a real
+ * tool.
+ *
+ * MERGE NOTE DISCHARGED (2026-08-26). This was the classification seat; the
+ * REPAIR seat in AgentRunner -- which rewrites a placeholder to the offered
+ * tool when exactly one read-effect tool is offered -- carried a byte-identical
+ * second copy named `isPlaceholderToolNameV1`. That copy is deleted and
+ * AgentRunner now imports this function, re-exporting it under the old name so
+ * existing importers keep working. This is the single definition; the only
+ * difference between the two bodies was null-tolerance, which this signature
+ * keeps.
  */
 export function looksLikeUnfilledToolNamePlaceholderV1(
   toolName: string | null | undefined,

@@ -1,5 +1,6 @@
 import type { MissionEvidence } from "./missionLedger";
 import { isBroadUnscopedVaultMutation } from "./missionScope";
+import { hasWordCountIntent } from "./wordCountIntent";
 import {
   evaluateResearchAcceptance,
   type ResearchPlan,
@@ -399,8 +400,12 @@ function hasVaultEvidence(evidence: MissionEvidence[]): boolean {
   );
 }
 
+// ONE word-count predicate. This was a SIXTH definition, byte-identical to the
+// one in missionPlan that adds the `word_count` proof obligation -- so the seat
+// that DEMANDS the evidence and the seat that CHECKS it were two regexes that
+// merely happened to agree. Both now read the shared predicate.
 function requiresWordCountEvidence(prompt: string): boolean {
-  return /\b(word\s*count|count\s+(?:the\s+)?words?|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(prompt);
+  return hasWordCountIntent(prompt);
 }
 
 function requiresHighlightReceipt(prompt: string): boolean {

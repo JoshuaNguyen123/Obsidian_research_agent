@@ -8,6 +8,7 @@ import {
   isCompletedAcceptedResearchPublicationReceipt,
 } from "../setLooseCompoundAutonomy";
 import { stripWriteVerificationPhrasesV1 } from "../claimLedger";
+import { hasWordCountIntent } from "../wordCountIntent";
 
 export { WRITE_RECEIPT_MISSING, receiptsSatisfyWriteProof };
 
@@ -110,10 +111,13 @@ export function requiresWebEvidence(prompt: string): boolean {
   );
 }
 
+// ONE word-count predicate. This was a SEVENTH definition of the same idea,
+// byte-identical to the acceptance seats in missionPlan and missionAcceptance.
+// The reflex path decides completion; deciding it with a different predicate
+// than the one that offered the tool and demanded the proof is how a mission
+// gets marked complete without the count it was asked for.
 export function requiresWordCount(prompt: string): boolean {
-  return /\b(word\s*count|count\s+(?:the\s+)?words?|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(
-    prompt,
-  );
+  return hasWordCountIntent(prompt);
 }
 
 function hasVaultEvidence(input: AgenticReflexInput): boolean {
