@@ -8,45 +8,47 @@
 // Model attribution joins the run's timestamp (from its id) against the
 // nearest curated row in playwright-run-metrics.csv within 45 minutes; runs
 // outside any window are "(unknown)". Read-only over the vault; best-effort.
+//
+// A joined row whose failure class is infrastructure (harness:*, process:*,
+// environment_not_configured) carries NO product outcome: `run_green` is left
+// blank and `run_infrastructure` says why, so P(run green | tool completed in
+// run) is not depressed by harness deaths in which every tool actually worked.
+// The predicate lives in scripts/product-evidence.mjs, shared with the proof
+// matrix that writes the rows and with the other two eval readers.
 import { readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+
+import {
+  csvRecords,
+  formatRate,
+  runRowIsGreen,
+  runRowIsInfrastructure,
+  toRunRow,
+} from "./product-evidence.mjs";
 
 const EVAL_DIR = path.dirname(fileURLToPath(new URL("../docs/eval/playwright-run-metrics.csv", import.meta.url)));
 const GRAPH_DIR = path.join(process.env.USERPROFILE ?? "", "OneDrive", "Desktop", "test_vault_obsidian_ai", "Agent Runs", "Mission Graphs");
 const OUT = path.join(EVAL_DIR, "tool-events.csv");
 const QUIET = process.argv.includes("--quiet");
 
-function parseCsv(text) {
-  const rows = []; let row = []; let field = ""; let q = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (q) { if (ch === '"') { if (text[i + 1] === '"') { field += '"'; i += 1; } else q = false; } else field += ch; }
-    else if (ch === '"') q = true;
-    else if (ch === ",") { row.push(field); field = ""; }
-    else if (ch === "\n" || ch === "\r") {
-      if (ch === "\r" && text[i + 1] === "\n") i += 1;
-      row.push(field); field = "";
-      if (row.length > 1 || row[0] !== "") rows.push(row);
-      row = [];
-    } else field += ch;
-  }
-  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
-  return rows;
-}
-
-// Curated run rows: [timestampMs, model, isGreen]
+// Curated run rows: timestamp, model, and the run's product outcome — where
+// one exists. Infrastructure rows keep their timestamp and model (so the
+// nearest-run join cannot skip past them onto a further-away product row) but
+// carry no green/red verdict at all.
 function loadRunIndex() {
   try {
-    const rows = parseCsv(readFileSync(path.join(EVAL_DIR, "playwright-run-metrics.csv"), "utf8"));
-    const header = rows[0];
-    const col = (name) => header.indexOf(name);
-    return rows.slice(1).map((c) => ({
-      at: Date.parse(c[col("run_started_at")] ?? ""),
-      model: (c[col("model")] ?? "").trim(),
-      green: (c[col("primary_failure_class")] ?? "").trim() === "none" ||
-        /passed|green|write_completed|fix_merged/i.test(c[col("mission_outcome")] ?? ""),
-    })).filter((r) => Number.isFinite(r.at) && r.model);
+    const records = csvRecords(readFileSync(path.join(EVAL_DIR, "playwright-run-metrics.csv"), "utf8"));
+    return records.map((cells) => {
+      const row = toRunRow(cells);
+      const infrastructure = runRowIsInfrastructure(row);
+      return {
+        at: Date.parse(cells.run_started_at ?? ""),
+        model: (cells.model ?? "").trim(),
+        infrastructure,
+        green: infrastructure ? null : runRowIsGreen(row),
+      };
+    }).filter((r) => Number.isFinite(r.at) && r.model);
   } catch { return []; }
 }
 
@@ -86,7 +88,10 @@ try {
         missionId,
         at: Number.isFinite(ms) ? new Date(ms).toISOString() : "",
         model: joined?.model ?? "(unknown)",
-        runGreen: joined ? String(joined.green) : "",
+        // Blank = no product outcome for this run. Unjoined runs and
+        // infrastructure deaths are both unknown here, never "false".
+        runGreen: joined && joined.green !== null ? String(joined.green) : "",
+        runInfrastructure: joined ? String(joined.infrastructure) : "",
         nodeId: node.id ?? "",
         tool,
         status: node.status ?? "",
@@ -96,8 +101,10 @@ try {
     }
   }
 
-  const header = "mission_id,run_started_at,model,run_green,node_id,tool,status,attempts,blocker";
-  const csvLine = (e) => [e.missionId, e.at, e.model, e.runGreen, e.nodeId, e.tool, e.status, e.attempts, e.blocker]
+  // `run_infrastructure` is APPENDED so existing name-indexing readers keep
+  // working: it says WHY a blank run_green is blank.
+  const header = "mission_id,run_started_at,model,run_green,node_id,tool,status,attempts,blocker,run_infrastructure";
+  const csvLine = (e) => [e.missionId, e.at, e.model, e.runGreen, e.nodeId, e.tool, e.status, e.attempts, e.blocker, e.runInfrastructure]
     .map((v) => (String(v).includes(",") ? `"${String(v).replace(/"/g, '""')}"` : String(v))).join(",");
   writeFileSync(OUT, [header, ...events.map(csvLine)].join(String.fromCharCode(10)) + String.fromCharCode(10));
 
@@ -106,7 +113,7 @@ try {
     for (const item of list) { const k = keyFn(item); if (!m.has(k)) m.set(k, []); m.get(k).push(item); }
     return m;
   };
-  const pct = (a, b) => (b ? ((100 * a) / b).toFixed(1) + "%" : "n/a");
+  const pct = formatRate;
   const attempted = events.filter((e) => e.status !== "cancelled" && e.status !== "queued" && e.status !== "ready");
 
   if (!QUIET) {
@@ -131,6 +138,15 @@ try {
     // run going green is the outcome. Precision-style conditional rate.
     console.log(String.fromCharCode(10) + "== Tool effectiveness: P(run green | tool completed in run) ==");
     const withOutcome = attempted.filter((e) => e.runGreen !== "");
+    const excludedInfra = new Set(
+      attempted.filter((e) => e.runInfrastructure === "true").map((e) => e.missionId),
+    );
+    if (excludedInfra.size > 0) {
+      console.log(
+        `  (${excludedInfra.size} run(s) excluded: the run died in the harness, so it has no ` +
+        "product outcome — their tools may well have all worked)",
+      );
+    }
     for (const [tool, list] of [...group(withOutcome.filter((e) => e.status === "complete"), (e) => e.tool)].sort((a, b) => b[1].length - a[1].length).slice(0, 10)) {
       const runs = group(list, (e) => e.missionId);
       const greenRuns = [...runs.values()].filter((nodes) => nodes[0].runGreen === "true").length;

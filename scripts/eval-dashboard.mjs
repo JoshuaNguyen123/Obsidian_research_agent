@@ -8,48 +8,41 @@
 // live in gitignored docs/eval/ so the refresh never dirties the tree that
 // exact-HEAD e2e lanes require clean. Best-effort by design: this script must
 // never fail a test run, so every error path exits 0 with a note.
+//
+// Every pass rate here — markdown, SVG and the generated notebook alike —
+// counts PRODUCT rows only. Infrastructure rows (harness:*, process:*,
+// environment_not_configured) get their own section and their own count. The
+// notebook's Python predicate is GENERATED from the same constants the JS
+// uses (scripts/product-evidence.mjs), because a hand-copied third-and-fourth
+// definition is how this drifted in the first place.
 import { readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import {
+  csvRecords,
+  describeExcludedInfrastructure,
+  partitionRunRows,
+  pythonProductEvidenceSource,
+  runRowIsGreen,
+  toRunRow,
+} from "./product-evidence.mjs";
+
 const EVAL_DIR = path.dirname(fileURLToPath(new URL("../docs/eval/playwright-run-metrics.csv", import.meta.url)));
 const CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
 const QUIET = process.argv.includes("--quiet");
-
-function parseCsv(text) {
-  const rows = []; let row = []; let field = ""; let q = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (q) { if (ch === '"') { if (text[i + 1] === '"') { field += '"'; i += 1; } else q = false; } else field += ch; }
-    else if (ch === '"') q = true;
-    else if (ch === ",") { row.push(field); field = ""; }
-    else if (ch === "\n" || ch === "\r") {
-      if (ch === "\r" && text[i + 1] === "\n") i += 1;
-      row.push(field); field = "";
-      if (row.length > 1 || row[0] !== "") rows.push(row);
-      row = [];
-    } else field += ch;
-  }
-  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
-  return rows;
-}
 
 try {
   try { execFileSync(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "eval-tool-events.mjs"), "--quiet"], { timeout: 120_000 }); } catch {}
   let toolEvents = [];
   try {
-    const teRows = parseCsv(readFileSync(path.join(EVAL_DIR, "tool-events.csv"), "utf8"));
-    const teHeader = teRows[0];
-    const teCol = (name) => teHeader.indexOf(name);
-    toolEvents = teRows.slice(1).map((c) => ({
-      model: c[teCol("model")] ?? "", tool: c[teCol("tool")] ?? "",
-      status: c[teCol("status")] ?? "", runGreen: c[teCol("run_green")] ?? "", missionId: c[teCol("mission_id")] ?? "",
+    toolEvents = csvRecords(readFileSync(path.join(EVAL_DIR, "tool-events.csv"), "utf8")).map((c) => ({
+      model: c.model ?? "", tool: c.tool ?? "",
+      status: c.status ?? "", runGreen: c.run_green ?? "", missionId: c.mission_id ?? "",
+      runInfrastructure: c.run_infrastructure ?? "",
     })).filter((e) => e.tool);
   } catch {}
-  const rows = parseCsv(readFileSync(CSV, "utf8"));
-  const header = rows[0];
-  const col = (name) => header.indexOf(name);
   // Old rows are SHORTER than the appended-column header: a missing cell
   // reads as undefined -> blank -> null/"" here. Blank is unknown, not zero.
   const num = (value) => {
@@ -58,20 +51,24 @@ try {
     const parsed = Number(text);
     return Number.isFinite(parsed) ? parsed : null;
   };
-  const records = rows.slice(1).map((c) => ({
-    at: c[col("run_started_at")] ?? "",
-    model: (c[col("model")] ?? "").trim() || "(unset)",
-    outcome: c[col("mission_outcome")] ?? "",
-    failureClass: (c[col("primary_failure_class")] ?? "").trim() || "none",
-    observed: num(c[col("tool_events_observed")]),
-    failed: num(c[col("tool_events_failed")]),
-    succeeded: num(c[col("tool_calls_succeeded")]),
-    vacuous: num(c[col("tool_calls_vacuous")]),
-    source: String(c[col("tool_events_source")] ?? "").trim(),
-    secondary: String(c[col("secondary_failure_classes")] ?? "").trim(),
-    confidence: String(c[col("classification_confidence")] ?? "").trim(),
+  const records = csvRecords(readFileSync(CSV, "utf8")).map((c) => ({
+    ...toRunRow(c),
+    at: c.run_started_at ?? "",
+    model: (c.model ?? "").trim() || "(unset)",
+    observed: num(c.tool_events_observed),
+    failed: num(c.tool_events_failed),
+    succeeded: num(c.tool_calls_succeeded),
+    vacuous: num(c.tool_calls_vacuous),
+    source: String(c.tool_events_source ?? "").trim(),
+    secondary: String(c.secondary_failure_classes ?? "").trim(),
+    confidence: String(c.classification_confidence ?? "").trim(),
   })).filter((r) => r.at);
-  const isGreen = (r) => r.failureClass === "none" || /passed|green|write_completed|fix_merged/i.test(r.outcome);
+  const isGreen = runRowIsGreen;
+  // `scored` is the only list a pass rate may see; `infrastructure` is
+  // reported beside it, never inside it. Sections that measure something
+  // other than the product (tool-call coverage, the uncertainty ledger) keep
+  // counting every row, and say so.
+  const { scored, infrastructure } = partitionRunRows(records);
 
   const group = (list, keyFn) => {
     const m = new Map();
@@ -80,30 +77,60 @@ try {
   };
   const pct = (a, b) => (b ? Math.round((1000 * a) / b) / 10 : 0);
 
-  const byModel = [...group(records, (r) => r.model)].map(([model, list]) => ({
+  const countIn = (list, keyFn) => {
+    const m = new Map();
+    for (const item of list) {
+      const k = keyFn(item);
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return m;
+  };
+  const infraByModel = countIn(infrastructure, (r) => r.model);
+  const infraByDay = countIn(infrastructure, (r) => r.at.slice(0, 10));
+  const byModel = [...group(scored, (r) => r.model)].map(([model, list]) => ({
     model, runs: list.length, green: list.filter(isGreen).length,
+    infra: infraByModel.get(model) ?? 0,
   })).sort((a, b) => b.runs - a.runs);
-  const byDay = [...group(records, (r) => r.at.slice(0, 10))].map(([day, list]) => ({
+  // A model or day whose ONLY rows were infrastructure deaths still appears,
+  // with an empty rate rather than a 0% one: nothing was measured.
+  for (const [model, infra] of infraByModel) {
+    if (byModel.some((m) => m.model === model)) continue;
+    byModel.push({ model, runs: 0, green: 0, infra });
+  }
+  const byDay = [...group(scored, (r) => r.at.slice(0, 10))].map(([day, list]) => ({
     day, runs: list.length, green: list.filter(isGreen).length,
+    infra: infraByDay.get(day) ?? 0,
   })).sort((a, b) => a.day.localeCompare(b.day));
-  const byClass = [...group(records.filter((r) => !isGreen(r)), (r) => r.failureClass)]
+  for (const [day, infra] of infraByDay) {
+    if (byDay.some((d) => d.day === day)) continue;
+    byDay.push({ day, runs: 0, green: 0, infra });
+  }
+  byDay.sort((a, b) => a.day.localeCompare(b.day));
+  const byClass = [...group(scored.filter((r) => !isGreen(r)), (r) => r.failureClass)]
     .map(([cls, list]) => ({ cls, n: list.length }))
     .sort((a, b) => b.n - a.n);
+  const byInfraClass = [...group(infrastructure, (r) => r.failureClass)]
+    .map(([cls, list]) => ({ cls, n: list.length }))
+    .sort((a, b) => b.n - a.n);
+  const rate = (part, whole) => (whole > 0 ? `${pct(part, whole)}%` : "n/a");
 
   const md = [
     "# Eval KPI dashboard",
     "",
-    `Generated ${new Date().toISOString()} from ${records.length} run rows. Regenerated automatically after every \`npm test\` (posttest hook) and on demand via \`node scripts/eval-dashboard.mjs\`.`,
+    `Generated ${new Date().toISOString()} from ${scored.length} product run rows of ${records.length} recorded. Regenerated automatically after every \`npm test\` (posttest hook) and on demand via \`node scripts/eval-dashboard.mjs\`.`,
     "",
+    ...(infrastructure.length > 0
+      ? [describeExcludedInfrastructure(infrastructure.length, records.length), ""]
+      : []),
     "![KPI charts](kpi-charts.svg)",
     "",
     "## Per model",
     "",
-    "| Model | Runs | Green | Green % |",
-    "|---|---|---|---|",
-    ...byModel.map((m) => `| ${m.model} | ${m.runs} | ${m.green} | ${pct(m.green, m.runs)}% |`),
+    "| Model | Runs | Green | Green % | Infrastructure (excluded) |",
+    "|---|---|---|---|---|",
+    ...byModel.map((m) => `| ${m.model} | ${m.runs} | ${m.green} | ${rate(m.green, m.runs)} | ${m.infra} |`),
     "",
-    "## Failure classes (non-green rows)",
+    "## Failure classes (non-green product rows)",
     "",
     "| Class | Count |",
     "|---|---|",
@@ -111,11 +138,23 @@ try {
     "",
     "A `product:` class appearing more than once is a regression alarm, not a statistic.",
     "",
+    "## Infrastructure (excluded from every pass rate)",
+    "",
+    "Harness/process deaths and unconfigured environments. These rows measured the harness, not the product, so they appear in NO numerator and NO denominator above — counting them as product reds is the exact misattribution the `harness:`/`process:` prefixes exist to end. The proof matrix stopped writing new rows for them on 2026-08-26; the ones below are history, kept visible rather than deleted.",
+    "",
+    ...(byInfraClass.length === 0
+      ? ["None recorded."]
+      : [
+          "| Class | Count |",
+          "|---|---|",
+          ...byInfraClass.map((c) => `| ${c.cls} | ${c.n} |`),
+        ]),
+    "",
     "## By day",
     "",
-    "| Day | Runs | Green | Green % |",
-    "|---|---|---|---|",
-    ...byDay.map((d) => `| ${d.day} | ${d.runs} | ${d.green} | ${pct(d.green, d.runs)}% |`),
+    "| Day | Runs | Green | Green % | Infrastructure (excluded) |",
+    "|---|---|---|---|---|",
+    ...byDay.map((d) => `| ${d.day} | ${d.runs} | ${d.green} | ${rate(d.green, d.runs)} | ${d.infra} |`),
     "",
   ].join("\n");
   const attemptedEvents = toolEvents.filter((e) => !["cancelled", "queued", "ready"].includes(e.status));
@@ -147,9 +186,11 @@ try {
     "",
     "## Tool effectiveness — P(run green | tool completed in run)",
     "",
+    "Runs whose row was an infrastructure death carry no product outcome (`run_green` blank, `run_infrastructure` true in tool-events.csv) and are excluded from this conditional entirely — a harness death in which every tool worked is not evidence that the tools failed.",
+    "",
     "| Tool | Runs with completion | Green | Rate |",
     "|---|---|---|---|",
-    ...effectiveness.map((t) => `| ${t.tool} | ${t.runs} | ${t.green} | ${pct(t.green, t.runs)}% |`),
+    ...effectiveness.map((t) => `| ${t.tool} | ${t.runs} | ${t.green} | ${rate(t.green, t.runs)} |`),
     "",
   ].join(String.fromCharCode(10));
 
@@ -189,7 +230,7 @@ try {
     "",
     "Fed by `tool_events_observed` / `tool_events_failed` / `tool_calls_vacuous` / `tool_calls_succeeded` (provenance per row in `tool_events_source`: summary = the attempt's fresh daily-use run summary, graphs = mined persisted mission graphs). Success % = succeeded/observed, where succeeded EXCLUDES vacuous calls when the vacuous count is known; a blank `tool_calls_vacuous` cell means vacuous completions may still hide inside succeeded. Blank cells are UNKNOWN, never zero.",
     "",
-    `Coverage: ${tcRows.length} of ${records.length} rows carry tool-call data.` +
+    `Coverage: ${tcRows.length} of ${records.length} recorded rows carry tool-call data (product AND infrastructure rows both count here — a tool call a harness death observed is still a real tool call; only PASS RATES exclude infrastructure).` +
       (tcRows.length < records.length ? " Rows without data prove nothing about tool reliability — they are absent, not perfect." : ""),
     "",
     "| Model | Rows | Observed | Failed | Vacuous | Succeeded | Success % |",
@@ -275,24 +316,27 @@ try {
   const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
   let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" font-family="Segoe UI, sans-serif" font-size="12">`;
   svg += `<rect width="${W}" height="${H}" fill="#ffffff"/>`;
-  svg += `<text x="16" y="24" font-size="16" font-weight="bold">Eval KPIs - per-model green rate</text>`;
-  const top = byModel.slice(0, 6);
+  svg += `<text x="16" y="24" font-size="16" font-weight="bold">Eval KPIs - per-model green rate (product rows only)</text>`;
+  const top = byModel.filter((m) => m.runs > 0).slice(0, 6);
   top.forEach((m, i) => {
     const y = 44 + i * 26;
     const w = Math.max(2, 3.4 * pct(m.green, m.runs));
     svg += `<text x="16" y="${y + 12}">${esc(m.model)} (${m.runs})</text>`;
     svg += `<rect x="220" y="${y}" width="340" height="16" fill="#e5e7eb"/>`;
     svg += `<rect x="220" y="${y}" width="${w}" height="16" fill="#16a34a"/>`;
-    svg += `<text x="${226 + 340}" y="${y + 12}">${pct(m.green, m.runs)}%</text>`;
+    svg += `<text x="${226 + 340}" y="${y + 12}">${rate(m.green, m.runs)}</text>`;
   });
   let yBase = 44 + top.length * 26 + 34;
   svg += `<text x="16" y="${yBase - 10}" font-size="16" font-weight="bold">Green rate by day</text>`;
   const chartW = 820, chartH = 120;
   svg += `<rect x="40" y="${yBase}" width="${chartW}" height="${chartH}" fill="#f9fafb" stroke="#d1d5db"/>`;
-  if (byDay.length > 0) {
-    const step = byDay.length > 1 ? chartW / (byDay.length - 1) : 0;
-    const pts = byDay.map((d, i) => {
-      const x = 40 + (byDay.length > 1 ? i * step : chartW / 2);
+  // Days that recorded only infrastructure deaths have no rate to plot: they
+  // are absent from the line rather than drawn at 0%.
+  const plottedDays = byDay.filter((d) => d.runs > 0);
+  if (plottedDays.length > 0) {
+    const step = plottedDays.length > 1 ? chartW / (plottedDays.length - 1) : 0;
+    const pts = plottedDays.map((d, i) => {
+      const x = 40 + (plottedDays.length > 1 ? i * step : chartW / 2);
       const y = yBase + chartH - (chartH * pct(d.green, d.runs)) / 100;
       return { x, y, d };
     });
@@ -303,7 +347,7 @@ try {
     }
   }
   yBase += chartH + 46;
-  svg += `<text x="16" y="${yBase - 10}" font-size="16" font-weight="bold">Failure classes</text>`;
+  svg += `<text x="16" y="${yBase - 10}" font-size="16" font-weight="bold">Failure classes (product rows; ${infrastructure.length} infrastructure rows excluded)</text>`;
   const maxClass = byClass[0]?.n ?? 1;
   byClass.slice(0, 10).forEach((c, i) => {
     const y = yBase + i * 22;
@@ -319,39 +363,58 @@ try {
   // Executed notebook: stdlib-only cells, real outputs captured at generation
   // time via the local python, so the file opens with fresh analysis and the
   // plugin's own sandbox cell runner can re-execute it unchanged.
+  // The green/infrastructure predicate below is GENERATED from the same
+  // constants this script uses (scripts/product-evidence.mjs). It used to be a
+  // third hand-written copy in Python, with no infrastructure exclusion at all
+  // — so the notebook confidently printed a pass rate that counted harness
+  // deaths as product reds.
   const cellSources = [
     [
-      "import csv, collections, re",
-      "rows = list(csv.DictReader(open('playwright-run-metrics.csv', encoding='utf-8')))",
-      "def green(r):",
-      "    return (r.get('primary_failure_class') or '').strip() in ('', 'none') or bool(re.search(r'passed|green|write_completed|fix_merged', r.get('mission_outcome') or '', re.I))",
-      "print(f'{len(rows)} run rows; {sum(1 for r in rows if green(r))} green')",
+      "import csv, collections",
+      ...pythonProductEvidenceSource(),
+      "all_rows = list(csv.DictReader(open('playwright-run-metrics.csv', encoding='utf-8')))",
+      "rows = [r for r in all_rows if measures_product(r)]",
+      "infra = [r for r in all_rows if infrastructure(r)]",
+      "print(f'{len(all_rows)} recorded rows: {len(rows)} product, {len(infra)} infrastructure (excluded from every rate below)')",
+      "print(f'{sum(1 for r in rows if green(r))} of {len(rows)} product rows green')",
     ],
     [
-      "per_model = collections.defaultdict(lambda: [0, 0])",
+      "per_model = collections.defaultdict(lambda: [0, 0, 0])",
       "for r in rows:",
       "    m = (r.get('model') or '').strip() or '(unset)'",
       "    per_model[m][0] += 1",
       "    per_model[m][1] += 1 if green(r) else 0",
-      "for m, (n, g) in sorted(per_model.items(), key=lambda kv: -kv[1][0]):",
-      "    print(f'{m}: {n} runs, {g} green ({100*g/n:.1f}%)')",
+      "for r in infra:",
+      "    per_model[(r.get('model') or '').strip() or '(unset)'][2] += 1",
+      "for m, (n, g, x) in sorted(per_model.items(), key=lambda kv: -kv[1][0]):",
+      "    rate = f'{100*g/n:.1f}%' if n else 'n/a'",
+      "    print(f'{m}: {n} runs, {g} green ({rate}), {x} infrastructure excluded')",
     ],
     [
-      "classes = collections.Counter((r.get('primary_failure_class') or 'none').strip() for r in rows if not green(r))",
+      "classes = collections.Counter(failure_class(r) for r in rows if not green(r))",
       "for cls, n in classes.most_common():",
       "    print(f'{cls}: {n}')",
       "repeats = [c for c, n in classes.items() if c.startswith('product:') and n > 1]",
       "print('REGRESSION ALARM:', repeats if repeats else 'none - every product: class fixed once and gone')",
+      "print()",
+      "print('infrastructure classes (excluded from the rates above):')",
+      "for cls, n in collections.Counter(failure_class(r) for r in infra).most_common():",
+      "    print(f'  {cls}: {n}')",
     ],
     [
-      "days = collections.defaultdict(lambda: [0, 0])",
+      "days = collections.defaultdict(lambda: [0, 0, 0])",
       "for r in rows:",
       "    d = (r.get('run_started_at') or '')[:10]",
       "    if d:",
       "        days[d][0] += 1",
       "        days[d][1] += 1 if green(r) else 0",
-      "for d, (n, g) in sorted(days.items()):",
-      "    print(f'{d}: {n} runs, {g} green ({100*g/n:.1f}%)')",
+      "for r in infra:",
+      "    d = (r.get('run_started_at') or '')[:10]",
+      "    if d:",
+      "        days[d][2] += 1",
+      "for d, (n, g, x) in sorted(days.items()):",
+      "    rate = f'{100*g/n:.1f}%' if n else 'n/a'",
+      "    print(f'{d}: {n} runs, {g} green ({rate}), {x} infrastructure excluded')",
     ],
     [
       "te = list(csv.DictReader(open('tool-events.csv', encoding='utf-8')))",
@@ -371,7 +434,8 @@ try {
     source: [
       "# Eval KPI analysis" + NL, NL,
       "Executed automatically by `scripts/eval-dashboard.mjs` after every `npm test`." + NL,
-      "Cells are Python-stdlib only, so the plugin's own sandbox cell runner can execute this notebook too." + NL,
+      "Cells are Python-stdlib only, so the plugin's own sandbox cell runner can execute this notebook too." + NL, NL,
+      "Every rate below counts PRODUCT rows only: `harness:*`, `process:*` and `environment_not_configured` rows measured the harness, not the product, and appear in no numerator and no denominator. The `green` / `measures_product` helpers in the first cell are generated from `scripts/product-evidence.mjs`, the same definition the proof matrix gates its CSV writes on — edit it there, not here." + NL,
     ],
   }];
   // One python process with a shared namespace, like a real kernel: later
@@ -418,7 +482,7 @@ try {
   };
   writeFileSync(path.join(EVAL_DIR, "kpi-analysis.ipynb"), JSON.stringify(notebook, null, 1) + NL);
 
-  if (!QUIET) console.log(`Eval dashboard regenerated: ${records.length} rows -> kpi-dashboard.md, kpi-charts.svg, kpi-analysis.ipynb`);
+  if (!QUIET) console.log(`Eval dashboard regenerated: ${scored.length} product rows (+${infrastructure.length} infrastructure excluded) -> kpi-dashboard.md, kpi-charts.svg, kpi-analysis.ipynb`);
 } catch (error) {
   if (!QUIET) console.log(`eval-dashboard: skipped (${String(error.message ?? error).slice(0, 160)})`);
 }

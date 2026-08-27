@@ -114,9 +114,17 @@ export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS: "environment_not_configur
  * and still a failure, but harness evidence — never counted as a product red.
  */
 export const HARNESS_CLEANUP_FAILURE_CLASS: "harness:cleanup_failed";
+/**
+ * The provider refused to serve the run (quota, monthly cap, rate limit), so
+ * the product was never exercised. Harness evidence, never a product red.
+ */
+export const PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS: "harness:provider_quota_exhausted";
 export function detectLaneCleanupFailure(
   logText: string,
 ): { lane: string; detail: string; index: number } | null;
+export function detectProviderQuotaExhaustion(
+  logText: string,
+): { detail: string; index: number } | null;
 export function detectMissingRequiredEnvironment(logText: string): string[];
 export const PROOF_MATRIX_STATE_RELATIVE_DIR: string;
 export const PROOF_MATRIX_MANIFEST_RELATIVE_PATH: string;
@@ -143,6 +151,7 @@ export function clearAttemptInFlight(manifest: ProofMatrixManifest): void;
 export function reconcileInFlightAttempt(
   manifest: ProofMatrixManifest,
 ): ProofMatrixAttempt | null;
+export const EMPTY_SCORECARD_HARVEST_MESSAGE: string;
 export function isEmptyScorecardHarvestOutput(output: string): boolean;
 
 export interface ProofMatrixAttempt {
