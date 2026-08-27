@@ -45,10 +45,31 @@ const ASSET_SOURCES = Object.freeze({
   "standalone-worker.cjs": "extensions/companion/generated/standalone-worker.txt",
 });
 
+/**
+ * Every asset source is a text file that .gitattributes pins to `eol=lf`, and
+ * the bytes below are hashed verbatim into companion-assets.json and into the
+ * manifest that main.js bundles. A checkout holding CRLF copies would produce
+ * artifacts no canonical checkout can reproduce, so refuse to hash them.
+ * check:eol-hygiene explains and repairs the whole tree; this is the last stop
+ * before the bad bytes reach a committed artifact.
+ */
+export function findNonCanonicalAssets(files) {
+  return Object.entries(files)
+    .filter(([, content]) => content.includes("\r"))
+    .map(([assetName]) => assetName);
+}
+
 export async function buildCompanionAssets(repoRoot) {
   const files = {};
   for (const [assetName, sourcePath] of Object.entries(ASSET_SOURCES)) {
     files[assetName] = await readFile(path.join(repoRoot, sourcePath), "utf8");
+  }
+
+  const nonCanonical = findNonCanonicalAssets(files);
+  if (nonCanonical.length > 0) {
+    throw new Error(
+      `Companion asset sources hold carriage returns, so their hashes would not match a clean checkout: ${nonCanonical.join(", ")}. Run npm run check:eol-hygiene -- --fix and rebuild.`,
+    );
   }
 
   const fileHashes = Object.fromEntries(
@@ -90,13 +111,20 @@ function sha256(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
-const direct = process.argv[1]
-  ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-  : false;
-if (direct) {
+async function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const result = await buildCompanionAssets(repoRoot);
   console.log(
     `Companion assets artifact written: ${result.fileCount} files, ${result.bundleHash}`,
   );
+}
+
+const direct = process.argv[1]
+  ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
+if (direct) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
 }
