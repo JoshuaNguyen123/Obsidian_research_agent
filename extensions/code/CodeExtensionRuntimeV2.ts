@@ -3212,7 +3212,7 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
     );
     if (
       !providerKinds.includes(provider.provider as typeof providerKinds[number]) ||
-      !["unprobed", "verified", "unavailable", "rejected"].includes(String(provider.state)) ||
+      !["unprobed", "verified", "unavailable", "rejected", "no_verdict"].includes(String(provider.state)) ||
       typeof provider.diagnostic !== "string" ||
       provider.diagnostic.length < 1 ||
       provider.diagnostic.length > 2_000
@@ -3228,7 +3228,7 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
     }
     return {
       provider: provider.provider as typeof providerKinds[number],
-      state: provider.state as "unprobed" | "verified" | "unavailable" | "rejected",
+      state: provider.state as "unprobed" | "verified" | "unavailable" | "rejected" | "no_verdict",
       diagnostic: provider.diagnostic,
       probeFingerprint,
       checkedAt,

@@ -59,7 +59,21 @@ export interface SandboxCommandRunnerV2 {
 
 export interface SandboxProviderStatusV2 {
   provider: SandboxProviderKindV2;
-  state: "unprobed" | "verified" | "unavailable" | "rejected";
+  /**
+   * - `unprobed`   — the probe has not run.
+   * - `verified`   — the probe answered and proved every isolation property.
+   * - `rejected`   — A VERDICT OF FAIL. The probe answered and the boundary did
+   *                  not hold. Terminal; never retried, never softened.
+   * - `unavailable`— the provider could not run the probe at all (non-zero exit
+   *                  or a failed spawn). A host condition, not a verdict.
+   * - `no_verdict` — the probe was killed before answering (timeout or caller
+   *                  abort). Nothing was proven either way.
+   *
+   * Only `verified` ever enables execution; every gate in this module and its
+   * consumers tests positively for `verified`, so a new state can never widen
+   * what is allowed to run.
+   */
+  state: "unprobed" | "verified" | "unavailable" | "rejected" | "no_verdict";
   diagnostic: string;
   probeFingerprint: string | null;
   checkedAt: string | null;
@@ -275,6 +289,69 @@ const PROBE_TIMEOUT_MS = 30_000;
 // fixed boundary command. Keep the ordinary provider budget tight, but allow
 // WSL2 enough time to produce fresh attestation under normal workstation load.
 export const WSL2_SANDBOX_PROBE_TIMEOUT_MS_V2 = 90_000;
+
+/**
+ * Bounded recovery for a boundary probe that produced NO VERDICT.
+ *
+ * A probe answers exactly one question: "is this provider actually confining
+ * code?" There are two failure shapes and they are not interchangeable.
+ *
+ *   - A VERDICT OF FAIL. The probe ran and answered, and the answer did not
+ *     prove isolation (unparseable proof, a false isolation property, a runtime
+ *     digest that is not ours, oversized output). This is `state: "rejected"`.
+ *     It is a security result and it is FINAL: re-running a provider that just
+ *     told us the boundary does not hold could only ever launder a "no" into a
+ *     "yes", so `rejected` is returned immediately and is never re-attempted.
+ *
+ *   - NO VERDICT. The provider process was killed before it could answer, so
+ *     nothing was learned either way. This is `state: "no_verdict"`, and it is
+ *     retriable for exactly the same reason a TCP connection that never
+ *     returned is retriable: no evidence was produced to soften.
+ *
+ * Retrying is admissible here only because the boundary probe command is fixed
+ * (built from provider configuration alone, `stdinMode: "none"`, never carrying
+ * a prepared action or staged repository bytes), so a second attempt has no
+ * workspace side effect and cannot execute repository code.
+ *
+ * ATTEMPTS: 2 (one retry). Host saturation — the measured cause — has a time
+ * constant of minutes, so a third attempt inside the same contention window is
+ * almost perfectly correlated with the second and buys nearly no new
+ * information, while every extra attempt costs a full provider budget in serial
+ * across up to four providers. Two attempts keep the worst case within one
+ * order of the original budget and keep the attestation window tight.
+ */
+export const SANDBOX_PROBE_NO_VERDICT_ATTEMPTS_V2 = 2;
+
+/**
+ * Load-aware escalation, measured rather than guessed.
+ *
+ * The first attempt always runs at the ordinary budget, so a quiet host still
+ * fails fast and nothing about a real rejection gets slower. A timeout on that
+ * first attempt IS the load measurement: it is direct evidence this host could
+ * not complete a fixed probe within the normal budget. Only then do we spend
+ * more, and only once.
+ *
+ * We deliberately do NOT read `os.loadavg()`: it returns [0,0,0] on Windows,
+ * which is precisely the host that runs the WSL2 provider, and the portable
+ * alternative — a synthetic busy-loop benchmark — would burn CPU on an already
+ * saturated machine to produce an arbitrarily calibrated number.
+ *
+ * BOUNDS: the escalated budget is `base * 2`, hard-capped by the ceiling below.
+ * Worst-case wall clock per provider is therefore `base + min(base * 2, ceiling)`
+ * — 90s + 180s for WSL2, 30s + 60s for every other provider — and a probe that
+ * will never answer still fails closed inside that stated bound.
+ */
+export const SANDBOX_PROBE_ESCALATED_TIMEOUT_FACTOR_V2 = 2;
+export const SANDBOX_PROBE_TIMEOUT_CEILING_MS_V2 = 180_000;
+
+/**
+ * Greppable operator markers. These two strings are the difference between "the
+ * sandbox told us it is not safe" and "the sandbox never answered", and they
+ * must stay stable: harness classification greps them to separate an
+ * infrastructure outage from a real boundary defect.
+ */
+export const SANDBOX_PROBE_NO_VERDICT_MARKER_V2 = "sandbox_probe_no_verdict";
+export const SANDBOX_PROBE_BOUNDARY_VIOLATION_MARKER_V2 = "sandbox_probe_boundary_violation";
 
 /**
  * Sandbox-only execution boundary. A runner must be injected explicitly; this
@@ -545,11 +622,7 @@ export class SandboxManagerV2 {
     try {
       execution = await this.runner.run(spec, { stagedFiles, signal: input.signal });
     } catch (error) {
-      const unsupportedStaging =
-        error !== null &&
-        typeof error === "object" &&
-        "code" in error &&
-        (error as { code?: unknown }).code === "unsupported_staging";
+      const unsupportedStaging = sandboxRunnerErrorCodeV2(error) === "unsupported_staging";
       return {
         status: "blocked",
         blocker: blocker(
@@ -665,30 +738,151 @@ export class SandboxManagerV2 {
     provider: SandboxProviderConfigV2,
     signal?: AbortSignal,
   ): Promise<SandboxProviderStatusV2> {
-    const checkedAt = this.now().toISOString();
+    // The fingerprinted spec is ALWAYS the canonical base spec, never the
+    // escalated copy handed to the runner on a retry. prepareExecution() records
+    // a probe fingerprint and executePrepared() re-probes and demands exact
+    // equality, so a probe that needed a retry has to fingerprint identically to
+    // one that passed first try. Folding the escalated timeout — or the attempt
+    // count — into the fingerprint would block every prepared action whose
+    // re-probe took a different number of attempts.
     const spec = buildSandboxProbeCommandV2(provider);
-    try {
-      const result = await this.runner.run(spec, { signal });
-      if (result.exitCode !== 0) {
-        const providerDiagnostic = safeDiagnostic(result.stderr).trim();
+    let lastNoVerdict: { diagnostic: string; timeoutMs: number } | null = null;
+    let attempts = 0;
+
+    for (let attempt = 1; attempt <= SANDBOX_PROBE_NO_VERDICT_ATTEMPTS_V2; attempt += 1) {
+      const checkedAt = this.now().toISOString();
+      const timeoutMs = attempt === 1
+        ? spec.timeoutMs
+        : escalatedProbeTimeoutMsV2(spec.timeoutMs);
+      attempts = attempt;
+      try {
+        const result = await this.runner.run(
+          attempt === 1 ? spec : { ...spec, timeoutMs },
+          { signal },
+        );
+        if (result.exitCode !== 0) {
+          // The provider answered with a failure exit. That is a host condition,
+          // not a boundary verdict, and it is deterministic — not retried.
+          const providerDiagnostic = safeDiagnostic(result.stderr).trim();
+          return {
+            provider: provider.kind,
+            state: "unavailable",
+            diagnostic: [
+              `Probe exited ${result.exitCode}.`,
+              providerDiagnostic,
+            ].filter(Boolean).join(" "),
+            probeFingerprint: null,
+            checkedAt,
+          };
+        }
+        const proof = parseBoundaryProof(result.stdout, provider.runtimeDigest);
+        const probeFingerprint = sha256Canonical({ version: 1, provider, spec, proof });
         return {
           provider: provider.kind,
-          state: "unavailable",
-          diagnostic: [
-            `Probe exited ${result.exitCode}.`,
-            providerDiagnostic,
-          ].filter(Boolean).join(" "),
-          probeFingerprint: null,
+          state: "verified",
+          // A pass that needed a retry must never read like a clean first-try
+          // pass; the recovery is stated in the status an operator reads.
+          diagnostic: lastNoVerdict
+            ? `Boundary probe verified on attempt ${attempt} of ${SANDBOX_PROBE_NO_VERDICT_ATTEMPTS_V2} ` +
+              `after ${SANDBOX_PROBE_NO_VERDICT_MARKER_V2} at ${lastNoVerdict.timeoutMs}ms: ` +
+              `${lastNoVerdict.diagnostic} Retried at ${timeoutMs}ms.`
+            : "Boundary probe verified.",
+          probeFingerprint,
           checkedAt,
         };
+      } catch (error) {
+        const failure = classifyProbeFailureV2(error);
+        if (failure === "verdict") {
+          // A VERDICT OF FAIL: the probe answered and the boundary did not hold.
+          // Return on the spot. No retry, no escalation, no softening.
+          return {
+            provider: provider.kind,
+            state: "rejected",
+            diagnostic: `${SANDBOX_PROBE_BOUNDARY_VIOLATION_MARKER_V2}: ${safeDiagnostic(error)}`,
+            probeFingerprint: null,
+            checkedAt,
+          };
+        }
+        if (failure === "unavailable") {
+          return {
+            provider: provider.kind,
+            state: "unavailable",
+            diagnostic: safeDiagnostic(error),
+            probeFingerprint: null,
+            checkedAt,
+          };
+        }
+        lastNoVerdict = { diagnostic: safeDiagnostic(error), timeoutMs };
+        // Only a timeout earns another attempt. A caller-driven abort produced no
+        // verdict either, but retrying it would ignore the cancellation.
+        if (!isRetriableNoVerdictProbeFailureV2(error) || signal?.aborted) break;
       }
-      const proof = parseBoundaryProof(result.stdout, provider.runtimeDigest);
-      const probeFingerprint = sha256Canonical({ version: 1, provider, spec, proof });
-      return { provider: provider.kind, state: "verified", diagnostic: "Boundary probe verified.", probeFingerprint, checkedAt };
-    } catch (error) {
-      return { provider: provider.kind, state: "rejected", diagnostic: safeDiagnostic(error), probeFingerprint: null, checkedAt };
     }
+
+    // Fail closed and stay loud: no verdict was ever produced, so no provider is
+    // selectable and execution stays blocked.
+    return {
+      provider: provider.kind,
+      state: "no_verdict",
+      diagnostic:
+        `${SANDBOX_PROBE_NO_VERDICT_MARKER_V2}: ${lastNoVerdict?.diagnostic ?? "Boundary probe produced no verdict."} ` +
+        `The boundary was neither proven nor disproven after ${attempts} ` +
+        `attempt${attempts === 1 ? "" : "s"} (last budget ${lastNoVerdict?.timeoutMs ?? spec.timeoutMs}ms).`,
+      probeFingerprint: null,
+      checkedAt: this.now().toISOString(),
+    };
   }
+}
+
+/**
+ * Bounded escalation for the single retry. Never exceeds the stated ceiling, and
+ * never shortens a budget that is already above it.
+ */
+function escalatedProbeTimeoutMsV2(baseTimeoutMs: number): number {
+  return Math.max(
+    baseTimeoutMs,
+    Math.min(baseTimeoutMs * SANDBOX_PROBE_ESCALATED_TIMEOUT_FACTOR_V2, SANDBOX_PROBE_TIMEOUT_CEILING_MS_V2),
+  );
+}
+
+/**
+ * Structural read of a runner error code. The manager deliberately does not
+ * import the spawn runner — it must stay usable with any injected runner — so
+ * the contract is duck-typed on the documented `code` field.
+ */
+export function sandboxRunnerErrorCodeV2(error: unknown): string | null {
+  if (error === null || typeof error !== "object" || !("code" in error)) return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+/**
+ * The single place that decides what a thrown probe failure MEANS. Default is
+ * `"verdict"`: anything this function does not positively recognise as a host
+ * condition is treated as a boundary answer we must respect, so an unfamiliar
+ * error can only ever fail closed and terminally — never become retriable.
+ */
+function classifyProbeFailureV2(error: unknown): "verdict" | "unavailable" | "no_verdict" {
+  switch (sandboxRunnerErrorCodeV2(error)) {
+    // Killed before it could answer. Nothing proven either way.
+    case "provider_timeout":
+    case "provider_aborted":
+      return "no_verdict";
+    // The provider binary never started; it cannot have judged anything.
+    case "provider_spawn_failed":
+      return "unavailable";
+    default:
+      return "verdict";
+  }
+}
+
+/**
+ * The ONLY retriable failure. A timeout is the one code that provably means "we
+ * killed it before it answered under our own budget"; an abort is the caller
+ * asking us to stop and must be obeyed.
+ */
+function isRetriableNoVerdictProbeFailureV2(error: unknown): boolean {
+  return sandboxRunnerErrorCodeV2(error) === "provider_timeout";
 }
 
 export class SandboxManagerV2Error extends Error {
