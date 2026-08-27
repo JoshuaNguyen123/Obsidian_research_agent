@@ -10,6 +10,9 @@ import { verifyPreparedActionFingerprint } from "../src/agent/actions";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
 import {
   SandboxManagerV2,
+  SANDBOX_PROBE_NO_VERDICT_ATTEMPTS_V2,
+  SANDBOX_PROBE_TIMEOUT_CEILING_MS_V2,
+  WSL2_SANDBOX_PROBE_TIMEOUT_MS_V2,
   buildSandboxExecutionCommandV2,
   buildSandboxProbeCommandV2,
   type SandboxCommandRunnerV2,
@@ -1094,6 +1097,230 @@ test("SpawnSandboxCommandRunnerV2 launches only fixed provider argv with clean b
       error instanceof SandboxSpawnRunnerV2Error &&
       error.code === "unsupported_staging",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Boundary-probe recovery. A probe answers "is this sandbox actually confining
+// code?". "It said no" and "it never answered" are different facts: the first is
+// a security verdict and is terminal, the second is an absence of evidence and
+// is retriable. These tests pin that the line between them cannot move.
+// ---------------------------------------------------------------------------
+
+test("a boundary probe with no verdict is retried once and its recovery is visible in diagnostics", async () => {
+  const budgets: number[] = [];
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: {
+      async run(spec) {
+        budgets.push(spec.timeoutMs);
+        if (budgets.length === 1) {
+          throw new SandboxSpawnRunnerV2Error(
+            "provider_timeout",
+            "Sandbox provider process exceeded its fixed timeout.",
+          );
+        }
+        return { exitCode: 0, stdout: PROBE, stderr: "" };
+      },
+    },
+  });
+
+  const status = await manager.probeProviders();
+  assert.equal(status.providers[0]?.state, "verified");
+  assert.equal(status.mode, "sandbox_verified");
+  assert.equal(status.executionAvailable, true);
+  assert.equal(status.selectedProvider, "docker");
+  assert.equal(budgets.length, 2, "a no-verdict probe earns exactly one retry");
+
+  // The recovery must not be silent: a pass that needed a retry cannot read like
+  // a clean first-try pass.
+  const diagnostic = status.providers[0]?.diagnostic ?? "";
+  assert.notEqual(diagnostic, "Boundary probe verified.");
+  assert.match(diagnostic, /verified on attempt 2 of 2/u);
+  assert.match(diagnostic, /sandbox_probe_no_verdict/u);
+
+  // The escalation is measured and bounded, not an arbitrary bigger number.
+  assert.equal(budgets[0], 30_000, "the first attempt keeps the ordinary budget");
+  assert.equal(budgets[1], 60_000, "the retry escalates by the stated factor");
+  assert.ok(
+    budgets[1]! <= SANDBOX_PROBE_TIMEOUT_CEILING_MS_V2,
+    "no attempt may exceed the stated ceiling",
+  );
+});
+
+test("a genuine boundary-violation verdict is never retried and never becomes a pass", async () => {
+  // The probe RUNS and ANSWERS on every attempt; the answer is that the network
+  // was not confined. If this were ever retried, a provider that reports a real
+  // escape could be re-rolled until it happened to report a good one.
+  let attempts = 0;
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: {
+      async run() {
+        attempts += 1;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ ...JSON.parse(PROBE), networkBlocked: false }),
+          stderr: "",
+        };
+      },
+    },
+  });
+
+  const status = await manager.probeProviders();
+  assert.equal(attempts, 1, "a verdict of FAIL is terminal: exactly one attempt");
+  assert.equal(status.providers[0]?.state, "rejected");
+  assert.equal(status.providers[0]?.probeFingerprint, null);
+  assert.equal(status.mode, "editing_only");
+  assert.equal(status.executionAvailable, false);
+  assert.equal(status.selectedProvider, null);
+
+  // The operator signal says "violation", never "no verdict".
+  const diagnostic = status.providers[0]?.diagnostic ?? "";
+  assert.match(diagnostic, /^sandbox_probe_boundary_violation:/u);
+  assert.doesNotMatch(diagnostic, /sandbox_probe_no_verdict/u);
+  assert.match(diagnostic, /did not prove every required isolation property/u);
+
+  // Execution stays blocked, loudly.
+  const prepared = await manager.prepareExecution(prepareInput());
+  assert.equal(prepared.status, "blocked");
+});
+
+test("every attempt timing out still fails closed, distinguishably from a violation", async () => {
+  let attempts = 0;
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: {
+      async run() {
+        attempts += 1;
+        throw new SandboxSpawnRunnerV2Error(
+          "provider_timeout",
+          "Sandbox provider process exceeded its fixed timeout.",
+        );
+      },
+    },
+  });
+
+  const status = await manager.probeProviders();
+  assert.equal(attempts, SANDBOX_PROBE_NO_VERDICT_ATTEMPTS_V2, "recovery stays bounded");
+  assert.equal(status.providers[0]?.state, "no_verdict");
+  assert.equal(status.providers[0]?.probeFingerprint, null);
+
+  // Loud: nothing may run when nothing was proven.
+  assert.equal(status.mode, "editing_only");
+  assert.equal(status.executionAvailable, false);
+  assert.equal(status.selectedProvider, null);
+  assert.equal(status.blocker?.code, "sandbox_provider_unavailable");
+
+  // Greppable and unambiguous, all the way out to the blocker an operator reads.
+  const diagnostic = status.providers[0]?.diagnostic ?? "";
+  assert.match(diagnostic, /^sandbox_probe_no_verdict:/u);
+  assert.doesNotMatch(diagnostic, /sandbox_probe_boundary_violation/u);
+  assert.match(diagnostic, /neither proven nor disproven after 2 attempts/u);
+  assert.match(status.blocker?.message ?? "", /docker no_verdict: sandbox_probe_no_verdict:/u);
+
+  const prepared = await manager.prepareExecution(prepareInput());
+  assert.equal(prepared.status, "blocked");
+});
+
+test("a caller abort yields no verdict but is not retried", async () => {
+  let attempts = 0;
+  const controller = new AbortController();
+  const manager = new SandboxManagerV2({
+    providers: [dockerProvider()],
+    runner: {
+      async run() {
+        attempts += 1;
+        controller.abort();
+        throw new SandboxSpawnRunnerV2Error(
+          "provider_aborted",
+          "Sandbox provider process was aborted.",
+        );
+      },
+    },
+  });
+
+  const status = await manager.probeProviders(controller.signal);
+  assert.equal(attempts, 1, "cancellation must be obeyed, not retried");
+  assert.equal(status.providers[0]?.state, "no_verdict");
+  assert.equal(status.executionAvailable, false);
+});
+
+test("a retried probe fingerprints identically to a clean one, so prepared actions still verify", async () => {
+  // prepareExecution() seals a probe fingerprint and executePrepared() re-probes
+  // and demands exact equality. If the escalated retry budget leaked into the
+  // fingerprint, every prepared action whose re-probe needed a different number
+  // of attempts would be blocked as "the sandbox boundary changed".
+  let probeCalls = 0;
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      if (spec.purpose !== "boundary_probe") {
+        return { exitCode: 0, stdout: "ok", stderr: "" };
+      }
+      probeCalls += 1;
+      // Clean pass while preparing; a timeout then a pass while executing.
+      if (probeCalls === 2) {
+        throw new SandboxSpawnRunnerV2Error(
+          "provider_timeout",
+          "Sandbox provider process exceeded its fixed timeout.",
+        );
+      }
+      return { exitCode: 0, stdout: PROBE, stderr: "" };
+    },
+  };
+  const manager = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await manager.probeProviders();
+  const cleanFingerprint = manager.readStatus().providers[0]?.probeFingerprint;
+  assert.ok(cleanFingerprint);
+
+  const prepared = await manager.prepareExecution(prepareInput());
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") return;
+
+  const source = new TextEncoder().encode("export const value = 1;\n");
+  const result = await manager.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: [{ path: "src/index.ts", bytes: source }],
+  });
+  assert.notEqual(result.status, "blocked");
+  assert.equal(
+    manager.readStatus().providers[0]?.probeFingerprint,
+    cleanFingerprint,
+    "the retry budget must never reach the probe fingerprint",
+  );
+});
+
+test("the WSL2 retry budget escalates to, and stops at, the stated ceiling", async () => {
+  const budgets: number[] = [];
+  const manager = new SandboxManagerV2({
+    providers: [{
+      version: 1,
+      kind: "wsl2",
+      executable: "wsl.exe",
+      priority: 1,
+      runtimeReference: "agentic-sandbox",
+      runtimeDigest: `sha256:${"f".repeat(64)}`,
+      wslDistribution: "agentic-sandbox",
+      runtimeRoot: "/opt/agentic/runtime",
+    }],
+    runner: {
+      async run(spec) {
+        budgets.push(spec.timeoutMs);
+        throw new SandboxSpawnRunnerV2Error(
+          "provider_timeout",
+          "Sandbox provider process exceeded its fixed timeout.",
+        );
+      },
+    },
+  });
+
+  const status = await manager.probeProviders();
+  assert.deepEqual(
+    budgets,
+    [WSL2_SANDBOX_PROBE_TIMEOUT_MS_V2, SANDBOX_PROBE_TIMEOUT_CEILING_MS_V2],
+    "90s then a ceiling-capped 180s; total wall clock per provider is bounded at 270s",
+  );
+  assert.equal(status.providers[0]?.state, "no_verdict");
+  assert.equal(status.executionAvailable, false);
 });
 
 function testExecutionJournal(
