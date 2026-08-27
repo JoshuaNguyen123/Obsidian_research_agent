@@ -15,6 +15,11 @@ import {
   isPromptDerivedAuthorityGrantV1,
 } from "../src/agent/policyEngine";
 import { preparedApprovalMayAutoWithoutCardV1 } from "../src/agent/setLooseCompoundAutonomy";
+import {
+  FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
+  resolveNestedApprovalBindingV1,
+} from "../src/agent/nestedApprovalPolicy";
+import { PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME } from "../src/tools/githubPublicationTool";
 import { createJupyterReflectionTool } from "../src/tools/jupyterReflectionTool";
 import { createProjectResultsTool } from "../src/tools/projectResultsTool";
 
@@ -188,6 +193,98 @@ for (const descriptor of [JUPYTER_DESCRIPTOR, PROJECT_RESULTS_DESCRIPTOR]) {
     assert.ok(refused.tags.includes("fail_closed"));
   });
 }
+
+/**
+ * The one host-owned vault subaction the GitHub publication finalizer may
+ * present. Its descriptor is owned by the closed nested contract rather than
+ * the tool registry, so it is fetched through the product's own resolver —
+ * a fixture copy here would drift away from the block it is meant to honour.
+ */
+async function nestedBacklinkDescriptor(): Promise<ToolDescriptor> {
+  const action = await withPreparedActionFingerprint({
+    version: 1,
+    id: "nested-backlink-descriptor-probe",
+    runId: "run-1",
+    toolCallId: "call-1",
+    toolName: FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
+    target: {
+      system: "vault",
+      resourceType: "markdown_file",
+      id: "Research/Issue 42.md",
+      path: "Research/Issue 42.md",
+      revision: `sha256:${"a".repeat(64)}`,
+    },
+    relatedResources: [],
+    normalizedArgs: {},
+    preview: {
+      summary: "Append the verified project completion reflection.",
+      destination: "Research/Issue 42.md",
+      warnings: [],
+      outboundBytes: 0,
+    },
+    preparedAt: "2026-08-22T12:00:00.000Z",
+    expiresAt: "2026-08-22T12:05:00.000Z",
+  });
+  const binding = await resolveNestedApprovalBindingV1({
+    outerToolName: PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+    request: {
+      toolName: action.toolName,
+      action: action.preview.summary,
+      reason: "Approve the exact finalizer effect.",
+      policyTags: ["github_publication", "exact"],
+      preparedAction: action,
+      confirmationIndex: 1,
+      requiredConfirmations: 1,
+    },
+    toolRegistry: { getDescriptor: () => null },
+  });
+  return binding.descriptor;
+}
+
+test("the nested-approval bridge reads the same descriptor predicate", async () => {
+  // Nested subactions were the last prompt-issued path deciding this for
+  // themselves: set-loose compound autonomy returned an approval straight from
+  // the mission prompt plus the autonomy profile, which is exactly the
+  // authority this block withholds.
+  const descriptor = await nestedBacklinkDescriptor();
+  assert.equal(descriptor.name, FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME);
+  assert.equal(descriptor.approval.fallback, "exact");
+  assert.equal(descriptorAllowsPromptIssuedGrantV1(descriptor), false);
+  assert.equal(descriptorAllowsPromptIssuedGrantV1(permissiveClone(descriptor)), true);
+
+  // The Bound gate cannot see this descriptor on its own: it is owned by the
+  // closed nested contract, so `getDescriptor` returns null for it and the
+  // gate reads nothing. AgentRunner hands it in explicitly for that reason.
+  assert.equal(
+    preparedApprovalMayAutoWithoutCardV1({
+      hasPreparedAction: true,
+      descriptors: [null],
+    }),
+    true,
+    "the registry alone cannot decide this subaction",
+  );
+  assert.equal(
+    preparedApprovalMayAutoWithoutCardV1({
+      hasPreparedAction: true,
+      descriptors: [null, descriptor],
+    }),
+    false,
+  );
+
+  // The mint refuses what the nested bridge now declines to ask for.
+  const action = await preparedActionFor(descriptor);
+  await assert.rejects(
+    () =>
+      createOneShotGrant({
+        id: "grant:set-loose-nested",
+        action,
+        descriptor,
+        issuer: "user_prompt",
+        issuedAt: NOW,
+      }),
+    /does not permit prompt-issued one-shot grants/,
+  );
+});
 
 test("every prompt-issued authority path reads the same descriptor predicate", async () => {
   // The runner's set-loose bridge, the write-autonomy bridge and the grant mint

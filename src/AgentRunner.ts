@@ -10136,6 +10136,7 @@ export async function runAgentMission({
     requiredConfirmations,
     missionGraphExecution,
     approvalIdentity,
+    approvalDescriptor,
   }: {
     toolCall: ModelToolCall;
     step: number;
@@ -10148,6 +10149,13 @@ export async function runAgentMission({
     requiredConfirmations?: 1 | 2;
     missionGraphExecution?: MissionGraphToolExecution | null;
     approvalIdentity?: { runId: string; toolName: string };
+    /**
+     * The descriptor this approval actually belongs to, for callers that
+     * resolve one the tool registry cannot. A nested subaction may be owned by
+     * the closed nested contract rather than the catalog, and `getDescriptor`
+     * returns null for it — leaving the gate below with nothing to read.
+     */
+    approvalDescriptor?: ToolDescriptor | null;
   }): Promise<{ decision: ApprovalDecision; request: ApprovalRequest }> => {
     const approvalToolName = approvalIdentity?.toolName ?? toolCall.name;
     // Central Bound gate: early bundled stage grant OR set-loose. Catalog
@@ -10159,9 +10167,12 @@ export async function runAgentMission({
     const approvalDescriptorAllowsPromptIssuedGrant =
       preparedApprovalMayAutoWithoutCardV1({
         hasPreparedAction: Boolean(preparedAction),
-        descriptors: [toolCall.name, approvalToolName].map(
-          (name) => toolRegistry.getDescriptor?.(name) ?? null,
-        ),
+        descriptors: [
+          ...[toolCall.name, approvalToolName].map(
+            (name) => toolRegistry.getDescriptor?.(name) ?? null,
+          ),
+          approvalDescriptor ?? null,
+        ],
       });
     const mayAutoBound =
       approvalDescriptorAllowsPromptIssuedGrant &&
@@ -10619,9 +10630,18 @@ export async function runAgentMission({
             request: request as NestedToolApprovalRequest,
             toolRegistry,
           });
+          // A nested subaction is still governed by its own descriptor.
+          // `allowPromptGrant: false` takes no authority from the mission
+          // prompt, and set-loose compound autonomy is precisely prompt plus
+          // autonomy profile — so the predicate every other prompt-issued
+          // path reads decides this one too, and the subaction reaches the
+          // approval its own `fallback` names.
+          const nestedTakesPromptIssuedAuthority =
+            descriptorAllowsPromptIssuedGrantV1(binding.descriptor);
           // Sandbox/validate nested approvals must not surface Chat Approve under
           // set-loose compound when the outer (or nested) Bound tool is eligible.
           const setLooseNestedAuto =
+            nestedTakesPromptIssuedAuthority &&
             resolveSetLooseCompoundEnabled() &&
             !isGeneralGitHubCatalogMutationToolName(toolCall.name) &&
             !isGeneralGitHubCatalogMutationToolName(binding.toolName) &&
@@ -10664,6 +10684,11 @@ export async function runAgentMission({
               runId: binding.runId,
               toolName: binding.toolName,
             },
+            // Without this the boundary above would be inert whenever the
+            // subaction's descriptor is invisible to the tool registry: the
+            // central gate would auto-approve what the nested bridge just
+            // declined to.
+            approvalDescriptor: binding.descriptor,
           });
           if (approval.decision !== "approved") {
             return { approved: false, reason: approval.decision };

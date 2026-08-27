@@ -235,6 +235,8 @@ import {
   type ProjectIdeaBriefToolOutputV1,
 } from "../src/tools/projectIdeaBriefTool";
 import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
+import { FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME } from "../src/agent/nestedApprovalPolicy";
+import { PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME } from "../src/tools/githubPublicationTool";
 import { isCompletedAcceptedResearchPublicationReceipt } from "../src/agent/setLooseCompoundAutonomy";
 import { completedResearchPublicationReceiptFixture } from "./fixtures/completedResearchPublicationReceipt";
 
@@ -23772,6 +23774,231 @@ test("composite GitHub merge routes two distinct nested approvals through the re
         request.payloadFingerprint === carrier.payloadFingerprint,
     ),
     true,
+  );
+});
+
+/**
+ * One compound set-loose mission whose outer publication tool presents two
+ * nested subactions: its own exact publication effect, and the host-owned
+ * vault finalizer. The vault descriptor is the shipped one, resolved out of the
+ * closed nested contract, so this binds the product's own approval block. Only
+ * the outer descriptor's `allowPromptGrant` varies between runs.
+ */
+async function runNestedPromptGrantBoundaryMission(
+  outerAllowsPromptGrant: boolean,
+): Promise<{
+  approvalRequests: ApprovalRequest[];
+  nestedDecisions: Array<{ approved: boolean; approvalId?: string }>;
+  statuses: string[];
+  runId: string;
+}> {
+  const prompt = [
+    "Research checkers using open web sources.",
+    "Then push the latest verified local commit for profile trusted-repository to GitHub and open a draft PR.",
+    "Finish with a reflection in the current note.",
+  ].join(" ");
+  const vault = createRunnerVaultContext({ prompt, content: "# Code publication\n" });
+  vault.context.settings.githubEnabled = true;
+  vault.context.settings.autonomyProfile = "automatic";
+  vault.context.settings.workingMode = "automatic";
+  vault.context.settings.modelRouterMode = "off";
+  const broker = new ApprovalBroker();
+  const approvalRequests: ApprovalRequest[] = [];
+  const statuses: string[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const nestedDecisions: Array<{ approved: boolean; approvalId?: string }> = [];
+  const runId = `nested-prompt-grant-${outerAllowsPromptGrant ? "allowed" : "withheld"}`;
+  const publication = await withPreparedActionFingerprint({
+    version: 1 as const,
+    id: "github-draft-publication-1",
+    runId,
+    toolCallId: "github-draft-publication-call",
+    toolName: PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+    target: {
+      system: "github" as const,
+      resourceType: "pull_request",
+      id: "acme/research-agent#12",
+    },
+    relatedResources: [],
+    normalizedArgs: { action: "publish_draft", profileKey: "trusted-repository" },
+    preview: {
+      summary: "Open draft pull request #12 at the verified head",
+      destination: "GitHub acme/research-agent PR #12",
+      outboundPayload: { pullRequestNumber: 12 },
+      warnings: [],
+      outboundBytes: 100,
+    },
+    preparedAt: "2026-08-22T20:00:00.000Z",
+    expiresAt: "2099-08-22T20:05:00.000Z",
+  });
+  const backlink = await withPreparedActionFingerprint({
+    version: 1 as const,
+    id: "github-obsidian-reflection-1",
+    runId,
+    toolCallId: "github-obsidian-reflection-call",
+    toolName: FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
+    target: {
+      system: "vault" as const,
+      resourceType: "markdown_file",
+      id: "Current.md",
+      path: "Current.md",
+      revision: `sha256:${"a".repeat(64)}`,
+    },
+    relatedResources: [],
+    normalizedArgs: { expectedNoteSha256: `sha256:${"a".repeat(64)}` },
+    preview: {
+      summary: "Append the verified project completion reflection to Current.md.",
+      destination: "Current.md",
+      outboundPayload: { pullRequestNumber: 12 },
+      warnings: [],
+      outboundBytes: 64,
+    },
+    preparedAt: "2026-08-22T20:00:00.000Z",
+    expiresAt: "2099-08-22T20:05:00.000Z",
+  });
+  const descriptor: ToolDescriptor = {
+    version: 1,
+    name: PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+    capability: { system: "github", resourceType: "pull_request", action: "publish" },
+    effect: "publish",
+    risk: "critical",
+    approval: {
+      allowPromptGrant: outerAllowsPromptGrant,
+      allowPersistentGrant: false,
+      fallback: "exact",
+    },
+    execution: { preparation: "none", cacheable: false, parallelSafe: false },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "required",
+    },
+    allowedPrincipals: ["single_agent"],
+    receiptKind: "external_action",
+  };
+  const tool: AgentTool = {
+    name: descriptor.name,
+    description: "Test nested prompt-grant boundary for the Obsidian finalizer.",
+    parameters: { type: "object", additionalProperties: false },
+    descriptor,
+    execute: async (_args, context) => {
+      assert.ok(context.requestNestedApproval);
+      for (const preparedAction of [publication, backlink]) {
+        nestedDecisions.push(
+          await context.requestNestedApproval!({
+            toolName: preparedAction.toolName,
+            action: preparedAction.preview.summary,
+            reason: "Approve the exact finalizer effect.",
+            policyTags: ["github_publication", "exact"],
+            preparedAction,
+            confirmationIndex: 1,
+            requiredConfirmations: 1,
+          }),
+        );
+      }
+      return { status: "complete" };
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    runId,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithToolCall(descriptor.name, {}),
+        () => responseWithContent("Opened the draft pull request."),
+      ],
+    }),
+    toolRegistry: new DefaultToolRegistry([tool]),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 2,
+    approvalBroker: broker,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onApprovalRequest: (request) => {
+        approvalRequests.push(request);
+        broker.resolve(request.id, "approved");
+      },
+    },
+  });
+
+  const diagnostic = `statuses=${statuses.join(" | ")}; offered=${chatRequests
+    .map((request) => request.tools?.map((item) => item.function.name).join(","))
+    .join(" | ")}`;
+  assert.equal(nestedDecisions.length, 2, diagnostic);
+  // Withholding the shortcut must route through the mission graph's approval
+  // wait, not its auto-resolve: resolving an approval on a node that is already
+  // running fails the outer tool outright.
+  assert.deepEqual(
+    statuses.filter((message) => /Tool returned error/u.test(message)),
+    [],
+    diagnostic,
+  );
+  return { approvalRequests, nestedDecisions, statuses, runId };
+}
+
+test("set-loose nested approval defers to a subaction descriptor that refuses prompt-issued authority", async () => {
+  const outcome = await runNestedPromptGrantBoundaryMission(true);
+  // The outer publication descriptor accepts prompt-issued authority, so
+  // set-loose still clears its own nested approval with no card.
+  assert.match(
+    String(outcome.nestedDecisions[0]?.approvalId ?? ""),
+    new RegExp(`^set-loose-nested:${PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME}:`, "u"),
+  );
+  // The vault finalizer declines that authority and must reach a real card —
+  // not the central Bound gate's `set-loose-auto:` shortcut either, which the
+  // outer tool's own eligibility would otherwise have opened.
+  assert.deepEqual(
+    outcome.approvalRequests.map((request) => request.toolName),
+    [FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME],
+  );
+  assert.equal(outcome.approvalRequests[0]?.runId, outcome.runId);
+  assert.equal(
+    outcome.approvalRequests[0]?.payloadFingerprint,
+    outcome.approvalRequests[0]?.preparedAction?.payloadFingerprint,
+  );
+  assert.equal(outcome.nestedDecisions[1]?.approved, true);
+  assert.equal(
+    outcome.nestedDecisions[1]?.approvalId,
+    outcome.approvalRequests[0]?.id,
+  );
+  assert.doesNotMatch(
+    String(outcome.nestedDecisions[1]?.approvalId ?? ""),
+    /^(?:set-loose|bundled)/u,
+  );
+});
+
+test("consecutive card-bearing nested approvals settle on one running mission-graph node", async () => {
+  // The shipped publish_verified_code_to_github descriptor also refuses
+  // prompt-issued authority, so a real journey raises two cards back to back
+  // against the same running node. Each must reach the broker, and the second
+  // must not be stranded by the approval-state transition the first one made.
+  const outcome = await runNestedPromptGrantBoundaryMission(false);
+  assert.deepEqual(
+    outcome.approvalRequests.map((request) => request.toolName),
+    [
+      PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+      FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
+    ],
+  );
+  assert.deepEqual(
+    outcome.nestedDecisions.map((decision) => decision.approved),
+    [true, true],
+  );
+  assert.deepEqual(
+    outcome.nestedDecisions.map((decision) => decision.approvalId),
+    outcome.approvalRequests.map((request) => request.id),
+  );
+  // Every card stayed bound to its own exact prepared payload.
+  assert.deepEqual(
+    outcome.approvalRequests.map(
+      (request) =>
+        request.payloadFingerprint === request.preparedAction?.payloadFingerprint,
+    ),
+    [true, true],
   );
 });
 
