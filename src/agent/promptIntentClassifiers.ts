@@ -36,6 +36,7 @@ import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
 import { detectLinearIntent } from "./linearIntent";
 import { hasMissionResumeIntent } from "./missionResume";
 import { extractExplicitNewWorkspaceFilePaths, extractMarkdownPathMentions, hasExplicitCurrentNoteMutationIntent } from "./missionScope";
+import { hasAffirmativeProjectIdeationIntentV1 } from "./projectIdeationIntent";
 import { detectProjectLifecycleStagesV1 } from "./projectLifecycle";
 import { canonicalizeKeywordTypos } from "./promptNormalization";
 import { isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
@@ -475,28 +476,12 @@ export function hasAffirmativeJoinedDeveloperLifecycleIntent(
 /**
  * Explicit project-ideation work, independent of whether the same mission also
  * requests research, Linear publication, code, or GitHub delivery.
+ *
+ * One definition, in ./projectIdeationIntent, shared with the publication seat
+ * that requires the resulting promotion seed. Offering and requiring must never
+ * be able to answer this differently.
  */
-export function hasProjectIdeationIntent(prompt: string): boolean {
-  const normalized = prompt.replace(/\r\n?/gu, "\n");
-  if (/\bcreate_project_idea_brief\b/iu.test(normalized)) return true;
-  return normalized
-    .split(/(?:[!?;\n]+|\.(?=\s|$)|\bbut\b)/iu)
-    .map((clause) => clause.trim())
-    .filter(Boolean)
-    .some(
-      (clause) =>
-        !/\b(?:do\s+not|don't|never|skip|without)\b[^.\n]{0,100}\b(?:ideat|brainstorm|project\s+(?:idea|concept|direction))\w*/iu.test(
-          clause,
-        ) &&
-        (/\bproject\s+ideation\b/iu.test(clause) ||
-          /\b(?:ideat\w*|brainstorm|generate|develop|evaluate|compare|select|choose)\b[^.\n]{0,140}\b(?:project\s+)?(?:ideas?|concepts?|directions?)\b/iu.test(
-            clause,
-          ) ||
-          /\b(?:project\s+)?(?:ideas?|concepts?|directions?)\b[^.\n]{0,140}\b(?:ideat\w*|brainstorm|generate|develop|evaluate|compare|select|choose)\b/iu.test(
-            clause,
-          )),
-    );
-}
+export const hasProjectIdeationIntent = hasAffirmativeProjectIdeationIntentV1;
 
 export function hasTemplateIntent(prompt: string): boolean {
   if (

@@ -10,6 +10,7 @@ import {
 import type { JsonSchemaObject } from "../model/types";
 import type { AuthorityGrantV1 } from "../agent/authority";
 import { extractMarkdownPathMentions } from "../agent/missionScope";
+import { hasAffirmativeProjectIdeationIntentV1 } from "../agent/projectIdeationIntent";
 import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
 import { sha256DiagramContent } from "../design/diagramArtifactStore";
 import {
@@ -694,34 +695,16 @@ export function canonicalSeedExactAcceptedResearchPackageV1(input: {
 }
 
 /**
- * Publication-side guard kept local to avoid a routing-module cycle. It is
- * deliberately narrower than general idea language: only an affirmative
- * request to brainstorm/evaluate/select project directions makes the durable
- * promotion seed mandatory after restart.
+ * Publication-side view of the ONE shared ideation-intent definition. The
+ * routing-module cycle that once forced a local copy is broken by the leaf
+ * module instead: `promptIntentClassifiers` imports this file, so this file
+ * cannot import it back, but both can import `agent/projectIdeationIntent`.
+ *
+ * Re-exported under the historical name so the seat that requires the promotion
+ * seed and the seat that offers/plans its producer are provably the same
+ * predicate rather than two copies that agree today.
  */
-export function hasAffirmativeProjectIdeationIntentV1(prompt: string): boolean {
-  const normalized = typeof prompt === "string"
-    ? prompt.replace(/\r\n?/gu, "\n")
-    : "";
-  if (/\bcreate_project_idea_brief\b/iu.test(normalized)) return true;
-  return normalized
-    .split(/(?:[!?;\n]+|\.(?=\s|$)|\bbut\b)/iu)
-    .map((clause) => clause.trim())
-    .filter(Boolean)
-    .some(
-      (clause) =>
-        !/\b(?:do\s+not|don't|never|skip|without)\b[^.\n]{0,100}\b(?:ideat|brainstorm|project\s+(?:idea|concept|direction))\w*/iu.test(
-          clause,
-        ) &&
-        (/\bproject\s+ideation\b/iu.test(clause) ||
-          /\b(?:ideat\w*|brainstorm|generate|develop|evaluate|compare|select|choose)\b[^.\n]{0,140}\b(?:project\s+)?(?:ideas?|concepts?|directions?)\b/iu.test(
-            clause,
-          ) ||
-          /\b(?:project\s+)?(?:ideas?|concepts?|directions?)\b[^.\n]{0,140}\b(?:ideat\w*|brainstorm|generate|develop|evaluate|compare|select|choose)\b/iu.test(
-            clause,
-          )),
-    );
-}
+export { hasAffirmativeProjectIdeationIntentV1 };
 
 /**
  * The exact validation requirement keys a trusted repository profile accepts:
