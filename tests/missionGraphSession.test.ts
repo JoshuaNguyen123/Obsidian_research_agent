@@ -2276,7 +2276,10 @@ test("a set-loose exact-frontier run admits every capability read it offers", as
   // `beginToolExecution` was handed `dynamicReadContinuationAllowed()` alone.
   // On a set-loose run over an exact planned frontier those differ by exactly
   // the capability-read set, so every read on that menu was a guaranteed
-  // `tool_not_allowed` the host itself caused.
+  // failed tool call the host itself caused. The code is
+  // `mission_graph_authority_blocked`, not `tool_not_allowed`: these names ARE
+  // in the offered menu, so they clear the off-frontier gate and die at the
+  // authority behind it. Both count against tool-call success.
   const harness = createVaultHarness();
   const graph = await graphFor({
     missionId: "session-set-loose-capability-read",
