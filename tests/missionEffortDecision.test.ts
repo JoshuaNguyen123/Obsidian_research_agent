@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   escalateMissionEffortDecisionForResearchV1,
+  hasExplicitExtendedResearchIntentV1,
   resolveMissionEffortDecisionV1,
 } from "../src/agent/missionEffortDecision";
 import { detectProjectLifecycleStagesV1 } from "../src/agent/projectLifecycle";
@@ -502,4 +503,66 @@ test("escalation floor + lower configured still clamps", () => {
   assert.equal(escalated.maxModelCalls, 4);
   assert.equal(escalated.maxToolCalls, 3);
   assert.equal(escalated.maxWallClockMs, 2 * 60_000);
+});
+
+// STRIP-THEN-TEST. `hasExplicitExtendedResearchIntentV1` gates extended-team
+// cost, so a lexical hit inside a clause that FORBIDS deep research used to buy
+// the mission the budget the sentence denied it.
+test("a negated research clause does not buy an extended team", () => {
+  const NEGATED = [
+    "Do not do deep research on this, just answer from what you know.",
+    "Summarize the paper without a multi-source review.",
+    "Don't do deep research, a quick answer is fine.",
+    "Answer directly, no deep research please.",
+    "Skip the deep research and give me the short version.",
+    "Avoid long research here.",
+    "Never do in-depth research for this one.",
+    "No need for deep research on this topic.",
+  ];
+  for (const prompt of NEGATED) {
+    assert.equal(
+      hasExplicitExtendedResearchIntentV1(prompt),
+      false,
+      `expected no extended intent for: ${prompt}`,
+    );
+    assert.notEqual(
+      resolveMissionEffortDecisionV1({
+        prompt,
+        route: "grounded_workflow",
+        outputTarget: "new_note",
+      }).profile,
+      "extended_team",
+      `expected no extended_team profile for: ${prompt}`,
+    );
+  }
+});
+
+// The strip is built from closed-class filler, not a character window, so an
+// affirmative request is not collateral damage of a nearby negation.
+test("an explicit extended request still selects the extended team", () => {
+  const AFFIRMATIVE = [
+    "Deep research on X.",
+    "Perform deep research and a systematic review of agent orchestration.",
+    "Run a multi-source review of the evidence.",
+    "Build an evidence ledger for this question.",
+    // A negated clause followed by an affirmative one: only the negated
+    // clause is stripped.
+    "Do not summarize, do a deep research pass on X.",
+  ];
+  for (const prompt of AFFIRMATIVE) {
+    assert.equal(
+      hasExplicitExtendedResearchIntentV1(prompt),
+      true,
+      `expected extended intent for: ${prompt}`,
+    );
+    assert.equal(
+      resolveMissionEffortDecisionV1({
+        prompt,
+        route: "grounded_workflow",
+        outputTarget: "new_note",
+      }).profile,
+      "extended_team",
+      `expected extended_team profile for: ${prompt}`,
+    );
+  }
 });
