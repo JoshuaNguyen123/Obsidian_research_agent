@@ -1345,3 +1345,55 @@ test("AgentRunner mints every repeat signature through the shared builder", () =
     /repeatKey: invalidToolCallRepeatKeyV1\(failureCode\)/u,
   );
 });
+
+test("the observed seven-refusal loop collapses to one signature", () => {
+  // Arithmetic on REAL data, not a projection. A recovered run refused
+  // `append_to_current_file` at steps 1,2,4,5,6,8,9 -- seven events for one
+  // name, because the model varied its arguments each time and the
+  // argument-keyed signature minted a fresh identity on every attempt.
+  //
+  // The node is ELEVEN in the plan, so no admissible frontier widening could
+  // have admitted it; the only available saving is to stop re-issuing it.
+  const observedAttempts = [
+    { path: "Notes/a.md", content: "first" },
+    { path: "Notes/a.md", content: "second attempt" },
+    { path: "Notes/b.md", content: "third" },
+    { path: "Notes/b.md", content: "fourth", mode: "append" },
+    { path: "Notes/c.md", content: "fifth" },
+    { path: "Notes/c.md", content: "sixth", heading: "## Notes" },
+    { path: "Notes/d.md", content: "seventh" },
+  ].map((value) => JSON.stringify(value));
+  const signatures = new Set(
+    observedAttempts.map((args) =>
+      buildInvalidToolCallFailureSignatureV1({
+        toolName: "append_to_current_file",
+        failureCode: "tool_not_allowed",
+        argumentsSignature: args,
+      }),
+    ),
+  );
+  // One name, one signature -- so the repeat guard fires on the SECOND event
+  // and the remaining five are never issued.
+  assert.equal(
+    signatures.size,
+    1,
+    "seven argument spellings of one refused name must collapse to one signature",
+  );
+
+  // The contrast that proves this is not blanket suppression: a genuine
+  // argument fault keeps its arguments, so seven distinct argument faults stay
+  // seven distinct signatures and each still gets its own correction.
+  const argumentFaults = new Set(
+    observedAttempts.map((args) =>
+      buildInvalidToolCallFailureSignatureV1({
+        toolName: "code_workspace_read",
+        failureCode: "invalid_arguments",
+        argumentsSignature: args,
+      }),
+    ),
+  );
+  assert.ok(
+    argumentFaults.size > 1,
+    "argument faults must stay argument-keyed so the model can correct them",
+  );
+});
