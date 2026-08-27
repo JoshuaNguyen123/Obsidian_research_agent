@@ -238,6 +238,8 @@ export interface VacuousDetectableReceipt {
   purpose?: unknown;
   /** Verification proof carried by the receipt itself. */
   readback?: unknown;
+  /** Present on real receipts; carried so fixtures can mirror the real shape. */
+  toolName?: unknown;
   /** Present on sandbox-backed receipts; 0 means the command really ran and passed. */
   exitCode?: unknown;
 }
