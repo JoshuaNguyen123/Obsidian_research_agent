@@ -79,6 +79,49 @@ test("beginToolExecution recovers an orphaned running node back to ready", async
   assert.equal(session.graph.nodes[recovered.nodeId]?.status, "ready");
 });
 
+/**
+ * A completing node is the LAST moment anything can be written to it: the
+ * reducer refuses every operation against a `complete` node
+ * (`completed_node_immutable`). Tools whose product is run-local — the project
+ * idea brief's signed promotion seed is the live example — therefore have
+ * exactly one chance to make that product durable, and it is here.
+ *
+ * Without this, a compound mission that crosses a segment boundary between
+ * `create_project_idea_brief` and `publish_research_to_linear` loses the seed
+ * with no way to recreate it, and the publish node blocks on
+ * `research_publication_project_idea_seed_required` until it exhausts its
+ * attempts.
+ */
+test("durable outputs are recorded before a node becomes immutable on completion", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-completion-durable-outputs",
+    allowedTools: ["web_fetch"],
+    plannedTools: ["web_fetch"],
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const execution = requireExecution(
+    await session.beginToolExecution("web_fetch"),
+  );
+  const node = session.graph.nodes[execution.nodeId]!;
+  assert.deepEqual(node.outputs, {});
+
+  await session.finishToolExecution(execution, {
+    ok: true,
+    evidence: evidenceFor(node, "b", harness.nextTimestamp()),
+    outputs: { carriedV1: { version: 1, value: "run-local product" } },
+  });
+
+  const completed = session.graph.nodes[execution.nodeId]!;
+  assert.equal(completed.status, "complete");
+  assert.deepEqual(completed.outputs, {
+    carriedV1: { version: 1, value: "run-local product" },
+  });
+});
+
 test("parallel same-name reads never recover an intentionally running node", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({

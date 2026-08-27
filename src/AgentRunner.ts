@@ -1052,6 +1052,10 @@ import {
 } from "./agent/missionGraphSession";
 import { reconcileCompositeOwnedCurrentNoteGraphOnResume } from "./agent/researchPublicationGraphReconciliation";
 import {
+  projectIdeaPromotionCarryOutputsV1,
+  restoreProjectIdeaPromotionSeedFromMissionGraphV1,
+} from "./agent/projectIdeaPromotionSeedCarry";
+import {
   canPersistMissionGraphStore,
   readMissionGraphStoreRecord,
 } from "./agent/missionGraphStore";
@@ -4523,6 +4527,27 @@ export async function runAgentMission({
                 outputPreview: reconciliation,
               });
             }
+            // Rebind this segment's run-local ideation bridge before any tool
+            // runs. The producing node completed in an earlier segment and can
+            // never run again, so without this the publish seat's seed
+            // requirement is an obligation with no surviving capability to pay
+            // it, and every remaining attempt refuses identically.
+            const seedCarry =
+              restoreProjectIdeaPromotionSeedFromMissionGraphV1(
+                runtimeCache,
+                missionGraphSession.graph,
+              );
+            if (seedCarry.reason !== "no_carry_found") {
+              events.onTrace?.({
+                id: "project-idea-promotion-seed-carry",
+                kind: "status",
+                toolName: CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
+                message: seedCarry.restored
+                  ? "Rebound the exact signed project-idea promotion seed from its completed producer node for this continuation segment."
+                  : `Project-idea promotion seed was not rebound (${seedCarry.reason}).`,
+                outputPreview: seedCarry,
+              });
+            }
           }
         } catch (error) {
           if (!/is unavailable/i.test(getUnknownErrorMessage(error))) {
@@ -5708,6 +5733,14 @@ export async function runAgentMission({
           ? "Validation completed red; a passing cycle is still required."
           : result.error?.message,
       terminalFailure: repairCycleTerminalFailure,
+      // The ideation brief's promotion seed lives only in `runtimeCache`, which
+      // is rebuilt per segment. Carry it on the producing node's durable
+      // outputs so a later segment's publish can rebind to it; the node itself
+      // becomes immutable the moment this call completes it.
+      outputs:
+        graphResultOk
+          ? projectIdeaPromotionCarryOutputsV1(toolName, result) ?? undefined
+          : undefined,
     });
   };
 

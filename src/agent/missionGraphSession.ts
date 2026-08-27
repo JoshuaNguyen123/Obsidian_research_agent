@@ -13,6 +13,7 @@ import {
   type MissionGraphPatchOperationV1,
   type MissionGraphPatchV1,
   type MissionGraphV3,
+  type MissionJsonValueV1,
   type MissionNodeBudgetV1,
   type MissionNodeV3,
   type MissionNodeStatusV3,
@@ -755,6 +756,13 @@ export class MissionGraphSession {
       failureMessage?: string;
       /** Host-verified domain outcome that must not be retried. */
       terminalFailure?: boolean;
+      /**
+       * Durable node outputs recorded with a successful completion. Used to
+       * carry a run-local tool product across a segment boundary when a later
+       * node depends on it and the producing node — once complete — can never
+       * run again (`completed_node_immutable`).
+       */
+      outputs?: Record<string, MissionJsonValueV1>;
       /** Conditional actions proved unnecessary by the just-finished result. */
       skipNextToolNames?: string[];
     },
@@ -916,6 +924,25 @@ export class MissionGraphSession {
             },
           });
         } else {
+          // Outputs must land BEFORE the node reaches `complete`: the reducer
+          // refuses every write to a completed node, so a carry recorded after
+          // the transition would be silently impossible to add later.
+          //
+          // Never on a composite lifecycle node. Those own `outputs` as their
+          // durable action cursor and have already queued their own set_outputs
+          // above; a second one built from the pre-patch `node.outputs` would
+          // silently roll that cursor back.
+          if (
+            !lifecycle &&
+            result.outputs &&
+            Object.keys(result.outputs).length > 0
+          ) {
+            operations.push({
+              op: "set_outputs",
+              nodeId: node.id,
+              outputs: { ...node.outputs, ...result.outputs },
+            });
+          }
           operations.push(
             {
               op: "set_status",
