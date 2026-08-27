@@ -392,3 +392,46 @@ function acceptedPackage(
 function rawUtf8Sha256(value: string): string {
   return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
+
+test("explicitly refused project ideation does not claim ideation intent", () => {
+  // Strip-then-test, the repo's most-repeated regression family. The negation
+  // vocabulary knew only do not|don't|never|skip|without, so these all claimed
+  // ideation on a prompt that forbade it -- which then DEMANDS a signed
+  // promotion seed the mission never owed, and blocks publish.
+  for (const prompt of [
+    "no project ideation",
+    "avoid project ideation entirely",
+    "rather than brainstorming project ideas, just summarize",
+    "instead of project ideation, write the note",
+    "refrain from brainstorming project ideas",
+    "no need for project ideation",
+    "do not brainstorm project ideas",
+    "don't do project ideation",
+    "skip the project ideation step",
+    "without any project ideation, publish the research",
+  ]) {
+    assert.equal(
+      hasAffirmativeProjectIdeationIntentV1(prompt),
+      false,
+      `must not claim ideation: ${prompt}`,
+    );
+  }
+});
+
+test("affirmative ideation requests still route", () => {
+  // The other half: stripping negations must not cost a real request. Firing
+  // less on a negated prompt is strictly more correct; firing less on an
+  // affirmative one would strand the mission.
+  for (const prompt of [
+    "call create_project_idea_brief exactly once",
+    "brainstorm project ideas for the vault",
+    "do project ideation and pick the best direction",
+    "generate three project concepts and select one",
+  ]) {
+    assert.equal(
+      hasAffirmativeProjectIdeationIntentV1(prompt),
+      true,
+      `must claim ideation: ${prompt}`,
+    );
+  }
+});

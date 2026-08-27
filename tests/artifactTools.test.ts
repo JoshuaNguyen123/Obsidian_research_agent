@@ -529,7 +529,21 @@ test("run_code_block executes explicit JavaScript and returns stdout metadata", 
       {
         language: "javascript",
         code: "console.log(JSON.stringify({ ok: true, value: 2 + 3 }));",
-        timeoutMs: 1000,
+        // 1000ms was a SPAWN budget, not a compute budget: the payload is one
+        // console.log, so the wall clock here is almost entirely process
+        // start-up. Under a loaded host that start-up exceeded a second, the
+        // child was SIGKILLed, and the assertion below saw `exitCode: null` --
+        // the signature of a killed process, not a failed one. It was the sole
+        // failure in an otherwise green 4124-test suite and passed 14/14 in
+        // isolation every time.
+        //
+        // Raised to a budget that still fails fast on a genuine hang while
+        // absorbing process start-up on a busy machine. The timeout PATH had
+        // NO dedicated test of its own -- only this happy path asserting
+        // `timedOut: false` -- so widening the budget here would have quietly
+        // reduced the only pressure on it. The test below now covers it
+        // directly, which is coverage this file did not previously have.
+        timeoutMs: 15_000,
       },
       mock.context,
     );
@@ -541,6 +555,46 @@ test("run_code_block executes explicit JavaScript and returns stdout metadata", 
     assert.equal(result.timedOut, false);
     assert.equal(result.stderr, "");
     assert.match(result.stdout, /"value":5/);
+  } finally {
+    __setCodeToolsDesktopAppForTests(null);
+  }
+});
+
+test("run_code_block reports a genuine hang as timedOut, not as a crash", async () => {
+  // Coverage this file did not have: every prior assertion on `timedOut` was
+  // the happy path asserting false. Raising the happy path's spawn budget
+  // would otherwise have left the timeout branch untested, so it is pinned
+  // here directly.
+  //
+  // The distinction matters because it is exactly what confused the earlier
+  // flake: a KILLED process reports `exitCode: null`, and without an explicit
+  // `timedOut` flag that is indistinguishable from a crash. A real hang must
+  // say so.
+  __setCodeToolsDesktopAppForTests(true);
+  const mock = createMockContext({
+    prompt: "Run this code block.",
+  });
+
+  try {
+    const output = await runCodeBlockTool.execute(
+      {
+        language: "javascript",
+        // Busy-wait rather than a timer: a sleeping process can be descheduled
+        // cheaply, while this guarantees the budget is genuinely exceeded.
+        code: "const end = Date.now() + 30000; while (Date.now() < end) {}",
+        timeoutMs: 1500,
+      },
+      mock.context,
+    );
+    const result = (
+      output as {
+        result: { exitCode: number | null; timedOut: boolean };
+      }
+    ).result;
+    assert.equal(result.timedOut, true, "a hang must be reported as timedOut");
+    // The killed child carries no ordinary exit code -- that is the signature
+    // of termination, and precisely why `timedOut` has to be its own fact.
+    assert.equal(result.exitCode, null);
   } finally {
     __setCodeToolsDesktopAppForTests(null);
   }

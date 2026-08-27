@@ -30,7 +30,22 @@ export function hasAffirmativeProjectIdeationIntentV1(prompt: string): boolean {
     .filter(Boolean)
     .some(
       (clause) =>
-        !/\b(?:do\s+not|don't|never|skip|without)\b[^.\n]{0,100}\b(?:ideat|brainstorm|project\s+(?:idea|concept|direction))\w*/iu.test(
+        // Strip-then-test. The negation vocabulary previously knew only
+        // do not|don't|never|skip|without, so "no project ideation", "avoid
+        // project ideation" and "rather than brainstorming project ideas" all
+        // slipped through and claimed ideation on a prompt that forbade it.
+        // Extended here to the closed-class refusals that actually appear;
+        // `no` is anchored to the ideation nouns so it cannot swallow an
+        // unrelated "no" earlier in the clause. This is deliberately the
+        // NEGATION half only -- the positive triggers are separately
+        // over-eager (a bare "compare the leading concepts" matches), but
+        // narrowing those changes which tools real missions are OFFERED and
+        // needs its own proof run. Firing less on an explicitly negated prompt
+        // is strictly more correct and cannot strand a mission that asked.
+        !/\b(?:do\s+not|don't|never|skip|without|avoid|refrain\s+from|rather\s+than|instead\s+of|no\s+need\s+(?:for|to))\b[^.\n]{0,100}\b(?:ideat|brainstorm|project\s+(?:idea|concept|direction))\w*/iu.test(
+          clause,
+        ) &&
+        !/\bno\s+(?:project\s+)?(?:ideation|brainstorm\w*|project\s+ideas?)\b/iu.test(
           clause,
         ) &&
         (/\bproject\s+ideation\b/iu.test(clause) ||
