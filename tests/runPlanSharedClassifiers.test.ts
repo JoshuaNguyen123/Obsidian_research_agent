@@ -322,6 +322,28 @@ test("word-count intent is one answer across all four former seats", () => {
     );
   }
 
+  // OWN-WRITE CONTRACT. A length TARGET the model must hit is not a request to
+  // COUNT anything -- the number is an instruction to the writer, not a
+  // question from the user. Reading it as word-count intent would plant a
+  // count_words node and a word_count proof obligation on every ordinary
+  // "write me N words" mission.
+  for (const ownContract of [
+    "Write a 500-word essay about tides.",
+    "Draft a 1000 word report.",
+    "Summarize this note in 200 words.",
+  ]) {
+    assert.equal(
+      wordCountIntent.hasWordCountIntent(ownContract),
+      false,
+      `a length target is not a count request: ${ownContract}`,
+    );
+  }
+  // Naming the metric outright is a request, and stays one.
+  assert.equal(
+    wordCountIntent.hasWordCountIntent("Write an essay with a word count of 500."),
+    true,
+  );
+
   // ...but stripping must not swallow a real request that merely FOLLOWS a
   // negated clause, which is why the strip uses closed-class fillers rather
   // than a character window.
