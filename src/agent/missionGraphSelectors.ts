@@ -198,13 +198,15 @@ export function readyMissionGraphFrontierToolNamesV1(
  *   (`missionGraphUsesExactPlannedFrontier && !setLooseCompoundEnabled`). Both
  *   halves of that edit say one thing: a set-loose compound run deliberately
  *   opts out of exact-planned-frontier narrowing and expands to the stage
- *   Soft-union. The host even names the decision — the whole purpose of
- *   `mayBypassMissionGraphStartForSetLooseSoftCompanion` is to let an unplanned
- *   Soft companion run on such a turn — but that verdict never reached the gate
- *   that refuses: the bypass calls `beginToolExecution` with
- *   `optionalDynamicContinuation` only, so `allowDynamicReadContinuation ===
- *   false` refused the very call the bypass had just authorized. The offer was
- *   intentional. The authority simply never learned that set-loose exists.
+ *   Soft-union. So the wider offer was the deliberate side.
+ *
+ *   The authority was never taught any of it. A set-loose run does have one
+ *   tolerance for unplanned work — `mayBypassMissionGraphStartForSetLoose-
+ *   SoftCompanion`, whose refusal AgentRunner swallows so the call still runs —
+ *   but its allowlist is the stage ladder (`toolsOfferedForSetLooseTurn`), not
+ *   `capabilityEnvelope.tools`. The reads unioned in here are in the envelope
+ *   and NOT on that ladder, so they got no bypass and hard-refused. The offer
+ *   grew a set-loose case; the authority kept answering `!exact`.
  *
  * Fail closed, by construction — this can never make an unplanned MUTATION
  * ready:
