@@ -1422,3 +1422,38 @@ test("a sandbox that RAN and failed its boundary stays a product failure", () =>
     );
   }
 });
+
+test("the no-verdict contract keys on the manager's stable marker, not runner prose", () => {
+  // The SandboxManager owns `sandbox_probe_no_verdict` and documents it as a
+  // stable contract; the runner's "exceeded its fixed timeout" is incidental
+  // prose that can be reworded without ceremony. Both match, but the marker is
+  // the durable half -- and the paired violation marker must never match.
+  const noVerdict =
+    "Error: No sandbox provider has passed its boundary probe. wsl2 no_verdict: " +
+    "sandbox_probe_no_verdict: Sandbox provider process exceeded its fixed timeout. " +
+    "The boundary was neither proven nor disproven after 2 attempts (last budget 180000ms).";
+  assert.equal(
+    classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false, logText: noVerdict })
+      .failureClass,
+    SANDBOX_UNAVAILABLE_FAILURE_CLASS,
+  );
+  const violation =
+    "Error: No sandbox provider has passed its boundary probe. wsl2 rejected: " +
+    "sandbox_probe_boundary_violation: Sandbox boundary probe did not prove every " +
+    "required isolation property.";
+  assert.notEqual(
+    classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false, logText: violation })
+      .failureClass,
+    SANDBOX_UNAVAILABLE_FAILURE_CLASS,
+    "a boundary violation must stay a product finding",
+  );
+  const unavailable =
+    "Error: No sandbox provider has passed its boundary probe. wsl2 unavailable: " +
+    "Probe exited 127. wsl.exe: command not found";
+  assert.notEqual(
+    classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false, logText: unavailable })
+      .failureClass,
+    SANDBOX_UNAVAILABLE_FAILURE_CLASS,
+    "a provider that cannot run at all is not a transient no-verdict",
+  );
+});

@@ -734,7 +734,7 @@ export const SANDBOX_UNAVAILABLE_FAILURE_CLASS = "harness:sandbox_unavailable";
  * and reported a violation can never match.
  */
 const SANDBOX_NO_VERDICT_CONTRACT =
-  /No sandbox provider has passed its boundary probe\.[^\r\n]*?(?:exceeded its fixed timeout|provider_timeout)[^\r\n]*/u;
+  /No sandbox provider has passed its boundary probe\.[^\r\n]*?(?:sandbox_probe_no_verdict|exceeded its fixed timeout|provider_timeout)[^\r\n]*/u;
 
 /** The no-verdict sentence, or null when the log carries none. */
 export function detectSandboxNoVerdict(logText) {
