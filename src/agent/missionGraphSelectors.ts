@@ -13,7 +13,7 @@ import {
   type MissionGraphV3,
 } from "../../packages/headless-runtime/src/missionGraphV3";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
-import { collectRequiredDependencyIds, isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
+import { collectRequiredDependencyIds, isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority, isOptionalMissionGraphNodeId, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
 import { type MissionEvidence } from "./missionLedger";
 import { getString, isRecord } from "./recordUtils";
 import type { MissionEvidenceAttestationV1 } from "../AgentRunner";
@@ -322,6 +322,127 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
     ].filter((name) => !excluded.has(name));
   }
   return candidates.filter(admits);
+}
+
+/**
+ * The mission's own remaining plan, in dependency order, EXCLUDING whatever is
+ * callable right now.
+ *
+ * This is steering, not authority. It exists because the exact planned frontier
+ * is one tool wide by construction and always has been:
+ * `buildToolNodeProposals` gives every effectful node a dependency on the
+ * immediately preceding effectful node, so an eleven-step compound plan
+ * (research -> Linear -> workspace -> code -> validate x3 -> commit -> GitHub ->
+ * reflection) offers exactly ONE tool at every one of its eleven steps. Measured
+ * on the reproduced graph in `missionGraphFrontierWidth.test.ts`: width 1, all
+ * eleven steps.
+ *
+ * That chain is CORRECT. Both plausible relaxations break real ordering:
+ *   - drop the all-prior-reads edge and `publish_research_to_linear` becomes
+ *     ready at step 1, before a single source has been read;
+ *   - serialize per binding instead of globally and `github_publish_repository`
+ *     plus the reflection append become ready at step 3, before the workspace
+ *     exists.
+ * So the width is not the defect. The defect is that a model offered one tool
+ * is told nothing about the other ten, and rationally reaches for the one the
+ * user actually asked for: `append_to_current_file` was refused at steps 1, 2,
+ * 4, 5, 6, 8 and 9 of one live run — it is node ELEVEN, and no admissible
+ * widening of the frontier would have admitted it. It needed to be told to wait.
+ *
+ * Everything this returns is explicitly NOT callable this turn. That is the
+ * whole contract, and it is the opposite of the seats governed by
+ * `authoritativeRefusalFrontierToolNamesV1`: those may name only what the
+ * authority WILL admit, this may name only what it will NOT. Ready and running
+ * frontier names are therefore excluded, or the two vocabularies would overlap
+ * and a "later" list would start telling the model to defer a call it could
+ * make right now.
+ *
+ * Fail closed: no graph, or nothing pending, returns `[]` and the caller emits
+ * no line at all.
+ */
+export function missionGraphPlannedSequenceAfterFrontierV1(
+  graph: MissionGraphV3 | null | undefined,
+): string[] {
+  if (!graph) return [];
+  const nodes = graph.nodes;
+  const depthOf = (nodeId: string, seen: ReadonlySet<string>): number => {
+    const node = nodes[nodeId];
+    if (!node || seen.has(nodeId)) return 0;
+    const nextSeen = new Set([...seen, nodeId]);
+    return node.dependencyIds.length === 0
+      ? 0
+      : 1 +
+          Math.max(
+            ...node.dependencyIds.map((dependencyId) =>
+              depthOf(dependencyId, nextSeen),
+            ),
+          );
+  };
+  const pending = Object.entries(nodes)
+    .filter(
+      ([nodeId, node]) =>
+        // The final synthesis node carries no tools; optional enrichment reads
+        // are not part of the sequence the model is waiting on.
+        nodeId !== "final" &&
+        !isOptionalMissionGraphNodeId(nodeId) &&
+        !missionGraphNodeIsTerminalV1(node),
+    )
+    .map(([nodeId, node]) => ({
+      nodeId,
+      depth: depthOf(nodeId, new Set<string>()),
+      toolNames: pendingToolNamesForNode(node),
+    }))
+    .sort((left, right) =>
+      left.depth === right.depth
+        ? left.nodeId.localeCompare(right.nodeId)
+        : left.depth - right.depth,
+    );
+  const readyNow = new Set(readyMissionGraphFrontierToolNamesV1(graph));
+  const runningNow = new Set(
+    Object.values(nodes)
+      .filter((node) => node.status === "running")
+      .flatMap(getMissionGraphNodeFrontierToolNames),
+  );
+  return [
+    ...new Set(
+      pending
+        .flatMap((entry) => entry.toolNames)
+        .map((name) => name.trim())
+        .filter(Boolean),
+    ),
+  ].filter((name) => !readyNow.has(name) && !runningNow.has(name));
+}
+
+/**
+ * The tool names one node still owes AFTER whatever it can run right now.
+ *
+ * A composite lifecycle node is a whole stage: `getMissionGraphNodeFrontier-
+ * ToolNames` deliberately reports only its CURRENT action, because that is the
+ * one thing authority will admit. For the planned sequence that answer is a
+ * lie of omission — a ready code_execution stage with four actions would report
+ * "1 later step" while owing seven. So expand the stage from its durable action
+ * cursor instead, dropping the current action when the stage is already live.
+ *
+ * Conditional actions (`code_repair_record_cycle`, which runs only when fast
+ * validation goes red) are omitted: the mission does not owe them, and a
+ * sequence that promises a repair the mission hopes to skip is worse than one
+ * that stays quiet about it.
+ */
+function pendingToolNamesForNode(
+  node: MissionGraphV3["nodes"][string],
+): string[] {
+  const lifecycle = getSafeMissionCompositeLifecycleSpecV1(node);
+  const live = node.status === "ready" || node.status === "running";
+  if (!lifecycle) {
+    // A conventional node is exactly one call: live means nothing is owed after
+    // it, and the ready frontier already names it.
+    return live ? [] : [...getMissionGraphNodeFrontierToolNames(node)];
+  }
+  const cursor = getSafeMissionCompositeLifecycleStateV1(node)?.actionCursor ?? 0;
+  return lifecycle.actions
+    .slice(cursor + (live ? 1 : 0))
+    .filter((action) => action.condition === undefined)
+    .map((action) => action.toolName);
 }
 
 export function findExactGraphBoundToolCallIndex(

@@ -18987,6 +18987,10 @@ export async function runAgentMission({
                   null,
                 stageBudgetBlock,
                 resolvedRepositoryVisibility,
+                // Same authoritative graph every other frontier seat reads.
+                // Steering input only — it derives the planned-sequence line
+                // and cannot change which schemas were offered above.
+                graph: missionGraphSession?.graph ?? missionGraph,
                 // These two cards must reach the model verbatim: the Linear
                 // card carries the product specification and the closure card
                 // carries the only legal next call. Concatenated into
@@ -33530,6 +33534,8 @@ function insertMissionGraphFrontierTurnContext(
     currentStage?: string | null;
     stageBudgetBlock?: string | null;
     resolvedRepositoryVisibility?: "public" | "private" | null;
+    /** Steering input only; see `buildMissionGraphFrontierTurnContext`. */
+    graph?: MissionGraphV3 | null;
     /**
      * Cards delivered as their own system message, bypassing the stage
      * prompt's evidence filter entirely. Reserved for content the model must

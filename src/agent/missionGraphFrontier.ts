@@ -25,10 +25,12 @@ import {
 // selectors are exactly the second-authority drift the shared-classifier
 // convention exists to prevent.
 import {
+  authoritativeRefusalFrontierToolNamesV1,
   getMissionGraphNodeFrontierToolNames,
   getSafeMissionCompositeLifecycleSpecV1,
   getSafeMissionCompositeLifecycleStateV1,
   missionGraphOnlyFinalSynthesisRemainsV1,
+  missionGraphPlannedSequenceAfterFrontierV1,
 } from "./missionGraphSelectors";
 import {
   flattenMissionPlanTasks,
@@ -1090,6 +1092,44 @@ export function getPendingResumeOwedWriteNodeIds(
     .map((node) => node.id);
 }
 
+/**
+ * The one line that tells a model on a one-tool frontier what the mission is
+ * going to ask for after this call, so it stops reaching for step eleven on
+ * step one.
+ *
+ * Hard rules, because a "what comes later" list on the same turn as a "call
+ * this now" list is one careless sentence away from becoming instance #18 of
+ * two-subsystems-disagree:
+ *   - every name here is one the authority WILL refuse right now, guaranteed by
+ *     `missionGraphPlannedSequenceAfterFrontierV1` excluding the ready/running
+ *     frontier;
+ *   - the prose says so in the same breath as the names, and repeats the one
+ *     callable instruction afterwards, so the nearest imperative to the tool
+ *     list is still "call the ready tool";
+ *   - fail closed: no pending names, or no ready names to contrast them with,
+ *     emits nothing.
+ *
+ * Capped, because the sequence is prompt context and a fifty-node repair graph
+ * must not push the actual instruction out of the window.
+ */
+export const MISSION_GRAPH_PLANNED_SEQUENCE_MAX_NAMES_V1 = 10;
+
+export function formatMissionGraphPlannedSequenceLineV1(input: {
+  readyToolNames: readonly string[];
+  laterToolNames: readonly string[];
+}): string | null {
+  const ready = input.readyToolNames.map((name) => name.trim()).filter(Boolean);
+  const later = input.laterToolNames.map((name) => name.trim()).filter(Boolean);
+  if (ready.length === 0 || later.length === 0) return null;
+  const shown = later.slice(0, MISSION_GRAPH_PLANNED_SEQUENCE_MAX_NAMES_V1);
+  const overflow = later.length - shown.length;
+  return [
+    `PLANNED SEQUENCE: this mission still owes ${later.length} later step(s), in this order: ${shown.join(" -> ")}${overflow > 0 ? ` -> (+${overflow} more)` : ""}.`,
+    "None of those are callable yet; each one opens only after the step before it produces its receipt. Calling one now is refused and costs a step.",
+    `Callable on this turn: ${ready.join(", ")}. Call one of those exact names now — the rest of the mission is planned and will be offered to you in turn.`,
+  ].join("\n");
+}
+
 export function buildMissionGraphFrontierTurnContext(
   stepTools: readonly ModelToolDefinition[],
   observedBinding: string | null = null,
@@ -1098,6 +1138,12 @@ export function buildMissionGraphFrontierTurnContext(
     currentStage?: string | null;
     stageBudgetBlock?: string | null;
     resolvedRepositoryVisibility?: "public" | "private" | null;
+    /**
+     * The authoritative mission graph, used ONLY to derive the planned-sequence
+     * steering line. It never widens, narrows, or reorders the offered menu:
+     * `stepTools` remains the sole source of what the model may call.
+     */
+    graph?: MissionGraphV3 | null;
   } = {},
 ): string {
   const names = stepTools.map((tool) => tool.function.name);
@@ -1218,7 +1264,24 @@ export function buildMissionGraphFrontierTurnContext(
           "The export preserves nested directories and never overwrites existing files or folders.",
         ]
       : [];
+  // Steering only, and only on the exact planned frontier — the branch that is
+  // one tool wide by construction and where `allowDynamicReadContinuation` is
+  // false by definition (`missionGraphRunAdmitsDynamicReadContinuationV1`), so
+  // the authority-admitted intersection below is exact rather than a
+  // fail-closed under-report. The set-loose branch returned above keeps its
+  // stage-local projection untouched.
+  const plannedSequenceLine = formatMissionGraphPlannedSequenceLineV1({
+    readyToolNames: authoritativeRefusalFrontierToolNamesV1({
+      graph: options.graph ?? null,
+      candidateToolNames: names,
+      allowDynamicReadContinuation: false,
+    }),
+    laterToolNames: missionGraphPlannedSequenceAfterFrontierV1(
+      options.graph ?? null,
+    ),
+  });
   const toolContractLines = [
+    ...(plannedSequenceLine ? [plannedSequenceLine] : []),
     ...codeCapabilityBoundary,
     ...acceptedResearchBoundary,
     ...researchHierarchyBoundary,
