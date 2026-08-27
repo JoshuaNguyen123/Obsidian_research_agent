@@ -191,11 +191,41 @@ export function selectInitialResearchEffort(
     reasons.push(...classified.reasons);
   }
 
+  // Quote-span verification is triggered by the same predicate the claim
+  // ledger uses, and it has a mechanical floor no tier scorer can express: the
+  // primary text must be fetched and its passages re-read until every quoted
+  // span matches verbatim. Two live missions died at standard's 12 tool calls
+  // with the graph refusing the verification reads mid-repair (2026-08-24), so
+  // the verifier was demanding work the budget never funded.
+  //
+  // The floor sits here rather than inside the scorer because two paths reach
+  // a tier without ever running the scorer: a caller-supplied `requestedTier`
+  // (which the plan assist fills from the model's own self-assessment) and the
+  // focused-source early return. Both were still stranding quote missions at
+  // quick or standard while the scorer's copy of this rule sat unreached. A
+  // brevity request shortens the note, not the verification.
+  const quoteFloorApplies =
+    shouldRequireQuoteSpans(input.prompt) &&
+    tierIndex(tier) < tierIndex("deep");
+  if (quoteFloorApplies) {
+    tier = "deep";
+    reasons.push(
+      "Verbatim quotation was requested: quote-span verification needs primary-text fetches and passage reads, so the deep budget is the floor.",
+    );
+  }
+
+  // The explicit ceiling still wins: a user who capped effort gets the cap,
+  // and the reason says the verification may run short rather than pretending
+  // the floor held.
   const constrainedTier = clampTier(tier, constraints.maxTier);
   const constrained =
     constrainedTier !== tier || hasNumericConstraint(constraints);
   if (constrainedTier !== tier) {
-    reasons.push(`Research tier was capped at ${constrainedTier}.`);
+    reasons.push(
+      quoteFloorApplies
+        ? `Research tier was capped at ${constrainedTier}, below the quote-span floor: verification may run out of budget before every quoted span is checked.`
+        : `Research tier was capped at ${constrainedTier}.`,
+    );
   }
 
   return {
@@ -520,23 +550,11 @@ function classifyTier(
     reasons.push("The user requested a concise research pass.");
   }
 
-  let tier: ResearchEffortTier =
+  // The quote-span floor is applied by `selectInitialResearchEffort`, after
+  // every path that can produce a tier — including the two that never reach
+  // this scorer. Do not reintroduce a copy here.
+  const tier: ResearchEffortTier =
     score >= 4 ? "deep" : score >= 2 ? "standard" : "quick";
-  // Quote-span verification is triggered by the same predicate the claim
-  // ledger uses, and it has a mechanical floor the score cannot express: the
-  // primary text must be fetched and its passages re-read until every quoted
-  // span matches verbatim. Two live missions died at standard's 12 tool calls
-  // with the graph refusing the verification reads mid-repair (2026-08-24),
-  // so the verifier was demanding work this budget never funded. A brevity
-  // request shortens the note, not the verification.
-  // Extended/durable routes return before this scorer, so the floor can only
-  // ever raise quick or standard.
-  if (shouldRequireQuoteSpans(prompt)) {
-    tier = "deep";
-    reasons.push(
-      "Verbatim quotation was requested: quote-span verification needs primary-text fetches and passage reads, so the deep budget is the floor.",
-    );
-  }
 
   return { tier, reasons };
 }

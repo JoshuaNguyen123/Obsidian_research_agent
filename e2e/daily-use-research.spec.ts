@@ -844,6 +844,47 @@ test.describe("Daily-use live research contract", () => {
     }
   });
 
+  test("a dead source URL is substituted by the host, not surfaced as a failed mission", async () => {
+    // The sibling lane above fails the first fetch with a retryable 503, so
+    // the transport recovers on its own and the model can also re-plan. A 404
+    // is not retryable: `web_fetch` used to throw on it four lines before its
+    // own substitution ladder, and one bad model-chosen URL ended the run.
+    // The product promise under test is that the fetch still returns usable
+    // content from an alternate source — not that the model recovers.
+    let harness: RealAiHarness | null = null;
+    try {
+      harness = await startRealAiHarness("live-dead-source-substitution");
+      await harness.installOwnedWebBackend({
+        failFirstFetch: true,
+        failFirstFetchStatus: 404,
+      });
+      await harness.submitMission(
+        `Research the owned recovery evidence. Search first, then fetch the top result. Append only verified findings and include ${harness.marker}.`,
+      );
+      const snapshot = await harness.attestProductionRun({ requireStructuredRouting: true });
+      const metrics = await harness.readOwnedWebMetrics();
+
+      // The dead URL was really attempted, and the ladder really ran.
+      expect(metrics.failedFetchTransportCalls).toBeGreaterThanOrEqual(1);
+      expect(metrics.fetchTransportCalls).toBeGreaterThan(
+        metrics.failedFetchTransportCalls,
+      );
+
+      // The 404 did not terminate the fetch node: some web_fetch node reached
+      // a non-blocked state, which is only possible if a substitute answered.
+      const graph = snapshot.lastMissionGraph as {
+        nodes?: Record<string, { id: string; status: string }>;
+      } | null;
+      const fetchNodes = Object.values(graph?.nodes ?? {}).filter((node) =>
+        node.id.includes("web_fetch"),
+      );
+      expect(fetchNodes.length).toBeGreaterThan(0);
+      expect(fetchNodes.some((node) => node.status === "complete")).toBe(true);
+    } finally {
+      await harness?.close();
+    }
+  });
+
   test("whole-note replacement is byte-stable on denial and receipt-backed on approval", async () => {
     let harness: RealAiHarness | null = null;
     try {

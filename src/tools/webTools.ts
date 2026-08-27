@@ -378,7 +378,15 @@ export const webFetchTool: AgentTool = {
 
     const response = await requestWithRetry(context.httpTransport, request);
     if (response.status >= 400) {
-      throw new Error(getHttpErrorMessage(response, "web_fetch"));
+      return await retrieveWebFetchSubstituteV1({
+        args,
+        context,
+        query,
+        url,
+        maxAgeMs,
+        failureCode: "source_http_error",
+        failureSummary: `web_fetch could not retrieve ${url} (${getHttpErrorMessage(response, "web_fetch")})`,
+      });
     }
 
     const normalized = normalizeWebFetchResponse(
@@ -392,69 +400,15 @@ export const webFetchTool: AgentTool = {
       parserStatus: normalized.parserStatus,
     });
     if (!sourceUsability.usable) {
-      const alternateUrls = await resolveFallbackUrls(args, context, query, url);
-      const fallback = await retrieveUsableResearchSource({
-        candidates: buildResearchFallbackCandidates({
-          url,
-          alternateUrls,
-          query,
-          documentLike: isDocumentLikeUrl(url),
-        }).filter(
-          (candidate) =>
-            candidate.strategy === "browser_extract" ||
-            candidate.strategy === "document_extract" ||
-            candidate.strategy === "alternate_result",
-        ),
-        providers: createRuntimeResearchProviders(context),
-        signal: context.abortSignal,
-        maxAttempts: 12,
-      });
-      if (!fallback.output) {
-        const attempted = fallback.attempts
-          .filter((attempt) => attempt.status !== "unsupported")
-          .map(
-            (attempt) =>
-              `${attempt.strategy}:${attempt.status}${attempt.reason ? `(${attempt.reason})` : ""}`,
-          )
-          .join(", ");
-        throw new ToolExecutionError(
-          "source_unusable",
-          `web_fetch could not extract usable source passages from ${url} (${sourceUsability.reason}).${attempted ? ` Fallbacks: ${attempted}.` : ""}`,
-        );
-      }
-      const effectiveUrl = normalizeWebFetchUrl(fallback.output.url || url);
-      const fallbackCache = await writeSourceCacheNote(context, {
-        url: effectiveUrl,
-        title: fallback.output.title,
-        content: fallback.output.content,
-        parserStatus: normalizeParserStatus(fallback.output.parserStatus),
-      });
-      const usableAttempt = fallback.attempts.find(
-        (attempt) => attempt.status === "usable",
-      );
-      return {
-        title: fallback.output.title,
-        url: effectiveUrl,
-        normalizedUrl: fallbackCache.normalizedUrl,
-        urlHash: fallbackCache.urlHash,
+      return await retrieveWebFetchSubstituteV1({
+        args,
+        context,
         query,
-        content: truncateText(fallback.output.content, MAX_WEB_FETCH_CHARS),
-        links: getProviderLinks(fallback.output.providerMetadata),
-        fromCache: false,
-        cachedPath: fallbackCache.vaultPath,
-        fetchedAt: fallbackCache.fetchedAt,
-        sourceChars: fallbackCache.sourceChars,
-        totalChars: fallbackCache.totalChars,
-        contentHash: fallbackCache.contentHash,
-        truncated: fallbackCache.truncated,
-        parserStatus: fallbackCache.parserStatus,
-        cacheMaxAgeMs: maxAgeMs,
-        section: 1,
-        sectionCount: fallbackCache.sectionCount,
-        fallbackUsed: true,
-        retrievalStrategy: usableAttempt?.strategy,
-        retrievalAttempts: fallback.attempts,
-      };
+        url,
+        maxAgeMs,
+        failureCode: "source_unusable",
+        failureSummary: `web_fetch could not extract usable source passages from ${url} (${sourceUsability.reason})`,
+      });
     }
     const cache = await writeSourceCacheNote(context, {
       url,
@@ -484,6 +438,94 @@ export const webFetchTool: AgentTool = {
     };
   },
 };
+
+/**
+ * Retrieve a substitute source after the primary web_fetch failed to yield
+ * usable passages.
+ *
+ * A transport-level HTTP failure and a 2xx body with nothing extractable are
+ * the same problem from the mission's point of view: the cited URL cannot
+ * supply evidence. Only the second used to reach this ladder, so a single
+ * model-chosen URL returning 404 ended the whole run while a working mirror,
+ * an open-access edition, or the next search result sat unused. Both paths
+ * enter here now; the caller supplies the failure code so the classifier
+ * downstream can still tell a dead endpoint from an unreadable page.
+ */
+async function retrieveWebFetchSubstituteV1(input: {
+  args: Record<string, unknown>;
+  context: ToolExecutionContext;
+  query: string | undefined;
+  url: string;
+  maxAgeMs: number;
+  failureCode: "source_unusable" | "source_http_error";
+  failureSummary: string;
+}) {
+  const { args, context, query, url, maxAgeMs } = input;
+  assertOperationActive(context);
+  const alternateUrls = await resolveFallbackUrls(args, context, query, url);
+  const fallback = await retrieveUsableResearchSource({
+    candidates: buildResearchFallbackCandidates({
+      url,
+      alternateUrls,
+      query,
+      documentLike: isDocumentLikeUrl(url),
+    }).filter(
+      (candidate) =>
+        candidate.strategy === "browser_extract" ||
+        candidate.strategy === "document_extract" ||
+        candidate.strategy === "alternate_result",
+    ),
+    providers: createRuntimeResearchProviders(context),
+    signal: context.abortSignal,
+    maxAttempts: 12,
+  });
+  if (!fallback.output) {
+    const attempted = fallback.attempts
+      .filter((attempt) => attempt.status !== "unsupported")
+      .map(
+        (attempt) =>
+          `${attempt.strategy}:${attempt.status}${attempt.reason ? `(${attempt.reason})` : ""}`,
+      )
+      .join(", ");
+    throw new ToolExecutionError(
+      input.failureCode,
+      `${input.failureSummary}.${attempted ? ` Fallbacks: ${attempted}.` : ""}`,
+    );
+  }
+  const effectiveUrl = normalizeWebFetchUrl(fallback.output.url || url);
+  const fallbackCache = await writeSourceCacheNote(context, {
+    url: effectiveUrl,
+    title: fallback.output.title,
+    content: fallback.output.content,
+    parserStatus: normalizeParserStatus(fallback.output.parserStatus),
+  });
+  const usableAttempt = fallback.attempts.find(
+    (attempt) => attempt.status === "usable",
+  );
+  return {
+    title: fallback.output.title,
+    url: effectiveUrl,
+    normalizedUrl: fallbackCache.normalizedUrl,
+    urlHash: fallbackCache.urlHash,
+    query,
+    content: truncateText(fallback.output.content, MAX_WEB_FETCH_CHARS),
+    links: getProviderLinks(fallback.output.providerMetadata),
+    fromCache: false,
+    cachedPath: fallbackCache.vaultPath,
+    fetchedAt: fallbackCache.fetchedAt,
+    sourceChars: fallbackCache.sourceChars,
+    totalChars: fallbackCache.totalChars,
+    contentHash: fallbackCache.contentHash,
+    truncated: fallbackCache.truncated,
+    parserStatus: fallbackCache.parserStatus,
+    cacheMaxAgeMs: maxAgeMs,
+    section: 1,
+    sectionCount: fallbackCache.sectionCount,
+    fallbackUsed: true,
+    retrievalStrategy: usableAttempt?.strategy,
+    retrievalAttempts: fallback.attempts,
+  };
+}
 
 export const readSourceSectionTool: AgentTool = {
   name: "read_source_section",

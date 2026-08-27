@@ -40,6 +40,28 @@ test("requestWithRetry does not retry a plain 4xx caller error", async () => {
   assert.equal(seq.calls(), 1);
 });
 
+test("requestWithRetry retries a provider 500 rather than surfacing the blip", async () => {
+  const seq = sequenceTransport([500, 200]);
+  const response = await requestWithRetry(
+    seq.transport,
+    { url: "https://example.test" },
+    { retryDelaysMs: [1, 1] },
+  );
+  assert.equal(response.status, 200);
+  assert.equal(seq.calls(), 2);
+});
+
+test("requestWithRetry returns a persistent 502 after its retries instead of throwing", async () => {
+  const seq = sequenceTransport([502, 502, 502, 502]);
+  const response = await requestWithRetry(
+    seq.transport,
+    { url: "https://example.test" },
+    { retryDelaysMs: [1, 1] },
+  );
+  assert.equal(response.status, 502);
+  assert.equal(seq.calls(), 3);
+});
+
 test("requestWithRetry gives up after exhausting the delay budget", async () => {
   const seq = sequenceTransport([503, 503, 503, 503]);
   const response = await requestWithRetry(

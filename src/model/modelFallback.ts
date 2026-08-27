@@ -1,6 +1,12 @@
 /**
  * Minimal primary→specialist model fallback after retries are exhausted.
- * Default OFF. Distinct from per-phase specialist routing.
+ * Default ON. Distinct from per-phase specialist routing.
+ *
+ * Eligibility below is deliberately provider-side only — timeout, network
+ * drop, or a 5xx — so the substitution can never be a quality decision. Auth,
+ * rate limit, budget exhaustion, and anything the model merely did badly are
+ * refused, because reissuing those on a second model would trade the answer
+ * the user configured for a different one without asking.
  */
 
 import type { MissionEvidence } from "../agent/missionLedger";

@@ -1006,6 +1006,11 @@ export class MissionGraphSession {
             : result.failureFingerprint
               ? 1
               : 0;
+        // Two identical failures end the node. That stays: the repair is to
+        // make the second attempt different (see `missionRetryVariation`), not
+        // to buy a third identical one. Raising this ceiling would also hand
+        // an effectful node an extra unguarded attempt, and the append path
+        // has no idempotency key yet.
         const terminal =
           result.terminalFailure === true ||
           nextAttempts >= node.retries.maxAttempts ||

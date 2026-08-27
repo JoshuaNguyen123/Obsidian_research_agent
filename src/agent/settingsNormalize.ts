@@ -101,7 +101,7 @@ export interface NormalizableAgentSettings {
   runRetentionDays?: number;
   /** Max Agent Runs to keep. 0 disables the cap. */
   runRetentionMaxRuns?: number;
-  /** Opt-in model fallback on provider outage. Default off. */
+  /** Model fallback on provider outage. Default on; provider-side failures only. */
   modelFallbackEnabled?: boolean;
   keepAwakeDuringOvernightRuns?: boolean;
   orchestratorPreviewEnabled?: boolean;
@@ -193,7 +193,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   showUnfinishedRunBannerOnOpen: true,
   runRetentionDays: 30,
   runRetentionMaxRuns: 200,
-  modelFallbackEnabled: false,
+  modelFallbackEnabled: true,
   keepAwakeDuringOvernightRuns: false,
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,

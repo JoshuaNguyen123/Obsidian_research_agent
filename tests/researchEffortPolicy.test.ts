@@ -436,3 +436,63 @@ test("verbatim quotation missions get the deep floor that funds quote-span verif
   });
   assert.equal(durable.tier, "extended");
 });
+
+test("the quote-span floor survives a model-supplied tier and the focused-source shortcut", () => {
+  // Two paths used to reach a tier without ever consulting the floor. The plan
+  // assist fills `requestedTier` from the model's own effort self-assessment,
+  // and a mission naming one source returns early from the scorer. Both left
+  // quote missions on a budget that cannot fund verification.
+  const modelAssessed = selectInitialResearchEffort({
+    prompt:
+      "Research the Nicene Creed clause on the Holy Spirit and quote it verbatim in the note.",
+    route: "grounded_research",
+    subquestions: 1,
+    freshness: "required",
+    risk: "low",
+    constraints: { requestedTier: "quick" },
+  });
+  assert.equal(modelAssessed.tier, "deep");
+  assert.ok(
+    modelAssessed.reasons.some((reason) => /quote-span verification/i.test(reason)),
+    modelAssessed.reasons.join(" | "),
+  );
+
+  const focusedSource = selectInitialResearchEffort({
+    prompt: "Quote the exact liability clause from this contract page.",
+    route: "grounded_research",
+    subquestions: 1,
+    requiredSources: 1,
+    freshness: "none",
+    risk: "low",
+  });
+  assert.equal(focusedSource.tier, "deep");
+
+  // Without the quotation demand the same focused mission keeps its shortcut.
+  const focusedWithoutQuotes = selectInitialResearchEffort({
+    prompt: "Summarize the liability clause from this contract page.",
+    route: "grounded_research",
+    subquestions: 1,
+    requiredSources: 1,
+    freshness: "none",
+    risk: "low",
+  });
+  assert.equal(focusedWithoutQuotes.tier, "quick");
+});
+
+test("an explicit effort ceiling still outranks the quote-span floor, and says so", () => {
+  const capped = selectInitialResearchEffort({
+    prompt:
+      "Research the Nicene Creed clause on the Holy Spirit and quote it verbatim in the note.",
+    route: "grounded_research",
+    subquestions: 1,
+    freshness: "required",
+    risk: "low",
+    constraints: { maxTier: "standard" },
+  });
+  assert.equal(capped.tier, "standard");
+  assert.equal(capped.constrained, true);
+  assert.ok(
+    capped.reasons.some((reason) => /below the quote-span floor/i.test(reason)),
+    capped.reasons.join(" | "),
+  );
+});

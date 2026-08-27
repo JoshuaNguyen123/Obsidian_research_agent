@@ -1,11 +1,15 @@
 import type { HttpRequest, HttpResponse, HttpTransport } from "../model/types";
 
 /**
- * Retry a transient HTTP failure with bounded exponential backoff. Only
- * rate-limit / temporary-unavailable statuses are retried (a 4xx that is not a
- * rate limit is a caller error and returned immediately). The wait is
- * abort-aware so a cancelled run never blocks. Retry delays are injectable so
- * tests stay fast.
+ * Retry a transient HTTP failure with bounded exponential backoff. Rate-limit
+ * and server-side statuses are retried (a 4xx that is not a rate limit is a
+ * caller error and returned immediately). The wait is abort-aware so a
+ * cancelled run never blocks. Retry delays are injectable so tests stay fast.
+ *
+ * 500/502/504 join 503 here because a bare provider hiccup used to get zero
+ * retries and end whole missions on the first blip; they are as transient as
+ * the "temporarily unavailable" status they sit beside, and every caller is a
+ * read.
  */
 export async function requestWithRetry(
   transport: HttpTransport,
@@ -13,7 +17,9 @@ export async function requestWithRetry(
   options?: { retryDelaysMs?: number[]; retryStatuses?: number[] },
 ): Promise<HttpResponse> {
   const delays = options?.retryDelaysMs ?? [400, 1200];
-  const retryStatuses = new Set(options?.retryStatuses ?? [429, 503]);
+  const retryStatuses = new Set(
+    options?.retryStatuses ?? [429, 500, 502, 503, 504],
+  );
   let attempt = 0;
   for (;;) {
     const response = await transport(request);
