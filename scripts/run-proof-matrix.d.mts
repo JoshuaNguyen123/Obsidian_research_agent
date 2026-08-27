@@ -114,6 +114,14 @@ export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS: "environment_not_configur
  * and still a failure, but harness evidence — never counted as a product red.
  */
 export const HARNESS_CLEANUP_FAILURE_CLASS: "harness:cleanup_failed";
+/**
+ * The model provider refused to serve the run — quota, monthly cap, or rate
+ * limit. The product was never exercised, so it is not a product red.
+ */
+export const PROVIDER_QUOTA_EXHAUSTED_FAILURE_CLASS: "harness:provider_quota_exhausted";
+export function detectProviderQuotaExhaustion(
+  logText: string,
+): { detail: string; index: number } | null;
 export function detectLaneCleanupFailure(
   logText: string,
 ): { lane: string; detail: string; index: number } | null;

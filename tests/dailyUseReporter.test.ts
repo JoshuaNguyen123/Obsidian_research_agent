@@ -514,3 +514,83 @@ test("counters come from ONE source: annotation and fold are never blended", () 
     toolCallsUndetermined: null,
   });
 });
+
+test("a validation verdict is work, not an empty contract", () => {
+  // Measured 2026-08-26: every compound run reported exactly 3 vacuous calls,
+  // and all three were code_validate_fast/targeted/full. Their receipts carry
+  // a verified readback, exitCode 0, real stdout bytes and a real duration --
+  // the sandbox command ran and passed -- alongside affectedCount: 0, because
+  // validating a workspace changes nothing. Scoring that as an empty contract
+  // was the instrument's error and cost 15 points of measured tool-call
+  // success on an otherwise perfect run.
+  for (const purpose of ["validation_fast", "validation_targeted", "validation_full"]) {
+    assert.equal(
+      classifyToolReceiptWork({
+        purpose,
+        exitCode: 0,
+        commitKind: "committed",
+        affectedCount: 0,
+        effects: { affectedCount: 0, changedFields: [] },
+      }),
+      "worked",
+      `${purpose} with a passing command is work`,
+    );
+  }
+});
+
+test("the validation exemption cannot be claimed by something that did not run", () => {
+  // The exemption is narrow on purpose. A verdict-only receipt must prove its
+  // command actually ran and passed; anything else falls back to the delta
+  // rules, so this cannot become a blanket amnesty for zero-delta successes.
+  assert.equal(
+    classifyToolReceiptWork({
+      purpose: "validation_fast",
+      exitCode: 1,
+      commitKind: "committed",
+      affectedCount: 0,
+    }),
+    "vacuous",
+    "a validation with a non-zero exit does not get the exemption",
+  );
+  assert.equal(
+    classifyToolReceiptWork({
+      purpose: "validation_fast",
+      commitKind: "committed",
+      affectedCount: 0,
+    }),
+    "vacuous",
+    "a validation with no exitCode at all does not get the exemption",
+  );
+  assert.equal(
+    classifyToolReceiptWork({
+      purpose: "mutation_write",
+      exitCode: 0,
+      commitKind: "committed",
+      affectedCount: 0,
+    }),
+    "vacuous",
+    "a non-verdict purpose is unaffected by the exemption",
+  );
+});
+
+test("a real empty contract is still caught", () => {
+  // The metric's whole reason for existing: a tool that WAS supposed to change
+  // something and reported success without changing it.
+  assert.equal(
+    classifyToolReceiptWork({
+      operation: "write",
+      commitKind: "committed",
+      bytesWritten: 0,
+      bytesDeleted: 0,
+      affectedCount: 0,
+    }),
+    "vacuous",
+  );
+  assert.equal(
+    classifyToolReceiptWork({ commitKind: "committed", effects: { changed: false } }),
+    "vacuous",
+  );
+  // And correct idempotent behaviour stays its own class, never lumped in.
+  assert.equal(classifyToolReceiptWork({ commitKind: "no_op" }), "intentional_no_op");
+  assert.equal(classifyToolReceiptWork({ commitKind: "reconciled" }), "intentional_no_op");
+});

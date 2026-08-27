@@ -230,7 +230,35 @@ export interface VacuousDetectableReceipt {
   affectedCount?: unknown;
   commitKind?: unknown;
   effects?: unknown;
+  /**
+   * What the action was FOR. Verification purposes (`validation_fast`,
+   * `validation_targeted`, `validation_full`) produce a verdict, not a delta.
+   * See classifyToolReceiptWork.
+   */
+  purpose?: unknown;
+  /** Present on sandbox-backed receipts; 0 means the command really ran and passed. */
+  exitCode?: unknown;
 }
+
+/**
+ * Purposes whose entire work product is a VERDICT rather than a mutation.
+ *
+ * Measured on 2026-08-26: every compound run reported exactly 3 vacuous tool
+ * calls, and all three were the validation tools — `code_validate_fast`,
+ * `code_validate_targeted`, `code_validate_full`. Their receipts carry
+ * `commitKind: "committed"`, `readback.status: "verified"`, `exitCode: 0`, real
+ * stdout bytes and a real duration — the sandbox command genuinely ran and
+ * passed — alongside `affectedCount: 0`, because validating a workspace
+ * changes nothing. That is correct behaviour, and scoring it as an
+ * empty-contract success was the instrument's error, not the product's.
+ *
+ * The distinction that matters: vacuous means "a tool that was supposed to
+ * change something reported success without changing it". A tool that never
+ * claimed to change anything cannot be vacuously unchanged.
+ */
+const VERDICT_ONLY_RECEIPT_PURPOSES = Object.freeze(
+  new Set(["validation_fast", "validation_targeted", "validation_full"]),
+);
 
 export type ToolReceiptWorkClass =
   | "worked"
@@ -265,6 +293,20 @@ export function classifyToolReceiptWork(
   if (!receipt || typeof receipt !== "object") return "unknown";
   if (receipt.commitKind === "no_op" || receipt.commitKind === "reconciled") {
     return "intentional_no_op";
+  }
+  // A verdict-only action (validation) did its work when its command ran and
+  // passed; it has no delta to show because it was never asked to change
+  // anything. Settled BEFORE the delta rules below, which would otherwise read
+  // `affectedCount: 0` as an empty contract. `exitCode === 0` is required, so a
+  // validation that did NOT actually run cannot claim this exemption — and a
+  // FAILING validation is a failure, not a success receipt, so it never
+  // reaches here.
+  if (
+    typeof receipt.purpose === "string" &&
+    VERDICT_ONLY_RECEIPT_PURPOSES.has(receipt.purpose) &&
+    receipt.exitCode === 0
+  ) {
+    return "worked";
   }
   const effects = receipt.effects;
   if (
