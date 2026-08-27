@@ -474,9 +474,10 @@ async function resolveExactCodeExamples(
   runId: string,
   events: readonly ProjectStageEventV1[],
 ): Promise<ResolvedCodeExamplesV1> {
-  // One shared answer with append_jupyter_reflection: a commit_readback event's
-  // resource addresses the durable repair CHECKPOINT (revision = its sequence
-  // number), never a Git object id, so the durable lineage owns the SHA.
+  // One shared answer with append_jupyter_reflection: a verified-commit receipt
+  // TARGETS the durable repair checkpoint but NAMES its commit as a related
+  // resource, and the durable lineage records the same SHA. See
+  // resolveVerifiedCommitEvidenceV1 for which one wins and when.
   let evidence: VerifiedCommitEvidenceV1;
   try {
     evidence = resolveVerifiedCommitEvidenceV1({
@@ -695,9 +696,9 @@ function projectExamplesFromBundle(
 ): ProjectCodeExampleV1[] {
   // Select the same event prepare bound the examples to: the most recent
   // verified commit readback. Selecting by SHA equality instead would silently
-  // pick a different event whenever the latest readback is the checkpoint-
-  // shaped receipt projection (see resolveVerifiedCommitEvidenceV1), and the
-  // recomputed sourceReceiptId would then fail its own consistency check.
+  // pick a different event whenever the latest readback names no Git object id
+  // (see resolveVerifiedCommitEvidenceV1), and the recomputed sourceReceiptId
+  // would then fail its own consistency check.
   const commitEvent = [...evidence]
     .filter(
       (event) =>

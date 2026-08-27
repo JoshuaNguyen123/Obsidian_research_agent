@@ -9,6 +9,7 @@ import {
   expectSha256,
 } from "../integrations/linear/LinearContractSupport";
 import {
+  canonicalGitCommitShaV1,
   createProjectStageEventV1,
   type ProjectEvidenceKindV1,
   type ProjectEvidenceResourceV1,
@@ -193,7 +194,7 @@ export function projectStageEventFromActionReceiptV1(input: {
   ) {
     return null;
   }
-  const resource = actionResourceToProjectResource(receipt.resource, receipt);
+  const resource = projectResourceFromReceiptResourcesV1(receipt);
   if (!resource) return null;
   return projectStageEventFromReceiptObservationV1({
     schemaVersion: PROJECT_RECEIPT_OBSERVATION_SCHEMA_VERSION,
@@ -322,19 +323,82 @@ export function parseProjectReceiptObservationV1(
   };
 }
 
-function actionResourceToProjectResource(
-  resource: ResourceRef,
-  receipt: ActionReceipt,
+/**
+ * The receipt-shaped input this projection needs. Deliberately structural, so
+ * the canonical `ActionReceipt` and the persisted `AgentRunReceipt` replay of
+ * the same immutable receipt run through ONE implementation. Two copies of
+ * this mapping is how a durable ledger and its live projection start naming
+ * different resources for one commit.
+ */
+export interface ProjectReceiptResourceEvidenceV1 {
+  resource: ResourceRef;
+  relatedResources?: readonly ResourceRef[] | undefined;
+  readback?: { observedRevision?: string | undefined } | undefined;
+}
+
+/**
+ * A receipt whose own resource addresses something other than a Git object may
+ * still NAME the commit it verified, as a related resource. `code_commit_verified`
+ * is exactly that case: its `resource` is the durable repair checkpoint (with
+ * the checkpoint SEQUENCE as its revision) because reconciliation keys on the
+ * checkpoint, while the commit SHA rides along in `relatedResources`.
+ *
+ * Only a value that IS a canonical Git object id qualifies, and a related
+ * resource that disagrees with itself (revision present but not equal to the
+ * id) is refused rather than trusted.
+ */
+function verifiedGitCommitResource(
+  related: readonly ResourceRef[] | undefined,
+): { resource: ResourceRef; commitSha: string } | null {
+  for (const candidate of related ?? []) {
+    if (candidate.system !== "git" || candidate.resourceType !== "commit") {
+      continue;
+    }
+    const commitSha = canonicalGitCommitShaV1(candidate.id);
+    if (!commitSha) continue;
+    if (candidate.revision !== undefined && candidate.revision !== commitSha) {
+      continue;
+    }
+    return { resource: candidate, commitSha };
+  }
+  return null;
+}
+
+/**
+ * Single host answer to "which resource does this receipt's stage evidence
+ * address?". Prefer the related Git commit only when the receipt's own
+ * resource does not already name a Git object id, so a receipt that addresses
+ * the commit directly keeps addressing it, and never invent a resource: a
+ * receipt that names no Git object id anywhere still projects its own
+ * checkpoint identity and remains unable to pay a commit-SHA consumer.
+ */
+export function projectResourceFromReceiptResourcesV1(
+  input: ProjectReceiptResourceEvidenceV1,
 ): ProjectEvidenceResourceV1 | null {
-  if (!isProjectResourceSystem(resource.system)) return null;
+  const own = input.resource;
+  const ownCommitSha = canonicalGitCommitShaV1(own.revision ?? own.id);
+  const named = ownCommitSha ? null : verifiedGitCommitResource(input.relatedResources);
+  if (named) {
+    if (!isProjectResourceSystem(named.resource.system)) return null;
+    return {
+      system: named.resource.system,
+      resourceType: named.resource.resourceType,
+      id: named.resource.id,
+      url: named.resource.url ?? null,
+      path: named.resource.path ?? null,
+      // The observed revision belongs to the receipt's own target (the
+      // checkpoint sequence number). Never stamp it onto the commit.
+      revision: named.commitSha,
+    };
+  }
+  if (!isProjectResourceSystem(own.system)) return null;
   return {
-    system: resource.system,
-    resourceType: resource.resourceType,
-    id: resource.id,
-    url: resource.url ?? null,
-    path: resource.path ?? null,
-    revision:
-      receipt.readback.observedRevision ?? resource.revision ?? null,
+    system: own.system,
+    resourceType: own.resourceType,
+    id: own.id,
+    url: own.url ?? null,
+    path: own.path ?? null,
+    revision: input.readback?.observedRevision ?? own.revision ?? null,
   };
 }
 

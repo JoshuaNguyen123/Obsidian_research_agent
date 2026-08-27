@@ -1078,6 +1078,7 @@ import {
   projectStageEventsFromProjectLineageV1,
 } from "./agent/projectStageLineageMapper";
 import {
+  projectResourceFromReceiptResourcesV1,
   projectStageEventFromReceiptObservationV1,
   type ProjectReceiptObservationV1,
 } from "./agent/projectStageReceiptMapper";
@@ -32998,13 +32999,20 @@ function projectStageEventFromAgentRunReceiptV1(
     !receipt.committedAt ||
     !/^sha256:[a-f0-9]{64}$/u.test(receipt.payloadFingerprint ?? "") ||
     receipt.readback?.status !== "verified" ||
-    !receipt.resource ||
-    !["vault", "linear", "workspace", "git", "github"].includes(
-      receipt.resource.system,
-    )
+    !receipt.resource
   ) {
     return null;
   }
+  // The replayed persisted receipt and the live ActionReceipt must project the
+  // same resource. projectResourceFromReceiptResourcesV1 is the one place that
+  // decides it — including when a receipt addresses a repair checkpoint but
+  // names its verified commit as a related resource.
+  const resource = projectResourceFromReceiptResourcesV1({
+    resource: receipt.resource,
+    relatedResources: receipt.relatedResources,
+    readback: receipt.readback,
+  });
+  if (!resource) return null;
   const observedFingerprint = receipt.readback.observedFingerprint;
   const observation: ProjectReceiptObservationV1 = {
     schemaVersion: 1,
@@ -33020,15 +33028,7 @@ function projectStageEventFromAgentRunReceiptV1(
         ? observedFingerprint
         : null,
     outcome: "committed",
-    resource: {
-      system: receipt.resource.system as ProjectReceiptObservationV1["resource"]["system"],
-      resourceType: receipt.resource.resourceType,
-      id: receipt.resource.id,
-      url: receipt.resource.url ?? null,
-      path: receipt.resource.path ?? null,
-      revision:
-        receipt.readback.observedRevision ?? receipt.resource.revision ?? null,
-    },
+    resource,
     workUnits: [],
   };
   try {

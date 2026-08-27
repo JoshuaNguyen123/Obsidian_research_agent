@@ -76,6 +76,7 @@ import {
   preWriteProofGateAppliesV1,
   resolveThinkingMode,
   canonicalLifecycleReflectionReceiptPaysV1,
+  collectProjectStageEventsV1,
   shouldPlanGenericInitiatingNoteReflectionV1,
   shouldOfferStandaloneLinearProgressReportV1,
   rememberLatestFastValidationDiagnostic,
@@ -27261,4 +27262,85 @@ test("a genuinely unoffered tool name stays in the tool_not_allowed bucket", asy
     ?.offFrontier;
   assert.equal(facts?.offeredAtStepStart, false);
   assert.equal(facts?.provenance, "model_named_unoffered_tool");
+});
+
+/**
+ * The persisted-ledger replay must reach the same conclusion the live receipt
+ * did. The shape here is the one
+ * extensions/code/repair/CodeRepairToolRuntimeV1.ts actually writes: the
+ * receipt targets the durable repair CHECKPOINT (revision = its sequence
+ * number) and names the commit it verified as a related Git resource. A
+ * fixture that puts a 40-hex SHA straight into `resource.id` tests a receipt
+ * no producer emits, which is how the missing SHA went unnoticed.
+ */
+test("replayed verified-commit receipts name their commit from the checkpoint target", () => {
+  const commitSha = "d".repeat(40);
+  const receipt: AgentRunReceipt = {
+    version: 1,
+    id: "code-repair:request-1:verified-commit",
+    runId: "run-replay",
+    toolName: "code_commit_verified",
+    operation: "commit",
+    message: `Created and read back verified local commit ${commitSha}.`,
+    actionId: "prepared:code_commit_verified:run-replay:workspace-1:request-1:1",
+    resource: {
+      system: "git",
+      resourceType: "verified_local_commit",
+      id: "code-repair:run-replay:workspace-1:request-1",
+      workspaceId: "workspace-1",
+      repositoryProfileId: "profile-1",
+      revision: "1",
+    },
+    relatedResources: [
+      {
+        system: "workspace",
+        resourceType: "workspace",
+        id: "workspace-1",
+        workspaceId: "workspace-1",
+      },
+      {
+        system: "git",
+        resourceType: "commit",
+        id: commitSha,
+        workspaceId: "workspace-1",
+        repositoryProfileId: "profile-1",
+        revision: commitSha,
+      },
+    ],
+    payloadFingerprint: `sha256:${"1".repeat(64)}`,
+    grantId: "grant-replay",
+    startedAt: "2026-08-26T09:00:00.000Z",
+    committedAt: "2026-08-26T09:00:01.000Z",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-08-26T09:00:01.000Z",
+      observedRevision: "1",
+      observedFingerprint: `sha256:${"2".repeat(64)}`,
+    },
+  };
+  const events = collectProjectStageEventsV1({
+    runId: "run-replay",
+    receiptEvents: [receipt],
+    lineages: [],
+  });
+  const commit = events.find((event) => event.evidenceKind === "commit_readback");
+  assert.ok(commit, "a verified commit receipt must pay the Test phase");
+  assert.equal(commit.resource.id, commitSha);
+  assert.equal(commit.resource.revision, commitSha);
+
+  // Fail closed: strip the named commit and the replay reports the checkpoint
+  // it addressed, never a sequence number dressed up as a commit.
+  const withoutCommit = collectProjectStageEventsV1({
+    runId: "run-replay",
+    receiptEvents: [
+      { ...receipt, relatedResources: receipt.relatedResources?.slice(0, 1) },
+    ],
+    lineages: [],
+  }).find((event) => event.evidenceKind === "commit_readback");
+  assert.equal(
+    withoutCommit?.resource.id,
+    "code-repair:run-replay:workspace-1:request-1",
+  );
+  assert.equal(withoutCommit?.resource.revision, "1");
 });

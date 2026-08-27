@@ -657,8 +657,8 @@ async function resolveCurrentRunCodeExamples(
       .map((value) => value.trim()),
   );
   // One shared answer with write_project_results. See
-  // resolveVerifiedCommitEvidenceV1 for why the commit_readback event resource
-  // is checkpoint identity and the durable lineage owns the Git object id.
+  // resolveVerifiedCommitEvidenceV1 for how a receipt that targets the repair
+  // checkpoint still names the Git object id it verified.
   let evidence: VerifiedCommitEvidenceV1;
   try {
     evidence = resolveVerifiedCommitEvidenceV1({

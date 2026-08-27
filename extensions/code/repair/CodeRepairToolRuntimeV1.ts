@@ -740,6 +740,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           receipt.committedAt,
           "Verified local commit was already reconciled.",
           "reconciled",
+          receipt.commitSha,
         ),
       };
     }
@@ -963,6 +964,8 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
         domainReceipt.fingerprint,
         domainReceipt.committedAt,
         `Created and read back verified local commit ${domainReceipt.commitSha}.`,
+        "committed",
+        domainReceipt.commitSha,
       ),
     };
   }
@@ -996,6 +999,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
             receipt.committedAt,
             `Verified commit ${receipt.commitSha} was proven from the durable checkpoint.`,
             "reconciled",
+            receipt.commitSha,
           ),
           message: `Verified local commit ${receipt.commitSha} is durably committed.`,
         };
@@ -1103,6 +1107,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           domainReceipt.committedAt,
           `Reconciled verified local commit ${domainReceipt.commitSha} from Git objects.`,
           "reconciled",
+          domainReceipt.commitSha,
         ),
         message: `Verified local commit ${domainReceipt.commitSha} was reconciled without replay.`,
       };
@@ -2247,6 +2252,38 @@ function compareCommitReadback(
   return null;
 }
 
+/**
+ * The verified-commit receipt addresses the durable repair CHECKPOINT: its
+ * `resource` is the checkpoint id and its `expectedTargetRevision` is that
+ * checkpoint's sequence number, because the checkpoint is what reconciliation,
+ * the idempotency key, and the prepared-action id all key on. Nothing about
+ * that identity may move. The Git object id the commit actually produced is
+ * therefore published alongside it as a related resource, so a consumer can
+ * name the commit from the receipt alone instead of separately consulting the
+ * durable lineage — which a run with no code stage does not have.
+ */
+function verifiedCommitRelatedResource(
+  action: PreparedActionV1,
+  commitSha: string,
+): PreparedActionV1["relatedResources"][number] {
+  if (!GIT_SHA.test(commitSha)) {
+    // Fail closed: a receipt must never publish a related resource that claims
+    // to be a commit without being a canonical Git object id.
+    throw new CodeRepairToolRuntimeErrorV1(
+      "commit_sha_invalid",
+      "Verified commit receipt does not carry a canonical Git object id.",
+    );
+  }
+  return {
+    system: "git",
+    resourceType: "commit",
+    id: commitSha,
+    workspaceId: action.target.workspaceId,
+    repositoryProfileId: action.target.repositoryProfileId,
+    revision: commitSha,
+  };
+}
+
 function actionReceipt(
   action: PreparedActionV1,
   context: ScopedExtensionContextV1,
@@ -2256,8 +2293,13 @@ function actionReceipt(
   committedAt: string,
   message: string,
   commitKind: ActionReceiptV1["commitKind"] = "committed",
+  verifiedCommitSha: string | null = null,
 ): ActionReceiptV1 {
   if (!context.authorizedAction) throw new Error("Authorized action context is missing.");
+  const relatedResources = cloneJson(action.relatedResources);
+  if (verifiedCommitSha !== null) {
+    relatedResources.push(verifiedCommitRelatedResource(action, verifiedCommitSha));
+  }
   return {
     version: 1,
     id: receiptId,
@@ -2266,7 +2308,7 @@ function actionReceipt(
     toolName: action.toolName,
     operation,
     resource: cloneJson(action.target),
-    relatedResources: cloneJson(action.relatedResources),
+    relatedResources,
     message,
     payloadFingerprint: action.payloadFingerprint,
     grantId: context.authorizedAction.grantId,
