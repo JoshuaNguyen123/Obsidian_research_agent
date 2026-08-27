@@ -1,5 +1,6 @@
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import type { NoteOutputDestination } from "./noteOutputPolicy";
+import { stripNegatedResearchDepthClausesV1 } from "./researchDepthIntent";
 
 export type MissionEffortProfileV1 =
   | "direct"
@@ -78,8 +79,25 @@ export function hasExplicitGroundingIntentV1(prompt: string): boolean {
   return EXPLICIT_GROUNDING_PATTERN.test(prompt);
 }
 
+/**
+ * STRIP-THEN-TEST. This predicate gates extended-team COST, so reading "do not
+ * do deep research" or "without a multi-source review" as a request FOR the
+ * extended team buys the mission the exact budget the sentence forbids -- the
+ * repo's most-repeated regression shape, and the reason `researchDepthIntent`
+ * exports its stripper rather than keeping it private.
+ *
+ * Only the strip is shared. The trigger stays this module's own and stays
+ * NARROW: `hasDeepResearchIntent` fires on bare `deep dive`/`thorough
+ * research` and `hasLongResearchIntent` on bare `investigate`/`strategy`,
+ * which are the right answers to *their* questions ("is this a deep research
+ * mission?", "does this need a long budget?") and the wrong answer to this one
+ * ("did the user explicitly ask to pay for an extended team?"). Same-shaped
+ * names, different questions.
+ */
 export function hasExplicitExtendedResearchIntentV1(prompt: string): boolean {
-  return EXPLICIT_EXTENDED_PATTERN.test(prompt);
+  return EXPLICIT_EXTENDED_PATTERN.test(
+    stripNegatedResearchDepthClausesV1(prompt),
+  );
 }
 
 /**
