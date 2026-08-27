@@ -38,7 +38,7 @@ describe("settingsNormalize", () => {
     assert.equal(settings.showUnfinishedRunBannerOnOpen, true);
     assert.equal(settings.runRetentionDays, 30);
     assert.equal(settings.runRetentionMaxRuns, 200);
-    assert.equal(settings.modelFallbackEnabled, false);
+    assert.equal(settings.modelFallbackEnabled, true);
     assert.equal(settings.settingsSchemaVersion, SETTINGS_SCHEMA_VERSION);
   });
 
@@ -63,23 +63,25 @@ describe("settingsNormalize", () => {
     );
   });
 
-  it("run retention and model fallback handshake defaults persist explicit 0/true", () => {
+  it("run retention and model fallback handshake defaults persist explicit 0/false", () => {
     const defaults = normalizeAgentSettings({}, "new_install");
     assert.equal(defaults.runRetentionDays, 30);
     assert.equal(defaults.runRetentionMaxRuns, 200);
-    assert.equal(defaults.modelFallbackEnabled, false);
+    // Provider-side failures (timeout, network, 5xx) substitute the specialist
+    // by default; a user who turned that off keeps it off.
+    assert.equal(defaults.modelFallbackEnabled, true);
 
     const explicit = normalizeAgentSettings(
       {
         runRetentionDays: 0,
         runRetentionMaxRuns: 0,
-        modelFallbackEnabled: true,
+        modelFallbackEnabled: false,
       },
       "existing_install",
     );
     assert.equal(explicit.runRetentionDays, 0);
     assert.equal(explicit.runRetentionMaxRuns, 0);
-    assert.equal(explicit.modelFallbackEnabled, true);
+    assert.equal(explicit.modelFallbackEnabled, false);
   });
 
   it("legacy explicit false values resolve to Custom and remain false", () => {

@@ -45,6 +45,12 @@ export interface RealAiHarness extends NativeObsidianHarness {
   readNote(path?: string): Promise<string>;
   installOwnedWebBackend(options?: {
     failFirstFetch?: boolean;
+    /**
+     * Status the first fetch fails with. 503 (the default) is retryable, so
+     * the transport recovers on its own. 404 is not: it proves the host's
+     * substitution ladder, which is the only thing that can save a dead URL.
+     */
+    failFirstFetchStatus?: number;
     sourceCount?: 1 | 2 | 3;
     topic?: "generic" | "checkers";
     conflictingEvidence?: boolean;
@@ -2306,12 +2312,13 @@ async function installOwnedWebBackend(
   marker: string,
   options: {
     failFirstFetch?: boolean;
+    failFirstFetchStatus?: number;
     sourceCount?: 1 | 2 | 3;
     topic?: "generic" | "checkers";
     conflictingEvidence?: boolean;
   },
 ): Promise<void> {
-  await page.evaluate(({ pluginId, failFirstFetch, sourceCount, marker, topic, conflictingEvidence }) => {
+  await page.evaluate(({ pluginId, failFirstFetch, failFirstFetchStatus, sourceCount, marker, topic, conflictingEvidence }) => {
     const w = window as typeof window & {
       app?: any;
       __realAiWebRestore?: () => void;
@@ -2379,7 +2386,10 @@ async function installOwnedWebBackend(
             if (w.__realAiWebMetrics) {
               w.__realAiWebMetrics.failedFetchTransportCalls += 1;
             }
-            return { status: 503, headers: { "retry-after": "0" }, json: { error: "owned retryable source failure" } };
+            const status = failFirstFetchStatus ?? 503;
+            return status === 503
+              ? { status, headers: { "retry-after": "0" }, json: { error: "owned retryable source failure" } }
+              : { status, headers: {}, json: { error: `owned source failure ${status}` } };
           }
           const alternate = String(body.url).includes("alternate");
           const corroborating = String(body.url).includes("corroborating");
@@ -2416,6 +2426,7 @@ async function installOwnedWebBackend(
   }, {
     pluginId: NATIVE_CORE_PLUGIN_ID,
     failFirstFetch: options.failFirstFetch === true,
+    failFirstFetchStatus: options.failFirstFetchStatus ?? 503,
     sourceCount: options.sourceCount ?? 2,
     marker,
     topic: options.topic ?? "generic",

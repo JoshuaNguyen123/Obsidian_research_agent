@@ -249,6 +249,22 @@ import {
   isOptionalMissionGraphNode,
 } from "./agent/missionGraphAuthority";
 import {
+  classifyMissionFailureV1,
+  type MissionFailureClassV1,
+} from "./agent/missionFailureClass";
+import {
+  buildDegradedDeliveryV1,
+  decideDegradedDeliveryV1,
+  summarizeOpenEvidenceConflictsV1,
+  type DegradedDeliveryResultV1,
+} from "./agent/degradedDelivery";
+import {
+  buildMissionRetryVariationPlanV1,
+  missionRetryVariationKeyV1,
+  shouldRefuseUnchangedRetryV1,
+  type MissionRetryVariationPlanV1,
+} from "./agent/missionRetryVariation";
+import {
   createStreamWriteSession,
   recordAppliedBytes,
   shouldAbortReleasedChunk,
@@ -986,6 +1002,7 @@ import {
 import type {
   MissionGraphPatchV1,
   MissionGraphV3,
+  MissionNodeV3,
 } from "../packages/headless-runtime/src/missionGraphV3";
 import {
   buildHostMissionGraphPlanV1,
@@ -3324,6 +3341,18 @@ export async function runAgentMission({
   const invalidToolCallFailureSignatures = new Set<string>();
   /** One corrective redirect per gated tool; repeats add noise, not signal. */
   const intentGateCorrectedToolNames = new Set<string>();
+  /**
+   * Retry variation state. A failed node returns to `ready` unchanged, so
+   * without these the model re-derives the same call from the same context and
+   * the graph terminates the node on the repeat. Keyed by node id: what failed
+   * and who owned the failure, what the failing call was called with, and
+   * which (node, attempt) pairs have already been handed corrective guidance.
+   */
+  const missionNodeFailureClasses = new Map<string, MissionFailureClassV1>();
+  const missionNodeFailureMessages = new Map<string, string>();
+  const missionNodeLastFailedArguments = new Map<string, string>();
+  const injectedRetryVariationKeys = new Set<string>();
+  const refusedUnchangedRetryKeys = new Set<string>();
   let consecutiveNoProgressSteps = 0;
   let lastProgressSignature = "";
   let lastNoToolFrontierFingerprint = "";
@@ -5211,6 +5240,33 @@ export async function runAgentMission({
     }
     return started.execution;
   };
+  /**
+   * The ready node a call would claim when that node has already failed once.
+   * Retry variation hangs off this: without it the model re-enters an
+   * identical call and the graph's second strike ends the node.
+   */
+  const findPendingRetryNodeV1 = (toolName: string): MissionNodeV3 | null => {
+    const graph = missionGraphSession?.graph;
+    if (!graph) return null;
+    for (const node of Object.values(graph.nodes)) {
+      if (node.status !== "ready") continue;
+      if ((node.retries?.attempts ?? 0) < 1) continue;
+      if (!missionNodeFailureClasses.has(node.id)) continue;
+      if (!node.allowedTools.includes(toolName)) continue;
+      return node;
+    }
+    return null;
+  };
+  const buildPendingRetryVariationV1 = (
+    node: MissionNodeV3 | null,
+  ): MissionRetryVariationPlanV1 | null =>
+    node
+      ? buildMissionRetryVariationPlanV1({
+          node,
+          failureClass: missionNodeFailureClasses.get(node.id) ?? "unknown",
+          failureMessage: missionNodeFailureMessages.get(node.id),
+        })
+      : null;
   const finishMissionGraphTool = async (
     execution: MissionGraphToolExecution | null,
     toolName: string,
@@ -5375,16 +5431,49 @@ export async function runAgentMission({
         },
       });
     }
+    const graphFailureMessage = repairCycleBlocked
+      ? "Fast validation remained red after the third bounded repair cycle."
+      : validationStatusFailed
+        ? "Validation completed red; a passing cycle is still required."
+        : result.error?.message;
+    if (!graphResultOk) {
+      // Attribute the failure while its signals are still in hand. The node
+      // goes back to `ready` after this and the next attempt has to be
+      // different in a way that suits whoever actually failed — a dead source
+      // wants a different source, a rejected argument wants a corrected one.
+      const failureClass = classifyMissionFailureV1({
+        toolName,
+        errorCode: result.error?.code,
+        errorMessage: result.error?.message ?? graphFailureMessage,
+      });
+      missionNodeFailureClasses.set(execution.nodeId, failureClass);
+      if (graphFailureMessage) {
+        missionNodeFailureMessages.set(execution.nodeId, graphFailureMessage);
+      }
+      events.onTrace?.({
+        id: `${execution.nodeId}:failure-class:${String(
+          missionGraphSession.graph.nodes[execution.nodeId]?.retries.attempts ?? 0,
+        )}`,
+        kind: "status",
+        toolName,
+        message: `${toolName} failed on ${execution.nodeId}; attributed to ${failureClass}.`,
+        outputPreview: {
+          nodeId: execution.nodeId,
+          failureClass,
+          errorCode: result.error?.code,
+        },
+      });
+    } else {
+      missionNodeFailureClasses.delete(execution.nodeId);
+      missionNodeFailureMessages.delete(execution.nodeId);
+      missionNodeLastFailedArguments.delete(`${execution.nodeId}:${toolName}`);
+    }
     await missionGraphSession.finishToolExecution(execution, {
       ok: graphResultOk,
       evidence: graphEvidence,
       receipt: graphReceipt,
       failureFingerprint: graphResultOk ? undefined : evidenceFingerprint,
-      failureMessage: repairCycleBlocked
-        ? "Fast validation remained red after the third bounded repair cycle."
-        : validationStatusFailed
-          ? "Validation completed red; a passing cycle is still required."
-          : result.error?.message,
+      failureMessage: graphFailureMessage,
       terminalFailure: repairCycleTerminalFailure,
     });
   };
@@ -10097,6 +10186,47 @@ export async function runAgentMission({
       runToolContext.now?.() ?? new Date(),
     );
   };
+  /**
+   * Record that this run delivered with verification incomplete.
+   *
+   * The user gets the work; the record must not get a clean bill of health.
+   * That honesty is already carried by the failing acceptance record written
+   * before this point and by never setting `acceptedCandidateAcceptance`, so
+   * this only adds the visible status line and the `deliveredDegraded` trace
+   * the eval record reads.
+   *
+   * Deliberately NOT a ledger blocker. Every `MissionBlockerCategory` names an
+   * external dependency that failed, so this would file as `unknown`, and a
+   * blocker also tells the Chat resume banner the run is stuck — which it is
+   * not. It delivered, with its gaps stated in the artifact itself.
+   */
+  const recordDegradedDeliveryV1 = (
+    marked: DegradedDeliveryResultV1,
+    missing: string[],
+    step: number,
+  ) => {
+    const summary =
+      `Delivered with verification incomplete: ${missing.join(", ") || "unknown proof"}. ` +
+      `${marked.verifiedClaimCount} claim(s) confirmed, ${marked.markedClaimIds.length} marked unverified` +
+      (marked.removedQuoteClaimIds.length > 0
+        ? `, ${marked.removedQuoteClaimIds.length} unverifiable quotation(s) removed`
+        : "") +
+      ".";
+    events.onStatus?.(summary);
+    events.onTrace?.({
+      id: `degraded-delivery-${step}`,
+      kind: "verification",
+      step,
+      message: summary,
+      outputPreview: {
+        missing,
+        markedClaimIds: marked.markedClaimIds,
+        removedQuoteClaimIds: marked.removedQuoteClaimIds,
+        verifiedClaimCount: marked.verifiedClaimCount,
+        deliveredDegraded: true,
+      },
+    });
+  };
   const finishErroredRunFromException = async (
     error: unknown,
     step: number,
@@ -10519,26 +10649,49 @@ export async function runAgentMission({
       }
 
       if (candidateAcceptance.status !== "pass") {
-        lastFinalOutput = "";
-        const message =
-          `Note writeback was not applied because proof verification is incomplete: ${
-            candidateAcceptance.missing.join(", ") || "unknown proof"
-          }. The existing note is unchanged and the run remains resumable.`;
-        events.onStatus?.(message);
-        emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
-        await finishRun(
-          "budget",
-          step,
-          maxSteps,
-          candidateAcceptance.nextAction ?? message,
-        );
-        return null;
+        // Correction budget is spent. If everything still outstanding is an
+        // unverified claim or an unresolved source disagreement, deliver the
+        // work with the gaps marked rather than throwing it away; anything
+        // else still fails closed.
+        const degraded = decideDegradedDeliveryV1(candidateAcceptance.missing);
+        if (degraded.eligible) {
+          const marked = buildDegradedDeliveryV1({
+            content: candidate,
+            missing: candidateAcceptance.missing,
+            ledger: lastClaimLedger,
+            conflictSummaries: summarizeOpenEvidenceConflictsV1(
+              lastEvidenceConflicts,
+            ),
+          });
+          candidate = marked.content;
+          recordDegradedDeliveryV1(marked, candidateAcceptance.missing, step);
+          // Deliberately NOT recorded as an accepted proof-gated write: the
+          // note ships, but the acceptance record must keep saying the proofs
+          // went unmet or the scorecard reads a caveat as a clean pass.
+          lastProofGatedHoldToolName = null;
+        } else {
+          lastFinalOutput = "";
+          const message =
+            `Note writeback was not applied because proof verification is incomplete: ${
+              candidateAcceptance.missing.join(", ") || "unknown proof"
+            }. The existing note is unchanged and the run remains resumable.`;
+          events.onStatus?.(message);
+          emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+          await finishRun(
+            "budget",
+            step,
+            maxSteps,
+            candidateAcceptance.nextAction ?? message,
+          );
+          return null;
+        }
+      } else {
+        acceptedCandidateAcceptance = candidateAcceptance;
+        // The staged final answer just passed verification; the hold it
+        // announced is satisfied, so frontier rejections may advise write
+        // tools again.
+        lastProofGatedHoldToolName = null;
       }
-      acceptedCandidateAcceptance = candidateAcceptance;
-      // The staged final answer just passed verification; the hold it
-      // announced is satisfied, so frontier rejections may advise write
-      // tools again.
-      lastProofGatedHoldToolName = null;
     } else {
       events.onTrace?.({
         id: `replacement-writeback-${step}:candidate-held`,
@@ -12609,6 +12762,79 @@ export async function runAgentMission({
       }
       return blockedResult;
     }
+    // A node whose failure a repeat cannot fix — rejected arguments, a host
+    // refusal — must not spend its last attempt re-sending the same call. This
+    // refuses once, before the graph node starts and before research usage is
+    // charged, so the correction costs a turn rather than the node or a tool
+    // call the model never got to make. External and transient failures are
+    // exempt: an identical retry against a flaky endpoint is legitimate.
+    if (origin === "model" && !prestartedMissionGraphExecution) {
+      const pendingRetryNode = findPendingRetryNodeV1(toolCall.name);
+      const pendingRetryPlan = buildPendingRetryVariationV1(pendingRetryNode);
+      const retryKey = pendingRetryPlan
+        ? missionRetryVariationKeyV1(
+            pendingRetryPlan.nodeId,
+            pendingRetryPlan.attempt,
+          )
+        : null;
+      const nextArguments = safeSerializeToolArgumentsV1(toolCall.arguments);
+      if (
+        pendingRetryPlan &&
+        retryKey &&
+        !refusedUnchangedRetryKeys.has(retryKey) &&
+        shouldRefuseUnchangedRetryV1({
+          plan: pendingRetryPlan,
+          previousArguments: missionNodeLastFailedArguments.get(
+            `${pendingRetryPlan.nodeId}:${toolCall.name}`,
+          ),
+          nextArguments,
+        })
+      ) {
+        refusedUnchangedRetryKeys.add(retryKey);
+        const message = [
+          `Rejected ${toolCall.name}: this repeats the call that already failed on ${pendingRetryPlan.nodeId}, unchanged.`,
+          pendingRetryPlan.guidance,
+        ].join("\n");
+        const blockedResult: ToolExecutionResult = {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: { code: "unchanged_retry_refused", message },
+        };
+        events.onStatus?.(message);
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:${toolCall.name}:unchanged-retry-refused`,
+          kind: "tool_rejected",
+          step,
+          toolName: toolCall.name,
+          message,
+          error: blockedResult.error,
+        });
+        events.onToolDone?.({
+          id: `${step}:${String(toolIndex)}:${toolCall.name}`,
+          name: toolCall.name,
+          step,
+          ok: false,
+          message,
+          error: blockedResult.error,
+        });
+        if (recordTranscript) {
+          appendToolTranscript({
+            messages,
+            toolCall,
+            resultContent: serializeToolResultForModel(blockedResult),
+            origin,
+            fallbackId: buildToolCallFallbackId(
+              runId,
+              step,
+              toolIndex,
+              toolCall.name,
+            ),
+          });
+        }
+        return blockedResult;
+      }
+    }
     if (compoundResearchToolGate.counted) {
       recordCompoundResearchUsage("tool", toolCall.name);
     }
@@ -12746,6 +12972,15 @@ export async function runAgentMission({
         });
       }
       return blockedResult;
+    }
+    // Remember what this node was called with. On failure the entry becomes
+    // the "already tried this" record the retry gate above compares against;
+    // on success `finishMissionGraphTool` clears it.
+    if (missionGraphExecution) {
+      missionNodeLastFailedArguments.set(
+        `${missionGraphExecution.nodeId}:${toolCall.name}`,
+        safeSerializeToolArgumentsV1(toolCall.arguments),
+      );
     }
     if (
       requiresVerifiedLinearCodeSpecReadbackV1(
@@ -18225,6 +18460,40 @@ export async function runAgentMission({
           ? `EXACT GITHUB PUBLICATION BINDING: profileKey=${JSON.stringify(verifiedLinearRepositoryBindingSnapshot.repositoryProfileKey)}; visibility=${resolvedRepositoryVisibility}; call github_create_repository with these exact values.`
           : null;
       pruneStaleFrontierCorrections(messages);
+      // A node that failed is back on the frontier looking exactly as it did
+      // the first time, so the model re-derives the call that just failed and
+      // the graph's second strike ends the node — across the whole eval corpus
+      // no node has ever reached a third attempt. Name the failure and who
+      // owned it before the retry.
+      //
+      // These are turn cards, not pushes onto `messages`. A trailing system
+      // message would displace whatever sits last, and the last message is
+      // load-bearing: schema corrections and write-tool allowlists are read
+      // from `messages.at(-1)` by both the runner and its tests. Cards also
+      // recompute from live graph state each turn, so the guidance stays
+      // present while the node is still owed a retry and disappears with it.
+      const retryVariationCards: string[] = [];
+      for (const tool of stepTools) {
+        const retryPlan = buildPendingRetryVariationV1(
+          findPendingRetryNodeV1(tool.function.name),
+        );
+        if (!retryPlan) continue;
+        const retryKey = missionRetryVariationKeyV1(
+          retryPlan.nodeId,
+          retryPlan.attempt,
+        );
+        if (retryVariationCards.includes(retryPlan.guidance)) continue;
+        retryVariationCards.push(retryPlan.guidance);
+        if (injectedRetryVariationKeys.has(retryKey)) continue;
+        injectedRetryVariationKeys.add(retryKey);
+        events.onTrace?.({
+          id: `${retryKey}:retry-variation`,
+          kind: "status",
+          step,
+          toolName: tool.function.name,
+          message: `Retry guidance delivered for ${retryPlan.nodeId} (attempt ${retryPlan.attempt}, ${retryPlan.failureClass}).`,
+        });
+      }
       // stepTools is the same array the schemas below are built from, so the
       // plan header cannot name a tool this step will refuse.
       refreshMissionPlanPromptMessage(messages, missionPlan, stepTools);
@@ -18271,6 +18540,11 @@ export async function runAgentMission({
                 verbatimCards: [
                   verifiedLinearRepositoryCard,
                   researchClosureCard,
+                  // Retry guidance is verbatim for the same reason: it names
+                  // the exact prior failure, and a summarizer that trims it
+                  // leaves the model with "try again" — the thing that already
+                  // failed.
+                  ...retryVariationCards,
                 ].filter((card): card is string => Boolean(card)),
               },
             )
@@ -20282,6 +20556,31 @@ export async function runAgentMission({
               ),
             });
             continue;
+          }
+
+          // Same rule as the writeback path: an answer whose only outstanding
+          // proofs are unverified claims or an open source disagreement is
+          // worth more marked than withheld. Everything else stays withheld.
+          const degraded = decideDegradedDeliveryV1(candidateAcceptance.missing);
+          if (degraded.eligible) {
+            const marked = buildDegradedDeliveryV1({
+              content: rejectedCandidate,
+              missing: candidateAcceptance.missing,
+              ledger: lastClaimLedger,
+              conflictSummaries: summarizeOpenEvidenceConflictsV1(
+                lastEvidenceConflicts,
+              ),
+            });
+            lastFinalOutput = marked.content;
+            recordDegradedDeliveryV1(marked, candidateAcceptance.missing, step);
+            commitAcceptedEvidenceConflictAcknowledgements(lastFinalOutput);
+            emitDirectAssistantAnswer(
+              lastFinalOutput,
+              events,
+              runPlan.requiresEnglishGuard,
+            );
+            await finishRun("final", lastStep, stepLimit);
+            return;
           }
 
           const message =
@@ -36839,6 +37138,19 @@ async function reconcileHistoricalCanvasPreflightOperations({
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(stableNormalize(value));
+}
+
+/**
+ * Argument text for the retry comparison. Key order must not decide whether
+ * two calls count as the same approach, so this goes through the same stable
+ * serializer the operation journal hashes with.
+ */
+function safeSerializeToolArgumentsV1(value: unknown): string {
+  try {
+    return stableStringify(value);
+  } catch {
+    return "";
+  }
 }
 
 function hashOperationInput(value: unknown): string {

@@ -207,7 +207,10 @@ export interface AgentSettings {
   runRetentionMaxRuns?: number;
   /**
    * When true, fall back to another model if the primary provider fails.
-   * Default off — may reduce quality; keeps long missions alive through outages.
+   * Default on: eligibility is provider-side only (timeout, network, 5xx —
+   * never auth, rate limit, or a model-quality miss), so the substitution
+   * buys mission survival through an outage without trading answer quality.
+   * It does spend the specialist slot, which BYOK users pay for.
    */
   modelFallbackEnabled?: boolean;
   keepAwakeDuringOvernightRuns?: boolean;
@@ -342,7 +345,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   showUnfinishedRunBannerOnOpen: true,
   runRetentionDays: 30,
   runRetentionMaxRuns: 200,
-  modelFallbackEnabled: false,
+  modelFallbackEnabled: true,
   keepAwakeDuringOvernightRuns: false,
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,
@@ -852,7 +855,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Fall back to another model on provider outage")
       .setDesc(
-        "May reduce quality; keeps long missions alive through provider outages.",
+        "Reissues once on the specialist model after a provider timeout, network drop, or server error. Uses the specialist slot.",
       )
       .addToggle((toggle) =>
         toggle
