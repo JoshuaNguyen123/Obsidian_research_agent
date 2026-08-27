@@ -412,7 +412,7 @@ export const BLOCKER_BUCKETS = [
  * this attempt's wall-clock window so serialized same-model cells attribute
  * exactly instead of via the 45-minute nearest-row heuristic).
  */
-function mineToolEvents(windowStartMs, windowEndMs) {
+export function mineToolEvents(windowStartMs, windowEndMs) {
   const counts = {
     observed: 0,
     failed: 0,
@@ -601,7 +601,7 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
   };
 }
 
-function readJsonFile(file) {
+export function readJsonFile(file) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
   } catch {
@@ -878,6 +878,36 @@ export function detectMissingRequiredEnvironment(logText) {
     }
   }
   return names;
+}
+
+/**
+ * Every error message a Playwright JSON report carries, flattened.
+ *
+ * Exported for the model-tier benchmark, which drives the SAME lanes through
+ * the SAME exclusive runner at caller-chosen models and must classify their
+ * outcomes with the SAME authority the matrix uses. Sharing the classifier is
+ * the point: a benchmark that forked its own copy would drift from the matrix
+ * and the two would disagree about what a red means.
+ */
+export function extractPlaywrightReportErrorText(report) {
+  const chunks = [];
+  const pushError = (error) => {
+    if (typeof error?.message === "string") chunks.push(error.message);
+  };
+  const walkSuite = (suite) => {
+    for (const spec of suite?.specs ?? []) {
+      for (const testEntry of spec?.tests ?? []) {
+        for (const result of testEntry?.results ?? []) {
+          pushError(result?.error);
+          for (const error of result?.errors ?? []) pushError(error);
+        }
+      }
+    }
+    for (const child of suite?.suites ?? []) walkSuite(child);
+  };
+  for (const suite of report?.suites ?? []) walkSuite(suite);
+  for (const error of report?.errors ?? []) pushError(error);
+  return chunks.join("\n").slice(0, 200_000);
 }
 
 /** Earliest match of any pattern in the text, or null. */
@@ -1171,7 +1201,7 @@ function csvField(value) {
   return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-function appendRunCsvRow(row) {
+export function appendRunCsvRow(row) {
   mkdirSync(EVAL_DIR, { recursive: true });
   if (!existsSync(RUN_CSV)) {
     writeFileSync(RUN_CSV, RUN_CSV_HEADER + "\n");
