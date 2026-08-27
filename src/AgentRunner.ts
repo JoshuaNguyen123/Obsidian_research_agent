@@ -13,6 +13,7 @@ import type { AgentSettings } from "./settings";
 import type { CapabilityReadinessV2 } from "./agent/capabilityReadiness";
 import { ModelClientError } from "./model/types";
 import { RECALL_TOOL_RESULT_TOOL_NAME } from "./tools/recallTools";
+import { describeMetricEventValue } from "./agent/metricEventRendering";
 import { createToolResultStoreV1 } from "./agent/toolResultStore";
 import {
   createSpecialistModelClient,
@@ -1295,6 +1296,15 @@ export interface AgentRunMetricEvent {
    * have intervened and did not.
    */
   unproductiveStreak?: number;
+  /**
+   * Base64 shard decode inside one indexed semantic search, split out of the
+   * tool's total duration. A tool metric says a search took 400ms; it cannot
+   * say whether that was decode or scoring, which is the split that decides
+   * whether optimising the scan is worth building.
+   */
+  decodeMs?: number;
+  /** Rows scored in that search, so decodeMs can be read per row. */
+  rowsScored?: number;
 }
 
 export type {
@@ -16616,7 +16626,11 @@ export async function runAgentMission({
     // Approaches that repeatedly failed in earlier runs on this project. Tool
     // names, target kinds, and error codes only — never paths or URLs.
     ...((): { role: "system"; content: string }[] => {
-      const learned = summarizeOutcomeMemoryForPrompt(toolOutcomeMemory);
+      const learned = summarizeOutcomeMemoryForPrompt(
+        toolOutcomeMemory,
+        8,
+        runToolContext.now?.() ?? new Date(),
+      );
       return learned ? [{ role: "system" as const, content: learned }] : [];
     })(),
     {
@@ -26024,16 +26038,44 @@ function summarizeModelRequest(request: ModelChatRequest) {
   };
 }
 
+/**
+ * The decode/score split a semantic search reported, if it reported one.
+ *
+ * Read defensively from the tool payload rather than typed against the search
+ * result: this emission site handles every tool and most carry no timings.
+ * Absent stays absent — a tool that never measured a decode must not
+ * contribute a zero, or a gate reading this would weigh real work against
+ * invented silence.
+ */
+function readSemanticSearchTimings(
+  result: ToolExecutionResult,
+): { decodeMs?: number; rowsScored?: number } {
+  const output: unknown = result.output;
+  if (!isRecord(output)) return {};
+  const timings: unknown = output.timings;
+  if (!isRecord(timings)) return {};
+  const decodeMs = (timings as { decodeMs?: unknown }).decodeMs;
+  const rowsScored = (timings as { rowsScored?: unknown }).rowsScored;
+  if (typeof decodeMs !== 'number' || !Number.isFinite(decodeMs)) return {};
+  return {
+    decodeMs,
+    ...(typeof rowsScored === 'number' && Number.isFinite(rowsScored)
+      ? { rowsScored }
+      : {}),
+  };
+}
+
 function emitMetricEvent(
   events: AgentRunEvents,
   event: AgentRunMetricEvent,
 ) {
   events.onMetric?.(event);
+  const value = describeMetricEventValue(event);
   events.onTrace?.({
-    id: `metric-${event.kind}-${event.name}-${event.step ?? "run"}-${event.durationMs}`,
+    id: `metric-${event.kind}-${event.name}-${event.step ?? "run"}-${value.token}`,
     kind: "metric",
     step: event.step,
-    message: `Metric: ${event.name} ${event.durationMs}ms`,
+    message: `Metric: ${event.name} ${value.rendered}`,
     outputPreview: event,
   });
 }
@@ -37311,6 +37353,7 @@ async function executeToolWithMetrics({
       durationMs: elapsedMs(startedAt),
       inputChars,
       outputChars: measureSerializedChars(result),
+      ...readSemanticSearchTimings(result),
     });
     if (result.ok && step === undefined) {
       const receipt = buildReceiptFromToolExecution(

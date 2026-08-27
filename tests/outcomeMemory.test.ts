@@ -109,10 +109,6 @@ test("penalty grows monotonically with repeated failures and stays bounded", () 
   let previous = -1;
   for (const count of [2, 3, 5, 8, 13, 40, 200]) {
     const memory = failNTimes(createToolOutcomeMemory(), count);
-    // Pinned for the same reason as the ratio test below: monotonicity is a
-    // property of the failure counts, not of how long ago the suite is run.
-    // Left to the real clock, the low-count end of this ladder decays under the
-    // penalty-free threshold and the assertion turns red with no code change.
     const penalty = outcomePenaltyForAction(
       memory,
       "code_workspace_create",
@@ -148,12 +144,10 @@ test("a mostly-successful tool is penalized far less than a mostly-failing one",
     targetKind: "vault_note",
   });
 
-  // Pin `now`. This test is about the failure RATIO -- 3-in-63 versus 3-in-3 --
-  // and the observations are stamped in July. Letting `now` default to the real
-  // clock made it a time bomb: once wall-clock drifted past ~1.5 recency
-  // half-lives, both weighted counts decayed under PENALTY_FREE_FAILURES, both
-  // sides scored 0, and the assertion failed on a tree whose scoring logic never
-  // changed. Decay has its own dedicated test below, with explicit dates.
+  // This is the test that detonated. Unpinned, it read the wall clock, and
+  // three failures dated 2026-07-10 decay under PENALTY_FREE_FAILURES at about
+  // 47.5 days -- so it passed for weeks and then failed mid-session when that
+  // boundary was crossed, with nothing about the code having changed.
   const forgiving = outcomePenaltyForAction(
     mostlyWorks,
     "read_file",
@@ -175,8 +169,11 @@ test("a mostly-successful tool is penalized far less than a mostly-failing one",
 
 test("an unknown tool carries no penalty", () => {
   const memory = failNTimes(createToolOutcomeMemory(), 5);
-  assert.equal(outcomePenaltyForAction(memory, "never_seen_tool"), 0);
-  assert.equal(outcomePenaltyForAction(memory, "   "), 0);
+  assert.equal(
+    outcomePenaltyForAction(memory, "never_seen_tool", "none", JUST_AFTER),
+    0,
+  );
+  assert.equal(outcomePenaltyForAction(memory, "   ", "none", JUST_AFTER), 0);
 });
 
 test("records are capped and evicted by least-recently-seen", () => {

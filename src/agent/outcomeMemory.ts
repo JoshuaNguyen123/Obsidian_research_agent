@@ -60,6 +60,21 @@ export const MAX_OUTCOME_PENALTY = 3;
  * success per historical failure.
  */
 export const OUTCOME_RECENCY_HALF_LIFE_DAYS = 30;
+/*
+ * Every reader of this ledger takes an explicit `now`, with no default.
+ *
+ * That is deliberate and was learned the hard way. When recency weighting
+ * landed, these took `now: Date = new Date()`, which quietly made every result
+ * depend on the wall clock. Two tests were pinned to a fixed instant and a
+ * third was missed -- it kept passing for weeks and then failed mid-session,
+ * because three failures dated 2026-07-10 decay below PENALTY_FREE_FAILURES at
+ * roughly 47.5 days and that boundary was crossed while the suite was running.
+ * The suite had been reporting green about code whose correctness depended on
+ * the date.
+ *
+ * Requiring the argument converts a convention that was already missed once
+ * into a compile error. Do not restore the default.
+ */
 /**
  * Minimum share of attempts that must have failed before a record is described
  * to the model as a failing approach.
@@ -305,8 +320,8 @@ export function weightedOutcomeCounts(
 export function aggregateWeightedOutcomeCounts(
   memory: ToolOutcomeMemoryV1,
   toolName: string,
-  targetKind: ToolOutcomeTargetKind = "none",
-  now: Date = new Date(),
+  targetKind: ToolOutcomeTargetKind,
+  now: Date,
 ): WeightedOutcomeCounts {
   let failures = 0;
   let successes = 0;
@@ -366,8 +381,8 @@ export function isNotablyFailing(
 export function outcomePenaltyForAction(
   memory: ToolOutcomeMemoryV1,
   toolName: string,
-  targetKind: ToolOutcomeTargetKind = "none",
-  now: Date = new Date(),
+  targetKind: ToolOutcomeTargetKind,
+  now: Date,
 ): number {
   const name = toolName.trim();
   if (!name) {
@@ -400,8 +415,8 @@ export function outcomePenaltyForAction(
  */
 export function summarizeOutcomeMemoryForPrompt(
   memory: ToolOutcomeMemoryV1,
-  limit = 8,
-  now: Date = new Date(),
+  limit: number,
+  now: Date,
 ): string | null {
   const notable = memory.records
     .filter((record) => isNotablyFailing(memory, record, now))

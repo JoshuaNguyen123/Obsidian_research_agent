@@ -8,6 +8,7 @@ import {
   summarizeRunWallClockV1,
 } from "../src/agent/performanceGates";
 import type { AgentRunMetricEvent } from "../src/AgentRunner";
+import { describeMetricEventValue } from "../src/agent/metricEventRendering";
 
 const modelCall = (durationMs: number): AgentRunMetricEvent => ({
   kind: "model_chat",
@@ -102,18 +103,16 @@ test("the formatted line reports both halves and never a fabricated total", () =
 });
 
 test("a declared-but-unmeasured metric reports unwired, never pass", () => {
-  // semantic_decode_ms and source_cache_lookup_ms are declared in the
-  // PerformanceGate metric union but metricValue computes neither, so a gate on
-  // either observes 0 forever. It used to report "pass": a threshold that can
+  // source_cache_lookup_ms is declared in the PerformanceGate metric union
+  // with no branch in metricValue, so a gate on it observes 0 forever.
+  // (semantic_decode_ms was in the same state until it was wired; the tests
+  // below now pin that it is measured, which is why it is absent here.) It used to report "pass": a threshold that can
   // only ever be met, presented as a threshold that was met. That is the same
   // dishonesty class as a fabricated zero in a report -- arguably worse, since
   // a clean-looking gate is an invitation to trust it.
   const results = evaluatePerformanceGates(
     [toolCall("semantic_search_notes", 5_000)],
-    [
-      { name: "semantic_decode", metric: "semantic_decode_ms", warnAt: 1 },
-      { name: "source_cache", metric: "source_cache_lookup_ms", warnAt: 1 },
-    ],
+    [{ name: "source_cache", metric: "source_cache_lookup_ms", warnAt: 1 }],
   );
 
   for (const result of results) {
@@ -143,11 +142,11 @@ test("an unwired gate reaches the runner's trace instead of being filtered away"
   // survives that filter.
   const surfaced = evaluatePerformanceGates(
     [],
-    [{ name: "semantic_decode", metric: "semantic_decode_ms", warnAt: 1 }],
+    [{ name: "source_cache", metric: "source_cache_lookup_ms", warnAt: 1 }],
   ).filter((item) => item.status !== "pass");
 
   assert.equal(surfaced.length, 1);
-  assert.equal(surfaced[0]?.name, "semantic_decode");
+  assert.equal(surfaced[0]?.name, "source_cache");
 });
 
 test("the shipped default gates are all wired", () => {
@@ -159,4 +158,88 @@ test("the shipped default gates are all wired", () => {
       `default gate ${gate.name} is on an unmeasured metric`,
     );
   }
+});
+
+/*
+ * semantic_decode_ms, now measured rather than declared.
+ *
+ * It sat in the PerformanceGate metric union with no branch in metricValue, so
+ * a gate on it observed 0 forever and always passed. It is now computed from
+ * the decode/score split a semantic search reports, which is the number that
+ * decides whether optimising the vector scan is worth building at all: a tool
+ * duration says a search took 400ms, and only the split says whether that was
+ * base64 decode or cosine scoring.
+ */
+
+const decodeToolCall = (
+  durationMs: number,
+  decodeMs: number,
+  rowsScored?: number,
+): AgentRunMetricEvent => ({
+  kind: "tool",
+  name: "semantic_search_notes",
+  durationMs,
+  decodeMs,
+  ...(rowsScored === undefined ? {} : { rowsScored }),
+});
+
+test("semantic_decode_ms is measured, not declared-and-dead", () => {
+  const results = evaluatePerformanceGates(
+    [decodeToolCall(400, 260, 12_000)],
+    [{ name: "decode", metric: "semantic_decode_ms", warnAt: 200 }],
+  );
+
+  assert.notEqual(results[0]?.status, "unwired");
+  assert.equal(results[0]?.observed, 260);
+  assert.equal(results[0]?.status, "warn");
+});
+
+test("a tool that measured no decode contributes nothing rather than a zero", () => {
+  // Math.max over a mix must reflect the searches that actually decoded. A
+  // tool with no timings returning 0 is inert; it must never look like a
+  // measured fast decode, which would understate the peak.
+  const results = evaluatePerformanceGates(
+    [toolCall("read_file", 30), decodeToolCall(400, 260), toolCall("web_fetch", 900)],
+    [{ name: "decode", metric: "semantic_decode_ms", warnAt: 10_000 }],
+  );
+
+  assert.equal(results[0]?.observed, 260);
+  assert.equal(results[0]?.status, "pass");
+});
+
+test("a run with no semantic search reports zero decode, and still passes", () => {
+  const results = evaluatePerformanceGates(
+    [toolCall("read_file", 30)],
+    [{ name: "decode", metric: "semantic_decode_ms", warnAt: 200 }],
+  );
+
+  // Zero here is honest: no search ran, so no decode happened. That is
+  // different from the old behaviour, where zero meant nobody was measuring.
+  assert.equal(results[0]?.observed, 0);
+  assert.equal(results[0]?.status, "pass");
+});
+
+test("source_cache_lookup_ms is still declared and still unwired", () => {
+  // One metric getting wired must not silently imply the other did.
+  const results = evaluatePerformanceGates(
+    [decodeToolCall(400, 260)],
+    [{ name: "source_cache", metric: "source_cache_lookup_ms", warnAt: 1 }],
+  );
+
+  assert.equal(results[0]?.status, "unwired");
+});
+
+test("the render derives id and message from the salient value", () => {
+  const withRows = describeMetricEventValue(decodeToolCall(400, 260, 12_000));
+  const withoutRows = describeMetricEventValue(decodeToolCall(400, 90, 3_000));
+
+  // The old id embedded durationMs alone, so two events differing only in the
+  // number they are named for collided within a step.
+  assert.notEqual(withRows.token, withoutRows.token);
+  assert.match(withRows.rendered, /decode 260ms, 12000 rows/u);
+
+  // A plain duration metric is unchanged.
+  const plain = describeMetricEventValue(toolCall("read_file", 30));
+  assert.equal(plain.token, "30");
+  assert.equal(plain.rendered, "30ms");
 });

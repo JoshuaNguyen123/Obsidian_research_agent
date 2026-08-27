@@ -9,6 +9,13 @@ import {
   recordToolOutcome,
 } from "../src/agent/outcomeMemory";
 
+/**
+ * Read instant for this file's fixtures (2026-08-01..03). Outcome history is
+ * recency-weighted, so a penalty depends on when it is read; pinning the
+ * instant keeps these assertions about merging rather than about today's date.
+ */
+const JUST_AFTER = new Date("2026-08-04T00:00:00.000Z");
+
 test("the tool outcome ledger is vault-wide while the rest of memory stays project-scoped", () => {
   const research = getProjectMemoryLocation("Projects/CRDT/Design.md");
   const coding = getProjectMemoryLocation("Desktop notes/Scratch.md");
@@ -78,15 +85,14 @@ test("merging folder ledgers into the vault ledger keeps every observation", () 
 
   // The point of promoting the ledger: a mission in one folder is now warned
   // by what a mission in another folder learned.
-  // `now` is pinned just after the observation window. Defaulting it to the
-  // real clock would make this assertion decay to `0 > 0` as wall-clock drifts
-  // past the recency half-life -- a red suite on an unchanged tree. What is
-  // being proven here is that merging ADDS evidence, which is a property of the
-  // ledger, not of the date the suite happens to run.
-  const asOf = new Date("2026-08-04T00:00:00.000Z");
   assert.ok(
-    outcomePenaltyForAction(merged, "web_fetch", "web_resource", asOf) >
-      outcomePenaltyForAction(fromCoding, "web_fetch", "web_resource", asOf),
+    outcomePenaltyForAction(merged, "web_fetch", "web_resource", JUST_AFTER) >
+      outcomePenaltyForAction(
+        fromCoding,
+        "web_fetch",
+        "web_resource",
+        JUST_AFTER,
+      ),
   );
 });
 
