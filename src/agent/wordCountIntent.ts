@@ -32,9 +32,11 @@
  * mission could never pay. Every seat now reads THIS predicate; what each does
  * with the answer stays its own policy.
  *
- * The affirmative surface is the union of all four, because each copy's misses
+ * The affirmative surface is the union of all seven, because each copy's misses
  * were demonstrable bugs rather than deliberate narrowing, and the negation
- * strip below is what makes the union safe to take.
+ * strip below is what makes the union safe to take. Widening the three
+ * obligation seats is safe in the direction that matters: the same predicate
+ * now offers the tool, so an obligation can never outrun the capability.
  *
  * Leaf module by design: `evidenceIntent` is imported BY
  * `promptIntentClassifiers`, so the shared definition cannot live there
