@@ -2332,6 +2332,29 @@ test("a set-loose exact-frontier run admits every capability read it offers", as
     "the capability read really is on the set-loose menu; this is the offer half",
   );
 
+  // The defect itself, pinned so the discrimination needs no archaeology. This
+  // is the pair the two seats used to compute independently: the menu built
+  // with `setLooseCompoundEnabled || ...` (true) against an authority handed
+  // `dynamicReadContinuationAllowed()` (false, because the frontier is exact).
+  // `missionGraphSession` and `missionGraphFrontier` are untouched by the fix,
+  // so this reproduces the live step-21/step-22 refusal exactly.
+  const underOldPairing = await session.beginToolExecution("read_current_file", {
+    allowDynamicReadContinuation: false,
+  });
+  assert.equal(
+    underOldPairing.ok,
+    false,
+    "the old pairing offered this read and then refused it",
+  );
+  if (!underOldPairing.ok) {
+    assert.match(
+      underOldPairing.reason,
+      /not ready in the exact authoritative mission graph/iu,
+    );
+  }
+  // One predicate cannot produce that pair: both fields are the same call.
+  assert.notEqual(admitsDynamicRead, false);
+
   // THE contract, and the whole point of the shared predicate: nothing the menu
   // offers may be refused by the authority that judges the very next call.
   for (const toolName of offered) {
