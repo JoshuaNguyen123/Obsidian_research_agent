@@ -1,6 +1,7 @@
 import type { MissionEvidence } from "./missionLedger";
 import { getEvidencePassageIdentifiers } from "./missionPlan";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { hasWordCountIntent } from "./wordCountIntent";
 import {
   createQuotedSpanPattern,
   findQuoteRawOffset,
@@ -294,10 +295,13 @@ export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
   // Deterministic output checks are not factual-source verification. A request
   // to count words or verify generated length must not manufacture passage-id
   // debt for ordinary prose.
-  const verifiesGeneratedLength =
-    /\b(?:count_words|word\s*count|count\s+(?:the\s+)?words?|verify\s+(?:the\s+)?(?:generated\s+|note\s+)?(?:word\s+)?length)\b/iu.test(
-      value,
-    );
+  // ONE word-count predicate, shared with the route, the loop planner and the
+  // web-evidence seat. This was a fourth private copy: it missed "how many
+  // words is this note?" and the gerund "counting the words", so an ordinary
+  // length check could still manufacture passage-id debt. The
+  // independent-grounding guard below stays local -- that is this seat's
+  // POLICY about the answer, not a second opinion on the question.
+  const verifiesGeneratedLength = hasWordCountIntent(value);
   const hasIndependentGroundingSignal =
     /\b(?:cite|cited|citation|citations|passage|passages|quote|quoted|quotations|text[-\s]?level\s+quotation|fact[-\s]?check|deep\s+research|long[-\s]?running\s+(?:research|co-?research)|long\s+research|exhaustive\s+(?:research|investigation)|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
       value,

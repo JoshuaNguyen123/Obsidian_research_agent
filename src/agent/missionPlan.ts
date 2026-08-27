@@ -1,5 +1,6 @@
 import type { MissionEvidence } from "./missionLedger";
 import { isBroadUnscopedVaultMutation } from "./missionScope";
+import { hasWordCountIntent } from "./wordCountIntent";
 import type { MissionIntent } from "../tools/types";
 import {
   hasPrimaryTextCitationIntent,
@@ -1177,7 +1178,13 @@ function inferProofContract(
   if (requiresVaultEvidenceProof(prompt, intent)) {
     requiredProof.add("vault_evidence");
   }
-  if (/\b(word\s*count|count\s+(?:the\s+)?words?|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(prompt)) {
+  // ONE word-count predicate. This inline copy was a FIFTH definition and it
+  // did not even match the literal `count_words` tool token, so a mission could
+  // be offered the tool and plant the graph node while owing no proof it ever
+  // called it. Sharing the predicate makes the OBLIGATION and the CAPABILITY
+  // identical by construction, which is the only arrangement that cannot
+  // deadlock in the route-promises-what-authority-refuses direction.
+  if (hasWordCountIntent(prompt)) {
     requiredProof.add("word_count");
   }
   const hasSpecializedWrite = requiredTools.some(

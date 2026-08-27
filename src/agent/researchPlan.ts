@@ -16,6 +16,12 @@ import {
   requiresWebEvidenceProof,
   withoutVaultAddressingVocabularyV1,
 } from "./evidenceIntent";
+// This module's private copy was WIDER than the shared one on the
+// sustained/multi-source family ("long research on X", "compare sources on Z",
+// "evidence ledger for W") and narrower on "serious research". The shared
+// predicate now carries the union, so the research MODE this file selects and
+// the tools the route offers are decided by the same words.
+import { hasDeepResearchIntent } from "./researchDepthIntent";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "./replaceIntent";
 import { hasExplicitNoVaultReadIntent } from "./missionScope";
 import {
@@ -1792,10 +1798,6 @@ function getResearchAcceptanceNextAction(missing: string[]): string | undefined 
     return "Revise the answer with limitations and confidence.";
   }
   return undefined;
-}
-
-function hasDeepResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|long\s+research|in[-\s]?depth\s+(?:research|analysis|investigation)|deep\s+dive|thorough\s+research|comprehensive\s+research|multi[-\s]?source\s+(?:research|review|comparison)|compare\s+sources?|evidence\s+ledger|long[-\s]?running\s+research)\b/i.test(prompt);
 }
 
 function hasInvestigativeIntent(prompt: string): boolean {

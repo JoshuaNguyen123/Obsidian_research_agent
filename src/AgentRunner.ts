@@ -719,6 +719,7 @@ import {
   FRONTIER_WITHHELD_REFUSAL_CODE_V1,
   isHostNarrowedOffFrontierRefusalV1,
   isHostWithheldOffFrontierRefusalV1,
+  looksLikeUnfilledToolNamePlaceholderV1,
   mapToolRejectCategory,
 } from "./agent/toolRejectEval";
 import { selectCodeWorkspaceEditToolName } from "./agent/codeWorkflowPlanner";
@@ -25674,29 +25675,22 @@ function reflectionCodeFenceV1(code: string): string {
 }
 
 /**
- * Tool names that are obviously an unfilled TEMPLATE rather than a request:
- * `$TOOL_NAME`, `${toolName}`, `<tool_name>`, `{{tool}}`, `your_tool_name`.
- * Cheap models emit these mid-ladder when they compose the next call from a
- * remembered function-calling form instead of the offered schema list
- * (observed live in the compound flow lane, 2026-08-26: a literal
- * `$TOOL_NAME` call right after a successful read_template).
+ * Tool names that are obviously an unfilled TEMPLATE rather than a request.
+ * See `toolRejectEval.looksLikeUnfilledToolNamePlaceholderV1` for the shapes
+ * covered and the live evidence behind them.
  *
- * No installed tool name can match these shapes — every real name is
- * snake_case words without `$`, `<`, or `{` — so this cannot shadow a real
- * tool.
+ * MERGE NOTE DISCHARGED (2026-08-26). This was a byte-identical second copy of
+ * `toolRejectEval.looksLikeUnfilledToolNamePlaceholderV1`, whose own merge note
+ * said: "when the branches merge, delete one and have the other import it.
+ * toolRejectEval is the correct home -- AgentRunner already imports this
+ * module." The branches merged; the dedup had not been done. It is done here,
+ * in the direction that note specified. The two bodies differed only in
+ * null-tolerance, so the surviving one is the tolerant signature.
+ *
+ * The name is re-exported rather than re-declared so the classification seat
+ * and the repair seat below cannot answer this question two different ways.
  */
-export function isPlaceholderToolNameV1(toolName: string): boolean {
-  const value = toolName.trim();
-  if (!value) return false;
-  return (
-    /^\$\{?\s*[a-z0-9_]*tool[a-z0-9_]*\s*\}?$/iu.test(value) ||
-    /^<+\s*\/?\s*(?:tool|tool[_\s-]?name|name)\s*>+$/iu.test(value) ||
-    /^\{\{\s*(?:tool|tool[_\s-]?name)\s*\}\}$/iu.test(value) ||
-    /^(?:tool[_\s-]?name|toolname|your[_\s-]?tool(?:[_\s-]?name)?|name[_\s-]?of[_\s-]?tool|exact[_\s-]?tool[_\s-]?name)$/iu.test(
-      value,
-    )
-  );
-}
+export { looksLikeUnfilledToolNamePlaceholderV1 as isPlaceholderToolNameV1 } from "./agent/toolRejectEval";
 
 /**
  * A placeholder-named call is a formatting failure, not a request for
@@ -25728,7 +25722,7 @@ export function repairPlaceholderToolCallNamesV1(input: {
   }
   const repaired: string[] = [];
   const toolCalls = input.toolCalls.map((call) => {
-    if (!isPlaceholderToolNameV1(call.name)) return call;
+    if (!looksLikeUnfilledToolNamePlaceholderV1(call.name)) return call;
     repaired.push(`${call.name}->${target}`);
     return { ...call, name: target };
   });

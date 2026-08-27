@@ -2,6 +2,13 @@ import { MAX_AGENT_STEPS } from "../tools/constants";
 import { FINALIZATION_RESERVE_STEPS } from "./AgentBudget";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
+// The MissionGraph node this planner plants and the tool the route offers must
+// come from ONE predicate. Both of these were private copies here until
+// 2026-08-26: the word-count copy answered FALSE to "how many words is this
+// note?" while the route answered TRUE, so the route offered `count_words` and
+// this planner planted no node to call it with.
+import { hasLongResearchIntent } from "./researchDepthIntent";
+import { hasWordCountIntent } from "./wordCountIntent";
 import type { RunBudgetProfile, RunBudgetRoute } from "./runBudget";
 import { getRunBudgetProfile, resolveConfiguredMaxAgentSteps } from "./runBudget";
 import type { GeneratedOutputPolicy } from "./generatedOutputPolicy";
@@ -194,24 +201,12 @@ function getRequestedToolBudget({
   return route === "grounded_workflow" ? 4 : 2;
 }
 
-function hasLongResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|long\s+research|in-depth\s+research|deep\s+dive|investigate|compare\s+sources|multi[-\s]?source|strategy|broad\s+constraints|evidence\s+ledger|checkpoint|long[-\s]?running)\b/i.test(
-    prompt,
-  );
-}
-
 function hasVaultOnlyGroundingIntent(prompt: string): boolean {
   const vaultSignal =
     /\b(?:my\s+)?vault\b|\b(?:my|local)\s+notes?\b|\bacross\s+(?:my\s+)?notes?\b|\bsemantic(?:ally|\s+search)?\b/i.test(
       prompt,
     );
   return vaultSignal && !hasExplicitWebGroundingIntent(prompt);
-}
-
-function hasWordCountIntent(prompt: string): boolean {
-  return /\bcount_words\b|\bword\s+count\b|\bcount(?:ing)?\s+(?:the\s+)?words?\b/iu.test(
-    prompt,
-  );
 }
 
 function hasExplicitMarkdownReadTarget(prompt: string): boolean {

@@ -1,4 +1,5 @@
 import type { MissionIntent } from "../tools/types";
+import { hasWordCountIntent } from "./wordCountIntent";
 
 /**
  * Literary / primary-text citation: "quotes/citations from the text|novel|book".
@@ -131,11 +132,12 @@ export function requiresWebEvidenceProof(
   // Verification is not synonymous with public-web research. Metadata and
   // local readback requests (especially generated-output word counts) must not
   // manufacture web proof debt merely because the user said "verify".
-  if (
-    /\bcount_words\b|\bword\s*count\b|\bcount(?:ing)?\s+(?:the\s+)?words?\b|\bverify\s+(?:the\s+)?(?:generated\s+)?(?:note\s+)?(?:word\s+)?length\b/iu.test(
-      prompt,
-    )
-  ) {
+  // ONE word-count predicate, shared with the route, the loop planner and the
+  // claim ledger. This was the fourth private copy: it missed "how many words
+  // is this note?" -- the most natural phrasing -- so that prompt was offered
+  // count_words by the route while still owing public-web proof it could never
+  // pay.
+  if (hasWordCountIntent(prompt)) {
     return false;
   }
   // `Sources/Alpha.md` is a vault binding, not public-web authority. A

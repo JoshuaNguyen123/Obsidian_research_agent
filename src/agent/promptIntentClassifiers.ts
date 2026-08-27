@@ -28,6 +28,7 @@ import {
   hasExplicitCanvasDestinationIntent,
   hasReviseDesignIntent,
 } from "./codeDesignIntent";
+import { hasDeepResearchIntent as hasSharedDeepResearchIntent } from "./researchDepthIntent";
 import { isCurrentNoteReplaceResetPrompt } from "./currentNoteResetPolicy";
 import { isCurrentNoteEditOrganizeIntent, isNamedSectionEditIntent, isVaultWideOrganizeIntent, isWholeNoteEditIntent } from "./editOrganizeIntent";
 import { hasExplicitNoWebIntent, hasExplicitPublicWebSignal, hasPrimaryTextCitationIntent } from "./evidenceIntent";
@@ -38,6 +39,24 @@ import { extractExplicitNewWorkspaceFilePaths, extractMarkdownPathMentions, hasE
 import { detectProjectLifecycleStagesV1 } from "./projectLifecycle";
 import { canonicalizeKeywordTypos } from "./promptNormalization";
 import { isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
+
+/**
+ * Ideas whose single definition lives in a lower-level module, re-exported
+ * here so the ~100 existing `promptIntentClassifiers` importers keep working.
+ *
+ * These are RE-EXPORTS, never wrappers. A wrapper is a second declaration
+ * site, and a second declaration site is where drift starts: it only has to
+ * grow one extra condition to become a private copy again. The guard in
+ * `tests/runPlanSharedClassifiers.test.ts` enforces exactly one declaration
+ * per shared name across `src/agent/**`, which a re-export satisfies and a
+ * wrapper does not.
+ *
+ * Each of these had a private second definition until 2026-08-26; see the
+ * defining module for the witness prompts that split them.
+ */
+export { hasDesignIntent, hasHtmlPreviewIntent } from "./codeDesignIntent";
+export { hasDeepResearchIntent, hasLongResearchIntent } from "./researchDepthIntent";
+export { hasWordCountIntent } from "./wordCountIntent";
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
   return (
@@ -117,11 +136,9 @@ export function hasChatOnlyResponseIntent(prompt: string): boolean {
   );
 }
 
-export function hasWordCountIntent(prompt: string): boolean {
-  return /\b(count_words|word\s*count|count\s+(?:the\s+)?words?|how\s+many\s+words?|length\s+check|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(
-    prompt,
-  );
-}
+// hasWordCountIntent now lives in ./wordCountIntent (re-exported above). It
+// had four definitions; "how many words is this note?" was true HERE and false
+// in all three others, and "counting the words" was the reverse.
 
 export function hasGraphConnectionIntent(prompt: string): boolean {
   // Vault paths are opaque resource identifiers, not natural-language intent.
@@ -367,15 +384,10 @@ export function hasAffirmativeCodePathAction(prompt: string, action: RegExp): bo
     });
 }
 
-export function hasHtmlPreviewIntent(prompt: string): boolean {
-  return /\b(preview|render|show)\b[\s\S]{0,100}\b(html|css|web\s+page|mockup|prototype)\b|\b(html|css|web\s+page|mockup|prototype)\b[\s\S]{0,100}\b(preview|render|show)\b/i.test(
-    prompt,
-  );
-}
-
-export function hasDesignIntent(prompt: string): boolean {
-  return hasSharedDesignIntent(prompt);
-}
+// hasHtmlPreviewIntent and hasDesignIntent now live in ./codeDesignIntent
+// (re-exported above). The html-preview pair INVERTED each other on "open the
+// html file" and "show me the mockup"; hasDesignIntent was only ever a
+// delegating wrapper, but a wrapper is still a second declaration site.
 
 export function hasDesignPackageIntent(prompt: string): boolean {
   return /\b(design\s*package|service\s*blueprint|logistics\s*system|project\s*ideation|canvas\s+plus\s+(brief|markdown)|canvas[\s\S]{0,80}(?:brief|svg\s+image|image)|brief\s+plus\s+canvas|ui\s*flow|mind\s*map|distributed(?:\s+\w+){0,3}\s+systems?|cloud\s+architecture|microservices?(?:\s+architecture)?|event[-\s]?driven\s+architecture|c4\s+(?:model|diagram)|business\s+process(?:es)?|manufacturing(?:\s+\w+){0,2}\s+process(?:es)?|production\s+lines?|plant\s+workflows?|value\s+streams?|bpmn|sipoc)\b/i.test(
@@ -390,7 +402,7 @@ export function hasDesignPackageIntent(prompt: string): boolean {
  */
 export function hasNarrativeDesignOutputIntent(prompt: string): boolean {
   return (
-    hasDesignIntent(prompt) &&
+    hasSharedDesignIntent(prompt) &&
     hasStaticGenerationIntent(prompt) &&
     !hasDesignPackageIntent(prompt)
   );
@@ -407,7 +419,7 @@ export function hasCanvasDesignIntent(prompt: string): boolean {
     /\b(canvas|mind\s*map|concept\s*map|flowchart|workflow|user\s*flows?|ui\s*flows?|process\s*map|research\s*map|architecture\s*diagram|software\s+architecture|system\s+design|systems?\s+charts?|distributed(?:\s+\w+){0,3}\s+systems?|cloud\s+architecture|microservices?(?:\s+architecture)?|event[-\s]?driven\s+architecture|c4\s+(?:model|diagram)|network\s+topology|data\s+architecture|business\s+process(?:es)?|manufacturing(?:\s+\w+){0,2}\s+process(?:es)?|production\s+lines?|plant\s+workflows?|value\s+streams?|bpmn|sipoc|dependency\s*map|visual\s*map|diagram)\b/i.test(
       prompt,
     ) ||
-    (hasDesignIntent(prompt) && !hasSvgDesignIntent(prompt))
+    (hasSharedDesignIntent(prompt) && !hasSvgDesignIntent(prompt))
   );
 }
 
@@ -429,11 +441,10 @@ export function hasExperienceMemoryIntent(prompt: string): boolean {
   );
 }
 
-export function hasLongResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|long\s+research|in-depth\s+research|deep\s+dive|investigate|compare\s+sources|multi[-\s]?source|strategy|broad\s+constraints|evidence\s+ledger|checkpoint|long[-\s]?running)\b/i.test(
-    prompt,
-  );
-}
+// hasLongResearchIntent and hasDeepResearchIntent now live in
+// ./researchDepthIntent (re-exported above). They remain two predicates
+// answering two questions -- long budget vs research depth -- but one
+// definition each.
 
 /**
  * One natural-language developer journey that affirmatively joins research,
@@ -1383,7 +1394,7 @@ export function hasWebSearchIntent(prompt: string): boolean {
     return false;
   }
 
-  if (hasExplicitWebSearchIntent(prompt) || hasDeepResearchIntent(prompt)) {
+  if (hasExplicitWebSearchIntent(prompt) || hasSharedDeepResearchIntent(prompt)) {
     return true;
   }
 
@@ -1406,12 +1417,6 @@ export function hasFetchedWebSourceIntent(prompt: string): boolean {
 
 export function hasCurrentWebFactIntent(prompt: string): boolean {
   return /\b(?:latest|recent|current|up[-\s]?to[-\s]?date)\b[\s\S]{0,100}\b(?:events?|news|information|info|data|facts?|research|reports?|papers?|studies?|market|markets?|industry|industries|trends?|prices?|rates?|status|versions?|law|policy|policies)\b/i.test(
-    prompt,
-  );
-}
-
-export function hasDeepResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|in[-\s]?depth\s+(?:research|analysis|investigation)|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
     prompt,
   );
 }
