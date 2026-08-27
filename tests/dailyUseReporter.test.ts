@@ -594,3 +594,54 @@ test("a real empty contract is still caught", () => {
   assert.equal(classifyToolReceiptWork({ commitKind: "no_op" }), "intentional_no_op");
   assert.equal(classifyToolReceiptWork({ commitKind: "reconciled" }), "intentional_no_op");
 });
+
+test("the REAL validation receipt shape is exempt, not a hypothetical one", () => {
+  // The first version of this exemption keyed on `purpose`, which lives on the
+  // nested sandboxReceipt and is not a field of the receipt these counters
+  // see. It was inert: three runs after it landed still reported vacuous=3.
+  // This pins the shape taken VERBATIM from a real persisted run receipt.
+  assert.equal(
+    classifyToolReceiptWork({
+      toolName: "code_validate_fast",
+      operation: "validate",
+      commitKind: "committed",
+      readback: { status: "verified" },
+      effects: { affectedCount: 0, changedFields: [] },
+      affectedCount: 0,
+    }),
+    "worked",
+  );
+});
+
+test("a validate receipt without verified readback is not exempt", () => {
+  // Proof-of-work is required; the operation name alone cannot buy the
+  // exemption, or any zero-delta receipt could claim to be a validation.
+  assert.equal(
+    classifyToolReceiptWork({
+      operation: "validate",
+      commitKind: "committed",
+      affectedCount: 0,
+    }),
+    "vacuous",
+  );
+  assert.equal(
+    classifyToolReceiptWork({
+      operation: "validate",
+      commitKind: "committed",
+      readback: { status: "unverified" },
+      affectedCount: 0,
+    }),
+    "vacuous",
+  );
+  // And a genuine zero-byte WRITE is still an empty contract.
+  assert.equal(
+    classifyToolReceiptWork({
+      operation: "write",
+      commitKind: "committed",
+      readback: { status: "verified" },
+      bytesWritten: 0,
+      affectedCount: 0,
+    }),
+    "vacuous",
+  );
+});

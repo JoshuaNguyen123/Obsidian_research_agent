@@ -236,6 +236,8 @@ export interface VacuousDetectableReceipt {
    * See classifyToolReceiptWork.
    */
   purpose?: unknown;
+  /** Verification proof carried by the receipt itself. */
+  readback?: unknown;
   /** Present on sandbox-backed receipts; 0 means the command really ran and passed. */
   exitCode?: unknown;
 }
@@ -259,6 +261,28 @@ export interface VacuousDetectableReceipt {
 const VERDICT_ONLY_RECEIPT_PURPOSES = Object.freeze(
   new Set(["validation_fast", "validation_targeted", "validation_full"]),
 );
+
+/**
+ * Receipt `operation` values whose work product is a verdict.
+ *
+ * The first version of this exemption keyed on `purpose`, which lives on the
+ * nested sandboxReceipt and is NOT a field of the receipt these counters see.
+ * The exemption was therefore inert, and three runs after it landed still
+ * reported vacuous=3 -- caught only by re-reading the measured CSV rather than
+ * assuming the fix worked. The receipts carry `operation: "validate"` and a
+ * verified `readback`, both of which are present and semantically exact.
+ */
+const VERDICT_ONLY_RECEIPT_OPERATIONS = Object.freeze(new Set(["validate"]));
+
+/** True when the receipt carries its own proof the action really ran. */
+function receiptReadbackVerified(receipt: VacuousDetectableReceipt): boolean {
+  const readback = receipt.readback;
+  return (
+    !!readback &&
+    typeof readback === "object" &&
+    (readback as { status?: unknown }).status === "verified"
+  );
+}
 
 export type ToolReceiptWorkClass =
   | "worked"
@@ -302,9 +326,12 @@ export function classifyToolReceiptWork(
   // FAILING validation is a failure, not a success receipt, so it never
   // reaches here.
   if (
-    typeof receipt.purpose === "string" &&
-    VERDICT_ONLY_RECEIPT_PURPOSES.has(receipt.purpose) &&
-    receipt.exitCode === 0
+    (typeof receipt.purpose === "string" &&
+      VERDICT_ONLY_RECEIPT_PURPOSES.has(receipt.purpose) &&
+      receipt.exitCode === 0) ||
+    (typeof receipt.operation === "string" &&
+      VERDICT_ONLY_RECEIPT_OPERATIONS.has(receipt.operation) &&
+      receiptReadbackVerified(receipt))
   ) {
     return "worked";
   }
