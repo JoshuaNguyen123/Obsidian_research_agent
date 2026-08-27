@@ -286,13 +286,69 @@ async function verifyInstalledPlugin(plugin) {
   );
 }
 
+/**
+ * Refuse to start while any Obsidian is running.
+ *
+ * THE GATE ITSELF IS NOT NEGOTIABLE and is deliberately unchanged: a live
+ * Obsidian genuinely poisons a lane, so this must refuse even when the leftover
+ * is our own. What was missing is WHY. On 2026-08-27 two campaign attempts died
+ * here with nothing but "Obsidian.exe is already running", and the leftover
+ * turned out to be a root leaked by the previous attempt's teardown that no
+ * kill could reach — a fact that took a journal reconstruction to recover. The
+ * refusal now names the PIDs, their ages, and whether they look like harness
+ * residue, so the cause is legible from the failure itself.
+ *
+ * The enrichment is strictly additive and best-effort: the trigger is still the
+ * tasklist read, and a CIM failure downgrades to the original sentence rather
+ * than letting the gate pass.
+ */
 async function assertObsidianClosed() {
   if (process.platform !== "win32") return;
   const { stdout } = await execFileAsync("tasklist", ["/FI", "IMAGENAME eq Obsidian.exe"]);
   if (/\bObsidian\.exe\b/i.test(stdout)) {
     throw new Error(
-      "Obsidian.exe is already running. Close Obsidian before running Playwright e2e.",
+      "Obsidian.exe is already running. Close Obsidian before running Playwright e2e." +
+        (await describeRunningObsidian()),
     );
+  }
+}
+
+async function describeRunningObsidian() {
+  try {
+    const { enumerateObsidianProcessesDetailedV1 } = await import(
+      "./e2e-obsidian-sweep.js"
+    );
+    const reading = await enumerateObsidianProcessesDetailedV1();
+    if (!reading.ok || reading.processes.length === 0) return "";
+    const now = Date.now();
+    const roots = reading.processes.filter(
+      (row) => !/--type=/u.test(row.commandLine),
+    );
+    const described = (roots.length > 0 ? roots : reading.processes)
+      .slice(0, 6)
+      .map((row) => {
+        const ageS =
+          row.createdAtMs === null
+            ? "age unknown"
+            : `${Math.round((now - row.createdAtMs) / 1000)}s old`;
+        const port = /--remote-debugging-port=(\d+)/u.exec(row.commandLine)?.[1];
+        return (
+          `PID ${row.pid} (${ageS}` +
+          (port ? `, harness CDP port ${port}` : "") +
+          (row.commandLine ? "" : ", command line unreadable — it is terminating") +
+          ")"
+        );
+      });
+    return (
+      ` Running now: ${described.join("; ")}` +
+      ` [${reading.processes.length} Obsidian process(es) total].` +
+      " A leftover carrying a harness CDP port is residue from a previous e2e" +
+      " attempt whose teardown did not drain; one whose command line is" +
+      " unreadable is already terminating and will clear on its own."
+    );
+  } catch {
+    // Diagnostics must never change the verdict.
+    return "";
   }
 }
 

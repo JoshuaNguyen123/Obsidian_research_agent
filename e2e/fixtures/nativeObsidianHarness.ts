@@ -14,7 +14,7 @@ import {
   appendHostEventV1,
   describeSweepOutcomeV1,
   describeWindowsExitCodeV1,
-  enumerateObsidianProcessesV1,
+  enumerateObsidianProcessesDetailedV1,
   selectOwnedObsidianPidsV1,
   summarizeRecentHostDeathV1,
   sweepOwnedObsidianSurvivorsV1,
@@ -1205,14 +1205,21 @@ async function waitForOwnedObsidianDrain(
   timeoutMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  const ownedRemaining = async () =>
-    selectOwnedObsidianPidsV1({
-      processes: await enumerateObsidianProcessesV1(obsidianImageName()),
+  // A CIM read that FAILED is not an empty process table. Collapsing the two
+  // let every enumeration timeout under load drain "cleanly" over a live host,
+  // which is the silent leak that poisons the next lane's already-running gate.
+  // Unknown counts as "still present": a false red is recoverable, a leak is not.
+  const ownedRemaining = async (): Promise<number[]> => {
+    const reading = await enumerateObsidianProcessesDetailedV1(obsidianImageName());
+    if (!reading.ok) return [-1];
+    return selectOwnedObsidianPidsV1({
+      processes: reading.processes,
       rootPid,
       cdpPort,
       rootCreatedAtMs,
       teardownStartedAtMs,
     });
+  };
   while (Date.now() < deadline) {
     if ((await ownedRemaining()).length === 0) return true;
     await delay(250);
@@ -1247,7 +1254,11 @@ async function waitForNoObsidian(timeoutMs: number): Promise<boolean> {
  * made teardown sweeps kill each other's hosts.
  */
 async function obsidianRunning(): Promise<boolean> {
-  return (await enumerateObsidianProcessesV1(obsidianImageName())).length > 0;
+  const reading = await enumerateObsidianProcessesDetailedV1(obsidianImageName());
+  // A failed read must not open the single-instance gate: two coexisting
+  // instances are what made teardown sweeps kill each other's hosts.
+  if (!reading.ok) return true;
+  return reading.processes.length > 0;
 }
 
 async function assertPortFree(port: number): Promise<void> {

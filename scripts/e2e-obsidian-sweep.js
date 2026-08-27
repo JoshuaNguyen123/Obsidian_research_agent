@@ -105,16 +105,142 @@ function describeWindowsExitCodeV1(code, signal) {
 }
 
 /**
- * Enumerate Obsidian processes through CIM.
+ * Decode what `taskkill /PID n /F` actually reported. Measured against the
+ * 2026-08-27 compound campaign journal, where SIX kill dispatches against one
+ * leaked root all "failed" and the harness reported a single undifferentiated
+ * `kill FAILED` — a sentence that cannot be acted on, because these four
+ * outcomes need four different responses:
+ *
+ *   killed        — TerminateProcess succeeded. Done.
+ *   not_found     — `ERROR: The process "N" not found.` The PID is not in the
+ *                   process table at all. Our enumeration snapshot was stale;
+ *                   there is nothing to reap and nothing to report.
+ *   terminating   — `ERROR: The process with PID N could not be terminated.
+ *                   Reason: There is no running instance of the task.`
+ *                   taskkill FOUND the PID but termination is already in
+ *                   flight, so no further kill can reach it. This is the shape
+ *                   that cost attempts 1 and 3: the process is genuinely
+ *                   unreapable AND genuinely still occupying the image name, so
+ *                   it is neither a probe lying nor a kill we botched. Only
+ *                   time removes it — and until it goes, the next lane's
+ *                   already-running gate will refuse.
+ *   access_denied — `Reason: Access is denied.` We do not own it, or it is
+ *                   elevated. A sweep must NEVER escalate around this; it is
+ *                   the signal that ownership scoping got something wrong.
+ *
+ * `reapable` answers the only question the sweep can act on: is another kill
+ * attempt worth making? `occupiesImageName` answers the question the NEXT lane
+ * cares about: will the already-running gate still see this PID?
+ */
+function describeTaskkillOutcomeV1(error) {
+  if (!error) {
+    return {
+      outcome: "killed",
+      killed: true,
+      reapable: false,
+      occupiesImageName: false,
+      error: null,
+    };
+  }
+  const message = summarizeError(error);
+  if (/not found/iu.test(message)) {
+    return {
+      outcome: "not_found",
+      killed: false,
+      reapable: false,
+      occupiesImageName: false,
+      error: message,
+    };
+  }
+  if (/there is no running instance of the task/iu.test(message)) {
+    return {
+      outcome: "terminating",
+      killed: false,
+      reapable: false,
+      occupiesImageName: true,
+      error: message,
+    };
+  }
+  if (/access is denied/iu.test(message)) {
+    return {
+      outcome: "access_denied",
+      killed: false,
+      reapable: false,
+      occupiesImageName: true,
+      error: message,
+    };
+  }
+  return {
+    outcome: "kill_failed",
+    killed: false,
+    reapable: true,
+    occupiesImageName: true,
+    error: message,
+  };
+}
+
+async function forceKillPidV1(pid, execImpl = execFileAsync) {
+  return execImpl("taskkill", ["/PID", String(pid), "/F"], {
+    windowsHide: true,
+  }).then(
+    () => ({ pid, ...describeTaskkillOutcomeV1(null) }),
+    (error) => ({ pid, ...describeTaskkillOutcomeV1(error) }),
+  );
+}
+
+/**
+ * Order a kill list LEAF-FIRST.
+ *
+ * Killing a root before its children hands those children to a new parent, so
+ * the very next enumeration sees them as orphans rather than as members of a
+ * tree we already claimed — and rule 3 only claims an orphan when
+ * `rootCreatedAtMs` is known. Reaping depth-first removes the reparenting
+ * window entirely instead of relying on a later rule to recover from it.
+ */
+function orderKillsLeafFirstV1(pids, processes) {
+  const parentOf = new Map(
+    processes.map((row) => [row.pid, row.parentPid]),
+  );
+  const target = new Set(pids);
+  const depth = (pid) => {
+    let steps = 0;
+    let cursor = pid;
+    const guard = new Set();
+    while (!guard.has(cursor)) {
+      guard.add(cursor);
+      const parent = parentOf.get(cursor);
+      if (parent === undefined || !target.has(parent)) break;
+      cursor = parent;
+      steps += 1;
+    }
+    return steps;
+  };
+  return [...pids].sort((a, b) => depth(b) - depth(a) || a - b);
+}
+
+/**
+ * Enumerate Obsidian processes through CIM, REPORTING WHETHER THE READ WORKED.
  *
  * Deliberately NOT `tasklist /FI`: that filter is known to lie on this machine
  * (a documented liveness trap), and a truncated or stale listing here makes a
  * LONE harness believe it has phantom survivors — which then makes it sweep.
  * CIM also carries ParentProcessId, CommandLine and CreationDate, which are
  * exactly the fields ownership scoping needs.
+ *
+ * THE FAILURE-IS-NOT-EMPTINESS RULE. This used to `catch { return [] }`, so a
+ * PowerShell spawn that timed out (30s — reachable on a machine at 100% CPU,
+ * which is exactly when leaks happen) was indistinguishable from "no Obsidian
+ * is running". Every caller reads that answer as CLEAN: the drain probe passes,
+ * `obsidianRunning()` says no, and the survivor sweep claims nothing and kills
+ * nothing. A failed read therefore scored a leak GREEN and handed the live
+ * process to the next lane's already-running check. `ok:false` is the third
+ * state that keeps "we could not look" from masquerading as "there is nothing
+ * there".
  */
-async function enumerateObsidianProcessesV1(imageName = "Obsidian.exe") {
-  if (process.platform !== "win32") return [];
+async function enumerateObsidianProcessesDetailedV1(imageName = "Obsidian.exe") {
+  if (process.platform !== "win32") {
+    return { ok: true, processes: [], error: null };
+  }
   const script =
     `Get-CimInstance Win32_Process -Filter "Name='${imageName.replace(/'/gu, "''")}'" | ` +
     "Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | " +
@@ -127,25 +253,55 @@ async function enumerateObsidianProcessesV1(imageName = "Obsidian.exe") {
       { windowsHide: true, timeout: 30_000, encoding: "utf8" },
     );
     raw = String(stdout ?? "").trim();
-  } catch {
-    return [];
+  } catch (error) {
+    return {
+      ok: false,
+      processes: [],
+      error: `CIM enumeration failed: ${summarizeError(error)}`,
+    };
   }
-  if (!raw) return [];
+  // An empty stdout is a genuine "no matching process": Get-CimInstance emits
+  // nothing when the filter matches nothing.
+  if (!raw) return { ok: true, processes: [], error: null };
   let parsed;
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    return [];
+  } catch (error) {
+    return {
+      ok: false,
+      processes: [],
+      error: `CIM enumeration returned unparseable output: ${summarizeError(error)}`,
+    };
   }
   const rows = Array.isArray(parsed) ? parsed : [parsed];
-  return rows
-    .map((row) => ({
-      pid: Number(row?.ProcessId),
-      parentPid: Number(row?.ParentProcessId),
-      commandLine: String(row?.CommandLine ?? ""),
-      createdAtMs: parseCimDate(row?.CreationDate),
-    }))
-    .filter((row) => Number.isSafeInteger(row.pid) && row.pid > 0);
+  return {
+    ok: true,
+    error: null,
+    processes: rows
+      .map((row) => ({
+        pid: Number(row?.ProcessId),
+        parentPid: Number(row?.ParentProcessId),
+        commandLine: String(row?.CommandLine ?? ""),
+        createdAtMs: parseCimDate(row?.CreationDate),
+      }))
+      .filter((row) => Number.isSafeInteger(row.pid) && row.pid > 0),
+  };
+}
+
+/**
+ * Compatibility shape for callers that only want the rows. A caller that must
+ * distinguish "nothing running" from "could not look" MUST use the detailed
+ * form — this one still collapses the two.
+ */
+async function enumerateObsidianProcessesV1(imageName = "Obsidian.exe") {
+  return (await enumerateObsidianProcessesDetailedV1(imageName)).processes;
+}
+
+function summarizeError(error) {
+  return String(error?.stderr || error?.message || error)
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 200);
 }
 
 function parseCimDate(value) {
@@ -299,70 +455,135 @@ async function sweepOwnedObsidianSurvivorsV1({
   teardownStartedAtMs = null,
   imageName = "Obsidian.exe",
   repoRoot = REPO_ROOT,
+  // A single snapshot cannot reap a tree. Re-enumerating catches children that
+  // were mid-spawn during the first read and any that reparented as their root
+  // died; without it the sweep could only ever kill what it happened to see in
+  // one instant.
+  passes = 3,
+  passDelayMs = 400,
+  enumerate = enumerateObsidianProcessesDetailedV1,
+  kill = forceKillPidV1,
+  sleep = delayMs,
+  platform = process.platform,
 } = {}) {
-  if (process.platform !== "win32") {
-    return { swept: 0, killedPids: [], killResults: [], observed: [] };
+  if (platform !== "win32") {
+    return {
+      swept: 0,
+      killedPids: [],
+      killResults: [],
+      observed: [],
+      residualPids: [],
+      enumerationOk: true,
+      enumerationError: null,
+    };
   }
-  const processes = await enumerateObsidianProcessesV1(imageName);
-  const killedPids = selectOwnedObsidianPidsV1({
-    processes,
-    rootPid,
-    cdpPort,
-    rootCreatedAtMs,
-    teardownStartedAtMs,
-  });
-  appendHostEventV1(
-    {
-      kind: "owned_survivor_sweep",
-      stage,
+  const killResults = [];
+  const killedPids = [];
+  let observed = [];
+  let enumerationOk = true;
+  let enumerationError = null;
+  let owned = [];
+
+  for (let pass = 0; pass < Math.max(1, passes); pass += 1) {
+    const reading = await enumerate(imageName);
+    enumerationOk = reading.ok;
+    enumerationError = reading.error;
+    // "We could not look" must never be reported as "there was nothing there".
+    // Claiming nothing on a failed read is what let a live survivor through.
+    if (!reading.ok) break;
+    observed = reading.processes;
+    owned = selectOwnedObsidianPidsV1({
+      processes: observed,
       rootPid,
       cdpPort,
       rootCreatedAtMs,
       teardownStartedAtMs,
-      observed: processes.map((row) => ({
-        pid: row.pid,
-        parentPid: row.parentPid,
-        createdAtMs: row.createdAtMs,
-        commandLine: row.commandLine.slice(0, 400),
-      })),
-      killedPids,
-      sparedPids: processes
-        .map((row) => row.pid)
-        .filter((pid) => !killedPids.includes(pid)),
-    },
-    repoRoot,
-  );
-  // Per-PID outcomes, not a swallowed `.catch(() => undefined)`. A kill that
-  // FAILED and a kill that succeeded used to be the same observable event, so
-  // "the drain still sees survivors after the sweep" could not be read as
-  // either "the sweep could not kill them" or "the probe is lying about them" —
-  // the exact discrimination this teardown failure needs.
-  const killResults = [];
-  for (const pid of killedPids) {
-    killResults.push(
-      await execFileAsync("taskkill", ["/PID", String(pid), "/F"], {
-        windowsHide: true,
-      }).then(
-        () => ({ pid, killed: true, error: null }),
-        (error) => ({
-          pid,
-          killed: false,
-          error: String(error?.stderr || error?.message || error)
-            .replace(/\s+/gu, " ")
-            .trim()
-            .slice(0, 200),
-        }),
-      ),
-    );
+    });
+    if (pass === 0) {
+      appendHostEventV1(
+        {
+          kind: "owned_survivor_sweep",
+          stage,
+          rootPid,
+          cdpPort,
+          rootCreatedAtMs,
+          teardownStartedAtMs,
+          observed: observed.map((row) => ({
+            pid: row.pid,
+            parentPid: row.parentPid,
+            createdAtMs: row.createdAtMs,
+            commandLine: row.commandLine.slice(0, 400),
+          })),
+          killedPids: owned,
+          sparedPids: observed
+            .map((row) => row.pid)
+            .filter((pid) => !owned.includes(pid)),
+        },
+        repoRoot,
+      );
+    }
+    if (owned.length === 0) break;
+    // Per-PID outcomes, not a swallowed `.catch(() => undefined)`. A kill that
+    // FAILED and a kill that succeeded used to be the same observable event, so
+    // "the drain still sees survivors after the sweep" could not be read as
+    // either "the sweep could not kill them" or "the probe is lying about
+    // them" — the exact discrimination this teardown failure needs.
+    for (const pid of orderKillsLeafFirstV1(owned, observed)) {
+      const outcome = await kill(pid);
+      killResults.push({ ...outcome, pass });
+      if (!killedPids.includes(pid)) killedPids.push(pid);
+    }
+    // Another pass is worth making whenever this one CHANGED something (a kill
+    // that landed can orphan children, and a child that was mid-spawn during
+    // the first read only shows up on a later one) or when a failure is still
+    // retryable. It is worth nothing when every survivor is beyond any kill —
+    // a tree reporting `terminating` will not yield to more force, so spinning
+    // on it would burn teardown budget for no chance of progress.
+    const thisPass = killResults.filter((entry) => entry.pass === pass);
+    if (thisPass.every((entry) => !entry.killed && !entry.reapable)) break;
+    if (pass < Math.max(1, passes) - 1) await sleep(passDelayMs);
   }
+
+  // What is STILL there after the sweep, by proven ownership — the only honest
+  // answer to "did the sweep work", and the fact the next attempt needs.
+  let residualPids = [];
+  if (enumerationOk) {
+    const verify = await enumerate(imageName);
+    if (verify.ok) {
+      observed = verify.processes;
+      residualPids = selectOwnedObsidianPidsV1({
+        processes: verify.processes,
+        rootPid,
+        cdpPort,
+        rootCreatedAtMs,
+        teardownStartedAtMs,
+      });
+    } else {
+      enumerationOk = false;
+      enumerationError = verify.error;
+    }
+  }
+
   const result = {
     swept: killResults.filter((entry) => entry.killed).length,
     killedPids,
     killResults,
-    observed: processes,
+    observed,
+    residualPids,
+    enumerationOk,
+    enumerationError,
   };
   appendHostEventV1(
-    { kind: "owned_survivor_sweep_result", stage, rootPid, cdpPort, killResults },
+    {
+      kind: "owned_survivor_sweep_result",
+      stage,
+      rootPid,
+      cdpPort,
+      killResults,
+      residualPids,
+      enumerationOk,
+      enumerationError,
+    },
     repoRoot,
   );
   return result;
@@ -381,20 +602,73 @@ async function sweepOwnedObsidianSurvivorsV1({
 function describeSweepOutcomeV1(result) {
   const observed = result?.observed ?? [];
   const killResults = result?.killResults ?? [];
-  const failed = killResults.filter((entry) => !entry.killed);
+  // One verdict per PID: the LAST pass is what the machine was left in.
+  const finalByPid = new Map();
+  for (const entry of killResults) {
+    finalByPid.set(entry.pid, {
+      ...entry,
+      // Records written before the fingerprint table existed carry only
+      // killed/error, so derive the outcome rather than mislabel them.
+      outcome:
+        entry.outcome ??
+        (entry.killed ? "killed" : describeTaskkillOutcomeV1(entry.error).outcome),
+    });
+  }
+  const claimed = result?.killedPids?.length
+    ? result.killedPids
+    : [...finalByPid.keys()];
   const parts = [`observed ${observed.length} Obsidian process(es)`];
-  if (killResults.length === 0) {
-    parts.push("claimed 0 as owned");
-  } else {
+  if (result && result.enumerationOk === false) {
+    // A sweep that could not look must not be read as a sweep that found
+    // nothing — that conflation scored real leaks green.
     parts.push(
-      `claimed ${killResults.length} as owned [${killResults.map((entry) => entry.pid).join(", ")}], ` +
-      `force-killed ${killResults.length - failed.length}`,
+      `ENUMERATION FAILED (${result.enumerationError ?? "unknown error"}) — ` +
+      "this reading proves nothing about what is running",
     );
   }
-  if (failed.length > 0) {
+  if (claimed.length === 0) {
+    parts.push("claimed 0 as owned");
+  } else {
+    const finals = claimed.map((pid) => finalByPid.get(pid)).filter(Boolean);
     parts.push(
-      `kill FAILED for ${failed.map((entry) => `${entry.pid} (${entry.error})`).join(", ")}`,
+      `claimed ${claimed.length} as owned [${claimed.join(", ")}], ` +
+      `force-killed ${finals.filter((entry) => entry.killed).length}`,
     );
+    const byOutcome = (outcome) =>
+      finals.filter((entry) => entry.outcome === outcome);
+    const alreadyGone = byOutcome("not_found");
+    if (alreadyGone.length > 0) {
+      parts.push(
+        `already gone before the kill: ${alreadyGone.map((entry) => entry.pid).join(", ")} ` +
+        "(stale snapshot, not a leak)",
+      );
+    }
+    const terminating = byOutcome("terminating");
+    if (terminating.length > 0) {
+      // The shape that cost attempts 1 and 3 of the 2026-08-27 campaign. It is
+      // NOT a kill we botched and NOT a probe lying: no kill can reach a
+      // process already terminating, and it keeps occupying the image name
+      // until the kernel finishes, so the next lane's gate will refuse.
+      parts.push(
+        `STILL TERMINATING, unreapable by any kill: ${terminating.map((entry) => entry.pid).join(", ")} ` +
+        "(taskkill reports the termination is already in flight; only time removes these)",
+      );
+    }
+    const failed = finals.filter(
+      (entry) =>
+        !entry.killed &&
+        entry.outcome !== "not_found" &&
+        entry.outcome !== "terminating",
+    );
+    if (failed.length > 0) {
+      parts.push(
+        `kill FAILED for ${failed.map((entry) => `${entry.pid} (${entry.error})`).join(", ")}`,
+      );
+    }
+  }
+  const residual = result?.residualPids ?? [];
+  if (residual.length > 0) {
+    parts.push(`still present after the sweep: ${residual.join(", ")}`);
   }
   return parts.join("; ");
 }
@@ -431,8 +705,14 @@ async function waitForOwnedRootExitV1({
   if (rootPid === null || rootPid === undefined) return true;
   const stillAlive = async () => {
     if (handle && handle.exitCode !== null) return false;
-    const processes = await enumerateObsidianProcessesV1(imageName);
-    return processes.some(
+    const reading = await enumerateObsidianProcessesDetailedV1(imageName);
+    // A read that FAILED says nothing about liveness. Treating it as "no rows,
+    // therefore exited" turned every CIM timeout under load into a green
+    // teardown over a live process — the silent leak that poisons the next
+    // lane. Unknown resolves to "still alive": a false red is recoverable, a
+    // leaked host is not.
+    if (!reading.ok) return true;
+    return reading.processes.some(
       (row) =>
         row.pid === rootPid &&
         createdWithinRootLifetimeV1(
@@ -484,6 +764,117 @@ function summarizeRecentHostDeathV1(sinceMs, repoRoot = REPO_ROOT) {
   return null;
 }
 
+/**
+ * Every Obsidian root THIS repo root spawned at or after `sinceMs`, read back
+ * from the durable journal.
+ *
+ * The campaign sweep runs BETWEEN attempts, so it has no live handle and no
+ * root PID of its own — which is why it used to select by
+ * `CommandLine -match 'test_vault_obsidian_ai'`. That is the exact rule that
+ * once force-killed another session's live lane: the vault path is shared by
+ * every instance, so it identifies a MACHINE-WIDE class, not a possession. The
+ * journal is the campaign's own write log; a spawn record in it is proof the
+ * campaign started that process.
+ */
+function readOwnedHostSpawnsV1({ sinceMs = 0, repoRoot = REPO_ROOT } = {}) {
+  let lines;
+  try {
+    lines = readFileSync(hostEventJournalPath(repoRoot), "utf8")
+      .split(/\r?\n/u)
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+  const spawns = [];
+  for (const line of lines) {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event.kind !== "host_spawned") continue;
+    const spawnedAtMs = Date.parse(String(event.ts ?? ""));
+    const pid = Number(event.pid);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    if (!Number.isFinite(spawnedAtMs) || spawnedAtMs < sinceMs) continue;
+    spawns.push({
+      pid,
+      spawnedAtMs,
+      label: event.label ?? null,
+      cdpPort: event.cdpPort ?? null,
+    });
+  }
+  return spawns;
+}
+
+/**
+ * Default slack between a process's creation instant and the journal line that
+ * records it. Measured across the 2026-08-27 campaign's ten spawns: the record
+ * lands 14–305ms AFTER the kernel's CreationDate. 60s is far beyond anything
+ * observed and still bounded.
+ */
+const SPAWN_CLAIM_WINDOW_MS = 60_000;
+
+/**
+ * Which LIVE Obsidian PIDs are residue this campaign itself created?
+ *
+ * Ownership is PID *and* creation instant, exactly as the teardown sweep
+ * requires, and the bound is causal rather than a tolerance guess:
+ *
+ *   our process occupies its PID from its creation until it exits, and the
+ *   journal line is written once spawn() has returned — so the line's instant
+ *   necessarily falls INSIDE our process's lifetime. Any other process wearing
+ *   that PID can only have been created after ours exited, which is strictly
+ *   after the journal line. `createdAtMs <= spawnedAtMs` therefore excludes
+ *   every PID-recycled impostor by construction.
+ *
+ * A row with NO creation time is NOT claimed. That is the opposite fail-safe
+ * from the teardown sweep, and deliberately so: teardown owns its root by
+ * construction, so disowning a survivor there would hide a leak, whereas here
+ * a wrong claim force-kills a concurrent session's live lane. A missed claim
+ * is now harmless — the caller reports residue and the campaign declines to
+ * spend an attempt instead of starting into it.
+ */
+function selectJournalOwnedResidueV1({
+  processes = [],
+  spawns = [],
+  claimWindowMs = SPAWN_CLAIM_WINDOW_MS,
+} = {}) {
+  const rows = processes.filter(
+    (row) => Number.isSafeInteger(row?.pid) && row.pid > 0,
+  );
+  const spawnByPid = new Map();
+  for (const spawn of spawns) {
+    const existing = spawnByPid.get(spawn.pid);
+    if (!existing || spawn.spawnedAtMs > existing.spawnedAtMs) {
+      spawnByPid.set(spawn.pid, spawn);
+    }
+  }
+  const isOurSpawn = (row) => {
+    const spawn = spawnByPid.get(row.pid);
+    if (!spawn) return false;
+    // No creation instant => no proof => no claim.
+    if (row.createdAtMs === null || row.createdAtMs === undefined) return false;
+    if (row.createdAtMs > spawn.spawnedAtMs) return false;
+    return row.createdAtMs >= spawn.spawnedAtMs - claimWindowMs;
+  };
+
+  const childrenOf = new Map();
+  for (const row of rows) {
+    if (!childrenOf.has(row.parentPid)) childrenOf.set(row.parentPid, []);
+    childrenOf.get(row.parentPid).push(row.pid);
+  }
+  const owned = new Set();
+  const collectTree = (pid) => {
+    if (owned.has(pid)) return;
+    owned.add(pid);
+    for (const child of childrenOf.get(pid) ?? []) collectTree(child);
+  };
+  for (const row of rows) if (isOurSpawn(row)) collectTree(row.pid);
+  return [...owned].sort((a, b) => a - b);
+}
+
 module.exports = {
   summarizeRecentHostDeathV1,
   HOST_DIAGNOSTICS_RELATIVE_DIR,
@@ -491,10 +882,17 @@ module.exports = {
   hostEventJournalPath,
   appendHostEventV1,
   describeWindowsExitCodeV1,
+  describeTaskkillOutcomeV1,
+  forceKillPidV1,
+  orderKillsLeafFirstV1,
   enumerateObsidianProcessesV1,
+  enumerateObsidianProcessesDetailedV1,
   createdWithinRootLifetimeV1,
   selectOwnedObsidianPidsV1,
   sweepOwnedObsidianSurvivorsV1,
   describeSweepOutcomeV1,
   waitForOwnedRootExitV1,
+  readOwnedHostSpawnsV1,
+  selectJournalOwnedResidueV1,
+  SPAWN_CLAIM_WINDOW_MS,
 };

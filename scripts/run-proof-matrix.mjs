@@ -295,12 +295,61 @@ function assertExactCleanHead(expectedHead, stage) {
  * Reporting event and no crash dump: the "silent host death". The shared
  * helper defers to a live lock holder and journals every decision.
  */
-async function sweepTestVaultObsidianZombies(stage) {
-  await sweepTestVaultObsidianZombiesV1({
+async function sweepTestVaultObsidianZombies(stage, sinceMs = 0) {
+  return sweepTestVaultObsidianZombiesV1({
     stage: `proof-matrix[${stage}]`,
     env: process.env,
     repoRoot: REPO_ROOT,
+    sinceMs,
   });
+}
+
+/**
+ * How long to let campaign-owned Obsidian residue finish dying before giving up
+ * on the attempt slot.
+ *
+ * A root that taskkill reports as already terminating cannot be reaped by any
+ * kill — the 2026-08-27 campaign's PID 25596 shrugged off six force-kills over
+ * 5.5 minutes and then exited on its own. Waiting is the ONLY remediation for
+ * that state, so the matrix waits here instead of launching attempts into a
+ * machine it knows is dirty: attempts 4 and 5 of that campaign each spent
+ * ~150s starting up only to be refused by the already-running gate, and four
+ * consecutive infrastructure reds put the cell two away from the
+ * MAX_CONSECUTIVE_HARNESS_FAILURES abort valve.
+ */
+const OBSIDIAN_RESIDUE_DRAIN_MS = Number.parseInt(
+  process.env.PROOF_MATRIX_RESIDUE_DRAIN_MS ?? "300000",
+  10,
+);
+const OBSIDIAN_RESIDUE_POLL_MS = 5_000;
+
+/**
+ * Wait for campaign-owned Obsidian residue to drain, re-sweeping as we go.
+ *
+ * Returns the PIDs still present when the budget ran out — empty means the
+ * machine is clean and the attempt may proceed.
+ */
+async function drainCampaignObsidianResidue(stage, sinceMs, initial) {
+  let residual = initial?.residualPids ?? [];
+  if (residual.length === 0 && initial?.enumerationOk !== false) return [];
+  const deadline = Date.now() + Math.max(0, OBSIDIAN_RESIDUE_DRAIN_MS);
+  console.log(
+    `proof-matrix[${stage}]: campaign-owned Obsidian residue ${residual.join(", ") || "(unknown)"} ` +
+    `is still present; waiting up to ${Math.round(OBSIDIAN_RESIDUE_DRAIN_MS / 1000)}s for it to drain ` +
+    "rather than starting an attempt the already-running gate will refuse.",
+  );
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, OBSIDIAN_RESIDUE_POLL_MS));
+    const swept = await sweepTestVaultObsidianZombies(`${stage} residue-drain`, sinceMs);
+    residual = swept.residualPids ?? [];
+    // An enumeration we could not perform proves nothing; keep waiting rather
+    // than reading "we could not look" as "the machine is clean".
+    if (residual.length === 0 && swept.enumerationOk !== false) {
+      console.log(`proof-matrix[${stage}]: residue drained; the attempt may proceed.`);
+      return [];
+    }
+  }
+  return residual.length > 0 ? residual : [-1];
 }
 
 function listWorkspaceEntries() {
@@ -657,6 +706,27 @@ export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS = "environment_not_configu
  * pass-rate denominator and only classifies green/not-green).
  */
 export const HARNESS_CLEANUP_FAILURE_CLASS = "harness:cleanup_failed";
+
+/**
+ * A previous attempt's Obsidian is STILL on the machine and would not drain, so
+ * this attempt was never launched.
+ *
+ * THE CASCADE THIS ENDS. On 2026-08-27 two `harness:cleanup_failed` teardowns
+ * leaked a live Obsidian, and the matrix launched straight into it twice more:
+ * attempts 4 and 5 each paid ~150s of build, vault sync and lane startup only
+ * to be refused by `assertObsidianClosed`, which is behaving correctly — a live
+ * Obsidian genuinely poisons a lane. Four of nine attempts were consumed by one
+ * root cause, and four CONSECUTIVE infrastructure reds left the cell two short
+ * of the MAX_CONSECUTIVE_HARNESS_FAILURES abort valve.
+ *
+ * The gate now reaps what the campaign can PROVE it owns, then waits for
+ * anything already terminating (no kill can reach that state), and only records
+ * this class when the machine is still dirty at the end. It is `harness:`
+ * prefixed, so the one shared predicate keeps it off the attempt budget and the
+ * green streak, it writes no run-metrics CSV row, and the valve still aborts a
+ * campaign that can never get a clean machine.
+ */
+export const OBSIDIAN_RESIDUE_FAILURE_CLASS = "harness:obsidian_residue_blocked";
 
 /**
  * The model provider refused to serve the run — quota, monthly cap, or rate
@@ -1229,6 +1299,19 @@ export function markAttemptInFlight(manifest, { cell, project, attempt, startedA
   manifest.inFlight = { cell, project, attempt, startedAt };
 }
 
+/**
+ * Record an attempt slot that was never launched.
+ *
+ * Distinct from the attempt record written after a run finishes: there is no
+ * runner, no exit code and no log to classify, only a reason the matrix
+ * declined to start. It is a plain push of a prepared record precisely so the
+ * source-shape guards over the POST-RUN attempt record keep matching the one
+ * literal they are about.
+ */
+function recordUnlaunchedAttempt(manifest, record) {
+  manifest.attempts.push(record);
+}
+
 export function clearAttemptInFlight(manifest) {
   delete manifest.inFlight;
 }
@@ -1466,7 +1549,60 @@ async function main() {
       const attemptIndex = totalAttemptCount(manifest, cell.id) + 1;
       const stage = `${cell.id}#${attemptIndex}`;
       assertExactCleanHead(expectedHead, `${stage} pre`);
-      await sweepTestVaultObsidianZombies(stage);
+      // Reap what this campaign can PROVE it started, then refuse to launch
+      // into a machine that is still dirty. `assertObsidianClosed` refusing is
+      // correct behaviour — the fix is to not hand it a dirty machine, never to
+      // start anyway.
+      const campaignSinceMs = Date.parse(manifest.startedAt ?? "") || 0;
+      const preSweep = await sweepTestVaultObsidianZombies(stage, campaignSinceMs);
+      const blockingResidue = await drainCampaignObsidianResidue(
+        stage,
+        campaignSinceMs,
+        preSweep,
+      );
+      if (blockingResidue.length > 0) {
+        const residueDetail =
+          `campaign-owned Obsidian residue did not drain within ` +
+          `${Math.round(OBSIDIAN_RESIDUE_DRAIN_MS / 1000)}s` +
+          (blockingResidue[0] === -1
+            ? " (and the process table could not be read, so the machine is UNKNOWN, not clean)"
+            : `: PID(s) ${blockingResidue.join(", ")} are still present`) +
+          ". The attempt was NOT launched — starting it would only be refused by " +
+          "the already-running gate after paying full lane startup.";
+        console.warn(`proof-matrix[${stage}]: ${residueDetail}`);
+        clearAttemptInFlight(manifest);
+        recordUnlaunchedAttempt(manifest, {
+          cell: cell.id,
+          project: cell.project,
+          attempt: attemptIndex,
+          startedAt: new Date().toISOString(),
+          durationS: 0,
+          green: false,
+          exitCode: null,
+          failureClass: OBSIDIAN_RESIDUE_FAILURE_CLASS,
+          confidence: CLASSIFICATION_CONFIRMED,
+          secondaryClasses: [],
+          failureDetail: residueDetail,
+          toolEvents: null,
+        });
+        manifest.harnessFailureCounts = manifest.harnessFailureCounts ?? {};
+        manifest.harnessFailureCounts[cell.id] =
+          (manifest.harnessFailureCounts[cell.id] ?? 0) + 1;
+        console.log(
+          `proof-matrix[${stage}]: ${OBSIDIAN_RESIDUE_FAILURE_CLASS} is a harness death, not product evidence — ` +
+          `attempt budget stays ${consumedAttemptCount(manifest, cell.id)}/${cell.maxAttempts}, streak preserved.`,
+        );
+        saveManifest(manifest);
+        if (consecutiveHarnessFailures(manifest, cell.id) > MAX_CONSECUTIVE_HARNESS_FAILURES) {
+          fail(
+            `cell '${cell.id}' hit ${consecutiveHarnessFailures(manifest, cell.id)} consecutive ` +
+            `harness/process failures (> ${MAX_CONSECUTIVE_HARNESS_FAILURES}) — a leaked Obsidian that ` +
+            "never drains cannot be retried around. Clear it, then resume (--resume); no attempt budget " +
+            "was spent on these deaths.",
+          );
+        }
+        continue;
+      }
       const workspacesBefore = listWorkspaceEntries();
 
       const env = {
@@ -1542,7 +1678,7 @@ async function main() {
         // The excerpt is best-effort; classification falls back to the tail rule.
       }
 
-      await sweepTestVaultObsidianZombies(`${stage} post`);
+      await sweepTestVaultObsidianZombies(`${stage} post`, campaignSinceMs);
       removeCampaignWorkspaceDebris(workspacesBefore, stage);
       assertExactCleanHead(expectedHead, `${stage} post`);
 

@@ -115,6 +115,12 @@ export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS: "environment_not_configur
  */
 export const HARNESS_CLEANUP_FAILURE_CLASS: "harness:cleanup_failed";
 /**
+ * A previous attempt's Obsidian was still on the machine, so this attempt was
+ * never launched. `harness:` prefixed, so budget-exempt and streak-preserving
+ * through the one shared predicate.
+ */
+export const OBSIDIAN_RESIDUE_FAILURE_CLASS: "harness:obsidian_residue_blocked";
+/**
  * The model provider refused to serve the run — quota, monthly cap, or rate
  * limit. The product was never exercised, so it is not a product red.
  */

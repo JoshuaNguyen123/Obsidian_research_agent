@@ -1,12 +1,14 @@
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
 import {
   appendHostEventV1,
-  enumerateObsidianProcessesV1,
+  enumerateObsidianProcessesDetailedV1,
+  forceKillPidV1,
+  orderKillsLeafFirstV1,
+  readOwnedHostSpawnsV1,
+  selectJournalOwnedResidueV1,
 } from "./e2e-obsidian-sweep.js";
 import {
   isProcessAlive,
@@ -14,7 +16,6 @@ import {
   resolveE2eLockPath,
 } from "./run-e2e-exclusive.mjs";
 
-const execFileAsync = promisify(execFile);
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 /**
@@ -43,23 +44,50 @@ export async function foreignExclusiveLockHolderV1(env = process.env) {
 }
 
 /**
- * Kill leaked test-vault Obsidian processes between campaign cells — but never
- * while another runner legitimately holds the exclusive lock.
+ * Reap Obsidian processes THIS campaign leaked, between cells — never while
+ * another runner legitimately holds the exclusive lock, and never anything the
+ * campaign cannot prove it started.
  *
- * Selecting by `CommandLine -match 'test_vault_obsidian_ai'` matches a LIVE
- * lane's root just as readily as a zombie; force-killing it then produced exit
- * 4294967295, no Windows Error Reporting event, no crash dump and no stderr —
- * a death indistinguishable from a product crash until you decode the exit
- * code. Deferring to the lock holder is what makes the sweep safe.
+ * TWO defects this replaces, both measured in the 2026-08-27 compound campaign
+ * where one leaked root (25596) burned attempts 4 and 5:
+ *
+ *  1. OWNERSHIP WAS INFERRED FROM A VAULT PATH.
+ *     `CommandLine -match 'test_vault_obsidian_ai'` matches a LIVE lane's root
+ *     just as readily as a leak, because every instance on this machine shares
+ *     that vault. Force-killing on that match produced exit 4294967295 with no
+ *     Windows Error Reporting event, no crash dump and no stderr — a death
+ *     indistinguishable from a product crash until you decode the exit code.
+ *     Ownership is now PID + creation instant proven against this repo root's
+ *     own spawn journal (selectJournalOwnedResidueV1), so a process we did not
+ *     start cannot be selected at all. The lock deferral stays as a second,
+ *     independent guard.
+ *
+ *  2. THE KILL OUTCOME WAS THROWN AWAY.
+ *     `.catch(() => undefined)` after a `killedPids` list that was recorded
+ *     BEFORE any kill ran. The journal therefore recorded "killed [25596]"
+ *     five times across 5.5 minutes for a process that never died — the
+ *     campaign believed it had cleaned up and started two attempts into a
+ *     machine that still had a live Obsidian on it. Kills now carry per-PID
+ *     outcomes and the sweep VERIFIES by re-enumerating, so `residualPids` is
+ *     an observation rather than an assumption.
  */
 export async function sweepTestVaultObsidianZombiesV1({
   stage = "unknown",
   env = process.env,
   repoRoot = REPO_ROOT,
   log = console,
+  sinceMs = 0,
 } = {}) {
   if (process.platform !== "win32") {
-    return { swept: 0, skipped: false, reason: null };
+    return {
+      swept: 0,
+      skipped: false,
+      reason: null,
+      targetedPids: [],
+      killResults: [],
+      residualPids: [],
+      enumerationOk: true,
+    };
   }
   const holder = await foreignExclusiveLockHolderV1(env);
   if (holder) {
@@ -75,34 +103,93 @@ export async function sweepTestVaultObsidianZombiesV1({
       `Skipped the test-vault Obsidian sweep before ${stage}: ${reason}. ` +
         "Sweeping now would force-kill a running lane's host.",
     );
-    return { swept: 0, skipped: true, reason };
+    return {
+      swept: 0,
+      skipped: true,
+      reason,
+      targetedPids: [],
+      killResults: [],
+      residualPids: [],
+      enumerationOk: true,
+    };
   }
-  const processes = await enumerateObsidianProcessesV1();
-  const targets = processes.filter((row) =>
-    /test_vault_obsidian_ai/iu.test(row.commandLine),
-  );
+
+  const spawns = readOwnedHostSpawnsV1({ sinceMs, repoRoot });
+  const reading = await enumerateObsidianProcessesDetailedV1();
+  const targetedPids = reading.ok
+    ? selectJournalOwnedResidueV1({ processes: reading.processes, spawns })
+    : [];
   appendHostEventV1(
     {
       kind: "campaign_sweep",
       stage,
-      observed: processes.map((row) => ({
+      enumerationOk: reading.ok,
+      enumerationError: reading.error,
+      observed: reading.processes.map((row) => ({
         pid: row.pid,
         parentPid: row.parentPid,
+        createdAtMs: row.createdAtMs,
         commandLine: row.commandLine.slice(0, 400),
       })),
-      killedPids: targets.map((row) => row.pid),
+      // TARGETED, not "killed" — this list is written before any kill runs and
+      // must never again claim an outcome it has not observed.
+      targetedPids,
+      sparedPids: reading.processes
+        .map((row) => row.pid)
+        .filter((pid) => !targetedPids.includes(pid)),
     },
     repoRoot,
   );
-  for (const row of targets) {
-    await execFileAsync("taskkill", ["/PID", String(row.pid), "/F"], {
-      windowsHide: true,
-    }).catch(() => undefined);
+
+  const killResults = [];
+  for (const pid of orderKillsLeafFirstV1(targetedPids, reading.processes)) {
+    killResults.push(await forceKillPidV1(pid));
   }
-  if (targets.length > 0) {
+
+  // VERIFY. The campaign's next act is to start an attempt on this machine, so
+  // "did they actually go" is the only answer worth recording.
+  let residualPids = [];
+  let enumerationOk = reading.ok;
+  if (reading.ok) {
+    const verify = await enumerateObsidianProcessesDetailedV1();
+    enumerationOk = verify.ok;
+    residualPids = verify.ok
+      ? selectJournalOwnedResidueV1({ processes: verify.processes, spawns })
+      : targetedPids;
+  }
+  const killed = killResults.filter((entry) => entry.killed).length;
+  appendHostEventV1(
+    {
+      kind: "campaign_sweep_result",
+      stage,
+      killResults,
+      residualPids,
+      enumerationOk,
+    },
+    repoRoot,
+  );
+  if (targetedPids.length > 0) {
     log.log?.(
-      `Swept ${targets.length} test-vault Obsidian zombie process(es) before ${stage}.`,
+      `Swept ${killed}/${targetedPids.length} campaign-owned Obsidian process(es) before ${stage}` +
+        (residualPids.length > 0
+          ? `; STILL PRESENT: ${residualPids.join(", ")}`
+          : "") +
+        ".",
     );
   }
-  return { swept: targets.length, skipped: false, reason: null };
+  if (!enumerationOk) {
+    log.warn?.(
+      `Could not enumerate Obsidian processes before ${stage}; ` +
+        "treat this as UNKNOWN, not as a clean machine.",
+    );
+  }
+  return {
+    swept: killed,
+    skipped: false,
+    reason: null,
+    targetedPids,
+    killResults,
+    residualPids,
+    enumerationOk,
+  };
 }
