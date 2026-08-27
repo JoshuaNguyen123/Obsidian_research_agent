@@ -1119,9 +1119,14 @@ async function terminateObsidian(
   hostTeardownRequested = true;
   await terminateControlledObsidian(processHandle, {
     terminateOwnedTree: async (pid) => {
-      await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"]).catch(
-        () => processHandle.kill(),
-      );
+      // Bounded and hidden. This dispatch had NO timeout, so a taskkill that
+      // itself blocked — reachable when a process is wedged in termination,
+      // the state this teardown keeps meeting — hung the whole teardown with
+      // no probe ever running and no evidence written.
+      await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 30_000,
+      }).catch(() => processHandle.kill());
     },
     waitForOwnedExit: (phase) =>
       waitForOwnedRootExitV1({
