@@ -10,12 +10,18 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertMissionScorecardSummaryFile } from "./mission-scorecard-regression.mjs";
+import { assertOfflineApplicationAttemptSummaryFile } from "./offline-application-attempt.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLAYWRIGHT_EXECUTION_REPORT_PATH = path.join(
   repoRoot,
   "test-results",
   "playwright-execution-report.json",
+);
+const OFFLINE_ATTEMPT_SUMMARY_PATH = path.join(
+  repoRoot,
+  "test-results",
+  "offline-application-attempts.json",
 );
 const DEFAULT_WAIT_MS = 30_000;
 const DEFAULT_POLL_MS = 250;
@@ -49,6 +55,7 @@ export const PLAYWRIGHT_PROJECTS = new Set([
   "linear-flow-real-cleanup",
   "compound-flow-real-live",
   "github-askpass-runtime-live",
+  "offline-core",
 ]);
 // Lanes that require an explicit disposable external-service scope. They gate
 // before the lock, build, vault sync, or Obsidian boot, so a missing credential
@@ -272,6 +279,11 @@ async function main() {
   installSignalHandlers();
 
   try {
+    if (aiMode === "offline") {
+      await unlink(OFFLINE_ATTEMPT_SUMMARY_PATH).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+      });
+    }
     activeLock = await acquireE2eLock({
       playwrightArgs,
       isCancelled: () => Boolean(interruptedSignal),
@@ -292,25 +304,41 @@ async function main() {
       // Execution proof first: a scorecard check over a suite that never ran
       // would just be a second way to report a green lie.
       const executionProof = await assertSelectedProjectsExecuted(projects);
-      try {
-        await assertMissionScorecardSummaryFile({
-          selectedProjects: projects,
-          requireSummary: true,
-          // A targeted grep may intentionally run an unscored settings/guard
-          // test inside a scored project. In that case compare only baselined
-          // tests that actually ran. Full project lanes remain fail-closed and
-          // still require every committed baseline record.
-          ...(hasTargetedPlaywrightSelection(playwrightArgs)
-            ? { executedTests: executionProof.executedTests }
-            : {}),
+      if (aiMode === "offline") {
+        const foundation = await assertOfflineApplicationAttemptSummaryFile({
+          filePath: OFFLINE_ATTEMPT_SUMMARY_PATH,
+          requiredScenarioIds: ["chat_only", "current_note_append"],
+          requiredRepetitions: 1,
+          requireCleanHead: false,
         });
-      } catch (error) {
-        if (!allowsWorkflowAuditBaselineBootstrap(error, projects, process.env)) {
-          throw error;
-        }
         console.log(
-          "BYOK execution passed with no prior scorecard baseline; the authorized workflow audit must run its independent verifier before harvesting this result.",
+          `Offline application proof: ` +
+            `${foundation.proofCompleteAttempts}/${foundation.expectedAttempts} ` +
+            `cloud_requests=${foundation.cloudRequests} ` +
+            `receipt_coverage=${foundation.receiptCoverage.toFixed(3)} ` +
+            `release_source=${foundation.releaseEligibleSource ? "clean" : "dirty"}`,
         );
+      } else {
+        try {
+          await assertMissionScorecardSummaryFile({
+            selectedProjects: projects,
+            requireSummary: true,
+            // A targeted grep may intentionally run an unscored settings/guard
+            // test inside a scored project. In that case compare only baselined
+            // tests that actually ran. Full project lanes remain fail-closed and
+            // still require every committed baseline record.
+            ...(hasTargetedPlaywrightSelection(playwrightArgs)
+              ? { executedTests: executionProof.executedTests }
+              : {}),
+          });
+        } catch (error) {
+          if (!allowsWorkflowAuditBaselineBootstrap(error, projects, process.env)) {
+            throw error;
+          }
+          console.log(
+            "BYOK execution passed with no prior scorecard baseline; the authorized workflow audit must run its independent verifier before harvesting this result.",
+          );
+        }
       }
     }
     process.exitCode = interruptedSignal
@@ -698,6 +726,10 @@ export function normalizeExclusiveArgs(rawArgs) {
       aiMode = "mock";
       continue;
     }
+    if (arg === "--offline-ai") {
+      aiMode = "offline";
+      continue;
+    }
     if (arg === "--live-external") {
       liveExternal = true;
       continue;
@@ -749,6 +781,12 @@ export function normalizeExclusiveArgs(rawArgs) {
     );
   }
   if (
+    aiMode === "offline" &&
+    (projects.length !== 1 || projects[0] !== "offline-core")
+  ) {
+    throw new Error("--offline-ai is restricted to the offline-core Playwright project.");
+  }
+  if (
     liveExternal &&
     (projects.length !== 1 || projects[0] !== "disposable-live-external")
   ) {
@@ -758,6 +796,9 @@ export function normalizeExclusiveArgs(rawArgs) {
   }
   if (liveExternal && aiMode === "real") {
     throw new Error("The disposable live external provider lane cannot also enable real-AI model calls.");
+  }
+  if (liveExternal && aiMode === "offline") {
+    throw new Error("The zero-cloud offline lane cannot enable live external providers.");
   }
   return { playwrightArgs, aiMode, liveExternal, projects };
 }
@@ -779,6 +820,16 @@ export function applyE2eAiMode(aiMode, env = process.env) {
   if (aiMode === "mock") {
     env.E2E_AI_MODE = "mock";
     env.E2E_REAL_AI = "0";
+  }
+  if (aiMode === "offline") {
+    env.E2E_AI_MODE = "real";
+    env.E2E_REAL_AI = "1";
+    env.E2E_OFFLINE_AI = "1";
+    env.E2E_AI_MODEL = "offline-scripted-v1";
+    env.E2E_MODEL_PROVIDER = "openai_compatible";
+    env.E2E_OPENAI_COMPATIBLE_BASE_URL = "http://127.0.0.1:7331/v1";
+    env.E2E_OLLAMA_BASE_URL = env.E2E_OPENAI_COMPATIBLE_BASE_URL;
+    env.E2E_OPENAI_COMPATIBLE_API_KEY = "offline-e2e-ephemeral-token";
   }
 }
 
