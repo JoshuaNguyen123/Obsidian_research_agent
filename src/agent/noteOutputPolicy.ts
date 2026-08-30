@@ -83,7 +83,7 @@ const CHAT_ONLY_PATTERN =
   /\b(chat\s+only|only\s+in\s+chat|answer\s+in\s+chat|respond\s+in\s+chat|do\s+not\s+(?:write|append|save)\s+(?:to|in|into)\s+(?:the\s+)?(?:note|page|document|file))\b/i;
 
 const EXPLICIT_NEW_NOTE_PATTERN =
-  /\b(create|make|new)\b[\s\S]{0,80}\b(note|markdown\s+file|file)\b|\b(note|markdown\s+file)\b[\s\S]{0,40}\b(named|called|titled)\b/i;
+  /\b(?:create|make)\s+(?:(?:me|us)\s+)?(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:note|markdown\s+file|file)\b|\bnew\s+(?:note|markdown\s+file)\b|\b(?:note|markdown\s+file)\b[\s\S]{0,40}\b(?:named|called|titled)\b/iu;
 
 const EXPLICIT_ACTIVE_NOTE_TARGET_PATTERN =
   /\b(?:this|the|current|active)\s+(?:note|page|document|file)\b|\b(?:on|onto|to|into|in)\s+(?:this|the\s+current|the\s+active)\s+(?:note|page|document|file)\b|\bstream\s+writeback\s+(?:onto|to|into)\s+the\s+page\b/iu;

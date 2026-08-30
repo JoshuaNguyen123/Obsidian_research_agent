@@ -1,6 +1,9 @@
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import { FINALIZATION_RESERVE_STEPS } from "./AgentBudget";
-import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import {
+  hasExplicitNoWebIntent,
+  hasPrimaryTextCitationIntent,
+} from "./evidenceIntent";
 import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
 // The MissionGraph node this planner plants and the tool the route offers must
 // come from ONE predicate. Both of these were private copies here until
@@ -283,6 +286,12 @@ function getExplicitMarkdownReadTargets(prompt: string): string[] {
 }
 
 function hasExplicitWebGroundingIntent(prompt: string): boolean {
+  // A negative network constraint is authoritative. Treating the token
+  // "web" inside "do not use the web" as positive intent can reserve
+  // web_search/web_fetch nodes that the user explicitly prohibited.
+  if (hasExplicitNoWebIntent(prompt)) {
+    return false;
+  }
   // "citations from the text" is close reading, not public-web grounding.
   if (hasPrimaryTextCitationIntent(prompt)) {
     return false;

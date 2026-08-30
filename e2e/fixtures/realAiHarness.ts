@@ -2002,7 +2002,6 @@ async function installRealAiPageHarness(context: {
     );
     const leaf =
       app.workspace.getLeavesOfType?.("markdown")?.[0] ??
-      app.workspace.getLeavesOfType?.("empty")?.[0] ??
       app.workspace.getLeaf("tab");
     await leaf.openFile(note);
     app.workspace.setActiveLeaf(leaf, { focus: true });

@@ -2,12 +2,14 @@ import { defineConfig } from "@playwright/test";
 
 /**
  * Every project here drives the installed production plugin inside real
- * Obsidian. There is no mock-model lane: the deterministic suites were removed
+ * Obsidian. There is no injected mock-model lane: the deterministic suites were removed
  * because they passed on a host whose plugin could not actually run a mission
  * — they injected the sandbox provider configuration the product never adopted,
  * which is exactly the failure they were supposed to catch. Each lane below
  * calls a real model, a real external service, or both, except for explicit
- * native UI security probes that exercise the installed production renderer.
+ * native UI security probes and `offline-core`. Offline-core reaches an
+ * authenticated loopback backend through the production HTTP model client;
+ * it does not replace the plugin's client or provision capabilities.
  * Every lane asserts on items that really exist afterwards.
  */
 
@@ -58,6 +60,14 @@ export default defineConfig({
     video: protectedLogMode ? "off" : "retain-on-failure",
   },
   projects: [
+    {
+      name: "offline-core",
+      testMatch: /offline-core\.spec\.ts/u,
+      retries: 0,
+      timeout: 240_000,
+      expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "only-on-failure", video: "off" },
+    },
     {
       // Default product-health proof: reported mission plus a run-owned artifact
       // destination, production model, native Obsidian writes, semantic

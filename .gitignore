@@ -92,3 +92,11 @@ companion/test-results/
 
 # Local project documentation (kept on disk, not published to GitHub)
 docs/
+
+# repo-harness:start
+# repo-harness local runtime
+.agent/runtime/
+.worktrees/
+.repo-harness/
+.claude/settings.local.json
+# repo-harness:end

@@ -561,6 +561,19 @@ test("generated count_words verification is local metadata proof, not web proof"
   );
 });
 
+test("loop planner treats an explicit no-web constraint as local-only", () => {
+  const prompt =
+    "How many words are in the current note? Call count_words before answering. Do not write notes or use the web.";
+  const budget = planLoopBudget({
+    prompt,
+    route: "tool_required",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 12,
+  });
+
+  assert.deepEqual(budget.expectedTools, ["count_words"]);
+});
+
 test("explicit vault-only scope outranks incidental negated web language", () => {
   const prompt =
     "Investigate my vault with semantic retrieval and batch reads. Do not use web or memory tools.";

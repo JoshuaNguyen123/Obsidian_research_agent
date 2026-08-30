@@ -225,7 +225,10 @@ export function resolveE2eLockPath(env = process.env) {
   if (env.OBSIDIAN_E2E_LOCK_PATH) {
     return path.resolve(env.OBSIDIAN_E2E_LOCK_PATH);
   }
-  return path.join(os.tmpdir(), "agentic-researcher-obsidian-e2e.lock");
+  return path.join(
+    os.tmpdir(),
+    "agentic-researcher-obsidian-e2e-machine.lock",
+  );
 }
 
 export async function readLockOwner(lockPath) {

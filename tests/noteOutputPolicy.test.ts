@@ -83,6 +83,30 @@ describe("noteOutputPolicy decision table", () => {
     assert.equal(result.reason, "active_note_available");
   });
 
+  it("new-line wording does not override an explicit current-note append", () => {
+    const result = plan({
+      prompt: "Append exactly one new line containing MARKER to the current note.",
+      hasActiveMarkdownNote: true,
+      activeNoteIsPlaceholder: false,
+    });
+    assert.equal(result.destination, "active_note");
+    assert.equal(result.mutation, "append");
+    assert.equal(result.reason, "active_note_available");
+  });
+
+  it("explicit create-new-note wording still creates a note", () => {
+    for (const prompt of [
+      "Create a new note about release readiness.",
+      "Make me a markdown file called Release Readiness.",
+      "Write this in a new note.",
+    ]) {
+      const result = plan({ prompt, hasActiveMarkdownNote: true });
+      assert.equal(result.destination, "new_note", prompt);
+      assert.equal(result.mutation, "create", prompt);
+      assert.equal(result.reason, "explicit_new_note", prompt);
+    }
+  });
+
   it("placeholder active note allows automatic title", () => {
     const result = plan({
       prompt: "Draft a one-paragraph summary of the moon landing in this note.",
