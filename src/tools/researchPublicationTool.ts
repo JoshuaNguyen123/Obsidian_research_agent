@@ -497,6 +497,13 @@ export interface TrustedRepositoryCatalogV1 {
   validationKeysByRepository: Readonly<Record<string, readonly string[]>>;
 }
 
+export interface ProjectIdeaSeedCanonicalizationTraceV1 {
+  version: 1;
+  applied: boolean;
+  /** Field names only. Values are deliberately never traced or persisted. */
+  substitutedFields: readonly string[];
+}
+
 /**
  * A native ideation brief that exists in this run is an exact publication
  * input, never advisory prose. Unverified/unselected briefs cannot promote,
@@ -738,6 +745,11 @@ export function createResearchPublicationTool(
           await options.loadDurableWebEvidence(rootRunId),
         );
       }
+      let seedCanonicalization: ProjectIdeaSeedCanonicalizationTraceV1 = {
+        version: 1,
+        applied: false,
+        substitutedFields: [],
+      };
       const parsedNote = priorCheckpoint?.acceptedPackage
         ? acceptedResearchRequestFromCheckpoint(
             priorCheckpoint,
@@ -757,6 +769,14 @@ export function createResearchPublicationTool(
             describeTrustedRepositoryCatalog: options.describeTrustedRepositoryCatalog,
             initiatingNote,
             nowProvider: options.now ?? context.now,
+            reportSeedCanonicalization: (trace) => {
+              seedCanonicalization = trace;
+              if (trace.applied) {
+                context.reportProgress?.(
+                  `Canonicalized durable project-idea fields: ${trace.substitutedFields.join(", ")}.`,
+                );
+              }
+            },
           });
       const note = stabilizeAcceptedResearchRequest(
         parsedNote,
@@ -888,7 +908,10 @@ export function createResearchPublicationTool(
           },
         );
       }
-      return result;
+      return {
+        ...result,
+        seedCanonicalization,
+      };
     },
   };
   tool.executeResult = async (args, context) => {
@@ -966,6 +989,9 @@ async function parseToolArguments(input: {
   describeTrustedRepositoryCatalog?: CreateResearchPublicationToolOptionsV1["describeTrustedRepositoryCatalog"];
   initiatingNote: InitiatingNoteBindingV1 | null;
   nowProvider?: () => Date;
+  reportSeedCanonicalization?: (
+    trace: ProjectIdeaSeedCanonicalizationTraceV1,
+  ) => void;
 }) {
   const { value, runId } = input;
   assertExactKeys(value, ["mode", "package"], ["notePath", "baseHash"]);
@@ -1050,6 +1076,12 @@ async function parseToolArguments(input: {
   });
   canonicalizePackageIdentifiers(packageRecord);
   canonicalizeProviderSafeWorkItemContract(packageRecord);
+  input.reportSeedCanonicalization?.(
+    canonicalizeProjectIdeaSeedPublicationFieldsV1(
+      packageRecord,
+      projectIdeaSeed,
+    ),
+  );
   if (value.mode !== "create" && value.mode !== "append") {
     throw new ToolExecutionError(
       "research_publication_invalid_arguments",
@@ -1900,6 +1932,113 @@ function canonicalizeProviderSafeWorkItemContract(
         return fallback(index);
       }
     });
+  }
+}
+
+/**
+ * A grounded project-idea seed is the host's exact publication input. Apply it
+ * only after provider compatibility and authority-safe normalization, so the
+ * durable package parser and its seed guard inspect the same canonical object.
+ * The returned trace contains field names only; no provider or vault content
+ * is exposed through progress, ledgers, or test reports.
+ */
+export function canonicalizeProjectIdeaSeedPublicationFieldsV1(
+  packageRecord: Record<string, unknown>,
+  seed: ProjectIdeaAcceptedResearchSeedV1 | null,
+): ProjectIdeaSeedCanonicalizationTraceV1 {
+  if (!seed) {
+    return { version: 1, applied: false, substitutedFields: [] };
+  }
+
+  assertProjectIdeaSeedPublicationFieldsSafeV1(seed);
+  const currentEvidence = Array.isArray(packageRecord.evidence)
+    ? packageRecord.evidence
+    : [];
+  const canonicalEvidence = seed.evidence.map((seedEvidence, index) => {
+    const existing = currentEvidence.find((candidate) => {
+      const record = asRecord(candidate);
+      return Boolean(
+        record &&
+        record.reference === seedEvidence.reference &&
+        record.contentSha256 === seedEvidence.contentSha256,
+      );
+    });
+    const record = asRecord(existing);
+    if (
+      !record ||
+      typeof record.label !== "string" ||
+      typeof record.summary !== "string"
+    ) {
+      throw new ToolExecutionError(
+        "research_publication_project_idea_seed_evidence_missing",
+        `Durable project-idea evidence ${index + 1} has no matching host-verified publication evidence. Re-read the exact source before publishing.`,
+        { mutationState: "not_applied" },
+      );
+    }
+    return {
+      ...record,
+      id: seedEvidence.id,
+      kind: seedEvidence.kind,
+      reference: seedEvidence.reference,
+      contentSha256: seedEvidence.contentSha256,
+    };
+  });
+
+  const replacements: Record<string, unknown> = {
+    title: seed.title,
+    problemImpact: seed.problemImpact,
+    objective: seed.selectedDirection.summary,
+    proposedWork: seed.proposedWork.map((value) => value),
+    nonGoals: seed.nonGoals.map((value) => value),
+    acceptanceCriteria: seed.acceptanceCriteria.map((criterion) => ({
+      ...criterion,
+    })),
+    evidence: canonicalEvidence,
+    riskClass: seed.riskClass,
+  };
+  const substitutedFields = Object.keys(replacements).filter(
+    (field) => canonicalJson(packageRecord[field]) !== canonicalJson(replacements[field]),
+  );
+  for (const [field, value] of Object.entries(replacements)) {
+    packageRecord[field] = value;
+  }
+  return {
+    version: 1,
+    applied: substitutedFields.length > 0,
+    substitutedFields,
+  };
+}
+
+function assertProjectIdeaSeedPublicationFieldsSafeV1(
+  seed: ProjectIdeaAcceptedResearchSeedV1,
+): void {
+  const values: Array<[string, string]> = [
+    ["title", seed.title],
+    ["problemImpact", seed.problemImpact],
+    ["objective", seed.selectedDirection.summary],
+    ...seed.proposedWork.map(
+      (value, index): [string, string] => [`proposedWork ${index + 1}`, value],
+    ),
+    ...seed.nonGoals.map(
+      (value, index): [string, string] => [`nonGoals ${index + 1}`, value],
+    ),
+    ...seed.acceptanceCriteria.map(
+      (criterion, index): [string, string] => [
+        `acceptanceCriteria ${index + 1}`,
+        criterion.text,
+      ],
+    ),
+  ];
+  try {
+    for (const [label, value] of values) {
+      assertNoRawAuthority(value, `project idea seed ${label}`);
+    }
+  } catch {
+    throw new ToolExecutionError(
+      "research_publication_project_idea_seed_unsafe",
+      "The durable project-idea seed contains raw execution authority and cannot be published. Recreate it with behavioral requirements and trusted logical validation keys.",
+      { mutationState: "not_applied" },
+    );
   }
 }
 

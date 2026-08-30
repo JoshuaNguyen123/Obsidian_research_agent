@@ -52,6 +52,7 @@ for (const plugin of PLUGIN_CATALOG) {
 }
 await assertLegacyPluginsRetired();
 if (playwrightLanes.some((lane) => [
+  "offline-core",
   "real-ai-contract",
   "real-ai-soak",
   "interrupted-continuation-live",
@@ -95,6 +96,7 @@ async function resolveExpectedPluginIds() {
   // Every remaining lane runs the single installed plugin; none needs an extra
   // community plugin. Credential presence is enforced by run-e2e-exclusive.mjs.
   const requiredByLane = {
+    "offline-core": [],
     "core-native": [],
     "safe-assistant-renderer": [],
     "retained-journey": [],

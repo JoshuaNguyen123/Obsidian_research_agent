@@ -106,10 +106,11 @@ Sync the built plugin artifacts into the live test vault:
 npm run sync:test-vault
 ```
 
-Run only the Obsidian desktop journey you changed (Obsidian must be closed first). Every lane drives the installed plugin inside real Obsidian against a real model, a real external service, or both — there is no mock-model lane:
+Run only the Obsidian desktop journey you changed (Obsidian must be closed first). Every lane drives the installed plugin inside real Obsidian. Paid/live lanes use a real model, a real external service, or both. The zero-cloud lane uses the production OpenAI-compatible HTTP client against an authenticated deterministic loopback backend; it never injects a model client into the plugin:
 
 ```bash
 npm run test:e2e                        # the reported daily-use failure: bare Desktop checkers prompt, real model
+npm run test:e2e:offline                # zero-cloud installed-runtime chat + current-note append proof
 npm run test:e2e:desktop-code-delivery  # bare Desktop prompt, number-guessing game
 npm run test:e2e:research               # DU-02 proof-gated sourced writeback
 npm run test:e2e:code                   # protected local WSL2 DU-03 repository delivery
@@ -123,7 +124,7 @@ npm run test:e2e:github-askpass         # real verified git push runtime, no mod
 npm run test:e2e:live                   # opt-in disposable provider mutation and cleanup
 ```
 
-The deterministic mock-model matrix was removed. It passed on a machine where the product could not run a mission at all: those lanes called `configureSandboxProvider` themselves, so a plugin holding zero sandbox providers still looked healthy while a real "write a Python game on my desktop" request stopped at `code_validate_fast`. Live lanes now assert the sandbox the product adopted for itself, and `--mock-ai` is refused with an explicit error. `npm run test:e2e:live` remains separately guarded: Linear uses one disposable issue and GitHub one disposable draft branch/PR, independently verifies the result, and cleans up. Live merge is not part of the protected release workflow.
+The old injected mock-model matrix was removed. It passed on a machine where the product could not run a mission at all: those lanes called `configureSandboxProvider` themselves, so a plugin holding zero sandbox providers still looked healthy while a real "write a Python game on my desktop" request stopped at `code_validate_fast`. Live lanes now assert the sandbox the product adopted for itself, and `--mock-ai` is refused with an explicit error. The offline lane is narrower: it proves installed application routing, production transport, note mutation/readback, receipts, and cloud isolation, but does not claim live-model competence. `npm run test:e2e:live` remains separately guarded: Linear uses one disposable issue and GitHub one disposable draft branch/PR, independently verifies the result, and cleans up. Live merge is not part of the protected release workflow.
 
 GitHub Actions is manual-only and targets the repository owner's trusted self-hosted Windows runner, labeled `agentic-daily-use`; it does not consume GitHub-hosted runner minutes. Normal pushes and public-fork pull requests do not trigger that machine. Workflows pin every Action by commit SHA, keep live provider lanes manual and exact-SHA, expose each credential only to its exact provider step, and upload only redacted daily-use summaries for three days. The runner executes validation and agent-capability tests; it does not host the Obsidian agent itself.
 

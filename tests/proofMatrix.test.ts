@@ -22,6 +22,7 @@ import {
   collectMechanicalFailureClasses,
   resolveAttemptToolEvents,
   summaryToolEventTotals,
+  summarizeAttemptAcceptance,
   upgradeRunCsvHeader,
   LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
@@ -579,6 +580,13 @@ test("new CSV columns are APPENDED - the legacy header survives as an exact pref
     "secondary_failure_classes",
     "classification_confidence",
     "tool_calls_vacuous",
+    "harness_outcome",
+    "acceptance_status",
+    "scorecard_total",
+    "scorecard_acceptance_passed",
+    "retries",
+    "artifact_proof_count",
+    "cleanup_proof_count",
   ]);
 });
 
@@ -694,6 +702,35 @@ test("summaryToolEventTotals sums refusal buckets and keeps partial knowledge a 
   // No records: nothing to speak for the attempt.
   assert.equal(summaryToolEventTotals({ records: [] }), null);
   assert.equal(summaryToolEventTotals(null), null);
+});
+
+test("mission acceptance remains separate from the Playwright harness outcome", () => {
+  const accepted = summarizeAttemptAcceptance({
+    summaries: [{
+      acceptanceStatus: "pass",
+      retries: 2,
+      artifactProofCount: 4,
+      cleanupProofCount: 1,
+      missionScorecard: { total: 0.96, acceptancePassed: true },
+    }],
+  }, true);
+  assert.equal(accepted.missionOutcome, "accepted");
+  assert.equal(accepted.acceptanceStatus, "pass");
+  assert.equal(accepted.scorecardTotal, 0.96);
+  assert.equal(accepted.scorecardAcceptancePassed, true);
+  assert.equal(accepted.retries, 2);
+  assert.equal(accepted.artifactProofCount, 4);
+  assert.equal(accepted.cleanupProofCount, 1);
+
+  assert.equal(
+    summarizeAttemptAcceptance({ summaries: [] }, true).missionOutcome,
+    "unknown",
+  );
+  assert.equal(
+    summarizeAttemptAcceptance({ summaries: [{ acceptanceStatus: "pass" }] }, false)
+      .missionOutcome,
+    "unknown",
+  );
 });
 
 test("secondary failure classes surface every co-matching signature without stealing the primary", () => {

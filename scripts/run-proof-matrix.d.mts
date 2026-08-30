@@ -68,6 +68,19 @@ export function resolveAttemptToolEvents(input: {
     buckets: Record<string, number> | null;
   } | null;
 }): AttemptToolEvents;
+export interface AttemptAcceptanceSummary {
+  missionOutcome: "accepted" | "needs_more_work" | "unknown";
+  acceptanceStatus: "pass" | "needs_more_work" | "unknown";
+  scorecardTotal: number | null;
+  scorecardAcceptancePassed: boolean | null;
+  retries: number | null;
+  artifactProofCount: number | null;
+  cleanupProofCount: number | null;
+}
+export function summarizeAttemptAcceptance(
+  summary: unknown,
+  summaryFresh: boolean,
+): AttemptAcceptanceSummary;
 export function attemptLogExcerpt(
   logText: string,
   endIndex?: number | null,

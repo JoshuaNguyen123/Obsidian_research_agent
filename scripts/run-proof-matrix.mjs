@@ -49,6 +49,10 @@ import {
 } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import {
+  evaluateReliabilityCampaign,
+  resolveReliabilityGate,
+} from "./reliability-campaign.mjs";
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const EVAL_DIR = path.join(REPO_ROOT, "docs", "eval");
@@ -131,7 +135,9 @@ export const LEGACY_RUN_CSV_HEADER =
 export const RUN_CSV_HEADER =
   LEGACY_RUN_CSV_HEADER +
   ",tool_events_source,tool_calls_succeeded,pct_tool_calls_succeeded," +
-  "secondary_failure_classes,classification_confidence,tool_calls_vacuous";
+  "secondary_failure_classes,classification_confidence,tool_calls_vacuous," +
+  "harness_outcome,acceptance_status,scorecard_total,scorecard_acceptance_passed," +
+  "retries,artifact_proof_count,cleanup_proof_count";
 
 /**
  * Upgrade an existing CSV's header line in place when it is a strict
@@ -474,6 +480,52 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
     intentionalNoOp: null,
     succeeded: null,
     buckets: null,
+  };
+}
+
+/** Separate mission/acceptance evidence from the Playwright process verdict. */
+export function summarizeAttemptAcceptance(summary, summaryFresh) {
+  const summaries = summaryFresh && Array.isArray(summary?.summaries)
+    ? summary.summaries
+    : [];
+  if (summaries.length === 0) {
+    return {
+      missionOutcome: "unknown",
+      acceptanceStatus: "unknown",
+      scorecardTotal: null,
+      scorecardAcceptancePassed: null,
+      retries: null,
+      artifactProofCount: null,
+      cleanupProofCount: null,
+    };
+  }
+  const acceptancePassed = summaries.every(
+    (record) => record?.acceptanceStatus === "pass",
+  );
+  const scorecards = summaries
+    .map((record) => record?.missionScorecard)
+    .filter((scorecard) => scorecard && Number.isFinite(scorecard.total));
+  return {
+    missionOutcome: acceptancePassed ? "accepted" : "needs_more_work",
+    acceptanceStatus: acceptancePassed ? "pass" : "needs_more_work",
+    scorecardTotal: scorecards.length === summaries.length
+      ? Math.min(...scorecards.map((scorecard) => scorecard.total))
+      : null,
+    scorecardAcceptancePassed: scorecards.length === summaries.length
+      ? scorecards.every((scorecard) => scorecard.acceptancePassed === true)
+      : null,
+    retries: summaries.reduce(
+      (total, record) => total + (Number.isSafeInteger(record?.retries) ? record.retries : 0),
+      0,
+    ),
+    artifactProofCount: summaries.reduce(
+      (total, record) => total + (Number.isSafeInteger(record?.artifactProofCount) ? record.artifactProofCount : 0),
+      0,
+    ),
+    cleanupProofCount: summaries.reduce(
+      (total, record) => total + (Number.isSafeInteger(record?.cleanupProofCount) ? record.cleanupProofCount : 0),
+      0,
+    ),
   };
 }
 
@@ -950,6 +1002,7 @@ function totalAttemptCount(manifest, cellId) {
 }
 
 async function main() {
+  const gate = resolveReliabilityGate(opt("--gate") ?? "recovery");
   const expectedHead = (process.env.PROOF_MATRIX_EXPECTED_HEAD ?? "").trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(expectedHead)) {
     fail("set PROOF_MATRIX_EXPECTED_HEAD to the exact 40-char sha this campaign pins.");
@@ -965,12 +1018,14 @@ async function main() {
   const preexistingWorkspaces = listWorkspaceEntries();
 
   if (flag("--dry-run")) {
-    console.log(`proof-matrix dry run @ ${expectedHead}`);
+    console.log(`proof-matrix ${gate.id} dry run @ ${expectedHead}`);
     for (const cell of cells) {
       console.log(
         `  ${cell.id}: project=${cell.project}` +
         (cell.grep ? ` grep="${cell.grep}"` : "") +
-        ` requiredGreens=${cell.requiredGreens} maxAttempts=${cell.maxAttempts}`,
+        (gate.kind === "consecutive"
+          ? ` requiredGreens=${cell.requiredGreens} maxAttempts=${cell.maxAttempts}`
+          : ` validAttempts=${gate.validAttemptsPerLane} minimumGreens=${gate.minimumGreensPerLane}`),
       );
     }
     if (preexistingWorkspaces.length > 0) {
@@ -1004,7 +1059,11 @@ async function main() {
   if (flag("--resume") && manifest.expectedHead && manifest.expectedHead !== expectedHead) {
     fail(`manifest pins ${manifest.expectedHead}; refusing to resume at ${expectedHead}.`);
   }
+  if (flag("--resume") && manifest.gate && manifest.gate !== gate.id) {
+    fail(`manifest pins gate ${manifest.gate}; refusing to resume as ${gate.id}.`);
+  }
   manifest.expectedHead = expectedHead;
+  manifest.gate = gate.id;
   if (flag("--resume")) {
     const reconciled = reconcileInFlightAttempt(manifest);
     if (reconciled) {
@@ -1018,10 +1077,47 @@ async function main() {
   }
   saveManifest(manifest);
 
+  const canaryCurrent =
+    manifest.providerCanary?.head === expectedHead &&
+    manifest.providerCanary?.model === PROOF_MATRIX_MODEL &&
+    manifest.providerCanary?.passed === true;
+  if (!canaryCurrent) {
+    assertExactCleanHead(expectedHead, "provider-canary pre");
+    sweepTestVaultObsidianZombies("provider-canary");
+    const canaryStartedAt = Date.now();
+    const canaryEnv = {
+      ...process.env,
+      E2E_AI_MODEL: PROOF_MATRIX_MODEL,
+      E2E_MODEL_PROVIDER: process.env.E2E_MODEL_PROVIDER ?? "ollama",
+      OBSIDIAN_E2E_LOCK_WAIT_MS:
+        process.env.OBSIDIAN_E2E_LOCK_WAIT_MS ?? String(20 * 60 * 1000),
+    };
+    console.log("proof-matrix: running the paid-provider canary before campaign attempts.");
+    const canaryExit = runNpm(
+      ["run", "test:e2e:provider-canary"],
+      canaryEnv,
+    );
+    sweepTestVaultObsidianZombies("provider-canary post");
+    assertExactCleanHead(expectedHead, "provider-canary post");
+    manifest.providerCanary = {
+      head: expectedHead,
+      model: PROOF_MATRIX_MODEL,
+      passed: canaryExit === 0,
+      startedAt: new Date(canaryStartedAt).toISOString(),
+      durationS: Math.round((Date.now() - canaryStartedAt) / 1000),
+    };
+    saveManifest(manifest);
+    if (canaryExit !== 0) {
+      fail("provider canary failed; no campaign attempt was launched. Diagnose its retained evidence before retrying.");
+    }
+  }
+
   for (const cell of cells) {
     while (
-      consecutiveGreens(manifest, cell.id) < cell.requiredGreens &&
-      consumedAttemptCount(manifest, cell.id) < cell.maxAttempts
+      gate.kind === "consecutive"
+        ? consecutiveGreens(manifest, cell.id) < cell.requiredGreens &&
+          consumedAttemptCount(manifest, cell.id) < cell.maxAttempts
+        : consumedAttemptCount(manifest, cell.id) < gate.validAttemptsPerLane
     ) {
       // Ordinal over ALL runs of this cell (harness deaths included) so stage
       // labels and per-attempt log files never collide or overwrite.
@@ -1130,6 +1226,7 @@ async function main() {
         summaryFresh,
         minedCounts: mineToolEvents(startedAt, endedAt),
       });
+      const acceptance = summarizeAttemptAcceptance(summary, summaryFresh);
       const sourceKnown = toolEvents.source !== TOOL_EVENT_SOURCE_NONE;
       const failedKnown = sourceKnown && toolEvents.failed !== null;
       const pctFailed =
@@ -1143,11 +1240,16 @@ async function main() {
       const bucketCell = (key) =>
         sourceKnown && toolEvents.buckets ? toolEvents.buckets[key] ?? "" : "";
       const consumesBudget = green || !isInfrastructureFailureClass(failureClass);
+      const attemptBudget = gate.kind === "consecutive"
+        ? cell.maxAttempts
+        : gate.validAttemptsPerLane;
       const csvNotes = consumesBudget
-        ? `attempt ${consumedAttemptCount(manifest, cell.id) + 1}/${cell.maxAttempts}; ` +
-          `streak target ${cell.requiredGreens}`
+        ? `gate ${gate.id}; attempt ${consumedAttemptCount(manifest, cell.id) + 1}/${attemptBudget}; ` +
+          (gate.kind === "consecutive"
+            ? `streak target ${cell.requiredGreens}`
+            : `lane minimum ${gate.minimumGreensPerLane}/${gate.validAttemptsPerLane}`)
         : `harness failure ${harnessFailureCount(manifest, cell.id) + 1}; ` +
-          `attempt budget ${consumedAttemptCount(manifest, cell.id)}/${cell.maxAttempts} unspent; streak preserved`;
+          `attempt budget ${consumedAttemptCount(manifest, cell.id)}/${attemptBudget} unspent; streak preserved`;
 
       // Unknown vs zero is explicit: a fresh summary that said zero writes an
       // explicit 0; blank means NO source was available (tool_events_source
@@ -1156,9 +1258,9 @@ async function main() {
         new Date(startedAt).toISOString(),
         cell.project,
         PROOF_MATRIX_MODEL,
-        expectedHead.slice(0, 7),
+        expectedHead,
         Math.round((endedAt - startedAt) / 1000),
-        green ? "green" : "red",
+        acceptance.missionOutcome,
         failureClass,
         green
           ? ""
@@ -1181,6 +1283,13 @@ async function main() {
         secondaryClasses.join(";"),
         confidence,
         toolEvents.vacuous ?? "",
+        green ? "passed" : "failed",
+        acceptance.acceptanceStatus,
+        acceptance.scorecardTotal ?? "",
+        acceptance.scorecardAcceptancePassed ?? "",
+        acceptance.retries ?? "",
+        acceptance.artifactProofCount ?? "",
+        acceptance.cleanupProofCount ?? "",
       ]);
 
       // The attempt finished (green or red) — the in-flight marker is now
@@ -1205,6 +1314,7 @@ async function main() {
             }),
         // source/succeeded/vacuous mirror the CSV columns; null = unknown.
         toolEvents,
+        acceptance,
       });
 
       if (!consumesBudget) {
@@ -1213,7 +1323,7 @@ async function main() {
           (manifest.harnessFailureCounts[cell.id] ?? 0) + 1;
         console.log(
           `proof-matrix[${stage}]: ${failureClass} is a harness death, not product evidence — ` +
-          `attempt budget stays ${consumedAttemptCount(manifest, cell.id)}/${cell.maxAttempts}, streak preserved.`,
+          `attempt budget stays ${consumedAttemptCount(manifest, cell.id)}/${attemptBudget}, streak preserved.`,
         );
         if (consecutiveHarnessFailures(manifest, cell.id) > MAX_CONSECUTIVE_HARNESS_FAILURES) {
           saveManifest(manifest);
@@ -1230,6 +1340,13 @@ async function main() {
         fail(
           `product failure class '${failureClass}' seen twice — regression alarm. ` +
           "The matrix stops here; fix the product before resuming (--resume).",
+        );
+      }
+      if (!green && gate.rejectAnyProductFailure && failureClass.startsWith("product:")) {
+        saveManifest(manifest);
+        fail(
+          `target gate encountered product failure '${failureClass}' — stop before spending more attempts, ` +
+          "repair it, and restart the exact-HEAD campaign.",
         );
       }
       saveManifest(manifest);
@@ -1252,19 +1369,49 @@ async function main() {
       }
     }
 
-    const streak = consecutiveGreens(manifest, cell.id);
-    if (streak < cell.requiredGreens) {
-      saveManifest(manifest);
-      fail(
-        `cell '${cell.id}' exhausted ${cell.maxAttempts} attempts with streak ${streak}/${cell.requiredGreens}. ` +
-        "Investigate before spending more.",
-      );
+    if (gate.kind === "consecutive") {
+      const streak = consecutiveGreens(manifest, cell.id);
+      if (streak < cell.requiredGreens) {
+        saveManifest(manifest);
+        fail(
+          `cell '${cell.id}' exhausted ${cell.maxAttempts} attempts with streak ${streak}/${cell.requiredGreens}. ` +
+          "Investigate before spending more.",
+        );
+      }
+      console.log(`proof-matrix: cell '${cell.id}' DONE (${streak} consecutive greens).`);
+    } else {
+      const valid = consumedAttemptCount(manifest, cell.id);
+      const greens = manifest.attempts.filter(
+        (attempt) => attempt.cell === cell.id && attempt.green,
+      ).length;
+      console.log(`proof-matrix: cell '${cell.id}' COLLECTED (${greens}/${valid} greens).`);
     }
-    console.log(`proof-matrix: cell '${cell.id}' DONE (${streak} consecutive greens).`);
   }
 
   saveManifest(manifest);
-  console.log("proof-matrix: all selected cells reached their consecutive-green bar.");
+  if (gate.kind === "fixed-attempts") {
+    const evaluation = evaluateReliabilityCampaign({
+      gate,
+      cells,
+      attempts: manifest.attempts.filter((attempt) =>
+        cells.some((cell) => cell.id === attempt.cell)
+      ),
+    });
+    manifest.evaluation = evaluation;
+    saveManifest(manifest);
+    console.log(JSON.stringify(evaluation, null, 2));
+    if (!evaluation.passed) {
+      fail(`${gate.id} gate failed: ${evaluation.failures.join("; ")}`);
+    }
+    console.log(
+      `proof-matrix: ${gate.id} PASSED with ${evaluation.greens}/${evaluation.validAttempts} observed greens.` +
+      (evaluation.observedPerfectCampaign
+        ? " This campaign observed 100%; it is not a guarantee of future reliability."
+        : ""),
+    );
+  } else {
+    console.log("proof-matrix: all selected cells reached their consecutive-green bar.");
+  }
   console.log("proof-matrix: run `npm run eval:dashboard` to refresh the KPI dashboard, and finish the campaign with the 8-stage workflow audit bookend.");
 }
 

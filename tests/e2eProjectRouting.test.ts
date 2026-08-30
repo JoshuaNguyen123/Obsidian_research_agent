@@ -10,7 +10,7 @@ import { validateLiveExternalPreflight } from "../scripts/live-external-prefligh
 // @ts-ignore The production workflow-audit runner is an intentionally unbundled Node ESM script.
 import { protectedWorkflowAuditManifestPathV1, runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_MODEL, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
 
-test("no Playwright lane runs against a mocked model", () => {
+test("no Playwright lane injects a model client into the installed plugin", () => {
   const config = readFileSync(
     new URL("../playwright.config.ts", import.meta.url),
     "utf8",
@@ -36,6 +36,7 @@ test("no Playwright lane runs against a mocked model", () => {
     );
   }
   assert.match(config, /core-native/u);
+  assert.match(config, /offline-core/u);
 });
 
 test("the reported desktop failure has a dedicated real-model lane", () => {
@@ -581,6 +582,31 @@ test("the removed mock mode is refused with an explicit message", () => {
   );
 });
 
+test("offline AI is restricted to the production-client offline project", () => {
+  const normalized = normalizeExclusiveArgs([
+    "--offline-ai",
+    "--project=offline-core",
+  ]);
+  assert.deepEqual(normalized, {
+    playwrightArgs: ["--project=offline-core"],
+    aiMode: "offline",
+    liveExternal: false,
+    projects: ["offline-core"],
+  });
+  assert.throws(
+    () => normalizeExclusiveArgs(["--offline-ai", "--project=daily-use-research"]),
+    /restricted to the offline-core/u,
+  );
+  assert.throws(
+    () => normalizeExclusiveArgs([
+      "--offline-ai",
+      "--live-external",
+      "--project=offline-core",
+    ]),
+    /live-external is restricted/u,
+  );
+});
+
 test("free self-hosted daily-use job explicitly trusts only its created disposable vault", () => {
   const workflow = readFileSync(
     new URL("../.github/workflows/ci.yml", import.meta.url),
@@ -826,6 +852,21 @@ test("runner mode exports explicit child-process environment without secrets", (
   });
 });
 
+test("offline runner mode binds the production client to authenticated loopback only", () => {
+  const env: NodeJS.ProcessEnv = {};
+  applyE2eAiMode("offline", env);
+  assert.deepEqual(env, {
+    E2E_AI_MODE: "real",
+    E2E_REAL_AI: "1",
+    E2E_OFFLINE_AI: "1",
+    E2E_AI_MODEL: "offline-scripted-v1",
+    E2E_MODEL_PROVIDER: "openai_compatible",
+    E2E_OPENAI_COMPATIBLE_BASE_URL: "http://127.0.0.1:7331/v1",
+    E2E_OLLAMA_BASE_URL: "http://127.0.0.1:7331/v1",
+    E2E_OPENAI_COMPATIBLE_API_KEY: "offline-e2e-ephemeral-token",
+  });
+});
+
 test("provider canary binds preflight and runtime to its exact requested model", () => {
   const env: NodeJS.ProcessEnv = {
     E2E_AI_MODEL: "stale-default",
@@ -915,6 +956,10 @@ test("package commands route only to real lanes and live projects disable reruns
     /--real-ai --project=core-native/u,
   );
   assert.match(
+    packageJson.scripts["test:e2e:offline"],
+    /--offline-ai --project=offline-core/u,
+  );
+  assert.match(
     packageJson.scripts["test:e2e:desktop-code-delivery"],
     /--real-ai --project=desktop-code-delivery-real-live/u,
   );
@@ -999,6 +1044,7 @@ test("package commands route only to real lanes and live projects disable reruns
     new URL("../scripts/e2e-preflight.mjs", import.meta.url),
     "utf8",
   );
+  assert.match(preflight, /"offline-core": \[\]/u);
   assert.match(preflight, /"byok-autonomous-journey": \[\]/u);
   assert.match(preflight, /"core-native": \[\]/u);
   assert.match(preflight, /"safe-assistant-renderer": \[\]/u);

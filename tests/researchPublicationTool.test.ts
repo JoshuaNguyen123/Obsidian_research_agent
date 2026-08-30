@@ -359,11 +359,16 @@ test("restart resumes ideation-bound publication only from the exact durable sig
   assert.equal(missing.grants.length, 0);
 });
 
-test("ideation-origin publication rejects an objective divergent from the signed selected direction before mutation", async () => {
+test("ideation-origin publication canonicalizes objective, proposed work, and acceptance criteria from the signed seed", async () => {
   const fixture = createFixture("created", { resumeCheckpoints: true });
   const args = argsFixture();
-  (args.package as Record<string, unknown>).objective =
-    "Perform unauthorized work outside the selected project direction.";
+  const package_ = args.package as Record<string, unknown>;
+  package_.objective = "A provider-drifted objective.";
+  package_.proposedWork = ["A provider-drifted implementation step."];
+  package_.acceptanceCriteria = [{
+    id: "AC-provider-drift",
+    text: "A provider-drifted acceptance criterion.",
+  }];
   const context = contextFixture(
     "Brainstorm, evaluate, and select a project idea, then publish the accepted research to Linear in Published.md.",
     "run-ideation-objective-drift",
@@ -371,19 +376,42 @@ test("ideation-origin publication rejects an objective divergent from the signed
   );
   context.runtimeCache = ideationRuntimeCacheFixture();
   context.requestNestedApproval = approveNested;
+  const progress: string[] = [];
+  context.reportProgress = (message) => {
+    progress.push(message);
+  };
 
-  const result = await new DefaultToolRegistry([fixture.tool]).execute(
-    { name: "publish_research_to_linear", arguments: args },
-    context,
+  const result = await fixture.tool.execute(args, context) as {
+    ok: boolean;
+    seedCanonicalization: {
+      applied: boolean;
+      substitutedFields: string[];
+    };
+  };
+
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites.length, 1);
+  assert.equal(
+    fixture.noteWrites[0]?.package.objective,
+    "Implement the accepted work item.",
   );
-
-  assert.equal(result.ok, false);
-  assert.equal(result.error?.code, "research_publication_invalid_arguments");
-  assert.match(result.error?.message ?? "", /project idea seed|objective|drift/iu);
-  assert.equal(result.mutationState, "not_applied");
-  assert.equal(fixture.noteWrites.length, 0);
-  assert.equal(fixture.publisher.publishCount, 0);
-  assert.equal(fixture.grants.length, 0);
+  assert.deepEqual(
+    fixture.noteWrites[0]?.package.proposedWork,
+    ["Implement the accepted work."],
+  );
+  assert.deepEqual(
+    fixture.noteWrites[0]?.package.acceptanceCriteria,
+    [{ id: "AC-1", text: "The handoff is verified." }],
+  );
+  assert.equal(result.seedCanonicalization.applied, true);
+  assert.deepEqual(
+    result.seedCanonicalization.substitutedFields.filter((field) =>
+      ["objective", "proposedWork", "acceptanceCriteria"].includes(field)
+    ),
+    ["objective", "proposedWork", "acceptanceCriteria"],
+  );
+  assert.match(progress.join("\n"), /objective, proposedWork, acceptanceCriteria/u);
+  assert.doesNotMatch(progress.join("\n"), /provider-drifted|Implement the accepted/u);
 });
 
 test("continuation segments replay one root-bound completed publication without another Linear mutation", async () => {
