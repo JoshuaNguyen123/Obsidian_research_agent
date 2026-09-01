@@ -68,6 +68,7 @@ import {
 } from "./product-evidence.mjs";
 import {
   evaluateReliabilityCampaign,
+  hasGreenAcceptanceProof,
   resolveReliabilityGate,
 } from "./reliability-campaign.mjs";
 
@@ -121,6 +122,8 @@ const WORKSPACES_ROOT = path.join(
 );
 
 export const DEFAULT_PROOF_MATRIX_MODEL = "deepseek-v4-pro";
+export const ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS =
+  "harness:acceptance_proof_missing";
 
 export function resolveProofMatrixModel(args = process.argv.slice(2)) {
   const modelArgs = args.filter((argument) => argument.startsWith("--model="));
@@ -219,6 +222,7 @@ export const CELLS = [
   {
     id: "research-current-note",
     project: "daily-use-research",
+    scenarioId: "DU-02",
     grep: "DU-02 proof-gated sourced writeback binds owned fetched passages",
     requiredGreens: 2,
     maxAttempts: 4,
@@ -226,6 +230,7 @@ export const CELLS = [
   {
     id: "vault-recall",
     project: "real-ai-soak",
+    scenarioId: "VAULT-01",
     grep: "deep vault retrieval and semantic expansion",
     requiredGreens: 2,
     maxAttempts: 4,
@@ -233,6 +238,7 @@ export const CELLS = [
   {
     id: "code-delivery",
     project: "desktop-code-delivery-real-live",
+    scenarioId: "CODE-DELIVERY-01",
     grep: null,
     requiredGreens: 2,
     maxAttempts: 4,
@@ -240,6 +246,7 @@ export const CELLS = [
   {
     id: "interrupted-continuation",
     project: "interrupted-continuation-live",
+    scenarioId: "INTERRUPT-01",
     grep: null,
     requiredGreens: 2,
     maxAttempts: 4,
@@ -247,6 +254,7 @@ export const CELLS = [
   {
     id: "notebook-execution",
     project: "notebook-execution-live",
+    scenarioId: "NOTEBOOK-01",
     grep: null,
     requiredGreens: 2,
     maxAttempts: 4,
@@ -254,6 +262,7 @@ export const CELLS = [
   {
     id: "compound-linear-github",
     project: "compound-flow-real-live",
+    scenarioId: "FLOW-REAL-01",
     grep: null,
     requiredGreens: 3,
     maxAttempts: 5,
@@ -633,10 +642,13 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
 }
 
 /** Separate mission/acceptance evidence from the Playwright process verdict. */
-export function summarizeAttemptAcceptance(summary, summaryFresh) {
-  const summaries = summaryFresh && Array.isArray(summary?.summaries)
+export function summarizeAttemptAcceptance(summary, summaryFresh, expectedScenarioId = null) {
+  const allSummaries = summaryFresh && Array.isArray(summary?.summaries)
     ? summary.summaries
     : [];
+  const summaries = expectedScenarioId
+    ? allSummaries.filter((record) => record?.scenarioId === expectedScenarioId)
+    : allSummaries;
   if (summaries.length === 0) {
     return {
       missionOutcome: "unknown",
@@ -684,6 +696,25 @@ export function summarizeAttemptAcceptance(summary, summaryFresh) {
           : 0),
       0,
     ),
+  };
+}
+
+/**
+ * A zero Playwright exit is not campaign evidence until the selected test also
+ * emits an accepted mission scorecard. Fail this at the first attempt instead
+ * of discovering after 60 paid calls that the fixed-attempt gate was
+ * structurally impossible to satisfy.
+ */
+export function resolveCampaignAttemptVerdict(input) {
+  if (!input.green || hasGreenAcceptanceProof(input)) return { ...input };
+  return {
+    ...input,
+    green: false,
+    failureClass: ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS,
+    failureDetail:
+      "Playwright exited 0, but the lane emitted no accepted mission and scorecard proof.",
+    confidence: CLASSIFICATION_CONFIRMED,
+    secondaryClasses: [],
   };
 }
 
@@ -1781,7 +1812,7 @@ async function main() {
       }
       const endedAt = Date.now();
       const exitCode = result.status ?? 1;
-      const green = exitCode === 0;
+      let green = exitCode === 0;
       let attemptLogText = "";
       try {
         attemptLogText = readFileSync(attemptLogPath, "utf8");
@@ -1806,7 +1837,7 @@ async function main() {
         summaryFresh,
         logText: attemptLogText,
       });
-      const {
+      let {
         failureClass,
         detail: failureDetail,
         confidence,
@@ -1878,7 +1909,30 @@ async function main() {
         summaryFresh,
         minedCounts: mineToolEvents(startedAt, endedAt),
       });
-      const acceptance = summarizeAttemptAcceptance(summary, summaryFresh);
+      const acceptance = summarizeAttemptAcceptance(
+        summary,
+        summaryFresh,
+        cell.scenarioId,
+      );
+      const campaignVerdict = resolveCampaignAttemptVerdict({
+        green,
+        failureClass,
+        failureDetail,
+        confidence,
+        secondaryClasses,
+        acceptance,
+      });
+      green = campaignVerdict.green;
+      failureClass = campaignVerdict.failureClass;
+      failureDetail = campaignVerdict.failureDetail;
+      confidence = campaignVerdict.confidence;
+      secondaryClasses = campaignVerdict.secondaryClasses;
+      if (failureClass === ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS) {
+        console.error(
+          `proof-matrix[${stage}]: ${failureDetail} ` +
+            "The application assertions passed, but this cannot count as a campaign green.",
+        );
+      }
       const sourceKnown = toolEvents.source !== TOOL_EVENT_SOURCE_NONE;
       const observedKnown = sourceKnown && toolEvents.observed !== null;
       const failedKnown = observedKnown && toolEvents.failed !== null;
@@ -2025,6 +2079,13 @@ async function main() {
         );
       }
       saveManifest(manifest);
+
+      if (failureClass === ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS) {
+        fail(
+          `cell '${cell.id}' cannot emit the accepted mission/scorecard proof required by every ` +
+            "reliability gate. Repair the lane instrumentation, commit it, and start a fresh exact-HEAD campaign.",
+        );
+      }
 
       if (green && !laneHasScorecardBaseline(cell.project)) {
         console.log(`proof-matrix[${stage}]: first green for unbaselined lane — harvesting scorecards.`);

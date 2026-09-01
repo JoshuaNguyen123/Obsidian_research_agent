@@ -1,7 +1,8 @@
-import { readdir, readFile, rm } from "node:fs/promises";
+import { lstat, readdir, readFile, rm } from "node:fs/promises";
 
 import { expect, test } from "@playwright/test";
 
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
   assertOwnedExportDirectory,
   cleanupOwnedExportDirectory,
@@ -42,7 +43,7 @@ const EXACT_PROMPT =
   "create a Jupyter notebook on my desktop that computes the first 12 Fibonacci numbers starting from 0 and 1, " +
   "run its cells so the saved notebook contains the printed sequence as real outputs, and deliver it";
 
-test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandbox and delivers outputs", async (
+test("NOTEBOOK-01 a notebook mission executes cells inside the real sandbox and delivers outputs", async (
   {},
   testInfo,
 ) => {
@@ -61,7 +62,16 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
   let rawSnapshot: any = null;
   let exportPath: string | null = null;
   let capturedWorkspaceId: string | null = null;
+  let approvalCount = 0;
+  let primaryError: unknown = null;
   const cleanupErrors: string[] = [];
+  const observed = {
+    artifacts: new Set<string>(),
+    proofs: new Set<string>(),
+    approvals: new Set<string>(),
+    bindings: new Set<string>(),
+    cleanup: new Set<string>(),
+  };
 
   try {
     harness = await startRealAiHarness(
@@ -88,6 +98,7 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
     // inside the actual WSL boundary, not a mocked runtime.
     const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
+    observed.proofs.add("sandbox:host_adopted");
 
     let missionFailure: unknown = null;
     try {
@@ -95,7 +106,7 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
         waitForCompletion: false,
         timeoutMs: 35 * 60_000,
       });
-      await harness.approveUntilMissionComplete(35 * 60_000, {
+      approvalCount = await harness.approveUntilMissionComplete(35 * 60_000, {
         onProgress: () => {
           if (capturedWorkspaceId) return;
           readRawRunSnapshot(harness!.page)
@@ -125,15 +136,28 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
       throw new Error(`mission did not complete: ${String(missionFailure)}\n${safeState}`);
     }
 
+    const snapshot = await harness.attestProductionRun();
+    rawSnapshot = snapshot;
+    capturedWorkspaceId ??= extractWorkspaceIdFromSnapshot(snapshot);
+    expect(snapshot.modelCallEvidence.length, safeState).toBeGreaterThan(0);
+    observed.proofs.add("model:production_call");
+    expect(snapshot.lastMissionLedger?.status, safeState).toBe("complete");
+    expect(snapshot.lastMissionLedger?.acceptance?.status, safeState).toBe("pass");
+    observed.proofs.add("graph:terminal");
+    observed.approvals.add("authorization:sandbox_execution");
+
     // Delivered artifact: the export receipt names the real Desktop directory.
-    requireExportReceipt(rawSnapshot);
-    exportPath = exportedDirectoryPath(rawSnapshot);
+    const exportReceipt = requireExportReceipt(snapshot);
+    expect(exportReceipt.readback?.status, safeState).toBe("verified");
+    exportPath = exportedDirectoryPath(snapshot);
     expect(exportPath, safeState).toBeTruthy();
     const ownedExportRoot = await assertOwnedExportDirectory(
       desktopRoot,
       exportPath!,
       startedAt,
     );
+    observed.artifacts.add("code:desktop_export");
+    observed.proofs.add("receipt:verified_desktop_export");
 
     // The exported notebook itself carries the execution evidence: nbformat 4
     // JSON whose code cells have real execution counts and outputs, including
@@ -151,6 +175,7 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
       (cell: any) => typeof cell?.execution_count === "number" && cell.execution_count >= 1,
     );
     expect(executedCells.length, safeState).toBe(codeCells.length);
+    observed.proofs.add("validation:all_cells_executed");
     const cellsWithOutputs = codeCells.filter(
       (cell: any) => Array.isArray(cell?.outputs) && cell.outputs.length > 0,
     );
@@ -159,6 +184,7 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
       (cell?.outputs ?? []).filter((output: any) => output?.output_type === "error"),
     );
     expect(errorOutputs, safeState).toHaveLength(0);
+    observed.proofs.add("validation:no_cell_errors");
     // The prompt pins the seed convention (starting from 0 and 1), so the
     // first 12 numbers are F(0)..F(11) and the sequence ends at 89. The
     // computed tail — and specifically that pinned last term — must appear in
@@ -169,26 +195,43 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
       expect(outputsJson, safeState).toMatch(new RegExp(`\\b${term}\\b`));
     }
     expect(outputsJson, safeState).toMatch(/\b89\b/);
+    observed.proofs.add("output:fibonacci_sequence");
+    observed.artifacts.add("code:executed_notebook");
+    observed.bindings.add("binding:notebook_outputs_export");
+  } catch (error) {
+    primaryError = error;
   } finally {
     if (harness) {
       if (exportPath) {
-        await cleanupOwnedExportDirectory({
-          desktopRoot,
-          exportPath,
-          desktopEntriesBefore,
-        }).catch((error) => cleanupErrors.push(`export: ${String(error)}`));
+        try {
+          await cleanupOwnedExportDirectory({
+            desktopRoot,
+            exportPath,
+            desktopEntriesBefore,
+          });
+          await assertPathAbsent(exportPath);
+          observed.cleanup.add("cleanup:desktop_export");
+        } catch (error) {
+          cleanupErrors.push(`export: ${String(error)}`);
+        }
       }
       if (capturedWorkspaceId) {
         const container = await resolveOwnedWorkspaceContainerById(
           capturedWorkspaceId,
         ).catch(() => null);
         if (container) {
-          await rm(container, { recursive: true, force: true }).catch((error) =>
-            cleanupErrors.push(`workspace: ${String(error)}`),
-          );
+          try {
+            await rm(container, { recursive: true, force: true });
+            await assertPathAbsent(container);
+            observed.cleanup.add("cleanup:scratch_workspace");
+          } catch (error) {
+            cleanupErrors.push(`workspace: ${String(error)}`);
+          }
         }
       }
-      await harness.close();
+      await harness.close().catch((error) =>
+        cleanupErrors.push(`harness: ${String(error)}`),
+      );
     }
     if (cleanupErrors.length > 0) {
       await testInfo.attach("notebook-exec-cleanup-errors", {
@@ -197,4 +240,51 @@ test("NOTEBOOK-EXEC-REAL a notebook mission executes cells inside the real sandb
       });
     }
   }
+
+  const missionScorecard = rawSnapshot?.lastMissionScorecard ?? null;
+  if (!primaryError && cleanupErrors.length === 0) {
+    expect(missionScorecard, "the completed notebook mission did not emit a scorecard").toBeTruthy();
+    expect(missionScorecard?.acceptancePassed).toBe(true);
+  }
+  await recordDailyUseAcceptance(
+    testInfo,
+    "NOTEBOOK-01",
+    {
+      artifacts: [...observed.artifacts],
+      proofs: [...observed.proofs],
+      approvals: [...observed.approvals],
+      bindings: [...observed.bindings],
+      cleanup: [...observed.cleanup],
+    },
+    {
+      modelCalls: safeCounter(
+        rawSnapshot?.providerUsage?.modelCallCount ??
+          rawSnapshot?.modelCallEvidence?.length,
+      ),
+      toolCalls: safeCounter(
+        rawSnapshot?.redactedResearchEffort?.usage?.toolCalls ??
+          rawSnapshot?.lastReceipts?.length,
+      ),
+      continuations: safeCounter(rawSnapshot?.attestedRunLineage?.segmentIndex),
+      approvals: approvalCount,
+      missionScorecard,
+    },
+    { requireComplete: !primaryError && cleanupErrors.length === 0 },
+  );
+  if (primaryError) throw primaryError;
+  if (cleanupErrors.length > 0) throw new Error(cleanupErrors.join("\n"));
 });
+
+function safeCounter(value: unknown): number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    ? value as number
+    : 0;
+}
+
+async function assertPathAbsent(target: string): Promise<void> {
+  const info = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (info) throw new Error(`Owned cleanup target still exists: ${target}`);
+}

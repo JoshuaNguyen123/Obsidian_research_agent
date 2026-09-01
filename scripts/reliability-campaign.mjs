@@ -64,7 +64,7 @@ function hasToolEventCoverage(attempt) {
   );
 }
 
-function hasGreenAcceptanceProof(attempt) {
+export function hasGreenAcceptanceProof(attempt) {
   if (!attempt?.green) return true;
   const acceptance = attempt?.acceptance;
   return Boolean(

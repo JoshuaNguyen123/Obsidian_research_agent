@@ -16,10 +16,9 @@ export const E2E_PROOF_CLASS_ANNOTATION = "e2e-proof-class-v1";
 /**
  * Folded tool-call outcome counts from the shared collector seam
  * (e2e/fixtures/toolCallCollector.ts). Parsed by the reporter
- * UNCONDITIONALLY — unlike the metrics annotation it must work for lanes with
- * no DailyUseScenarioId (real-ai-soak, desktop-code-delivery,
- * interrupted-continuation, notebook-execution), whose records would otherwise
- * carry no tool-call counters at all.
+ * UNCONDITIONALLY — unlike the metrics annotation it must also work for any
+ * future or targeted lane that has not yet been assigned a scenario contract;
+ * such records would otherwise carry no tool-call counters at all.
  */
 export const DAILY_USE_TOOL_OUTCOMES_ANNOTATION = "daily-use-tool-outcomes-v1";
 

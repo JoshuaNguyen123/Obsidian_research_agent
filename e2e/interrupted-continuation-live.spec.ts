@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import {
@@ -31,7 +32,7 @@ recordToolCallOutcomesAfterEach();
 test.describe("interrupted continuation", () => {
   test.describe.configure({ mode: "default", timeout: 1_500_000, retries: 0 });
 
-  test("a mission killed mid-flight resumes and completes the remaining work", async () => {
+  test("INTERRUPT-01 a mission killed mid-flight resumes and completes the remaining work", async ({}, testInfo) => {
     let harness: RealAiHarness | null = null;
     try {
       harness = await startRealAiHarness("interrupted-continuation", {}, {
@@ -194,6 +195,9 @@ test.describe("interrupted continuation", () => {
         snapshot.lastMissionLedger?.acceptance?.status,
         safeState,
       ).toBe("pass");
+      expect(snapshot.lastMissionLedger?.runId, safeState).toBe(runId);
+      expect(snapshot.lastMissionScorecard, safeState).toBeTruthy();
+      expect(snapshot.lastMissionScorecard?.acceptancePassed, safeState).toBe(true);
 
       // A green end state is not enough: the pre-fix run reached both markers
       // through one successful append after four rejected calls. Require two
@@ -246,6 +250,36 @@ test.describe("interrupted continuation", () => {
       expect(toolOutcomes.succeededWithWork, toolOutcomeEvidence).toBe(2);
       expect(toolOutcomes.failed, toolOutcomeEvidence).toBe(0);
       expect(toolOutcomes.vacuous, toolOutcomeEvidence).toBe(0);
+      await recordDailyUseAcceptance(
+        testInfo,
+        "INTERRUPT-01",
+        {
+          artifacts: ["vault:ordered_two_part_writeback"],
+          proofs: [
+            "restart:midflight",
+            "restart:no_replay",
+            "order:preserved",
+            "receipt:two_appends",
+            "graph:terminal",
+            "tool_calls:complete_zero_failure",
+          ],
+          approvals: [],
+          bindings: ["binding:resume_same_run"],
+          cleanup: [],
+        },
+        {
+          modelCalls: snapshot.providerUsage.modelCallCount,
+          toolCalls: toolOutcomes.attempted ?? 0,
+          continuations: 1,
+          missionScorecard: snapshot.lastMissionScorecard,
+          toolCallsAttempted: toolOutcomes.attempted,
+          toolCallsFailed: toolOutcomes.failed,
+          toolCallsVacuous: toolOutcomes.vacuous,
+          toolCallsIntentionalNoOp: toolOutcomes.intentionalNoOp,
+          refusalBuckets: toolOutcomes.failureBuckets,
+        },
+        { requireComplete: true },
+      );
     } finally {
       await harness?.close();
     }

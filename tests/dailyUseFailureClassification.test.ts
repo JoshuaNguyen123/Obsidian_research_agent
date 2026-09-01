@@ -57,6 +57,26 @@ describe("daily-use Playwright failure classification", () => {
         category: "product_assertion",
       },
     );
+    for (const [scenarioId, title, taskFamily] of [
+      ["VAULT-01", "VAULT-01 semantic vault recall", "research"],
+      ["CODE-DELIVERY-01", "CODE-DELIVERY-01 scratch delivery", "code"],
+      ["INTERRUPT-01", "INTERRUPT-01 durable continuation", "notes"],
+      ["NOTEBOOK-01", "NOTEBOOK-01 executed notebook delivery", "code"],
+    ] as const) {
+      assert.deepEqual(
+        classifyDailyUseFailure({
+          title,
+          file: `e2e/${scenarioId.toLowerCase()}.spec.ts`,
+          project: "reliability-proof",
+          errorMessages: [],
+        }),
+        {
+          scenarioId,
+          taskFamily,
+          category: "product_assertion",
+        },
+      );
+    }
   });
 
   it("separates setup, provider competence, lifecycle, mapping, and cleanup failures", () => {

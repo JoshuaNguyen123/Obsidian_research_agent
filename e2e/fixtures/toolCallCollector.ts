@@ -261,8 +261,23 @@ export async function armToolCallCollector(page: Page): Promise<void> {
               });
             },
             onReceipt: (receipt: any) => {
-              // Delta/commit projection ONLY: no paths, no payload text ever
-              // crosses the page boundary.
+              // Bounded work/verdict projection ONLY: no paths, command output,
+              // or payload text ever crosses the page boundary. Validation
+              // receipts need these three scalar fields so a real passing
+              // sandbox verdict is not misreported as a vacuous mutation.
+              const purpose =
+                receipt?.purpose === "validation_fast" ||
+                receipt?.purpose === "validation_targeted" ||
+                receipt?.purpose === "validation_full"
+                  ? receipt.purpose
+                  : undefined;
+              const readbackStatus =
+                receipt?.readback?.status === "verified"
+                  ? "verified"
+                  : undefined;
+              const exitCode = Number.isSafeInteger(receipt?.exitCode)
+                ? receipt.exitCode
+                : undefined;
               push({
                 kind: "receipt",
                 id: text(receipt?.id),
@@ -273,6 +288,11 @@ export async function armToolCallCollector(page: Page): Promise<void> {
                   bytesDeleted: receipt?.bytesDeleted,
                   affectedCount: receipt?.affectedCount,
                   commitKind: receipt?.commitKind,
+                  purpose,
+                  readback: readbackStatus
+                    ? { status: readbackStatus }
+                    : undefined,
+                  exitCode,
                   ...(receipt?.effects && typeof receipt.effects === "object"
                     ? { effects: { changed: receipt.effects.changed } }
                     : {}),

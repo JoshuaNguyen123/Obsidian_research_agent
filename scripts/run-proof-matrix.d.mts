@@ -1,12 +1,14 @@
 export const CELLS: Array<{
   id: string;
   project: string;
+  scenarioId: string;
   grep: string | null;
   requiredGreens: number;
   maxAttempts: number;
 }>;
 export const DEFAULT_PROOF_MATRIX_MODEL: string;
 export const PROOF_MATRIX_MODEL: string;
+export const ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS: "harness:acceptance_proof_missing";
 export function resolveProofMatrixModel(args?: string[]): string;
 export const ATTEMPT_LOG_DIR: string;
 export const SCORECARD_BASELINE_RELATIVE_PATH: string;
@@ -113,7 +115,19 @@ export interface AttemptAcceptanceSummary {
 export function summarizeAttemptAcceptance(
   summary: unknown,
   summaryFresh: boolean,
+  expectedScenarioId?: string | null,
 ): AttemptAcceptanceSummary;
+export interface CampaignAttemptVerdict {
+  green: boolean;
+  failureClass: string;
+  failureDetail: string;
+  confidence: ClassificationConfidence;
+  secondaryClasses: string[];
+  acceptance: AttemptAcceptanceSummary;
+}
+export function resolveCampaignAttemptVerdict(
+  input: CampaignAttemptVerdict,
+): CampaignAttemptVerdict;
 export function attemptLogExcerpt(
   logText: string,
   endIndex?: number | null,

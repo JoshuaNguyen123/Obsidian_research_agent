@@ -1,9 +1,10 @@
-import { execFile } from "node:child_process";
-import { readdir, readFile, rm } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { lstat, readdir, readFile, rm } from "node:fs/promises";
 import { promisify } from "node:util";
 
 import { expect, test } from "@playwright/test";
 
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
   assertOwnedExportDirectory,
   captureCatalogAndFrontierTrace,
@@ -46,7 +47,7 @@ const REQUIRED_CODE_LADDER = [
 ] as const;
 const execFileAsync = promisify(execFile);
 
-test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game", async (
+test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game", async (
   {},
   testInfo,
 ) => {
@@ -72,7 +73,16 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
   // cleared by a blocked-resume or failure before the finally block runs.
   let capturedWorkspaceId: string | null = null;
   let workspaceContainer: string | null = null;
+  let approvalCount = 0;
+  let primaryError: unknown = null;
   const cleanupErrors: string[] = [];
+  const observed = {
+    artifacts: new Set<string>(),
+    proofs: new Set<string>(),
+    approvals: new Set<string>(),
+    bindings: new Set<string>(),
+    cleanup: new Set<string>(),
+  };
 
   try {
     harness = await startRealAiHarness(
@@ -99,6 +109,7 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
     // must for a user typing this prompt.
     const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
+    observed.proofs.add("sandbox:host_adopted");
 
     let missionFailure: unknown = null;
     try {
@@ -109,7 +120,7 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
       // onProgress fires on every approval/continuation tick; capture the
       // workspaceId as soon as the create receipt appears.  Fire-and-forget is
       // intentional: onProgress is a void callback and reads are idempotent.
-      await harness.approveUntilMissionComplete(35 * 60_000, {
+      approvalCount = await harness.approveUntilMissionComplete(35 * 60_000, {
         onProgress: () => {
           if (capturedWorkspaceId) return;
           readRawRunSnapshot(harness!.page)
@@ -159,6 +170,7 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
     ).catch(() => null);
 
     expect(snapshot.modelCallEvidence.length).toBeGreaterThan(0);
+    observed.proofs.add("model:production_call");
     expect(snapshot.lastConfig?.allowedToolNames).toEqual(
       expect.arrayContaining([...REQUIRED_CODE_LADDER]),
     );
@@ -170,6 +182,18 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
     );
     expect(plannedGraphTools).not.toContain("code_commit_verified");
     expect(plannedGraphTools).not.toContain("append_to_current_file");
+    const completedGraph = graphFrontiers(snapshot);
+    for (const toolName of REQUIRED_CODE_LADDER) {
+      expect(
+        completedGraph.some(
+          (node) =>
+            node.status === "complete" && node.allowedTools.includes(toolName),
+        ),
+        `${toolName} was planned but did not complete`,
+      ).toBe(true);
+    }
+    observed.proofs.add("graph:required_code_ladder_complete");
+    observed.approvals.add("authorization:sandbox_execution");
 
     const exportReceipt = requireExportReceipt(snapshot);
     expect(exportReceipt.readback?.status).toBe("verified");
@@ -184,6 +208,8 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
       exportPath,
       startedAt,
     );
+    observed.artifacts.add("code:desktop_export");
+    observed.proofs.add("receipt:verified_desktop_export");
     const pythonFiles = await listFilesBounded(canonicalExport, ".py");
     expect(pythonFiles).toHaveLength(1);
     const authoredSource = await readFile(pythonFiles[0]!, "utf8");
@@ -202,11 +228,25 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
         await pythonStandardLibraryModuleNames(),
       ),
     ).toEqual([]);
+    observed.artifacts.add("code:python_source");
     await execFileAsync("python", ["-m", "py_compile", pythonFiles[0]!], {
       timeout: 30_000,
       windowsHide: true,
       encoding: "utf8",
     });
+    observed.proofs.add("validation:python_compile");
+
+    const runtime = await runNumberGuessingGame(pythonFiles[0]!, canonicalExport);
+    await testInfo.attach("number-guessing-runtime", {
+      body: JSON.stringify(runtime, null, 2),
+      contentType: "application/json",
+    });
+    expect(runtime.timedOut, `number game timed out: ${runtime.stderr}`).toBe(false);
+    expect(runtime.exitCode, `number game exited red: ${runtime.stderr}`).toBe(0);
+    expect(runtime.stderr).not.toMatch(/Traceback \(most recent call last\):/u);
+    expect(runtime.stdout).toMatch(/guess|number|correct|won|congrat/iu);
+    observed.artifacts.add("code:runnable_cli");
+    observed.proofs.add("runtime:number_game_completed");
 
     const assistantMessage = harness.page
       .locator(
@@ -231,6 +271,10 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
       `Chat did not project the verified export receipt: ${JSON.stringify(exportDiagnostic)}`,
     ).toContain(canonicalExport);
     expect(assistantReply ?? "").not.toMatch(/~[\\/]Desktop/iu);
+    observed.proofs.add("ui:verified_export_path");
+    observed.bindings.add("binding:assistant_absolute_export_path");
+  } catch (error) {
+    primaryError = error;
   } finally {
     if (rawSnapshot) {
       exportPath ??= exportedDirectoryPath(rawSnapshot);
@@ -252,18 +296,22 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
       ).catch(() => null);
     }
     if (exportPath) {
-      await cleanupOwnedExportDirectory({
-        desktopRoot,
-        exportPath,
-        desktopEntriesBefore,
-      }).catch((error) => {
+      try {
+        await cleanupOwnedExportDirectory({
+          desktopRoot,
+          exportPath,
+          desktopEntriesBefore,
+        });
+        await assertPathAbsent(exportPath);
+        observed.cleanup.add("cleanup:desktop_export");
+      } catch (error) {
         const detail = `Desktop export cleanup failed: ${String(error)}`;
         cleanupErrors.push(detail);
         testInfo.annotations.push({
           type: "cleanup-error",
           description: detail,
         });
-      });
+      }
     }
     await harness?.close().catch((error) => {
       const detail = `Harness cleanup failed: ${String(error)}`;
@@ -271,16 +319,18 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
       testInfo.annotations.push({ type: "cleanup-error", description: detail });
     });
     if (workspaceContainer) {
-      await rm(workspaceContainer, { recursive: true, force: true }).catch(
-        (error) => {
+      try {
+        await rm(workspaceContainer, { recursive: true, force: true });
+        await assertPathAbsent(workspaceContainer);
+        observed.cleanup.add("cleanup:scratch_workspace");
+      } catch (error) {
           const detail = `Scratch workspace cleanup failed: ${String(error)}`;
           cleanupErrors.push(detail);
           testInfo.annotations.push({
             type: "cleanup-error",
             description: detail,
           });
-        },
-      );
+      }
     }
     const receipts = Array.isArray(rawSnapshot?.lastReceipts)
       ? rawSnapshot.lastReceipts
@@ -306,4 +356,104 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
       }),
     });
   }
+
+  const missionScorecard = rawSnapshot?.lastMissionScorecard ?? null;
+  if (!primaryError && cleanupErrors.length === 0) {
+    expect(missionScorecard, "the completed code-delivery mission did not emit a scorecard").toBeTruthy();
+    expect(missionScorecard?.acceptancePassed).toBe(true);
+  }
+  await recordDailyUseAcceptance(
+    testInfo,
+    "CODE-DELIVERY-01",
+    {
+      artifacts: [...observed.artifacts],
+      proofs: [...observed.proofs],
+      approvals: [...observed.approvals],
+      bindings: [...observed.bindings],
+      cleanup: [...observed.cleanup],
+    },
+    {
+      modelCalls: safeCounter(
+        rawSnapshot?.providerUsage?.modelCallCount ??
+          rawSnapshot?.modelCallEvidence?.length,
+      ),
+      toolCalls: safeCounter(
+        rawSnapshot?.redactedResearchEffort?.usage?.toolCalls ??
+          rawSnapshot?.lastReceipts?.length,
+      ),
+      continuations: safeCounter(rawSnapshot?.attestedRunLineage?.segmentIndex),
+      approvals: approvalCount,
+      missionScorecard,
+    },
+    { requireComplete: !primaryError && cleanupErrors.length === 0 },
+  );
+  if (primaryError) throw primaryError;
+  if (cleanupErrors.length > 0) throw new Error(cleanupErrors.join("\n"));
 });
+
+function safeCounter(value: unknown): number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    ? value as number
+    : 0;
+}
+
+async function assertPathAbsent(target: string): Promise<void> {
+  const info = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (info) throw new Error(`Owned cleanup target still exists: ${target}`);
+}
+
+async function runNumberGuessingGame(
+  entryPoint: string,
+  cwd: string,
+): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> {
+  const scriptedInput = [
+    ...Array.from({ length: 1000 }, (_, index) => String(index + 1)),
+    "n",
+    "quit",
+    "exit",
+    "",
+  ].join("\n");
+  return new Promise((resolve) => {
+    const child = spawn("python", ["-X", "utf8", entryPoint], {
+      cwd,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 20_000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      if (stdout.length > 500_000) child.kill("SIGKILL");
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+      if (stderr.length > 100_000) child.kill("SIGKILL");
+    });
+    child.on("error", (error) => {
+      clearTimeout(deadline);
+      resolve({
+        stdout,
+        stderr: `${stderr}\n${String(error)}`,
+        exitCode: null,
+        timedOut,
+      });
+    });
+    child.on("close", (code) => {
+      clearTimeout(deadline);
+      resolve({ stdout, stderr, exitCode: code, timedOut });
+    });
+    child.stdin.write(scriptedInput);
+    child.stdin.end();
+  });
+}

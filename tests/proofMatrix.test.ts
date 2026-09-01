@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { PLAYWRIGHT_PROJECTS } from "../scripts/run-e2e-exclusive.mjs";
 import {
   ATTEMPT_LOG_DIR,
+  ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS,
   CELLS,
   DEFAULT_PROOF_MATRIX_MODEL,
   PROOF_MATRIX_MODEL,
@@ -37,6 +38,7 @@ import {
   collectMechanicalFailureClasses,
   fileMtimeMs,
   resolveAttemptToolEvents,
+  resolveCampaignAttemptVerdict,
   summaryToolEventTotals,
   summaryWrittenSince,
   summarizeAttemptAcceptance,
@@ -161,6 +163,20 @@ test("proof-matrix cell projects are exclusive-runner allowlisted", () => {
       `${cell.id} project ${cell.project} is missing from PLAYWRIGHT_PROJECTS`,
     );
   }
+});
+
+test("every proof-matrix cell pins the exact acceptance scenario it must emit", () => {
+  assert.deepEqual(
+    CELLS.map(({ id, scenarioId }) => [id, scenarioId]),
+    [
+      ["research-current-note", "DU-02"],
+      ["vault-recall", "VAULT-01"],
+      ["code-delivery", "CODE-DELIVERY-01"],
+      ["interrupted-continuation", "INTERRUPT-01"],
+      ["notebook-execution", "NOTEBOOK-01"],
+      ["compound-linear-github", "FLOW-REAL-01"],
+    ],
+  );
 });
 
 test("preflight refusals and lock timeouts get their own harness classes", () => {
@@ -805,6 +821,77 @@ test("mission acceptance remains separate from the Playwright harness outcome", 
       .missionOutcome,
     "unknown",
   );
+  const crossScenario = {
+    summaries: [
+      {
+        scenarioId: "DU-02",
+        acceptanceStatus: "pass",
+        missionScorecard: { total: 0.98, acceptancePassed: true },
+      },
+      {
+        scenarioId: "VAULT-01",
+        acceptanceStatus: "needs_more_work",
+        missionScorecard: null,
+      },
+    ],
+  };
+  assert.equal(
+    summarizeAttemptAcceptance(crossScenario, true, "VAULT-01").missionOutcome,
+    "needs_more_work",
+    "another scenario's passing scorecard must not satisfy this cell",
+  );
+  assert.equal(
+    summarizeAttemptAcceptance(crossScenario, true, "NOTEBOOK-01").missionOutcome,
+    "unknown",
+    "a missing expected scenario stays explicit",
+  );
+});
+
+test("a green Playwright exit without accepted scorecard proof fails fast as harness evidence debt", () => {
+  const verdict = resolveCampaignAttemptVerdict({
+    green: true,
+    failureClass: "none",
+    failureDetail: "",
+    confidence: "confirmed",
+    secondaryClasses: [],
+    acceptance: summarizeAttemptAcceptance(
+      {
+        summaries: [
+          {
+            acceptanceStatus: "needs_more_work",
+            missionScorecard: null,
+          },
+        ],
+      },
+      true,
+    ),
+  });
+  assert.equal(verdict.green, false);
+  assert.equal(verdict.failureClass, ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS);
+  assert.match(verdict.failureDetail, /accepted mission and scorecard proof/u);
+  assert.ok(isInfrastructureFailureClass(verdict.failureClass));
+  assert.equal(attemptConsumesBudget(verdict), false);
+
+  const accepted = resolveCampaignAttemptVerdict({
+    green: true,
+    failureClass: "none",
+    failureDetail: "",
+    confidence: "confirmed",
+    secondaryClasses: [],
+    acceptance: summarizeAttemptAcceptance(
+      {
+        summaries: [
+          {
+            acceptanceStatus: "pass",
+            missionScorecard: { total: 0.95, acceptancePassed: true },
+          },
+        ],
+      },
+      true,
+    ),
+  });
+  assert.equal(accepted.green, true);
+  assert.equal(accepted.failureClass, "none");
 });
 
 test("secondary failure classes surface every co-matching signature without stealing the primary", () => {

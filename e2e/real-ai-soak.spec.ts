@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
 import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
 
@@ -55,7 +56,8 @@ test.describe("real AI autonomy soak", () => {
 
   for (const scenario of [
     {
-      name: "deep vault retrieval and semantic expansion",
+      name: "VAULT-01 deep vault retrieval and semantic expansion",
+      acceptanceScenarioId: "VAULT-01" as const,
       setup: async (h: RealAiHarness) => {
         // These prefixes keep the owned fixtures inside the harness's bounded
         // initial semantic-index slice when no compatible index exists yet.
@@ -78,6 +80,7 @@ test.describe("real AI autonomy soak", () => {
     },
     {
       name: "long public-web research and source-cache reuse",
+      acceptanceScenarioId: null,
       setup: async (h: RealAiHarness) => {
         await h.installOwnedWebBackend({ sourceCount: 2 });
       },
@@ -88,6 +91,7 @@ test.describe("real AI autonomy soak", () => {
     },
     {
       name: "generated output with genuine count_words follow-up",
+      acceptanceScenarioId: null,
       setup: async () => undefined,
       prompt: (h: RealAiHarness) =>
         `Write approximately 180 words about local-first research workflows to this note, include ${h.marker}, then use count_words to verify the generated note length.`,
@@ -95,7 +99,7 @@ test.describe("real AI autonomy soak", () => {
       pluginDataOverrides: { autoContinueLongRuns: false },
     },
   ]) {
-    test(scenario.name, async () => {
+    test(scenario.name, async ({}, testInfo) => {
       let harness: RealAiHarness | null = null;
       try {
         harness = await startRealAiHarness(
@@ -143,6 +147,50 @@ test.describe("real AI autonomy soak", () => {
             graphNodes.some((node) => node.allowedTools?.includes(toolName)),
             `${toolName}: ${safeState}`,
           ).toBe(true);
+        }
+        if (scenario.acceptanceScenarioId === "VAULT-01") {
+          const semanticSearch = snapshot.missionEvidence.find((item: any) =>
+            String(item?.id ?? "").startsWith("vault_search:"),
+          );
+          const boundedBatch = snapshot.missionEvidence.find((item: any) =>
+            String(item?.id ?? "").startsWith("vault_batch:"),
+          );
+          const appended = after.slice(before.length);
+          expect(snapshot.modelCallEvidence.length, safeState).toBeGreaterThan(0);
+          expect(semanticSearch, safeState).toBeTruthy();
+          expect(boundedBatch, safeState).toBeTruthy();
+          expect((boundedBatch as any)?.passageIds?.length ?? 0, safeState).toBeGreaterThanOrEqual(2);
+          expect(appended, safeState).toMatch(/alpha/iu);
+          expect(appended, safeState).toMatch(/beta/iu);
+          expect(snapshot.lastMissionLedger?.status, safeState).toBe("complete");
+          expect(snapshot.lastMissionLedger?.acceptance?.status, safeState).toBe("pass");
+          expect(snapshot.lastMissionScorecard, safeState).toBeTruthy();
+          expect(snapshot.lastMissionScorecard?.acceptancePassed, safeState).toBe(true);
+
+          await recordDailyUseAcceptance(
+            testInfo,
+            "VAULT-01",
+            {
+              artifacts: ["vault:grounded_synthesis"],
+              proofs: [
+                "model:production_call",
+                "vault:semantic_search",
+                "vault:bounded_batch_read",
+                "vault:two_marker_passages",
+                "receipt:single_append",
+                "graph:terminal",
+              ],
+              approvals: [],
+              bindings: ["binding:synthesis_marker_sources"],
+              cleanup: [],
+            },
+            {
+              modelCalls: snapshot.providerUsage.modelCallCount,
+              toolCalls: snapshot.missionEvidence.length,
+              missionScorecard: snapshot.lastMissionScorecard,
+            },
+            { requireComplete: true },
+          );
         }
       } finally {
         await harness?.close();

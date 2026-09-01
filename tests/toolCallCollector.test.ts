@@ -367,6 +367,18 @@ test("collector diagnostics expose only bounded event metadata", async () => {
   );
 });
 
+test("collector retains only bounded validation-verdict receipt fields", () => {
+  const collector = readRepoFile("e2e/fixtures/toolCallCollector.ts");
+  assert.match(collector, /receipt\?\.readback\?\.status === "verified"/u);
+  assert.match(collector, /receipt\?\.purpose === "validation_fast"/u);
+  assert.match(collector, /Number\.isSafeInteger\(receipt\?\.exitCode\)/u);
+  assert.doesNotMatch(
+    collector,
+    /receipt:\s*\{[^}]*\b(?:path|content|output|command)\s*:/su,
+    "the page-side projection must not expose paths, payloads, or command output",
+  );
+});
+
 test("harvests are keyed per test, so no spec can inherit another spec's counts", () => {
   // Playwright reuses one worker across spec files, and startRealAiHarness arms
   // for every lane — including the many specs that never register the recorder.

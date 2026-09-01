@@ -69,9 +69,9 @@ export interface DailyUseRunRecord extends Pick<
   /**
    * The DU-acceptance tool-call counter — the quantity the record FINGERPRINT
    * was computed over, so its meaning is frozen: whatever the spec annotated
-   * (daily-use-research feeds `missionEvidence.length`, an evidence count that
+   * (some mission specs feed `missionEvidence.length`, an evidence count that
    * sees successes only). Null — never 0 — when the spec annotated nothing:
-   * three of the four proof lanes have no DailyUseScenarioId, and the previous
+   * unlabelled targeted lanes can still exist, and the previous
    * `metrics?.toolCalls ?? 0` here manufactured the explicit observed=0 rows in
    * docs/eval/playwright-run-metrics.csv for lanes that certainly called tools.
    * The real per-call count lives in `toolCallsAttempted`; the two legitimately
@@ -446,9 +446,9 @@ export default class DailyUseReporter implements Reporter {
           observedAt: new Date().toISOString(),
         })
       : null;
-    // Parsed UNCONDITIONALLY, unlike the metrics annotation: four of the five
-    // real-AI proof lanes have no DailyUseScenarioId, and gating this the same
-    // way would silently drop their only real tool-call counters.
+    // Parsed UNCONDITIONALLY, unlike the metrics annotation: an unlabelled
+    // targeted lane can still exist, and gating this the same way would
+    // silently drop its only real tool-call counters.
     const outcomes = parseToolCallOutcomesAnnotation(test);
     // Only a COMPLETE fold speaks. A lossy or unobserved one is unknown, and
     // unknown must never be read as a number.

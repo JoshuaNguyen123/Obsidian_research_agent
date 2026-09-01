@@ -3,10 +3,14 @@ import { describe, it } from "node:test";
 
 import {
   BYOK_01_ACCEPTANCE_TOKENS,
+  CODE_DELIVERY_01_ACCEPTANCE_TOKENS,
   DAILY_USE_ACCEPTANCE_V1,
   DESKTOP_01_ACCEPTANCE_TOKENS,
   evaluateDailyUseAcceptanceV1,
   FLOW_REAL_01_ACCEPTANCE_TOKENS,
+  INTERRUPT_01_ACCEPTANCE_TOKENS,
+  NOTEBOOK_01_ACCEPTANCE_TOKENS,
+  VAULT_01_ACCEPTANCE_TOKENS,
 } from "../src/agent/dailyUseAcceptance";
 
 describe("DailyUseAcceptanceV1", () => {
@@ -22,6 +26,10 @@ describe("DailyUseAcceptanceV1", () => {
       "DESKTOP-01",
       "FLOW-REAL-01",
       "CORE-01",
+      "VAULT-01",
+      "CODE-DELIVERY-01",
+      "INTERRUPT-01",
+      "NOTEBOOK-01",
     ]);
     for (const [scenarioId, contract] of Object.entries(DAILY_USE_ACCEPTANCE_V1)) {
       assert.equal(contract.version, 1);
@@ -199,5 +207,42 @@ describe("DailyUseAcceptanceV1", () => {
       status: "needs_more_work",
       missing: ["research:cache_reuse"],
     });
+  });
+
+  it("defines exact proof contracts for every non-daily-use reliability lane", () => {
+    for (const [scenarioId, tokens] of [
+      ["VAULT-01", VAULT_01_ACCEPTANCE_TOKENS],
+      ["CODE-DELIVERY-01", CODE_DELIVERY_01_ACCEPTANCE_TOKENS],
+      ["INTERRUPT-01", INTERRUPT_01_ACCEPTANCE_TOKENS],
+      ["NOTEBOOK-01", NOTEBOOK_01_ACCEPTANCE_TOKENS],
+    ] as const) {
+      const contract = DAILY_USE_ACCEPTANCE_V1[scenarioId];
+      assert.deepEqual(contract.requestedArtifacts, tokens.artifacts);
+      assert.deepEqual(contract.requiredProofs, tokens.proofs);
+      assert.deepEqual(contract.approvalBoundaries, tokens.approvals);
+      assert.deepEqual(contract.finalBindings, tokens.bindings);
+      assert.deepEqual(contract.cleanupObligations, tokens.cleanup);
+
+      const complete = {
+        artifacts: [...tokens.artifacts],
+        proofs: [...tokens.proofs],
+        approvals: [...tokens.approvals],
+        bindings: [...tokens.bindings],
+        cleanup: [...tokens.cleanup],
+      };
+      assert.deepEqual(evaluateDailyUseAcceptanceV1(contract, complete), {
+        status: "pass",
+        missing: [],
+      });
+
+      const missingProof = tokens.proofs[0]!;
+      assert.deepEqual(
+        evaluateDailyUseAcceptanceV1(contract, {
+          ...complete,
+          proofs: complete.proofs.filter((proof) => proof !== missingProof),
+        }),
+        { status: "needs_more_work", missing: [missingProof] },
+      );
+    }
   });
 });

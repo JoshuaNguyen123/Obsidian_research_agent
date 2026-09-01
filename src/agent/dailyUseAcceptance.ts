@@ -8,7 +8,11 @@ export type DailyUseScenarioId =
   | "BYOK-01"
   | "DESKTOP-01"
   | "FLOW-REAL-01"
-  | "CORE-01";
+  | "CORE-01"
+  | "VAULT-01"
+  | "CODE-DELIVERY-01"
+  | "INTERRUPT-01"
+  | "NOTEBOOK-01";
 
 export interface DailyUseAcceptanceV1 {
   version: 1;
@@ -160,6 +164,85 @@ export const CORE_01_ACCEPTANCE_TOKENS = Object.freeze({
   approvals: Object.freeze([] as const),
   bindings: Object.freeze(["binding:brief_canvas"] as const),
   cleanup: Object.freeze([] as const),
+});
+
+/** Exact runtime proof for the semantic-search and bounded-batch vault lane. */
+export const VAULT_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze(["vault:grounded_synthesis"] as const),
+  proofs: Object.freeze([
+    "model:production_call",
+    "vault:semantic_search",
+    "vault:bounded_batch_read",
+    "vault:two_marker_passages",
+    "receipt:single_append",
+    "graph:terminal",
+  ] as const),
+  approvals: Object.freeze([] as const),
+  bindings: Object.freeze(["binding:synthesis_marker_sources"] as const),
+  cleanup: Object.freeze([] as const),
+});
+
+/** Exact runtime proof for the scratch Python-to-Desktop delivery lane. */
+export const CODE_DELIVERY_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze([
+    "code:python_source",
+    "code:runnable_cli",
+    "code:desktop_export",
+  ] as const),
+  proofs: Object.freeze([
+    "model:production_call",
+    "sandbox:host_adopted",
+    "graph:required_code_ladder_complete",
+    "validation:python_compile",
+    "runtime:number_game_completed",
+    "receipt:verified_desktop_export",
+    "ui:verified_export_path",
+  ] as const),
+  approvals: Object.freeze(["authorization:sandbox_execution"] as const),
+  bindings: Object.freeze(["binding:assistant_absolute_export_path"] as const),
+  cleanup: Object.freeze([
+    "cleanup:desktop_export",
+    "cleanup:scratch_workspace",
+  ] as const),
+});
+
+/** Exact runtime proof for a killed mission resuming the same durable run. */
+export const INTERRUPT_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze(["vault:ordered_two_part_writeback"] as const),
+  proofs: Object.freeze([
+    "restart:midflight",
+    "restart:no_replay",
+    "order:preserved",
+    "receipt:two_appends",
+    "graph:terminal",
+    "tool_calls:complete_zero_failure",
+  ] as const),
+  approvals: Object.freeze([] as const),
+  bindings: Object.freeze(["binding:resume_same_run"] as const),
+  cleanup: Object.freeze([] as const),
+});
+
+/** Exact runtime proof for a sandbox-executed notebook delivered with outputs. */
+export const NOTEBOOK_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze([
+    "code:executed_notebook",
+    "code:desktop_export",
+  ] as const),
+  proofs: Object.freeze([
+    "model:production_call",
+    "sandbox:host_adopted",
+    "graph:terminal",
+    "validation:all_cells_executed",
+    "validation:no_cell_errors",
+    "output:fibonacci_sequence",
+    "receipt:verified_desktop_export",
+  ] as const),
+  approvals: Object.freeze(["authorization:sandbox_execution"] as const),
+  bindings: Object.freeze(["binding:notebook_outputs_export"] as const),
+  cleanup: Object.freeze([
+    "cleanup:desktop_export",
+    "cleanup:scratch_workspace",
+  ] as const),
 });
 
 /**
@@ -378,6 +461,34 @@ export const DAILY_USE_ACCEPTANCE_V1: Readonly<
     approvalBoundaries: CORE_01_ACCEPTANCE_TOKENS.approvals,
     finalBindings: CORE_01_ACCEPTANCE_TOKENS.bindings,
     cleanupObligations: CORE_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "VAULT-01": contract("VAULT-01", {
+    requestedArtifacts: VAULT_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: VAULT_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: VAULT_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: VAULT_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: VAULT_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "CODE-DELIVERY-01": contract("CODE-DELIVERY-01", {
+    requestedArtifacts: CODE_DELIVERY_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: CODE_DELIVERY_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: CODE_DELIVERY_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: CODE_DELIVERY_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: CODE_DELIVERY_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "INTERRUPT-01": contract("INTERRUPT-01", {
+    requestedArtifacts: INTERRUPT_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: INTERRUPT_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: INTERRUPT_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: INTERRUPT_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: INTERRUPT_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "NOTEBOOK-01": contract("NOTEBOOK-01", {
+    requestedArtifacts: NOTEBOOK_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: NOTEBOOK_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: NOTEBOOK_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: NOTEBOOK_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: NOTEBOOK_01_ACCEPTANCE_TOKENS.cleanup,
   }),
 });
 

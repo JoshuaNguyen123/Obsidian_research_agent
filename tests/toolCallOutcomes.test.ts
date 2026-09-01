@@ -393,7 +393,7 @@ test("normalization maps the three native event shapes and rejects the rest", ()
   assert.equal(normalizeMissionToolEventV1(null, "trace"), null);
 });
 
-test("receipt normalization projects deltas only and drops payload text", () => {
+test("receipt normalization projects bounded work signals and drops payload text", () => {
   const normalized = normalizeMissionToolEventV1(
     {
       id: "r-1",
@@ -418,11 +418,48 @@ test("receipt normalization projects deltas only and drops payload text", () => 
     "bytesWritten",
     "commitKind",
     "effects",
+    "exitCode",
     "operation",
+    "purpose",
+    "readback",
   ]);
   assert.deepEqual(receipt.effects, { changed: false });
   assert.ok(!JSON.stringify(normalized).includes("Secret Note"));
   assert.ok(!JSON.stringify(normalized).includes("sensitive body text"));
+});
+
+test("validation receipt projection preserves bounded verdict proof and counts it as work", () => {
+  const normalized = normalizeMissionToolEventV1(
+    {
+      id: "validation-receipt",
+      toolName: "code_validate_full",
+      operation: "validate",
+      purpose: "validation_full",
+      exitCode: 0,
+      affectedCount: 0,
+      readback: {
+        status: "verified",
+        path: "C:/private/workspace",
+        output: "must not escape",
+      },
+    },
+    "receipt",
+  );
+  assert.equal(normalized?.kind, "receipt");
+  const serialized = JSON.stringify(normalized);
+  assert.doesNotMatch(serialized, /private|must not escape/u);
+  assert.match(serialized, /validation_full/u);
+  assert.match(serialized, /verified/u);
+
+  const counts = foldToolCallOutcomesV1([
+    { kind: "tool_start", id: "run-a:1:0:code_validate_full", toolName: "code_validate_full" },
+    { kind: "tool_result", id: "run-a:1:0:code_validate_full", toolName: "code_validate_full", errorCode: null },
+    { kind: "tool_done", id: "run-a:1:0:code_validate_full", toolName: "code_validate_full", ok: true, errorCode: null },
+    normalized!,
+  ]);
+  assert.equal(counts.coverage, "complete");
+  assert.equal(counts.succeededWithWork, 1);
+  assert.equal(counts.vacuous, 0);
 });
 
 test("merging segments sums complete counts and degrades to lossy on contact", () => {

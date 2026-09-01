@@ -200,6 +200,21 @@ export function normalizeMissionToolEventV1(
             changed: (receipt.effects as { changed?: unknown }).changed,
           }
         : undefined;
+    const purpose =
+      receipt.purpose === "validation_fast" ||
+      receipt.purpose === "validation_targeted" ||
+      receipt.purpose === "validation_full"
+        ? receipt.purpose
+        : undefined;
+    const readback =
+      receipt.readback &&
+      typeof receipt.readback === "object" &&
+      (receipt.readback as { status?: unknown }).status === "verified"
+        ? { status: "verified" }
+        : undefined;
+    const exitCode = Number.isSafeInteger(receipt.exitCode)
+      ? receipt.exitCode
+      : undefined;
     return {
       kind: "receipt",
       id: asText(event.id),
@@ -210,6 +225,9 @@ export function normalizeMissionToolEventV1(
         bytesDeleted: receipt.bytesDeleted,
         affectedCount: receipt.affectedCount,
         commitKind: receipt.commitKind,
+        purpose,
+        readback,
+        exitCode,
         ...(effects ? { effects } : {}),
       },
     };
