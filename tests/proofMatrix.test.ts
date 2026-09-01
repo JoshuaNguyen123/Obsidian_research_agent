@@ -759,6 +759,46 @@ test("a fresh run summary outranks graph mining as the tool-event source", () =>
   assert.equal(stale.vacuous, null);
 });
 
+test("fresh summaries preserve bounded failed-call identity after graph cleanup", () => {
+  const detail = {
+    id: "2:1:read_current_file",
+    toolName: "read_current_file",
+    errorCode: null,
+    bucket: "other",
+  };
+  const summary = {
+    records: [
+      {
+        toolCallsAttempted: 6,
+        toolCallsFailed: 1,
+        toolCallOutcomes: {
+          failureDetails: [detail],
+          failureDetailsTruncated: false,
+        },
+      },
+    ],
+  };
+  const totals = summaryToolEventTotals(summary);
+  assert.deepEqual(totals?.failureDetails, [detail]);
+  assert.equal(totals?.failureDetailsTruncated, false);
+
+  const events = resolveAttemptToolEvents({
+    summary,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.deepEqual(events.failureDetails, [detail]);
+  assert.equal(events.failureDetailsTruncated, false);
+
+  const stale = resolveAttemptToolEvents({
+    summary,
+    summaryFresh: false,
+    minedCounts: { observed: 2, failed: 1, buckets: { execution_failed: 1 } },
+  });
+  assert.equal(stale.failureDetails, null, "graphs cannot recover per-call failure identity");
+  assert.equal(stale.failureDetailsTruncated, null);
+});
+
 test("unknown is never collapsed into zero: explicit summary zeros vs no source at all", () => {
   // A fresh summary that SAID zero is an explicit zero.
   const zeroSummary = {

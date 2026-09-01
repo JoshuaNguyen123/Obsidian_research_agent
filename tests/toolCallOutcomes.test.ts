@@ -6,6 +6,7 @@ import {
   foldToolCallOutcomesV1,
   mergeToolCallOutcomeCountsV1,
   normalizeMissionToolEventV1,
+  TOOL_CALL_FAILURE_DETAIL_CAP,
   TOOL_CALL_FAILURE_BUCKET_KEYS,
   toolCallOutcomeAcceptanceCountersV1,
   unknownToolCallOutcomeCountsV1,
@@ -108,6 +109,27 @@ test("a known stream folds to exact counts, and attempted includes failures", ()
     tool_failure_terminal: 0,
     other: 0,
   });
+  assert.deepEqual(counts.failureDetails, [
+    {
+      id: "2:0:append_to_current_file",
+      toolName: "append_to_current_file",
+      errorCode: "execution_failed",
+      bucket: "execution_failed",
+    },
+    {
+      id: "2:1:create_file",
+      toolName: "create_file",
+      errorCode: "invalid_argument_path",
+      bucket: "invalid_arguments",
+    },
+    {
+      id: "3:1:github_create_pull_request",
+      toolName: "github_create_pull_request",
+      errorCode: "tool_not_allowed",
+      bucket: "tool_not_allowed",
+    },
+  ]);
+  assert.equal(counts.failureDetailsTruncated, false);
 });
 
 test("a failed call is counted as attempted AND failed, never dropped", () => {
@@ -339,6 +361,45 @@ test("unknown error codes land in `other` instead of vanishing", () => {
   ]);
   assert.equal(counts.failureBuckets?.other, 1);
   assert.equal(counts.failed, 1);
+  assert.deepEqual(counts.failureDetails, [
+    {
+      id: "9:9:mystery_tool",
+      toolName: "mystery_tool",
+      errorCode: "a_brand_new_refusal",
+      bucket: "other",
+    },
+  ]);
+});
+
+test("failed-call diagnostics are content-free, deterministic, and bounded", () => {
+  const events: ToolCallOutcomeEventV1[] = Array.from(
+    { length: TOOL_CALL_FAILURE_DETAIL_CAP + 3 },
+    (_, index) => ({
+      kind: "tool_rejected",
+      id: `${String(index).padStart(2, "0")}:mystery_tool`,
+      toolName: "mystery_tool",
+      errorCode: null,
+    }),
+  );
+  const forward = foldToolCallOutcomesV1(events);
+  const reversed = foldToolCallOutcomesV1([...events].reverse());
+
+  assert.equal(forward.failed, TOOL_CALL_FAILURE_DETAIL_CAP + 3);
+  assert.equal(forward.failureDetails?.length, TOOL_CALL_FAILURE_DETAIL_CAP);
+  assert.equal(forward.failureDetailsTruncated, true);
+  assert.deepEqual(reversed.failureDetails, forward.failureDetails);
+  assert.deepEqual(forward.failureDetails?.[0], {
+    id: "00:mystery_tool",
+    toolName: "mystery_tool",
+    errorCode: null,
+    bucket: "other",
+  });
+  assert.deepEqual(Object.keys(forward.failureDetails?.[0] ?? {}).sort(), [
+    "bucket",
+    "errorCode",
+    "id",
+    "toolName",
+  ]);
 });
 
 test("every emitted bucket key is present when coverage is complete", () => {

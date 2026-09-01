@@ -544,6 +544,11 @@ export function summaryToolEventTotals(summary) {
     // buckets came from a complete fold contributes all keys with explicit
     // zeros, so those rows still make the whole vocabulary known.
     buckets: null,
+    // Content-free failed-call identity from the shared collector. The
+    // reporter carries this inside toolCallOutcomes, so it survives the
+    // passing lane's mandatory cleanup that deletes run-owned graphs.
+    failureDetails: null,
+    failureDetailsTruncated: null,
   };
   for (const record of records) {
     const observed =
@@ -572,6 +577,38 @@ export function summaryToolEventTotals(summary) {
           totals.buckets[key] = (totals.buckets[key] ?? 0) + parsed;
         }
       }
+    }
+    const failureDetails = record?.toolCallOutcomes?.failureDetails;
+    if (Array.isArray(failureDetails)) {
+      totals.failureDetails ??= [];
+      for (const detail of failureDetails) {
+        if (
+          !detail ||
+          typeof detail !== "object" ||
+          typeof detail.id !== "string" ||
+          detail.id.length === 0 ||
+          !(
+            detail.toolName === null ||
+            typeof detail.toolName === "string"
+          ) ||
+          !(
+            detail.errorCode === null ||
+            typeof detail.errorCode === "string"
+          ) ||
+          typeof detail.bucket !== "string"
+        ) {
+          continue;
+        }
+        totals.failureDetails.push({
+          id: detail.id,
+          toolName: detail.toolName,
+          errorCode: detail.errorCode,
+          bucket: detail.bucket,
+        });
+      }
+      totals.failureDetailsTruncated =
+        totals.failureDetailsTruncated === true ||
+        record?.toolCallOutcomes?.failureDetailsTruncated === true;
     }
   }
   return totals;
@@ -621,6 +658,8 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
                   (totals.undetermined ?? 0),
               ),
         buckets: totals.buckets,
+        failureDetails: totals.failureDetails,
+        failureDetailsTruncated: totals.failureDetailsTruncated,
       };
     }
   }
@@ -635,6 +674,8 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
       undetermined: null,
       succeeded: Math.max(0, mined.observed - mined.failed),
       buckets: mined.buckets,
+      failureDetails: null,
+      failureDetailsTruncated: null,
     };
   }
   return {
@@ -646,6 +687,8 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
     undetermined: null,
     succeeded: null,
     buckets: null,
+    failureDetails: null,
+    failureDetailsTruncated: null,
   };
 }
 
@@ -2011,6 +2054,17 @@ async function main() {
         summaryFresh,
         minedCounts: mineToolEvents(startedAt, endedAt),
       });
+      if ((toolEvents.failed ?? 0) > 0) {
+        const details = Array.isArray(toolEvents.failureDetails)
+          ? JSON.stringify(toolEvents.failureDetails)
+          : "unavailable";
+        console.warn(
+          `proof-matrix[${stage}]: mission outcome may still be green, but ` +
+            `${toolEvents.failed}/${toolEvents.observed ?? "?"} tool calls failed; ` +
+            `content-free failure details=${details}` +
+            (toolEvents.failureDetailsTruncated === true ? " (truncated)" : ""),
+        );
+      }
       const acceptance = summarizeAttemptAcceptance(
         summary,
         summaryFresh,

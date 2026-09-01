@@ -328,6 +328,15 @@ test("a folded outcomes annotation supplies real counters for a scenario-less la
           intentionalNoOp: 1,
           succeededWithWork: 36,
           failureBuckets: { execution_failed: 3, tool_not_allowed: 0 },
+          failureDetails: [
+            {
+              id: "2:1:read_current_file",
+              toolName: "read_current_file",
+              errorCode: "execution_failed",
+              bucket: "execution_failed",
+            },
+          ],
+          failureDetailsTruncated: false,
           observedEvents: 120,
         }),
       ],
@@ -347,6 +356,15 @@ test("a folded outcomes annotation supplies real counters for a scenario-less la
   // The fingerprinted DU counter is a different quantity and stays unknown.
   assert.equal(record.toolCalls, null);
   assert.equal(record.toolCallOutcomes.coverage, "complete");
+  assert.deepEqual(record.toolCallOutcomes.failureDetails, [
+    {
+      id: "2:1:read_current_file",
+      toolName: "read_current_file",
+      errorCode: "execution_failed",
+      bucket: "execution_failed",
+    },
+  ]);
+  assert.equal(record.toolCallOutcomes.failureDetailsTruncated, false);
 });
 
 test("a lossy or malformed outcomes annotation stays unknown rather than becoming zero", () => {
@@ -469,6 +487,8 @@ test("counters come from ONE source: annotation and fold are never blended", () 
       receiptsUnknown: 0,
       succeededWithWork: 43,
       failureBuckets: {},
+      failureDetails: [],
+      failureDetailsTruncated: false,
       atLeast: null,
       observedEvents: 300,
     },
@@ -501,6 +521,8 @@ test("counters come from ONE source: annotation and fold are never blended", () 
       receiptsUnknown: 0,
       succeededWithWork: 5,
       failureBuckets: {},
+      failureDetails: [],
+      failureDetailsTruncated: false,
       atLeast: null,
       observedEvents: 40,
     },

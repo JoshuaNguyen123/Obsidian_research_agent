@@ -116,6 +116,18 @@ export interface ToolCallOutcomeCountsV1 {
    */
   failureBuckets: Record<string, number> | null;
   /**
+   * Bounded, content-free identity for each failed logical call. This keeps a
+   * green mission that recovered from a failed call diagnosable after the
+   * native harness deletes its run-owned graph: no arguments, paths, output,
+   * note text, or provider payloads are retained.
+   *
+   * Null means the capture was unobserved/lossy (unknown); an empty array is
+   * an explicit complete observation with no failed calls.
+   */
+  failureDetails: ToolCallFailureDetailV1[] | null;
+  /** True when the bounded detail list omitted additional failed calls. */
+  failureDetailsTruncated: boolean | null;
+  /**
    * Lower bounds recovered from a lossy capture. Diagnostic only: never
    * promote these into the headline counters, which are already null.
    */
@@ -123,6 +135,16 @@ export interface ToolCallOutcomeCountsV1 {
   /** Events the fold actually consumed, after de-duplication. */
   observedEvents: number;
 }
+
+export interface ToolCallFailureDetailV1 {
+  id: string;
+  toolName: string | null;
+  errorCode: string | null;
+  bucket: string;
+}
+
+/** Keep summaries useful without allowing a pathological run to grow them. */
+export const TOOL_CALL_FAILURE_DETAIL_CAP = 32;
 
 /** Failure bucket for an error code that matches no known refusal marker. */
 export const TOOL_CALL_FAILURE_BUCKET_OTHER = "other";
@@ -272,14 +294,18 @@ function baseCallKey(id: string): string {
 }
 
 interface CallAccumulator {
+  id: string;
+  toolName: string | null;
   started: boolean;
   terminalOk: boolean;
   terminalFailed: boolean;
   failureCodes: (string | null)[];
 }
 
-function emptyCall(): CallAccumulator {
+function emptyCall(id: string): CallAccumulator {
   return {
+    id,
+    toolName: null,
     started: false,
     terminalOk: false,
     terminalFailed: false,
@@ -303,6 +329,8 @@ export function unknownToolCallOutcomeCountsV1(
     receiptsUnknown: null,
     succeededWithWork: null,
     failureBuckets: null,
+    failureDetails: null,
+    failureDetailsTruncated: null,
     atLeast: null,
     observedEvents: 0,
   };
@@ -323,7 +351,11 @@ export function foldToolCallOutcomesV1(
   const coverage = options.coverage ?? "complete";
   const seen = new Set<string>();
   const calls = new Map<string, CallAccumulator>();
-  const rejections: { id: string; errorCode: string | null }[] = [];
+  const rejections: {
+    id: string;
+    toolName: string | null;
+    errorCode: string | null;
+  }[] = [];
   const receipts: VacuousDetectableReceipt[] = [];
   const seenReceiptIds = new Set<string>();
   let observedEvents = 0;
@@ -331,7 +363,7 @@ export function foldToolCallOutcomesV1(
   const callFor = (key: string): CallAccumulator => {
     const existing = calls.get(key);
     if (existing) return existing;
-    const created = emptyCall();
+    const created = emptyCall(key);
     calls.set(key, created);
     return created;
   };
@@ -356,15 +388,21 @@ export function foldToolCallOutcomesV1(
     observedEvents += 1;
 
     if (event.kind === "tool_rejected") {
-      rejections.push({ id: event.id, errorCode: event.errorCode });
+      rejections.push({
+        id: event.id,
+        toolName: event.toolName,
+        errorCode: event.errorCode,
+      });
       continue;
     }
     const call = callFor(baseCallKey(event.id));
     if (event.kind === "tool_start") {
+      call.toolName ??= event.toolName;
       call.started = true;
       continue;
     }
     if (event.kind === "tool_done") {
+      call.toolName ??= event.toolName;
       if (event.ok === false) {
         call.terminalFailed = true;
         call.failureCodes.push(event.errorCode);
@@ -376,6 +414,7 @@ export function foldToolCallOutcomesV1(
       continue;
     }
     // tool_result
+    call.toolName ??= event.toolName;
     if (event.errorCode) {
       call.terminalFailed = true;
       call.failureCodes.push(event.errorCode);
@@ -392,6 +431,7 @@ export function foldToolCallOutcomesV1(
   for (const rejection of rejections) {
     const owner = resolveRejectionOwner(rejection.id, calls);
     const call = owner ? calls.get(owner)! : callFor(rejection.id);
+    call.toolName ??= rejection.toolName;
     call.terminalFailed = true;
     call.terminalOk = false;
     call.failureCodes.push(rejection.errorCode);
@@ -403,13 +443,21 @@ export function foldToolCallOutcomesV1(
   const failureBuckets: Record<string, number> = Object.fromEntries(
     TOOL_CALL_FAILURE_BUCKET_KEYS.map((key) => [key, 0]),
   );
+  const allFailureDetails: ToolCallFailureDetailV1[] = [];
   for (const call of calls.values()) {
     if (call.terminalFailed) {
       failed += 1;
       // One call is one failure, whatever how many streams reported it; the
       // bucket comes from the first code that named a reason.
       const code = call.failureCodes.find((value) => value !== null) ?? null;
-      failureBuckets[classifyToolFailureBucketV1(code)] += 1;
+      const bucket = classifyToolFailureBucketV1(code);
+      failureBuckets[bucket] += 1;
+      allFailureDetails.push({
+        id: call.id,
+        toolName: call.toolName,
+        errorCode: code,
+        bucket,
+      });
     } else if (call.terminalOk) {
       succeeded += 1;
     } else {
@@ -438,6 +486,11 @@ export function foldToolCallOutcomesV1(
       observedEvents,
     };
   }
+  // Event order must not affect either counts or diagnostics. Sort before the
+  // bound is applied so even an over-cap stream retains the same calls.
+  const failureDetails = allFailureDetails
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .slice(0, TOOL_CALL_FAILURE_DETAIL_CAP);
   return {
     version: 1,
     coverage: "complete",
@@ -450,6 +503,8 @@ export function foldToolCallOutcomesV1(
     receiptsUnknown,
     succeededWithWork: Math.max(0, succeeded - vacuous),
     failureBuckets,
+    failureDetails,
+    failureDetailsTruncated: allFailureDetails.length > failureDetails.length,
     atLeast: null,
     observedEvents,
   };
@@ -510,6 +565,14 @@ export function mergeToolCallOutcomeCountsV1(
   }
   const succeeded = addNullable(left.succeeded, right.succeeded);
   const vacuous = addNullable(left.vacuous, right.vacuous);
+  const mergedFailureDetails = [
+    ...(left.failureDetails ?? []),
+    ...(right.failureDetails ?? []),
+  ];
+  const failureDetails = mergedFailureDetails.slice(
+    0,
+    TOOL_CALL_FAILURE_DETAIL_CAP,
+  );
   return {
     version: 1,
     coverage: "complete",
@@ -523,6 +586,11 @@ export function mergeToolCallOutcomeCountsV1(
     succeededWithWork:
       succeeded === null ? null : Math.max(0, succeeded - (vacuous ?? 0)),
     failureBuckets: buckets,
+    failureDetails,
+    failureDetailsTruncated:
+      left.failureDetailsTruncated === true ||
+      right.failureDetailsTruncated === true ||
+      mergedFailureDetails.length > failureDetails.length,
     atLeast: null,
     observedEvents,
   };

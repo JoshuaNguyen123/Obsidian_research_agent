@@ -74,6 +74,13 @@ export interface SummaryToolEventTotals {
   undetermined: number | null;
   /** Only contributed vocabulary keys; null when no record carried buckets. */
   buckets: Record<string, number> | null;
+  failureDetails: Array<{
+    id: string;
+    toolName: string | null;
+    errorCode: string | null;
+    bucket: string;
+  }> | null;
+  failureDetailsTruncated: boolean | null;
 }
 export function summaryToolEventTotals(
   summary: unknown,
@@ -87,6 +94,13 @@ export interface AttemptToolEvents {
   undetermined: number | null;
   succeeded: number | null;
   buckets: Record<string, number> | null;
+  failureDetails: Array<{
+    id: string;
+    toolName: string | null;
+    errorCode: string | null;
+    bucket: string;
+  }> | null;
+  failureDetailsTruncated: boolean | null;
 }
 export function resolveAttemptToolEvents(input: {
   summary?: unknown;
