@@ -97,7 +97,7 @@ export interface ToolCallCollectorRawV1 {
 export interface ToolCallCollectorDiagnosticV1 {
   segmentIndex: number;
   kind: ToolCallOutcomeEventV1["kind"];
-  /** Receipt ids are deliberately omitted; call ids contain only step/index/name. */
+  /** Receipt ids are omitted; call ids contain only run/step/index/tool identity. */
   id: string | null;
   toolName: string | null;
   errorCode: string | null;

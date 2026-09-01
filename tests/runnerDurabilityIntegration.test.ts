@@ -1533,6 +1533,7 @@ test("continue of a stub graph with streaming off and only the durable anchor he
   vault.context.settings.maxAgentSteps = 24;
   const resumeRequests: ModelChatRequest[] = [];
   const toolStarts: string[] = [];
+  const appendToolStartIds: string[] = [];
   const appendReceipts: AgentRunReceipt[] = [];
   const completions: AgentRunCompleteEvent[] = [];
   const traces: AgentTraceEvent[] = [];
@@ -1637,7 +1638,12 @@ test("continue of a stub graph with streaming off and only the durable anchor he
     enableStreaming: false,
     events: {
       onRunConfig: (event) => seg2Configs.push(event),
-      onToolStart: (event) => toolStarts.push(event.name),
+      onToolStart: (event) => {
+        toolStarts.push(event.name);
+        if (event.name === "append_to_current_file") {
+          appendToolStartIds.push(event.id);
+        }
+      },
       onReceipt: (receipt) => {
         if (receipt.operation === "append") appendReceipts.push(receipt);
       },
@@ -1808,7 +1814,12 @@ test("continue of a stub graph with streaming off and only the durable anchor he
       enableStreaming: false,
       events: {
         onTrace: (event) => seg3Traces.push(event),
-        onToolStart: (event) => toolStarts.push(event.name),
+        onToolStart: (event) => {
+          toolStarts.push(event.name);
+          if (event.name === "append_to_current_file") {
+            appendToolStartIds.push(event.id);
+          }
+        },
         onReceipt: (receipt) => {
           if (receipt.operation === "append") appendReceipts.push(receipt);
         },
@@ -1843,6 +1854,23 @@ test("continue of a stub graph with streaming off and only the durable anchor he
       rule: "Two ordered durable appends require two executed append calls, even when one model response carries both literals.",
       toolStarts,
       note: vault.files.get("Current.md") ?? "",
+    }),
+  );
+  assert.equal(
+    new Set(appendToolStartIds).size,
+    2,
+    JSON.stringify({
+      rule: "Distinct tool executions across continuation segments require distinct observable call identities.",
+      appendToolStartIds,
+    }),
+  );
+  assert.ok(
+    appendToolStartIds.every(
+      (id) => id.startsWith("run-") && id.endsWith(":append_to_current_file"),
+    ),
+    JSON.stringify({
+      rule: "Tool-call identity must carry the owning run scope so two coordinator starts in one observer segment cannot collide.",
+      appendToolStartIds,
     }),
   );
   assert.equal(appendReceipts.length, 2, JSON.stringify(appendReceipts));

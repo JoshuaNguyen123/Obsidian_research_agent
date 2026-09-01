@@ -14566,7 +14566,12 @@ export async function runAgentMission({
     }
     observedToolCallCount += 1;
     const toolEventBase: AgentToolRunEvent = {
-      id: `${step}:${toolIndex}:${toolCall.name}`,
+      id: buildRunScopedToolEventIdV1(
+        runId,
+        step,
+        toolIndex,
+        toolCall.name,
+      ),
       name: toolCall.name,
       step,
     };
@@ -22006,7 +22011,12 @@ export async function runAgentMission({
         });
       }
       const toolEventBase: AgentToolRunEvent = {
-        id: `${step}:${toolIndex}:${toolCall.name}`,
+        id: buildRunScopedToolEventIdV1(
+          runId,
+          step,
+          toolIndex,
+          toolCall.name,
+        ),
         name: toolCall.name,
         step,
       };
@@ -38937,6 +38947,20 @@ function buildToolCallFallbackId(
     /[^A-Za-z0-9_-]/g,
     "_",
   );
+}
+
+/**
+ * Tool step/index coordinates restart at one for every runner invocation.
+ * Include the host-owned run identity so an observer that survives multiple
+ * coordinator starts never collapses distinct calls onto the same event id.
+ */
+export function buildRunScopedToolEventIdV1(
+  runId: string,
+  step: number,
+  toolIndex: number | string,
+  toolName: string,
+): string {
+  return `${runId}:${step}:${String(toolIndex)}:${toolName}`;
 }
 
 function formatObservedToolFailureStatus(
