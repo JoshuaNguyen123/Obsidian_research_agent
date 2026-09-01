@@ -600,6 +600,31 @@ test("the removed mock mode is refused with an explicit message", () => {
   );
 });
 
+test("interrupted continuation proves a durable window and settles the old coordinator", () => {
+  const spec = readFileSync(
+    new URL("../e2e/interrupted-continuation-live.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const harness = readFileSync(
+    new URL("../e2e/fixtures/realAiHarness.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(spec, /appendNodeStatuses/u);
+  assert.match(spec, /appendReceiptCount/u);
+  assert.match(spec, /intervals: \[100\]/u);
+  assert.match(spec, /postRestartHasA && postRestartHasB/u);
+  assert.match(spec, /process:interrupt_window_missed/u);
+  assert.match(spec, /peekToolCallCollectorDiagnosticsV1/u);
+
+  const disable = harness.indexOf("await app.plugins.disablePlugin(pluginId)");
+  const settle = harness.indexOf(
+    "activePlugin?.getMissionRunSnapshot?.().isRunning === true",
+  );
+  const enable = harness.indexOf("await app.plugins.enablePlugin(pluginId)");
+  assert.ok(disable >= 0 && settle > disable && enable > settle);
+  assert.match(harness, /process:prior_plugin_run_did_not_settle/u);
+});
+
 test("offline AI is restricted to the production-client offline project", () => {
   const normalized = normalizeExclusiveArgs([
     "--offline-ai",

@@ -94,6 +94,17 @@ export interface ToolCallCollectorRawV1 {
   segments: ToolCallCollectorSegmentV1[];
 }
 
+export interface ToolCallCollectorDiagnosticV1 {
+  segmentIndex: number;
+  kind: ToolCallOutcomeEventV1["kind"];
+  /** Receipt ids are deliberately omitted; call ids contain only step/index/name. */
+  id: string | null;
+  toolName: string | null;
+  errorCode: string | null;
+  ok: boolean | null;
+  operation: string | null;
+}
+
 /**
  * Fold raw collector state into outcome counts. PURE — this is the whole
  * Node-side judgment surface of the collector, and every branch of it is
@@ -337,6 +348,43 @@ export async function peekToolCallCollector(
     // Instrumentation must never turn product work red merely because the
     // renderer disappeared during diagnosis; unknown is the honest result.
     return unknownToolCallOutcomeCountsV1("unobserved");
+  }
+}
+
+/**
+ * Read a bounded, content-free event projection for failed-lane diagnostics.
+ * No arguments, paths, provider payloads, note text, or receipt ids cross the
+ * renderer boundary.
+ */
+export async function peekToolCallCollectorDiagnosticsV1(
+  page: Page,
+): Promise<ToolCallCollectorDiagnosticV1[]> {
+  try {
+    const raw = await readToolCallCollectorRawV1(page, false);
+    return (raw?.segments ?? [])
+      .flatMap((segment) =>
+        segment.events.map((event) => ({
+          segmentIndex: segment.index,
+          kind: event.kind,
+          id: event.kind === "receipt" ? null : event.id,
+          toolName: event.toolName,
+          errorCode:
+            event.kind === "tool_done" ||
+            event.kind === "tool_result" ||
+            event.kind === "tool_rejected"
+              ? event.errorCode
+              : null,
+          ok: event.kind === "tool_done" ? event.ok : null,
+          operation:
+            event.kind === "receipt" &&
+            typeof event.receipt.operation === "string"
+              ? event.receipt.operation
+              : null,
+        })),
+      )
+      .slice(-64);
+  } catch {
+    return [];
   }
 }
 

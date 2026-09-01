@@ -10,6 +10,7 @@ import {
   collectedToolCallCountsForTestV1,
   harvestToolCallCollector,
   peekToolCallCollector,
+  peekToolCallCollectorDiagnosticsV1,
   resetToolCallCollectorStateForTestsV1,
   summarizeCollectedToolCallsV1,
   type ToolCallCollectorRawV1,
@@ -313,6 +314,56 @@ test("a live peek reports exact counters without consuming the collector", async
     reads,
     2,
     "peek must leave the page-side slot available for teardown harvest",
+  );
+});
+
+test("collector diagnostics expose only bounded event metadata", async () => {
+  const captured = raw(
+    segment(0, [
+      {
+        kind: "tool_done",
+        id: "2:0:append_to_current_file",
+        toolName: "append_to_current_file",
+        ok: false,
+        errorCode: "mission_graph_authority_blocked",
+      },
+      {
+        kind: "receipt",
+        id: "receipt-private-id",
+        toolName: "append_to_current_file",
+        receipt: {
+          operation: "append",
+          bytesWritten: 12,
+          path: "must-not-escape.md",
+        } as any,
+      },
+    ]),
+  );
+  const page = { evaluate: async () => captured } as any;
+
+  assert.deepEqual(await peekToolCallCollectorDiagnosticsV1(page), [
+    {
+      segmentIndex: 0,
+      kind: "tool_done",
+      id: "2:0:append_to_current_file",
+      toolName: "append_to_current_file",
+      errorCode: "mission_graph_authority_blocked",
+      ok: false,
+      operation: null,
+    },
+    {
+      segmentIndex: 0,
+      kind: "receipt",
+      id: null,
+      toolName: "append_to_current_file",
+      errorCode: null,
+      ok: null,
+      operation: "append",
+    },
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(await peekToolCallCollectorDiagnosticsV1(page)),
+    /must-not-escape|receipt-private-id/u,
   );
 });
 

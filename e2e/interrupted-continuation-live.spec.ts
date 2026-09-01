@@ -4,6 +4,7 @@ import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import {
   peekToolCallCollector,
+  peekToolCallCollectorDiagnosticsV1,
   recordToolCallOutcomesAfterEach,
 } from "./fixtures/toolCallCollector";
 
@@ -51,10 +52,23 @@ test.describe("interrupted continuation", () => {
           const plugin = (window as typeof window & { app?: any }).app?.plugins
             ?.plugins?.[pluginId];
           const snapshot = plugin?.getMissionRunSnapshot?.();
+          const appendNodes = Object.values(
+            snapshot?.lastMissionGraph?.nodes ?? {},
+          ).filter(
+            (node: any) =>
+              Array.isArray(node?.allowedTools) &&
+              node.allowedTools.includes("append_to_current_file"),
+          );
           return {
             runId: typeof snapshot?.runId === "string" ? snapshot.runId : null,
             isRunning: snapshot?.isRunning === true,
             state: typeof snapshot?.state === "string" ? snapshot.state : null,
+            appendNodeStatuses: appendNodes.map((node: any) => node.status),
+            appendReceiptCount: Array.isArray(snapshot?.lastReceipts)
+              ? snapshot.lastReceipts.filter(
+                  (receipt: any) => receipt?.operation === "append",
+                ).length
+              : 0,
           };
         }, NATIVE_CORE_PLUGIN_ID);
 
@@ -68,8 +82,11 @@ test.describe("interrupted continuation", () => {
         }, { timeout: 120_000, message: "the submitted mission must publish a run id" })
         .toMatch(/^run-/u);
 
-      // Wait for an interruption window: part A committed but B still pending,
-      // or 90s of pre-write flight. Both parts landing first = missed window.
+      // Wait for a DURABLE interruption window: a persisted two-append graph
+      // before either receipt, part A committed with B pending, or a bounded
+      // pre-planning flight. Polling only the note every two seconds raced the
+      // provider's fast two-call batch and mislabeled a completed old segment
+      // as "pre-first-write".
       const submittedAtMs = Date.now();
       let interruptWindow: "pre-first-write" | "between-writes" | null = null;
       await expect
@@ -78,18 +95,28 @@ test.describe("interrupted continuation", () => {
             const note = await readFile(harness!.noteFilePath, "utf8").catch(() => "");
             const hasA = note.includes(markerA);
             const hasB = note.includes(markerB);
-            if (hasA && hasB) return "missed";
-            if (hasA) {
+            const snapshot = await readRunSnapshot();
+            if (hasA && hasB || snapshot.appendReceiptCount >= 2) return "missed";
+            if (hasA || snapshot.appendReceiptCount === 1) {
               interruptWindow = "between-writes";
               return "ready";
             }
-            if (Date.now() - submittedAtMs > 90_000) {
+            if (
+              snapshot.appendNodeStatuses.length >= 2 &&
+              snapshot.appendNodeStatuses.every(
+                (status) => status !== "complete" && status !== "cancelled",
+              )
+            ) {
+              interruptWindow = "pre-first-write";
+              return "ready";
+            }
+            if (Date.now() - submittedAtMs > 30_000) {
               interruptWindow = "pre-first-write";
               return "ready";
             }
             return "waiting";
           },
-          { timeout: 480_000, intervals: [2_000] },
+          { timeout: 480_000, intervals: [100] },
         )
         .not.toBe("waiting");
       if (interruptWindow === null) {
@@ -100,6 +127,20 @@ test.describe("interrupted continuation", () => {
 
       // Kill the plugin mid-flight and resume the same run.
       await harness.restartCorePlugin();
+      const postRestartNote = await readFile(harness.noteFilePath, "utf8");
+      const postRestartHasA = postRestartNote.includes(markerA);
+      const postRestartHasB = postRestartNote.includes(markerB);
+      if (postRestartHasA && postRestartHasB) {
+        throw new Error(
+          "process:interrupt_window_missed — both appends settled in the old coordinator before restart completed; rerun the attempt.",
+        );
+      }
+      if (postRestartHasB && !postRestartHasA) {
+        throw new Error(
+          "product:ordered_append_invariant — part B landed before part A during shutdown.",
+        );
+      }
+      interruptWindow = postRestartHasA ? "between-writes" : "pre-first-write";
       expect(runId).toMatch(/^run-/u);
       await harness.submitMission(`continue run ${runId}`, { waitForCompletion: false });
       await harness.approveUntilMissionComplete(900_000);
@@ -158,9 +199,12 @@ test.describe("interrupted continuation", () => {
       // through one successful append after four rejected calls. Require two
       // real write successes and zero failures across both restart segments.
       const toolOutcomes = await peekToolCallCollector(harness.page);
+      const collectorDiagnostics =
+        await peekToolCallCollectorDiagnosticsV1(harness.page);
       const toolOutcomeEvidence = JSON.stringify({
         interruptWindow,
         toolOutcomes,
+        collectorDiagnostics,
         // Sanitized coordinator attestations only: these expose the projected
         // tool names and rejected step/name, never provider payloads, note
         // content, paths, or credentials. Aggregate-only failures previously

@@ -516,6 +516,23 @@ async function restartCorePlugin(
       await leaf.detach?.();
     }
     await app.plugins.disablePlugin(pluginId);
+    // `Plugin.onunload()` cannot return a promise, so disablePlugin may resolve
+    // while the old coordinator is still honoring its abort. Do not enable a
+    // replacement instance or unsubscribe the old collector until that run is
+    // settled; otherwise an old mutation can overlap the resumed coordinator
+    // and its terminal events disappear from the quantitative record.
+    const priorRunDeadline = Date.now() + 30_000;
+    while (
+      activePlugin?.getMissionRunSnapshot?.().isRunning === true &&
+      Date.now() < priorRunDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (activePlugin?.getMissionRunSnapshot?.().isRunning === true) {
+      throw new Error(
+        "process:prior_plugin_run_did_not_settle — the disabled coordinator remained active after its bounded shutdown window.",
+      );
+    }
     await app.plugins.enablePlugin(pluginId);
     let plugin: any = null;
     for (let attempt = 0; attempt < 240; attempt += 1) {
