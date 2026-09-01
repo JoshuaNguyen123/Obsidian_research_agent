@@ -77,7 +77,7 @@ test("MissionGraphV3 projects status, progress, next action, evidence, and recei
   assert.deepEqual(orchestrator.nodes.research.evidenceIds, ["evidence-web"]);
 });
 
-test("legacy aliases do not hide graph-native final-output proof after restart", async () => {
+test("legacy aliases preserve migrated final-relevance proof after restart", async () => {
   const envelope = await createEnvelope();
   const migrated = await migrateLegacyMissionPlanToMissionGraphV3(
     completePlan(),
@@ -102,7 +102,9 @@ test("legacy aliases do not hide graph-native final-output proof after restart",
           },
           {
             id: "durable-final-output",
-            kind: "final-output",
+            // Legacy MissionPlan -> MissionGraph migration names this proof
+            // `final-relevance`; fresh host graphs use `final-output`.
+            kind: "final-relevance",
             fingerprint: fp("d"),
             observedAt: UPDATED_AT,
           },
@@ -110,7 +112,7 @@ test("legacy aliases do not hide graph-native final-output proof after restart",
         completionContract: {
           ...migrated.nodes.write.completionContract,
           minimumEvidence: 1,
-          requiredEvidenceKinds: ["final-output"],
+          requiredEvidenceKinds: ["final-relevance"],
           minimumReceipts: 0,
           requiredReceiptKinds: [],
         },

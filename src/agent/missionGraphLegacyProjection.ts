@@ -780,7 +780,12 @@ function projectLegacyEvidenceId(
   node: MissionNodeV3,
   evidence: MissionEvidenceRefV1,
 ): string {
-  if (evidence.kind === "final-output") {
+  // Fresh host graphs call this proof `final-output`; graphs migrated from a
+  // legacy MissionPlan call the same proof `final-relevance`. A continuation
+  // can therefore complete its authoritative final node successfully but
+  // still fail the compatibility verifier unless both contract vocabularies
+  // project to the one legacy proof ID.
+  if (/final-output|final-relevance/i.test(evidence.kind)) {
     return FINAL_OUTPUT_RELEVANT_EVIDENCE_ID;
   }
   if (/web|source/i.test(evidence.kind)) {
