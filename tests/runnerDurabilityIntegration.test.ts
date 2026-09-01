@@ -61,6 +61,7 @@ import {
 import { RunCoordinator } from "../src/agent/runCoordinator";
 import type { AgentSettings } from "../src/settings";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
+import { ScopedToolRegistry } from "../src/tools/ScopedToolRegistry";
 import type {
   ToolExecutionContext,
   ToolExecutionResult,
@@ -1614,10 +1615,19 @@ test("continue of a stub graph with streaming off and only the durable anchor he
       return response;
     },
   };
+  const scopedResumeRegistry = new ScopedToolRegistry(
+    createDefaultToolRegistry(),
+    (toolName) => toolName === "append_to_current_file",
+  );
+  assert.equal(
+    scopedResumeRegistry.getDescriptor("read_current_file"),
+    null,
+    "The production-shaped scope must hide the drifted read descriptor so the test cannot pass through registry metadata.",
+  );
   await runAgentMission({
     prompt: `continue run ${interruptedRunId}`,
     modelClient: resumedClient,
-    toolRegistry: createDefaultToolRegistry(),
+    toolRegistry: scopedResumeRegistry,
     toolContext: vault.context,
     enableStreaming: false,
     events: {

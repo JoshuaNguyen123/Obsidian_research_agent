@@ -19522,8 +19522,14 @@ export async function runAgentMission({
         currentNoteText: readCurrentNoteTextForLiteralDebt(),
         offeredToolNames: [...stepAllowedToolNames],
         toolCalls: repairedPlaceholderCalls.toolCalls,
+        // The production registry can be a least-authority ScopedToolRegistry.
+        // By definition it hides descriptors for names outside that scope, so
+        // it cannot classify the unoffered safe read-name drift this repair is
+        // designed to handle. TOOL_AUTHORITY is the host's static tool-kind
+        // authority and does not grant execution; the scoped registry still
+        // owns the later execution boundary.
         isReadOnlyToolName: (toolName) =>
-          toolRegistry.getDescriptor?.(toolName)?.effect === "read",
+          TOOL_AUTHORITY[toolName] === "read",
       });
     const responseToolCalls = orderedAppendProjection.toolCalls;
     const responseToolCallProjectionChanged =
