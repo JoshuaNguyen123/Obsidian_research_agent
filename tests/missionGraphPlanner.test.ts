@@ -109,6 +109,50 @@ test("automatic planning accepts a high-confidence semantic DAG without trusting
   assert.match(requests[0].messages[0].content, /hostDependencyIds/);
 });
 
+test("structured planning releases an uncooperative model call when the owning run aborts", async () => {
+  const fixture = await createFixture();
+  const controller = new AbortController();
+  let requestSignal: AbortSignal | undefined;
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const client = clientFrom(async (request) => {
+    requestSignal = request.abortSignal;
+    markStarted?.();
+    return new Promise<ModelChatResponse>(() => undefined);
+  });
+  const pending = planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: client,
+    timeoutMs: 60_000,
+    abortSignal: controller.signal,
+  });
+
+  await started;
+  controller.abort("coordinator_shutdown");
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const bounded = Promise.race([
+    pending,
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("structured planner ignored owning-run abort")),
+        250,
+      );
+    }),
+  ]).finally(() => {
+    if (timeout !== undefined) clearTimeout(timeout);
+  });
+  await assert.rejects(
+    bounded,
+    (error: unknown) =>
+      error instanceof DOMException && error.name === "AbortError",
+  );
+  assert.equal(requestSignal?.aborted, true);
+});
+
 test("Ollama Cloud graph planning omits provider format while repairing authority widening", async () => {
   const fixture = await createFixture();
   const requests: ModelChatRequest[] = [];

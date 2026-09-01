@@ -65,7 +65,13 @@ export async function withModelRetry<T>(
   while (true) {
     throwIfAborted(options.abortSignal);
     try {
-      return await run();
+      // A transport is expected to honor the request signal, but the runner's
+      // lifecycle cannot depend on that implementation detail. Electron fetch,
+      // a provider SDK, or a test double can leave an in-flight promise pending
+      // after cancellation. Race every attempt against the host signal so the
+      // agent loop relinquishes mutation authority immediately; any late
+      // transport result is ignored by the already-settled race.
+      return await runAbortableAttempt(run, options.abortSignal);
     } catch (error) {
       if (
         attempt >= policy.maxAttempts ||
@@ -89,6 +95,31 @@ export async function withModelRetry<T>(
       attempt += 1;
     }
   }
+}
+
+function runAbortableAttempt<T>(
+  run: () => Promise<T>,
+  abortSignal: AbortSignal | undefined,
+): Promise<T> {
+  if (!abortSignal) {
+    return run();
+  }
+  throwIfAborted(abortSignal);
+
+  let removeAbortListener: (() => void) | undefined;
+  const aborted = new Promise<T>((_resolve, reject) => {
+    const onAbort = () => reject(createAbortError());
+    abortSignal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () =>
+      abortSignal.removeEventListener("abort", onAbort);
+  });
+
+  // Promise.resolve().then(run) also normalizes a synchronous throw from a
+  // custom client into the same rejected-promise path as a transport failure.
+  const operation = Promise.resolve().then(run);
+  return Promise.race([operation, aborted]).finally(() => {
+    removeAbortListener?.();
+  });
 }
 
 export function parseRetryAfterMs(
@@ -176,8 +207,12 @@ function abortableDelay(delayMs: number, abortSignal: AbortSignal | undefined) {
 
 function throwIfAborted(abortSignal: AbortSignal | undefined) {
   if (abortSignal?.aborted) {
-    throw new DOMException("The operation was aborted.", "AbortError");
+    throw createAbortError();
   }
+}
+
+function createAbortError(): DOMException {
+  return new DOMException("The operation was aborted.", "AbortError");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

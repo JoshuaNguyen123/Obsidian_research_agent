@@ -5095,6 +5095,7 @@ export async function runAgentMission({
               deterministicProposal: hostPlan.deterministicProposal,
               allowedToolDescriptors: hostPlan.allowedToolDescriptors,
               timeoutMs: structuredPlanningTimeoutMs,
+              abortSignal,
               modelClient:
                 modelRouterMode === "authority" &&
                 routedModelIntent &&

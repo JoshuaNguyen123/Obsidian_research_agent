@@ -189,3 +189,46 @@ test("withModelRetry keeps the full budget for non-timeout transient errors", as
   );
   assert.equal(attempts, 4);
 });
+
+test("withModelRetry releases an uncooperative in-flight attempt on abort", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const neverSettles = new Promise<string>(() => undefined);
+  const pending = withModelRetry(
+    async () => {
+      attempts += 1;
+      markStarted?.();
+      return neverSettles;
+    },
+    {
+      policy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      abortSignal: controller.signal,
+    },
+  );
+
+  await started;
+  controller.abort("coordinator_shutdown");
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const bounded = Promise.race([
+    pending,
+    new Promise<string>((_resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("in-flight model attempt ignored abort")),
+        250,
+      );
+    }),
+  ]).finally(() => {
+    if (timeout !== undefined) clearTimeout(timeout);
+  });
+  await assert.rejects(
+    bounded,
+    (error: unknown) =>
+      error instanceof DOMException && error.name === "AbortError",
+  );
+  assert.equal(attempts, 1);
+});

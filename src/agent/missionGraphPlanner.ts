@@ -97,6 +97,8 @@ export interface MissionGraphPlannerInputV1 {
   })[];
   modelClient?: ModelClient | null;
   timeoutMs?: number;
+  /** Cancels planning with the owning run; timeout fallback remains separate. */
+  abortSignal?: AbortSignal;
   confidenceThreshold?: number;
   now?: () => string;
 }
@@ -141,8 +143,10 @@ type StructuredModelCallResult =
 export async function planMissionGraphV3(
   input: MissionGraphPlannerInputV1,
 ): Promise<MissionGraphPlanningResultV1> {
+  throwIfPlanningAborted(input.abortSignal);
   const decidedAt = normalizeTimestamp((input.now ?? (() => new Date().toISOString()))());
   const context = await preparePlanningContext(input, decidedAt);
+  throwIfPlanningAborted(input.abortSignal);
 
   if (input.routerMode === "off") {
     return deterministicResult(
@@ -159,6 +163,7 @@ export async function planMissionGraphV3(
         mission: input.mission,
         context,
         timeoutMs: input.timeoutMs ?? MISSION_GRAPH_PLANNER_DEFAULT_TIMEOUT_MS,
+        abortSignal: input.abortSignal,
         validateProposal: async (proposal) => {
           const candidate = await resolveAuthoritativeMissionGraphV3({
             deterministicGraph: context.deterministicGraph,
@@ -512,12 +517,14 @@ async function requestStructuredMissionGraph({
   mission,
   context,
   timeoutMs,
+  abortSignal,
   validateProposal,
 }: {
   client: ModelClient;
   mission: ExplicitMissionV1;
   context: PreparedPlanningContextV1;
   timeoutMs: number;
+  abortSignal?: AbortSignal;
   validateProposal?: (
     proposal: StructuredMissionGraphProposalV1,
   ) => Promise<
@@ -608,6 +615,11 @@ async function requestStructuredMissionGraph({
     { role: "user", content: mission.objective },
   ];
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(abortSignal?.reason);
+  abortSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (abortSignal?.aborted) {
+    abortFromCaller();
+  }
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   try {
@@ -690,6 +702,9 @@ async function requestStructuredMissionGraph({
     }
     return { kind: lastInvalidKind };
   } catch (error) {
+    if (abortSignal?.aborted) {
+      throw error;
+    }
     if (
       error instanceof ModelClientError &&
       error.category === "provider_budget_exhausted"
@@ -699,6 +714,13 @@ async function requestStructuredMissionGraph({
     return timedOut ? { kind: "timeout" } : { kind: "unavailable" };
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
+    abortSignal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+function throwIfPlanningAborted(abortSignal: AbortSignal | undefined): void {
+  if (abortSignal?.aborted) {
+    throw new DOMException("The operation was aborted.", "AbortError");
   }
 }
 
