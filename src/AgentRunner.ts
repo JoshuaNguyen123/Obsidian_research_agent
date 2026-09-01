@@ -1335,6 +1335,8 @@ export type {
 
 export interface AgentRunConfigEvent {
   runId: string;
+  /** Stable durable mission root; continuation segments keep their own runId. */
+  rootRunId?: string;
   model: string;
   base: string;
   streaming: boolean;
@@ -24828,6 +24830,9 @@ function buildRunConfigEvent({
 
   return {
     runId,
+    ...(toolContext.rootMissionId?.trim()
+      ? { rootRunId: toolContext.rootMissionId.trim() }
+      : {}),
     model: settings?.model?.trim() || "unknown",
     base: formatBaseUrlCategory(getProviderBaseUrl(settings)),
     modelProvider: settings?.modelProvider ?? "ollama",

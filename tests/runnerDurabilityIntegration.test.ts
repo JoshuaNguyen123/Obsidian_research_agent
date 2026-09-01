@@ -3594,6 +3594,7 @@ test("continue run of an anchor-only interrupted run restarts the mission from i
   const assistant: string[] = [];
   const traces: AgentTraceEvent[] = [];
   const completions: AgentRunCompleteEvent[] = [];
+  const configs: AgentRunConfigEvent[] = [];
 
   await runAgentMission({
     prompt: `continue run ${interruptedRunId}`,
@@ -3615,6 +3616,7 @@ test("continue run of an anchor-only interrupted run restarts the mission from i
       onAssistantDelta: (delta) => assistant.push(delta),
       onTrace: (event) => traces.push(event),
       onRunComplete: (event) => completions.push(event),
+      onRunConfig: (event) => configs.push(event),
     },
   });
 
@@ -3640,6 +3642,11 @@ test("continue run of an anchor-only interrupted run restarts the mission from i
   );
   assert.equal(completions.length, 1);
   assert.notEqual(completions[0].stopReason, "error");
+  assert.equal(
+    configs.at(-1)?.rootRunId,
+    interruptedRunId,
+    "the segment config must attest the exact durable root it resumed",
+  );
 });
 
 test("a graceful pre-planning abort keeps the anchor and continue completes the mission", async () => {

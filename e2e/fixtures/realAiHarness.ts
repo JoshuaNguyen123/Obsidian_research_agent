@@ -364,6 +364,18 @@ export async function startRealAiHarness(
   let recordedApprovals = 0;
   let recordedContinuations = 0;
   const recordedModelCallsByUsageScopeId = new Map<string, number>();
+  const recordModelCalls = (
+    usageScopeId: string | null | undefined,
+    modelCalls: number | null | undefined,
+  ) => {
+    if (!usageScopeId || !Number.isSafeInteger(modelCalls) || modelCalls! < 0) {
+      return;
+    }
+    recordedModelCallsByUsageScopeId.set(
+      usageScopeId,
+      Math.max(recordedModelCallsByUsageScopeId.get(usageScopeId) ?? 0, modelCalls!),
+    );
+  };
   const totalRecordedModelCalls = () =>
     [...recordedModelCallsByUsageScopeId.values()].reduce(
       (total, count) => total + count,
@@ -420,8 +432,10 @@ export async function startRealAiHarness(
     readOwnedWebMetrics: () => readOwnedWebMetrics(native.page),
     attestProductionRun: (options = {}) =>
       attestProductionRun(native.page, config, options),
-    restartCorePlugin: () =>
-      restartCorePlugin(native.page, config, provider),
+    restartCorePlugin: async () => {
+      const priorUsage = await restartCorePlugin(native.page, config, provider);
+      recordModelCalls(priorUsage.usageScopeId, priorUsage.modelCalls);
+    },
     approveUntilMissionComplete: async (
       timeoutMs = config.completionTimeoutMs,
       options = {},
@@ -444,18 +458,18 @@ export async function startRealAiHarness(
             });
           },
           onUsageScopeModelCalls: (usageScopeId, modelCalls) => {
-            recordedModelCallsByUsageScopeId.set(
-              usageScopeId,
-              Math.max(
-                recordedModelCallsByUsageScopeId.get(usageScopeId) ?? 0,
-                modelCalls,
-              ),
-            );
+            recordModelCalls(usageScopeId, modelCalls);
           },
-          restartCorePlugin: (stage) =>
-            restartCorePlugin(native.page, config, provider, stage).then(async () => {
-              await options.onStageRestarted?.(stage);
-            }),
+          restartCorePlugin: async (stage) => {
+            const priorUsage = await restartCorePlugin(
+              native.page,
+              config,
+              provider,
+              stage,
+            );
+            recordModelCalls(priorUsage.usageScopeId, priorUsage.modelCalls);
+            await options.onStageRestarted?.(stage);
+          },
         });
       } finally {
         recordedApprovals += callApprovals;
@@ -488,8 +502,8 @@ async function restartCorePlugin(
   config: E2EAiConfig,
   provider: "ollama" | "openai_compatible",
   stage?: ProjectLifecycleStageName,
-): Promise<void> {
-  await page.evaluate(async ({ pluginId, requiredLifecycleTool }) => {
+): Promise<{ usageScopeId: string | null; modelCalls: number | null }> {
+  const priorUsage = await page.evaluate(async ({ pluginId, requiredLifecycleTool }) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.plugins?.disablePlugin || !app?.plugins?.enablePlugin) {
       throw new Error("Obsidian plugin lifecycle APIs are unavailable.");
@@ -533,6 +547,18 @@ async function restartCorePlugin(
         "process:prior_plugin_run_did_not_settle — the disabled coordinator remained active after its bounded shutdown window.",
       );
     }
+    const settledSnapshot = activePlugin?.getMissionRunSnapshot?.();
+    const priorUsage = {
+      usageScopeId:
+        typeof settledSnapshot?.providerUsageScopeId === "string"
+          ? settledSnapshot.providerUsageScopeId
+          : null,
+      modelCalls: Number.isSafeInteger(
+        settledSnapshot?.providerUsage?.modelCallCount,
+      )
+        ? settledSnapshot.providerUsage.modelCallCount
+        : null,
+    };
     await app.plugins.enablePlugin(pluginId);
     let plugin: any = null;
     for (let attempt = 0; attempt < 240; attempt += 1) {
@@ -544,6 +570,7 @@ async function restartCorePlugin(
       throw new Error("Agentic Researcher did not become ready after restart.");
     }
     await plugin.activateView?.();
+    return priorUsage;
   }, {
     pluginId: NATIVE_CORE_PLUGIN_ID,
     requiredLifecycleTool: stage
@@ -560,6 +587,7 @@ async function restartCorePlugin(
   // cannot prove it saw that prefix marks itself lossy, which degrades the
   // whole merged answer to UNKNOWN rather than reporting a short count.
   await armToolCallCollector(page);
+  return priorUsage;
 }
 
 async function waitUntilIdleOrComplete(

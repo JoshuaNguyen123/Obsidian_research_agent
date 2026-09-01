@@ -623,6 +623,9 @@ test("interrupted continuation proves a durable window and settles the old coord
   const enable = harness.indexOf("await app.plugins.enablePlugin(pluginId)");
   assert.ok(disable >= 0 && settle > disable && enable > settle);
   assert.match(harness, /process:prior_plugin_run_did_not_settle/u);
+  assert.match(spec, /lastConfig\?\.rootRunId/u);
+  assert.match(spec, /binding:resume_same_root_run/u);
+  assert.match(spec, /readProgressCounters\(\)/u);
 });
 
 test("offline AI is restricted to the production-client offline project", () => {

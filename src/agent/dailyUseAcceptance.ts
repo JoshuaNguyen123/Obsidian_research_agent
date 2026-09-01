@@ -218,7 +218,7 @@ export const INTERRUPT_01_ACCEPTANCE_TOKENS = Object.freeze({
     "tool_calls:complete_zero_failure",
   ] as const),
   approvals: Object.freeze([] as const),
-  bindings: Object.freeze(["binding:resume_same_run"] as const),
+  bindings: Object.freeze(["binding:resume_same_root_run"] as const),
   cleanup: Object.freeze([] as const),
 });
 

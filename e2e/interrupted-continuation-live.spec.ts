@@ -150,8 +150,12 @@ test.describe("interrupted continuation", () => {
       const snapshot = await harness.attestProductionRun({
         allowVerifiedNoModelResume: true,
       });
+      const progress = harness.readProgressCounters();
       const safeState = JSON.stringify({
         interruptWindow,
+        requestedRootRunId: runId,
+        attestedRootRunId: snapshot.lastConfig?.rootRunId ?? null,
+        segmentRunId: snapshot.lastMissionLedger?.runId ?? null,
         complete: snapshot.lastComplete,
         acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
         receipts: snapshot.lastReceipts.map((receipt: any) => ({
@@ -160,6 +164,7 @@ test.describe("interrupted continuation", () => {
           hasReadback: Boolean(receipt.readback),
         })),
         providerUsage: snapshot.providerUsage,
+        totalModelCalls: progress.modelCalls,
       });
 
       // The ordered append graph is authority-complete. Resume must expose
@@ -195,7 +200,11 @@ test.describe("interrupted continuation", () => {
         snapshot.lastMissionLedger?.acceptance?.status,
         safeState,
       ).toBe("pass");
-      expect(snapshot.lastMissionLedger?.runId, safeState).toBe(runId);
+      // Continuations intentionally mint a new segment ledger id. The binding
+      // contract is the durable root id, not equality between root and segment.
+      expect(snapshot.lastConfig?.rootRunId, safeState).toBe(runId);
+      expect(snapshot.lastMissionLedger?.runId, safeState).toMatch(/^run-/u);
+      expect(progress.modelCalls, safeState).toBeGreaterThan(0);
       expect(snapshot.lastMissionScorecard, safeState).toBeTruthy();
       expect(snapshot.lastMissionScorecard?.acceptancePassed, safeState).toBe(true);
 
@@ -264,11 +273,11 @@ test.describe("interrupted continuation", () => {
             "tool_calls:complete_zero_failure",
           ],
           approvals: [],
-          bindings: ["binding:resume_same_run"],
+          bindings: ["binding:resume_same_root_run"],
           cleanup: [],
         },
         {
-          modelCalls: snapshot.providerUsage.modelCallCount,
+          modelCalls: progress.modelCalls,
           toolCalls: toolOutcomes.attempted ?? 0,
           continuations: 1,
           missionScorecard: snapshot.lastMissionScorecard,
