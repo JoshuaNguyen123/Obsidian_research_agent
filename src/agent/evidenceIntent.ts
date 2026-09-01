@@ -2,6 +2,52 @@ import type { MissionIntent } from "../tools/types";
 import { hasWordCountIntent } from "./wordCountIntent";
 
 /**
+ * Return the one normalized HTTP(S) target named by an explicit `web_fetch`
+ * request. Multiple targets are deliberately ambiguous: the host must not
+ * collapse a comparison or source set into one provider call.
+ */
+export function getSingleExplicitWebFetchUrlV1(prompt: string): string | null {
+  if (!/\bweb_fetch\b/iu.test(prompt)) return null;
+  const urls = new Set<string>();
+  for (const match of prompt.matchAll(/https?:\/\/[^\s<>"'`]+/giu)) {
+    const candidate = match[0]!.replace(/[)\],.;!?]+$/gu, "");
+    if (!candidate) continue;
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
+      parsed.hash = "";
+      urls.add(parsed.toString());
+    } catch {
+      // Invalid prompt URLs remain model text; they grant no host binding.
+    }
+  }
+  return urls.size === 1 ? [...urls][0]! : null;
+}
+
+/**
+ * A single exact fetch plus an explicit search prohibition is a closed read
+ * frontier, not a research-discovery request. Keeping this predicate shared is
+ * essential: the tool catalogue, loop budget, and MissionGraph must all remove
+ * `web_search`, or one of them can reintroduce the forbidden transport call.
+ */
+export function hasExplicitSingleWebFetchOnlyIntent(prompt: string): boolean {
+  if (!getSingleExplicitWebFetchUrlV1(prompt)) return false;
+  const exactlyOnce =
+    /\bweb_fetch\b[\s\S]{0,40}\bonce\b|\b(?:once|single)\b[\s\S]{0,40}\bweb_fetch\b|\bexactly\s+(?:one|1)\b[\s\S]{0,40}\bweb_fetch\b/iu.test(
+      prompt,
+    );
+  const forbidsSearch =
+    /\b(?:do\s+not|don't|never)\s+(?:(?:use|call|run|perform)\s+)?(?:web_)?search(?:ing)?\b/iu.test(
+      prompt,
+    ) ||
+    /\bwithout\s+(?:(?:using|calling|running|performing)\s+)?(?:web_)?search(?:ing)?\b/iu.test(
+      prompt,
+    ) ||
+    /\bno\s+(?:web_)?search(?:ing)?\b/iu.test(prompt);
+  return exactlyOnce && forbidsSearch;
+}
+
+/**
  * Literary / primary-text citation: "quotes/citations from the text|novel|book".
  * This is close-reading support, not a request for public-web sources.
  */

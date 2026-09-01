@@ -469,6 +469,19 @@ test("loop planner reserves finalization for grounded generated writing", () => 
   assert.deepEqual(budget.expectedTools, ["web_search", "web_fetch"]);
 });
 
+test("loop planner owes only the explicitly requested cache fetch when search is forbidden", () => {
+  const prompt =
+    "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.";
+  const budget = planLoopBudget({
+    prompt,
+    route: "grounded_workflow",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 12,
+  });
+
+  assert.deepEqual(budget.expectedTools, ["web_fetch"]);
+});
+
 test("loop planner does not expect web tools for primary-text literary citations", () => {
   const prompt =
     "Write a 3000 college level essay on the Catcher in the rye. Use supporting details and quotes, and citations directly from the text to support your essay.";

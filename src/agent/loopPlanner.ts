@@ -2,6 +2,7 @@ import { MAX_AGENT_STEPS } from "../tools/constants";
 import { FINALIZATION_RESERVE_STEPS } from "./AgentBudget";
 import {
   hasExplicitNoWebIntent,
+  hasExplicitSingleWebFetchOnlyIntent,
   hasPrimaryTextCitationIntent,
 } from "./evidenceIntent";
 import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
@@ -87,6 +88,10 @@ function getExpectedTools(
   // web evidence before repository execution. Generic later wording such as
   // "run targeted validation" must not replace that evidence frontier with
   // the legacy single-block code tool.
+  if (hasExplicitSingleWebFetchOnlyIntent(prompt)) {
+    return ["web_fetch"];
+  }
+
   if (hasExplicitWebGroundingIntent(prompt)) {
     return ["web_search", "web_fetch"];
   }

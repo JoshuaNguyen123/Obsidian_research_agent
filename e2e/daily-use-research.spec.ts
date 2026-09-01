@@ -622,6 +622,14 @@ test.describe("Daily-use live research contract", () => {
       const cacheSnapshot = await harness.attestProductionRun({
         requireStructuredRouting: true,
       });
+      expect(
+        cacheSnapshot.lastConfig?.allowedToolNames,
+        "an exact one-call cache read must keep web_fetch available",
+      ).toContain("web_fetch");
+      expect(
+        cacheSnapshot.lastConfig?.allowedToolNames,
+        "an explicit no-search cache read must not offer web_search",
+      ).not.toContain("web_search");
       const metricsAfterCacheRead = await harness.readOwnedWebMetrics();
       expect(
         cacheSnapshot.missionEvidence.some(

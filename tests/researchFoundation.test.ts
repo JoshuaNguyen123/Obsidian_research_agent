@@ -15,6 +15,7 @@ import {
   parseExplicitResearchSourceCount,
   decomposePromptIntoResearchQuestions,
   normalizeResearchPlan,
+  researchLadderToolNamesForPromptV1,
 } from "../src/agent/researchPlan";
 import {
   SOURCE_CACHE_SECTION_CHARS,
@@ -876,6 +877,30 @@ test("bounded two-claim verification does not inherit the deep-research three-so
   });
 
   assert.equal(plan, null);
+});
+
+test("single exact cache fetch has no search debt or research-plan expansion", () => {
+  const prompt =
+    "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.";
+  const plan = createResearchPlan({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+    modeOverride: "deep_web",
+  });
+
+  assert.equal(plan, null);
+  assert.deepEqual(researchLadderToolNamesForPromptV1(prompt, 3), ["web_fetch"]);
+  assert.deepEqual(
+    researchLadderToolNamesForPromptV1(
+      "Search the web and fetch two sources about cache design.",
+      2,
+    ),
+    ["web_search", "web_fetch", "web_fetch"],
+  );
 });
 
 test("current-note sourced writeback is not misclassified as current-events deep research", () => {

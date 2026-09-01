@@ -16,6 +16,7 @@ import type {
 import { type AgentRuntimeCache, type CodeValidationDiagnosticObservation, type ToolExecutionContext, type ToolExecutionResult, type VerifiedWorkspaceReadObservation } from "../tools/types";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
 import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
+import { getSingleExplicitWebFetchUrlV1 } from "./evidenceIntent";
 import { isAdaptiveCodeWorkspaceMutationToolNameV1 } from "./missionGraphFrontier";
 import { getMissionGraphNodeSelector, getSafeMissionCompositeLifecycleSpecV1 } from "./missionGraphSelectors";
 import { extractRequiredLiteralAnchors } from "./missionPlan";
@@ -278,24 +279,9 @@ export function bindExplicitWebFetchContract(
   ) {
     return null;
   }
-  const urls = new Set<string>();
-  for (const match of prompt.matchAll(/https?:\/\/[^\s<>"'`]+/giu)) {
-    const candidate = match[0]!.replace(/[)\],.;!?]+$/gu, "");
-    if (!candidate) continue;
-    try {
-      const parsed = new URL(candidate);
-      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-        parsed.hash = "";
-        urls.add(parsed.toString());
-      }
-    } catch {
-      // Invalid prompt URLs remain model text; do not create a host binding.
-    }
-  }
-  if (urls.size !== 1) return null;
-
   const refreshMatch = /\brefresh\s*=\s*(true|false)\b/iu.exec(prompt);
-  const explicitUrl = [...urls][0]!;
+  const explicitUrl = getSingleExplicitWebFetchUrlV1(prompt);
+  if (!explicitUrl) return null;
   return {
     ...toolCall,
     arguments: {

@@ -463,8 +463,8 @@ test("the mission graph folds its two research ladders instead of summing them",
   // Both ladders must keep deriving their shape from the ONE shared helper.
   assert.match(
     runner,
-    /const plannedResearchGraphToolNames = researchLadderToolNamesV1\(/u,
-    "the proof-debt ladder must consume the shared ladder derivation",
+    /const plannedResearchGraphToolNames = researchLadderToolNamesForPromptV1\(/u,
+    "the proof-debt ladder must consume the shared prompt-aware ladder derivation",
   );
   assert.match(
     runner,

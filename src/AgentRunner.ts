@@ -787,6 +787,7 @@ import {
 } from "./agent/missionPlanAcceptance";
 import {
   hasExplicitNoWebIntent,
+  hasExplicitSingleWebFetchOnlyIntent,
   hasExplicitPublicWebSignal,
   hasPrimaryTextCitationIntent,
   isLiteraryPrimaryTextWriteMission,
@@ -893,6 +894,7 @@ import {
   mergeResearchLadderToolNamesV1,
   parseExplicitResearchSourceCount,
   promptForbidsFetchedSourceWriteback,
+  researchLadderToolNamesForPromptV1,
   researchLadderToolNamesV1,
   type ResearchEffortAssessment,
   type ResearchEffortAssist,
@@ -4726,7 +4728,8 @@ export async function runAgentMission({
             ? (parseExplicitResearchSourceCount(activeIntentPrompt) ?? 1)
             : 0,
         );
-        const plannedResearchGraphToolNames = researchLadderToolNamesV1(
+        const plannedResearchGraphToolNames = researchLadderToolNamesForPromptV1(
+          activeIntentPrompt,
           requiredGraphFetchCount,
         ).filter((name) => graphAllowedToolNames.includes(name));
         for (const name of plannedResearchGraphToolNames) {
@@ -28201,6 +28204,8 @@ function getAllowedToolDefinitions(
     shouldAllowWebSearch(prompt, missionIntent) ||
     allowResume ||
     hasReflexReadLabel(["web_research"]);
+  const explicitSingleWebFetchOnly =
+    hasExplicitSingleWebFetchOnlyIntent(prompt);
   const allowCurrentNoteRead =
     hasCurrentNoteReadIntent(prompt) || hasCurrentNoteSectionTarget(prompt) || allowResume;
   const allowWordCount =
@@ -28427,12 +28432,12 @@ function getAllowedToolDefinitions(
       return false;
     }
 
-    if (
-      name === "web_search" ||
-      name === "web_fetch" ||
-      name === "read_source_section"
-    ) {
+    if (name === "web_fetch") {
       return allowWebSearch;
+    }
+
+    if (name === "web_search" || name === "read_source_section") {
+      return allowWebSearch && !explicitSingleWebFetchOnly;
     }
 
     if (name === "open_web_source") {
@@ -28703,6 +28708,15 @@ function getAllowedToolDefinitions(
 
     return true;
   });
+
+  // The user named one exact read and explicitly prohibited discovery. Keep
+  // this catalogue closed to that single call; incidental words such as
+  // "note" in a write prohibition must not reintroduce a vault read tool.
+  if (explicitSingleWebFetchOnly) {
+    return filtered.filter(
+      (definition) => definition.function.name === "web_fetch",
+    );
+  }
 
   // Explicit parallel vault-read missions must keep a multi-tool read batch
   // available even when mutation intent would otherwise narrow the allowlist.

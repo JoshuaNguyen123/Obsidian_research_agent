@@ -125,6 +125,7 @@ import {
   hasPreparedBackgroundCodeValidationCommitIntent,
   hasIgnoreRememberedContextIntent,
 } from "../src/agent/promptIntentClassifiers";
+import { hasExplicitSingleWebFetchOnlyIntent } from "../src/agent/evidenceIntent";
 import {
   applyExactWorkspaceCorrectionReplacements,
   applyExactWorkspaceLineRangeCorrections,
@@ -331,8 +332,23 @@ test("explicit Code tool selection does not widen a tool name to its prefix", ()
 });
 
 test("single explicit web_fetch target and cache policy override provider drift", () => {
+  const fetchOnlyPrompt =
+    "Call web_fetch once for https://primary.owned.example/evidence/marker with refresh=false. Do not search.";
+  assert.equal(hasExplicitSingleWebFetchOnlyIntent(fetchOnlyPrompt), true);
+  assert.equal(
+    hasExplicitSingleWebFetchOnlyIntent(
+      "Call web_fetch once for https://primary.owned.example/evidence/marker with refresh=false.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasExplicitSingleWebFetchOnlyIntent(
+      "Call web_fetch once for https://one.example/a and https://two.example/b. Do not search.",
+    ),
+    false,
+  );
   const bound = bindExplicitWebFetchContract(
-    "Call web_fetch once for https://primary.owned.example/evidence/marker with refresh=false.",
+    fetchOnlyPrompt,
     {
       id: "fetch-1",
       name: "web_fetch",
@@ -368,6 +384,36 @@ test("single explicit web_fetch target and cache policy override provider drift"
       },
     ),
     null,
+  );
+});
+
+test("single exact cache fetch excludes search from the offered frontier", async () => {
+  const prompt =
+    "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.";
+  const chatRequests: ModelChatRequest[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("The cache read still needs its tool call.")],
+    }),
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    maxSteps: 1,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(configs[0]?.allowedToolNames.includes("web_fetch"), true);
+  assert.equal(configs[0]?.allowedToolNames.includes("web_search"), false);
+  assert.equal(configs[0]?.allowedToolNames.includes("read_source_section"), false);
+  assert.deepEqual(
+    chatRequests[0]?.tools?.map((tool) => tool.function.name),
+    ["web_fetch"],
   );
 });
 

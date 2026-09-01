@@ -12,6 +12,7 @@ import {
 } from "./missionPlan";
 import {
   hasExplicitNoWebIntent,
+  hasExplicitSingleWebFetchOnlyIntent,
   requiresVaultEvidenceProof,
   requiresWebEvidenceProof,
   withoutVaultAddressingVocabularyV1,
@@ -163,6 +164,9 @@ export function createResearchPlan({
   defaultMinFetchedSources,
   researchEffortCeiling,
 }: CreateResearchPlanInput): ResearchPlan | null {
+  if (hasExplicitSingleWebFetchOnlyIntent(prompt)) {
+    return null;
+  }
   const regexMode = classifyResearchMode(prompt, missionIntent, runPlan);
   // A self-contained revision of the current note is a positive "not research"
   // verdict, not merely an unclassified prompt. The semantic assist may upgrade
@@ -458,6 +462,9 @@ export function allowsResearchModeAssistActivation(
   prompt: string,
   missionIntent: MissionIntent,
 ): boolean {
+  if (hasExplicitSingleWebFetchOnlyIntent(prompt)) {
+    return false;
+  }
   return (
     requiresWebEvidenceProof(prompt, missionIntent) ||
     requiresVaultEvidenceProof(prompt, missionIntent)
@@ -531,6 +538,20 @@ export function researchLadderToolNamesV1(fetchCount: number): string[] {
   const fetches = Math.max(0, Math.trunc(fetchCount));
   if (fetches <= 0) return [];
   return ["web_search", ...Array.from({ length: fetches }, () => "web_fetch")];
+}
+
+/**
+ * Prompt-aware research debt. An explicit one-call fetch-only contract already
+ * supplies source discovery, so its graph owes exactly that fetch and no search.
+ */
+export function researchLadderToolNamesForPromptV1(
+  prompt: string,
+  fetchCount: number,
+): string[] {
+  if (hasExplicitSingleWebFetchOnlyIntent(prompt)) {
+    return fetchCount > 0 ? ["web_fetch"] : [];
+  }
+  return researchLadderToolNamesV1(fetchCount);
 }
 
 /**
