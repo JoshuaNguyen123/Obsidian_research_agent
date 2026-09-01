@@ -377,6 +377,9 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       waitForCompletion: false,
       timeoutMs: 50 * 60_000,
     });
+    // Also pins terminal projection closure: if the last draft is held while
+    // only final relevance/output evidence remains, the harness emits the
+    // stable product:final_projection_candidate_rejected alarm.
     const preparedApprovalCount = await harness.approveUntilMissionComplete(
       50 * 60_000,
       {

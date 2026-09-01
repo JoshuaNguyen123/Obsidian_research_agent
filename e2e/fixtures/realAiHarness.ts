@@ -1722,8 +1722,34 @@ async function approveUntilMissionComplete(
         autoContinueReason: ui.autoContinueReason,
         recentDiagnostics: ui.diagnostics.slice(-6),
       };
+      const acceptanceMissing = (
+        ui.ledger?.acceptance as { missing?: unknown } | undefined
+      )?.missing;
+      const finalProjectionDebtOnly =
+        Array.isArray(acceptanceMissing) &&
+        acceptanceMissing.length > 0 &&
+        acceptanceMissing.every(
+          (item) =>
+            typeof item === "string" &&
+            (item === "final_output" ||
+              /(?:^|:)final_relevance$/u.test(item) ||
+              /(?:^|:)final_output$/u.test(item)),
+        );
+      const finalNodeReady = ui.graph.some(
+        (node) =>
+          node.id === "final" &&
+          (node.status === "ready" || node.status === "queued") &&
+          node.allowedTools.length === 0,
+      );
+      // Stable product identity for the circular finalization failure: every
+      // substantive proof is paid, but the candidate was held before the only
+      // operation that can record terminal projection evidence.
+      const failurePrefix =
+        finalProjectionDebtOnly && finalNodeReady
+          ? "product:final_projection_candidate_rejected — "
+          : "";
       throw new Error(
-        `Mission stopped before acceptance; approved=${approvals}; summary=${JSON.stringify(failureSummary)}; state=${JSON.stringify(ui)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
+        `${failurePrefix}Mission stopped before acceptance; approved=${approvals}; summary=${JSON.stringify(failureSummary)}; state=${JSON.stringify(ui)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
       );
     }
     missingContinuationPolls = 0;

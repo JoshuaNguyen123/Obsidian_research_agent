@@ -188,6 +188,26 @@ test("an exhausted semantic-index helper timeout is a stable product alarm", () 
   assert.deepEqual(classified.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
 });
 
+test("a circular final-projection hold is a stable product alarm", () => {
+  const logText = [
+    "Error: product:final_projection_candidate_rejected — Mission stopped before acceptance",
+    'missing=["plan:final:final_relevance","verifier:final:final_relevance"]',
+    "  1) [compound-flow-real-live] › e2e/compound-flow-real-live.spec.ts › FLOW-REAL-01",
+  ].join("\n");
+  const classified = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: { records: [{ status: "failed" }] },
+    summaryFresh: true,
+    logText,
+  });
+  assert.equal(
+    classified.failureClass,
+    "product:final_projection_candidate_rejected",
+  );
+  assert.equal(classified.confidence, CLASSIFICATION_MECHANICAL);
+  assert.deepEqual(classified.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
+});
+
 test("proof-matrix cell projects are exclusive-runner allowlisted", () => {
   // 2026-08-25: interrupted-continuation-live existed in playwright.config.ts
   // and package.json but not PLAYWRIGHT_PROJECTS, so four proof-matrix

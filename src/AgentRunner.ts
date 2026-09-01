@@ -21726,7 +21726,35 @@ export async function runAgentMission({
           activeIntentPrompt,
         );
         await recordMissionAcceptance(candidateAcceptance, step);
-        if (candidateAcceptance.status !== "pass") {
+        // The final MissionGraph node is the authority that RECORDS these two
+        // projection proofs, so pre-emission verification cannot demand they
+        // already exist. Doing so is circular: a fully proved compound run
+        // held its relevant 3,822-character final draft, reoffered read tools,
+        // and exhausted the graph envelope after 99 model calls. Every other
+        // proof remains blocking; this narrow debt set proceeds to
+        // finishRun("final"), which records the final node and re-evaluates.
+        const candidateOnlyFinalProjectionDebt =
+          missionAcceptanceHasOnlyFinalProjectionDebt(candidateAcceptance);
+        if (candidateOnlyFinalProjectionDebt) {
+          events.onStatus?.(
+            "Final draft passed every pre-projection check; recording terminal relevance proof...",
+          );
+          events.onTrace?.({
+            id: `final-projection-candidate-admitted-${step}`,
+            kind: "verification",
+            step,
+            message:
+              "Admitted a verified final draft whose only remaining debt is recorded by the terminal MissionGraph projection.",
+            outputPreview: {
+              missing: candidateAcceptance.missing,
+              payloadFingerprint: hashOperationInput(lastFinalOutput),
+            },
+          });
+        }
+        if (
+          candidateAcceptance.status !== "pass" &&
+          !candidateOnlyFinalProjectionDebt
+        ) {
           const rejectedCandidate = lastFinalOutput;
           lastFinalOutput = "";
           if (

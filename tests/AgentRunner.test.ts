@@ -3840,7 +3840,17 @@ test("verified host export finalizes immediately only after all proof debt is pa
   );
 });
 
-test("verified host export recognizes only terminal projection debt", () => {
+test("terminal projection debt classifier is narrow enough for pre-emission finalization", () => {
+  assert.equal(
+    missionAcceptanceHasOnlyFinalProjectionDebt({
+      missing: [
+        "plan:final:final_relevance",
+        "verifier:final:final_relevance",
+      ],
+    }),
+    true,
+    "the exact live compound failure must reach finishRun so the final node can record both proofs",
+  );
   assert.equal(
     missionAcceptanceHasOnlyFinalProjectionDebt({
       missing: ["plan:final:final_relevance", "final_output"],
@@ -3854,9 +3864,40 @@ test("verified host export recognizes only terminal projection debt", () => {
     false,
   );
   assert.equal(
+    missionAcceptanceHasOnlyFinalProjectionDebt({
+      missing: [
+        "plan:final:final_relevance",
+        "verifier:citation_coverage:source-1",
+      ],
+    }),
+    false,
+    "citation debt remains blocking before any output is emitted",
+  );
+  assert.equal(
     missionAcceptanceHasOnlyFinalProjectionDebt({ missing: [] }),
     false,
   );
+});
+
+test("pre-emission verification admits projection-only debt before its rejection branch", () => {
+  const runnerSource = readFileSync(
+    new URL("../src/AgentRunner.ts", import.meta.url),
+    "utf8",
+  );
+  const classifierAt = runnerSource.indexOf(
+    "const candidateOnlyFinalProjectionDebt =",
+  );
+  const rejectionAt = runnerSource.indexOf(
+    'candidateAcceptance.status !== "pass" &&\n          !candidateOnlyFinalProjectionDebt',
+    classifierAt,
+  );
+  const terminalAt = runnerSource.indexOf(
+    'await finishRun(\n        isClarifyingQuestionResponse',
+    rejectionAt,
+  );
+  assert.ok(classifierAt > 0, "the candidate gate must classify terminal projection debt");
+  assert.ok(rejectionAt > classifierAt, "projection-only debt must be excluded from rejection");
+  assert.ok(terminalAt > rejectionAt, "the admitted candidate must still flow through finishRun(final)");
 });
 
 test("verified host export rechecks readiness after active-task acceptance advances", () => {

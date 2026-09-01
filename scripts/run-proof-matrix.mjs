@@ -806,6 +806,10 @@ const PRODUCT_LOG_SIGNATURES = [
     /product:semantic_index_setup_timeout\b/u,
     "product:semantic_index_setup_timeout",
   ],
+  [
+    /product:final_projection_candidate_rejected\b/u,
+    "product:final_projection_candidate_rejected",
+  ],
 ];
 
 /**
