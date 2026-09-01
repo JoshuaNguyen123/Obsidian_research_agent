@@ -739,6 +739,10 @@ const HARNESS_LOG_SIGNATURES = [
   [/^test-vault sync exited with code \d+\.$/mu, "harness:vault_sync_failed"],
   [/^e2e preflight exited with code \d+\.$/mu, "harness:preflight_refused"],
   [/Unknown E2E project /u, "harness:unknown_project"],
+  [
+    /process:prior_plugin_run_did_not_settle\b/u,
+    "process:prior_plugin_run_did_not_settle",
+  ],
 ];
 
 /**
@@ -1751,6 +1755,10 @@ async function main() {
         ...process.env,
         E2E_AI_MODEL: PROOF_MATRIX_MODEL,
         E2E_MODEL_PROVIDER: process.env.E2E_MODEL_PROVIDER ?? "ollama",
+        // The campaign writes the authoritative row after it adds attempt,
+        // streak, and classification evidence. Prevent the child runner from
+        // recording a second, less specific row for the same execution.
+        E2E_RUN_METRICS_OWNER: "proof-matrix",
         // A campaign attempt must outwait a stray exclusive run, not burn an
         // attempt every 30 seconds against a held lock (the 2026-08-25 03:06
         // crash loop exhausted a cell in 90 seconds this way). Explicit

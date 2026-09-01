@@ -83,6 +83,23 @@ test("guard tests and exempt lanes are ignored without complaint", () => {
   assert.match(skipped[0], /exempt/u);
 });
 
+test("an explicit mission proof overrides a sibling project's generic exemption", () => {
+  const { harvestable, skipped } = selectHarvestableRecords(
+    summary([
+      record({
+        project: "real-ai-soak",
+        scenarioId: "VAULT-01",
+        title: "VAULT-01 deep vault retrieval and semantic expansion",
+        proofClass: "mission",
+      }),
+    ]),
+  );
+  assert.equal(skipped.length, 0);
+  assert.equal(harvestable.length, 1);
+  assert.equal(harvestable[0].project, "real-ai-soak");
+  assert.equal(harvestable[0].scenarioId, "VAULT-01");
+});
+
 test("harvesting one lane keeps the records of lanes that did not run", () => {
   // This is what makes the loop usable without CI: the scored lanes take hours
   // in total but can be run and harvested independently, across sittings.

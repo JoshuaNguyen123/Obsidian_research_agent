@@ -83,7 +83,17 @@ export function selectHarvestableRecords(summary) {
       typeof record?.scenarioId === "string" ? record.scenarioId.trim() : "";
     // Guard tests carry no scenario mapping and nothing to regress.
     if (!scenarioId) continue;
-    if (MISSION_SCORECARD_EXEMPT_PROJECTS.has(project)) {
+    // Project exemptions protect generic contract/guard tests that cannot emit
+    // a mission scorecard. A targeted test that explicitly declares itself a
+    // mission proof through recordDailyUseAcceptance has a stronger contract:
+    // its typed scorecard must be harvestable even when sibling tests in the
+    // same Playwright project remain unscored.
+    const proofClass =
+      typeof record?.proofClass === "string" ? record.proofClass.trim() : "";
+    if (
+      MISSION_SCORECARD_EXEMPT_PROJECTS.has(project) &&
+      proofClass !== "mission"
+    ) {
       skipped.push(`${project}/${scenarioId}: lane is exempt from scorecards`);
       continue;
     }

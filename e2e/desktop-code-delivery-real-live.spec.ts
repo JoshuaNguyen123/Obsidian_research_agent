@@ -27,7 +27,11 @@ import {
   type RealAiHarness,
 } from "./fixtures/realAiHarness";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
-import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+import {
+  peekToolCallCollector,
+  peekToolCallCollectorDiagnosticsV1,
+  recordToolCallOutcomesAfterEach,
+} from "./fixtures/toolCallCollector";
 
 recordToolCallOutcomesAfterEach();
 
@@ -310,6 +314,30 @@ test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game",
         testInfo.annotations.push({
           type: "cleanup-error",
           description: detail,
+        });
+      }
+    }
+    if (harness) {
+      try {
+        const [toolCounts, toolDiagnostics] = await Promise.all([
+          peekToolCallCollector(harness.page),
+          peekToolCallCollectorDiagnosticsV1(harness.page),
+        ]);
+        await testInfo.attach("desktop-code-tool-call-diagnostics", {
+          body: JSON.stringify(
+            {
+              counts: toolCounts,
+              events: toolDiagnostics,
+            },
+            null,
+            2,
+          ),
+          contentType: "application/json",
+        });
+      } catch (error) {
+        testInfo.annotations.push({
+          type: "tool-diagnostics-error",
+          description: String(error).slice(0, 500),
         });
       }
     }

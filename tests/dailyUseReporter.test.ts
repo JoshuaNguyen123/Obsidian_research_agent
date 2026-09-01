@@ -429,6 +429,9 @@ test("a spec's own counters outrank the harness-wide fold", () => {
   assert.equal(record.toolCallsFailed, 4);
   // The fingerprinted evidence-derived counter is untouched.
   assert.equal(record.toolCalls, 11);
+  const [summary] = summarizeRecords([record]);
+  assert.equal(summary.scenarioId, "DU-06");
+  assert.equal(summary.taskFamily, "compound");
 });
 
 test("group summaries keep unknown tool calls unknown", () => {
@@ -436,6 +439,8 @@ test("group summaries keep unknown tool calls unknown", () => {
   reporter.onTestEnd(fakeTest({}), fakeResult());
   reporter.onTestEnd(fakeTest({}), fakeResult());
   const [summary] = summarizeRecords(recordsOf(reporter));
+  assert.equal(summary.scenarioId, null);
+  assert.equal(summary.taskFamily, "unknown");
   assert.equal(summary.toolCalls, null, "no record knew: the group total is unknown");
   assert.equal(summary.toolCallsAttempted, null);
 });

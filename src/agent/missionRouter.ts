@@ -205,6 +205,14 @@ export async function classifyMissionWithModelDetailed({
       attempts: 2,
     };
   } catch (error) {
+    // The router may fail closed on its own timeout/provider error, but a
+    // caller cancellation is lifecycle authority, not routing evidence. If we
+    // translate it to router_provider_unavailable the agent keeps
+    // bootstrapping after plugin unload and the old coordinator can overlap a
+    // resumed instance.
+    if (abortSignal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
     if (
       error instanceof ModelClientError &&
       error.category === "provider_budget_exhausted"

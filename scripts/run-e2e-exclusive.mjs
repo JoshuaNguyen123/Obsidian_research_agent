@@ -4,6 +4,7 @@ import {
   mkdir,
   open,
   readFile,
+  stat,
   unlink,
 } from "node:fs/promises";
 import os from "node:os";
@@ -22,6 +23,11 @@ const OFFLINE_ATTEMPT_SUMMARY_PATH = path.join(
   repoRoot,
   "test-results",
   "offline-application-attempts.json",
+);
+const DAILY_USE_RUN_SUMMARY_PATH = path.join(
+  repoRoot,
+  "test-results",
+  "daily-use-run-summary.json",
 );
 const DEFAULT_WAIT_MS = 30_000;
 const DEFAULT_POLL_MS = 250;
@@ -278,6 +284,11 @@ async function main() {
   applyPersistedWindowsSandboxEnvironment({ projects });
   installSignalHandlers();
 
+  const runStartedAt = Date.now();
+  const summaryMtimeBefore = await asyncFileMtimeMs(DAILY_USE_RUN_SUMMARY_PATH);
+  const reportMtimeBefore = await asyncFileMtimeMs(PLAYWRIGHT_EXECUTION_REPORT_PATH);
+  let completedPipelineExitCode = null;
+  let finalRunExitCode = null;
   try {
     if (aiMode === "offline") {
       await unlink(OFFLINE_ATTEMPT_SUMMARY_PATH).catch((error) => {
@@ -300,6 +311,7 @@ async function main() {
       `E2E lane=${process.env.E2E_PLAYWRIGHT_LANE} live_external=${process.env.E2E_LIVE_EXTERNAL === "1" ? "enabled" : "disabled"}`,
     );
     const exitCode = await runE2ePipeline(playwrightArgs);
+    completedPipelineExitCode = exitCode;
     if (exitCode === 0) {
       // Execution proof first: a scorecard check over a suite that never ran
       // would just be a second way to report a green lie.
@@ -341,20 +353,49 @@ async function main() {
         }
       }
     }
-    process.exitCode = interruptedSignal
+    finalRunExitCode = interruptedSignal
       ? SIGNAL_EXIT_CODES[interruptedSignal] ?? 1
       : exitCode;
+    process.exitCode = finalRunExitCode;
   } catch (error) {
     if (!interruptedSignal) {
       console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
+      finalRunExitCode = 1;
+      process.exitCode = finalRunExitCode;
     } else {
-      process.exitCode = SIGNAL_EXIT_CODES[interruptedSignal] ?? 1;
+      finalRunExitCode = SIGNAL_EXIT_CODES[interruptedSignal] ?? 1;
+      process.exitCode = finalRunExitCode;
     }
   } finally {
     if (forcedExitTimer) {
       clearTimeout(forcedExitTimer);
       forcedExitTimer = null;
+    }
+    if (completedPipelineExitCode !== null && aiMode === "real") {
+      try {
+        const { recordExclusiveRunMetricsIfExecuted } = await import(
+          "./record-e2e-run-metrics.mjs"
+        );
+        const metric = recordExclusiveRunMetricsIfExecuted({
+          repoRoot,
+          reportPath: PLAYWRIGHT_EXECUTION_REPORT_PATH,
+          summaryPath: DAILY_USE_RUN_SUMMARY_PATH,
+          reportMtimeBefore,
+          summaryMtimeBefore,
+          projects,
+          model: process.env.E2E_AI_MODEL || "(unset)",
+          startedAt: runStartedAt,
+          endedAt: Date.now(),
+          exitCode: finalRunExitCode ?? completedPipelineExitCode,
+          metricsOwner: process.env.E2E_RUN_METRICS_OWNER,
+        });
+        if (metric.recorded) {
+          console.log("Recorded direct real-AI run metrics from fresh execution proof.");
+        }
+      } catch (error) {
+        console.error(`Failed to record real-AI run metrics: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
     }
     await activeLock?.release().catch((error) => {
       console.error(`Failed to release Obsidian e2e lock: ${error.message}`);
@@ -362,6 +403,14 @@ async function main() {
     });
     activeLock = null;
     removeSignalHandlers();
+  }
+}
+
+async function asyncFileMtimeMs(filePath) {
+  try {
+    return (await stat(filePath)).mtimeMs;
+  } catch {
+    return null;
   }
 }
 

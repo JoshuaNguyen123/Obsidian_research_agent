@@ -377,6 +377,29 @@ export class RunCoordinator {
           maxSteps: complete.maxSteps,
         });
       } catch (error) {
+        if (controller.signal.aborted) {
+          if (!this.activeRunPublishedAuthority) {
+            this.emit("onTrace", [
+              buildPreAuthorityCompletionDiagnostic(controller.signal),
+            ]);
+          }
+          const fallbackComplete = {
+            step: 0,
+            maxSteps: this.lastConfig?.maxStepsForRun ?? 0,
+            stopReason: "user_stopped" as const,
+          } satisfies AgentRunCompleteEvent;
+          if (!this.lastComplete) {
+            this.emit("onRunComplete", [fallbackComplete]);
+          }
+          const complete = this.lastComplete ?? fallbackComplete;
+          resolveOutcome({
+            runId: this.runId,
+            stopReason: complete.stopReason,
+            step: complete.step,
+            maxSteps: complete.maxSteps,
+          });
+          return;
+        }
         this.emit("onTrace", [buildTerminalErrorDiagnostic(error)]);
         if (!this.lastComplete) {
           this.emit("onRunComplete", [

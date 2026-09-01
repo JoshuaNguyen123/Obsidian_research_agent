@@ -294,7 +294,7 @@ function preparedSandboxContribution(
         };
       } catch (error) {
         return failure(
-          "sandbox_prepare_rejected",
+          sandboxPreparationFailureCodeV2(error),
           error instanceof Error ? error.message : String(error),
         );
       }
@@ -1076,6 +1076,18 @@ function requireExecutionJournal(
 
 function failure(code: string, message: string): PreparedActionResultV1 {
   return { ok: false, error: { code, message } };
+}
+
+/**
+ * Preserve the stable, privacy-safe code from our own validation boundary.
+ * Collapsing every typed preparation failure into `sandbox_prepare_rejected`
+ * made live reliability telemetry unable to distinguish model arguments from
+ * provider, staging, or manifest defects. Unknown exceptions remain generic.
+ */
+function sandboxPreparationFailureCodeV2(error: unknown): string {
+  return error instanceof CodeSandboxContributionErrorV2
+    ? error.code
+    : "sandbox_prepare_rejected";
 }
 
 function assertAllowedArgs(args: Record<string, unknown>, allowed: readonly string[]): void {

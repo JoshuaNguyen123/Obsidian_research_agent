@@ -231,11 +231,16 @@ test("classifyMissionWithModel propagates caller abort without retrying", async 
   const outerController = new AbortController();
   let calls = 0;
   let innerAbortSignal: AbortSignal | undefined;
+  let markRequestStarted!: () => void;
+  const requestStarted = new Promise<void>((resolve) => {
+    markRequestStarted = resolve;
+  });
   const client = clientFromResponse(
     (request) =>
       new Promise((resolve, reject) => {
         calls += 1;
         innerAbortSignal = request.abortSignal;
+        markRequestStarted();
         request.abortSignal?.addEventListener(
           "abort",
           () => reject(new ModelClientError("network", "caller aborted")),
@@ -250,10 +255,15 @@ test("classifyMissionWithModel propagates caller abort without retrying", async 
     timeoutMs: 10_000,
     abortSignal: outerController.signal,
   });
+  await requestStarted;
   assert.ok(innerAbortSignal);
   outerController.abort();
 
-  assert.equal(await intentPromise, null);
+  await assert.rejects(
+    intentPromise,
+    (error: unknown) =>
+      error instanceof DOMException && error.name === "AbortError",
+  );
   assert.equal(innerAbortSignal.aborted, true);
   assert.equal(calls, 1);
 });

@@ -572,6 +572,12 @@ export function summarizeRecords(records: readonly DailyUseRunRecord[]) {
           : ["test_result:passed"];
       return {
         key,
+        // Keep the typed identity explicit in the serialized rollup. The
+        // proof matrix must select one exact scenario; parsing `key` would
+        // couple it to a display/grouping string and silently breaks when the
+        // reporter shape changes.
+        scenarioId: scenarioId ?? null,
+        taskFamily: group[0]?.taskFamily ?? "unknown",
         runs: group.length,
         passed: group.filter((record) => record.status === "passed").length,
         retries: group.reduce((total, record) => total + record.retry, 0),

@@ -626,6 +626,37 @@ test("run coordinator publishes a fallback completion when an aborted executor r
   });
 });
 
+test("run coordinator settles cancellation when an abort-aware executor rejects", async () => {
+  const coordinator = new RunCoordinator();
+  const completions: string[] = [];
+  coordinator.subscribe({
+    onRunComplete: (event) => completions.push(event.stopReason),
+  });
+  const active = coordinator.start(async (signal, events) => {
+    events.onRunConfig?.({
+      runId: "run-abort-rejection",
+      maxStepsForRun: 24,
+    } as never);
+    await new Promise<never>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new DOMException("aborted", "AbortError")),
+        { once: true },
+      );
+    });
+  });
+
+  assert.equal(coordinator.requestStop("coordinator_shutdown"), true);
+  assert.deepEqual(await active, {
+    runId: "run-abort-rejection",
+    step: 0,
+    maxSteps: 24,
+    stopReason: "user_stopped",
+  });
+  assert.deepEqual(completions, ["user_stopped"]);
+  assert.equal(coordinator.getSnapshot().isRunning, false);
+});
+
 test("run coordinator emits a terminal error projection when the executor rejects", async () => {
   const coordinator = new RunCoordinator();
   const completions: string[] = [];

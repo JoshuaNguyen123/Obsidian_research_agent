@@ -564,6 +564,59 @@ test("code contribution factory replaces compatibility execution tools with prep
   assert.equal(observedValidationReceipts, 1);
 });
 
+test("code contribution preparation preserves typed failure codes and keeps unknown exceptions generic", async () => {
+  const manager = new SandboxManagerV2({
+    runner: {
+      async run() {
+        return { exitCode: 1, stdout: "", stderr: "unused" };
+      },
+    },
+    providers: [dockerProvider()],
+  });
+  const fixture = prepareInput();
+  let preparationError: unknown = new CodeSandboxContributionErrorV2(
+    "sandbox_staging_empty",
+    "The trusted workspace has no staged files.",
+  );
+  const contributions = createCodeExecutionContributionsV2({
+    sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
+    getProfile: async () => fixture.profile,
+    async resolvePreparationInput() {
+      throw preparationError;
+    },
+  });
+  const validation = contributions
+    .filter((contribution) => contribution.descriptor.kind === "tool")
+    .map((contribution) => contribution as Extract<typeof contribution, { tool: unknown }>)
+    .find((contribution) => contribution.tool.name === "code_validate_fast")!.tool;
+
+  const typed = await validation.prepare!(
+    { workspaceId: "workspace-1", repairRequestId: "request-1" },
+    context(),
+  );
+  assert.deepEqual(typed, {
+    ok: false,
+    error: {
+      code: "sandbox_staging_empty",
+      message: "The trusted workspace has no staged files.",
+    },
+  });
+
+  preparationError = new Error("Unexpected journal failure.");
+  const unknown = await validation.prepare!(
+    { workspaceId: "workspace-1", repairRequestId: "request-1" },
+    context(),
+  );
+  assert.deepEqual(unknown, {
+    ok: false,
+    error: {
+      code: "sandbox_prepare_rejected",
+      message: "Unexpected journal failure.",
+    },
+  });
+});
+
 test("validation contribution withholds success when durable receipt persistence/readback fails", async () => {
   let executions = 0;
   const manager = new SandboxManagerV2({
