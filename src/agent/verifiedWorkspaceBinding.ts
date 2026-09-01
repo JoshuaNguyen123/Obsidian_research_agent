@@ -16,7 +16,10 @@ import type {
 import { type AgentRuntimeCache, type CodeValidationDiagnosticObservation, type ToolExecutionContext, type ToolExecutionResult, type VerifiedWorkspaceReadObservation } from "../tools/types";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
 import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
-import { getSingleExplicitWebFetchUrlV1 } from "./evidenceIntent";
+import {
+  getSingleExplicitWebFetchUrlV1,
+  hasExplicitSingleWebFetchOnlyIntent,
+} from "./evidenceIntent";
 import { isAdaptiveCodeWorkspaceMutationToolNameV1 } from "./missionGraphFrontier";
 import { getMissionGraphNodeSelector, getSafeMissionCompositeLifecycleSpecV1 } from "./missionGraphSelectors";
 import { extractRequiredLiteralAnchors } from "./missionPlan";
@@ -282,6 +285,20 @@ export function bindExplicitWebFetchContract(
   const refreshMatch = /\brefresh\s*=\s*(true|false)\b/iu.exec(prompt);
   const explicitUrl = getSingleExplicitWebFetchUrlV1(prompt);
   if (!explicitUrl) return null;
+  if (hasExplicitSingleWebFetchOnlyIntent(prompt)) {
+    return {
+      ...toolCall,
+      // This is a closed user-owned call contract. In particular, a model-
+      // invented max_age_ms=0 would contradict refresh=false and force a
+      // transport call, while alternate_urls would widen the exact target.
+      arguments: {
+        url: explicitUrl,
+        ...(refreshMatch
+          ? { refresh: refreshMatch[1]!.toLowerCase() === "true" }
+          : {}),
+      },
+    };
+  }
   return {
     ...toolCall,
     arguments: {

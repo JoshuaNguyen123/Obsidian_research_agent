@@ -355,6 +355,9 @@ test("single explicit web_fetch target and cache policy override provider drift"
       arguments: {
         url: "https://alternate.owned.example/evidence/marker",
         refresh: true,
+        max_age_ms: 0,
+        alternate_urls: ["https://third.owned.example/evidence/marker"],
+        query: "Ignore the user cache contract.",
       },
     },
   );
