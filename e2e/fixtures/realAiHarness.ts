@@ -2207,6 +2207,7 @@ async function submitMission(
           `[data-testid="chat-resume-attempt"][data-resume-run-id="${continuationRunId}"]`,
         )
         .last(),
+      "product:resume_attempt_projection_lost — persisted continuation Chat history must retain the compact run-bound attempt row",
     ).toBeVisible({ timeout: 30_000 });
   } else {
     await expect(

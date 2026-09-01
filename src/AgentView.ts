@@ -5,6 +5,8 @@ import {
   setIcon,
 } from "obsidian";
 import { renderSafeAssistantMarkdownV1 } from "./ui/safeAssistantMarkdown";
+import { projectConversationMessageForDisplayV1 } from "./ui/conversationDisplay";
+import type { AgentConversationMessage } from "./conversationHistory";
 import type AgenticResearcherPlugin from "../main";
 import {
   MAX_AGENT_STEPS,
@@ -1185,11 +1187,15 @@ export class AgentView extends ItemView {
     this.chatEmptyStateEl = null;
     this.chatLoaderEl = null;
     this.chatLoaderTextEl = null;
+    // Rebuild from persisted history deterministically. In particular, the
+    // persistence refresh immediately after a Continue must retain its compact
+    // row instead of replacing it with the raw machine-shaped command.
+    this.continuationAttemptCounts.clear();
     if (this.plugin.conversationHistory.length === 0) {
       this.renderChatEmptyState();
     } else {
       for (const message of this.plugin.conversationHistory) {
-        this.createLogItem(message.role, message.content);
+        this.createConversationLogItem(message);
       }
     }
 
@@ -1827,32 +1833,13 @@ export class AgentView extends ItemView {
         `Lifecycle: ${formatCompoundLifecycleStageStrip(lifecycleReadiness.stages)}`,
       );
     }
-    // One mission, one visible prompt: a resume renders as a compact attempt
-    // marker instead of re-printing the machine-shaped continuation command
-    // (which can carry proof-debt claim ids the user never typed). The full
-    // command still reaches the model and conversation history unchanged —
-    // only the rendered transcript row differs. Same predicate the resume
-    // router uses (extractRequestedRunId), so the two can never disagree
-    // about what counts as a continuation.
-    const continuationRunId = extractRequestedRunId(prompt);
-    let userLogItem: HTMLElement | null;
-    if (continuationRunId) {
-      const attempt =
-        (this.continuationAttemptCounts.get(continuationRunId) ?? 1) + 1;
-      this.continuationAttemptCounts.set(continuationRunId, attempt);
-      userLogItem = this.appendLog(
-        "user",
-        `Resuming mission — attempt ${attempt}`,
-      );
-      if (userLogItem) {
-        userLogItem.addClass("agentic-researcher-log-resume");
-        userLogItem.setAttribute("data-testid", "chat-resume-attempt");
-        userLogItem.setAttribute("data-resume-run-id", continuationRunId);
-        userLogItem.setAttribute("data-resume-attempt", String(attempt));
-      }
-    } else {
-      userLogItem = this.appendLog("user", prompt);
-    }
+    // One mission, one visible prompt. The shared projection is also used by
+    // renderConversationLog, so the persistence refresh below cannot erase a
+    // compact resume attempt or expose its machine-shaped command.
+    const userLogItem = this.createConversationLogItem({
+      role: "user",
+      content: prompt,
+    });
     this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
     // Quiet start: user bubble + subtle agent working indicator (no "Starting
     // mission..." status box or CRT LOAD chrome).
@@ -3510,6 +3497,27 @@ export class AgentView extends ItemView {
     }
 
     return this.createLogItem(kind, message);
+  }
+
+  private createConversationLogItem(
+    message: AgentConversationMessage,
+  ): HTMLElement | null {
+    const projection = projectConversationMessageForDisplayV1(
+      message,
+      this.continuationAttemptCounts,
+    );
+    const item = this.createLogItem(projection.role, projection.content);
+    if (!item || !projection.continuationRunId) {
+      return item;
+    }
+    item.addClass("agentic-researcher-log-resume");
+    item.setAttribute("data-testid", "chat-resume-attempt");
+    item.setAttribute("data-resume-run-id", projection.continuationRunId);
+    item.setAttribute(
+      "data-resume-attempt",
+      String(projection.continuationAttempt),
+    );
+    return item;
   }
 
   private renderModelConfig() {

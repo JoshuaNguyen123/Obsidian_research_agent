@@ -151,6 +151,22 @@ test("an attempt that dies in the build stage is a harness failure, not matrix_u
   assert.match(outcome.detail, /error TS2307/u);
 });
 
+test("a lost persisted resume-attempt row is a stable product alarm", () => {
+  const logText = [
+    "Error: product:resume_attempt_projection_lost — persisted continuation Chat history must retain the compact run-bound attempt row",
+    "Error: expect(locator).toBeVisible() failed",
+  ].join("\n");
+  const classified = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: { records: [{ status: "failed" }] },
+    summaryFresh: true,
+    logText,
+  });
+  assert.equal(classified.failureClass, "product:resume_attempt_projection_lost");
+  assert.equal(classified.confidence, CLASSIFICATION_MECHANICAL);
+  assert.deepEqual(classified.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
+});
+
 test("proof-matrix cell projects are exclusive-runner allowlisted", () => {
   // 2026-08-25: interrupted-continuation-live existed in playwright.config.ts
   // and package.json but not PLAYWRIGHT_PROJECTS, so four proof-matrix

@@ -745,6 +745,14 @@ const HARNESS_LOG_SIGNATURES = [
   ],
 ];
 
+/** Stable lane-owned product assertions that are precise enough to alarm. */
+const PRODUCT_LOG_SIGNATURES = [
+  [
+    /product:resume_attempt_projection_lost\b/u,
+    "product:resume_attempt_projection_lost",
+  ],
+];
+
 /**
  * Driver/renderer deaths Playwright reports when the app process goes away
  * under the test: the lane never got to assert anything, so this is harness
@@ -1063,6 +1071,11 @@ export const CLASSIFICATION_UNCLASSIFIED = "unclassified";
 export function collectMechanicalFailureClasses(logText) {
   const text = typeof logText === "string" ? logText : "";
   const classes = [];
+  for (const [pattern, failureClass] of PRODUCT_LOG_SIGNATURES) {
+    if (pattern.test(text) && !classes.includes(failureClass)) {
+      classes.push(failureClass);
+    }
+  }
   for (const [pattern, failureClass] of HARNESS_LOG_SIGNATURES) {
     if (pattern.test(text) && !classes.includes(failureClass)) {
       classes.push(failureClass);
@@ -1194,6 +1207,17 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
           secondaryClasses: secondaryFor(cls),
         };
       }
+    }
+  }
+  for (const [pattern, failureClass] of PRODUCT_LOG_SIGNATURES) {
+    const match = pattern.exec(text);
+    if (match) {
+      return {
+        failureClass,
+        detail: attemptLogExcerpt(text, match.index),
+        confidence: CLASSIFICATION_MECHANICAL,
+        secondaryClasses: secondaryFor(failureClass),
+      };
     }
   }
   for (const [pattern, failureClass] of HARNESS_LOG_SIGNATURES) {
