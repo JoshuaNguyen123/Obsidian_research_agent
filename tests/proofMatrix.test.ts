@@ -1219,6 +1219,82 @@ test("a mission that passed every assertion and only failed teardown is NOT a la
   assert.ok(!outcome.secondaryClasses.includes(LANE_ASSERTION_FAILURE_CLASS));
 });
 
+const DIRECT_CLEANUP_ATTEMPT_LOG = [
+  "Running 1 test using 1 worker",
+  "",
+  "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts:102:9 › VAULT-01 deep vault retrieval and semantic expansion",
+  "",
+  "    Error: Controlled Obsidian teardown did not drain cleanly (owned process exit). Survivor sweep: observed 1 Obsidian process(es); STILL TERMINATING, unreapable by any kill: 17876",
+  "",
+  "      at scripts/obsidian-process-lifecycle.ts:119:9",
+  "",
+  "  1 failed",
+].join("\n");
+
+const DIRECT_CLEANUP_ACCEPTED_SUMMARY = {
+  records: [
+    {
+      scenarioId: "VAULT-01",
+      project: "real-ai-soak",
+      status: "failed",
+      missionScorecard: { acceptancePassed: true, total: 1 },
+    },
+  ],
+};
+
+test("a direct lane's sole controlled teardown failure is cleanup-only when its fresh scorecard passed", () => {
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: DIRECT_CLEANUP_ACCEPTED_SUMMARY,
+    summaryFresh: true,
+    logText: DIRECT_CLEANUP_ATTEMPT_LOG,
+  });
+  assert.equal(outcome.failureClass, HARNESS_CLEANUP_FAILURE_CLASS);
+  assert.equal(outcome.confidence, CLASSIFICATION_CONFIRMED);
+  assert.equal(outcome.cleanupFailure?.lane, "VAULT-01");
+  assert.match(outcome.detail, /fresh accepted scorecard/u);
+  assert.ok(!outcome.secondaryClasses.includes(LANE_ASSERTION_FAILURE_CLASS));
+});
+
+test("direct teardown cannot hide behind a stale or failed scorecard", () => {
+  const stale = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: DIRECT_CLEANUP_ACCEPTED_SUMMARY,
+    summaryFresh: false,
+    logText: DIRECT_CLEANUP_ATTEMPT_LOG,
+  });
+  assert.equal(stale.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+
+  const unaccepted = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: {
+      records: [
+        {
+          ...DIRECT_CLEANUP_ACCEPTED_SUMMARY.records[0],
+          missionScorecard: { acceptancePassed: false, total: 0.8 },
+        },
+      ],
+    },
+    summaryFresh: true,
+    logText: DIRECT_CLEANUP_ATTEMPT_LOG,
+  });
+  assert.equal(unaccepted.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+});
+
+test("direct teardown cannot hide an independent product assertion error", () => {
+  const outcome = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: DIRECT_CLEANUP_ACCEPTED_SUMMARY,
+    summaryFresh: true,
+    logText: DIRECT_CLEANUP_ATTEMPT_LOG.replace(
+      "    Error: Controlled Obsidian teardown",
+      "    Error: expect(locator).toBeVisible() failed\n\n    Error: Controlled Obsidian teardown",
+    ),
+  });
+  assert.equal(outcome.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.equal(attemptConsumesBudget(red("vault-recall", outcome.failureClass)), true);
+});
+
 test("a lane whose ASSERTIONS failed stays a product-bucket red even when cleanup also failed", () => {
   // The discriminator. Both halves of the wrapper mention cleanup; only the
   // "assertions passed" half means the product succeeded. A failure on both

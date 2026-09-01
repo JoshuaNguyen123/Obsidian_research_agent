@@ -949,6 +949,42 @@ export function detectLaneCleanupFailure(logText) {
 }
 
 /**
+ * Some single-purpose lanes close their native harness directly instead of
+ * using composeMandatoryCleanupError. They therefore cannot emit the stronger
+ * "assertions passed" sentence above. Treat their controlled teardown as
+ * cleanup-only evidence only when the same attempt wrote exactly one fresh,
+ * accepted scorecard and the teardown is the log's sole Error header. The
+ * conjunction matters: neither a stale scorecard nor a second assertion error
+ * can launder a real product red into the budget-exempt harness bucket.
+ */
+const DIRECT_OBSIDIAN_CLEANUP_CONTRACT =
+  /Controlled Obsidian teardown did not drain cleanly \([^\r\n)]*\)(?:\.\s*Survivor sweep:[^\r\n]*)?/u;
+const PLAYWRIGHT_ERROR_HEADER = /^\s*Error:\s+([^\r\n]+)/gmu;
+
+function detectAttestedDirectCleanupFailure({ logText, summary, summaryFresh }) {
+  if (!summaryFresh) return null;
+  const text = typeof logText === "string" ? logText : "";
+  const errorHeaders = [...text.matchAll(PLAYWRIGHT_ERROR_HEADER)];
+  if (errorHeaders.length !== 1) return null;
+  const cleanup = DIRECT_OBSIDIAN_CLEANUP_CONTRACT.exec(errorHeaders[0][1] ?? "");
+  if (!cleanup) return null;
+  const records = Array.isArray(summary?.records)
+    ? summary.records
+    : Array.isArray(summary)
+      ? summary
+      : [];
+  if (records.length !== 1 || records[0]?.missionScorecard?.acceptancePassed !== true) {
+    return null;
+  }
+  const record = records[0];
+  return {
+    lane: record.scenarioId ?? record.project ?? "scorecard-attested lane",
+    detail: cleanup[0].trim(),
+    index: errorHeaders[0].index,
+  };
+}
+
+/**
  * The live lanes guard their required environment with a `requiredEnvironment()`
  * (or `requiredSecret()`) helper that throws a DELIBERATE, fixed, greppable
  * sentence NAMING the variable. Detection keys on those whole sentences plus an
@@ -1141,6 +1177,28 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
         (cls) => cls !== LANE_ASSERTION_FAILURE_CLASS,
       ),
       cleanupFailure: { lane: cleanupFailure.lane, detail: cleanupFailure.detail },
+    };
+  }
+  const directCleanupFailure = detectAttestedDirectCleanupFailure({
+    logText: text,
+    summary,
+    summaryFresh,
+  });
+  if (directCleanupFailure) {
+    return {
+      failureClass: HARNESS_CLEANUP_FAILURE_CLASS,
+      detail:
+        `${directCleanupFailure.lane} fresh accepted scorecard; mandatory harness cleanup failed: ` +
+        `${directCleanupFailure.detail}\n` +
+        attemptLogExcerptFrom(text, directCleanupFailure.index),
+      confidence: CLASSIFICATION_CONFIRMED,
+      secondaryClasses: secondaryFor(HARNESS_CLEANUP_FAILURE_CLASS).filter(
+        (cls) => cls !== LANE_ASSERTION_FAILURE_CLASS,
+      ),
+      cleanupFailure: {
+        lane: directCleanupFailure.lane,
+        detail: directCleanupFailure.detail,
+      },
     };
   }
   // Settled THIRD, for the same reason as the two above: the model provider
