@@ -8373,14 +8373,48 @@ export async function runAgentMission({
           isHostFollowupToolExecutable("read_markdown_files")) &&
         vaultSearchSurfacedPaths.length > 0,
     });
-  /** Live current-note text for the durable literal-debt check; null when unreadable. */
+  // Target-only current-note writes intentionally skip the model-facing
+  // `read_current_file` tool, and an Obsidian view can briefly have no live
+  // editor text even though its TFile remains readable through the vault API.
+  // Keep one host-owned cache so the ordered-write projector and acceptance
+  // check do not mistake "editor cache unavailable" for "note unreadable".
+  let currentNoteLiteralDebtTextCache: string | null = null;
+  /** Live/cached current-note text for synchronous acceptance checks. */
   const readCurrentNoteTextForLiteralDebt = (): string | null => {
     try {
       const file = runToolContext.getCurrentMarkdownFile?.();
-      if (!file) return null;
-      return runToolContext.getCurrentMarkdownContent?.(file) ?? null;
+      if (!file) return currentNoteLiteralDebtTextCache;
+      const live = runToolContext.getCurrentMarkdownContent?.(file) ?? null;
+      if (typeof live === "string") {
+        currentNoteLiteralDebtTextCache = live;
+        return live;
+      }
+      return currentNoteLiteralDebtTextCache;
     } catch {
-      return null;
+      return currentNoteLiteralDebtTextCache;
+    }
+  };
+  /** Refresh the same cache from the vault when no editor buffer is exposed. */
+  const refreshCurrentNoteTextForLiteralDebt = async (): Promise<
+    string | null
+  > => {
+    try {
+      const file =
+        runToolContext.getCurrentMarkdownFile?.() ??
+        runToolContext.app.workspace.getActiveFile();
+      if (!file) return currentNoteLiteralDebtTextCache;
+      const live = runToolContext.getCurrentMarkdownContent?.(file) ?? null;
+      if (typeof live === "string") {
+        currentNoteLiteralDebtTextCache = live;
+        return live;
+      }
+      const durable = await runToolContext.app.vault.read(file as never);
+      if (typeof durable === "string") {
+        currentNoteLiteralDebtTextCache = durable;
+      }
+      return currentNoteLiteralDebtTextCache;
+    } catch {
+      return currentNoteLiteralDebtTextCache;
     }
   };
   const evaluateCurrentAcceptance = (
@@ -15506,6 +15540,14 @@ export async function runAgentMission({
         outputPreview: truncateTracePayload(result.output),
       });
 
+      if (CURRENT_NOTE_LITERAL_CONTRACT_TOOL_NAMES.has(toolCall.name)) {
+        // A single provider response can carry several ordered appends. The
+        // next call is validated after this one commits, so its literal-order
+        // decision must observe the just-written vault state even when the
+        // Obsidian editor cache is unavailable after a restart.
+        await refreshCurrentNoteTextForLiteralDebt();
+      }
+
       if (
         shouldEvaluateVerifiedLinearCodeRepositoryBindingV1({
           toolName: toolCall.name,
@@ -18003,6 +18045,56 @@ export async function runAgentMission({
   // would spend the shared budget looking busy instead of making progress.
   let specialistRecoveryConsulted = false;
 
+  // A crash can land after every graph node and durable write receipt commit
+  // but before the terminal run snapshot is published. On Continue, that is
+  // already a verified terminal state: asking a provider to synthesize again
+  // exposes an empty tool menu, and weaker tool-trained models may still guess
+  // calls that the host must reject. Re-evaluate the restored proof locally
+  // and finish without a provider call only when every independent gate agrees.
+  if (resumeSnapshot || resumeLedger) {
+    await refreshCurrentNoteTextForLiteralDebt();
+    const restoredTerminalGraph = missionGraphSession?.graph ?? missionGraph;
+    const restoredDeliveryComplete = setLooseCompoundEnabled
+      ? setLooseDeliveryComplete({
+          stages: compoundLifecycleStages,
+          proofs: setLooseDeliveryProofs,
+        }).complete
+      : true;
+    const restoredTerminalAcceptance = evaluateCurrentAcceptance();
+    if (
+      restoredTerminalGraph !== null &&
+      isMissionGraphAcceptablyComplete(restoredTerminalGraph) &&
+      writeReceipts.length > 0 &&
+      !hasPendingOperationGoals(operationGoals) &&
+      restoredDeliveryComplete &&
+      restoredTerminalAcceptance.status === "pass"
+    ) {
+      events.onTrace?.({
+        id: "resume-already-verified-complete",
+        kind: "verification",
+        step: 0,
+        message:
+          "Completed the resumed run from its verified graph, receipts, operation goals, and acceptance without another provider turn.",
+        outputPreview: {
+          graphRevision: restoredTerminalGraph.revision,
+          receiptCount: writeReceipts.length,
+          acceptanceStatus: restoredTerminalAcceptance.status,
+        },
+      });
+      emitRunDiagnostics({
+        events,
+        toolContext: runToolContext,
+        tools,
+        enableStreaming,
+        finalMode: "none",
+        runPlan,
+      });
+      emitLocalWriteSummary(events, writeReceipts);
+      await finishRun("write_completed", 0, stepLimit);
+      return;
+    }
+  }
+
   for (let step = 1; step <= stepLimit + finalRetryExtraSteps; step += 1) {
     if (await stopIfRequested(step)) {
       return;
@@ -19516,7 +19608,8 @@ export async function runAgentMission({
         },
       });
     }
-    const orderedAppendCurrentNoteText = readCurrentNoteTextForLiteralDebt();
+    const orderedAppendCurrentNoteText =
+      await refreshCurrentNoteTextForLiteralDebt();
     const orderedAppendProjection =
       repairOrderedCurrentNoteAppendFrontierToolCallsV1({
         prompt: activeIntentPrompt,
@@ -22309,17 +22402,10 @@ export async function runAgentMission({
             : "";
       let literalContractNoteText: string | null = null;
       if (toolCall.name === "append_to_current_file") {
-        try {
-          const literalContractNoteFile =
-            runToolContext.getCurrentMarkdownFile?.() ?? null;
-          literalContractNoteText = literalContractNoteFile
-            ? (runToolContext.getCurrentMarkdownContent?.(
-                literalContractNoteFile,
-              ) ?? null)
-            : null;
-        } catch {
-          literalContractNoteText = null;
-        }
+        // Same host-owned observation as the ordered-call projector and
+        // acceptance gate. After each successful append the cache is refreshed
+        // from the vault, so call N+1 in one response sees call N's mutation.
+        literalContractNoteText = readCurrentNoteTextForLiteralDebt();
       }
       // Bind before validate. The host knows the exact literal this step owes
       // and the final-answer path already restores missing literals
@@ -23241,6 +23327,19 @@ export async function runAgentMission({
     // paid append would cancel the remaining owed node when `final`
     // completes over unpaid work. Scoped to the heal's exactly-once nodes:
     // planned workflows keep their historical completion semantics.
+    if (
+      requiredWriteTools.some((toolName) =>
+        CURRENT_NOTE_LITERAL_CONTRACT_TOOL_NAMES.has(toolName),
+      ) &&
+      writeReceipts.some((receipt) =>
+        CURRENT_NOTE_LITERAL_CONTRACT_TOOL_NAMES.has(receipt.toolName),
+      )
+    ) {
+      // The projection read happened before this step's mutations. Refresh
+      // once after the tool batch so the synchronous acceptance gate observes
+      // every append that just committed, even without a live editor buffer.
+      await refreshCurrentNoteTextForLiteralDebt();
+    }
     const pendingResumeOwedWriteNodesAfterToolUse =
       getPendingResumeOwedWriteNodeIds(
         missionGraphSession?.graph ?? missionGraph,

@@ -1619,6 +1619,11 @@ test("continue of a stub graph with streaming off and only the durable anchor he
     createDefaultToolRegistry(),
     (toolName) => toolName === "append_to_current_file",
   );
+  // Native target-only writes can have no active editor cache after a plugin
+  // restart even though the current TFile is still readable. The production
+  // projector must use that durable vault read instead of refusing GLM's safe
+  // read-name drift and losing the ordered append frontier.
+  vault.context.getCurrentMarkdownContent = undefined;
   assert.equal(
     scopedResumeRegistry.getDescriptor("read_current_file"),
     null,
@@ -2228,13 +2233,14 @@ test("a continuation of a killed run whose graph already completed everything te
 
   const completion = completions.at(-1);
   assert.ok(completion);
-  // The reflex gate must defer to passing acceptance instead of burning
-  // every remaining step in completion corrections; the run must terminate
-  // within a few model calls and never as an error.
-  assert.ok(
-    modelCalls <= 5,
+  // The reflex gate must defer to passing acceptance before invoking the
+  // provider at all. The graph, receipts, goals, and acceptance already prove
+  // the terminal state; another model turn can only introduce regressions.
+  assert.equal(
+    modelCalls,
+    0,
     JSON.stringify({
-      rule: "A restored acceptance-passing mission must terminate promptly, not wander the reflex completion loop to the step cap.",
+      rule: "A restored acceptance-passing mission must terminate from durable proof without another provider call.",
       modelCalls,
       completion,
     }),
