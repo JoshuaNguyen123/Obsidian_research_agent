@@ -12,6 +12,10 @@ export const ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS: "harness:acceptance_proof_m
 export function resolveProofMatrixModel(args?: string[]): string;
 export const ATTEMPT_LOG_DIR: string;
 export const SCORECARD_BASELINE_RELATIVE_PATH: string;
+export function normalizeGitCommandOutput(
+  output: string,
+  options?: { preserveLeading?: boolean },
+): string;
 export function porcelainWithoutAllowedHarvest(status: string): string;
 export function laneHasScorecardBaselineFrom(
   baseline: { records?: unknown } | null | undefined,

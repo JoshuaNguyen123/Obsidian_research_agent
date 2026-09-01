@@ -281,10 +281,15 @@ function fail(message) {
   process.exit(1);
 }
 
-function git(args) {
+export function normalizeGitCommandOutput(output, { preserveLeading = false } = {}) {
+  const text = typeof output === "string" ? output : "";
+  return preserveLeading ? text.trimEnd() : text.trim();
+}
+
+function git(args, options = {}) {
   const result = spawnSync("git", args, { cwd: REPO_ROOT, encoding: "utf8", windowsHide: true });
   if (result.status !== 0) fail(`git ${args.join(" ")} failed: ${result.stderr}`);
-  return result.stdout.trim();
+  return normalizeGitCommandOutput(result.stdout, options);
 }
 
 export const SCORECARD_BASELINE_RELATIVE_PATH =
@@ -314,7 +319,10 @@ function assertExactCleanHead(expectedHead, stage) {
     fail(`${stage}: HEAD ${head} != pinned ${expectedHead}; the campaign's evidence would be unattributable.`);
   }
   const status = porcelainWithoutAllowedHarvest(
-    git(["status", "--porcelain=v1", "--untracked-files=all"]),
+    git(
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { preserveLeading: true },
+    ),
   );
   if (status !== "") {
     fail(`${stage}: working tree not clean:\n${status}`);

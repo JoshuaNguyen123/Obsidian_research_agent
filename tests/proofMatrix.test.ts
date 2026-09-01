@@ -63,6 +63,7 @@ import {
   laneHasScorecardBaselineFrom,
   markAttemptInFlight,
   migrateLegacyManifestFile,
+  normalizeGitCommandOutput,
   porcelainWithoutAllowedHarvest,
   reconcileInFlightAttempt,
   registerProductFailure,
@@ -118,10 +119,13 @@ test("scorecard baseline detection reads records[].project, not array indices", 
 });
 
 test("exact-HEAD cleanliness allows only the harvested scorecard baseline", () => {
+  const rawPorcelain = " M e2e/baselines/mission-scorecards.v1.json\r\n";
+  const preserved = normalizeGitCommandOutput(rawPorcelain, {
+    preserveLeading: true,
+  });
+  assert.equal(preserved[0], " ", "porcelain column 1 must survive Git output normalization");
   assert.equal(
-    porcelainWithoutAllowedHarvest(
-      " M e2e/baselines/mission-scorecards.v1.json\n",
-    ),
+    porcelainWithoutAllowedHarvest(preserved),
     "",
   );
   assert.match(
