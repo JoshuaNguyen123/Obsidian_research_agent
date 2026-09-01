@@ -16,7 +16,9 @@ import {
 } from "../src/agent/missionGraphLegacyProjection";
 import {
   createHierarchicalMissionPlanFromV1,
+  FINAL_OUTPUT_RELEVANT_EVIDENCE_ID,
   isFinalOutputRelevant,
+  taskHasRecordedProof,
   type MissionPlan,
 } from "../src/agent/missionPlan";
 import type { OrchestratorSnapshotV1 } from "../src/orchestrator/types";
@@ -73,6 +75,65 @@ test("MissionGraphV3 projects status, progress, next action, evidence, and recei
   assert.deepEqual(orchestrator.nodes.research.childIds, ["write"]);
   assert.equal(orchestrator.participants.lead.currentNodeId, "write");
   assert.deepEqual(orchestrator.nodes.research.evidenceIds, ["evidence-web"]);
+});
+
+test("legacy aliases do not hide graph-native final-output proof after restart", async () => {
+  const envelope = await createEnvelope();
+  const migrated = await migrateLegacyMissionPlanToMissionGraphV3(
+    completePlan(),
+    migrationOptions(envelope),
+  );
+  const graph = await parseMissionGraphV3({
+    ...migrated,
+    nodes: {
+      ...migrated.nodes,
+      write: {
+        ...migrated.nodes.write,
+        outputs: {
+          ...migrated.nodes.write.outputs,
+          legacyEvidenceIds: ["legacy-final-summary"],
+        },
+        evidence: [
+          {
+            id: "migrated-legacy-summary",
+            kind: "tool-result",
+            fingerprint: fp("c"),
+            observedAt: UPDATED_AT,
+          },
+          {
+            id: "durable-final-output",
+            kind: "final-output",
+            fingerprint: fp("d"),
+            observedAt: UPDATED_AT,
+          },
+        ],
+        completionContract: {
+          ...migrated.nodes.write.completionContract,
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["final-output"],
+          minimumReceipts: 0,
+          requiredReceiptKinds: [],
+        },
+      },
+    },
+  });
+
+  const finalTask = projectMissionGraphToLegacyPlan(graph).tasks.find(
+    (task) => task.id === "write",
+  );
+  assert.deepEqual(finalTask?.evidenceIds, [
+    "legacy-final-summary",
+    FINAL_OUTPUT_RELEVANT_EVIDENCE_ID,
+  ]);
+  assert.equal(
+    isFinalOutputRelevant(projectMissionGraphToLegacyPlan(graph), "Done."),
+    false,
+  );
+  assert.equal(
+    finalTask ? taskHasRecordedProof(finalTask, "final_relevance") : false,
+    true,
+    "The restart must accept durable final proof even when the new segment's prose is too short to establish relevance independently.",
+  );
 });
 
 test("optional cancellation does not reduce required progress or block completion", async () => {

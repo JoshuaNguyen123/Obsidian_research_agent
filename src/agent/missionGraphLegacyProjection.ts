@@ -732,16 +732,34 @@ function projectGraphNodeToLegacyTask(node: MissionNodeV3): MissionPlanTask {
     node.outputs.legacyEvidenceIds,
   );
   const legacyReceiptIds = legacyOutputIds(node.outputs.legacyReceiptIds);
+  // Legacy host migration preserves one alias per evidence record in the
+  // graph's original append-only prefix. Do not expose that same historical
+  // record twice under its alias and canonical graph id. Evidence appended
+  // after migration has no alias and must be projected normally.
+  const graphEvidenceWithoutLegacyAliases =
+    legacyEvidenceIds.length > 0
+      ? node.evidence.slice(
+          Math.min(legacyEvidenceIds.length, node.evidence.length),
+        )
+      : node.evidence;
   return {
     id: node.id,
     title: node.objective,
     status: projectLegacyNodeStatus(node.status),
     allowedTools: [...node.allowedTools],
     dependencies: [...node.dependencyIds],
-    evidenceIds:
-      legacyEvidenceIds.length > 0
-        ? legacyEvidenceIds
-        : node.evidence.map((item) => projectLegacyEvidenceId(node, item)),
+    // Migration aliases preserve the legacy IDs that old ledgers and tests
+    // still reference, but they are not an alternate source of truth. A
+    // resumed graph can append new evidence after migration (most critically
+    // the host-verified final-output proof). Treating a non-empty alias list
+    // as an override hid that appended proof on the next projection and sent
+    // an otherwise complete run into empty-frontier continuations.
+    evidenceIds: unique([
+      ...legacyEvidenceIds,
+      ...graphEvidenceWithoutLegacyAliases.map((item) =>
+        projectLegacyEvidenceId(node, item),
+      ),
+    ]),
     receiptIds: node.receipts.flatMap((item, index) => [
       legacyReceiptIds[index] ?? item.id,
       `${RECEIPT_PROOF_ID_PREFIX}${projectReceiptKindToLegacyProof(item.kind)}`,
