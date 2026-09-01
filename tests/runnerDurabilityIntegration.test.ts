@@ -1583,10 +1583,11 @@ test("continue of a stub graph with streaming off and only the durable anchor he
   );
   const firstTools =
     resumeRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
-  assert.ok(
-    firstTools.includes("append_to_current_file"),
+  assert.deepEqual(
+    firstTools,
+    ["append_to_current_file"],
     JSON.stringify({
-      rule: "The healed graph must expose append_to_current_file through the normal frontier on the very first resumed step.",
+      rule: "An ordered same-note write continuation must expose only its exact ready append; capability reads must not distract the model from unpaid write debt.",
       requests: resumeRequests.map(
         (request) => request.tools?.map((tool) => tool.function.name) ?? [],
       ),

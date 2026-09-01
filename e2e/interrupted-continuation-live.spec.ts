@@ -115,6 +115,18 @@ test.describe("interrupted continuation", () => {
         providerUsage: snapshot.providerUsage,
       });
 
+      // The ordered append graph is authority-complete. Resume must expose
+      // only its one ready append at a time; capability reads previously
+      // widened this to 15 tools and GLM Flash chose read_current_file twice,
+      // tripping the production no-progress circuit with part B still owed.
+      expect(
+        snapshot.lastComplete?.autonomyStats?.toolsOffered?.max,
+        safeState,
+      ).toBeLessThanOrEqual(1);
+      expect(snapshot.lastComplete?.autoContinueReason, safeState).not.toBe(
+        "no_progress",
+      );
+
       // The remaining work completed: both parts exactly once — the resumed
       // segment neither replayed a committed append nor abandoned a pending one.
       expect(note.split(markerA).length - 1, safeState).toBe(1);

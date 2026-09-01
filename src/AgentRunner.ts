@@ -379,6 +379,7 @@ import {
   isBroadUnscopedVaultMutation,
   type AutonomyScope,
 } from "./agent/missionScope";
+import { deriveOrderedWriteLiteralContractsV1 } from "./agent/repeatedOperationTargets";
 import {
   buildLivenessProbe,
   recheckLinkLiveness,
@@ -4893,6 +4894,7 @@ export async function runAgentMission({
                     ? explicitGraphNamedVaultReadWorkflowToolNames
                     : explicitGraphSemanticToolNames;
         missionGraphUsesExactPlannedFrontier =
+          hasExplicitOrderedWorkflowIntent(activeIntentPrompt) ||
           requiredWriteTools.includes(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) ||
           explicitGraphWorkflowToolNames.length > 0 ||
           isBufferedNewNoteOutput(
@@ -32344,6 +32346,17 @@ export function getExplicitCodeToolNames(prompt: string): string[] {
 
 function hasExplicitOrderedWorkflowIntent(prompt: string): boolean {
   return (
+    [
+      "append_to_current_file",
+      "append_to_current_section",
+      "append_file",
+    ].some(
+      (toolName) =>
+        deriveOrderedWriteLiteralContractsV1({
+          toolName,
+          objective: prompt,
+        }).length > 1,
+    ) ||
     extractExplicitVaultReadFilePaths(prompt).length > 0 ||
     hasExplicitSemanticRetrievalIntent(prompt) ||
     getExplicitCodeToolNames(prompt).length > 0 ||
