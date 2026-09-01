@@ -1519,6 +1519,26 @@ export function writeJsonAtomic(filePath, value) {
 }
 
 /**
+ * Claim an attempt-log path before the child starts. Fresh campaigns reuse
+ * per-cell attempt ordinals, so leaving the previous campaign's file in place
+ * makes live inspection show convincing but stale output until spawnSync
+ * returns. The content-free header both truncates that output and records the
+ * exact evidence identity if the parent dies while the child is in flight.
+ */
+export function initializeAttemptLogFile(filePath, metadata) {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(
+    filePath,
+    `${JSON.stringify({
+      schema: "proof-matrix-attempt-log-v1",
+      status: "in_flight",
+      ...metadata,
+    })}\n`,
+    "utf8",
+  );
+}
+
+/**
  * One-time migration from the pre-2026-08-25 manifest location inside
  * test-results/ (which Playwright wipes). Copies the legacy manifest to the
  * durable location only when no durable manifest exists yet; the legacy file
@@ -1911,6 +1931,7 @@ async function main() {
       if (cell.grep) runnerArgs.push(`--grep=${cell.grep}`);
 
       const startedAt = Date.now();
+      const attemptStartedAt = new Date(startedAt).toISOString();
       // Persist the manifest BEFORE launching: if the runner dies mid-attempt
       // the marker survives (outside the wiped tree), and the next --resume
       // reconciles it instead of silently restarting the campaign from zero.
@@ -1918,16 +1939,27 @@ async function main() {
         cell: cell.id,
         project: cell.project,
         attempt: attemptIndex,
-        startedAt: new Date(startedAt).toISOString(),
+        startedAt: attemptStartedAt,
       });
       saveManifest(manifest);
       // Attempt output goes to a per-attempt file, not the launcher console:
       // detached campaigns have no console, and a red attempt whose stderr is
       // gone is undiagnosable (the 2026-08-25 02:37 crash loop left nothing).
+      // Claim/truncate the path before launch because fresh campaigns reuse
+      // ordinals; otherwise a live tail can show a prior campaign's result.
       // The log dir lives in proof-matrix-state/ so Playwright's test-results
       // wipe can never delete a log mid-write again.
       mkdirSync(ATTEMPT_LOG_DIR, { recursive: true });
       const attemptLogPath = path.join(ATTEMPT_LOG_DIR, `${cell.id}-attempt-${attemptIndex}.log`);
+      initializeAttemptLogFile(attemptLogPath, {
+        campaignStartedAt: manifest.startedAt,
+        attemptStartedAt,
+        expectedHead,
+        model: PROOF_MATRIX_MODEL,
+        cell: cell.id,
+        project: cell.project,
+        attempt: attemptIndex,
+      });
       console.log(
         `proof-matrix[${stage}]: node ${runnerArgs.map((a) => path.basename(a)).join(" ")}` +
         ` (output: ${path.relative(REPO_ROOT, attemptLogPath)})`,
@@ -1943,7 +1975,7 @@ async function main() {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
-      writeFileSync(
+      appendFileSync(
         attemptLogPath,
         `${result.stdout ?? ""}${result.stderr ?? ""}`,
       );

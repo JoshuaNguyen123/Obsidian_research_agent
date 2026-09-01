@@ -189,6 +189,18 @@ export const PROOF_MATRIX_MANIFEST_RELATIVE_PATH: string;
 export const PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR: string;
 export const LEGACY_MANIFEST_RELATIVE_PATH: string;
 export function writeJsonAtomic(filePath: string, value: unknown): void;
+export function initializeAttemptLogFile(
+  filePath: string,
+  metadata: {
+    campaignStartedAt: string;
+    attemptStartedAt: string;
+    expectedHead: string;
+    model: string;
+    cell: string;
+    project: string;
+    attempt: number;
+  },
+): void;
 export function migrateLegacyManifestFile(
   legacyPath: string,
   newPath: string,

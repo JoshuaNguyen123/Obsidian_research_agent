@@ -58,6 +58,7 @@ import {
   consecutiveHarnessFailures,
   consumedAttemptCount,
   harnessFailureCount,
+  initializeAttemptLogFile,
   isEmptyScorecardHarvestOutput,
   isInfrastructureFailureClass,
   laneHasScorecardBaselineFrom,
@@ -436,6 +437,53 @@ test("the durable state dir is gitignored (exact-HEAD clean checks must not see 
     "utf8",
   );
   assert.match(gitignore, /^\/proof-matrix-state\/$/mu);
+});
+
+test("a new attempt truncates stale same-ordinal output before launch", () => {
+  const dir = tempDir();
+  try {
+    const target = path.join(dir, "logs", "vault-recall-attempt-1.log");
+    writeJsonAtomic(target, { stale: "prior campaign looked green" });
+
+    initializeAttemptLogFile(target, {
+      campaignStartedAt: "2026-09-01T22:00:00.000Z",
+      attemptStartedAt: "2026-09-01T22:00:01.000Z",
+      expectedHead: "a".repeat(40),
+      model: "glm-5.3-flash:cloud",
+      cell: "vault-recall",
+      project: "real-ai-soak",
+      attempt: 1,
+    });
+
+    const current = readFileSync(target, "utf8");
+    assert.doesNotMatch(current, /prior campaign looked green/u);
+    assert.deepEqual(JSON.parse(current), {
+      schema: "proof-matrix-attempt-log-v1",
+      status: "in_flight",
+      campaignStartedAt: "2026-09-01T22:00:00.000Z",
+      attemptStartedAt: "2026-09-01T22:00:01.000Z",
+      expectedHead: "a".repeat(40),
+      model: "glm-5.3-flash:cloud",
+      cell: "vault-recall",
+      project: "real-ai-soak",
+      attempt: 1,
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the attempt loop claims its log before launch and appends child output", () => {
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "run-proof-matrix.mjs"),
+    "utf8",
+  );
+  const claim = source.indexOf("initializeAttemptLogFile(attemptLogPath, {");
+  const launch = source.indexOf("const result = spawnSync(process.execPath, runnerArgs", claim);
+  const append = source.indexOf("appendFileSync(\n        attemptLogPath", launch);
+  assert.ok(claim > 0, "the attempt must claim its durable log path");
+  assert.ok(launch > claim, "the stale log must be truncated before the child launches");
+  assert.ok(append > launch, "completed child output must append after the in-flight header");
 });
 
 function tempDir(): string {
