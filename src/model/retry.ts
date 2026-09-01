@@ -57,6 +57,13 @@ export async function withModelRetry<T>(
      * writeback has already applied note bytes (re-stream would duplicate).
      */
     shouldRetry?: (error: unknown, attempt: number) => boolean;
+    /**
+     * Optional grace period for an already-invoked client to settle after the
+     * host aborts. The default is zero so lifecycle authority is released
+     * immediately. Observation-only calls may use a short bounded grace to
+     * retain their final usage evidence without permitting an unbounded hang.
+     */
+    abortSettleGraceMs?: number;
   } = {},
 ): Promise<T> {
   const policy = normalizeRetryPolicy(options.policy);
@@ -71,7 +78,11 @@ export async function withModelRetry<T>(
       // after cancellation. Race every attempt against the host signal so the
       // agent loop relinquishes mutation authority immediately; any late
       // transport result is ignored by the already-settled race.
-      return await runAbortableAttempt(run, options.abortSignal);
+      return await runAbortableAttempt(
+        run,
+        options.abortSignal,
+        options.abortSettleGraceMs,
+      );
     } catch (error) {
       if (
         attempt >= policy.maxAttempts ||
@@ -100,6 +111,7 @@ export async function withModelRetry<T>(
 function runAbortableAttempt<T>(
   run: () => Promise<T>,
   abortSignal: AbortSignal | undefined,
+  abortSettleGraceMs = 0,
 ): Promise<T> {
   if (!abortSignal) {
     return run();
@@ -107,8 +119,21 @@ function runAbortableAttempt<T>(
   throwIfAborted(abortSignal);
 
   let removeAbortListener: (() => void) | undefined;
+  let abortTimer: ReturnType<typeof setTimeout> | undefined;
+  const boundedAbortSettleGraceMs = Math.min(
+    5_000,
+    Math.max(0, Math.trunc(abortSettleGraceMs)),
+  );
   const aborted = new Promise<T>((_resolve, reject) => {
-    const onAbort = () => reject(createAbortError());
+    const rejectAbort = () => reject(createAbortError());
+    const onAbort = () => {
+      if (boundedAbortSettleGraceMs === 0) {
+        rejectAbort();
+        return;
+      }
+      abortTimer = setTimeout(rejectAbort, boundedAbortSettleGraceMs);
+      (abortTimer as unknown as { unref?: () => void }).unref?.();
+    };
     abortSignal.addEventListener("abort", onAbort, { once: true });
     removeAbortListener = () =>
       abortSignal.removeEventListener("abort", onAbort);
@@ -118,6 +143,7 @@ function runAbortableAttempt<T>(
   // custom client into the same rejected-promise path as a transport failure.
   const operation = Promise.resolve().then(run);
   return Promise.race([operation, aborted]).finally(() => {
+    if (abortTimer !== undefined) clearTimeout(abortTimer);
     removeAbortListener?.();
   });
 }

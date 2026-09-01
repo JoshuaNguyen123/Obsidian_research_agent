@@ -100,12 +100,15 @@ export async function classifyMissionWithModel({
   recentAssistant,
   timeoutMs = 10_000,
   abortSignal,
+  abortSettleGraceMs = 0,
 }: {
   client: ModelClient;
   prompt: string;
   recentAssistant?: string;
   timeoutMs?: number;
   abortSignal?: AbortSignal;
+  /** Bounded post-abort settlement window for observation-only callers. */
+  abortSettleGraceMs?: number;
 }): Promise<RoutedMissionIntent | null> {
   return (
     await classifyMissionWithModelDetailed({
@@ -114,6 +117,7 @@ export async function classifyMissionWithModel({
       recentAssistant,
       timeoutMs,
       abortSignal,
+      abortSettleGraceMs,
     })
   ).intent;
 }
@@ -136,12 +140,15 @@ export async function classifyMissionWithModelDetailed({
   recentAssistant,
   timeoutMs = 10_000,
   abortSignal,
+  abortSettleGraceMs = 0,
 }: {
   client: ModelClient;
   prompt: string;
   recentAssistant?: string;
   timeoutMs?: number;
   abortSignal?: AbortSignal;
+  /** Bounded post-abort settlement window for observation-only callers. */
+  abortSettleGraceMs?: number;
 }): Promise<RouterModelClassificationResult> {
   const controller = new AbortController();
   const abortFromCaller = () => controller.abort(abortSignal?.reason);
@@ -185,6 +192,7 @@ export async function classifyMissionWithModelDetailed({
       const response = await withModelRetry(() => client.chat(request), {
         policy: { maxAttempts: 2 },
         abortSignal: controller.signal,
+        abortSettleGraceMs,
       });
       const normalized = normalizeRoutedMissionIntent(response.message.content);
       if (normalized) return { intent: normalized, failureReason: null, attempts: attempt };

@@ -232,3 +232,43 @@ test("withModelRetry releases an uncooperative in-flight attempt on abort", asyn
   );
   assert.equal(attempts, 1);
 });
+
+test("withModelRetry gives an invoked observation call bounded time to settle after abort", async () => {
+  const controller = new AbortController();
+  let release!: () => void;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const operation = new Promise<string>((resolve) => {
+    release = () => resolve("settled evidence");
+  });
+  const pending = withModelRetry(
+    async () => {
+      markStarted();
+      return operation;
+    },
+    {
+      abortSignal: controller.signal,
+      abortSettleGraceMs: 100,
+    },
+  );
+
+  await started;
+  controller.abort("coordinator_shutdown");
+  release();
+  assert.equal(await pending, "settled evidence");
+
+  const neverSettles = withModelRetry(
+    async () => new Promise<string>(() => undefined),
+    {
+      abortSignal: AbortSignal.abort("coordinator_shutdown"),
+      abortSettleGraceMs: 10,
+    },
+  );
+  await assert.rejects(
+    neverSettles,
+    (error: unknown) =>
+      error instanceof DOMException && error.name === "AbortError",
+  );
+});

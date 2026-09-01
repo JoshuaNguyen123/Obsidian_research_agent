@@ -62,6 +62,37 @@ export interface ObservableModelClient {
   updateBudget(budget: ModelExecutionBudgetV1): void;
 }
 
+/**
+ * Add disjoint provider-usage segments without losing the schema shape.
+ * Continuations use this to carry the interrupted segment's durable totals
+ * forward while the fresh observable client measures only the new segment.
+ */
+export function mergeModelUsageAggregatesV1(
+  ...segments: ReadonlyArray<ModelUsageAggregateV1 | null | undefined>
+): ModelUsageAggregateV1 {
+  const merged: ModelUsageAggregateV1 = {
+    schemaVersion: 1,
+    modelCallCount: 0,
+    successfulCallCount: 0,
+    failedCallCount: 0,
+    reportedTokens: 0,
+    estimatedTokens: 0,
+    retries: 0,
+    wallClockMs: 0,
+  };
+  for (const segment of segments) {
+    if (!segment) continue;
+    merged.modelCallCount += segment.modelCallCount;
+    merged.successfulCallCount += segment.successfulCallCount;
+    merged.failedCallCount += segment.failedCallCount;
+    merged.reportedTokens += segment.reportedTokens;
+    merged.estimatedTokens += segment.estimatedTokens;
+    merged.retries += segment.retries;
+    merged.wallClockMs += segment.wallClockMs;
+  }
+  return merged;
+}
+
 const UNKNOWN_DESCRIPTOR: ModelClientDescriptor = {
   provider: "ollama",
   model: "unknown",

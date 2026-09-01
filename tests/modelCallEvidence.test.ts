@@ -5,6 +5,7 @@ import {
   createObservableModelClient,
   cachedPromptTokenRatio,
   extractProviderTokenUsage,
+  mergeModelUsageAggregatesV1,
   measureAssistantPayloadChars,
   type ModelCallEvidenceV1,
 } from "../src/model/modelCallEvidence";
@@ -14,6 +15,43 @@ test("categorizes endpoints without retaining raw URLs", () => {
   assert.equal(categorizeModelEndpoint("http://127.0.0.1:11434/api"), "local");
   assert.equal(categorizeModelEndpoint("https://ollama.com/api"), "ollama_cloud");
   assert.equal(categorizeModelEndpoint("https://models.example.test/v1"), "custom");
+});
+
+test("merges disjoint provider-usage segments for continuation scorecards", () => {
+  assert.deepEqual(
+    mergeModelUsageAggregatesV1(
+      {
+        schemaVersion: 1,
+        modelCallCount: 2,
+        successfulCallCount: 1,
+        failedCallCount: 1,
+        reportedTokens: 120,
+        estimatedTokens: 0,
+        retries: 1,
+        wallClockMs: 4_000,
+      },
+      {
+        schemaVersion: 1,
+        modelCallCount: 1,
+        successfulCallCount: 1,
+        failedCallCount: 0,
+        reportedTokens: 0,
+        estimatedTokens: 80,
+        retries: 0,
+        wallClockMs: 2_000,
+      },
+    ),
+    {
+      schemaVersion: 1,
+      modelCallCount: 3,
+      successfulCallCount: 2,
+      failedCallCount: 1,
+      reportedTokens: 120,
+      estimatedTokens: 80,
+      retries: 1,
+      wallClockMs: 6_000,
+    },
+  );
 });
 
 test("extracts Ollama and OpenAI-compatible token usage", () => {

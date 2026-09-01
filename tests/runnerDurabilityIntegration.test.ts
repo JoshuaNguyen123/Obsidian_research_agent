@@ -8,6 +8,7 @@ import {
   type AgentTraceEvent,
 } from "../src/AgentRunner";
 import {
+  addLedgerReceipt,
   createMissionLedger,
   createPrePlanningAnchorLedger,
   getMissionLedgerPath,
@@ -19,6 +20,7 @@ import {
   writeMissionLedger,
   type MissionEvidence,
 } from "../src/agent/missionLedger";
+import type { MissionScorecardV1 } from "../src/agent/missionScorecard";
 import {
   buildMissionResumePlan,
   formatLedgerForModel,
@@ -2172,15 +2174,30 @@ test("a continuation of a killed run whose graph already completed everything te
   });
   vault.files.set("Current.md", "Initial note\nMARKER_A1\nMARKER_B2");
   vault.files.delete(`Agent Runs/${interruptedRunId}.md`);
-  await writeMissionLedger(
-    vault.context,
-    createPrePlanningAnchorLedger({
-      runId: interruptedRunId,
-      mission: originalMission,
-      targetNotePath: "Current.md",
-      now: new Date("2026-08-26T02:15:40.000Z"),
-    }),
+  const partialLedger = createPrePlanningAnchorLedger({
+    runId: interruptedRunId,
+    mission: originalMission,
+    targetNotePath: "Current.md",
+    now: new Date("2026-08-26T02:15:40.000Z"),
+  });
+  // Deliberately preserve only one ledger id beside two newer snapshot
+  // receipts. This is the exact cross-restart skew the live lane exposed.
+  addLedgerReceipt(
+    partialLedger,
+    "receipt-ledger-only",
+    new Date("2026-08-26T02:15:41.000Z"),
   );
+  partialLedger.providerUsage = {
+    schemaVersion: 1,
+    modelCallCount: 2,
+    successfulCallCount: 1,
+    failedCallCount: 1,
+    reportedTokens: 120,
+    estimatedTokens: 0,
+    retries: 1,
+    wallClockMs: 4_000,
+  };
+  await writeMissionLedger(vault.context, partialLedger);
   // The lane's interrupted segment got far enough for checkpoints: the
   // runtime snapshot carries the paid, readback-verified append receipt and
   // the done note-content goal — which is exactly what let the live
@@ -2218,6 +2235,21 @@ test("a continuation of a killed run whose graph already completed everything te
             observedFingerprint: "fnv1a32:89abcdef",
           },
         },
+        {
+          id: "receipt-append-paid-b",
+          runId: interruptedRunId,
+          toolName: "append_to_current_file",
+          operation: "append",
+          message: "Appended second result to Current.md.",
+          path: "Current.md",
+          createdAt: "2026-08-26T02:15:20.000Z",
+          readback: {
+            status: "verified",
+            checkedAt: "2026-08-26T02:15:20.000Z",
+            observedRevision: "fnv1a32:11111111",
+            observedFingerprint: "fnv1a32:22222222",
+          },
+        },
       ],
       lastSafeStep: 3,
       createdAt: new Date("2026-08-26T02:15:00.000Z"),
@@ -2226,6 +2258,7 @@ test("a continuation of a killed run whose graph already completed everything te
   );
 
   const completions: AgentRunCompleteEvent[] = [];
+  const scorecards: MissionScorecardV1[] = [];
   let modelCalls = 0;
   const thinThenRealFinal = () => {
     modelCalls += 1;
@@ -2256,6 +2289,7 @@ test("a continuation of a killed run whose graph already completed everything te
     enableStreaming: false,
     events: {
       onRunComplete: (event) => completions.push(event),
+      onMissionScorecard: (scorecard) => scorecards.push(scorecard),
     },
   });
 
@@ -2280,6 +2314,21 @@ test("a continuation of a killed run whose graph already completed everything te
       rule: "The reflex heuristic may not terminal-fail an acceptance-passing run; acceptance owns the hard stop.",
       completion,
     }),
+  );
+  const scorecard = scorecards.at(-1);
+  assert.ok(scorecard);
+  const receiptCoverage = scorecard.dimensions.find(
+    (dimension) => dimension.id === "receipt_coverage",
+  );
+  const modelEfficiency = scorecard.dimensions.find(
+    (dimension) => dimension.id === "model_call_efficiency",
+  );
+  assert.equal(receiptCoverage?.score, 1);
+  assert.equal(receiptCoverage?.detail, "2/2 mutations receipted");
+  assert.match(
+    modelEfficiency?.detail ?? "",
+    /^2\/\d+ model calls$/u,
+    "the no-model continuation score must retain both prior segment calls",
   );
   // Exactly-once holds: the continuation adds nothing to the note.
   assert.equal(
@@ -3580,15 +3629,23 @@ test("continue run of an anchor-only interrupted run restarts the mission from i
     "Append the anchored haiku about rivers to the current note.";
   // A mission killed before planning leaves ONLY the durable run anchor: no
   // checkpoint, no runtime snapshot, no mission graph store.
-  await writeMissionLedger(
-    vault.context,
-    createPrePlanningAnchorLedger({
-      runId: interruptedRunId,
-      mission: recordedMission,
-      targetNotePath: "Current.md",
-      now: new Date("2026-07-10T12:10:00.000Z"),
-    }),
-  );
+  const anchor = createPrePlanningAnchorLedger({
+    runId: interruptedRunId,
+    mission: recordedMission,
+    targetNotePath: "Current.md",
+    now: new Date("2026-07-10T12:10:00.000Z"),
+  });
+  anchor.providerUsage = {
+    schemaVersion: 1,
+    modelCallCount: 2,
+    successfulCallCount: 1,
+    failedCallCount: 1,
+    reportedTokens: 120,
+    estimatedTokens: 0,
+    retries: 1,
+    wallClockMs: 4_000,
+  };
+  await writeMissionLedger(vault.context, anchor);
 
   let modelCalls = 0;
   const assistant: string[] = [];
@@ -3647,6 +3704,74 @@ test("continue run of an anchor-only interrupted run restarts the mission from i
     interruptedRunId,
     "the segment config must attest the exact durable root it resumed",
   );
+  assert.ok(
+    Math.max(
+      ...configs.map(
+        (config) => config.missionLedger?.providerUsage.modelCallCount ?? 0,
+      ),
+    ) >= 3,
+    "the continuation ledger must add this segment's call to the two durable prior calls",
+  );
+});
+
+test("router cancellation persists its invoked provider call into the durable anchor", async () => {
+  const vault = createVaultHarness();
+  vault.context.settings.modelRouterEnabled = true;
+  vault.context.settings.modelRouterMode = "authority";
+  const controller = new AbortController();
+  let runId: string | null = null;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const completions: AgentRunCompleteEvent[] = [];
+  const client: ModelClient = {
+    async chat(request) {
+      markStarted();
+      return await new Promise<ModelChatResponse>((_resolve, reject) => {
+        const rejectAbort = () =>
+          reject(request.abortSignal?.reason ?? new Error("aborted"));
+        if (request.abortSignal?.aborted) {
+          rejectAbort();
+          return;
+        }
+        request.abortSignal?.addEventListener("abort", rejectAbort, {
+          once: true,
+        });
+      });
+    },
+    async streamChat() {
+      throw new Error("streaming must not begin after router cancellation");
+    },
+  };
+
+  const mission = runAgentMission({
+    prompt: "Append a durable provider-accounting line to the current note.",
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    abortSignal: controller.signal,
+    events: {
+      onRunIdentity: (event) => {
+        runId = event.runId;
+      },
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+  await started;
+  controller.abort("coordinator_shutdown");
+  await mission;
+
+  assert.ok(runId);
+  const persistedAnchor = parseMissionLedgerFromMarkdown(
+    vault.files.get(`Agent Runs/${runId}.md`) ?? "",
+  );
+  assert.ok(persistedAnchor);
+  assert.equal(isPrePlanningAnchorLedger(persistedAnchor), true);
+  assert.equal(persistedAnchor.providerUsage?.modelCallCount, 1);
+  assert.equal(persistedAnchor.providerUsage?.failedCallCount, 1);
+  assert.equal(completions.at(-1)?.stopReason, "user_stopped");
 });
 
 test("a graceful pre-planning abort keeps the anchor and continue completes the mission", async () => {

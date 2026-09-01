@@ -42,6 +42,7 @@ import {
 import {
   createObservableModelClient,
   extractProviderTokenUsage,
+  mergeModelUsageAggregatesV1,
   type ModelCallEvidenceV1,
   type ModelExecutionBudgetV1,
   type ModelUsageAggregateV1,
@@ -1816,6 +1817,7 @@ const OFF_TOPIC_MODEL_OUTPUT_MESSAGE =
 // grounded missions (DU-02, 2026-08-20). Slow planners must fall back.
 const MAX_STRUCTURED_PLANNING_TIMEOUT_MS = 120_000;
 const BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS = 5_000;
+const SHADOW_ROUTER_ABORT_SETTLE_GRACE_MS = 1_000;
 
 export async function settleToolOutcomeMemoryPersistence(
   persistence: Promise<void>,
@@ -2086,6 +2088,12 @@ export async function runAgentMission({
   // including stops that fire before the anchor site executes.
   let prePlanningAnchorPersisted = false;
   let prePlanningAnchorSuperseded = false;
+  let prePlanningAnchorLedger: MissionLedger | null = null;
+  let prePlanningAnchorContext: ToolExecutionContext | null = null;
+  // A continuation's observable client measures only this process segment.
+  // Keep the last durable segment separate so repeated syncs never double-add
+  // it and the final scorecard reflects the whole root mission.
+  let inheritedProviderUsage: ModelUsageAggregateV1 | null = null;
   // Once a runtime-snapshot write has an ambiguous outcome, no later ledger or
   // snapshot write may touch the same Agent Runs artifact in this process. A
   // retry could race the original unresolved vault operation and overwrite a
@@ -2209,15 +2217,20 @@ export async function runAgentMission({
         evidence,
         estimatedPromptCharsForRun,
       );
-      if (missionLedger) {
-        missionLedger.providerUsage = observableModel.getUsage();
-      }
+      syncMissionLedgerProviderUsage();
     },
   });
   const syncMissionLedgerProviderUsage = () => {
+    const providerUsage = mergeModelUsageAggregatesV1(
+      inheritedProviderUsage,
+      observableModel.getUsage(),
+    );
     if (missionLedger) {
-      missionLedger.providerUsage = observableModel.getUsage();
+      missionLedger.providerUsage = providerUsage;
+    } else if (prePlanningAnchorLedger) {
+      prePlanningAnchorLedger.providerUsage = providerUsage;
     }
+    return providerUsage;
   };
   const updateModelExecutionBudget = (next: ModelExecutionBudgetV1) => {
     modelExecutionBudget = { ...next, schemaVersion: 1 };
@@ -2425,21 +2438,27 @@ export async function runAgentMission({
     } catch {
       anchorTargetNotePath = null;
     }
+    const anchorLedger = createPrePlanningAnchorLedger({
+      runId,
+      mission: anchorMission,
+      targetNotePath: anchorTargetNotePath,
+      now: anchorContext.now?.() ?? new Date(),
+    });
+    anchorLedger.providerUsage = mergeModelUsageAggregatesV1(
+      inheritedProviderUsage,
+      observableModel.getUsage(),
+    );
+    prePlanningAnchorLedger = anchorLedger;
+    prePlanningAnchorContext = anchorContext;
     prePlanningAnchorPersisted = true;
     const anchorSettlement = await settleBounded(
-      writeMissionLedger(
-        anchorContext,
-        createPrePlanningAnchorLedger({
-          runId,
-          mission: anchorMission,
-          targetNotePath: anchorTargetNotePath,
-          now: anchorContext.now?.() ?? new Date(),
-        }),
-      ),
+      writeMissionLedger(anchorContext, anchorLedger),
       BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
     );
     if (anchorSettlement.kind === "rejected") {
       prePlanningAnchorPersisted = false;
+      prePlanningAnchorLedger = null;
+      prePlanningAnchorContext = null;
       events.onTrace?.({
         id: "durable-run-anchor:error",
         kind: "error",
@@ -2458,6 +2477,45 @@ export async function runAgentMission({
         kind: "status",
         path: anchorSettlement.value.path,
         message: `Persisted durable run anchor to ${anchorSettlement.value.path}; run ${runId} is resumable before planning begins.`,
+      });
+    }
+  };
+  const persistPrePlanningAnchorUsageAfterAbort = async () => {
+    if (
+      !prePlanningAnchorPersisted ||
+      prePlanningAnchorSuperseded ||
+      !prePlanningAnchorLedger ||
+      !prePlanningAnchorContext ||
+      runtimeSnapshotPersistenceBlockedError !== null
+    ) {
+      return;
+    }
+    prePlanningAnchorLedger.providerUsage = mergeModelUsageAggregatesV1(
+      inheritedProviderUsage,
+      observableModel.getUsage(),
+    );
+    prePlanningAnchorLedger.updatedAt = (
+      prePlanningAnchorContext.now?.() ?? new Date()
+    ).toISOString();
+    const settlement = await settleBounded(
+      writeMissionLedger(prePlanningAnchorContext, prePlanningAnchorLedger),
+      BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
+    );
+    if (settlement.kind !== "resolved") {
+      events.onTrace?.({
+        id: "durable-run-anchor:abort-usage-save-failed",
+        kind: "error",
+        message:
+          settlement.kind === "timed_out"
+            ? "Interrupted provider usage did not settle into the durable run anchor within 5 seconds."
+            : `Could not save interrupted provider usage into the durable run anchor: ${getUnknownErrorMessage(settlement.value)}`,
+        error: {
+          code: "durable_run_anchor_abort_usage_save_failed",
+          message:
+            settlement.kind === "timed_out"
+              ? "The durable anchor usage write remained pending after the bounded wait."
+              : getUnknownErrorMessage(settlement.value),
+        },
       });
     }
   };
@@ -2490,15 +2548,35 @@ export async function runAgentMission({
       toolContext.settings?.speechActSemanticRescueMode === "authority")
   ) {
     events.onStatus?.("Classifying mission with structured router...");
-    const routedClassification = await classifyMissionWithModelDetailed({
-      client: modelClient,
-      prompt: activeIntentPrompt,
-      timeoutMs: structuredPlanningTimeoutMs,
-      abortSignal,
-      recentAssistant: conversationHistory
-        .filter((message) => message.role === "assistant")
-        .slice(-1)[0]?.content,
-    });
+    let routedClassification;
+    try {
+      routedClassification = await classifyMissionWithModelDetailed({
+        client: modelClient,
+        prompt: activeIntentPrompt,
+        timeoutMs: structuredPlanningTimeoutMs,
+        abortSignal,
+        recentAssistant: conversationHistory
+          .filter((message) => message.role === "assistant")
+          .slice(-1)[0]?.content,
+      });
+    } catch (error) {
+      if (abortSignal?.aborted) {
+        // The router is intentionally ahead of the full ledger. Preserve the
+        // already-invoked call count in the durable anchor before propagating
+        // the coordinator cancellation to the host.
+        await persistPrePlanningAnchorUsageAfterAbort();
+        // Preserve the established graceful-stop path: downstream setup is
+        // deterministic and the first stop boundary emits user_stopped only
+        // after every terminal callback dependency has been initialized.
+        routedClassification = {
+          intent: null,
+          failureReason: null,
+          attempts: 1,
+        };
+      } else {
+        throw error;
+      }
+    }
     routedModelIntent = routedClassification.intent;
     routedModelFailureReason = routedClassification.failureReason;
     const earlyRegexIntent = deriveRoutedIntentFallback({
@@ -2518,34 +2596,36 @@ export async function runAgentMission({
     });
     routedMissionIntent =
       modelRouterMode === "authority" ? earlyResolved.intent : null;
-    events.onTrace?.({
-      id:
-        modelRouterMode === "authority"
-          ? "structured-router-authority"
-          : "structured-router-shadow",
-      kind: "mission_intent",
-      message:
-        modelRouterMode === "authority"
-          ? earlyResolved.source === "model"
-            ? `Structured router authority decision: ${earlyResolved.intent.mode} (${earlyResolved.intent.confidence}).`
-            : `Structured router authority fell back to regex (${routedModelFailureReason ?? earlyResolved.fallbackReason ?? "unknown"}).`
-          : routedModelIntent
-            ? `Structured router shadow decision: ${routedModelIntent.mode} (${routedModelIntent.confidence}).`
-            : `Structured router shadow decision unavailable (${routedModelFailureReason ?? "unknown"}); regex fallback remains authoritative.`,
-      outputPreview: {
-        mode: modelRouterMode,
-        source: earlyResolved.source,
-        fallbackReason: earlyResolved.fallbackReason,
-        modelFailureReason: routedModelFailureReason,
-        modelIntent: routedModelIntent,
-        resolvedIntent: earlyResolved.intent,
-        regexIntent: earlyRegexIntent,
-        regexMode: missionIntent.mode,
-        agreement: routedModelIntent
-          ? compareRouterWithRegex(routedModelIntent, missionIntent)
-          : "fallback",
-      },
-    });
+    if (!abortSignal?.aborted) {
+      events.onTrace?.({
+        id:
+          modelRouterMode === "authority"
+            ? "structured-router-authority"
+            : "structured-router-shadow",
+        kind: "mission_intent",
+        message:
+          modelRouterMode === "authority"
+            ? earlyResolved.source === "model"
+              ? `Structured router authority decision: ${earlyResolved.intent.mode} (${earlyResolved.intent.confidence}).`
+              : `Structured router authority fell back to regex (${routedModelFailureReason ?? earlyResolved.fallbackReason ?? "unknown"}).`
+            : routedModelIntent
+              ? `Structured router shadow decision: ${routedModelIntent.mode} (${routedModelIntent.confidence}).`
+              : `Structured router shadow decision unavailable (${routedModelFailureReason ?? "unknown"}); regex fallback remains authoritative.`,
+        outputPreview: {
+          mode: modelRouterMode,
+          source: earlyResolved.source,
+          fallbackReason: earlyResolved.fallbackReason,
+          modelFailureReason: routedModelFailureReason,
+          modelIntent: routedModelIntent,
+          resolvedIntent: earlyResolved.intent,
+          regexIntent: earlyRegexIntent,
+          regexMode: missionIntent.mode,
+          agreement: routedModelIntent
+            ? compareRouterWithRegex(routedModelIntent, missionIntent)
+            : "fallback",
+        },
+      });
+    }
   }
   let writeAutonomy = missionIntent.allowAutonomousWrite;
   // May be recomputed after durable Continue restores originalMission — the
@@ -2855,6 +2935,7 @@ export async function runAgentMission({
       prompt: activeIntentPrompt,
       timeoutMs: structuredPlanningTimeoutMs,
       abortSignal,
+      abortSettleGraceMs: SHADOW_ROUTER_ABORT_SETTLE_GRACE_MS,
       recentAssistant: conversationHistory
         .filter((message) => message.role === "assistant")
         .slice(-1)[0]?.content,
@@ -3819,6 +3900,9 @@ export async function runAgentMission({
   }
   const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
   const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
+  inheritedProviderUsage = resumeLedger?.providerUsage
+    ? { ...resumeLedger.providerUsage }
+    : null;
   if (resumeLedger && isPrePlanningAnchorLedger(resumeLedger)) {
     // Anchor-only continuation: the interrupted run persisted its durable
     // anchor but planning never began, so there is nothing to preserve
@@ -7312,21 +7396,16 @@ export async function runAgentMission({
       resumeSnapshot?.originalMission ?? resumeLedger.mission;
     missionLedger.evidence = missionEvidenceRecords.map((item) => ({ ...item }));
     missionLedger.receipts = [...resumeLedger.receipts];
-    // Continue segments can load a ledger with empty receipt IDs even when the
-    // runtime snapshot still has durable write receipts. Rebuild IDs so
-    // receiptCount/set-loose seed stay truthful across Continues.
-    if (
-      missionLedger.receipts.length === 0 &&
-      writeReceipts.length > 0
-    ) {
-      for (const receipt of writeReceipts) {
-        const evidence = evidenceFromReceipt(receipt);
-        addLedgerReceipt(
-          missionLedger,
-          evidence.id,
-          runToolContext.now?.() ?? new Date(),
-        );
-      }
+    // A continuation may carry a partial ledger receipt list beside a newer
+    // runtime snapshot. Reconcile every concrete receipt id, not only the
+    // all-empty case, so one stale id cannot suppress the remaining proofs.
+    for (const receipt of writeReceipts) {
+      const evidence = evidenceFromReceipt(receipt);
+      addLedgerReceipt(
+        missionLedger,
+        evidence.id,
+        runToolContext.now?.() ?? new Date(),
+      );
     }
     missionLedger.resumeCount = resumeLedger.resumeCount;
     missionLedger.lastSafeStep = Math.max(
@@ -8813,6 +8892,7 @@ export async function runAgentMission({
     step: number,
     { advancePlan = true }: { advancePlan?: boolean } = {},
   ) => {
+    syncMissionLedgerProviderUsage();
     events.onTrace?.({
       id: `mission-acceptance-${step}`,
       kind: "acceptance",
@@ -8845,7 +8925,10 @@ export async function runAgentMission({
         Boolean(missionResearchSignals) ||
         shouldRequireClaimGrounding(activeIntentPrompt),
       mutationsPerformed: writeReceipts.length,
-      mutationsWithReceipts: missionLedger?.receipts.length ?? 0,
+      // Every entry is a concrete receipt object restored from or persisted to
+      // the runtime snapshot. Ledger ids are reconciled above, but the score
+      // must be based on the direct mutation proof rather than a lossy index.
+      mutationsWithReceipts: writeReceipts.length,
       recoveryAttempts: recoveryAttemptSignatures.length,
       modelCalls: missionLedger?.providerUsage?.modelCallCount ?? 0,
       modelCallBudget: modelExecutionBudget.maxCalls,
