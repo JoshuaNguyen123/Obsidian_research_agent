@@ -19516,7 +19516,44 @@ export async function runAgentMission({
         },
       });
     }
-    const responseToolCalls = repairedPlaceholderCalls.toolCalls;
+    const orderedAppendProjection =
+      repairOrderedCurrentNoteAppendFrontierToolCallsV1({
+        prompt: activeIntentPrompt,
+        currentNoteText: readCurrentNoteTextForLiteralDebt(),
+        offeredToolNames: [...stepAllowedToolNames],
+        toolCalls: repairedPlaceholderCalls.toolCalls,
+        isReadOnlyToolName: (toolName) =>
+          toolRegistry.getDescriptor?.(toolName)?.effect === "read",
+      });
+    const responseToolCalls = orderedAppendProjection.toolCalls;
+    const responseToolCallProjectionChanged =
+      orderedAppendProjection.remapped.length > 0 ||
+      orderedAppendProjection.dropped.length > 0;
+    if (responseToolCallProjectionChanged) {
+      const projectionMessage =
+        `Projected model tool calls onto ${orderedAppendProjection.remapped.length} exact ordered append slot(s)` +
+        (orderedAppendProjection.dropped.length > 0
+          ? ` and discarded ${orderedAppendProjection.dropped.length} surplus safe call(s).`
+          : ".");
+      events.onStatus?.(projectionMessage);
+      events.onTrace?.({
+        id: `ordered-current-note-append-frontier-projection-${step}`,
+        kind: "verification",
+        step,
+        toolName: "append_to_current_file",
+        message: projectionMessage,
+        outputPreview: {
+          remappedFrom: orderedAppendProjection.remapped.map(
+            (item) => item.fromToolName,
+          ),
+          droppedToolNames: orderedAppendProjection.dropped.map(
+            (item) => item.toolName,
+          ),
+          remainingLiteralSlots:
+            orderedAppendProjection.remainingLiteralSlots,
+        },
+      });
+    }
     if (remappedAppendAliases.remapped.length > 0) {
       events.onStatus?.(
         `Remapped tool alias: ${remappedAppendAliases.remapped.join(", ")}`,
@@ -19776,10 +19813,11 @@ export async function runAgentMission({
       continue;
     }
 
-    const assistantStepMessage = recoveredTextToolCalls
+    const assistantStepMessage =
+      recoveredTextToolCalls || responseToolCallProjectionChanged
       ? {
           ...response.message,
-          content: "",
+          content: recoveredTextToolCalls ? "" : response.message.content,
           toolCalls: responseToolCalls,
         }
       : response.message;
@@ -36321,6 +36359,124 @@ const LITERAL_CONTENT_WRITE_TOOLS = new Set([
   "replace_file",
   "create_file",
 ]);
+
+export interface OrderedCurrentNoteAppendFrontierProjectionV1 {
+  toolCalls: ModelToolCall[];
+  remapped: Array<{
+    index: number;
+    fromToolName: string;
+  }>;
+  dropped: Array<{
+    index: number;
+    toolName: string;
+  }>;
+  remainingLiteralSlots: number;
+}
+
+/**
+ * Project a cheap model's SAFE name drift onto an exact ordered append
+ * frontier the host can prove from the user's own literals.
+ *
+ * Live GLM Flash evidence: the request exposed exactly one schema —
+ * `append_to_current_file` — while the response emitted four copies of the
+ * known read-only `read_current_file` call. Refusing all four is technically
+ * safe but operationally useless: the host already knows the only authorized
+ * operation, the exact next payload, and how many receipt-backed mutations
+ * remain. This projection turns at most that many eligible calls into the
+ * exact append calls and discards only surplus SAFE calls after every literal
+ * slot is provisioned.
+ *
+ * Fail closed everywhere else:
+ * - more than one offered tool means the model still has a real choice;
+ * - a non-ordered/single-literal prompt has no repeated-operation contract;
+ * - an unreadable current note cannot prove which slots remain;
+ * - an unoffered mutation is preserved for the normal refusal path, never
+ *   converted into a different mutation.
+ *
+ * The projected assistant message is rewritten to this returned call list,
+ * so every retained tool-call id receives one result and discarded surplus
+ * calls do not leave unresolved provider transcript entries.
+ */
+export function repairOrderedCurrentNoteAppendFrontierToolCallsV1(input: {
+  prompt: string;
+  currentNoteText: string | null;
+  offeredToolNames: readonly string[];
+  toolCalls: readonly ModelToolCall[];
+  isReadOnlyToolName: (toolName: string) => boolean;
+}): OrderedCurrentNoteAppendFrontierProjectionV1 {
+  const unchanged = (): OrderedCurrentNoteAppendFrontierProjectionV1 => ({
+    toolCalls: input.toolCalls.map((call) => ({
+      ...call,
+      arguments: { ...call.arguments },
+    })),
+    remapped: [],
+    dropped: [],
+    remainingLiteralSlots: 0,
+  });
+  const offered = [
+    ...new Set(input.offeredToolNames.map((name) => name.trim()).filter(Boolean)),
+  ];
+  if (
+    offered.length !== 1 ||
+    offered[0] !== "append_to_current_file" ||
+    typeof input.currentNoteText !== "string" ||
+    input.toolCalls.length === 0
+  ) {
+    return unchanged();
+  }
+  const orderedLiterals = deriveOrderedWriteLiteralContractsV1({
+    toolName: "append_to_current_file",
+    objective: input.prompt,
+  });
+  if (orderedLiterals.length < 2) {
+    return unchanged();
+  }
+  const normalizedNote = input.currentNoteText.toLowerCase();
+  const missingLiterals = orderedLiterals.filter(
+    (literal) => !normalizedNote.includes(literal.toLowerCase()),
+  );
+  if (missingLiterals.length === 0) {
+    return unchanged();
+  }
+
+  const toolCalls: ModelToolCall[] = [];
+  const remapped: OrderedCurrentNoteAppendFrontierProjectionV1["remapped"] = [];
+  const dropped: OrderedCurrentNoteAppendFrontierProjectionV1["dropped"] = [];
+  let literalIndex = 0;
+  for (const [index, call] of input.toolCalls.entries()) {
+    const eligible =
+      call.name === "append_to_current_file" ||
+      input.isReadOnlyToolName(call.name);
+    if (!eligible) {
+      toolCalls.push({ ...call, arguments: { ...call.arguments } });
+      continue;
+    }
+    if (literalIndex >= missingLiterals.length) {
+      dropped.push({ index, toolName: call.name });
+      continue;
+    }
+    const literal = missingLiterals[literalIndex]!;
+    literalIndex += 1;
+    if (
+      call.name !== "append_to_current_file" ||
+      call.arguments.text !== literal ||
+      Object.keys(call.arguments).length !== 1
+    ) {
+      remapped.push({ index, fromToolName: call.name });
+    }
+    toolCalls.push({
+      ...call,
+      name: "append_to_current_file",
+      arguments: { text: literal },
+    });
+  }
+  return {
+    toolCalls,
+    remapped,
+    dropped,
+    remainingLiteralSlots: Math.max(0, missingLiterals.length - literalIndex),
+  };
+}
 
 /**
  * The final-answer path has always REPAIRED a missing user-required literal

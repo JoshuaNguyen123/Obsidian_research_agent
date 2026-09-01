@@ -1520,38 +1520,103 @@ test("continue of a stub graph with streaming off and only the durable anchor he
   );
 
   // Segment 2: `continue run <id>` must heal the restored stub before the
-  // loop starts even though no streamed-writeback context exists.
+  // loop starts even though no streamed-writeback context exists. Match the
+  // live proof lane's authority router and automatic profile: the router gets
+  // its own structured response, while every actual agent step follows the
+  // one tool the host offered. This catches a menu/authority disagreement
+  // without hard-coding the tool name the mock is supposed to choose.
+  vault.context.settings.modelRouterEnabled = true;
+  vault.context.settings.modelRouterMode = "authority";
+  vault.context.settings.workingMode = "automatic";
+  vault.context.settings.agenticReflexEnabled = true;
+  vault.context.settings.maxAgentSteps = 24;
   const resumeRequests: ModelChatRequest[] = [];
   const toolStarts: string[] = [];
   const appendReceipts: AgentRunReceipt[] = [];
   const completions: AgentRunCompleteEvent[] = [];
   const traces: AgentTraceEvent[] = [];
   const seg2Configs: AgentRunConfigEvent[] = [];
+  const orderedAgentResponses = [
+    // Live GLM Flash ignored the one-tool append schema and emitted four
+    // copies of read_current_file. The host already knows the only legal
+    // action and both exact user literals, so the response must be projected
+    // onto the two unpaid append slots instead of recording four refusals.
+    responseWithToolCalls(
+      Array.from({ length: 4 }, () => ({
+        name: "read_current_file",
+        arguments: {},
+      })),
+    ),
+    {
+      message: {
+        role: "assistant" as const,
+        content:
+          "Both ordered appends are durably recorded with verified receipts.",
+        toolCalls: [],
+      },
+      toolCalls: [],
+    },
+  ];
+  let orderedAgentResponseIndex = 0;
+  const respondToAuthorityOrAgentStep = (
+    request: ModelChatRequest,
+  ): ModelChatResponse => {
+    resumeRequests.push(cloneRequest(request));
+    if (request.evidencePhase === "router") {
+      return responseWithContent(
+        JSON.stringify({
+          mode: "vault_write",
+          writeScope: "current_note_append",
+          needsWebEvidence: false,
+          needsVaultContext: false,
+          needsCodeExecution: false,
+          wordTarget: null,
+          confidence: 0.99,
+          rationale: "Two exact target-only current-note appends are required.",
+        }),
+      );
+    }
+    if (request.evidencePhase === "graph_planner") {
+      const system = request.messages.find((message) => message.role === "system");
+      const template = /requiredProposalTemplate=(\{[^\n]+\})/u.exec(
+        system?.content ?? "",
+      )?.[1];
+      return responseWithContent(
+        template ?? JSON.stringify({ confidence: 0.99, nodes: [] }),
+      );
+    }
+    const offered = request.tools?.map((tool) => tool.function.name) ?? [];
+    if (offered.length > 0) {
+      assert.deepEqual(
+        offered,
+        ["append_to_current_file"],
+        JSON.stringify({
+          rule: "Every resumed tool step must expose the one exact owed append and no redundant read.",
+          offered,
+          evidencePhase: request.evidencePhase ?? null,
+        }),
+      );
+    }
+    const response =
+      orderedAgentResponses[
+        Math.min(orderedAgentResponseIndex, orderedAgentResponses.length - 1)
+      ];
+    orderedAgentResponseIndex += 1;
+    return response!;
+  };
+  const resumedClient: ModelClient = {
+    chat: async (request) => respondToAuthorityOrAgentStep(request),
+    streamChat: async (request, events = {}) => {
+      const response = respondToAuthorityOrAgentStep(request);
+      if (response.message.content) {
+        events.onContentDelta?.(response.message.content);
+      }
+      return response;
+    },
+  };
   await runAgentMission({
     prompt: `continue run ${interruptedRunId}`,
-    modelClient: createModelClient(
-      [
-        responseWithToolCall("append_to_current_file", {
-          // Live GLM Flash emitted both owed lines in one call. The runner
-          // must bind this response to the first graph node only; otherwise
-          // one receipt falsely discharges a two-operation mission.
-          text: "MARKER_A1\nMARKER_B2",
-        }),
-        responseWithToolCall("append_to_current_file", {
-          text: "MARKER_B2",
-        }),
-        {
-          message: {
-            role: "assistant",
-            content:
-              "Both ordered appends are durably recorded with verified receipts.",
-            toolCalls: [],
-          },
-          toolCalls: [],
-        },
-      ],
-      resumeRequests,
-    ),
+    modelClient: resumedClient,
     toolRegistry: createDefaultToolRegistry(),
     toolContext: vault.context,
     enableStreaming: false,
@@ -1588,8 +1653,42 @@ test("continue of a stub graph with streaming off and only the durable anchor he
     [],
     "The graph authority rejected a tool the offered frontier advertised — the two subsystems disagree again.",
   );
+  assert.deepEqual(
+    traces
+      .filter((event) => event.kind === "tool_rejected")
+      .map((event) => ({ id: event.id, message: event.message })),
+    [],
+    "Safe read-name drift on a fully bound append frontier must not manufacture failed tool events.",
+  );
+  const orderedProjection = traces.find(
+    (event) =>
+      event.id === "ordered-current-note-append-frontier-projection-1",
+  );
+  assert.ok(
+    orderedProjection,
+    JSON.stringify({
+      rule: "The live four-read provider deviation must be visibly projected onto exact append debt.",
+      traceIds: traces.map((event) => event.id),
+    }),
+  );
+  assert.deepEqual(
+    (orderedProjection.outputPreview as {
+      remappedFrom?: string[];
+      droppedToolNames?: string[];
+      remainingLiteralSlots?: number;
+    })?.remappedFrom,
+    ["read_current_file", "read_current_file"],
+  );
+  assert.deepEqual(
+    (orderedProjection.outputPreview as { droppedToolNames?: string[] })
+      ?.droppedToolNames,
+    ["read_current_file", "read_current_file"],
+  );
+  const firstAgentRequest = resumeRequests.find(
+    (request) => request.evidencePhase === "agent_step",
+  );
   const firstTools =
-    resumeRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+    firstAgentRequest?.tools?.map((tool) => tool.function.name) ?? [];
   assert.deepEqual(
     firstTools,
     ["append_to_current_file"],

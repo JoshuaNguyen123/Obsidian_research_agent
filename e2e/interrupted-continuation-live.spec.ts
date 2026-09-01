@@ -134,10 +134,23 @@ test.describe("interrupted continuation", () => {
       // segment neither replayed a committed append nor abandoned a pending one.
       expect(note.split(markerA).length - 1, safeState).toBe(1);
       expect(note.split(markerB).length - 1, safeState).toBe(1);
+      const appendReceipts = snapshot.lastReceipts.filter(
+        (receipt: any) => receipt.operation === "append",
+      );
+      expect(appendReceipts.length, safeState).toBe(2);
       expect(
-        snapshot.lastReceipts.filter((receipt: any) => receipt.operation === "append").length,
+        appendReceipts.every(
+          (receipt: any) =>
+            (typeof receipt.bytesWritten === "number" &&
+              receipt.bytesWritten > 0) ||
+            receipt.effects?.changed === true,
+        ),
         safeState,
-      ).toBe(2);
+      ).toBe(true);
+      expect(
+        snapshot.lastMissionLedger?.acceptance?.status,
+        safeState,
+      ).toBe("pass");
 
       // A green end state is not enough: the pre-fix run reached both markers
       // through one successful append after four rejected calls. Require two

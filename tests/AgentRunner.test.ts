@@ -72,6 +72,7 @@ import {
   containProofGateRejectedWriteToolsV1,
   PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
   canonicalRequiredLiteralWriteContentV1,
+  repairOrderedCurrentNoteAppendFrontierToolCallsV1,
   validateRequiredLiteralWriteArguments,
   preWriteProofGateAppliesV1,
   resolveThinkingMode,
@@ -27109,6 +27110,99 @@ test("the required-literal write contract is step-scoped, not mission-scoped", (
     }),
     null,
   );
+});
+
+test("safe tool-name drift is projected onto exact ordered append slots only", () => {
+  const markerA = "ORDERED_FRONTIER_A1";
+  const markerB = "ORDERED_FRONTIER_B2";
+  const prompt =
+    `Perform exactly two ordered durable appends to the current note, then finish. ` +
+    `First append exactly one line containing ${markerA} and verify that write. ` +
+    `Then append exactly one separate line containing ${markerB} and verify that write. ` +
+    "Two appends total, in that order.";
+  const readOnly = (toolName: string) => toolName === "read_current_file";
+
+  const fourReadCopies = Array.from({ length: 4 }, (_, index) => ({
+    id: `read-${index + 1}`,
+    name: "read_current_file",
+    arguments: {},
+  }));
+  const projected = repairOrderedCurrentNoteAppendFrontierToolCallsV1({
+    prompt,
+    currentNoteText: "Initial note\n",
+    offeredToolNames: ["append_to_current_file"],
+    toolCalls: fourReadCopies,
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(
+    projected.toolCalls,
+    [
+      {
+        id: "read-1",
+        name: "append_to_current_file",
+        arguments: { text: markerA },
+      },
+      {
+        id: "read-2",
+        name: "append_to_current_file",
+        arguments: { text: markerB },
+      },
+    ],
+  );
+  assert.equal(projected.remapped.length, 2);
+  assert.deepEqual(
+    projected.dropped.map((item) => item.index),
+    [2, 3],
+  );
+  assert.equal(projected.remainingLiteralSlots, 0);
+
+  const betweenWrites = repairOrderedCurrentNoteAppendFrontierToolCallsV1({
+    prompt,
+    currentNoteText: `Initial note\n${markerA}\n`,
+    offeredToolNames: ["append_to_current_file"],
+    toolCalls: fourReadCopies,
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(betweenWrites.toolCalls, [
+    {
+      id: "read-1",
+      name: "append_to_current_file",
+      arguments: { text: markerB },
+    },
+  ]);
+  assert.equal(betweenWrites.dropped.length, 3);
+
+  const unofferedMutation = repairOrderedCurrentNoteAppendFrontierToolCallsV1({
+    prompt,
+    currentNoteText: "Initial note\n",
+    offeredToolNames: ["append_to_current_file"],
+    toolCalls: [
+      { name: "replace_current_file", arguments: { text: "unsafe drift" } },
+      { name: "read_current_file", arguments: {} },
+    ],
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(
+    unofferedMutation.toolCalls[0],
+    { name: "replace_current_file", arguments: { text: "unsafe drift" } },
+    "an unoffered mutation must reach the normal refusal path unchanged",
+  );
+  assert.deepEqual(unofferedMutation.toolCalls[1], {
+    name: "append_to_current_file",
+    arguments: { text: markerA },
+  });
+  assert.equal(unofferedMutation.remainingLiteralSlots, 1);
+
+  const realChoice = repairOrderedCurrentNoteAppendFrontierToolCallsV1({
+    prompt,
+    currentNoteText: "Initial note\n",
+    offeredToolNames: ["append_to_current_file", "count_words"],
+    toolCalls: fourReadCopies,
+    isReadOnlyToolName: readOnly,
+  });
+  assert.deepEqual(realChoice.toolCalls, fourReadCopies);
+  assert.deepEqual(realChoice.remapped, []);
+  assert.deepEqual(realChoice.dropped, []);
 });
 
 test("a paraphrased required literal is repaired, not refused", () => {
