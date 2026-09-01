@@ -22255,12 +22255,14 @@ export async function runAgentMission({
           literalContractNoteText = null;
         }
       }
-      // Repair before validate. The host knows the exact literal this step
-      // owes and the final-answer path already restores it deterministically;
-      // refusing here only spent a bounded retry to ask the model for an edit
-      // the host could make itself. The validator below stays the single
-      // authority: a repaired payload now carries an anchor, so it passes for
-      // the same reason any compliant call does.
+      // Bind before validate. The host knows the exact literal this step owes
+      // and the final-answer path already restores missing literals
+      // deterministically. For an ordered multi-append contract this also
+      // isolates ONE owed literal when a model combines later markers into the
+      // same call; otherwise one receipt can falsely pay several operations.
+      // The validator below stays the single authority: the bound payload
+      // carries the one current anchor, so it passes for the same reason any
+      // compliant call does.
       const literalRepair = canonicalRequiredLiteralWriteContentV1(
         activeIntentPrompt,
         toolCall,
@@ -22278,7 +22280,7 @@ export async function runAgentMission({
           step,
           toolName: toolCall.name,
           message:
-            `Deterministically restored the exact user-required literal marker "${literalRepair.insertedAnchor}" before executing ${toolCall.name}.`,
+            `Deterministically restored the exact user-required literal marker "${literalRepair.insertedAnchor}" and bound ${toolCall.name} to that currently owed marker before execution.`,
           outputPreview: {
             insertedAnchor: literalRepair.insertedAnchor,
             payloadFingerprint: hashOperationInput(literalRepair.content),
@@ -30749,11 +30751,33 @@ function shouldOmitCurrentNoteReadForTargetOnlyWrite(
 ): boolean {
   // Cloud fast path: skip redundant current-note reads when writeback does not
   // depend on existing note body. Web/tool loops may still run without a read.
+  // Ordered literal appends are also target-only when the prompt names no
+  // body-dependent operation. Their live note observation is host-owned at
+  // the literal/continuation boundary, where it decides which marker remains;
+  // exposing read_current_file to the model duplicates that observation and
+  // can put an exact graph's offered menu out of step with its authority.
+  const orderedCurrentNoteAppendIsTargetOnly =
+    deriveOrderedWriteLiteralContractsV1({
+      toolName: "append_to_current_file",
+      objective: prompt,
+    }).length > 1 &&
+    !isPromptOnCurrentPageIntent(prompt) &&
+    !hasWholeNoteRevisionIntent(prompt) &&
+    !hasSectionAppendIntent(prompt) &&
+    !hasReplaceIntent(prompt) &&
+    !hasTitleIntent(prompt) &&
+    !hasDeleteIntent(prompt) &&
+    !/\b(?:read|check|inspect|look\s+at|open|summari[sz]e|analy[sz]e|explain|extract|review|describe)\b[\s\S]{0,80}\b(?:current|this|active)\s+(?:note|file|markdown|document)\b/iu.test(
+      prompt,
+    ) &&
+    !/\b(?:based\s+on|from|using|according\s+to)\s+(?:the\s+)?(?:current|this|active)\s+(?:note|file|markdown|document|content)\b/iu.test(
+      prompt,
+    );
   return (
     missionIntent.noteOutput &&
-    !missionIntent.vaultContext &&
     !missionIntent.explicitDelete &&
-    !requiresCurrentNoteContent(prompt)
+    (orderedCurrentNoteAppendIsTargetOnly ||
+      (!missionIntent.vaultContext && !requiresCurrentNoteContent(prompt)))
   );
 }
 
@@ -36322,9 +36346,9 @@ const LITERAL_CONTENT_WRITE_TOOLS = new Set([
  * the exact fix and refused anyway:
  * - not a literal-content write tool, no demanded literals, or no text /
  *   content string to repair;
- * - content already carries an anchor, which includes the anti-duplication
- *   case where the model re-carries a marker the note already landed and the
- *   validator's redirect must keep its teeth.
+ * - a single-literal call that already carries its anchor needs no repair;
+ * - an ordered multi-literal call is bound to exactly the next missing anchor,
+ *   so one mutation and receipt can pay only one ordered operation.
  */
 export function canonicalRequiredLiteralWriteContentV1(
   prompt: string,
@@ -36349,6 +36373,39 @@ export function canonicalRequiredLiteralWriteContentV1(
   }
   const content = toolCall.arguments[field] as string;
   const normalizedContent = content.toLowerCase();
+  const orderedContracts = deriveOrderedWriteLiteralContractsV1({
+    toolName: toolCall.name,
+    objective: prompt,
+  });
+  if (orderedContracts.length > 1) {
+    const normalizedNote =
+      typeof currentNoteText === "string" ? currentNoteText.toLowerCase() : null;
+    const insertedAnchor =
+      (normalizedNote === null
+        ? undefined
+        : orderedContracts.find(
+            (anchor) => !normalizedNote.includes(anchor.toLowerCase()),
+          )) ?? orderedContracts[0];
+    // When every ordered literal already landed, acceptance/graph completion
+    // owns the terminal decision. Do not manufacture another mutation.
+    if (
+      normalizedNote !== null &&
+      orderedContracts.every((anchor) =>
+        normalizedNote.includes(anchor.toLowerCase()),
+      )
+    ) {
+      return null;
+    }
+    const alreadyBound = content.trim() === insertedAnchor;
+    if (alreadyBound) {
+      return null;
+    }
+    return {
+      field,
+      content: insertedAnchor,
+      insertedAnchor,
+    };
+  }
   if (
     anchors.some((anchor) => normalizedContent.includes(anchor.toLowerCase()))
   ) {

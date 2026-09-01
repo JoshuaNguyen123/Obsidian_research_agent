@@ -27156,6 +27156,30 @@ test("a paraphrased required literal is repaired, not refused", () => {
   });
   assert.equal(firstAppend?.insertedAnchor, markerA);
   assert.doesNotMatch(String(firstAppend?.content), new RegExp(markerB, "u"));
+  // A cheap model commonly combines both requested lines in one tool call.
+  // That is not progress on a two-operation contract: the host must isolate
+  // the one literal the current graph node owes so the second durable append
+  // remains payable by its own receipt.
+  const combinedFirstAppend = canonicalRequiredLiteralWriteContentV1(
+    orderedPrompt,
+    {
+      name: "append_to_current_file",
+      arguments: { text: `${markerA}\n${markerB}` },
+    },
+    "Initial note\n",
+  );
+  assert.equal(combinedFirstAppend?.insertedAnchor, markerA);
+  assert.equal(combinedFirstAppend?.content, markerA);
+  const paraphrasedFirstAppend = canonicalRequiredLiteralWriteContentV1(
+    orderedPrompt,
+    {
+      name: "append_to_current_file",
+      arguments: { text: `Completed the first line: ${markerA}` },
+    },
+    "Initial note\n",
+  );
+  assert.equal(paraphrasedFirstAppend?.insertedAnchor, markerA);
+  assert.equal(paraphrasedFirstAppend?.content, markerA);
   // With the note observable, the anchor restored is the one the note still
   // lacks, so an ordered mission progresses in its stated order.
   const secondAppend = canonicalRequiredLiteralWriteContentV1(
@@ -27168,7 +27192,18 @@ test("a paraphrased required literal is repaired, not refused", () => {
   );
   assert.equal(secondAppend?.insertedAnchor, markerB);
 
-  // Declines wherever refusal is the right answer.
+  const combinedSecondAppend = canonicalRequiredLiteralWriteContentV1(
+    orderedPrompt,
+    {
+      name: "append_to_current_file",
+      arguments: { text: `${markerA}\n${markerB}` },
+    },
+    `Initial note\n${markerA}\n`,
+  );
+  assert.equal(combinedSecondAppend?.insertedAnchor, markerB);
+  assert.equal(combinedSecondAppend?.content, markerB);
+
+  // Single-literal content already carrying its anchor is untouched.
   assert.equal(
     canonicalRequiredLiteralWriteContentV1(singlePrompt, {
       name: "append_to_current_file",
@@ -27177,7 +27212,7 @@ test("a paraphrased required literal is repaired, not refused", () => {
     null,
     "content that already carries an anchor is never rewritten",
   );
-  assert.equal(
+  assert.deepEqual(
     canonicalRequiredLiteralWriteContentV1(
       orderedPrompt,
       {
@@ -27186,8 +27221,12 @@ test("a paraphrased required literal is repaired, not refused", () => {
       },
       `Initial note\n${markerA}\n`,
     ),
-    null,
-    "the anti-duplication redirect must keep its teeth",
+    {
+      field: "text",
+      content: markerB,
+      insertedAnchor: markerB,
+    },
+    "the exact ordered contract should repair a duplicate directly to the next owed marker",
   );
   assert.equal(
     canonicalRequiredLiteralWriteContentV1(

@@ -2,7 +2,10 @@ import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
-import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+import {
+  peekToolCallCollector,
+  recordToolCallOutcomesAfterEach,
+} from "./fixtures/toolCallCollector";
 
 // Counting survives this lane's mid-mission restartCorePlugin: the harness
 // re-arms a new collector segment after the plugin comes back, each segment is
@@ -134,7 +137,16 @@ test.describe("interrupted continuation", () => {
       expect(
         snapshot.lastReceipts.filter((receipt: any) => receipt.operation === "append").length,
         safeState,
-      ).toBeGreaterThanOrEqual(1);
+      ).toBe(2);
+
+      // A green end state is not enough: the pre-fix run reached both markers
+      // through one successful append after four rejected calls. Require two
+      // real write successes and zero failures across both restart segments.
+      const toolOutcomes = await peekToolCallCollector(harness.page);
+      expect(toolOutcomes.coverage, JSON.stringify(toolOutcomes)).toBe("complete");
+      expect(toolOutcomes.succeededWithWork, JSON.stringify(toolOutcomes)).toBe(2);
+      expect(toolOutcomes.failed, JSON.stringify(toolOutcomes)).toBe(0);
+      expect(toolOutcomes.vacuous, JSON.stringify(toolOutcomes)).toBe(0);
     } finally {
       await harness?.close();
     }

@@ -299,34 +299,7 @@ export async function harvestToolCallCollector(
 ): Promise<ToolCallOutcomeCountsV1> {
   let counts: ToolCallOutcomeCountsV1;
   try {
-    const raw = (await withHarvestTimeout(page.evaluate((slotKey) => {
-      const host = window as typeof window & Record<string, any>;
-      const state = host[slotKey];
-      if (!state || !Array.isArray(state.segments)) return null;
-      try {
-        state.unsubscribe?.();
-      } catch {
-        // The events are already copied into the segment arrays.
-      }
-      const projected = {
-        version: 1,
-        segments: state.segments.map((segment: any) => ({
-          index: segment?.index,
-          armDroppedEventCount: Number.isSafeInteger(
-            segment?.armDroppedEventCount,
-          )
-            ? segment.armDroppedEventCount
-            : null,
-          armedWhileRunning: segment?.armedWhileRunning === true,
-          overflowed: segment?.overflowed === true,
-          events: Array.isArray(segment?.events)
-            ? segment.events.map((event: object) => ({ ...event }))
-            : [],
-        })),
-      };
-      delete host[slotKey];
-      return projected;
-    }, TOOL_CALL_COLLECTOR_SLOT))) as ToolCallCollectorRawV1 | null;
+    const raw = await readToolCallCollectorRawV1(page, true);
     counts = summarizeCollectedToolCallsV1(raw);
   } catch {
     // Distinguishable from "never armed" only in intent; both are unknown, and
@@ -346,6 +319,64 @@ export async function harvestToolCallCollector(
     }
   }
   return counts;
+}
+
+/**
+ * Read the current counters without consuming the collector. Live lanes can
+ * assert their quantitative tool contract before teardown, while afterEach
+ * still harvests the same stream for the durable report.
+ */
+export async function peekToolCallCollector(
+  page: Page,
+): Promise<ToolCallOutcomeCountsV1> {
+  try {
+    return summarizeCollectedToolCallsV1(
+      await readToolCallCollectorRawV1(page, false),
+    );
+  } catch {
+    // Instrumentation must never turn product work red merely because the
+    // renderer disappeared during diagnosis; unknown is the honest result.
+    return unknownToolCallOutcomeCountsV1("unobserved");
+  }
+}
+
+async function readToolCallCollectorRawV1(
+  page: Page,
+  consume: boolean,
+): Promise<ToolCallCollectorRawV1 | null> {
+  return (await withHarvestTimeout(page.evaluate(
+    ({ slotKey, consumeSlot }) => {
+      const host = window as typeof window & Record<string, any>;
+      const state = host[slotKey];
+      if (!state || !Array.isArray(state.segments)) return null;
+      if (consumeSlot) {
+        try {
+          state.unsubscribe?.();
+        } catch {
+          // The events are already copied into the segment arrays.
+        }
+      }
+      const projected = {
+        version: 1,
+        segments: state.segments.map((segment: any) => ({
+          index: segment?.index,
+          armDroppedEventCount: Number.isSafeInteger(
+            segment?.armDroppedEventCount,
+          )
+            ? segment.armDroppedEventCount
+            : null,
+          armedWhileRunning: segment?.armedWhileRunning === true,
+          overflowed: segment?.overflowed === true,
+          events: Array.isArray(segment?.events)
+            ? segment.events.map((event: object) => ({ ...event }))
+            : [],
+        })),
+      };
+      if (consumeSlot) delete host[slotKey];
+      return projected;
+    },
+    { slotKey: TOOL_CALL_COLLECTOR_SLOT, consumeSlot: consume },
+  ))) as ToolCallCollectorRawV1 | null;
 }
 
 /**

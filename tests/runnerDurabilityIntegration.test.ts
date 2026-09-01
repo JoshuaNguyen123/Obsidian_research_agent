@@ -1523,6 +1523,7 @@ test("continue of a stub graph with streaming off and only the durable anchor he
   // loop starts even though no streamed-writeback context exists.
   const resumeRequests: ModelChatRequest[] = [];
   const toolStarts: string[] = [];
+  const appendReceipts: AgentRunReceipt[] = [];
   const completions: AgentRunCompleteEvent[] = [];
   const traces: AgentTraceEvent[] = [];
   const seg2Configs: AgentRunConfigEvent[] = [];
@@ -1531,7 +1532,10 @@ test("continue of a stub graph with streaming off and only the durable anchor he
     modelClient: createModelClient(
       [
         responseWithToolCall("append_to_current_file", {
-          text: "MARKER_A1",
+          // Live GLM Flash emitted both owed lines in one call. The runner
+          // must bind this response to the first graph node only; otherwise
+          // one receipt falsely discharges a two-operation mission.
+          text: "MARKER_A1\nMARKER_B2",
         }),
         responseWithToolCall("append_to_current_file", {
           text: "MARKER_B2",
@@ -1554,6 +1558,9 @@ test("continue of a stub graph with streaming off and only the durable anchor he
     events: {
       onRunConfig: (event) => seg2Configs.push(event),
       onToolStart: (event) => toolStarts.push(event.name),
+      onReceipt: (receipt) => {
+        if (receipt.operation === "append") appendReceipts.push(receipt);
+      },
       onRunComplete: (event) => completions.push(event),
       onTrace: (event) => traces.push(event),
     },
@@ -1644,7 +1651,18 @@ test("continue of a stub graph with streaming off and only the durable anchor he
   const lastCompletion = completions.at(-1);
   assert.ok(lastCompletion);
   if (!note.includes("MARKER_B2")) {
-    assert.equal(lastCompletion.stopReason, "budget");
+    assert.equal(
+      lastCompletion.stopReason,
+      "budget",
+      JSON.stringify({
+        completion: lastCompletion,
+        trace: traces.slice(-40).map((event) => ({
+          id: event.id,
+          message: event.message,
+          error: event.error,
+        })),
+      }),
+    );
     assert.equal(lastCompletion.autoContinueRecommended, true);
     // Segment 3 — the lane's next explicit continuation. The restored graph
     // now holds a PAID spliced node (complete, receipt-backed) beside the
@@ -1676,6 +1694,10 @@ test("continue of a stub graph with streaming off and only the durable anchor he
       enableStreaming: false,
       events: {
         onTrace: (event) => seg3Traces.push(event),
+        onToolStart: (event) => toolStarts.push(event.name),
+        onReceipt: (receipt) => {
+          if (receipt.operation === "append") appendReceipts.push(receipt);
+        },
         onRunComplete: (event) => seg3Completions.push(event),
       },
     });
@@ -1700,6 +1722,27 @@ test("continue of a stub graph with streaming off and only the durable anchor he
   } else {
     assert.equal(note.split("MARKER_B2").length - 1, 1, note);
   }
+  assert.equal(
+    toolStarts.filter((name) => name === "append_to_current_file").length,
+    2,
+    JSON.stringify({
+      rule: "Two ordered durable appends require two executed append calls, even when one model response carries both literals.",
+      toolStarts,
+      note: vault.files.get("Current.md") ?? "",
+    }),
+  );
+  assert.equal(appendReceipts.length, 2, JSON.stringify(appendReceipts));
+  assert.ok(
+    appendReceipts.every(
+      (receipt) =>
+        (typeof receipt.bytesWritten === "number" && receipt.bytesWritten > 0) ||
+        receipt.effects?.changed === true,
+    ),
+    JSON.stringify({
+      rule: "Each ordered append needs its own work-producing receipt; an idempotent second call cannot retroactively split the first mutation.",
+      appendReceipts,
+    }),
+  );
 });
 
 test("a between-writes continuation splices only the remaining owed append and never duplicates the landed one", async () => {

@@ -9,6 +9,7 @@ import {
   armToolCallCollector,
   collectedToolCallCountsForTestV1,
   harvestToolCallCollector,
+  peekToolCallCollector,
   resetToolCallCollectorStateForTestsV1,
   summarizeCollectedToolCallsV1,
   type ToolCallCollectorRawV1,
@@ -293,6 +294,26 @@ test("instrumentation can never fail a lane: a dead page harvests to unknown", a
   assert.equal(counts.coverage, "unobserved");
   assert.equal(counts.attempted, null);
   resetToolCallCollectorStateForTestsV1();
+});
+
+test("a live peek reports exact counters without consuming the collector", async () => {
+  const captured = raw(segment(0, callPair(1)));
+  let reads = 0;
+  const page = {
+    evaluate: async () => {
+      reads += 1;
+      return captured;
+    },
+  } as any;
+  const first = await peekToolCallCollector(page);
+  const second = await peekToolCallCollector(page);
+  assert.deepEqual(first, foldToolCallOutcomesV1(callPair(1)));
+  assert.deepEqual(second, first);
+  assert.equal(
+    reads,
+    2,
+    "peek must leave the page-side slot available for teardown harvest",
+  );
 });
 
 test("harvests are keyed per test, so no spec can inherit another spec's counts", () => {
