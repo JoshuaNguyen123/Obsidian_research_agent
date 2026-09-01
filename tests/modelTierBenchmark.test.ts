@@ -7,10 +7,14 @@ import { fileURLToPath } from "node:url";
 import {
   assertBenchmarkExactCleanHead,
   BENCHMARK_EVIDENCE_MISSING_FAILURE_CLASS,
+  BENCHMARK_PROOF_POLICY_CONTRACT,
+  BENCHMARK_PROOF_POLICY_SCORECARD,
   createBenchmarkPlan,
   describeMissingBenchmarkEvidence,
   hasAcceptedBenchmarkEvidence,
+  hasFreshPassingProjectSummary,
   parseBenchmarkOptions,
+  resolveBenchmarkProofPolicy,
 } from "../scripts/run-model-tier-benchmark.mjs";
 
 test("model benchmark pins the exact clean HEAD before spending a provider call", () => {
@@ -102,7 +106,7 @@ test("plan cardinality equals models times cells times attempts", () => {
   );
 });
 
-test("exit zero is green only with fresh accepted scorecard evidence", () => {
+test("scored exit zero is green only with fresh accepted scorecard evidence", () => {
   const accepted = {
     acceptanceStatus: "pass",
     scorecardAcceptancePassed: true,
@@ -130,6 +134,49 @@ test("exit zero is green only with fresh accepted scorecard evidence", () => {
   );
 });
 
+test("scorecard-exempt contract lanes use fresh passing execution proof", () => {
+  assert.equal(resolveBenchmarkProofPolicy("daily-use-research"), BENCHMARK_PROOF_POLICY_SCORECARD);
+  assert.equal(resolveBenchmarkProofPolicy("real-ai-soak"), BENCHMARK_PROOF_POLICY_CONTRACT);
+  assert.equal(
+    resolveBenchmarkProofPolicy("desktop-code-delivery-real-live"),
+    BENCHMARK_PROOF_POLICY_CONTRACT,
+  );
+
+  const summary = {
+    records: [
+      { project: "real-ai-soak", status: "passed" },
+      { project: "another-project", status: "failed" },
+    ],
+  };
+  assert.equal(hasFreshPassingProjectSummary(summary, true, "real-ai-soak"), true);
+  assert.equal(hasFreshPassingProjectSummary(summary, false, "real-ai-soak"), false);
+  assert.equal(hasFreshPassingProjectSummary(summary, true, "missing-project"), false);
+  assert.equal(
+    hasAcceptedBenchmarkEvidence({
+      exitCode: 0,
+      summaryFresh: true,
+      acceptance: {
+        acceptanceStatus: "needs_more_work",
+        scorecardAcceptancePassed: null,
+        scorecardTotal: null,
+      },
+      proofPolicy: BENCHMARK_PROOF_POLICY_CONTRACT,
+      contractEvidencePassed: true,
+    }),
+    true,
+  );
+  assert.equal(
+    hasAcceptedBenchmarkEvidence({
+      exitCode: 0,
+      summaryFresh: true,
+      acceptance: {},
+      proofPolicy: BENCHMARK_PROOF_POLICY_CONTRACT,
+      contractEvidencePassed: false,
+    }),
+    false,
+  );
+});
+
 test("missing-evidence diagnostics name every absent proof field", () => {
   assert.equal(
     BENCHMARK_EVIDENCE_MISSING_FAILURE_CLASS,
@@ -145,5 +192,17 @@ test("missing-evidence diagnostics name every absent proof field", () => {
       },
     }),
     /fresh run summary, acceptanceStatus=pass, scorecardAcceptancePassed=true, finite scorecardTotal/u,
+  );
+});
+
+test("contract-lane diagnostics name missing execution proof instead of an absent scorecard", () => {
+  assert.equal(
+    describeMissingBenchmarkEvidence({
+      summaryFresh: false,
+      acceptance: {},
+      proofPolicy: BENCHMARK_PROOF_POLICY_CONTRACT,
+      contractEvidencePassed: false,
+    }),
+    "fresh run summary, passing project execution record",
   );
 });

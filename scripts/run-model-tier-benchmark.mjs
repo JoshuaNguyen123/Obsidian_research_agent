@@ -19,7 +19,6 @@ import {
   classifyAttemptOutcome,
   extractPlaywrightReportErrorText,
   fileMtimeMs,
-  isInfrastructureFailureClass,
   mineToolEvents,
   readJsonFile,
   resolveAttemptToolEvents,
@@ -27,6 +26,7 @@ import {
   summaryWrittenSince,
   writeJsonAtomic,
 } from "./run-proof-matrix.mjs";
+import { MISSION_SCORECARD_EXEMPT_PROJECTS } from "./mission-scorecard-regression.mjs";
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const RUN_SUMMARY_PATH = path.join(REPO_ROOT, "test-results", "daily-use-run-summary.json");
@@ -52,6 +52,8 @@ export const DEFAULT_BENCHMARK_MODELS = Object.freeze([
 ]);
 export const BENCHMARK_EVIDENCE_MISSING_FAILURE_CLASS =
   "harness:benchmark_evidence_missing";
+export const BENCHMARK_PROOF_POLICY_SCORECARD = "scorecard";
+export const BENCHMARK_PROOF_POLICY_CONTRACT = "contract";
 
 const USAGE = `Model-tier benchmark
 
@@ -176,19 +178,49 @@ export function createBenchmarkPlan(options) {
   return plan;
 }
 
-export function hasAcceptedBenchmarkEvidence({ exitCode, summaryFresh, acceptance }) {
+export function resolveBenchmarkProofPolicy(project) {
+  return MISSION_SCORECARD_EXEMPT_PROJECTS.has(project)
+    ? BENCHMARK_PROOF_POLICY_CONTRACT
+    : BENCHMARK_PROOF_POLICY_SCORECARD;
+}
+
+export function hasFreshPassingProjectSummary(summary, summaryFresh, project) {
+  if (!summaryFresh || typeof project !== "string" || project === "") return false;
+  const records = Array.isArray(summary?.records) ? summary.records : [];
+  const matching = records.filter((record) => record?.project === project);
+  return matching.length > 0 && matching.every((record) => record?.status === "passed");
+}
+
+export function hasAcceptedBenchmarkEvidence({
+  exitCode,
+  summaryFresh,
+  acceptance,
+  proofPolicy = BENCHMARK_PROOF_POLICY_SCORECARD,
+  contractEvidencePassed = false,
+}) {
+  if (exitCode !== 0 || summaryFresh !== true) return false;
+  if (proofPolicy === BENCHMARK_PROOF_POLICY_CONTRACT) {
+    return contractEvidencePassed === true;
+  }
   return Boolean(
-    exitCode === 0 &&
-    summaryFresh === true &&
     acceptance?.acceptanceStatus === "pass" &&
     acceptance?.scorecardAcceptancePassed === true &&
     Number.isFinite(acceptance?.scorecardTotal),
   );
 }
 
-export function describeMissingBenchmarkEvidence({ summaryFresh, acceptance }) {
+export function describeMissingBenchmarkEvidence({
+  summaryFresh,
+  acceptance,
+  proofPolicy = BENCHMARK_PROOF_POLICY_SCORECARD,
+  contractEvidencePassed = false,
+}) {
   const missing = [];
   if (!summaryFresh) missing.push("fresh run summary");
+  if (proofPolicy === BENCHMARK_PROOF_POLICY_CONTRACT) {
+    if (!contractEvidencePassed) missing.push("passing project execution record");
+    return missing.join(", ");
+  }
   if (acceptance?.acceptanceStatus !== "pass") missing.push("acceptanceStatus=pass");
   if (acceptance?.scorecardAcceptancePassed !== true) {
     missing.push("scorecardAcceptancePassed=true");
@@ -334,11 +366,28 @@ export function runModelTierBenchmark(argv = process.argv.slice(2)) {
     const summary = readJsonFile(RUN_SUMMARY_PATH);
     const summaryFresh = summaryWrittenSince(RUN_SUMMARY_PATH, summaryMtimeBeforeLaunch);
     const acceptance = summarizeAttemptAcceptance(summary, summaryFresh);
-    const green = hasAcceptedBenchmarkEvidence({ exitCode, summaryFresh, acceptance });
+    const proofPolicy = resolveBenchmarkProofPolicy(cell.project);
+    const contractEvidencePassed = hasFreshPassingProjectSummary(
+      summary,
+      summaryFresh,
+      cell.project,
+    );
+    const green = hasAcceptedBenchmarkEvidence({
+      exitCode,
+      summaryFresh,
+      acceptance,
+      proofPolicy,
+      contractEvidencePassed,
+    });
 
     let classified;
     if (exitCode === 0 && !green) {
-      const missing = describeMissingBenchmarkEvidence({ summaryFresh, acceptance });
+      const missing = describeMissingBenchmarkEvidence({
+        summaryFresh,
+        acceptance,
+        proofPolicy,
+        contractEvidencePassed,
+      });
       classified = {
         failureClass: BENCHMARK_EVIDENCE_MISSING_FAILURE_CLASS,
         detail: `runner exited 0 without required benchmark evidence: ${missing}`,
@@ -375,14 +424,13 @@ export function runModelTierBenchmark(argv = process.argv.slice(2)) {
         : "";
     const durationS = Math.round((endedAt - startedAt) / 1000);
 
-    if (green || !isInfrastructureFailureClass(classified.failureClass)) {
-      appendRunCsvRow([
+    appendRunCsvRow([
         new Date(startedAt).toISOString(),
         cell.project,
         model,
         expectedHead,
         durationS,
-        acceptance.missionOutcome,
+        green ? "accepted" : acceptance.missionOutcome,
         classified.failureClass,
         green ? "" : `benchmark ${stage} exit ${exitCode}: ${classified.detail}`.slice(0, 500),
         observedKnown ? toolEvents.observed : "",
@@ -405,14 +453,19 @@ export function runModelTierBenchmark(argv = process.argv.slice(2)) {
         bucketCell("frontier_narrowed_mid_response"),
         bucketCell("frontier_withheld_since_earlier_step"),
         green ? "passed" : "failed",
-        acceptance.acceptanceStatus,
-        acceptance.scorecardTotal ?? "",
-        acceptance.scorecardAcceptancePassed ?? "",
+        proofPolicy === BENCHMARK_PROOF_POLICY_CONTRACT
+          ? "not_applicable"
+          : acceptance.acceptanceStatus,
+        proofPolicy === BENCHMARK_PROOF_POLICY_CONTRACT
+          ? ""
+          : acceptance.scorecardTotal ?? "",
+        proofPolicy === BENCHMARK_PROOF_POLICY_CONTRACT
+          ? ""
+          : acceptance.scorecardAcceptancePassed ?? "",
         acceptance.retries ?? "",
         acceptance.artifactProofCount ?? "",
         acceptance.cleanupProofCount ?? "",
       ]);
-    }
 
     const result = {
       cell: cell.id,
@@ -427,6 +480,8 @@ export function runModelTierBenchmark(argv = process.argv.slice(2)) {
       durationS,
       toolEvents,
       acceptance,
+      proofPolicy,
+      contractEvidencePassed,
       logPath: path.relative(REPO_ROOT, logPath),
     };
     const modelState = sweep.models[model] ?? { results: [], tierBarMet: false };
