@@ -1221,6 +1221,25 @@ test("run coordinator attests in-flight model retry and wait diagnostics", async
   );
 });
 
+test("run coordinator attests ordered append frontier projection decisions", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onTrace?.({
+      id: "ordered-current-note-append-frontier-projection-skipped-1",
+      kind: "verification",
+      step: 1,
+      message:
+        "Ordered append projection skipped: decision=current_note_unreadable; offered=append_to_current_file; model_tools=read_file; current_note_readable=false.",
+    });
+    events.onRunComplete?.({ step: 1, maxSteps: 2, stopReason: "error" });
+  });
+
+  assert.deepEqual(
+    coordinator.getSnapshot().diagnosticAttestations.map((item) => item.id),
+    ["ordered-current-note-append-frontier-projection-skipped-1"],
+  );
+});
+
 test("a refused create-file collision replan is attested with its reason", async () => {
   // Regression: the desktop audit lane blocked because code_workspace_create_file
   // hit an existing file and the read -> write_expected replan was refused. The

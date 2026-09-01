@@ -804,7 +804,7 @@ function emptyProviderUsage(): ModelUsageAggregateV1 {
 
 function isAttestedDiagnosticTraceId(id: string): boolean {
   return (
-    /^(?:agent-step-response-|loop-decision-|model-retry-|model-wait-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|committed-write-acceptance-invariant-|wall-clock-budget-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|checkpoint-resume:|mission-ledger-resume:invalid-handoff$|resume-mutation-reconciliation-required$|operation-goals:)/u.test(
+    /^(?:agent-step-response-|loop-decision-|model-retry-|model-wait-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|committed-write-acceptance-invariant-|wall-clock-budget-|mission-graph-tool-frontier-|ordered-current-note-append-frontier-projection-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|checkpoint-resume:|mission-ledger-resume:invalid-handoff$|resume-mutation-reconciliation-required$|operation-goals:)/u.test(
       id,
     ) ||
     // A create-file collision replans into read -> write_expected. When that

@@ -19516,10 +19516,11 @@ export async function runAgentMission({
         },
       });
     }
+    const orderedAppendCurrentNoteText = readCurrentNoteTextForLiteralDebt();
     const orderedAppendProjection =
       repairOrderedCurrentNoteAppendFrontierToolCallsV1({
         prompt: activeIntentPrompt,
-        currentNoteText: readCurrentNoteTextForLiteralDebt(),
+        currentNoteText: orderedAppendCurrentNoteText,
         offeredToolNames: [...stepAllowedToolNames],
         toolCalls: repairedPlaceholderCalls.toolCalls,
         // The production registry can be a least-authority ScopedToolRegistry.
@@ -19558,6 +19559,27 @@ export async function runAgentMission({
           remainingLiteralSlots:
             orderedAppendProjection.remainingLiteralSlots,
         },
+      });
+    } else if (
+      repairedPlaceholderCalls.toolCalls.some(
+        (call) => TOOL_AUTHORITY[call.name] === "read",
+      )
+    ) {
+      // This trace is deliberately aggregate-only. A cheap model returning a
+      // known safe read name against a one-tool write frontier is recoverable,
+      // but if projection declines it the exact failed precondition must
+      // survive the run for diagnosis. Never retain arguments, prompt text,
+      // note content, or a path here.
+      const skippedProjectionMessage =
+        `Ordered append projection skipped: decision=${orderedAppendProjection.decision}; ` +
+        `offered=${[...stepAllowedToolNames].join(",") || "none"}; ` +
+        `model_tools=${repairedPlaceholderCalls.toolCalls.map((call) => call.name).join(",") || "none"}; ` +
+        `current_note_readable=${typeof orderedAppendCurrentNoteText === "string"}.`;
+      events.onTrace?.({
+        id: `ordered-current-note-append-frontier-projection-skipped-${step}`,
+        kind: "verification",
+        step,
+        message: skippedProjectionMessage,
       });
     }
     if (remappedAppendAliases.remapped.length > 0) {
@@ -36377,6 +36399,15 @@ export interface OrderedCurrentNoteAppendFrontierProjectionV1 {
     toolName: string;
   }>;
   remainingLiteralSlots: number;
+  decision:
+    | "projected"
+    | "offered_frontier_mismatch"
+    | "current_note_unreadable"
+    | "no_tool_calls"
+    | "insufficient_ordered_literals"
+    | "no_missing_literals"
+    | "no_eligible_calls"
+    | "already_canonical";
 }
 
 /**
@@ -36410,7 +36441,12 @@ export function repairOrderedCurrentNoteAppendFrontierToolCallsV1(input: {
   toolCalls: readonly ModelToolCall[];
   isReadOnlyToolName: (toolName: string) => boolean;
 }): OrderedCurrentNoteAppendFrontierProjectionV1 {
-  const unchanged = (): OrderedCurrentNoteAppendFrontierProjectionV1 => ({
+  const unchanged = (
+    decision: Exclude<
+      OrderedCurrentNoteAppendFrontierProjectionV1["decision"],
+      "projected"
+    >,
+  ): OrderedCurrentNoteAppendFrontierProjectionV1 => ({
     toolCalls: input.toolCalls.map((call) => ({
       ...call,
       arguments: { ...call.arguments },
@@ -36418,31 +36454,33 @@ export function repairOrderedCurrentNoteAppendFrontierToolCallsV1(input: {
     remapped: [],
     dropped: [],
     remainingLiteralSlots: 0,
+    decision,
   });
   const offered = [
     ...new Set(input.offeredToolNames.map((name) => name.trim()).filter(Boolean)),
   ];
-  if (
-    offered.length !== 1 ||
-    offered[0] !== "append_to_current_file" ||
-    typeof input.currentNoteText !== "string" ||
-    input.toolCalls.length === 0
-  ) {
-    return unchanged();
+  if (offered.length !== 1 || offered[0] !== "append_to_current_file") {
+    return unchanged("offered_frontier_mismatch");
+  }
+  if (typeof input.currentNoteText !== "string") {
+    return unchanged("current_note_unreadable");
+  }
+  if (input.toolCalls.length === 0) {
+    return unchanged("no_tool_calls");
   }
   const orderedLiterals = deriveOrderedWriteLiteralContractsV1({
     toolName: "append_to_current_file",
     objective: input.prompt,
   });
   if (orderedLiterals.length < 2) {
-    return unchanged();
+    return unchanged("insufficient_ordered_literals");
   }
   const normalizedNote = input.currentNoteText.toLowerCase();
   const missingLiterals = orderedLiterals.filter(
     (literal) => !normalizedNote.includes(literal.toLowerCase()),
   );
   if (missingLiterals.length === 0) {
-    return unchanged();
+    return unchanged("no_missing_literals");
   }
 
   const toolCalls: ModelToolCall[] = [];
@@ -36481,6 +36519,12 @@ export function repairOrderedCurrentNoteAppendFrontierToolCallsV1(input: {
     remapped,
     dropped,
     remainingLiteralSlots: Math.max(0, missingLiterals.length - literalIndex),
+    decision:
+      remapped.length > 0 || dropped.length > 0
+        ? "projected"
+        : toolCalls.some((call) => call.name === "append_to_current_file")
+          ? "already_canonical"
+          : "no_eligible_calls",
   };
 }
 

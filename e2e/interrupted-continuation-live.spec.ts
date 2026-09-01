@@ -167,7 +167,11 @@ test.describe("interrupted continuation", () => {
           .filter(
             (item: any) =>
               /^agent-step-response-/u.test(item?.id ?? "") ||
-              /:graph-rejected$/u.test(item?.id ?? ""),
+              /^mission-graph-tool-frontier-/u.test(item?.id ?? "") ||
+              /^ordered-current-note-append-frontier-projection-/u.test(
+                item?.id ?? "",
+              ) ||
+              /:(?:graph-)?rejected$/u.test(item?.id ?? ""),
           )
           .map((item: any) => ({
             id: item.id,
@@ -177,6 +181,16 @@ test.describe("interrupted continuation", () => {
             message: item.message,
             errorCode: item.errorCode,
           })),
+        configuredAllowedTools: snapshot.lastConfig?.allowedToolNames ?? null,
+        graph: Object.values(snapshot.lastMissionGraph?.nodes ?? {}).map(
+          (node: any) => ({
+            id: node.id,
+            status: node.status,
+            allowedTools: node.allowedTools,
+            attempts: node.retries?.attempts ?? 0,
+            blockerCode: node.blocker?.code ?? null,
+          }),
+        ),
       });
       expect(toolOutcomes.coverage, toolOutcomeEvidence).toBe("complete");
       expect(toolOutcomes.succeededWithWork, toolOutcomeEvidence).toBe(2);

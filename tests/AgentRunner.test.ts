@@ -27155,6 +27155,7 @@ test("safe tool-name drift is projected onto exact ordered append slots only", (
     [2, 3],
   );
   assert.equal(projected.remainingLiteralSlots, 0);
+  assert.equal(projected.decision, "projected");
 
   const betweenWrites = repairOrderedCurrentNoteAppendFrontierToolCallsV1({
     prompt,
@@ -27171,6 +27172,7 @@ test("safe tool-name drift is projected onto exact ordered append slots only", (
     },
   ]);
   assert.equal(betweenWrites.dropped.length, 3);
+  assert.equal(betweenWrites.decision, "projected");
 
   const unofferedMutation = repairOrderedCurrentNoteAppendFrontierToolCallsV1({
     prompt,
@@ -27203,6 +27205,23 @@ test("safe tool-name drift is projected onto exact ordered append slots only", (
   assert.deepEqual(realChoice.toolCalls, fourReadCopies);
   assert.deepEqual(realChoice.remapped, []);
   assert.deepEqual(realChoice.dropped, []);
+  assert.equal(realChoice.decision, "offered_frontier_mismatch");
+});
+
+test("ordered append projection reports an unreadable current-note precondition", () => {
+  const projected = repairOrderedCurrentNoteAppendFrontierToolCallsV1({
+    prompt:
+      "Perform exactly two ordered durable appends. First append MARKER_A, then append MARKER_B.",
+    currentNoteText: null,
+    offeredToolNames: ["append_to_current_file"],
+    toolCalls: [{ name: "read_file", arguments: {} }],
+    isReadOnlyToolName: (toolName) => toolName === "read_file",
+  });
+
+  assert.equal(projected.decision, "current_note_unreadable");
+  assert.deepEqual(projected.toolCalls, [
+    { name: "read_file", arguments: {} },
+  ]);
 });
 
 test("a paraphrased required literal is repaired, not refused", () => {
