@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "debt_policy": {
+    "max_parallel_workers": 1,
+    "automatic_repair": {
+      "minimum_confidence": 0.8,
+      "minimum_priority": 0.6
+    },
+    "opportunistic_repairs": {
+      "max_files": 5,
+      "max_diff_lines": 400
+    },
+    "require_human_review": [
+      "public_api_changes",
+      "database_schema_changes",
+      "major_dependency_upgrades",
+      "authentication_architecture_changes",
+      "large_architectural_rewrites",
+      "production_deployment",
+      "package_publication",
+      "cloud_or_billing_changes"
+    ],
+    "estimated_scope_cost": {
+      "tiny": 1,
+      "small": 2,
+      "medium": 5,
+      "large": 10
+    },
+    "priority_model": "normalized(severity * interest * confidence / estimated_scope_cost)",
+    "interest_definition": "The recurring future engineering cost currently caused by the debt."
+  }
+}

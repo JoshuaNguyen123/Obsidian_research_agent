@@ -1,0 +1,32 @@
+{
+  "description": "Bounded repo-harness lifecycle controller. Review before trusting.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^apply_patch$|^Edit$|^Write$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "repo-harness hook post-tool",
+            "commandWindows": "repo-harness hook post-tool",
+            "timeout": 5,
+            "statusMessage": "Marking repository checkpoint due"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "repo-harness hook stop",
+            "commandWindows": "repo-harness hook stop",
+            "timeout": 10,
+            "statusMessage": "Checking repository convergence"
+          }
+        ]
+      }
+    ]
+  }
+}

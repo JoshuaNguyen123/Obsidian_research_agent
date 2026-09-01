@@ -1,0 +1,25 @@
+{
+  "agent": "B",
+  "startedAt": "2026-09-01T05:41:38.9716047Z",
+  "completedAt": "2026-09-01T05:43:39.1252774Z",
+  "deleted": [
+    { "path": ".cache/semantic-eval-venv/", "sizeBytes": 179283635, "itemCount": 5989 },
+    { "path": ".cache/semantic-eval-model-cache/", "sizeBytes": 138016978, "itemCount": 23 },
+    { "path": ".cache/ui-preview/", "sizeBytes": 720499, "itemCount": 34 },
+    { "path": ".cache/semantic-eval/", "sizeBytes": 156854, "itemCount": 3 },
+    { "path": ".cache/compound-flow-real.log", "sizeBytes": 38478, "itemCount": 1 },
+    { "path": ".cache/compound-flow-smoke.log", "sizeBytes": 9082, "itemCount": 1 },
+    { "path": ".cache/du06-checkers-live.log", "sizeBytes": 10058, "itemCount": 1 },
+    { "path": ".cache/obs-hello-github-live.log", "sizeBytes": 59804, "itemCount": 1 },
+    { "path": "test-results/", "sizeBytes": 23191, "itemCount": 6 },
+    { "path": "playwright-report/", "sizeBytes": 526430, "itemCount": 1 },
+    { "path": "proof-matrix-state/", "sizeBytes": 558987, "itemCount": 28 },
+    { "path": ".agentic-proof/", "sizeBytes": 200671, "itemCount": 53 },
+    { "path": "e2e-host-diagnostics/", "sizeBytes": 49888, "itemCount": 1 },
+    { "path": "e2e-compound-real-run.log", "sizeBytes": 9816, "itemCount": 1 },
+    { "path": "docs/eval/proof-matrix-logs/", "sizeBytes": 302616, "itemCount": 26 }
+  ],
+  "skipped": [],
+  "bytesReclaimed": 319966987,
+  "errors": []
+}

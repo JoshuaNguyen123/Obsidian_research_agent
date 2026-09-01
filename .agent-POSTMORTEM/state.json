@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "objective": "Make local main the single authoritative working home: checkout on main, prune unlocked merged worktrees and merged local branches, then close consolidation without using Ollama Cloud or pushing to origin.",
+  "phase": "complete",
+  "current_task": null,
+  "next_task": null,
+  "completed": [
+    {
+      "task": "zero-cloud-installed-runtime-foundation",
+      "completed_at": "2026-08-30T19:46:56Z",
+      "verification": "PASS"
+    },
+    {
+      "task": "zero-cloud-recovery-and-no-web-routing",
+      "completed_at": "2026-08-30T22:11:25Z",
+      "verification": "PASS"
+    },
+    {
+      "task": "consolidate-local-main",
+      "completed_at": "2026-08-31T21:14:38Z",
+      "verification": "PASS"
+    },
+    {
+      "task": "make-main-authoritative-home",
+      "completed_at": "2026-08-31T21:54:44Z",
+      "verification": "PASS"
+    },
+    {
+      "task": "e2e-artifact-cleanup-audit-3-agent-plan",
+      "completed_at": "2026-09-01T05:06:14Z",
+      "verification": "PASS"
+    },
+    {
+      "task": "e2e-artifact-cleanup-plan-state-refresh",
+      "completed_at": "2026-09-01T05:29:05Z",
+      "verification": "PASS"
+    },
+    {
+      "task": "e2e-artifact-cleanup-execution",
+      "completed_at": "2026-09-01T05:53:06Z",
+      "verification": "PASS"
+    },
+    {
+      "task": "e2e-artifact-cleanup-merge-reconcile",
+      "completed_at": "2026-09-01T06:01:19Z",
+      "verification": "PASS"
+    }
+  ],
+  "known_issues": [
+    "The installed scripted text-tool-call recovery scenario did not reach a note mutation through adaptive planning; parser and AgentRunner coverage remain, but installed recovery is not claimed.",
+    "Local main remains ~348 commits ahead of origin/main; push requires explicit approval."
+  ],
+  "deferred": [
+    "Revisit installed text-tool-call recovery only with an attributable orchestration fixture or a real local model; do not spend Ollama Cloud tokens for this gap.",
+    "Pushing local main to origin/main requires explicit approval.",
+    "GLM-5.3 model default rewire and offline/live E2E expansion require a separate objective."
+  ],
+  "active_claims": {},
+  "last_evaluation": "2026-09-01T06:01:19Z",
+  "last_verification": {
+    "at": "2026-09-01T06:01:15Z",
+    "classification": "PASS",
+    "required_passed": 2,
+    "required_total": 2
+  },
+  "iteration": 12,
+  "failed_attempts": {
+    "installed-text-tool-call-recovery": 3
+  },
+  "controller": {
+    "paused": false,
+    "needs_checkpoint": false,
+    "converged": true,
+    "stop_reason": "convergence criteria met",
+    "last_change_at": "2026-09-01T05:53:41Z"
+  }
+}

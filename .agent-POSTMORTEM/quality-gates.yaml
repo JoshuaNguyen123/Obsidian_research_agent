@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "gates": [
+    {
+      "id": "tests",
+      "required": true,
+      "command": [
+        "npm.cmd",
+        "run",
+        "test",
+        "--if-present"
+      ],
+      "source": "detected"
+    },
+    {
+      "id": "build",
+      "required": true,
+      "command": [
+        "npm.cmd",
+        "run",
+        "build",
+        "--if-present"
+      ],
+      "source": "detected"
+    }
+  ],
+  "security": {
+    "secret_scan": "when_tool_available",
+    "dependency_scan": "when_manifest_and_tool_available",
+    "unsafe_configuration_check": "review_changed_configuration"
+  },
+  "production": {
+    "configuration_externalized": "when_applicable",
+    "useful_error_handling": "when_applicable",
+    "logging": "when_applicable",
+    "health_checks": "services_only",
+    "documentation_current": "when_material_behavior_changes"
+  },
+  "autonomy": {
+    "max_iterations": 25,
+    "max_failed_attempts_per_task": 3,
+    "minimum_task_value": 0.6,
+    "minimum_confidence": 0.75
+  }
+}
