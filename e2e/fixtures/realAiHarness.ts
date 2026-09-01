@@ -31,6 +31,16 @@ import {
 
 export { clearChatInline } from "./chatCleanup";
 
+export interface ProductionRunAttestationOptionsV1 {
+  requireStructuredRouting?: boolean;
+  /**
+   * A resumed coordinator may legitimately make no new provider call when the
+   * host proves the restored mission is already complete. This opt-in remains
+   * fail-closed unless every durable terminal proof is present.
+   */
+  allowVerifiedNoModelResume?: boolean;
+}
+
 export interface RealAiHarness extends NativeObsidianHarness {
   config: E2EAiConfig;
   /** Relaunch the same owned Obsidian process boundary without reseeding state. */
@@ -62,7 +72,7 @@ export interface RealAiHarness extends NativeObsidianHarness {
     conflictingEvidence?: boolean;
   }): Promise<void>;
   readOwnedWebMetrics(): Promise<OwnedWebMetricsV1>;
-  attestProductionRun(options?: { requireStructuredRouting?: boolean }): Promise<any>;
+  attestProductionRun(options?: ProductionRunAttestationOptionsV1): Promise<any>;
   restartCorePlugin(): Promise<void>;
   approveUntilMissionComplete(
     timeoutMs?: number,
@@ -2512,10 +2522,53 @@ async function restoreOwnedWebBackend(page: Page): Promise<void> {
   });
 }
 
+/**
+ * The only production attestation that may omit a model call. The provider
+ * was exercised by the interrupted segment; this fresh coordinator is proving
+ * that the durable graph, acceptance, and receipts already settle the run.
+ */
+export function isVerifiedNoModelResumeAttestationV1(
+  snapshot: any,
+  allowed: boolean,
+): boolean {
+  if (!allowed || !snapshot || typeof snapshot !== "object") return false;
+  const diagnostics = Array.isArray(snapshot.diagnosticAttestations)
+    ? snapshot.diagnosticAttestations
+    : [];
+  const receipts = Array.isArray(snapshot.lastReceipts)
+    ? snapshot.lastReceipts
+    : [];
+  const nodes =
+    snapshot.lastMissionGraph?.nodes &&
+    typeof snapshot.lastMissionGraph.nodes === "object"
+      ? Object.values(snapshot.lastMissionGraph.nodes)
+      : [];
+  const modelCallEvidence = Array.isArray(snapshot.modelCallEvidence)
+    ? snapshot.modelCallEvidence
+    : [];
+
+  return (
+    diagnostics.some(
+      (item: any) =>
+        item?.id === "resume-already-verified-complete" &&
+        item?.kind === "verification",
+    ) &&
+    snapshot.lastComplete?.stopReason === "write_completed" &&
+    snapshot.lastMissionLedger?.acceptance?.status === "pass" &&
+    receipts.length > 0 &&
+    nodes.length > 0 &&
+    nodes.every(
+      (node: any) => node?.status === "complete" || node?.status === "cancelled",
+    ) &&
+    modelCallEvidence.length === 0 &&
+    snapshot.providerUsage?.modelCallCount === 0
+  );
+}
+
 async function attestProductionRun(
   page: Page,
   config: E2EAiConfig,
-  options: { requireStructuredRouting?: boolean },
+  options: ProductionRunAttestationOptionsV1,
 ): Promise<any> {
   const snapshot = await page.evaluate(async ({ pluginId }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
@@ -2788,11 +2841,17 @@ async function attestProductionRun(
     return current;
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
   expect(snapshot).toBeTruthy();
-  expect(snapshot.modelCallEvidence.length).toBeGreaterThan(0);
+  const verifiedNoModelResume = isVerifiedNoModelResumeAttestationV1(
+    snapshot,
+    options.allowVerifiedNoModelResume === true,
+  );
+  if (!verifiedNoModelResume) {
+    expect(snapshot.modelCallEvidence.length).toBeGreaterThan(0);
+  }
   const successes = snapshot.modelCallEvidence.filter(
     (item: any) => item.outcome === "success" && item.transportKind === "production",
   );
-  if (successes.length === 0) {
+  if (!verifiedNoModelResume && successes.length === 0) {
     const redactedCalls = snapshot.modelCallEvidence.slice(-8).map((item: any) => ({
       phase: item.phase ?? null,
       attempt: item.attempt ?? null,
@@ -2807,11 +2866,15 @@ async function attestProductionRun(
       `No successful production model call was attested: ${JSON.stringify(redactedCalls)}.`,
     );
   }
-  expect(successes.some((item: any) => item.model === config.model && item.responseChars > 0)).toBe(true);
+  if (!verifiedNoModelResume) {
+    expect(successes.some((item: any) => item.model === config.model && item.responseChars > 0)).toBe(true);
+  }
   for (const item of successes.filter((candidate: any) => candidate.tokenUsageReported)) {
     expect(item.totalTokens).toBeGreaterThan(0);
   }
-  expect(snapshot.providerUsage.modelCallCount).toBeGreaterThan(0);
+  if (!verifiedNoModelResume) {
+    expect(snapshot.providerUsage.modelCallCount).toBeGreaterThan(0);
+  }
   expect(snapshot.modelCallEvidence.some((item: any) => "prompt" in item || "response" in item || "url" in item)).toBe(false);
   expect(Array.isArray(snapshot.missionEvidence)).toBe(true);
   expect(

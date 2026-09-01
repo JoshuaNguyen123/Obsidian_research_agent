@@ -105,7 +105,9 @@ test.describe("interrupted continuation", () => {
       await harness.approveUntilMissionComplete(900_000);
 
       const note = await readFile(harness.noteFilePath, "utf8");
-      const snapshot = await harness.attestProductionRun();
+      const snapshot = await harness.attestProductionRun({
+        allowVerifiedNoModelResume: true,
+      });
       const safeState = JSON.stringify({
         interruptWindow,
         complete: snapshot.lastComplete,

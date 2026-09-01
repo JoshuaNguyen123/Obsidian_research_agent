@@ -1240,6 +1240,36 @@ test("run coordinator attests ordered append frontier projection decisions", asy
   );
 });
 
+test("run coordinator attests the verified no-model resume terminal", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onTrace?.({
+      id: "resume-already-verified-complete",
+      kind: "verification",
+      step: 0,
+      message:
+        "Completed the resumed run from its verified graph, receipts, operation goals, and acceptance without another provider turn.",
+    });
+    events.onRunComplete?.({
+      step: 0,
+      maxSteps: 24,
+      stopReason: "write_completed",
+    });
+  });
+
+  assert.deepEqual(coordinator.getSnapshot().diagnosticAttestations, [
+    {
+      schemaVersion: 1,
+      id: "resume-already-verified-complete",
+      kind: "verification",
+      step: 0,
+      message:
+        "Completed the resumed run from its verified graph, receipts, operation goals, and acceptance without another provider turn.",
+      missing: [],
+    },
+  ]);
+});
+
 test("a refused create-file collision replan is attested with its reason", async () => {
   // Regression: the desktop audit lane blocked because code_workspace_create_file
   // hit an existing file and the read -> write_expected replan was refused. The
