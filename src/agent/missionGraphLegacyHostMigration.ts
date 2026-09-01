@@ -207,6 +207,14 @@ export async function migrateLegacyPlanWithHostAuthority(input: {
   const nodes = Object.fromEntries(
     Object.entries(migrated.nodes).map(([nodeId, node]) => {
       const originalTask = originalTasksById.get(nodeId);
+      const legacyEvidenceAliasBindingsV1 = node.evidence.flatMap((item) => {
+        const aliasId = originalEvidenceIdByCanonical.get(item.id);
+        return aliasId ? [{ aliasId, evidenceId: item.id }] : [];
+      });
+      const legacyReceiptAliasBindingsV1 = node.receipts.flatMap((item) => {
+        const aliasId = originalReceiptIdByCanonical.get(item.id);
+        return aliasId ? [{ aliasId, receiptId: item.id }] : [];
+      });
       return [
         nodeId,
         {
@@ -218,6 +226,12 @@ export async function migrateLegacyPlanWithHostAuthority(input: {
               : {}),
             ...(originalTask?.receiptIds.length
               ? { legacyReceiptIds: [...originalTask.receiptIds] }
+              : {}),
+            ...(legacyEvidenceAliasBindingsV1.length
+              ? { legacyEvidenceAliasBindingsV1 }
+              : {}),
+            ...(legacyReceiptAliasBindingsV1.length
+              ? { legacyReceiptAliasBindingsV1 }
               : {}),
           },
         },

@@ -92,10 +92,16 @@ test("legacy aliases preserve migrated final-relevance proof after restart", asy
         outputs: {
           ...migrated.nodes.write.outputs,
           legacyEvidenceIds: ["legacy-final-summary"],
+          legacyEvidenceAliasBindingsV1: [
+            {
+              aliasId: "legacy-final-summary",
+              evidenceId: "legacy-final-summary",
+            },
+          ],
         },
         evidence: [
           {
-            id: "migrated-legacy-summary",
+            id: "legacy-final-summary",
             kind: "tool-result",
             fingerprint: fp("c"),
             observedAt: UPDATED_AT,
@@ -135,6 +141,54 @@ test("legacy aliases preserve migrated final-relevance proof after restart", asy
     finalTask ? taskHasRecordedProof(finalTask, "final_relevance") : false,
     true,
     "The restart must accept durable final proof even when the new segment's prose is too short to establish relevance independently.",
+  );
+});
+
+test("a stale legacy alias cannot hide the only graph-native final proof", async () => {
+  const envelope = await createEnvelope();
+  const migrated = await migrateLegacyMissionPlanToMissionGraphV3(
+    completePlan(),
+    migrationOptions(envelope),
+  );
+  const graph = await parseMissionGraphV3({
+    ...migrated,
+    nodes: {
+      ...migrated.nodes,
+      write: {
+        ...migrated.nodes.write,
+        outputs: {
+          ...migrated.nodes.write.outputs,
+          // This alias has no evidence record with the same durable identity.
+          // It must not consume the later final proof by array position.
+          legacyEvidenceIds: ["stale-legacy-summary"],
+          legacyEvidenceAliasBindingsV1: [],
+        },
+        evidence: [
+          {
+            id: "durable-final-output-only",
+            kind: "final-relevance",
+            fingerprint: fp("e"),
+            observedAt: UPDATED_AT,
+          },
+        ],
+        completionContract: {
+          ...migrated.nodes.write.completionContract,
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["final-relevance"],
+          minimumReceipts: 0,
+          requiredReceiptKinds: [],
+        },
+      },
+    },
+  });
+
+  const finalTask = projectMissionGraphToLegacyPlan(graph).tasks.find(
+    (task) => task.id === "write",
+  );
+  assert.deepEqual(finalTask?.evidenceIds, [FINAL_OUTPUT_RELEVANT_EVIDENCE_ID]);
+  assert.equal(
+    finalTask ? taskHasRecordedProof(finalTask, "final_relevance") : false,
+    true,
   );
 });
 

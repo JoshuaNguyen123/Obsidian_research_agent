@@ -53,6 +53,9 @@ test("legacy host migration canonicalizes unsafe proof ids while preserving comp
   assert.equal(node.evidence.length, 1);
   assert.doesNotMatch(node.evidence[0].id, /https?:\/\//);
   assert.match(node.evidence[0].fingerprint, /^sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(node.outputs.legacyEvidenceAliasBindingsV1, [
+    { aliasId: evidence.id, evidenceId: node.evidence[0].id },
+  ]);
   const projected = projectMissionGraphToLegacyPlan(graph);
   assert.deepEqual(projected.tasks[0].evidenceIds, [evidence.id]);
 });

@@ -732,36 +732,56 @@ function projectGraphNodeToLegacyTask(node: MissionNodeV3): MissionPlanTask {
     node.outputs.legacyEvidenceIds,
   );
   const legacyReceiptIds = legacyOutputIds(node.outputs.legacyReceiptIds);
-  // Legacy host migration preserves one alias per evidence record in the
-  // graph's original append-only prefix. Do not expose that same historical
-  // record twice under its alias and canonical graph id. Evidence appended
-  // after migration has no alias and must be projected normally.
-  const graphEvidenceWithoutLegacyAliases =
-    legacyEvidenceIds.length > 0
-      ? node.evidence.slice(
-          Math.min(legacyEvidenceIds.length, node.evidence.length),
-        )
-      : node.evidence;
+  const rawEvidenceAliasBindings = node.outputs.legacyEvidenceAliasBindingsV1;
+  const rawReceiptAliasBindings = node.outputs.legacyReceiptAliasBindingsV1;
+  const hasEvidenceAliasBindings = Array.isArray(rawEvidenceAliasBindings);
+  const hasReceiptAliasBindings = Array.isArray(rawReceiptAliasBindings);
+  const evidenceAliasByGraphId = new Map(
+    legacyReferenceAliasBindings(
+      rawEvidenceAliasBindings,
+      "evidenceId",
+    ).map((item) => [item.referenceId, item.aliasId]),
+  );
+  const receiptAliasByGraphId = new Map(
+    legacyReferenceAliasBindings(
+      rawReceiptAliasBindings,
+      "receiptId",
+    ).map((item) => [item.referenceId, item.aliasId]),
+  );
+  // New migrations persist the exact alias -> graph-reference identity. Old
+  // stores had only parallel arrays, so retain their positional compatibility
+  // except where it would consume final-output evidence under a non-final
+  // alias. That final-proof safeguard is what prevents a stale restart alias
+  // from hiding the only durable terminal evidence.
+  const projectedEvidenceIds = node.evidence.map((item, index) => {
+    const boundAlias = evidenceAliasByGraphId.get(item.id);
+    if (boundAlias) return boundAlias;
+    if (!hasEvidenceAliasBindings) {
+      const positionalAlias = legacyEvidenceIds[index];
+      if (
+        positionalAlias &&
+        (!/final-output|final-relevance/i.test(item.kind) ||
+          positionalAlias === FINAL_OUTPUT_RELEVANT_EVIDENCE_ID)
+      ) {
+        return positionalAlias;
+      }
+    }
+    return projectLegacyEvidenceId(node, item);
+  });
   return {
     id: node.id,
     title: node.objective,
     status: projectLegacyNodeStatus(node.status),
     allowedTools: [...node.allowedTools],
     dependencies: [...node.dependencyIds],
-    // Migration aliases preserve the legacy IDs that old ledgers and tests
-    // still reference, but they are not an alternate source of truth. A
-    // resumed graph can append new evidence after migration (most critically
-    // the host-verified final-output proof). Treating a non-empty alias list
-    // as an override hid that appended proof on the next projection and sent
-    // an otherwise complete run into empty-frontier continuations.
-    evidenceIds: unique([
-      ...legacyEvidenceIds,
-      ...graphEvidenceWithoutLegacyAliases.map((item) =>
-        projectLegacyEvidenceId(node, item),
-      ),
-    ]),
+    // Migration aliases preserve legacy IDs, but one graph evidence record
+    // still projects to exactly one evidence ID. This avoids double-counting a
+    // single source toward minimum-evidence acceptance.
+    evidenceIds: unique(projectedEvidenceIds),
     receiptIds: node.receipts.flatMap((item, index) => [
-      legacyReceiptIds[index] ?? item.id,
+      receiptAliasByGraphId.get(item.id) ??
+        (!hasReceiptAliasBindings ? legacyReceiptIds[index] : undefined) ??
+        item.id,
       `${RECEIPT_PROOF_ID_PREFIX}${projectReceiptKindToLegacyProof(item.kind)}`,
     ]),
     completionContract: projectLegacyCompletionContract(node),
@@ -774,6 +794,25 @@ function legacyOutputIds(value: unknown): string[] {
   return value.filter(
     (item): item is string => typeof item === "string" && item.length > 0,
   );
+}
+
+function legacyReferenceAliasBindings(
+  value: unknown,
+  referenceKey: "evidenceId" | "receiptId",
+): Array<{ aliasId: string; referenceId: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    const aliasId = record.aliasId;
+    const referenceId = record[referenceKey];
+    return typeof aliasId === "string" &&
+      aliasId.length > 0 &&
+      typeof referenceId === "string" &&
+      referenceId.length > 0
+      ? [{ aliasId, referenceId }]
+      : [];
+  });
 }
 
 function projectLegacyEvidenceId(

@@ -188,6 +188,10 @@ test.describe("interrupted continuation", () => {
             status: node.status,
             allowedTools: node.allowedTools,
             attempts: node.retries?.attempts ?? 0,
+            evidenceKinds: Array.isArray(node.evidence)
+              ? node.evidence.map((item: any) => item.kind)
+              : [],
+            verificationStatus: node.verification?.status ?? null,
             blockerCode: node.blocker?.code ?? null,
           }),
         ),
