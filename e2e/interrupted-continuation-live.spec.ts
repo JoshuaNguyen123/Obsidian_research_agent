@@ -156,10 +156,32 @@ test.describe("interrupted continuation", () => {
       // through one successful append after four rejected calls. Require two
       // real write successes and zero failures across both restart segments.
       const toolOutcomes = await peekToolCallCollector(harness.page);
-      expect(toolOutcomes.coverage, JSON.stringify(toolOutcomes)).toBe("complete");
-      expect(toolOutcomes.succeededWithWork, JSON.stringify(toolOutcomes)).toBe(2);
-      expect(toolOutcomes.failed, JSON.stringify(toolOutcomes)).toBe(0);
-      expect(toolOutcomes.vacuous, JSON.stringify(toolOutcomes)).toBe(0);
+      const toolOutcomeEvidence = JSON.stringify({
+        interruptWindow,
+        toolOutcomes,
+        // Sanitized coordinator attestations only: these expose the projected
+        // tool names and rejected step/name, never provider payloads, note
+        // content, paths, or credentials. Aggregate-only failures previously
+        // could not distinguish a projection miss from a graph-sequencing bug.
+        diagnostics: (snapshot.diagnosticAttestations ?? [])
+          .filter(
+            (item: any) =>
+              /^agent-step-response-/u.test(item?.id ?? "") ||
+              /:graph-rejected$/u.test(item?.id ?? ""),
+          )
+          .map((item: any) => ({
+            id: item.id,
+            kind: item.kind,
+            step: item.step,
+            toolName: item.toolName,
+            message: item.message,
+            errorCode: item.errorCode,
+          })),
+      });
+      expect(toolOutcomes.coverage, toolOutcomeEvidence).toBe("complete");
+      expect(toolOutcomes.succeededWithWork, toolOutcomeEvidence).toBe(2);
+      expect(toolOutcomes.failed, toolOutcomeEvidence).toBe(0);
+      expect(toolOutcomes.vacuous, toolOutcomeEvidence).toBe(0);
     } finally {
       await harness?.close();
     }
