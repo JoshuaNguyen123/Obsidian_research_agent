@@ -9,6 +9,8 @@ import { PLAYWRIGHT_PROJECTS } from "../scripts/run-e2e-exclusive.mjs";
 import {
   ATTEMPT_LOG_DIR,
   CELLS,
+  DEFAULT_PROOF_MATRIX_MODEL,
+  PROOF_MATRIX_MODEL,
   CLASSIFICATION_CONFIRMED,
   CLASSIFICATION_MECHANICAL,
   CLASSIFICATION_UNCLASSIFIED,
@@ -62,6 +64,7 @@ import {
   porcelainWithoutAllowedHarvest,
   reconcileInFlightAttempt,
   registerProductFailure,
+  resolveProofMatrixModel,
   writeJsonAtomic,
   type ProofMatrixAttempt,
   type ProofMatrixManifest,
@@ -80,6 +83,20 @@ function green(cell: string): ProofMatrixAttempt {
 function red(cell: string, failureClass: string): ProofMatrixAttempt {
   return { cell, green: false, failureClass };
 }
+
+test("proof matrix model pin is explicit and rejects ambiguous tags", () => {
+  assert.equal(DEFAULT_PROOF_MATRIX_MODEL, "deepseek-v4-pro");
+  assert.equal(PROOF_MATRIX_MODEL, DEFAULT_PROOF_MATRIX_MODEL);
+  assert.equal(
+    resolveProofMatrixModel(["--model=glm-5.3-flash:cloud"]),
+    "glm-5.3-flash:cloud",
+  );
+  assert.throws(
+    () => resolveProofMatrixModel(["--model=glm-5.3:cloud", "--model=kimi-k3:cloud"]),
+    /only once/u,
+  );
+  assert.throws(() => resolveProofMatrixModel(["--model="]), /bounded exact model tag/u);
+});
 
 test("scorecard baseline detection reads records[].project, not array indices", () => {
   const baseline = {

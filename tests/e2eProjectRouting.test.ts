@@ -8,7 +8,7 @@ import { allowsWorkflowAuditBaselineBootstrap, applyE2eAiMode, applyE2eLane, app
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
 // @ts-ignore The production workflow-audit runner is an intentionally unbundled Node ESM script.
-import { protectedWorkflowAuditManifestPathV1, runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_MODEL, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
+import { DEFAULT_WORKFLOW_AUDIT_MODEL, parseWorkflowAuditModelArgV1, protectedWorkflowAuditManifestPathV1, resolveWorkflowAuditModel, runWorkflowAuditE2eV1, validateWorkflowAuditEnvironmentV1, WORKFLOW_AUDIT_CONFIRMATION, WORKFLOW_AUDIT_MODEL, WORKFLOW_AUDIT_STAGES } from "../scripts/run-workflow-audit-e2e.mjs";
 
 test("no Playwright lane injects a model client into the installed plugin", () => {
   const config = readFileSync(
@@ -123,6 +123,21 @@ test("exclusive E2E runner routes the BYOK autonomous journey as real AI", () =>
   });
 });
 
+test("workflow audit model selection is explicit and fail-closed", () => {
+  assert.equal(DEFAULT_WORKFLOW_AUDIT_MODEL, "deepseek-v4-pro");
+  assert.equal(WORKFLOW_AUDIT_MODEL, DEFAULT_WORKFLOW_AUDIT_MODEL);
+  assert.equal(resolveWorkflowAuditModel("glm-5.3:cloud"), "glm-5.3:cloud");
+  assert.equal(
+    parseWorkflowAuditModelArgV1(["--model=kimi-k3:cloud"]),
+    "kimi-k3:cloud",
+  );
+  assert.throws(
+    () => parseWorkflowAuditModelArgV1(["--model=a", "--model=b"]),
+    /only once/u,
+  );
+  assert.throws(() => resolveWorkflowAuditModel("bad model"), /bounded exact model tag/u);
+});
+
 test("full workflow audit routes independent functions and the joined journey sequentially", async () => {
   const auditStages = WORKFLOW_AUDIT_STAGES as ReadonlyArray<{
     id: string;
@@ -200,6 +215,7 @@ test("full workflow audit routes independent functions and the joined journey se
   );
 
   const headSha = "a".repeat(40);
+  const auditModel = "glm-5.3-flash:cloud";
   const calls: Array<{
     args: string[];
     visibility: string | undefined;
@@ -208,6 +224,7 @@ test("full workflow audit routes independent functions and the joined journey se
   const manifests: any[] = [];
   const protectedManifests: Array<{ path: string; manifest: any }> = [];
   const result = await runWorkflowAuditE2eV1({
+    model: auditModel,
     platform: "win32",
     env: {
       WORKFLOW_AUDIT_LIVE_CONFIRMATION: WORKFLOW_AUDIT_CONFIRMATION,
@@ -251,6 +268,7 @@ test("full workflow audit routes independent functions and the joined journey se
   });
   assert.equal(result.status, "passed");
   assert.equal(result.headSha, headSha);
+  assert.equal(result.model, auditModel);
   assert.deepEqual(
     calls.flatMap((call) => {
       const project = call.args.find((argument) =>
@@ -281,7 +299,7 @@ test("full workflow audit routes independent functions and the joined journey se
   ), true);
   assert.equal(calls.every((call) => call.visibility === "private"), true);
   assert.equal(
-    calls.filter((call) => call.model).every((call) => call.model === WORKFLOW_AUDIT_MODEL),
+    calls.filter((call) => call.model).every((call) => call.model === auditModel),
     true,
   );
   assert.equal(manifests.at(-1)?.version, 2);

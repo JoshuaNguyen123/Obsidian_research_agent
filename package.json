@@ -48,6 +48,7 @@
     "test:e2e:interrupted-continuation": "node scripts/run-e2e-exclusive.mjs --real-ai --project=interrupted-continuation-live",
     "test:e2e:notebook": "node scripts/run-e2e-exclusive.mjs --real-ai --project=notebook-execution-live",
     "test:e2e:proof-matrix": "node scripts/run-proof-matrix.mjs",
+    "test:e2e:model-benchmark": "node scripts/run-model-tier-benchmark.mjs",
     "test:e2e:reliability-90": "node scripts/run-proof-matrix.mjs --gate=acceptable90",
     "test:e2e:reliability-95": "node scripts/run-proof-matrix.mjs --gate=target95",
     "test:e2e:provider-canary": "node scripts/run-e2e-exclusive.mjs --real-ai --project=provider-canary",

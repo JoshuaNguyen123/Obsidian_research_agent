@@ -23,11 +23,13 @@
 //   E2E_OLLAMA_API_KEY           real-model credential (cloud API)
 //   LINEAR_LIVE_TEST_TEAM_ID     required by Linear-exercising lanes
 //   E2E_GITHUB_TOKEN             required by GitHub-exercising lanes
-// The model is hard-pinned (deepseek-v4-pro) regardless of E2E_AI_MODEL, the
-// same rule the 8-stage workflow audit applies.
+// The model defaults to deepseek-v4-pro and can be pinned explicitly with
+// --model=<exact-tag>. E2E_AI_MODEL is still ignored: campaign identity must
+// come from the command recorded in the manifest, not ambient process state.
 //
 // Usage:
-//   node scripts/run-proof-matrix.mjs [--cells=a,b] [--dry-run] [--resume]
+//   node scripts/run-proof-matrix.mjs [--model=exact-tag] [--cells=a,b]
+//                                     [--dry-run] [--resume]
 //                                     [--allow-preexisting-workspaces]
 //
 // Evidence duties handled per attempt (previously hand-maintained):
@@ -118,10 +120,22 @@ const WORKSPACES_ROOT = path.join(
   "workspaces-v2",
 );
 
-// Same pin rule as scripts/run-workflow-audit-e2e.mjs: matrix evidence is
-// meaningful only on the recommended profile; other models come later, behind
-// the behavioral canary.
-const PROOF_MATRIX_MODEL = "deepseek-v4-pro";
+export const DEFAULT_PROOF_MATRIX_MODEL = "deepseek-v4-pro";
+
+export function resolveProofMatrixModel(args = process.argv.slice(2)) {
+  const modelArgs = args.filter((argument) => argument.startsWith("--model="));
+  if (modelArgs.length > 1) {
+    throw new Error("proof-matrix: --model may be specified only once.");
+  }
+  if (modelArgs.length === 0) return DEFAULT_PROOF_MATRIX_MODEL;
+  const model = modelArgs[0].slice("--model=".length).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/u.test(model)) {
+    throw new Error("proof-matrix: --model requires one bounded exact model tag.");
+  }
+  return model;
+}
+
+export const PROOF_MATRIX_MODEL = resolveProofMatrixModel();
 
 /**
  * The pre-2026-08-25 header. New columns are APPENDED only — readers index by
@@ -1567,7 +1581,7 @@ async function main() {
   const preexistingWorkspaces = listWorkspaceEntries();
 
   if (flag("--dry-run")) {
-    console.log(`proof-matrix ${gate.id} dry run @ ${expectedHead}`);
+    console.log(`proof-matrix ${gate.id} dry run @ ${expectedHead} model=${PROOF_MATRIX_MODEL}`);
     for (const cell of cells) {
       console.log(
         `  ${cell.id}: project=${cell.project}` +
@@ -1615,8 +1629,12 @@ async function main() {
   if (flag("--resume") && manifest.gate && manifest.gate !== gate.id) {
     fail(`manifest pins gate ${manifest.gate}; refusing to resume as ${gate.id}.`);
   }
+  if (flag("--resume") && manifest.model && manifest.model !== PROOF_MATRIX_MODEL) {
+    fail(`manifest pins model ${manifest.model}; refusing to resume as ${PROOF_MATRIX_MODEL}.`);
+  }
   manifest.expectedHead = expectedHead;
   manifest.gate = gate.id;
+  manifest.model = PROOF_MATRIX_MODEL;
   if (flag("--resume")) {
     const reconciled = reconcileInFlightAttempt(manifest);
     if (reconciled) {

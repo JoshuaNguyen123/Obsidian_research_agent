@@ -5,6 +5,9 @@ export const CELLS: Array<{
   requiredGreens: number;
   maxAttempts: number;
 }>;
+export const DEFAULT_PROOF_MATRIX_MODEL: string;
+export const PROOF_MATRIX_MODEL: string;
+export function resolveProofMatrixModel(args?: string[]): string;
 export const ATTEMPT_LOG_DIR: string;
 export const SCORECARD_BASELINE_RELATIVE_PATH: string;
 export function porcelainWithoutAllowedHarvest(status: string): string;

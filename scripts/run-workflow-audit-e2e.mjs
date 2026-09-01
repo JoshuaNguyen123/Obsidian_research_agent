@@ -23,7 +23,27 @@ const byokVerifier = path.join(
 
 export const WORKFLOW_AUDIT_CONFIRMATION =
   "RESEARCH_LINEAR_DESKTOP_PRIVATE_GITHUB_REFLECTION";
-export const WORKFLOW_AUDIT_MODEL = "deepseek-v4-pro";
+export const DEFAULT_WORKFLOW_AUDIT_MODEL = "deepseek-v4-pro";
+// Backward-compatible public name for callers that want the default.
+export const WORKFLOW_AUDIT_MODEL = DEFAULT_WORKFLOW_AUDIT_MODEL;
+
+export function resolveWorkflowAuditModel(value) {
+  const model = String(value ?? DEFAULT_WORKFLOW_AUDIT_MODEL).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/u.test(model)) {
+    throw new Error("Workflow audit model must be one bounded exact model tag.");
+  }
+  return model;
+}
+
+export function parseWorkflowAuditModelArgV1(argv = process.argv.slice(2)) {
+  const values = argv
+    .filter((argument) => argument.startsWith("--model="))
+    .map((argument) => argument.slice("--model=".length));
+  if (values.length > 1) {
+    throw new Error("Workflow audit --model may be specified only once.");
+  }
+  return resolveWorkflowAuditModel(values[0]);
+}
 
 /**
  * Project ideation first proves its independent closed API contract, followed
@@ -135,6 +155,9 @@ export async function runWorkflowAuditE2eV1(options = {}) {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const { expectedHead } = validateWorkflowAuditEnvironmentV1(env, platform);
+  const auditModel = resolveWorkflowAuditModel(
+    options.model ?? env.WORKFLOW_AUDIT_MODEL,
+  );
   const runChild = options.runChild ?? runChildV1;
   const gitState = options.gitState ?? readGitStateV1;
   const persistManifest = options.persistManifest ?? persistManifestV1;
@@ -150,7 +173,7 @@ export async function runWorkflowAuditE2eV1(options = {}) {
     kind: "exact_head_workflow_audit",
     headSha: expectedHead,
     githubVisibility: "private",
-    model: WORKFLOW_AUDIT_MODEL,
+    model: auditModel,
     startedAt: now().toISOString(),
     completedAt: null,
     status: "running",
@@ -187,7 +210,7 @@ export async function runWorkflowAuditE2eV1(options = {}) {
         env: {
           ...env,
           E2E_GITHUB_VISIBILITY: "private",
-          ...(stage.realAi ? { E2E_AI_MODEL: WORKFLOW_AUDIT_MODEL } : {}),
+          ...(stage.realAi ? { E2E_AI_MODEL: auditModel } : {}),
           ...(stage.id === "linked_phase_research_to_note_and_jupyter_reflection" &&
               env.WORKFLOW_AUDIT_BASELINE_BOOTSTRAP === "1"
             ? { E2E_ALLOW_MISSING_SCORECARD_BASELINE: "1" }
@@ -235,7 +258,7 @@ export async function runWorkflowAuditE2eV1(options = {}) {
           Date.parse(completedAt) - Date.parse(startedAt),
         ),
         status: "passed",
-        model: stage.realAi ? WORKFLOW_AUDIT_MODEL : null,
+        model: stage.realAi ? auditModel : null,
         providerUsage: runtimeEvidence.providerUsage,
         receipts: runtimeEvidence.receipts,
         cleanup: runtimeEvidence.cleanup,
@@ -578,7 +601,14 @@ function runChildV1(command, args, options) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(scriptPath)) {
-  runWorkflowAuditE2eV1().catch((error) => {
+  let model;
+  try {
+    model = parseWorkflowAuditModelArgV1();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
+  if (model) runWorkflowAuditE2eV1({ model }).catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });
