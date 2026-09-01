@@ -413,6 +413,31 @@ test("the real AI harness clicks only the exact rendered prepared action", () =>
   }
 });
 
+test("the real AI harness preserves the legacy terminal-plan projection alarm", () => {
+  const harness = readFileText("../e2e/fixtures/realAiHarness.ts");
+  for (const required of [
+    "product:final_projection_candidate_rejected",
+    'item === "mission_plan_incomplete"',
+    'node.id === "final"',
+    'node.status === "ready"',
+    "node.allowedTools.length === 0",
+  ]) {
+    assert.ok(
+      harness.includes(required),
+      `missing terminal finalization alarm contract: ${required}`,
+    );
+  }
+});
+
+test("the exact Linear cleanup lane accepts both marker families it owns", () => {
+  const cleanup = readFileText("../e2e/linear-flow-real-cleanup.spec.ts");
+  assert.match(
+    cleanup,
+    /EXACT_OWNED_MARKER = \/\^\(\?:FLOW_REAL\|BYOK_AUTONOMOUS\)_\[a-f0-9\]\{12\}\$\/u/u,
+  );
+  assert.match(cleanup, /!EXACT_OWNED_MARKER\.test\(EXACT_MARKER\)/u);
+});
+
 test("the exclusive runner preserves list output plus execution JSON and scorecard reports", () => {
   // list must stay first: --reporter REPLACES the config's reporters, and
   // without it no assertion text reaches stdout, so every red classifies as

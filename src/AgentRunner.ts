@@ -415,6 +415,7 @@ import {
   isIncompleteWorkspaceReplacementContent,
   isWorkspaceCreateFilePlaceholderContent,
   missionAcceptanceHasOnlyFinalProjectionDebt,
+  missionAcceptanceHasOnlyTerminalFinalizationDebt,
   normalizeWorkspaceObservationId,
   receiptProvesWorkspaceContentChangeV1,
   rememberVerifiedMermaidReadResult,
@@ -9431,7 +9432,11 @@ export async function runAgentMission({
     // the write-specific proof was dropped on the floor.
     acceptance = reconcileCommittedProofGatedWriteAcceptance(acceptance, step);
     let onlyFinalProjectionProofMissing =
-      missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
+      missionAcceptanceHasOnlyTerminalFinalizationDebt(
+        acceptance,
+        missionGraph?.nodes.final?.status === "ready" &&
+          missionGraph.nodes.final.allowedTools.length === 0,
+      );
     if (
       missionGraphSession &&
       (stopReason === "final" || stopReason === "write_completed") &&
@@ -9451,7 +9456,11 @@ export async function runAgentMission({
       // Same invariant as above: the committed write, not the label, decides.
       acceptance = reconcileCommittedProofGatedWriteAcceptance(acceptance, step);
       onlyFinalProjectionProofMissing =
-        missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
+        missionAcceptanceHasOnlyTerminalFinalizationDebt(
+          acceptance,
+          missionGraph?.nodes.final?.status === "ready" &&
+            missionGraph.nodes.final.allowedTools.length === 0,
+        );
     }
     // Research memory may only extract after honest acceptance — never force a
     // pass before final graph projection / verification.
@@ -21734,7 +21743,11 @@ export async function runAgentMission({
         // proof remains blocking; this narrow debt set proceeds to
         // finishRun("final"), which records the final node and re-evaluates.
         const candidateOnlyFinalProjectionDebt =
-          missionAcceptanceHasOnlyFinalProjectionDebt(candidateAcceptance);
+          missionAcceptanceHasOnlyTerminalFinalizationDebt(
+            candidateAcceptance,
+            missionGraph?.nodes.final?.status === "ready" &&
+              missionGraph.nodes.final.allowedTools.length === 0,
+          );
         if (candidateOnlyFinalProjectionDebt) {
           events.onStatus?.(
             "Final draft passed every pre-projection check; recording terminal relevance proof...",

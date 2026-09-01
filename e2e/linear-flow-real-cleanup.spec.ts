@@ -36,6 +36,7 @@ const LANE = "linear-flow-real-cleanup";
  * which a strict end-anchor excluded and left behind as residue.
  */
 const FLOW_REAL_TITLE = /^Flow real FLOW_REAL_[0-9a-f]+(?:\s|$)/u;
+const EXACT_OWNED_MARKER = /^(?:FLOW_REAL|BYOK_AUTONOMOUS)_[a-f0-9]{12}$/u;
 const APPLY = process.env.FLOW_REAL_CLEANUP_APPLY === "1";
 const PERMANENT =
   process.env.LINEAR_EXACT_CLEANUP_PERMANENT === "1";
@@ -54,7 +55,7 @@ if (
     /^[A-Za-z0-9-]{8,200}$/u.test(EXACT_ISSUE_ID) ||
     /^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/u.test(EXACT_ISSUE_ID)
   ) ||
-    !/^BYOK_AUTONOMOUS_[a-f0-9]{12}$/u.test(EXACT_MARKER))
+    !EXACT_OWNED_MARKER.test(EXACT_MARKER))
 ) {
   throw new Error("Exact Linear cleanup scope is malformed.");
 }

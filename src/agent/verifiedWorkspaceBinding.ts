@@ -755,6 +755,37 @@ export function missionAcceptanceHasOnlyFinalProjectionDebt(
 }
 
 /**
+ * The legacy mission-plan projection stays `in_progress` until the
+ * authoritative graph's final node records its output. Consequently a fully
+ * proved graph can report `mission_plan_incomplete` alongside (or immediately
+ * after) its final relevance debt. Admit that extra marker only when the host
+ * has independently established that the zero-tool final node is ready; an
+ * arbitrary incomplete plan must never qualify.
+ */
+export function missionAcceptanceHasOnlyTerminalFinalizationDebt(
+  acceptance: Pick<MissionAcceptanceResult, "missing">,
+  hasReadyToollessFinalNode: boolean,
+): boolean {
+  if (missionAcceptanceHasOnlyFinalProjectionDebt(acceptance)) {
+    return true;
+  }
+  if (
+    !hasReadyToollessFinalNode ||
+    acceptance.missing.length === 0 ||
+    !acceptance.missing.includes("mission_plan_incomplete")
+  ) {
+    return false;
+  }
+  return acceptance.missing.every(
+    (item) =>
+      item === "mission_plan_incomplete" ||
+      item === "final_output" ||
+      /(?:^|:)final_relevance$/u.test(item) ||
+      /(?:^|:)final_output$/u.test(item),
+  );
+}
+
+/**
  * A verified host-directory export is already a complete, receipt-backed
  * terminal answer. Once acceptance passes and every explicit proof debt is
  * paid, a controller routing label cannot add authority; another provider turn

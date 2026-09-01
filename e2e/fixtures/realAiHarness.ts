@@ -1725,27 +1725,29 @@ async function approveUntilMissionComplete(
       const acceptanceMissing = (
         ui.ledger?.acceptance as { missing?: unknown } | undefined
       )?.missing;
+      const finalNodeReady = ui.graph.some(
+        (node) =>
+          node.id === "final" &&
+          node.status === "ready" &&
+          node.allowedTools.length === 0,
+      );
       const finalProjectionDebtOnly =
+        finalNodeReady &&
         Array.isArray(acceptanceMissing) &&
         acceptanceMissing.length > 0 &&
         acceptanceMissing.every(
           (item) =>
             typeof item === "string" &&
-            (item === "final_output" ||
+            (item === "mission_plan_incomplete" ||
+              item === "final_output" ||
               /(?:^|:)final_relevance$/u.test(item) ||
               /(?:^|:)final_output$/u.test(item)),
         );
-      const finalNodeReady = ui.graph.some(
-        (node) =>
-          node.id === "final" &&
-          (node.status === "ready" || node.status === "queued") &&
-          node.allowedTools.length === 0,
-      );
       // Stable product identity for the circular finalization failure: every
       // substantive proof is paid, but the candidate was held before the only
       // operation that can record terminal projection evidence.
       const failurePrefix =
-        finalProjectionDebtOnly && finalNodeReady
+        finalProjectionDebtOnly
           ? "product:final_projection_candidate_rejected — "
           : "";
       throw new Error(

@@ -191,7 +191,7 @@ test("an exhausted semantic-index helper timeout is a stable product alarm", () 
 test("a circular final-projection hold is a stable product alarm", () => {
   const logText = [
     "Error: product:final_projection_candidate_rejected — Mission stopped before acceptance",
-    'missing=["plan:final:final_relevance","verifier:final:final_relevance"]',
+    'missing=["plan:final:final_relevance","verifier:final:final_relevance","mission_plan_incomplete"]',
     "  1) [compound-flow-real-live] › e2e/compound-flow-real-live.spec.ts › FLOW-REAL-01",
   ].join("\n");
   const classified = classifyAttemptOutcome({

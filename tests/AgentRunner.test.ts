@@ -143,6 +143,7 @@ import {
   bindVerifiedWorkspaceObservationTool,
   buildVerifiedHostExportFinalAnswer,
   missionAcceptanceHasOnlyFinalProjectionDebt,
+  missionAcceptanceHasOnlyTerminalFinalizationDebt,
   shouldFinalizeVerifiedHostExportAfterToolUse,
   shouldRequestStreamingFinalProjection,
   buildExactCodeValidationFallbackToolCall,
@@ -3877,6 +3878,54 @@ test("terminal projection debt classifier is narrow enough for pre-emission fina
     missionAcceptanceHasOnlyFinalProjectionDebt({ missing: [] }),
     false,
   );
+  assert.equal(
+    missionAcceptanceHasOnlyTerminalFinalizationDebt(
+      {
+        missing: [
+          "plan:final:final_relevance",
+          "verifier:final:final_relevance",
+          "mission_plan_incomplete",
+        ],
+      },
+      true,
+    ),
+    true,
+    "a ready zero-tool final node owns the legacy plan-completion projection too",
+  );
+  assert.equal(
+    missionAcceptanceHasOnlyTerminalFinalizationDebt(
+      { missing: ["mission_plan_incomplete"] },
+      true,
+    ),
+    true,
+    "the last projection marker alone may be recorded by the ready final node",
+  );
+  assert.equal(
+    missionAcceptanceHasOnlyTerminalFinalizationDebt(
+      {
+        missing: [
+          "plan:final:final_relevance",
+          "mission_plan_incomplete",
+        ],
+      },
+      false,
+    ),
+    false,
+    "an arbitrary incomplete plan cannot borrow terminal projection authority",
+  );
+  assert.equal(
+    missionAcceptanceHasOnlyTerminalFinalizationDebt(
+      {
+        missing: [
+          "mission_plan_incomplete",
+          "verifier:citation_coverage:source-1",
+        ],
+      },
+      true,
+    ),
+    false,
+    "a ready final node cannot waive substantive citation debt",
+  );
 });
 
 test("pre-emission verification admits projection-only debt before its rejection branch", () => {
@@ -3887,6 +3936,10 @@ test("pre-emission verification admits projection-only debt before its rejection
   const classifierAt = runnerSource.indexOf(
     "const candidateOnlyFinalProjectionDebt =",
   );
+  const terminalClassifierAt = runnerSource.indexOf(
+    "missionAcceptanceHasOnlyTerminalFinalizationDebt(",
+    classifierAt,
+  );
   const rejectionAt = runnerSource.indexOf(
     'candidateAcceptance.status !== "pass" &&\n          !candidateOnlyFinalProjectionDebt',
     classifierAt,
@@ -3896,6 +3949,10 @@ test("pre-emission verification admits projection-only debt before its rejection
     rejectionAt,
   );
   assert.ok(classifierAt > 0, "the candidate gate must classify terminal projection debt");
+  assert.ok(
+    terminalClassifierAt > classifierAt,
+    "the candidate gate must bind legacy plan debt to a ready final node",
+  );
   assert.ok(rejectionAt > classifierAt, "projection-only debt must be excluded from rejection");
   assert.ok(terminalAt > rejectionAt, "the admitted candidate must still flow through finishRun(final)");
 });
