@@ -10,6 +10,7 @@ const REQUEST_TIMEOUT_MS = 180000;
 const IDLE_SHUTDOWN_MS = 120000;
 const MAX_OUTPUT_CHARS = 10_000_000;
 const MAX_STDERR_CHARS = 20_000;
+const MAX_HELPER_RECOVERIES_PER_REQUEST = 1;
 
 export interface HelperChildLike {
   stdin: {
@@ -305,28 +306,50 @@ export function createPythonFastEmbedProvider(
 
       const activeSettings = getSettings();
       const commands = getPythonCommands(activeSettings.semanticPythonCommand);
+      let helperRecoveriesRemaining = MAX_HELPER_RECOVERIES_PER_REQUEST;
 
       if (session?.alive && commands.includes(session.command)) {
         const result = await sendRequest(session, request, activeSettings);
-        // A previously-working helper that died mid-request falls through to
-        // one fresh respawn attempt below instead of failing the embed.
-        if (result.code !== "helper_exited") {
+        // A previously-working helper that died or timed out mid-request falls
+        // through to one fresh respawn attempt below instead of failing the
+        // embed. The same single recovery budget is shared with a cold helper,
+        // so no request can loop beyond two actual helper attempts.
+        if (!isRetryableHelperFailure(result) || helperRecoveriesRemaining <= 0) {
           return result;
         }
+        helperRecoveriesRemaining -= 1;
       } else if (session) {
         destroySession(session);
       }
 
       const errors: string[] = [];
       for (const command of commands) {
-        const fresh = spawnSession(runtime, command);
-        session = fresh;
-        const result = await sendRequest(fresh, request, activeSettings);
-        if (result.ok || result.code !== "missing_python") {
+        while (true) {
+          const fresh = spawnSession(runtime, command);
+          session = fresh;
+          const result = await sendRequest(fresh, request, activeSettings);
+          if (result.ok) {
+            return result;
+          }
+          if (result.code === "missing_python") {
+            errors.push(`${command}: ${result.message ?? result.code}`);
+            if (fresh.alive) {
+              destroySession(fresh);
+            }
+            break;
+          }
+          if (
+            isRetryableHelperFailure(result) &&
+            helperRecoveriesRemaining > 0
+          ) {
+            helperRecoveriesRemaining -= 1;
+            if (fresh.alive) {
+              destroySession(fresh);
+            }
+            continue;
+          }
           return result;
         }
-        errors.push(`${command}: ${result.message ?? result.code}`);
-        destroySession(fresh);
       }
 
       return {
@@ -360,6 +383,10 @@ export function createPythonFastEmbedProvider(
       }
     },
   };
+}
+
+function isRetryableHelperFailure(response: SemanticEmbeddingResponse): boolean {
+  return response.code === "helper_exited" || response.code === "timeout";
 }
 
 function settlePending(

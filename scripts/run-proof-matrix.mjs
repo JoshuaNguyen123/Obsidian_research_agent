@@ -751,6 +751,10 @@ const PRODUCT_LOG_SIGNATURES = [
     /product:resume_attempt_projection_lost\b/u,
     "product:resume_attempt_projection_lost",
   ],
+  [
+    /product:semantic_index_setup_timeout\b/u,
+    "product:semantic_index_setup_timeout",
+  ],
 ];
 
 /**

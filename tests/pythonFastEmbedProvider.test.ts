@@ -265,6 +265,36 @@ test("persistent FastEmbed provider respawns once when a reused helper dies mid-
   }
 });
 
+test("persistent FastEmbed provider respawns once when a reused helper times out", async () => {
+  let hangNextWrite = false;
+  const { runtime, spawned } = createFakeRuntime((child) => {
+    respondOk(child);
+    const respond = child.onWrite;
+    child.onWrite = (line) => {
+      if (hangNextWrite && child === spawned[0]) {
+        return;
+      }
+      respond?.(line);
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+    requestTimeoutMs: 15,
+  });
+  try {
+    const first = await provider.embed(REQUEST);
+    assert.equal(first.ok, true);
+
+    hangNextWrite = true;
+    const second = await provider.embed(REQUEST);
+    assert.equal(second.ok, true);
+    assert.equal(spawned.length, 2);
+    assert.equal(spawned[0].killed, true);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
 test("persistent FastEmbed provider falls back to the next python command on ENOENT", async () => {
   const { runtime, spawned } = createFakeRuntime((child) => {
     if (child.command === "python-primary") {
@@ -291,7 +321,33 @@ test("persistent FastEmbed provider falls back to the next python command on ENO
   }
 });
 
-test("persistent FastEmbed provider times out and kills a hung helper", async () => {
+test("persistent FastEmbed provider retries one timed-out cold helper and succeeds", async () => {
+  let first = true;
+  const { runtime, spawned } = createFakeRuntime((child) => {
+    if (first) {
+      first = false;
+      child.onWrite = () => {};
+      return;
+    }
+    respondOk(child);
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+    requestTimeoutMs: 15,
+  });
+  try {
+    const result = await provider.embed(REQUEST);
+
+    assert.equal(result.ok, true);
+    assert.equal(spawned.length, 2);
+    assert.equal(spawned[0].killed, true);
+    assert.equal(spawned[1].writes.length, 1);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("persistent FastEmbed provider stops after one timeout recovery", async () => {
   const { runtime, spawned } = createFakeRuntime((child) => {
     child.onWrite = () => {};
   });
@@ -304,7 +360,8 @@ test("persistent FastEmbed provider times out and kills a hung helper", async ()
 
     assert.equal(result.ok, false);
     assert.equal(result.code, "timeout");
-    assert.equal(spawned[0].killed, true);
+    assert.equal(spawned.length, 2);
+    assert.ok(spawned.every((child) => child.killed));
   } finally {
     provider.dispose?.();
   }

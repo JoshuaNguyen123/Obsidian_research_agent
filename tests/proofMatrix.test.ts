@@ -167,6 +167,22 @@ test("a lost persisted resume-attempt row is a stable product alarm", () => {
   assert.deepEqual(classified.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
 });
 
+test("an exhausted semantic-index helper timeout is a stable product alarm", () => {
+  const logText = [
+    "Error: page.evaluate: Error: product:semantic_index_setup_timeout — Production semantic index update failed: timeout: FastEmbed helper timed out after 180000ms.",
+    "  1) [real-ai-soak] › e2e/real-ai-soak.spec.ts › VAULT-01",
+  ].join("\n");
+  const classified = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: { records: [{ status: "failed" }] },
+    summaryFresh: true,
+    logText,
+  });
+  assert.equal(classified.failureClass, "product:semantic_index_setup_timeout");
+  assert.equal(classified.confidence, CLASSIFICATION_MECHANICAL);
+  assert.deepEqual(classified.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
+});
+
 test("proof-matrix cell projects are exclusive-runner allowlisted", () => {
   // 2026-08-25: interrupted-continuation-live existed in playwright.config.ts
   // and package.json but not PLAYWRIGHT_PROJECTS, so four proof-matrix

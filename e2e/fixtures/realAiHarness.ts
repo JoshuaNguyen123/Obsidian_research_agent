@@ -2389,8 +2389,12 @@ async function indexSemanticNotes(page: Page, paths: string[]): Promise<void> {
     };
     let result = await runUpdate("initial update");
     if (!result?.ok) {
+      const stableClass =
+        result?.code === "timeout"
+          ? "product:semantic_index_setup_timeout — "
+          : "";
       throw new Error(
-        `Production semantic index update failed: ` +
+        `${stableClass}Production semantic index update failed: ` +
           `${result?.code ?? "unknown"}${result?.message ? `: ${result.message}` : ""}`,
       );
     }
@@ -2403,8 +2407,12 @@ async function indexSemanticNotes(page: Page, paths: string[]): Promise<void> {
       // paths directly instead of weakening the product's bounded rebuild cap.
       result = await runUpdate("exact-path retry");
       if (!result?.ok) {
+        const stableClass =
+          result?.code === "timeout"
+            ? "product:semantic_index_setup_timeout — "
+            : "";
         throw new Error(
-          `Production semantic index retry failed: ` +
+          `${stableClass}Production semantic index retry failed: ` +
             `${result?.code ?? "unknown"}${result?.message ? `: ${result.message}` : ""}`,
         );
       }
