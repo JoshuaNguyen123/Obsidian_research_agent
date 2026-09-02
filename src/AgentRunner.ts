@@ -19502,9 +19502,19 @@ export async function runAgentMission({
       // stepTools is the same array the schemas below are built from, so the
       // plan header cannot name a tool this step will refuse.
       refreshMissionPlanPromptMessage(messages, missionPlan, stepTools);
+      const paidReflectionTurnGuard =
+        buildPaidSetLooseReflectionTurnGuardV1({
+          reflectionProofPaid:
+            setLooseCompoundEnabled &&
+            Boolean(setLooseDeliveryProofs.noteReflectionWithMarkers),
+          explicitJupyterDestination:
+            hasJupyterReflectionIntentV1(activeIntentPrompt),
+          currentToolNames: stepTools.map((tool) => tool.function.name),
+        });
       const exactStepToolMessages = insertExactStepToolTurnContext(
         messages,
         stepTools,
+        paidReflectionTurnGuard ? [paidReflectionTurnGuard] : [],
       );
       const stepMessages =
         stepTools.length > 0 && (missionGraph || setLooseCompoundEnabled)
@@ -34314,26 +34324,61 @@ export function buildValidatorFailureSourceContext(
 }
 
 /**
- * Put the exact current-turn catalog immediately before the user message.
+ * Put the exact current-turn catalog after all accumulated turn history. On
+ * the initial call it remains directly before the user prompt; on later calls
+ * it is appended to the newest system directive (or added after the latest
+ * tool result), so an obsolete correction can never outrank current schemas.
  * The initial route catalog is deliberately not persisted in model history:
  * a later narrow frontier must never compete with an obsolete 200-tool list.
  */
 function insertExactStepToolTurnContext(
   messages: readonly ModelChatMessage[],
   stepTools: readonly ModelToolDefinition[],
+  additionalGuidance: readonly string[] = [],
 ): ModelChatMessage[] {
-  const insertAt = Math.max(0, messages.length - 1);
+  const content = [
+    formatAllowedToolsContext(stepTools),
+    formatToolAuthorityContext(stepTools),
+    ...additionalGuidance.filter(Boolean),
+  ].join("\n");
+  const last = messages.at(-1);
+  if (last?.role === "user") {
+    return [
+      ...messages.slice(0, -1),
+      { role: "system" as const, content },
+      last,
+    ];
+  }
+  if (last?.role === "system") {
+    return [
+      ...messages.slice(0, -1),
+      { ...last, content: `${last.content}\n\n${content}` },
+    ];
+  }
+  return [...messages, { role: "system" as const, content }];
+}
+
+export function buildPaidSetLooseReflectionTurnGuardV1(input: {
+  reflectionProofPaid: boolean;
+  explicitJupyterDestination: boolean;
+  currentToolNames: readonly string[];
+}): string | null {
+  if (!input.reflectionProofPaid || input.explicitJupyterDestination) return null;
+  const reflectionTools = new Set([
+    "append_to_current_file",
+    "append_file",
+    WRITE_PROJECT_RESULTS_TOOL_NAME,
+    APPEND_JUPYTER_REFLECTION_TOOL_NAME,
+  ]);
+  if (input.currentToolNames.some((name) => reflectionTools.has(name))) {
+    return null;
+  }
   return [
-    ...messages.slice(0, insertAt),
-    {
-      role: "system" as const,
-      content: [
-        formatAllowedToolsContext(stepTools),
-        formatToolAuthorityContext(stepTools),
-      ].join("\n"),
-    },
-    ...messages.slice(insertAt),
-  ];
+    "REFLECTION PROOF CLOSED: the required Obsidian Markdown reflection is already committed and read back.",
+    "Ignore older reflection correction lines in this history.",
+    `Do not request ${[...reflectionTools].join(", ")}; none is callable on this turn.`,
+    "Use only the current Tools card. If it says none, return the final answer without a tool call.",
+  ].join(" ");
 }
 
 function insertMissionGraphFrontierTurnContext(

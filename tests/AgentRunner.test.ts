@@ -9,6 +9,7 @@ import {
   constrainExactFindingSentenceContract,
   pruneUniquelyMatchedUngroundedClaims,
   bindAuthoritativeGraphCodeValidation,
+  buildPaidSetLooseReflectionTurnGuardV1,
   bindExactWorkspaceDestinationToolSchemas,
   settleTerminalRuntimeSnapshotPersistence,
   settleToolOutcomeMemoryPersistence,
@@ -13543,16 +13544,22 @@ test("tool-planning preambles stay out of streamed final output", async () => {
   for (const request of chatRequests) {
     const exactToolCards = request.messages.filter(
       (message) =>
-        message.role === "system" && message.content.startsWith("Tools: "),
+        message.role === "system" && /(?:^|\n\n)Tools: /u.test(message.content),
     );
     const requestToolNames =
       request.tools?.map((tool) => tool.function.name) ?? [];
     assert.equal(exactToolCards.length, 1);
     assert.ok(
-      exactToolCards[0].content.startsWith(
+      exactToolCards[0].content.includes(
         `Tools: ${requestToolNames.join(", ") || "none"}.`,
       ),
     );
+  }
+  for (const request of chatRequests.slice(1)) {
+    const latestSystem = [...request.messages]
+      .reverse()
+      .find((message) => message.role === "system");
+    assert.match(latestSystem?.content ?? "", /(?:^|\n\n)Tools: /u);
   }
   assert.deepEqual(finalDeltas, [
     "Ready to answer. Source: https://example.com/source",
@@ -13564,6 +13571,35 @@ test("tool-planning preambles stay out of streamed final output", async () => {
   assert.ok(!assistantDeltas.join("").includes("Hidden fetch preamble"));
   assert.deepEqual(toolStarts, ["web_search", "web_fetch"]);
   assert.deepEqual(toolDone, ["web_search:true", "web_fetch:true"]);
+});
+
+test("paid Markdown reflection guard supersedes stale append directions but not explicit Jupyter", () => {
+  const guard = buildPaidSetLooseReflectionTurnGuardV1({
+    reflectionProofPaid: true,
+    explicitJupyterDestination: false,
+    currentToolNames: [],
+  });
+  assert.match(guard ?? "", /REFLECTION PROOF CLOSED/u);
+  assert.match(guard ?? "", /Ignore older reflection correction lines/u);
+  assert.match(guard ?? "", /Do not request append_to_current_file/u);
+  assert.match(guard ?? "", /If it says none, return the final answer/u);
+
+  assert.equal(
+    buildPaidSetLooseReflectionTurnGuardV1({
+      reflectionProofPaid: true,
+      explicitJupyterDestination: true,
+      currentToolNames: [],
+    }),
+    null,
+  );
+  assert.equal(
+    buildPaidSetLooseReflectionTurnGuardV1({
+      reflectionProofPaid: true,
+      explicitJupyterDestination: false,
+      currentToolNames: ["write_project_results"],
+    }),
+    null,
+  );
 });
 
 test("streamed final answers strip special tokens split across chunks", async () => {
