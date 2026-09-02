@@ -9,6 +9,7 @@ import {
   constrainExactFindingSentenceContract,
   pruneUniquelyMatchedUngroundedClaims,
   bindAuthoritativeGraphCodeValidation,
+  buildCompletedAbsentToolTurnGuardV1,
   buildPaidSetLooseReflectionTurnGuardV1,
   bindExactWorkspaceDestinationToolSchemas,
   settleTerminalRuntimeSnapshotPersistence,
@@ -13597,6 +13598,43 @@ test("paid Markdown reflection guard supersedes stale append directions but not 
       reflectionProofPaid: true,
       explicitJupyterDestination: false,
       currentToolNames: ["write_project_results"],
+    }),
+    null,
+  );
+});
+
+test("completed absent tool guard names recent paid calls but omits a reopened tool", () => {
+  const guard = buildCompletedAbsentToolTurnGuardV1({
+    enabled: true,
+    currentToolNames: ["web_search", "write_project_results"],
+    successfulToolNames: [
+      "read_current_file",
+      "web_search",
+      "read_template",
+      "read_current_file",
+    ],
+  });
+  assert.match(
+    guard ?? "",
+    /RECENT COMPLETED CALLS NOW ABSENT: read_current_file, read_template\./u,
+  );
+  assert.doesNotMatch(guard ?? "", /ABSENT:[^.]*web_search/u);
+  assert.match(guard ?? "", /successful results are already in this history/u);
+  assert.match(guard ?? "", /wait for an absent name to reappear/u);
+
+  assert.equal(
+    buildCompletedAbsentToolTurnGuardV1({
+      enabled: false,
+      currentToolNames: [],
+      successfulToolNames: ["read_current_file"],
+    }),
+    null,
+  );
+  assert.equal(
+    buildCompletedAbsentToolTurnGuardV1({
+      enabled: true,
+      currentToolNames: ["read_current_file"],
+      successfulToolNames: ["read_current_file"],
     }),
     null,
   );

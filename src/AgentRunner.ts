@@ -19502,6 +19502,13 @@ export async function runAgentMission({
       // stepTools is the same array the schemas below are built from, so the
       // plan header cannot name a tool this step will refuse.
       refreshMissionPlanPromptMessage(messages, missionPlan, stepTools);
+      const currentToolNames = stepTools.map((tool) => tool.function.name);
+      const completedAbsentToolTurnGuard =
+        buildCompletedAbsentToolTurnGuardV1({
+          enabled: setLooseCompoundEnabled,
+          currentToolNames,
+          successfulToolNames,
+        });
       const paidReflectionTurnGuard =
         buildPaidSetLooseReflectionTurnGuardV1({
           reflectionProofPaid:
@@ -19509,12 +19516,14 @@ export async function runAgentMission({
             Boolean(setLooseDeliveryProofs.noteReflectionWithMarkers),
           explicitJupyterDestination:
             hasJupyterReflectionIntentV1(activeIntentPrompt),
-          currentToolNames: stepTools.map((tool) => tool.function.name),
+          currentToolNames,
         });
       const exactStepToolMessages = insertExactStepToolTurnContext(
         messages,
         stepTools,
-        paidReflectionTurnGuard ? [paidReflectionTurnGuard] : [],
+        [completedAbsentToolTurnGuard, paidReflectionTurnGuard].filter(
+          (guidance): guidance is string => Boolean(guidance),
+        ),
       );
       const stepMessages =
         stepTools.length > 0 && (missionGraph || setLooseCompoundEnabled)
@@ -34378,6 +34387,32 @@ export function buildPaidSetLooseReflectionTurnGuardV1(input: {
     "Ignore older reflection correction lines in this history.",
     `Do not request ${[...reflectionTools].join(", ")}; none is callable on this turn.`,
     "Use only the current Tools card. If it says none, return the final answer without a tool call.",
+  ].join(" ");
+}
+
+export function buildCompletedAbsentToolTurnGuardV1(input: {
+  enabled: boolean;
+  currentToolNames: readonly string[];
+  successfulToolNames: readonly string[];
+  maxNames?: number;
+}): string | null {
+  if (!input.enabled) return null;
+  const current = new Set(input.currentToolNames.map((name) => name.trim()));
+  const maxNames = Math.max(1, Math.min(12, input.maxNames ?? 8));
+  const seen = new Set<string>();
+  const completedAbsent: string[] = [];
+  for (let index = input.successfulToolNames.length - 1; index >= 0; index -= 1) {
+    const name = input.successfulToolNames[index]?.trim() ?? "";
+    if (!name || current.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    completedAbsent.push(name);
+    if (completedAbsent.length >= maxNames) break;
+  }
+  if (completedAbsent.length === 0) return null;
+  return [
+    `RECENT COMPLETED CALLS NOW ABSENT: ${completedAbsent.join(", ")}.`,
+    "Their successful results are already in this history.",
+    "Do not repeat these names on this turn; call only a name in the current Tools card and wait for an absent name to reappear before calling it again.",
   ].join(" ");
 }
 
