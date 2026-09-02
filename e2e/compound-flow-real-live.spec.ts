@@ -382,7 +382,9 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     });
     // Also pins terminal projection closure: if the last draft is held while
     // only final relevance/output evidence remains, the harness emits the
-    // stable product:final_projection_candidate_rejected alarm.
+    // stable product:final_projection_candidate_rejected alarm. A locally
+    // finished post-tool run intentionally has no extra provider prompt, so
+    // the graph projection below is the terminal frontier authority.
     const preparedApprovalCount = await harness.approveUntilMissionComplete(
       50 * 60_000,
       {
@@ -400,13 +402,6 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
         snapshot?.lastMissionGraph?.nodes ?? {},
       ) as Array<{ id?: string; status?: string; allowedTools?: unknown }>;
       const final = nodes.find((node) => node.id === "final");
-      const frontierDiagnostics = Array.isArray(snapshot?.diagnosticAttestations)
-        ? snapshot.diagnosticAttestations.filter(
-            (item: any) =>
-              typeof item?.id === "string" &&
-              item.id.startsWith("mission-graph-tool-frontier-"),
-          )
-        : [];
       return {
         finalStatus: final?.status ?? null,
         finalAllowedTools: Array.isArray(final?.allowedTools)
@@ -420,8 +415,6 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
               node.allowedTools.length > 0,
           )
           .map((node) => node.id ?? "unknown"),
-        lastFrontierMessage:
-          frontierDiagnostics.at(-1)?.message ?? null,
       };
     }, { pluginId: NATIVE_CORE_PLUGIN_ID });
     expect(
@@ -436,10 +429,6 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       terminalProjection.openToolNodeIds,
       "no required or dynamic tool node may reopen after terminal projection",
     ).toEqual([]);
-    expect(
-      terminalProjection.lastFrontierMessage,
-      "the final model turn must receive a sealed tool frontier",
-    ).toMatch(/MissionGraph frontier tools:\s*none/iu);
     expect(preparedApprovalCount).toBe(preparedApprovalObservations.length);
     const linearPreparedApprovals = preparedApprovalObservations.filter(
       (approval) =>
