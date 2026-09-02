@@ -766,6 +766,10 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
         receipt?.output?.reason ===
           "set_loose_terminal_replay_already_satisfied",
     );
+    expect(
+      terminalReplayNoOpReceipts,
+      "a fresh compound run must terminate locally when the publishing tool pays the final proof instead of spending an empty-frontier provider turn",
+    ).toHaveLength(0);
     const graphReceiptIds = new Set(
       Object.values(acceptanceSnapshot.lastMissionGraph?.nodes ?? {}).flatMap(
         (node: any) =>

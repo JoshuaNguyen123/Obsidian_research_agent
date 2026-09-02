@@ -23368,6 +23368,37 @@ export async function runAgentMission({
     }
 
     if (setLooseCompoundEnabled) {
+      // A model tool can pay the final delivery proof in this response. Finish
+      // locally only when the graph and operation-goal authorities independently
+      // agree that no executable work remains; otherwise keep the ordinary loop
+      // open for the still-required frontier.
+      const postToolDeliveryComplete = setLooseDeliveryComplete({
+        stages: compoundLifecycleStages,
+        proofs: setLooseDeliveryProofs,
+      }).complete;
+      const postToolTerminalFrontierSealed =
+        missionGraphTerminalProjectionSealsToolFrontierV1(
+          missionGraphSession?.graph ?? missionGraph,
+        );
+      if (
+        shouldFinishSetLooseLocallyAfterToolV1({
+          enabled: setLooseCompoundEnabled,
+          deliveryComplete: postToolDeliveryComplete,
+          terminalFrontierSealed: postToolTerminalFrontierSealed,
+          hasPendingOperationGoals: hasPendingOperationGoals(operationGoals),
+        })
+      ) {
+        events.onStatus?.(
+          "Set-loose delivery, graph frontier, and operation goals complete after tool response; finishing locally.",
+        );
+        await finishRun(
+          "write_completed",
+          step,
+          stepLimit,
+          lastFinalOutput || undefined,
+        );
+        return;
+      }
       const hostDrive = await driveSetLooseHostProgressIfStalled({
         step,
         githubToolsOffered: githubToolsOfferedThisStep,
@@ -34663,6 +34694,26 @@ export function completedSetLooseReflectionAppendAlreadySatisfiedV1(input: {
     hasCompleteSetLooseNoteReflectionProof(attemptedText) &&
     hasCompleteSetLooseNoteReflectionProof(currentNoteText) &&
     currentNoteText.includes(attemptedText)
+  );
+}
+
+/**
+ * Stop before another provider turn only when all three independent runtime
+ * authorities agree that a just-finished tool closed the mission's executable
+ * work. Delivery proof alone must not hide an open graph action or operation
+ * goal.
+ */
+export function shouldFinishSetLooseLocallyAfterToolV1(input: {
+  enabled: boolean;
+  deliveryComplete: boolean;
+  terminalFrontierSealed: boolean;
+  hasPendingOperationGoals: boolean;
+}): boolean {
+  return (
+    input.enabled &&
+    input.deliveryComplete &&
+    input.terminalFrontierSealed &&
+    !input.hasPendingOperationGoals
   );
 }
 

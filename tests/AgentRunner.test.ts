@@ -13,6 +13,7 @@ import {
   buildPaidSetLooseReflectionTurnGuardV1,
   completedSetLooseReflectionAppendAlreadySatisfiedV1,
   decideCompletedSetLooseToolReplayNoOpV1,
+  shouldFinishSetLooseLocallyAfterToolV1,
   bindExactWorkspaceDestinationToolSchemas,
   settleTerminalRuntimeSnapshotPersistence,
   settleToolOutcomeMemoryPersistence,
@@ -13780,6 +13781,28 @@ test("terminal set-loose replay no-ops require a sealed empty frontier and exact
     { ...base, toolName: "append_file" },
   ]) {
     assert.equal(decideCompletedSetLooseToolReplayNoOpV1(input), null);
+  }
+});
+
+test("post-tool set-loose completion requires delivery, a sealed frontier, and no pending goals", () => {
+  const complete = {
+    enabled: true,
+    deliveryComplete: true,
+    terminalFrontierSealed: true,
+    hasPendingOperationGoals: false,
+  };
+  assert.equal(shouldFinishSetLooseLocallyAfterToolV1(complete), true);
+
+  for (const incomplete of [
+    { ...complete, enabled: false },
+    { ...complete, deliveryComplete: false },
+    { ...complete, terminalFrontierSealed: false },
+    { ...complete, hasPendingOperationGoals: true },
+  ]) {
+    assert.equal(
+      shouldFinishSetLooseLocallyAfterToolV1(incomplete),
+      false,
+    );
   }
 });
 
