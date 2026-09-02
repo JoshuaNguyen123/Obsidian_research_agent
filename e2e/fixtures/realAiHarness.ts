@@ -1745,7 +1745,10 @@ async function approveUntilMissionComplete(
         );
       // Stable product identity for the circular finalization failure: every
       // substantive proof is paid, but the candidate was held before the only
-      // operation that can record terminal projection evidence.
+      // operation that can record terminal projection evidence. This also
+      // covers the upstream sibling where force_final_no_tools is followed by
+      // a reopened set-loose read frontier, so the candidate never reaches the
+      // terminal seat.
       const failurePrefix =
         finalProjectionDebtOnly
           ? "product:final_projection_candidate_rejected — "

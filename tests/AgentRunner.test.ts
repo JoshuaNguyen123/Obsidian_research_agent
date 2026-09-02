@@ -2497,6 +2497,14 @@ test("ready final suppresses optional tool frontiers and optional write debt", (
         status: "complete",
         dependencyIds: [],
         allowedTools: ["publish_research_to_linear"],
+        evidence: [
+          {
+            id: "evidence-publication-complete",
+            kind: "external-action-receipt",
+            fingerprint: `sha256:${"a".repeat(64)}`,
+            observedAt: "2026-09-02T00:05:00.000Z",
+          },
+        ],
         completionContract: { requiredEvidenceKinds: [] },
       },
       "optional-tool-12-linear_get_issue": {
@@ -2544,8 +2552,8 @@ test("ready final suppresses optional tool frontiers and optional write debt", (
         "web_search",
       ],
     }).map((tool) => tool.function.name),
-    ["web_search"],
-    "unrelated unplanned Soft companions remain available until terminal projection",
+    [],
+    "a proof-backed ready final seals even unplanned set-loose Soft companions",
   );
   assert.deepEqual(
     getPendingMissionGraphWriteToolNames(graph),

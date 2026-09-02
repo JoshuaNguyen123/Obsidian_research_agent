@@ -19,6 +19,7 @@ import {
 import {
   findFinalMissionGraphNode,
   isOptionalMissionGraphNode,
+  missionGraphNodeIsTerminalV1,
 } from "./missionGraphAuthority";
 // Shared selector authorities — these MUST come from missionGraphSelectors,
 // never re-inlined here: private copies of the frontier-tool and lifecycle
@@ -489,6 +490,42 @@ export function graphHasCompletedRequiredMutation(
 }
 
 /**
+ * A proof-backed, tool-less final node is the terminal projection seat. Once
+ * every required predecessor is terminal, neither optional graph nodes nor
+ * unplanned set-loose Soft companions may reopen the model tool catalog.
+ *
+ * The completed-proof requirement preserves the interrupted streaming stub:
+ * a bare final node still owes its write, so the empty-frontier write fallback
+ * below remains reachable. This is the shared distinction between "finish the
+ * answer" and "resume the missing mutation".
+ */
+export function missionGraphTerminalProjectionSealsToolFrontierV1(
+  graph: MissionGraphV3 | null | undefined,
+): boolean {
+  if (!graph) return false;
+  const final = findFinalMissionGraphNode(graph);
+  if (
+    !final ||
+    final.node.allowedTools.length > 0 ||
+    (final.node.status !== "ready" &&
+      final.node.status !== "running" &&
+      final.node.status !== "complete")
+  ) {
+    return false;
+  }
+  const requiredPredecessorStillOpen = Object.entries(graph.nodes).some(
+    ([nodeId, node]) =>
+      nodeId !== final.id &&
+      !isOptionalMissionGraphNode(nodeId, node) &&
+      !missionGraphNodeIsTerminalV1(node),
+  );
+  return (
+    !requiredPredecessorStillOpen &&
+    graphHasCompletedRequiredMutation(graph)
+  );
+}
+
+/**
  * ONE shared answer to "may a final-only graph stand in for proven work?" —
  * inverted: true when it may NOT. A graph whose only open node is the
  * tool-less `final` while no completed required node carries real
@@ -795,6 +832,14 @@ export function constrainToolsToMissionGraphFrontier(
     graph !== null &&
     graph !== undefined &&
     shouldSuppressOptionalMissionGraphFrontier(graph);
+  // Terminal projection is a closed frontier, not another set-loose phase.
+  // Without this early seal the Soft-union branch below re-advertises reads
+  // after the loop has already decided `force_final_no_tools`; each completed
+  // read then materializes another dynamic retry node and the verified final
+  // draft is never allowed to terminate the run.
+  if (missionGraphTerminalProjectionSealsToolFrontierV1(graph)) {
+    return [];
+  }
   if (graph && suppressOptionalFrontier && setLooseNames.length > 0) {
     const optionalOnlyNames =
       getOptionalOnlyMissionGraphFrontierToolNames(graph);

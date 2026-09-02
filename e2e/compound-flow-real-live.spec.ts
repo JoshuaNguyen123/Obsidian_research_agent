@@ -390,6 +390,53 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
         onApproval: (approval) => preparedApprovalObservations.push(approval),
       },
     );
+    const terminalProjection = await harness.page.evaluate(({ pluginId }) => {
+      const snapshot = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId]?.getMissionRunSnapshot?.();
+      const nodes = Object.values(
+        snapshot?.lastMissionGraph?.nodes ?? {},
+      ) as Array<{ id?: string; status?: string; allowedTools?: unknown }>;
+      const final = nodes.find((node) => node.id === "final");
+      const frontierDiagnostics = Array.isArray(snapshot?.diagnosticAttestations)
+        ? snapshot.diagnosticAttestations.filter(
+            (item: any) =>
+              typeof item?.id === "string" &&
+              item.id.startsWith("mission-graph-tool-frontier-"),
+          )
+        : [];
+      return {
+        finalStatus: final?.status ?? null,
+        finalAllowedTools: Array.isArray(final?.allowedTools)
+          ? final.allowedTools
+          : null,
+        openToolNodeIds: nodes
+          .filter(
+            (node) =>
+              (node.status === "ready" || node.status === "running") &&
+              Array.isArray(node.allowedTools) &&
+              node.allowedTools.length > 0,
+          )
+          .map((node) => node.id ?? "unknown"),
+        lastFrontierMessage:
+          frontierDiagnostics.at(-1)?.message ?? null,
+      };
+    }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    expect(
+      terminalProjection.finalStatus,
+      "the compound lane must record the terminal final node",
+    ).toBe("complete");
+    expect(
+      terminalProjection.finalAllowedTools,
+      "the terminal projection must remain tool-less",
+    ).toEqual([]);
+    expect(
+      terminalProjection.openToolNodeIds,
+      "no required or dynamic tool node may reopen after terminal projection",
+    ).toEqual([]);
+    expect(
+      terminalProjection.lastFrontierMessage,
+      "the final model turn must receive a sealed tool frontier",
+    ).toMatch(/MissionGraph frontier tools:\s*none/iu);
     expect(preparedApprovalCount).toBe(preparedApprovalObservations.length);
     const linearPreparedApprovals = preparedApprovalObservations.filter(
       (approval) =>
