@@ -785,7 +785,11 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     const researchMetrics = await readResearchBackendMetrics(harness.page);
     expect(researchMetrics.searchCalls).toBeGreaterThanOrEqual(1);
     expect(new Set(researchMetrics.fetchedUrls)).toEqual(new Set(sources));
-    expect(researchMetrics.fetchCalls).toBeGreaterThanOrEqual(4);
+    expect(researchMetrics.fetchCalls).toBe(sources.length);
+    expect(
+      researchMetrics.fetchedUrls.length,
+      "Phase A must not transport the same owned source twice while distinct-source debt remains",
+    ).toBe(new Set(researchMetrics.fetchedUrls).size);
     const fetchedEvidence = phaseASnapshot.missionEvidence.filter(
       (item: any) =>
         item?.kind === "web_source" &&

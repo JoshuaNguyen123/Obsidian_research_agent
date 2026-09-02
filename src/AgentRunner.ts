@@ -23145,6 +23145,7 @@ export async function runAgentMission({
         const batch: Array<{ call: ModelToolCall; index: number }> = [];
         const exactReadySlotsByTool = new Map<string, number>();
         const reservedReadySlotsByTool = new Map<string, number>();
+        const reservedResearchSourceReferences = new Set<string>();
         const batchGraph = missionGraphSession?.graph ?? missionGraph;
         for (
           let batchIndex = toolIndex;
@@ -23162,6 +23163,22 @@ export async function runAgentMission({
           ) {
             break;
           }
+          const researchSourceReservation =
+            getOutstandingResearchSourceFetchReservationV1({
+              toolCall: candidate,
+              originalPrompt: activeIntentPrompt,
+              evidence: missionEvidenceRecords,
+              reservedReferences: reservedResearchSourceReferences,
+            });
+          if (researchSourceReservation?.duplicate) {
+            // Duplicate validation normally runs inside runToolNow. Parallel
+            // siblings all observe the same pre-batch evidence snapshot,
+            // though, so two calls for one URL could both pass and complete
+            // separate graph nodes. Stop this batch before any graph start;
+            // after the distinct prefix settles, the existing sequential
+            // rejection path handles the duplicate without paying proof.
+            break;
+          }
           if (missionGraphUsesExactPlannedFrontier && batchGraph) {
             const readySlots =
               exactReadySlotsByTool.get(candidate.name) ??
@@ -23173,6 +23190,11 @@ export async function runAgentMission({
               break;
             }
             reservedReadySlotsByTool.set(candidate.name, reservedSlots + 1);
+          }
+          if (researchSourceReservation) {
+            reservedResearchSourceReferences.add(
+              researchSourceReservation.reference,
+            );
           }
           batch.push({ call: candidate, index: batchIndex });
         }
@@ -32802,17 +32824,8 @@ export function rejectDuplicateResearchSourceFetchV1(input: {
   originalPrompt: string;
   evidence: readonly MissionEvidence[];
 }): ToolExecutionResult | null {
-  if (input.toolCall.name !== "web_fetch") return null;
-  const required = parseExplicitResearchSourceCount(input.originalPrompt);
-  if (required === null) return null;
-  const verifiedReferences = distinctHostVerifiedWebSourceReferences(
-    input.evidence,
-  );
-  if (verifiedReferences.size >= required) return null;
-  const requested = normalizeResearchSourceReference(
-    getString(input.toolCall.arguments.url),
-  );
-  if (!requested || !verifiedReferences.has(requested)) return null;
+  const assessment = getOutstandingResearchSourceFetchReservationV1(input);
+  if (!assessment?.duplicate) return null;
   return {
     ok: false,
     toolName: "web_fetch",
@@ -32820,9 +32833,41 @@ export function rejectDuplicateResearchSourceFetchV1(input: {
     error: {
       code: "duplicate_research_source",
       message:
-        `This mission requires ${required} distinct host-verified web sources and currently has ${verifiedReferences.size}. ` +
-        `${requested} is already bound; fetch a different source before publication.`,
+        `This mission requires ${assessment.required} distinct host-verified web sources and currently has ${assessment.verifiedCount}. ` +
+        `${assessment.reference} is already bound; fetch a different source before publication.`,
     },
+  };
+}
+
+export function getOutstandingResearchSourceFetchReservationV1(input: {
+  toolCall: Pick<ModelToolCall, "name" | "arguments">;
+  originalPrompt: string;
+  evidence: readonly MissionEvidence[];
+  reservedReferences?: ReadonlySet<string>;
+}): {
+  reference: string;
+  required: number;
+  verifiedCount: number;
+  duplicate: boolean;
+} | null {
+  if (input.toolCall.name !== "web_fetch") return null;
+  const required = parseExplicitResearchSourceCount(input.originalPrompt);
+  if (required === null) return null;
+  const verifiedReferences = distinctHostVerifiedWebSourceReferences(
+    input.evidence,
+  );
+  if (verifiedReferences.size >= required) return null;
+  const reference = normalizeResearchSourceReference(
+    getString(input.toolCall.arguments.url),
+  );
+  if (!reference) return null;
+  return {
+    reference,
+    required,
+    verifiedCount: verifiedReferences.size,
+    duplicate:
+      verifiedReferences.has(reference) ||
+      Boolean(input.reservedReferences?.has(reference)),
   };
 }
 

@@ -49,6 +49,7 @@ import {
   getVerifiedWorkspaceReadRefreshBinding,
   getVerifiedWorkspaceSupportingReadRefreshBindings,
   getCompoundLifecycleResearchGraphToolNames,
+  getOutstandingResearchSourceFetchReservationV1,
   rejectDuplicateResearchSourceFetchV1,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
@@ -11517,6 +11518,63 @@ test("explicit source proof rejects duplicate fetches while distinct debt remain
     }),
     null,
   );
+
+  const reserved = new Set(["https://source-2.example.test/evidence"]);
+  assert.deepEqual(
+    getOutstandingResearchSourceFetchReservationV1({
+      toolCall: {
+        name: "web_fetch",
+        arguments: { url: "https://source-2.example.test/evidence#same-batch" },
+      },
+      originalPrompt: "Use exactly two independent sources.",
+      evidence,
+      reservedReferences: reserved,
+    }),
+    {
+      reference: "https://source-2.example.test/evidence",
+      required: 2,
+      verifiedCount: 1,
+      duplicate: true,
+    },
+  );
+  assert.equal(
+    getOutstandingResearchSourceFetchReservationV1({
+      toolCall: {
+        name: "web_fetch",
+        arguments: { url: "not-a-url" },
+      },
+      originalPrompt: "Use exactly two independent sources.",
+      evidence,
+      reservedReferences: reserved,
+    }),
+    null,
+  );
+  assert.equal(
+    getOutstandingResearchSourceFetchReservationV1({
+      toolCall: {
+        name: "web_fetch",
+        arguments: { url: "https://source-2.example.test/evidence" },
+      },
+      originalPrompt: "Compare independent sources.",
+      evidence,
+      reservedReferences: reserved,
+    }),
+    null,
+  );
+  assert.equal(
+    getOutstandingResearchSourceFetchReservationV1({
+      toolCall: {
+        name: "web_fetch",
+        arguments: { url: "https://source-1.example.test/evidence" },
+      },
+      originalPrompt: "Use exactly one independent source.",
+      evidence,
+      reservedReferences: new Set([
+        "https://source-1.example.test/evidence",
+      ]),
+    }),
+    null,
+  );
 });
 
 test("continuation restores a mutation only from receipt-bound graph proof", () => {
@@ -19548,6 +19606,99 @@ test("parallel same-name reads finish distinct graph nodes before follow-ups", a
   assert.doesNotMatch(
     completions.at(-1)?.stopDetail ?? "",
     /expected running before result/u,
+  );
+  const completedFetchNodes = Object.values(graphs.at(-1)?.nodes ?? {}).filter(
+    (node) =>
+      node.status === "complete" && node.allowedTools.includes("web_fetch"),
+  );
+  assert.equal(completedFetchNodes.length, 3);
+});
+
+test("parallel research reads reserve normalized URLs before graph execution", async () => {
+  const sourceA = "https://alpha.example/one";
+  const sourceB = "https://beta.example/two";
+  const sourceC = "https://gamma.example/three";
+  const prompt =
+    `Fetch exactly three independent sources ${sourceA}, ${sourceB}, and ${sourceC}, then compare them.`;
+  const executedCalls: ModelToolCall[] = [];
+  const transportedUrls: string[] = [];
+  const traceErrorCodes: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const graphs: Array<{ nodes: Record<string, { status: string; allowedTools: string[] }> }> = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.modelRouterMode = "off";
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return { status: 200, headers: {}, json: { results: [] } };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      const body = JSON.parse(
+        typeof request.body === "string" ? request.body : "{}",
+      ) as { url?: string };
+      const requestedUrl = String(body.url ?? "");
+      transportedUrls.push(requestedUrl);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: `Owned source ${transportedUrls.length}`,
+          url: requestedUrl,
+          content: `Distinct host-verified evidence from ${requestedUrl}.`,
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () =>
+        responseWithToolCalls([
+          { name: "web_fetch", arguments: { url: sourceA } },
+          { name: "web_fetch", arguments: { url: sourceB } },
+          { name: "web_fetch", arguments: { url: `${sourceA}#duplicate` } },
+        ]),
+      () => responseWithToolCall("web_fetch", { url: sourceC }),
+      () => responseWithContent("The three independent sources were compared."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 3,
+    events: {
+      onTrace: (event) => {
+        if (event.error?.code) traceErrorCodes.push(event.error.code);
+      },
+      onRunComplete: (event) => completions.push(event),
+      onMissionGraphUpdate: (graph) => graphs.push(graph),
+    },
+  });
+
+  assert.deepEqual(transportedUrls, [sourceA, sourceB, sourceC]);
+  assert.deepEqual(
+    executedCalls
+      .filter((call) => call.name === "web_fetch")
+      .map((call) => String(call.arguments.url)),
+    [sourceA, sourceB, sourceC],
+  );
+  assert.ok(maxInFlight >= 2, `expected distinct reads to overlap; max=${maxInFlight}`);
+  assert.ok(traceErrorCodes.includes("duplicate_research_source"));
+  assert.notEqual(
+    completions.at(-1)?.stopDetail,
+    "policy_deferral_repeated",
   );
   const completedFetchNodes = Object.values(graphs.at(-1)?.nodes ?? {}).filter(
     (node) =>
