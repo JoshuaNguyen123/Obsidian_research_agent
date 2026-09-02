@@ -31,6 +31,7 @@ import {
   toolsOfferedForSetLooseStage,
   toolsOfferedForSetLooseTurn,
   unpaidSetLooseDeliveryStages,
+  verifiedGitHubMarkdownReflectionProofV1,
   type SetLooseDeliveryReceiptLikeV1,
 } from "../src/agent/setLooseCompoundAutonomy";
 import { toolsAllowedForLifecycleStage } from "../src/agent/lifecycleStagePolicy";
@@ -1836,6 +1837,17 @@ test("set-loose reflection pays only from a verified meaningful writeback or fin
   });
   assert.equal(finalizedPublication.githubPrivateRepoOrPrUrl, true);
   assert.equal(finalizedPublication.noteReflectionWithMarkers, true);
+  assert.deepEqual(
+    verifiedGitHubMarkdownReflectionProofV1({
+      status: "finalized",
+      obsidianReceiptId: "github-note-reflection-proof",
+      pullRequest: { htmlUrl: "https://github.com/o/r/pull/5" },
+    }),
+    {
+      obsidianReceiptId: "github-note-reflection-proof",
+      pullRequestUrl: "https://github.com/o/r/pull/5",
+    },
+  );
 
   const unfinalizedPublication = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "publish_verified_code_to_github",

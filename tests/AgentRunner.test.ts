@@ -1822,11 +1822,12 @@ test("includes prior user and assistant chat history before current prompt", asy
 
   assert.equal(chatRequests.length, 1);
   const messages = chatRequests[0].messages;
-  assert.match(
-    messages.at(-4)?.content ?? "",
-    /Recent chat history is included/,
+  assert.ok(
+    messages.some((message) =>
+      /Recent chat history is included/.test(message.content),
+    ),
   );
-  assert.deepEqual(messages.slice(-3), [
+  assert.deepEqual(messages.filter((message) => message.role !== "system").slice(-3), [
     { role: "user", content: "Write a short essay about coral reefs." },
     { role: "assistant", content: "Coral reefs are living ocean cities." },
     { role: "user", content: "Edit the essay you gave me with more details." },
@@ -13529,11 +13530,28 @@ test("tool-planning preambles stay out of streamed final output", async () => {
   assert.equal(planningDeltas.length, 3);
   assert.ok(planningDeltas.every((delta) => delta.includes("route=grounded_workflow")));
   assert.ok(
+    planningDeltas.every((delta) => /catalog_tool_count=\d+/u.test(delta)),
+  );
+  assert.ok(
     planningDeltas.slice(0, 2).every((delta) =>
       delta.includes("tools=web_search, web_fetch"),
     ),
   );
   assert.match(planningDeltas[2], /tools=none/);
+  for (const request of chatRequests) {
+    const exactToolCards = request.messages.filter(
+      (message) =>
+        message.role === "system" && message.content.startsWith("Tools: "),
+    );
+    const requestToolNames =
+      request.tools?.map((tool) => tool.function.name) ?? [];
+    assert.equal(exactToolCards.length, 1);
+    assert.ok(
+      exactToolCards[0].content.startsWith(
+        `Tools: ${requestToolNames.join(", ") || "none"}.`,
+      ),
+    );
+  }
   assert.deepEqual(finalDeltas, [
     "Ready to answer. Source: https://example.com/source",
   ]);

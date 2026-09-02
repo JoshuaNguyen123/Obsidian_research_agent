@@ -32,6 +32,17 @@ import {
 
 const WEB_SHA = `sha256:${"a".repeat(64)}`;
 
+test("project idea schema publishes the same limitation cap the core enforces", () => {
+  const parameters = createProjectIdeaBriefTool().parameters as {
+    properties?: Record<string, { maxItems?: number; description?: string }>;
+  };
+  assert.equal(parameters.properties?.limitations?.maxItems, 10);
+  assert.match(
+    parameters.properties?.limitations?.description ?? "",
+    /at most 10/iu,
+  );
+});
+
 test("native project ideation works independently without claiming evidence", async () => {
   const cache = runtimeCache();
   const output = (await createProjectIdeaBriefTool().execute(

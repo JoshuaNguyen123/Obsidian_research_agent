@@ -1260,6 +1260,11 @@ test("host graph composes six typed developer stages without widening per-action
     reflectionSpec?.actions.at(-1)?.selector,
     "Research/Workflow Reflection.ipynb",
   );
+  assert.equal(
+    reflectionSpec?.actions.at(-1)?.condition,
+    undefined,
+    "an explicit notebook remains mandatory even when GitHub publication also writes Markdown",
+  );
 
   const planned = await planMissionGraphV3({
     mission: { missionId: "run-composite-project-lifecycle", objective },

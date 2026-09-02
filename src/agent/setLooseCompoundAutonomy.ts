@@ -1233,6 +1233,46 @@ export function hasCompleteSetLooseNoteReflectionProof(text: string): boolean {
   );
 }
 
+export interface VerifiedGitHubMarkdownReflectionProofV1 {
+  obsidianReceiptId: string;
+  pullRequestUrl: string;
+}
+
+/**
+ * A finalized GitHub publication is also the Markdown-reflection writer when
+ * its host checkpoint names the verified vault receipt and a draft-PR URL.
+ * Keep this predicate shared by the delivery ledger and MissionGraph
+ * reconciliation so the two completion seats cannot disagree again.
+ */
+export function verifiedGitHubMarkdownReflectionProofV1(
+  output: unknown,
+): VerifiedGitHubMarkdownReflectionProofV1 | null {
+  const record = isRecordLike(output) ? output : null;
+  if (record?.status !== "finalized") return null;
+  const obsidianReceiptId = stringField(record, "obsidianReceiptId");
+  const directPullRequestUrl =
+    stringField(record, "pullRequestUrl") || stringField(record, "htmlUrl");
+  const nestedPullRequest = isRecordLike(record.pullRequest)
+    ? record.pullRequest
+    : null;
+  const pullRequestUrl =
+    directPullRequestUrl ||
+    (nestedPullRequest
+      ? stringField(nestedPullRequest, "htmlUrl") ||
+        stringField(nestedPullRequest, "url")
+      : null);
+  if (
+    !obsidianReceiptId ||
+    !pullRequestUrl ||
+    !/https:\/\/github\.com\/[^\s)\]"'<>]+\/pull\/\d+/iu.test(
+      pullRequestUrl,
+    )
+  ) {
+    return null;
+  }
+  return { obsidianReceiptId, pullRequestUrl };
+}
+
 /**
  * Require every rendered example to carry the exact hash of its fenced bytes.
  * The metadata hash is host-provided; recomputing it here prevents an arbitrary
@@ -1332,12 +1372,11 @@ export function applySetLooseDeliveryProofFromSuccessfulTool(input: {
   if (hasDraftPrUrl) {
     next.githubPrivateRepoOrPrUrl = true;
   }
-  const hasFinalizedProjectReflection =
-    toolName === "publish_verified_code_to_github" &&
-    outputRecord?.status === "finalized" &&
-    Boolean(stringField(outputRecord, "obsidianReceiptId")) &&
-    hasDraftPrUrl;
-  if (hasFinalizedProjectReflection) {
+  const finalizedProjectReflection =
+    toolName === "publish_verified_code_to_github"
+      ? verifiedGitHubMarkdownReflectionProofV1(input.output)
+      : null;
+  if (finalizedProjectReflection && hasDraftPrUrl) {
     // The exact publication finalizer already appended and verified the
     // accepted-research note reflection. Do not synthesize a second legacy
     // "Flow real reflection" section merely to pay this delivery proof.

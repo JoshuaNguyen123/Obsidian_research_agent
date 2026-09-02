@@ -418,6 +418,13 @@ const STRING_LIST: JsonSchemaObject = {
   items: STRING,
   maxItems: 20,
 };
+const LIMITATION_LIST: JsonSchemaObject = {
+  type: "array",
+  items: STRING,
+  maxItems: 10,
+  description:
+    "Known limitations of this idea. Supply at most 10 entries; grounded ideas may use an empty list.",
+};
 const PROJECT_IDEA_BRIEF_PARAMETERS: JsonSchemaObject = {
   type: "object",
   additionalProperties: false,
@@ -481,7 +488,7 @@ const PROJECT_IDEA_BRIEF_PARAMETERS: JsonSchemaObject = {
       },
     },
     riskClass: { type: "string", enum: ["low", "medium", "high"] },
-    limitations: STRING_LIST,
+    limitations: LIMITATION_LIST,
     groundingReferences: {
       type: "array",
       maxItems: 50,

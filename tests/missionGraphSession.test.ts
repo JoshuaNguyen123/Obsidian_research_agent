@@ -694,6 +694,83 @@ test("green fast validation skips the conditional repair checkpoint", async () =
   );
 });
 
+test("verified nested GitHub Markdown reflection reconciles the required Results action", async () => {
+  const harness = createVaultHarness();
+  const graph = await conditionalMarkdownReflectionGraphFor(
+    "session-nested-github-markdown-reflection",
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+
+  for (const [index, toolName] of [
+    "github_create_repository",
+    "publish_verified_code_to_github",
+  ].entries()) {
+    const execution = requireExecution(
+      await session.beginToolExecution(toolName),
+    );
+    const node = session.graph.nodes[execution.nodeId]!;
+    await session.finishToolExecution(execution, {
+      ok: true,
+      evidence: evidenceFor(
+        node,
+        String(index + 1),
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        node,
+        String(index + 3),
+        harness.nextTimestamp(),
+      ),
+    });
+  }
+
+  const reflectionBefore = session.graph.nodes["lifecycle-reflection"]!;
+  assert.equal(reflectionBefore.status, "ready");
+  assert.equal(
+    getCurrentMissionCompositeLifecycleActionV1(reflectionBefore)?.condition,
+    undefined,
+  );
+  const settled =
+    await session.settleLifecycleActionFromEquivalentHostProof({
+      nodeId: "lifecycle-reflection",
+      expectedToolName: "write_project_results",
+      proofSource: "github_publication_markdown_reflection",
+      evidence: {
+        id: "nested-reflection-evidence",
+        kind: "tool-result",
+        fingerprint: fp("8"),
+        observedAt: harness.nextTimestamp(),
+      },
+      receipt: {
+        id: "github-note-reflection-proof",
+        kind: "external_action",
+        fingerprint: fp("9"),
+        committedAt: harness.nextTimestamp(),
+      },
+    });
+  assert.equal(settled.settled, true);
+  assert.equal(settled.graph.nodes["lifecycle-reflection"]?.status, "complete");
+  assert.deepEqual(
+    getMissionCompositeLifecycleStateV1(
+      settled.graph.nodes["lifecycle-reflection"]!,
+    ),
+    {
+      actionCursor: 1,
+      completedActionIds: ["action-001-write_project_results"],
+      skippedActionIds: [],
+      actionAttemptCounts: { "action-001-write_project_results": 1 },
+    },
+  );
+  assert.equal(settled.graph.nodes.final?.status, "ready");
+  assert.equal(
+    (await session.beginToolExecution("write_project_results")).ok,
+    false,
+  );
+});
+
 test("consecutive repaired conventional checkpoints each insert a fresh receipt-bound fast cycle before targeted validation", async () => {
   const harness = createVaultHarness();
   const missionId = "session-conventional-conditional-code-repair";
@@ -3833,6 +3910,69 @@ async function conditionalCodeLifecycleGraphFor(
   };
   const objective =
     "Research the requirements, then implement and validate the code workspace.";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective,
+    toolRegistry: registry,
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: names.length,
+    maxWallClockMs: 120_000,
+    now: GRAPH_TIME,
+  });
+  assert.ok(host.projectLifecycleIntent);
+  return (
+    await planMissionGraphV3({
+      mission: { missionId, objective },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+}
+
+async function conditionalMarkdownReflectionGraphFor(
+  missionId: string,
+): Promise<MissionGraphV3> {
+  const names = [
+    "github_create_repository",
+    "publish_verified_code_to_github",
+    "write_project_results",
+  ];
+  const descriptors = [
+    sessionLifecycleDescriptor(
+      "github_create_repository",
+      "github",
+      "publish",
+    ),
+    sessionLifecycleDescriptor(
+      "publish_verified_code_to_github",
+      "github",
+      "publish",
+    ),
+    sessionLifecycleDescriptor(
+      "write_project_results",
+      "vault",
+      "reversible_mutation",
+    ),
+  ];
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const objective =
+    "Create a private GitHub repository, publish the verified draft pull request, and write the final Markdown reflection.";
   const host = await buildHostMissionGraphPlanV1({
     missionId,
     objective,

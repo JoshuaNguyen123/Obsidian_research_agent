@@ -1064,6 +1064,137 @@ export class MissionGraphSession {
   }
 
   /**
+   * Reconcile the required Markdown reflection action when the bounded GitHub
+   * publisher already wrote and read back that same reflection. This is not a
+   * generic completion escape hatch: it accepts only the reflection node, the
+   * Results tool, the one named proof source, dependency readiness, and proof
+   * that satisfies the action's own immutable completion contract.
+   */
+  async settleLifecycleActionFromEquivalentHostProof(input: {
+    nodeId: string;
+    expectedToolName: string;
+    proofSource: "github_publication_markdown_reflection";
+    evidence: MissionEvidenceRefV1;
+    receipt: MissionReceiptRefV1;
+  }): Promise<{ settled: boolean; graph: MissionGraphV3 }> {
+    return this.enqueueMutation(async () => {
+      const node = this.record.graph.nodes[input.nodeId];
+      if (!node) return { settled: false, graph: this.graph };
+      const lifecycle = getMissionCompositeLifecycleSpecV1(node);
+      const state = getMissionCompositeLifecycleStateV1(node);
+      const action = getCurrentMissionCompositeLifecycleActionV1(node);
+      if (
+        !lifecycle ||
+        !state ||
+        !action ||
+        input.nodeId !== "lifecycle-reflection" ||
+        input.expectedToolName !== "write_project_results" ||
+        input.proofSource !== "github_publication_markdown_reflection" ||
+        action.toolName !== input.expectedToolName ||
+        action.condition !== undefined ||
+        actionProofMissingV1(action, input) ||
+        (node.status !== "queued" && node.status !== "ready") ||
+        !node.dependencyIds.every(
+          (dependencyId) =>
+            this.record.graph.nodes[dependencyId]?.status === "complete",
+        )
+      ) {
+        return { settled: false, graph: this.graph };
+      }
+
+      const operations: MissionGraphPatchOperationV1[] = [];
+      if (node.status === "queued") {
+        operations.push({
+          op: "set_status",
+          nodeId: node.id,
+          expectedStatus: "queued",
+          status: "ready",
+          blocker: null,
+        });
+      }
+      operations.push(
+        { op: "append_evidence", nodeId: node.id, evidence: input.evidence },
+        { op: "append_receipt", nodeId: node.id, receipt: input.receipt },
+        {
+          op: "set_outputs",
+          nodeId: node.id,
+          outputs: {
+            lifecycleActionCursor: state.actionCursor + 1,
+            lifecycleCompletedActionIds: [
+              ...state.completedActionIds,
+              action.id,
+            ],
+            lifecycleSkippedActionIds: [...state.skippedActionIds],
+            lifecycleActionAttemptCounts: {
+              ...state.actionAttemptCounts,
+              [action.id]: (state.actionAttemptCounts[action.id] ?? 0) + 1,
+            },
+          },
+        },
+      );
+
+      const settlesNode = state.actionCursor + 1 >= lifecycle.actions.length;
+      if (settlesNode) {
+        operations.push(
+          {
+            op: "set_status",
+            nodeId: node.id,
+            expectedStatus: "ready",
+            status: "running",
+            blocker: null,
+          },
+          {
+            op: "set_status",
+            nodeId: node.id,
+            expectedStatus: "running",
+            status: "verifying",
+            blocker: null,
+          },
+          {
+            op: "set_status",
+            nodeId: node.id,
+            expectedStatus: "verifying",
+            status: "complete",
+            blocker: null,
+          },
+        );
+        const completedIds = new Set(
+          Object.values(this.record.graph.nodes)
+            .filter((candidate) => candidate.status === "complete")
+            .map((candidate) => candidate.id),
+        );
+        completedIds.add(node.id);
+        for (const candidate of Object.values(this.record.graph.nodes)) {
+          if (
+            candidate.status === "queued" &&
+            !isFastValidationAwaitingCorrection(
+              this.record.graph,
+              candidate.id,
+            ) &&
+            candidate.dependencyIds.every((dependencyId) =>
+              completedIds.has(dependencyId),
+            )
+          ) {
+            operations.push({
+              op: "set_status",
+              nodeId: candidate.id,
+              expectedStatus: "queued",
+              status: "ready",
+              blocker: null,
+            });
+          }
+        }
+      }
+
+      const graph = await this.applyUnlocked(
+        `Reconcile ${input.expectedToolName} in ${node.id} from verified ${input.proofSource}.`,
+        operations,
+      );
+      return { settled: true, graph };
+    });
+  }
+
+  /**
    * A recorded `repaired` outcome proves only that one red fast-validation
    * receipt was journaled. Before that repair node completes, insert the next
    * bounded fast-validation -> repair-record pair and make every unfinished

@@ -703,6 +703,7 @@ import {
   SET_LOOSE_STAGE_SOFT_COMPANIONS,
   toolsOfferedForSetLooseTurn,
   unpaidSetLooseDeliveryStages,
+  verifiedGitHubMarkdownReflectionProofV1,
   type CompoundRunBudgetPlanV1,
   type SetLooseDeliveryProofsV1,
 } from "./agent/setLooseCompoundAutonomy";
@@ -16132,6 +16133,73 @@ export async function runAgentMission({
         result,
         receipt,
       );
+      const nestedMarkdownReflection =
+        toolCall.name === PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME &&
+        !hasJupyterReflectionIntentV1(activeIntentPrompt)
+          ? verifiedGitHubMarkdownReflectionProofV1(result.output)
+          : null;
+      if (missionGraphSession && nestedMarkdownReflection) {
+        const observedAt = (runToolContext.now?.() ?? new Date()).toISOString();
+        const proofFingerprint = await sha256MissionFingerprint({
+          sourceToolName: toolCall.name,
+          sourceStatus: "finalized",
+          obsidianReceiptId: nestedMarkdownReflection.obsidianReceiptId,
+          pullRequestUrl: nestedMarkdownReflection.pullRequestUrl,
+          output: result.output,
+        });
+        const graphRevision = missionGraphSession.graph.revision + 1;
+        const settled =
+          await missionGraphSession.settleLifecycleActionFromEquivalentHostProof(
+            {
+              nodeId: "lifecycle-reflection",
+              expectedToolName: WRITE_PROJECT_RESULTS_TOOL_NAME,
+              proofSource: "github_publication_markdown_reflection",
+              evidence: {
+                id: missionGraphReferenceId(
+                  "evidence",
+                  "lifecycle-reflection",
+                  graphRevision,
+                ),
+                kind: "tool-result",
+                fingerprint: proofFingerprint,
+                observedAt,
+              },
+              receipt: {
+                id: isSafeMissionGraphReferenceId(
+                  nestedMarkdownReflection.obsidianReceiptId,
+                )
+                  ? nestedMarkdownReflection.obsidianReceiptId
+                  : missionGraphReferenceId(
+                      "receipt",
+                      "lifecycle-reflection",
+                      graphRevision,
+                    ),
+                kind: "vault-write",
+                fingerprint: proofFingerprint,
+                committedAt: observedAt,
+              },
+            },
+          );
+        if (settled.settled) {
+          missionGraph = settled.graph;
+          events.onStatus?.(
+            "Verified GitHub publication already committed the required Obsidian Markdown reflection; reconciled the Results stage without a duplicate append.",
+          );
+          events.onTrace?.({
+            id: `${toolEventBase.id}:nested-markdown-reflection-settled`,
+            kind: "verification",
+            step,
+            toolName: toolCall.name,
+            message:
+              "Reconciled the required Markdown reflection action from the verified nested Obsidian receipt.",
+            outputPreview: {
+              obsidianReceiptId:
+                nestedMarkdownReflection.obsidianReceiptId,
+              pullRequestUrl: nestedMarkdownReflection.pullRequestUrl,
+            },
+          });
+        }
+      }
       const validationCorrectionDecision =
         missionGraphSession &&
           receipt &&
@@ -17177,14 +17245,6 @@ export async function runAgentMission({
           },
         ]
       : []),
-    {
-      role: "system" as const,
-      content: formatAllowedToolsContext(tools),
-    },
-    {
-      role: "system" as const,
-      content: formatToolAuthorityContext(tools),
-    },
     ...(runPlan.route === "tool_required" || runPlan.route === "grounded_workflow"
       ? [
           {
@@ -17413,11 +17473,8 @@ export async function runAgentMission({
       allowedToolNames = new Set(tools.map((tool) => tool.function.name));
       messages.push({
         role: "system" as const,
-        content: [
-          "Local vault prefetch failed, so normal vault tools are available.",
-          formatAllowedToolsContext(tools),
-          formatToolAuthorityContext(tools),
-        ].join(" "),
+        content:
+          "Local vault prefetch failed, so the next turn will expose the exact available vault-tool schemas.",
       });
     }
   }
@@ -18398,24 +18455,6 @@ export async function runAgentMission({
         }),
       );
     }
-    events.onPlanningDelta?.(
-      [
-        `Step ${step}/${stepLimit}`,
-        `route=${runPlan.route}`,
-        `reason=${runPlan.slowPathReason}`,
-        `estimated_prompt_chars=${estimatedPromptCharsForRun}`,
-        `num_ctx=${modelOptions?.num_ctx ?? "default"}`,
-        `context_budget_source=${runContextBudget.budgetSource}`,
-        `context_budget_chars=${effectiveContextBudget.maxPromptChars}`,
-        formatContextCalibrationForRunDetails(
-          contextCalibration,
-          runContextBudget,
-        ),
-        `tool_budget=${loopBudgetPlan.toolStepBudget}`,
-        `finalization_reserved=${loopBudgetPlan.finalizationReserve}`,
-        `tools=${Array.from(allowedToolNames).join(", ") || "none"}`,
-      ].join("; "),
-    );
     if (
       missionPlan &&
       (step % PROGRESS_REVIEW_EVERY_STEPS === 0 ||
@@ -19463,10 +19502,14 @@ export async function runAgentMission({
       // stepTools is the same array the schemas below are built from, so the
       // plan header cannot name a tool this step will refuse.
       refreshMissionPlanPromptMessage(messages, missionPlan, stepTools);
+      const exactStepToolMessages = insertExactStepToolTurnContext(
+        messages,
+        stepTools,
+      );
       const stepMessages =
         stepTools.length > 0 && (missionGraph || setLooseCompoundEnabled)
           ? insertMissionGraphFrontierTurnContext(
-              messages,
+              exactStepToolMessages,
               stepTools,
               [
                 buildObservedMissionGraphFrontierBinding(
@@ -19518,7 +19561,7 @@ export async function runAgentMission({
                 ].filter((card): card is string => Boolean(card)),
               },
             )
-          : messages;
+          : exactStepToolMessages;
       const escalateThisStep = noToolEscalationActive && stepTools.length > 0;
       const exactRepairReceiptFrontier =
         stepTools.length === 1 &&
@@ -19528,6 +19571,26 @@ export async function runAgentMission({
           missionGraphSession?.graph ?? missionGraph,
         );
       noToolEscalationActive = false;
+      estimatedPromptCharsForRun = estimatePromptChars(stepMessages);
+      events.onPlanningDelta?.(
+        [
+          `Step ${step}/${stepLimit}`,
+          `route=${runPlan.route}`,
+          `reason=${runPlan.slowPathReason}`,
+          `estimated_prompt_chars=${estimatedPromptCharsForRun}`,
+          `num_ctx=${modelOptions?.num_ctx ?? "default"}`,
+          `context_budget_source=${runContextBudget.budgetSource}`,
+          `context_budget_chars=${effectiveContextBudget.maxPromptChars}`,
+          formatContextCalibrationForRunDetails(
+            contextCalibration,
+            runContextBudget,
+          ),
+          `tool_budget=${loopBudgetPlan.toolStepBudget}`,
+          `finalization_reserved=${loopBudgetPlan.finalizationReserve}`,
+          `catalog_tool_count=${allowedToolNames.size}`,
+          `tools=${stepTools.map((tool) => tool.function.name).join(", ") || "none"}`,
+        ].join("; "),
+      );
       const segmentBudgetPrompt = formatSegmentBudgetPrompt({
         remainingToolCalls: Math.max(0, maxToolCalls - observedToolCallCount),
         remainingModelCalls: Math.max(0, stepLimit - step + 1),
@@ -24491,7 +24554,7 @@ function formatDirectCurrentNoteWritebackContext(): string {
 }
 
 function formatAllowedToolsContext(
-  tools: ModelChatRequest["tools"],
+  tools: readonly ModelToolDefinition[] | undefined,
 ): string {
   const toolNames = tools?.map((tool) => tool.function.name) ?? [];
 
@@ -24503,7 +24566,7 @@ function formatAllowedToolsContext(
 }
 
 function formatToolAuthorityContext(
-  tools: ModelChatRequest["tools"],
+  tools: readonly ModelToolDefinition[] | undefined,
 ): string {
   const toolNames = tools?.map((tool) => tool.function.name) ?? [];
   const authority = toolNames
@@ -34248,6 +34311,29 @@ export function buildValidatorFailureSourceContext(
     })
     .filter(Boolean)
     .join(" ");
+}
+
+/**
+ * Put the exact current-turn catalog immediately before the user message.
+ * The initial route catalog is deliberately not persisted in model history:
+ * a later narrow frontier must never compete with an obsolete 200-tool list.
+ */
+function insertExactStepToolTurnContext(
+  messages: readonly ModelChatMessage[],
+  stepTools: readonly ModelToolDefinition[],
+): ModelChatMessage[] {
+  const insertAt = Math.max(0, messages.length - 1);
+  return [
+    ...messages.slice(0, insertAt),
+    {
+      role: "system" as const,
+      content: [
+        formatAllowedToolsContext(stepTools),
+        formatToolAuthorityContext(stepTools),
+      ].join("\n"),
+    },
+    ...messages.slice(insertAt),
+  ];
 }
 
 function insertMissionGraphFrontierTurnContext(
