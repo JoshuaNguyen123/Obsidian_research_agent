@@ -11,14 +11,21 @@
  *
  * The rules this module enforces, in order of how much they matter:
  *
- *  1. A quotation that failed verbatim verification is never delivered. It is
+ *  1. A mission that forbids note mutation ("do not write or edit any note",
+ *     chat-only answers, exact-cache verification follow-ups) is never
+ *     eligible for degraded vault delivery. A marked provisional draft is
+ *     still a vault write, and the mission said no vault writes — the proof
+ *     taxonomy below never gets a vote. (This closed the DU-02 hole, where a
+ *     cache follow-up that said "do not write or edit any note" had its note
+ *     replaced by a provisional verification draft.)
+ *  2. A quotation that failed verbatim verification is never delivered. It is
  *     removed, exactly as the existing finalization repairs remove it. A
  *     fabricated quote with a caveat attached is still a fabricated quote.
- *  2. A non-quote claim that no passage supports is delivered with an inline
+ *  3. A non-quote claim that no passage supports is delivered with an inline
  *     marker, so a reader skimming the body cannot mistake it for verified.
- *  3. The note carries a `## Verification status` section stating what was and
+ *  4. The note carries a `## Verification status` section stating what was and
  *     was not confirmed, and naming the outstanding proofs.
- *  4. Anything outside those two failure families — authority, approval,
+ *  5. Anything outside those two failure families — authority, approval,
  *     receipts, structural contract gaps — still fails closed, unchanged.
  *
  * A degraded delivery is a real delivery to the user and NOT a green run. The
@@ -47,6 +54,22 @@ export interface DegradedDeliveryDecisionV1 {
   reason: string;
 }
 
+/**
+ * Mission-level constraints the delivery seats know and the proof list does
+ * not. `candidateAcceptance.missing` describes what verification could not
+ * confirm; it says nothing about what the user told the agent it may touch.
+ */
+export interface DegradedDeliveryMissionContextV1 {
+  /**
+   * True when the mission explicitly forbids mutating notes — "do not write
+   * or edit any note", chat-only answers, exact-cache verification
+   * follow-ups (`hasExplicitNoNoteWriteIntent` in `noNoteWriteIntent.ts` is
+   * the shared detector). When set, the decision is ineligible regardless of
+   * which proofs are missing: a marked draft is still a write.
+   */
+  missionForbidsNoteMutation?: boolean;
+}
+
 export interface DegradedDeliveryResultV1 {
   content: string;
   markedClaimIds: string[];
@@ -68,9 +91,23 @@ export function isMarkableUnverifiedProofV1(item: string): boolean {
 
 export function decideDegradedDeliveryV1(
   missing: string[],
+  mission?: DegradedDeliveryMissionContextV1,
 ): DegradedDeliveryDecisionV1 {
   const markable = missing.filter(isMarkableUnverifiedProofV1);
   const blocking = missing.filter((item) => !isMarkableUnverifiedProofV1(item));
+  // Mission authority outranks the proof taxonomy: this guard runs before any
+  // family sorting so no combination of "benign" missing proofs can make a
+  // forbidden write eligible. markable/blocking stay populated for Run
+  // Details; they explain what verification found, not what may ship.
+  if (mission?.missionForbidsNoteMutation) {
+    return {
+      eligible: false,
+      markable,
+      blocking,
+      reason:
+        "The mission forbids writing or editing notes, so no provisional draft may be delivered to the vault; the existing note stays unchanged.",
+    };
+  }
   if (missing.length === 0) {
     return {
       eligible: false,

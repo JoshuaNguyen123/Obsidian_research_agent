@@ -52,6 +52,65 @@ test("only unverified claims and open conflicts may ship marked", () => {
   assert.equal(decideDegradedDeliveryV1([]).eligible, false);
 });
 
+test("a mission that forbids note mutation is never eligible, even for markable-only gaps", () => {
+  // DU-02: a cache follow-up said "do not write or edit any note"; the only
+  // outstanding proof was claim_grounding:ungrounded — markable for an
+  // ordinary write mission — and a provisional draft replaced the note
+  // anyway. Mission authority outranks the proof taxonomy.
+  const decision = decideDegradedDeliveryV1(
+    ["claim_grounding:ungrounded_claim:c1"],
+    { missionForbidsNoteMutation: true },
+  );
+  assert.equal(decision.eligible, false);
+  assert.match(decision.reason, /existing note stays unchanged/i);
+  // Diagnostics still name the gaps for Run Details.
+  assert.deepEqual(decision.markable, ["claim_grounding:ungrounded_claim:c1"]);
+  assert.deepEqual(decision.blocking, []);
+
+  // Both markable families together change nothing.
+  assert.equal(
+    decideDegradedDeliveryV1(
+      [
+        "claim_grounding:ungrounded_claim:c1",
+        "open_evidence_conflicts:conflict-2",
+      ],
+      { missionForbidsNoteMutation: true },
+    ).eligible,
+    false,
+  );
+
+  // Even the degenerate empty case stays ineligible under the mission guard.
+  assert.equal(
+    decideDegradedDeliveryV1([], { missionForbidsNoteMutation: true }).eligible,
+    false,
+  );
+});
+
+test("an ordinary write mission keeps its markable-only eligibility", () => {
+  for (const mission of [
+    undefined,
+    {},
+    { missionForbidsNoteMutation: false },
+  ]) {
+    const decision = decideDegradedDeliveryV1(
+      ["claim_grounding:ungrounded_claim:c1"],
+      mission,
+    );
+    assert.equal(decision.eligible, true, JSON.stringify(mission));
+  }
+});
+
+test("blocking proofs stay ineligible regardless of mission context", () => {
+  for (const mission of [undefined, { missionForbidsNoteMutation: true }]) {
+    const decision = decideDegradedDeliveryV1(
+      ["claim_grounding:ungrounded_claim:c1", "final_output"],
+      mission,
+    );
+    assert.equal(decision.eligible, false, JSON.stringify(mission));
+    assert.deepEqual(decision.blocking, ["final_output"]);
+  }
+});
+
 test("an unverifiable quotation is removed, never delivered with a caveat", () => {
   const quoted = "The council affirmed the clause in exactly these words.";
   const result = buildDegradedDeliveryV1({

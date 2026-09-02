@@ -1,5 +1,6 @@
 import { prefersStreamedReplaceForEditOrganize } from "./editOrganizeIntent";
 import { hasWordCountShortfallFollowUp } from "./generatedOutputPolicy";
+import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
 
 /**
  * Classic user language that authorizes whole-note replace/rewrite.
@@ -44,6 +45,9 @@ export function stripNegatedReplaceClauses(prompt: string): string {
 }
 
 export function hasAuthorizedCurrentNoteReplaceIntent(prompt: string): boolean {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return false;
+  }
   const promptWithoutNegatedClassicReplaceClauses =
     stripNegatedReplaceClauses(prompt);
   return (

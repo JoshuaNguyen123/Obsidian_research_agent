@@ -469,6 +469,12 @@ test("loop planner reserves finalization for grounded generated writing", () => 
   assert.deepEqual(budget.expectedTools, ["web_search", "web_fetch"]);
 });
 
+test("generated output policy keeps an explicit no-write cache read in chat", () => {
+  const prompt =
+    "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.";
+  assert.equal(analyzeGeneratedOutputPrompt(prompt).target, "chat_only");
+});
+
 test("loop planner owes only the explicitly requested cache fetch when search is forbidden", () => {
   const prompt =
     "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.";

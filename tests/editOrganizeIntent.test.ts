@@ -224,6 +224,14 @@ test("edit/organize intent matrix routes current note, vault clarify, whole note
   }
 });
 
+test("do-not-write cache verification is not a whole-note edit or streamed replace", () => {
+  const prompt =
+    "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.";
+  assert.equal(isWholeNoteEditIntent(prompt), false);
+  assert.equal(prefersStreamedReplaceForEditOrganize(prompt), false);
+  assert.equal(classifyEditOrganizeRoute(prompt), "other");
+});
+
 test("current-note edit/organize prefers streamed replace; vault-wide does not", () => {
   assert.equal(prefersStreamedReplaceForEditOrganize("Edit this page"), true);
   assert.equal(prefersStreamedReplaceForEditOrganize("Organize my vault"), false);

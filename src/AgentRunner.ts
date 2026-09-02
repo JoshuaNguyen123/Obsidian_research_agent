@@ -271,6 +271,8 @@ import {
   summarizeOpenEvidenceConflictsV1,
   type DegradedDeliveryResultV1,
 } from "./agent/degradedDelivery";
+import { hasExplicitNoNoteWriteIntent } from "./agent/noNoteWriteIntent";
+import { missionForbidsNoteMutationV1 } from "./agent/noWriteMissionGuard";
 import {
   buildMissionRetryVariationPlanV1,
   missionRetryVariationKeyV1,
@@ -2389,7 +2391,10 @@ export async function runAgentMission({
   let missionIntent = classifyMissionIntent(activeIntentPrompt, {
     hasActiveMarkdownNote: hasActiveCurrentMarkdownFile(toolContext),
   });
-  if (shouldForceCurrentPromptChatOnly()) {
+  if (
+    shouldForceCurrentPromptChatOnly() ||
+    hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+  ) {
     missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
   }
   const modelRouterMode = resolveModelRouterMode(toolContext.settings);
@@ -3088,7 +3093,10 @@ export async function runAgentMission({
     enableStreaming,
     forceChatOnly: shouldForceCurrentPromptChatOnly(),
   });
-  if (shouldForceCurrentPromptChatOnly()) {
+  if (
+    shouldForceCurrentPromptChatOnly() ||
+    hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+  ) {
     missionIntent = suppressNoteWritebackForChatOnly(
       activeIntentPrompt,
       missionIntent,
@@ -4257,7 +4265,10 @@ export async function runAgentMission({
         ? `set_loose_compound=enabled stages=${compoundLifecycleStages.join(",")}`
         : `set_loose_compound=disabled stages=${compoundLifecycleStages.join(",") || "none"} autonomy=${autonomyProfileForRun}`,
     );
-    if (shouldForceCurrentPromptChatOnly()) {
+    if (
+      shouldForceCurrentPromptChatOnly() ||
+      hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+    ) {
       missionIntent = suppressNoteWritebackForChatOnly(
         activeIntentPrompt,
         missionIntent,
@@ -4290,9 +4301,14 @@ export async function runAgentMission({
       missionIntent,
       toolContext: runToolContext,
       enableStreaming,
-      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+      forceChatOnly:
+        shouldForceCurrentPromptChatOnly() ||
+        hasExplicitNoNoteWriteIntent(activeIntentPrompt),
     });
-    if (shouldForceCurrentPromptChatOnly()) {
+    if (
+      shouldForceCurrentPromptChatOnly() ||
+      hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+    ) {
       missionIntent = suppressNoteWritebackForChatOnly(
         activeIntentPrompt,
         missionIntent,
@@ -6027,7 +6043,10 @@ export async function runAgentMission({
         hasActiveMarkdownNote: hasActiveCurrentMarkdownFile(runToolContext),
       },
     );
-    if (shouldForceCurrentPromptChatOnly()) {
+    if (
+      shouldForceCurrentPromptChatOnly() ||
+      hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+    ) {
       missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
     }
     reflexOutput = await reflexController.evaluate({
@@ -6061,9 +6080,14 @@ export async function runAgentMission({
       missionIntent,
       toolContext: runToolContext,
       enableStreaming,
-      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+      forceChatOnly:
+        shouldForceCurrentPromptChatOnly() ||
+        hasExplicitNoNoteWriteIntent(activeIntentPrompt),
     });
-    if (shouldForceCurrentPromptChatOnly()) {
+    if (
+      shouldForceCurrentPromptChatOnly() ||
+      hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+    ) {
       missionIntent = suppressNoteWritebackForChatOnly(
         activeIntentPrompt,
         missionIntent,
@@ -10958,6 +10982,31 @@ export async function runAgentMission({
     step: number,
     maxSteps = runPlan.maxStepsForRun,
   ): Promise<AgentRunReceipt | null> => {
+    if (
+      hasExplicitNoNoteWriteIntent(activeIntentPrompt) ||
+      missionForbidsNoteMutationV1({
+        userPrompt: activeIntentPrompt,
+        allowedToolNames: [...allowedToolNames],
+      })
+    ) {
+      const message =
+        "Note writeback was not applied because the mission forbids writing or editing notes. The existing note is unchanged.";
+      events.onStatus?.(message);
+      events.onTrace?.({
+        id: `proof-gated-writeback-${step}:no-write-mission-rejected`,
+        kind: "tool_rejected",
+        step,
+        message,
+        outputPreview: { kind: input.kind },
+        error: {
+          code: "no_write_mission",
+          message,
+        },
+      });
+      emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+      await finishRun("budget", step, maxSteps, message, true);
+      return null;
+    }
     const plannedToolName =
       input.kind === "append"
         ? "append_to_current_file"
@@ -11341,7 +11390,13 @@ export async function runAgentMission({
         // unverified claim or an unresolved source disagreement, deliver the
         // work with the gaps marked rather than throwing it away; anything
         // else still fails closed.
-        const degraded = decideDegradedDeliveryV1(candidateAcceptance.missing);
+        const forbidsNoteMutation = missionForbidsNoteMutationV1({
+          userPrompt: activeIntentPrompt,
+          allowedToolNames: [...allowedToolNames],
+        });
+        const degraded = decideDegradedDeliveryV1(candidateAcceptance.missing, {
+          missionForbidsNoteMutation: forbidsNoteMutation,
+        });
         if (degraded.eligible) {
           const marked = buildDegradedDeliveryV1({
             content: candidate,
@@ -17482,7 +17537,10 @@ export async function runAgentMission({
     }
   }
 
-  if (runPlan.route === "prefetched_vault_writeback") {
+  if (
+    runPlan.route === "prefetched_vault_writeback" &&
+    !hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+  ) {
     if (await stopIfRequested(0)) {
       return;
     }
@@ -17595,7 +17653,10 @@ export async function runAgentMission({
     return;
   }
 
-  if (promptOnPageWritebackKind !== null) {
+  if (
+    promptOnPageWritebackKind !== null &&
+    !hasExplicitNoNoteWriteIntent(activeIntentPrompt)
+  ) {
     if (await stopIfRequested(1)) {
       return;
     }
@@ -21380,6 +21441,11 @@ export async function runAgentMission({
         // Item 1/15: at last step, attempt runner-owned streamed replace when
         // write_receipt is missing and current-note write/stream is allowed.
         if (
+          !hasExplicitNoNoteWriteIntent(activeIntentPrompt) &&
+          !missionForbidsNoteMutationV1({
+            userPrompt: activeIntentPrompt,
+            allowedToolNames: [...allowedToolNames],
+          }) &&
           missingWriteReceipt &&
           writeAutonomy &&
           hasActiveCurrentMarkdownFile(runToolContext) &&
@@ -29338,15 +29404,28 @@ function getAllowedToolDefinitions(
   // Explicit parallel vault-read missions must keep a multi-tool read batch
   // available even when mutation intent would otherwise narrow the allowlist.
   if (allowParallelVaultInspection) {
-    return addToolDefinitions(filtered, toolRegistry, [
-      "read_current_file",
-      "count_words",
-      "get_note_graph_context",
-      "find_related_notes",
-      "list_markdown_files",
-      "read_markdown_files",
-      "append_to_current_file",
-    ]);
+    return addToolDefinitions(
+      filtered,
+      toolRegistry,
+      hasExplicitNoNoteWriteIntent(prompt)
+        ? [
+            "read_current_file",
+            "count_words",
+            "get_note_graph_context",
+            "find_related_notes",
+            "list_markdown_files",
+            "read_markdown_files",
+          ]
+        : [
+            "read_current_file",
+            "count_words",
+            "get_note_graph_context",
+            "find_related_notes",
+            "list_markdown_files",
+            "read_markdown_files",
+            "append_to_current_file",
+          ],
+    );
   }
 
   return filtered;
@@ -31624,6 +31703,9 @@ function classifyPromptOnCurrentPageMissionIntent(
   context: MissionIntentClassificationContext = {},
 ): MissionIntent {
   const intent = classifyMissionIntent(prompt, context);
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return suppressNoteWritebackForChatOnly(prompt, intent);
+  }
   if (intent.vaultContext && hasCurrentPageWritebackIntent(prompt)) {
     return {
       ...intent,
@@ -32212,6 +32294,23 @@ function classifyMissionIntent(
       {
         mode: "vault_context_answer",
         vaultContext: true,
+        noteOutput: false,
+        explicitPersistence: false,
+        explicitMutation: false,
+        explicitDelete: false,
+        allowAutonomousWrite: false,
+        requireWriteCompletion: false,
+      },
+      context,
+    );
+  }
+
+  if (chatOnlyResponse) {
+    return buildMissionIntent(
+      prompt,
+      {
+        mode: vaultContext ? "vault_context_answer" : "chat_only",
+        vaultContext,
         noteOutput: false,
         explicitPersistence: false,
         explicitMutation: false,

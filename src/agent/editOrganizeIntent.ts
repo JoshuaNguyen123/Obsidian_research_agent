@@ -3,6 +3,8 @@
  * and whole-note vs named-section edit routing.
  */
 
+import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
+
 export const WRITE_RECEIPT_MISSING = "write_receipt";
 
 export type EditOrganizeRoute =
@@ -112,6 +114,9 @@ export function isVaultWideOrganizeIntent(prompt: string): boolean {
  * primary verb.
  */
 export function isWholeNoteEditIntent(prompt: string): boolean {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return false;
+  }
   if (isNamedSectionEditIntent(prompt)) {
     return false;
   }
@@ -282,6 +287,9 @@ export function missingIncludesWriteReceipt(missing: string[]): boolean {
 
 /** Prefer streamed replace for current-note edit/organize and whole-note edits. */
 export function prefersStreamedReplaceForEditOrganize(prompt: string): boolean {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return false;
+  }
   // Named section edits stay on edit_current_section / prepare_edit — not
   // whole-note streamed replace — even when the prompt also says "this note".
   if (isNamedSectionEditIntent(prompt)) {

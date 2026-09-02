@@ -3,6 +3,7 @@
  * authority: only an action clause can turn discussion about a pipeline into
  * execution of that pipeline.
  */
+import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
 import {
   canonicalizeKeywordTypos,
   fuzzyCorrectionReason,
@@ -57,6 +58,7 @@ function classifyTrimmedPrompt(
   value: string,
 ): MissionSpeechActClassificationV1 {
   const explicitChatOnly =
+    hasExplicitNoNoteWriteIntent(value) ||
     /\b(?:chat[- ]only|answer (?:only )?in (?:the )?chat|(?:do not|don'?t|without)\s+(?:write|writing|save|saving|append|appending|persist|persisting)(?:\s+(?:to|in))?\s+(?:the\s+)?(?:current\s+)?(?:document|note|page|file|vault|memory)|no (?:specific )?(?:document|note|page|file))\b/iu.test(
       value,
     );
@@ -143,7 +145,7 @@ function classifyTrimmedPrompt(
       value,
     );
 
-  if (!explicitChatOnly && (explicitExecution || writeLikeExecution)) {
+  if (explicitExecution || writeLikeExecution) {
     return result(
       "execute",
       namedExternalMutation || compoundStages >= 2 || lifecycleSignal
@@ -154,7 +156,9 @@ function classifyTrimmedPrompt(
         ...(namedExternalMutation ? ["named_external_mutation"] : []),
         ...(compoundStages >= 2 ? ["compound_stage_request"] : []),
         ...(lifecycleSignal ? ["lifecycle_signal"] : []),
+        ...(explicitChatOnly ? ["explicit_chat_only"] : []),
       ],
+      explicitChatOnly,
     );
   }
 

@@ -26,6 +26,7 @@ import {
   type ResearchMemoryIndexEntry,
   type ToolExecutionContext,
 } from "./types";
+import { hasExplicitNoNoteWriteIntent } from "../agent/noNoteWriteIntent";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "../agent/replaceIntent";
 import { currentNoteReplaceCatalogEligible } from "../agent/missionScope";
 import {
@@ -2261,6 +2262,11 @@ export const appendToCurrentFileTool: AgentTool = {
   },
   async execute(args, context) {
     const requestedText = getRequiredString(args, "text");
+    if (hasExplicitNoNoteWriteIntent(context.originalPrompt)) {
+      throw new Error(
+        "append_to_current_file is refused because the user forbade writing or editing notes.",
+      );
+    }
     if (!context.writeAutonomy && !APPEND_INTENT_PATTERN.test(context.originalPrompt)) {
       throw new Error(
         "append_to_current_file requires the user to explicitly ask to append, save, write, add, insert, or update the note.",
@@ -3001,6 +3007,11 @@ function assertCreateIntent(
 }
 
 function assertAppendIntent(context: ToolExecutionContext, toolName: string) {
+  if (hasExplicitNoNoteWriteIntent(context.originalPrompt)) {
+    throw new Error(
+      `${toolName} is refused because the user forbade writing or editing notes.`,
+    );
+  }
   if (!APPEND_INTENT_PATTERN.test(context.originalPrompt)) {
     throw new Error(`${toolName} requires the user to explicitly ask to append, save, write, add, insert, or update a note or file.`);
   }

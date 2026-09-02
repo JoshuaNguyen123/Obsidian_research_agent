@@ -59,6 +59,15 @@ test("tool-dependent imperatives are not mistaken for analytical chat", () => {
   }
 });
 
+test("do-not-write cache verification stays executable and refuses persist", () => {
+  const result = classifyMissionSpeechAct(
+    "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.",
+  );
+  assert.equal(result.explicitChatOnly, true);
+  assert.equal(result.speechAct, "execute");
+  assert.equal(result.executionTier, "bounded_tool");
+});
+
 test("single writes are bounded persistence and explicit resume is durable", () => {
   assert.deepEqual(
     classifyMissionSpeechAct("Append this summary to the current note"),

@@ -39,6 +39,15 @@ test("plain write essay does not authorize replace", () => {
   );
 });
 
+test("explicit do-not-write cache verification does not authorize replace", () => {
+  assert.equal(
+    hasAuthorizedCurrentNoteReplaceIntent(
+      "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.",
+    ),
+    false,
+  );
+});
+
 test("negative non-note rewrite clause does not authorize current-note replacement", () => {
   const prompt = [
     "Create a repository workspace and append the verified reflection to the current note.",

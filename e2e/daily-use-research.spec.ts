@@ -19,7 +19,7 @@ import {
   readSemanticRetrievalOutcomeV1,
   semanticModeSatisfiedV1,
 } from "../src/agent/semanticRetrievalHealth";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   startAuthenticatedOllamaProxyV1,
   type AuthenticatedOllamaProxyV1,
@@ -616,6 +616,9 @@ test.describe("Daily-use live research contract", () => {
       expect(metricsBeforeCacheRead.searchTransportCalls).toBeGreaterThanOrEqual(1);
       expect(metricsBeforeCacheRead.fetchTransportCalls).toBeGreaterThanOrEqual(2);
       const cachedSourceUrl = `https://primary.owned.example/evidence/${encodeURIComponent(harness.marker)}`;
+      const beforeFollowUpNote = await readActiveNoteIdentityV1(harness);
+      expect(beforeFollowUpNote.content).toBe(after);
+      expect(beforeFollowUpNote.fingerprint).toMatch(/^sha256:[a-f0-9]{64}$/u);
       await harness.submitMission(
         `Call web_fetch once for the exact already-fetched URL ${cachedSourceUrl} with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.`,
       );
@@ -647,7 +650,56 @@ test.describe("Daily-use live research contract", () => {
       expect(metricsAfterCacheRead.fetchTransportCalls).toBe(
         metricsBeforeCacheRead.fetchTransportCalls,
       );
-      expect(await readFile(harness.noteFilePath, "utf8")).toBe(after);
+      const afterFollowUpNote = await readActiveNoteIdentityV1(harness);
+      const followUpMutationReceipts = noteMutationReceiptsV1(
+        cacheSnapshot.lastReceipts,
+      );
+      const followUpSafeState = {
+        beforePath: beforeFollowUpNote.path,
+        afterPath: afterFollowUpNote.path,
+        beforeTitle: beforeFollowUpNote.title,
+        afterTitle: afterFollowUpNote.title,
+        beforeHeading: beforeFollowUpNote.heading,
+        afterHeading: afterFollowUpNote.heading,
+        beforeFingerprint: beforeFollowUpNote.fingerprint,
+        afterFingerprint: afterFollowUpNote.fingerprint,
+        receiptOperations: (cacheSnapshot.lastReceipts ?? []).map(
+          (receipt: any) => ({
+            operation: receipt.operation ?? null,
+            toolName: receipt.toolName ?? null,
+            path: receipt.path ?? null,
+            toPath: receipt.toPath ?? null,
+            commitKind: receipt.commitKind ?? null,
+            bytesWritten: receipt.bytesWritten ?? null,
+            readback: receipt.readback?.status ?? null,
+          }),
+        ),
+      };
+      // Seeded-path byte equality alone misses a new-note create or a
+      // title rewrite that leaves harness.noteFilePath untouched.
+      expect(
+        await readFile(harness.noteFilePath, "utf8"),
+        JSON.stringify(followUpSafeState),
+      ).toBe(after);
+      expect(afterFollowUpNote.path, JSON.stringify(followUpSafeState)).toBe(
+        beforeFollowUpNote.path,
+      );
+      expect(afterFollowUpNote.title, JSON.stringify(followUpSafeState)).toBe(
+        beforeFollowUpNote.title,
+      );
+      expect(afterFollowUpNote.heading, JSON.stringify(followUpSafeState)).toBe(
+        beforeFollowUpNote.heading,
+      );
+      expect(
+        afterFollowUpNote.fingerprint,
+        JSON.stringify(followUpSafeState),
+      ).toBe(beforeFollowUpNote.fingerprint);
+      expect(afterFollowUpNote.content, JSON.stringify(followUpSafeState)).toBe(
+        after,
+      );
+      expect(followUpMutationReceipts, JSON.stringify(followUpSafeState)).toEqual(
+        [],
+      );
       const observed = {
         artifacts: [] as string[],
         proofs: [] as string[],
@@ -721,6 +773,16 @@ test.describe("Daily-use live research contract", () => {
             metricsBeforeCacheRead.searchTransportCalls &&
           metricsAfterCacheRead.fetchTransportCalls ===
             metricsBeforeCacheRead.fetchTransportCalls,
+      );
+      attest(
+        observed.proofs,
+        "receipt:no_followup_mutation",
+        followUpMutationReceipts.length === 0 &&
+          afterFollowUpNote.path === beforeFollowUpNote.path &&
+          afterFollowUpNote.title === beforeFollowUpNote.title &&
+          afterFollowUpNote.heading === beforeFollowUpNote.heading &&
+          afterFollowUpNote.fingerprint === beforeFollowUpNote.fingerprint &&
+          afterFollowUpNote.content === after,
       );
       attest(
         observed.bindings,
@@ -1427,3 +1489,75 @@ test.describe("Daily-use live research contract", () => {
     }
   });
 });
+
+const NOTE_MUTATION_RECEIPT_OPERATIONS = new Set([
+  "append",
+  "create",
+  "replace",
+  "rename",
+  "overwrite",
+  "edit",
+  "retitle",
+  "rename_current_file",
+  "move",
+]);
+
+function fingerprintNoteContentV1(content: string): string {
+  return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+}
+
+function extractLeadingNoteHeadingV1(content: string): string | null {
+  const match = /^[ \t]{0,3}#(?!#)[ \t]+(.+?)[ \t]*#*[ \t]*$/mu.exec(content);
+  const heading = match?.[1]?.trim() ?? "";
+  return heading.length > 0 ? heading : null;
+}
+
+function noteMutationReceiptsV1(
+  receipts: readonly any[] | null | undefined,
+): any[] {
+  return (receipts ?? []).filter((receipt) => {
+    if (!receipt || typeof receipt !== "object") return false;
+    // A refused write may appear as a failed tool event; those are
+    // acceptable when the note is unchanged. lastReceipts is success-only,
+    // but still drop an explicit failure if one leaks through.
+    if (receipt.ok === false) return false;
+    if (typeof receipt.errorCode === "string" && receipt.errorCode.length > 0) {
+      return false;
+    }
+    // Intentional no-op replays still carry operation:"append" with
+    // commitKind:"no_op". Those are not mutations.
+    if (receipt.commitKind === "no_op") return false;
+    const operation = String(receipt.operation ?? receipt.kind ?? "");
+    return NOTE_MUTATION_RECEIPT_OPERATIONS.has(operation);
+  });
+}
+
+async function readActiveNoteIdentityV1(harness: RealAiHarness): Promise<{
+  path: string;
+  title: string;
+  heading: string | null;
+  content: string;
+  fingerprint: string;
+}> {
+  const identity = await harness.page.evaluate(() => {
+    const app = (window as typeof window & { app?: any }).app;
+    const active = app?.workspace?.getActiveFile?.();
+    const path = typeof active?.path === "string" ? active.path.trim() : "";
+    const title = typeof active?.basename === "string" ? active.basename.trim() : "";
+    if (!path || !title) {
+      throw new Error("Current note path or title is unavailable.");
+    }
+    return { path, title };
+  });
+  const content = await readFile(
+    join(harness.vaultRoot, ...identity.path.split("/")),
+    "utf8",
+  );
+  return {
+    path: identity.path,
+    title: identity.title,
+    heading: extractLeadingNoteHeadingV1(content),
+    content,
+    fingerprint: fingerprintNoteContentV1(content),
+  };
+}

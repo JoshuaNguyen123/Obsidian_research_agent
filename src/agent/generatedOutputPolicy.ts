@@ -7,6 +7,7 @@ import {
   isNamedSectionEditIntent,
   isWholeNoteEditIntent,
 } from "./editOrganizeIntent";
+import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
 import { detectExplicitReplaceIntent } from "./noteOutputPolicy";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 
@@ -208,7 +209,7 @@ function getGeneratedOutputTarget(
     return "design_canvas";
   }
 
-  if (/\b(chat\s+only|only\s+in\s+chat|do\s+not\s+(?:write|append|save)\s+(?:to|in|into)\s+(?:the\s+)?(?:note|page|document|file))\b/i.test(prompt)) {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
     return "chat_only";
   }
 

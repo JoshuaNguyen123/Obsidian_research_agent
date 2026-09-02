@@ -22,6 +22,7 @@ import {
   isWholeNoteEditIntent,
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
+import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
 import type { RoutedMissionIntent } from "./missionRouter";
 import type { MissionSpeechActClassificationV1 } from "./missionSpeechAct";
 import type { AutonomyEffectClass } from "./autonomyEffectClass";
@@ -582,9 +583,10 @@ export function createRunPlan({
   // Current-note edit/organize prefers streamed replace; when stream kind was
   // not precomputed, still route as write/edit rather than chat-only.
   if (
-    prefersStreamedReplaceForEditOrganize(prompt) ||
-    isCurrentNoteEditOrganizeIntent(prompt) ||
-    isWholeNoteEditIntent(prompt)
+    !hasExplicitNoNoteWriteIntent(prompt) &&
+    (prefersStreamedReplaceForEditOrganize(prompt) ||
+      isCurrentNoteEditOrganizeIntent(prompt) ||
+      isWholeNoteEditIntent(prompt))
   ) {
     return plan({
       route: "single_model_writeback",

@@ -33,6 +33,17 @@ describe("noteOutputPolicy decision table", () => {
     assert.equal(result.reason, "explicit_chat_only");
   });
 
+  it("exact-fetch cache follow-up is a no-write chat destination", () => {
+    const result = plan({
+      prompt:
+        "Call web_fetch once for the exact already-fetched URL https://primary.owned.example/evidence/marker with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.",
+      hasActiveMarkdownNote: true,
+      contentProducing: true,
+    });
+    assert.equal(result.destination, "chat");
+    assert.equal(result.reason, "explicit_chat_only");
+  });
+
   it("forceChatOnly wins", () => {
     const result = plan({
       prompt: "Write a short summary of photosynthesis.",
@@ -192,6 +203,18 @@ describe("noteOutputPolicy decision table", () => {
 
   it("detect helpers match expected intents", () => {
     assert.equal(detectChatOnlyIntent("respond in chat please"), true);
+    assert.equal(
+      detectChatOnlyIntent(
+        "Verify the cached passage is readable, do not search, and do not write or edit any note.",
+      ),
+      true,
+    );
+    assert.equal(
+      detectChatOnlyIntent(
+        "Append findings to the current note. Do not write before fetch.",
+      ),
+      false,
+    );
     assert.equal(detectContentProducingIntent("hi"), false);
     assert.equal(
       detectContentProducingIntent("Write a summary of the Vietnam War"),

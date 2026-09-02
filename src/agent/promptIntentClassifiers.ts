@@ -39,6 +39,7 @@ import { extractExplicitNewWorkspaceFilePaths, extractMarkdownPathMentions, hasE
 import { hasAffirmativeProjectIdeationIntentV1 } from "./projectIdeationIntent";
 import { detectProjectLifecycleStagesV1 } from "./projectLifecycle";
 import { canonicalizeKeywordTypos } from "./promptNormalization";
+import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
 import { isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
 
 /**
@@ -57,6 +58,10 @@ import { isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIn
  */
 export { hasDesignIntent, hasHtmlPreviewIntent } from "./codeDesignIntent";
 export { hasDeepResearchIntent, hasLongResearchIntent } from "./researchDepthIntent";
+export {
+  hasExplicitNoNoteWriteIntent,
+  hasExplicitNoNoteWriteIntent as hasChatOnlyResponseIntent,
+} from "./noNoteWriteIntent";
 export { hasWordCountIntent } from "./wordCountIntent";
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
@@ -126,16 +131,14 @@ export function hasOwnPriorThinkingRecallIntent(prompt: string): boolean {
 }
 
 export function hasExplicitWritePersistenceIntent(prompt: string): boolean {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return false;
+  }
   return /\b(append|save|write|update|add|insert|copy|paste|put|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b[\s\S]{0,100}\b(note|file|markdown|vault|folder|directory|path|page|document)\b|\b(note|file|markdown|vault|folder|directory|path|page|document)\b[\s\S]{0,100}\b(append|save|write|update|add|insert|copy|paste|put|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b|\.md\b/i.test(
     prompt,
   );
 }
 
-export function hasChatOnlyResponseIntent(prompt: string): boolean {
-  return /\b(chat\s+only|only\s+in\s+chat|answer\s+in\s+chat|respond\s+in\s+chat|do\s+not\s+(?:write|append|save)\s+(?:to|in|into)\s+(?:the\s+)?(?:note|page|document|file))\b/i.test(
-    prompt,
-  );
-}
 
 // hasWordCountIntent now lives in ./wordCountIntent (re-exported above). It
 // had four definitions; "how many words is this note?" was true HERE and false
@@ -1064,7 +1067,7 @@ export function hasCurrentNoteTarget(prompt: string): boolean {
 }
 
 export function hasNoteOutputIntent(prompt: string): boolean {
-  if (hasChatOnlyResponseIntent(prompt)) {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
     return false;
   }
 
@@ -1104,6 +1107,9 @@ export function hasNoteOutputIntent(prompt: string): boolean {
 }
 
 export function hasAppendIntent(prompt: string): boolean {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return false;
+  }
   // Scope restrictions constrain *where* an already-requested mutation may
   // occur; they are not a second append instruction. Without this removal,
   // "Create X.md ... Only write to that requested file" manufactures an
@@ -1123,6 +1129,9 @@ export function hasAppendIntent(prompt: string): boolean {
 }
 
 export function hasReplaceIntent(prompt: string): boolean {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return false;
+  }
   const positivePrompt = prompt
     .replace(
       /\b(?:do\s+not|don't|never)\s+(?:rewrite|replace|reset|overwrite)\b[^.;\n]*/giu,
@@ -1169,6 +1178,9 @@ export function hasClearPageAndWriteIntent(prompt: string): boolean {
 }
 
 export function hasWholeNoteRevisionIntent(prompt: string): boolean {
+  if (hasExplicitNoNoteWriteIntent(prompt)) {
+    return false;
+  }
   if (isNamedSectionEditIntent(prompt)) {
     return false;
   }

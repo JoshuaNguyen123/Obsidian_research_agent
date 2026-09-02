@@ -3,6 +3,8 @@
  * One plan controls destination, mutation, delivery, and title policy.
  */
 
+import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
+
 export type NoteOutputDestination = "active_note" | "new_note" | "chat";
 export type NoteOutputMutation =
   | "append"
@@ -79,9 +81,6 @@ export interface NoteOutputPolicyInput {
   sectionTargetAmbiguous?: boolean;
 }
 
-const CHAT_ONLY_PATTERN =
-  /\b(chat\s+only|only\s+in\s+chat|answer\s+in\s+chat|respond\s+in\s+chat|do\s+not\s+(?:write|append|save)\s+(?:to|in|into)\s+(?:the\s+)?(?:note|page|document|file))\b/i;
-
 const EXPLICIT_NEW_NOTE_PATTERN =
   /\b(?:create|make)\s+(?:(?:me|us)\s+)?(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:note|markdown\s+file|file)\b|\bnew\s+(?:note|markdown\s+file)\b|\b(?:note|markdown\s+file)\b[\s\S]{0,40}\b(?:named|called|titled)\b/iu;
 
@@ -104,7 +103,7 @@ const TRIVIAL_CHAT_PATTERN =
   /^(?:\s*(?:hi|hello|hey|thanks|thank\s+you|ok|okay|yes|no|sure|what(?:'s|\s+is)\s+up)\s*[.!?…]*)+$/i;
 
 export function detectChatOnlyIntent(prompt: string): boolean {
-  return CHAT_ONLY_PATTERN.test(prompt);
+  return hasExplicitNoNoteWriteIntent(prompt);
 }
 
 export function detectExplicitNewNoteIntent(prompt: string): boolean {
