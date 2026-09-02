@@ -358,6 +358,8 @@ test("a set-loose turn keeps its stage-local projection unchanged", async () => 
   // Set-loose turns deliberately stay stage-local; widening THAT surface is a
   // separate change with its own compactness budget.
   assert.equal(setLoose.includes("PLANNED SEQUENCE"), false);
+  assert.match(setLoose, /exactly one tool call in this response/u);
+  assert.match(setLoose, /stale authority/u);
 });
 
 async function walkFrontier(

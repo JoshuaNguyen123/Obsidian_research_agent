@@ -11668,6 +11668,8 @@ test("set-loose accepted-research frontier retains the nonempty JSON array contr
   assert.match(context, /nonempty JSON arrays/u);
   assert.match(context, /Even one proposedWork item must be written as \["\.\.\."\]/u);
   assert.match(context, /never send a bare string, object, null, or empty array/u);
+  assert.match(context, /exactly one tool call in this response/u);
+  assert.match(context, /recalculates the frontier after every receipt/u);
 });
 
 test("research-hierarchy frontier states exact issue list and fingerprint contracts", () => {

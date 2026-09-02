@@ -1226,6 +1226,7 @@ export function buildMissionGraphFrontierTurnContext(
     // projectStagePrompt rather than re-emitted into the model context.
     return [
       stageProjection,
+      "Return exactly one tool call in this response. The host commits one lifecycle action and recalculates the frontier after every receipt, so batching a second call would use stale authority even when both names are listed now.",
       ...setLooseAcceptedResearchBoundary,
       ...codeCapabilityBoundary,
     ].join("\n");
