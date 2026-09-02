@@ -580,7 +580,17 @@ test("the runner's step-menu gate consumes the shared predicate, not a private c
     "if (!stepAllowedToolNames.has(toolCall.name)) {",
   );
   assert.ok(gateAt > 0, "step-menu gate not found");
-  const window = runnerSource.slice(gateAt, gateAt + 9000);
+  const ordinaryRefusalAt = runnerSource.indexOf(
+    "const offFrontierFacts = classifyOffFrontierRefusalV1({",
+    gateAt,
+  );
+  const nextGateAt = runnerSource.indexOf(
+    "const setLooseSoftWriteBypass",
+    ordinaryRefusalAt,
+  );
+  assert.ok(ordinaryRefusalAt > gateAt, "ordinary refusal branch not found");
+  assert.ok(nextGateAt > ordinaryRefusalAt, "step-menu gate boundary not found");
+  const window = runnerSource.slice(ordinaryRefusalAt, nextGateAt);
   assert.match(window, /classifyOffFrontierRefusalV1\(\{/u);
   assert.match(window, /isHostNarrowedOffFrontierRefusalV1\(/u);
   assert.match(window, /FRONTIER_NARROWED_REFUSAL_CODE_V1/u);
@@ -1067,7 +1077,17 @@ test("the step-menu refusal seat reads the authority, not the offered menu", () 
     "if (!stepAllowedToolNames.has(toolCall.name)) {",
   );
   assert.ok(gateAt > 0, "step-menu gate not found");
-  const window = runnerSource.slice(gateAt, gateAt + 9000);
+  const ordinaryRefusalAt = runnerSource.indexOf(
+    "const offFrontierFacts = classifyOffFrontierRefusalV1({",
+    gateAt,
+  );
+  const nextGateAt = runnerSource.indexOf(
+    "const setLooseSoftWriteBypass",
+    ordinaryRefusalAt,
+  );
+  assert.ok(ordinaryRefusalAt > gateAt, "ordinary refusal branch not found");
+  assert.ok(nextGateAt > ordinaryRefusalAt, "step-menu gate boundary not found");
+  const window = runnerSource.slice(ordinaryRefusalAt, nextGateAt);
   assert.match(window, /authoritativeRefusalFrontierToolNamesV1\(\{/u);
   assert.match(window, /readyFrontierToolNames: authoritativeRejectFrontier/u);
   assert.match(window, /readyFrontier: authoritativeRejectFrontier/u);

@@ -11,6 +11,8 @@ import {
   bindAuthoritativeGraphCodeValidation,
   buildCompletedAbsentToolTurnGuardV1,
   buildPaidSetLooseReflectionTurnGuardV1,
+  completedSetLooseReflectionAppendAlreadySatisfiedV1,
+  decideCompletedSetLooseToolReplayNoOpV1,
   bindExactWorkspaceDestinationToolSchemas,
   settleTerminalRuntimeSnapshotPersistence,
   settleToolOutcomeMemoryPersistence,
@@ -217,6 +219,7 @@ import type { AgentTool } from "../src/tools/types";
 import { parseMissionRuntimeSnapshotFromMarkdown } from "../src/agent/runStore";
 import { buildOperationReconciliationInputs } from "../src/agent/runStore";
 import { parseMissionGraphStoreRecordFromMarkdown } from "../src/agent/missionGraphStore";
+import { portableSha256Text } from "../packages/core-api/src/portableSha256";
 import {
   parseMissionLedgerFromMarkdown,
   type MissionEvidence,
@@ -13637,6 +13640,147 @@ test("completed absent tool guard names recent paid calls but omits a reopened t
       successfulToolNames: ["read_current_file"],
     }),
     null,
+  );
+});
+
+test("terminal set-loose replay no-ops require a sealed empty frontier and exact prior proof", () => {
+  const base = {
+    enabled: true,
+    currentToolNames: [] as string[],
+    successfulToolNames: ["read_current_file", "web_search"],
+    deliveryComplete: true,
+    terminalFrontierSealed: true,
+    explicitJupyterDestination: false,
+    verifiedMarkdownReflectionReceiptId: "obsidian-reflection-receipt-1",
+    appendPayloadAlreadySatisfied: true,
+    terminalNoOpAlreadyAcknowledged: false,
+  };
+
+  assert.deepEqual(
+    decideCompletedSetLooseToolReplayNoOpV1({
+      ...base,
+      toolName: "read_current_file",
+    }),
+    {
+      kind: "current_note_read_not_required_after_terminal_proof",
+      sourceReceiptId: null,
+    },
+  );
+  assert.deepEqual(
+    decideCompletedSetLooseToolReplayNoOpV1({
+      ...base,
+      toolName: "append_to_current_file",
+    }),
+    {
+      kind: "markdown_reflection_replay_already_satisfied",
+      sourceReceiptId: "obsidian-reflection-receipt-1",
+    },
+  );
+
+  for (const input of [
+    { ...base, enabled: false, toolName: "read_current_file" },
+    {
+      ...base,
+      deliveryComplete: false,
+      toolName: "read_current_file",
+    },
+    {
+      ...base,
+      terminalFrontierSealed: false,
+      toolName: "read_current_file",
+    },
+    {
+      ...base,
+      currentToolNames: ["return_final_answer"],
+      toolName: "read_current_file",
+    },
+    {
+      ...base,
+      successfulToolNames: ["web_search"],
+      toolName: "read_current_file",
+    },
+    {
+      ...base,
+      explicitJupyterDestination: true,
+      toolName: "append_to_current_file",
+    },
+    {
+      ...base,
+      verifiedMarkdownReflectionReceiptId: null,
+      toolName: "append_to_current_file",
+    },
+    {
+      ...base,
+      appendPayloadAlreadySatisfied: false,
+      toolName: "append_to_current_file",
+    },
+    {
+      ...base,
+      terminalNoOpAlreadyAcknowledged: true,
+      toolName: "read_current_file",
+    },
+    { ...base, toolName: "append_file" },
+  ]) {
+    assert.equal(decideCompletedSetLooseToolReplayNoOpV1(input), null);
+  }
+});
+
+test("terminal reflection replay equivalence requires the entire verified block already in the note", () => {
+  const code = "const value = 1;";
+  const codeHash = `sha256:${portableSha256Text(code)}`;
+  const proofBlock = [
+    "Marker: FLOW_REAL_replay123",
+    "The completed work is tracked in https://linear.app/team/issue/APP-123/example and available for review at https://github.com/example/private/pull/7.",
+    "The implementation was validated against the accepted requirements before publication.",
+    "",
+    "### Verified code example",
+    `src/example.ts lines 1-1 at commit \`aaaaaaaaaaaa\` (file hash \`bbbbbbbbbbbb\`; excerpt hash \`${codeHash}\`).`,
+    "```ts",
+    code,
+    "```",
+  ].join("\n");
+  const currentNote = [
+    "# Accepted research",
+    "",
+    "## Mission completion reflection",
+    "The durable delivery outcome is complete and remains bounded to the draft pull request.",
+    proofBlock,
+  ].join("\n");
+  const equivalentAttempt = [
+    "## Flow real reflection",
+    "This alternate wording describes the same verified delivery outcome and does not add another requested artifact.",
+    proofBlock,
+  ].join("\n");
+
+  assert.equal(
+    completedSetLooseReflectionAppendAlreadySatisfiedV1({
+      attemptedText: proofBlock,
+      currentNoteText: currentNote,
+    }),
+    true,
+  );
+  assert.equal(
+    completedSetLooseReflectionAppendAlreadySatisfiedV1({
+      attemptedText: "The durable delivery outcome is complete",
+      currentNoteText: currentNote,
+    }),
+    false,
+    "a short existing substring is not a complete reflection replay",
+  );
+  assert.equal(
+    completedSetLooseReflectionAppendAlreadySatisfiedV1({
+      attemptedText: equivalentAttempt,
+      currentNoteText: currentNote,
+    }),
+    false,
+    "matching proof identity cannot suppress different prose",
+  );
+  assert.equal(
+    completedSetLooseReflectionAppendAlreadySatisfiedV1({
+      attemptedText: "Add a new retrospective section with unrelated lessons.",
+      currentNoteText: currentNote,
+    }),
+    false,
   );
 });
 

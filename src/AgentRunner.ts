@@ -316,6 +316,7 @@ import {
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
   missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
+  missionGraphTerminalProjectionSealsToolFrontierV1,
 } from "./agent/missionGraphFrontier";
 import { enforcePhaseToolMenuCeilingV1 } from "./agent/toolSchemaPolicy";
 import { proofDebtSeedsFromOrchestratorHandoff } from "./agent/leadHandoffProof";
@@ -706,6 +707,7 @@ import {
   verifiedGitHubMarkdownReflectionProofV1,
   type CompoundRunBudgetPlanV1,
   type SetLooseDeliveryProofsV1,
+  type VerifiedGitHubMarkdownReflectionProofV1,
 } from "./agent/setLooseCompoundAutonomy";
 import {
   buildBundledApprovalPreview,
@@ -3636,6 +3638,7 @@ export async function runAgentMission({
   const currentSegmentSuccessfulToolNames: string[] = [];
   const failedToolNames: string[] = [];
   const writeReceipts: AgentRunReceipt[] = [];
+  let completedSetLooseTerminalReplayNoOpCount = 0;
   const getPersistedProjectStageEvents = runToolContext.getProjectStageEvents;
   runToolContext = {
     ...runToolContext,
@@ -22341,6 +22344,176 @@ export async function runAgentMission({
 
       if (!stepAllowedToolNames.has(toolCall.name)) {
         const authoritativeGraph = missionGraphSession?.graph ?? missionGraph;
+        let verifiedMarkdownReflectionSource: {
+          receipt: AgentRunReceipt;
+          proof: VerifiedGitHubMarkdownReflectionProofV1;
+        } | null = null;
+        for (let index = writeReceipts.length - 1; index >= 0; index -= 1) {
+          const candidate = writeReceipts[index]!;
+          if (
+            candidate.toolName !==
+            PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME
+          ) {
+            continue;
+          }
+          const proof = verifiedGitHubMarkdownReflectionProofV1(
+            candidate.output,
+          );
+          if (proof) {
+            verifiedMarkdownReflectionSource = { receipt: candidate, proof };
+            break;
+          }
+        }
+        const completedReplayNoOp =
+          decideCompletedSetLooseToolReplayNoOpV1({
+            enabled: setLooseCompoundEnabled,
+            toolName: toolCall.name,
+            currentToolNames: [...stepAllowedToolNames],
+            successfulToolNames,
+            deliveryComplete:
+              setLooseDeliveryComplete({
+                stages: compoundLifecycleStages,
+                proofs: setLooseDeliveryProofs,
+              }).unpaid.length === 0,
+            terminalFrontierSealed:
+              missionGraphTerminalProjectionSealsToolFrontierV1(
+                authoritativeGraph,
+              ),
+            explicitJupyterDestination:
+              hasJupyterReflectionIntentV1(activeIntentPrompt),
+            verifiedMarkdownReflectionReceiptId:
+              verifiedMarkdownReflectionSource?.proof.obsidianReceiptId ?? null,
+            appendPayloadAlreadySatisfied:
+              toolCall.name === "append_to_current_file"
+                ? completedSetLooseReflectionAppendAlreadySatisfiedV1({
+                    attemptedText:
+                      typeof toolCall.arguments.text === "string"
+                        ? toolCall.arguments.text
+                        : typeof toolCall.arguments.content === "string"
+                          ? toolCall.arguments.content
+                          : "",
+                    currentNoteText: readCurrentNoteTextForLiteralDebt(),
+                  })
+                : false,
+            terminalNoOpAlreadyAcknowledged:
+              completedSetLooseTerminalReplayNoOpCount > 0,
+          });
+        if (completedReplayNoOp) {
+          const observedAt = (runToolContext.now?.() ?? new Date()).toISOString();
+          const noOpReceiptId = `${toolEventBase.id}:intentional-no-op`;
+          const notePath = pinnedCurrentMarkdownPathForRun ?? undefined;
+          const noOpOutput = {
+            status: "no_op",
+            skipped: true,
+            intentionalNoOp: true,
+            reason: "set_loose_terminal_replay_already_satisfied",
+            replayKind: completedReplayNoOp.kind,
+            sourceReceiptId: completedReplayNoOp.sourceReceiptId,
+          };
+          const noOpResult: ToolExecutionResult = {
+            ok: true,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            output: noOpOutput,
+          };
+          const noOpMessage =
+            completedReplayNoOp.kind ===
+            "markdown_reflection_replay_already_satisfied"
+              ? "Intentional no-op: the finalized GitHub workflow already committed and verified the required Markdown reflection."
+              : "Intentional no-op: the current note was already read and the proof-backed terminal frontier requires no refresh.";
+          const noOpReceipt: AgentRunReceipt = {
+            version: 1,
+            id: noOpReceiptId,
+            runId,
+            actionId: noOpReceiptId,
+            toolName: toolCall.name,
+            operation:
+              toolCall.name === "read_current_file" ? "read" : "append",
+            message: noOpMessage,
+            resource: {
+              system: "vault",
+              resourceType: "markdown_note",
+              id:
+                notePath ??
+                completedReplayNoOp.sourceReceiptId ??
+                "current-note",
+              ...(notePath ? { path: notePath } : {}),
+            },
+            ...(completedReplayNoOp.sourceReceiptId &&
+            verifiedMarkdownReflectionSource?.receipt.resource
+              ? {
+                  relatedResources: [
+                    { ...verifiedMarkdownReflectionSource.receipt.resource },
+                  ],
+                }
+              : {}),
+            path: notePath,
+            payloadFingerprint: await sha256MissionFingerprint({
+              runId,
+              toolName: toolCall.name,
+              replayKind: completedReplayNoOp.kind,
+              sourceReceiptId: completedReplayNoOp.sourceReceiptId,
+            }),
+            idempotencyKey: noOpReceiptId,
+            startedAt: observedAt,
+            committedAt: observedAt,
+            commitKind: "no_op",
+            readback: {
+              status: "not_required",
+              checkedAt: observedAt,
+            },
+            effects: {
+              bytesWritten: 0,
+              bytesDeleted: 0,
+              affectedCount: 0,
+              changed: false,
+            },
+            bytesWritten: 0,
+            bytesDeleted: 0,
+            affectedCount: 0,
+            output: noOpOutput,
+          };
+          events.onStatus?.(noOpMessage);
+          events.onReceipt?.(noOpReceipt);
+          events.onToolDone?.({
+            ...toolEventBase,
+            ok: true,
+            message: noOpMessage,
+            output: noOpOutput,
+          });
+          events.onTrace?.({
+            // Keep the shared `:result` event-id convention so the quantitative
+            // fold joins this trace to the matching `onToolDone` call instead
+            // of inventing a second successful attempt.
+            id: `${toolEventBase.id}:result`,
+            kind: "tool_result",
+            step,
+            toolName: toolCall.name,
+            message: noOpMessage,
+            outputPreview: {
+              commitKind: "no_op",
+              replayKind: completedReplayNoOp.kind,
+              sourceReceiptId: completedReplayNoOp.sourceReceiptId,
+            },
+          });
+          appendToolTranscript({
+            messages,
+            toolCall,
+            resultContent: serializeToolResultForModel(noOpResult),
+            origin: "model",
+            fallbackId: noOpReceiptId,
+          });
+          messages.push({
+            role: "system" as const,
+            content:
+              "The repeated terminal call was acknowledged as an intentional no-op from existing proof. No read or mutation was performed. Return the final answer now without another tool call.",
+          });
+          executedModelTool = true;
+          completedSetLooseTerminalReplayNoOpCount += 1;
+          lastUnavailableToolName = null;
+          toolIndex += 1;
+          continue;
+        }
         const pendingGraphNode = authoritativeGraph
           ? Object.values(authoritativeGraph.nodes).find(
               (node) =>
@@ -34414,6 +34587,93 @@ export function buildCompletedAbsentToolTurnGuardV1(input: {
     "Their successful results are already in this history.",
     "Do not repeat these names on this turn; call only a name in the current Tools card and wait for an absent name to reappear before calling it again.",
   ].join(" ");
+}
+
+export type CompletedSetLooseToolReplayNoOpV1 =
+  | {
+      kind: "current_note_read_not_required_after_terminal_proof";
+      sourceReceiptId: null;
+    }
+  | {
+      kind: "markdown_reflection_replay_already_satisfied";
+      sourceReceiptId: string;
+    };
+
+/**
+ * Prove that a late reflection append cannot add a new delivery outcome.
+ * The attempted payload must itself be a complete verified reflection and its
+ * entire normalized block must already exist in the freshly observed note.
+ * Sharing only markers or provider proof is insufficient because different
+ * prose could still be a novel requested mutation.
+ */
+export function completedSetLooseReflectionAppendAlreadySatisfiedV1(input: {
+  attemptedText: string;
+  currentNoteText: string | null;
+}): boolean {
+  const attemptedText = input.attemptedText.replace(/\r\n?/gu, "\n").trim();
+  const currentNoteText =
+    input.currentNoteText?.replace(/\r\n?/gu, "\n").trim() ?? "";
+  if (!attemptedText || !currentNoteText) return false;
+  return (
+    hasCompleteSetLooseNoteReflectionProof(attemptedText) &&
+    hasCompleteSetLooseNoteReflectionProof(currentNoteText) &&
+    currentNoteText.includes(attemptedText)
+  );
+}
+
+/**
+ * Classify the two terminal replays observed in real compound campaigns.
+ *
+ * This is intentionally narrower than generic idempotency. The model call is
+ * acknowledged only after the set-loose delivery contract is fully paid, the
+ * proof-backed final node has sealed the whole tool frontier, and no other
+ * tool is currently callable. A read additionally requires an earlier
+ * successful read in this run. A write additionally requires the durable
+ * Obsidian receipt nested in a finalized GitHub publication. Everything else
+ * stays on the ordinary off-frontier refusal path.
+ */
+export function decideCompletedSetLooseToolReplayNoOpV1(input: {
+  enabled: boolean;
+  toolName: string;
+  currentToolNames: readonly string[];
+  successfulToolNames: readonly string[];
+  deliveryComplete: boolean;
+  terminalFrontierSealed: boolean;
+  explicitJupyterDestination: boolean;
+  verifiedMarkdownReflectionReceiptId: string | null;
+  appendPayloadAlreadySatisfied: boolean;
+  terminalNoOpAlreadyAcknowledged: boolean;
+}): CompletedSetLooseToolReplayNoOpV1 | null {
+  if (
+    !input.enabled ||
+    !input.deliveryComplete ||
+    !input.terminalFrontierSealed ||
+    input.currentToolNames.length > 0 ||
+    input.terminalNoOpAlreadyAcknowledged
+  ) {
+    return null;
+  }
+  if (
+    input.toolName === "read_current_file" &&
+    input.successfulToolNames.includes("read_current_file")
+  ) {
+    return {
+      kind: "current_note_read_not_required_after_terminal_proof",
+      sourceReceiptId: null,
+    };
+  }
+  if (
+    input.toolName === "append_to_current_file" &&
+    !input.explicitJupyterDestination &&
+    input.verifiedMarkdownReflectionReceiptId &&
+    input.appendPayloadAlreadySatisfied
+  ) {
+    return {
+      kind: "markdown_reflection_replay_already_satisfied",
+      sourceReceiptId: input.verifiedMarkdownReflectionReceiptId,
+    };
+  }
+  return null;
 }
 
 function insertMissionGraphFrontierTurnContext(

@@ -33,7 +33,10 @@ import {
 } from "./fixtures/realAiHarness";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
 import { assertVerifiedCommitBoundCodeExamplesV1 } from "./fixtures/reflectionAssertions";
-import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+import {
+  peekToolCallCollector,
+  recordToolCallOutcomesAfterEach,
+} from "./fixtures/toolCallCollector";
 
 // The compound lane was the ONLY proof lane with no tool-call meter attached,
 // which is why its run records carried `toolCallsFailed: null` /
@@ -735,6 +738,75 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     // mandates a Linear initiative and project that this single-issue chain
     // never creates.
     const acceptanceSnapshot = await harness.attestProductionRun();
+    const toolOutcomes = await peekToolCallCollector(harness.page);
+    expect(
+      toolOutcomes.coverage,
+      "compound acceptance requires complete tool-event coverage",
+    ).toBe("complete");
+    expect(
+      toolOutcomes.failed,
+      `compound acceptance requires zero failed tool calls; failures=${JSON.stringify(toolOutcomes.failureDetails)}`,
+    ).toBe(0);
+    expect(
+      toolOutcomes.undetermined,
+      "compound acceptance requires every attempted tool call to reach a terminal event",
+    ).toBe(0);
+    expect(
+      toolOutcomes.vacuous,
+      "compound acceptance rejects unintended no-work success receipts",
+    ).toBe(0);
+
+    const terminalReplayNoOpReceipts = (
+      Array.isArray(acceptanceSnapshot.lastReceipts)
+        ? acceptanceSnapshot.lastReceipts
+        : []
+    ).filter(
+      (receipt: any) =>
+        receipt?.commitKind === "no_op" &&
+        receipt?.output?.reason ===
+          "set_loose_terminal_replay_already_satisfied",
+    );
+    const graphReceiptIds = new Set(
+      Object.values(acceptanceSnapshot.lastMissionGraph?.nodes ?? {}).flatMap(
+        (node: any) =>
+          Array.isArray(node?.receipts)
+            ? node.receipts
+                .map((receipt: any) => receipt?.id)
+                .filter((id: unknown): id is string => typeof id === "string")
+            : [],
+      ),
+    );
+    const ledgerReceiptIds = new Set(
+      Array.isArray(acceptanceSnapshot.lastConfig?.missionLedger?.receipts)
+        ? acceptanceSnapshot.lastConfig.missionLedger.receipts
+        : [],
+    );
+    for (const receipt of terminalReplayNoOpReceipts) {
+      expect(receipt?.id).toMatch(/\S/u);
+      expect(["read_current_file", "append_to_current_file"]).toContain(
+        receipt?.toolName,
+      );
+      expect(receipt?.effects?.changed).toBe(false);
+      expect(receipt?.effects?.bytesWritten).toBe(0);
+      expect(receipt?.readback?.status).toBe("not_required");
+      expect(receipt?.grantId).toBeUndefined();
+      expect(
+        graphReceiptIds.has(receipt?.id),
+        "an observational terminal no-op must never become MissionGraph proof",
+      ).toBe(false);
+      expect(
+        ledgerReceiptIds.has(receipt?.id),
+        "an observational terminal no-op must never become durable ledger proof",
+      ).toBe(false);
+      if (receipt?.toolName === "append_to_current_file") {
+        expect(receipt?.output?.sourceReceiptId).toMatch(/\S/u);
+      }
+    }
+    expect(
+      toolOutcomes.intentionalNoOp,
+      "every terminal replay receipt must remain visible in the quantitative no-op counter",
+    ).toBeGreaterThanOrEqual(terminalReplayNoOpReceipts.length);
+
     const projectIdeaAttestation = acceptanceSnapshot.missionEvidence.find(
       (item: any) =>
         /^project_idea:sha256:[a-f0-9]{64}:grounded:selected:promoted$/u.test(
@@ -873,7 +945,12 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
       },
       {
         modelCalls: acceptanceSnapshot?.modelCallEvidence?.length,
-        toolCalls: acceptanceSnapshot?.missionEvidence?.length,
+        toolCalls: toolOutcomes.attempted ?? undefined,
+        toolCallsAttempted: toolOutcomes.attempted,
+        toolCallsFailed: toolOutcomes.failed,
+        toolCallsVacuous: toolOutcomes.vacuous,
+        toolCallsIntentionalNoOp: toolOutcomes.intentionalNoOp,
+        refusalBuckets: toolOutcomes.failureBuckets,
         missionScorecard: acceptanceSnapshot?.lastMissionScorecard ?? null,
       },
       { requireComplete: true },

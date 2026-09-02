@@ -235,6 +235,33 @@ test("intentional no-ops are their own bucket, not vacuous, and keep work credit
   assert.equal(counts.succeededWithWork, 1);
 });
 
+test("a terminal replay no-op joins canonical result and done events into one call", () => {
+  const c = call(24, 0, "append_to_current_file");
+  const counts = foldToolCallOutcomesV1([
+    // The terminal replay is classified before registry execution, so it has
+    // no tool_start event. Its result and done events must still share one
+    // canonical call key.
+    ...ok(c.base, "append_to_current_file"),
+    {
+      kind: "receipt",
+      id: `${c.base}:intentional-no-op`,
+      toolName: "append_to_current_file",
+      receipt: {
+        operation: "append",
+        commitKind: "no_op",
+        effects: { changed: false },
+      },
+    },
+  ]);
+
+  assert.equal(counts.attempted, 1);
+  assert.equal(counts.succeeded, 1);
+  assert.equal(counts.failed, 0);
+  assert.equal(counts.undetermined, 0);
+  assert.equal(counts.intentionalNoOp, 1);
+  assert.equal(counts.vacuous, 0);
+});
+
 test("a receipt with no usable work signal is unknown, never guessed", () => {
   const c = call(1, 0, "read_current_file");
   const counts = foldToolCallOutcomesV1([
