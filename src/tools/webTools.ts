@@ -46,9 +46,15 @@ import {
   FREE_SEARCH_PROVIDER_IDS,
   resolveFreeSearchProviders,
   resolveOpenAccessEditions,
-  runFreeSearchFallback,
-  runFreeSearchProviders,
+  runFreeSearchProvidersDetailed,
+  type FreeSearchProviderFailure,
 } from "./freeSearchProviders";
+import {
+  SEARCH_CACHE_PATH,
+  findFreshCachedSearch,
+  writeSearchCacheEntry,
+  type SearchCacheLookup,
+} from "./searchCache";
 import { createDocumentExtractProvider } from "./documentExtract";
 import { inferSourceSignals } from "../agent/sourceSignals";
 import { scoreSourceCandidate } from "../orchestrator/sourceCandidateLedger";
@@ -84,6 +90,10 @@ export const webSearchTool: AgentTool = {
         // of valid names, so the full set stays discoverable in one turn.
         description: "Optional index: pubmed|arxiv|courtlistener|scholar|law.",
       },
+      refresh: {
+        type: "boolean",
+        description: "Bypass cached results (24 h). Freshness-sensitive missions default to true.",
+      },
     },
     additionalProperties: false,
   },
@@ -106,11 +116,34 @@ export const webSearchTool: AgentTool = {
       );
     }
 
+    // Same bypass rule as web_fetch: an explicit refresh wins, otherwise a
+    // freshness-sensitive mission ("latest", "current", "as of") never reads
+    // yesterday's results. `fromCache` / `cachedPath` are web_fetch's
+    // vocabulary for the same fact, so coverage and receipts read one word.
+    const refresh =
+      getOptionalBoolean(args, "refresh") ??
+      isFreshnessSensitivePrompt(context.originalPrompt ?? "");
+    const cacheLookup: SearchCacheLookup = {
+      query,
+      index: requestedProviders ? requestedProviders.join(",") : "",
+      maxResults,
+    };
+    const cached = await findFreshCachedSearch(context, cacheLookup, { refresh });
+    if (cached) {
+      return {
+        ...(cached.index ? { index: cached.index } : {}),
+        results: cached.results,
+        fromCache: true,
+        cachedPath: SEARCH_CACHE_PATH,
+        searchedAt: cached.searchedAt,
+      };
+    }
+
     // A named index is an instruction, not a preference: falling through to the
     // general web would answer a question about PubMed with something else and
     // give the reader no way to tell.
     if (requestedProviders) {
-      const targeted = await runFreeSearchProviders({
+      const targeted = await runFreeSearchProvidersDetailed({
         transport: context.httpTransport,
         query,
         maxResults,
@@ -118,12 +151,16 @@ export const webSearchTool: AgentTool = {
         signal: context.abortSignal,
         providers: requestedProviders,
       });
+      const results = rankWebSearchResults(
+        targeted.results.map(toWebSearchResult),
+        context,
+      );
+      await rememberWebSearchResults(context, cacheLookup, results);
       return {
         index: requestedProviders.join(","),
-        results: rankWebSearchResults(
-          targeted.map(toWebSearchResult),
-          context,
-        ),
+        results,
+        fromCache: false,
+        ...providerFailuresField(targeted.providerFailures),
       };
     }
 
@@ -131,7 +168,9 @@ export const webSearchTool: AgentTool = {
     try {
       const primary = await runOllamaWebSearch(query, maxResults, context);
       if (primary.results.some((result) => result.url)) {
-        return { results: rankWebSearchResults(primary.results, context) };
+        const results = rankWebSearchResults(primary.results, context);
+        await rememberWebSearchResults(context, cacheLookup, results);
+        return { results, fromCache: false };
       }
     } catch (error) {
       primaryError = error;
@@ -140,16 +179,23 @@ export const webSearchTool: AgentTool = {
     // Primary provider failed or returned nothing usable: fall back to keyless
     // official public APIs so research is never blocked by a single provider.
     if (context.settings.freeSearchFallbackEnabled !== false) {
-      const fallback = await runFreeSearchFallback({
+      const fallback = await runFreeSearchProvidersDetailed({
         transport: context.httpTransport,
         query,
         maxResults,
         timeoutMs: getOperationTimeoutMs(context),
         signal: context.abortSignal,
       });
-      if (fallback.length > 0) {
+      if (fallback.results.length > 0) {
+        const results = rankWebSearchResults(
+          fallback.results.map(toWebSearchResult),
+          context,
+        );
+        await rememberWebSearchResults(context, cacheLookup, results);
         return {
-          results: rankWebSearchResults(fallback.map(toWebSearchResult), context),
+          results,
+          fromCache: false,
+          ...providerFailuresField(fallback.providerFailures),
         };
       }
     }
@@ -157,9 +203,30 @@ export const webSearchTool: AgentTool = {
     if (primaryError) {
       throw primaryError;
     }
-    return { results: [] };
+    return { results: [], fromCache: false };
   },
 };
+
+/**
+ * Cache maintenance must never fail a search that already succeeded: the
+ * cache module swallows its own errors, and this keeps the write off the
+ * result's critical path in spirit while still awaiting it so a follow-up
+ * search in the same run sees the entry.
+ */
+async function rememberWebSearchResults(
+  context: ToolExecutionContext,
+  lookup: SearchCacheLookup,
+  results: readonly WebSearchResultV1[],
+): Promise<void> {
+  if (results.length === 0) return;
+  await writeSearchCacheEntry(context, { ...lookup, results });
+}
+
+function providerFailuresField(
+  failures: readonly FreeSearchProviderFailure[],
+): { providerFailures?: FreeSearchProviderFailure[] } {
+  return failures.length > 0 ? { providerFailures: [...failures] } : {};
+}
 
 function isGeneralWebIndex(value: string): boolean {
   const normalized = value.trim().toLowerCase();

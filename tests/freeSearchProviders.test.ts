@@ -7,6 +7,7 @@ import {
   openAlexSearch,
   pubmedSearch,
   runFreeSearchFallback,
+  runFreeSearchProvidersDetailed,
   wikipediaSearch,
 } from "../src/tools/freeSearchProviders";
 import { webSearchTool } from "../src/tools/webTools";
@@ -411,4 +412,139 @@ test("web_search surfaces the primary error when the fallback is disabled", asyn
   } as unknown as ToolExecutionContext;
 
   await assert.rejects(() => webSearchTool.execute({ query: "topic" }, context));
+});
+
+test("a free provider that answers 503 then 200 is retried once and included in the fusion", async () => {
+  const calls: Record<string, number> = {};
+  const transport: HttpTransport = async (request) => {
+    const host = new URL(request.url).hostname;
+    calls[host] = (calls[host] ?? 0) + 1;
+    if (host.endsWith("wikipedia.org")) {
+      return calls[host] === 1
+        ? { status: 503, headers: {} }
+        : ok({ pages: [{ key: "Retried", title: "Retried", excerpt: "Back up." }] });
+    }
+    if (host.endsWith("openalex.org")) {
+      return ok({
+        results: [
+          { display_name: "Steady", primary_location: { landing_page_url: "https://steady.example/p" } },
+        ],
+      });
+    }
+    if (host.endsWith("arxiv.org")) return okText(arxivFeed([]));
+    if (host.endsWith("crossref.org")) return ok({ message: { items: [] } });
+    return ok({ esearchresult: { idlist: [] } });
+  };
+  const outcome = await runFreeSearchProvidersDetailed({
+    transport,
+    query: "retry",
+    maxResults: 5,
+    retryDelaysMs: [0],
+  });
+  assert.equal(calls["en.wikipedia.org"], 2, "one retry after the 503");
+  assert.deepEqual(outcome.providerFailures, []);
+  assert.deepEqual(
+    outcome.results.map((item) => item.url).sort(),
+    ["https://en.wikipedia.org/wiki/Retried", "https://steady.example/p"],
+  );
+});
+
+test("a provider that still fails after its retry is a partial failure, not an empty search", async () => {
+  const calls: Record<string, number> = {};
+  const transport: HttpTransport = async (request) => {
+    const host = new URL(request.url).hostname;
+    calls[host] = (calls[host] ?? 0) + 1;
+    if (host.endsWith("wikipedia.org")) return { status: 500, headers: {} };
+    if (host.endsWith("openalex.org")) {
+      return ok({
+        results: [
+          { display_name: "Survivor", primary_location: { landing_page_url: "https://survivor.example/p" } },
+        ],
+      });
+    }
+    if (host.endsWith("arxiv.org")) return okText(arxivFeed([]));
+    if (host.endsWith("crossref.org")) return ok({ message: { items: [] } });
+    return ok({ esearchresult: { idlist: [] } });
+  };
+  const outcome = await runFreeSearchProvidersDetailed({
+    transport,
+    query: "partial",
+    maxResults: 5,
+    retryDelaysMs: [0],
+  });
+  assert.equal(calls["en.wikipedia.org"], 2, "the retry budget is one retry");
+  assert.deepEqual(outcome.providerFailures, [{ provider: "wikipedia", code: "http_500" }]);
+  assert.deepEqual(
+    outcome.results.map((item) => item.url),
+    ["https://survivor.example/p"],
+  );
+  // The array-returning wrapper keeps its contract for callers that only
+  // want results.
+  assert.deepEqual(
+    (await runFreeSearchFallback({ transport, query: "partial", maxResults: 5, retryDelaysMs: [0] })).map(
+      (item) => item.url,
+    ),
+    ["https://survivor.example/p"],
+  );
+});
+
+test("a malformed provider body and an aborted request are classified, and a 4xx is not retried", async () => {
+  const calls: Record<string, number> = {};
+  const transport: HttpTransport = async (request) => {
+    const host = new URL(request.url).hostname;
+    calls[host] = (calls[host] ?? 0) + 1;
+    if (host.endsWith("wikipedia.org")) return { status: 200, headers: {}, text: "<html>not json" };
+    if (host.endsWith("openalex.org")) return { status: 404, headers: {} };
+    if (host.endsWith("arxiv.org")) throw new DOMException("stop", "AbortError");
+    if (host.endsWith("crossref.org")) throw new Error("socket hang up");
+    return ok({ esearchresult: { idlist: [] } });
+  };
+  const outcome = await runFreeSearchProvidersDetailed({
+    transport,
+    query: "codes",
+    maxResults: 5,
+    retryDelaysMs: [0],
+  });
+  assert.equal(calls["api.openalex.org"], 1, "a caller error is not retried");
+  assert.equal(calls["api.crossref.org"], 2, "a thrown transport failure is retried once");
+  assert.deepEqual(
+    [...outcome.providerFailures].sort((left, right) => left.provider.localeCompare(right.provider)),
+    [
+      { provider: "arxiv", code: "aborted" },
+      { provider: "crossref", code: "transport_error" },
+      { provider: "openalex", code: "http_404" },
+      { provider: "wikipedia", code: "invalid_response" },
+    ],
+  );
+  assert.deepEqual(outcome.results, []);
+});
+
+test("web_search reports free-tier provider failures beside the fused results", async () => {
+  const context = {
+    settings: {
+      ollamaBaseUrl: "https://ollama.com/api",
+      ollamaApiKey: "k",
+      requestTimeoutMs: 30_000,
+      freeSearchFallbackEnabled: true,
+    },
+    httpTransport: transportFor({
+      "/web_search": { status: 400, headers: {}, json: { error: "bad request" } },
+      "wikipedia.org": ok({
+        pages: [{ key: "Topic", title: "Topic", excerpt: "About the topic." }],
+      }),
+      "openalex.org": { status: 500, headers: {} },
+      "export.arxiv.org": okText(arxivFeed([])),
+      "api.crossref.org": ok({ message: { items: [] } }),
+      esearch: ok({ esearchresult: { idlist: [] } }),
+    }),
+  } as unknown as ToolExecutionContext;
+
+  const result = (await webSearchTool.execute({ query: "topic" }, context)) as {
+    results: Array<{ url: string }>;
+    fromCache: boolean;
+    providerFailures?: Array<{ provider: string; code: string }>;
+  };
+  assert.equal(result.fromCache, false);
+  assert.ok(result.results.some((item) => item.url.includes("wikipedia.org/wiki/Topic")));
+  assert.deepEqual(result.providerFailures, [{ provider: "openalex", code: "http_500" }]);
 });

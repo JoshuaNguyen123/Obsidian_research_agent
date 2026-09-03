@@ -4,6 +4,7 @@ import {
   type ResearchSourceType,
 } from "../orchestrator/sourceCandidateLedger";
 import { atomEntries, collapseWhitespace, stripJats, xmlText } from "./atomText";
+import { isAbortError, requestWithRetry } from "./httpRetry";
 
 /**
  * Keyless, official, safe web-search fallbacks. The primary search path is the
@@ -18,6 +19,11 @@ import { atomEntries, collapseWhitespace, stripJats, xmlText } from "./atomText"
  *
  * Every provider is defensive: a failure returns an empty list rather than
  * throwing, so one provider being down never blocks the others or the caller.
+ * Each request is retried once on a transient status through the shared
+ * `requestWithRetry` path, and a provider that still fails is reported as a
+ * partial failure (`providerFailures`) beside the fused results of the
+ * providers that answered, so the caller can tell "nothing indexed" from
+ * "PubMed was down".
  *
  * Deliberately absent: any general web index. Every keyless one is either an
  * HTML scrape of a search engine (fragile and against its terms) or key-gated.
@@ -43,6 +49,38 @@ export interface FreeSearchInput {
   maxResults: number;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Retry delays for a transient provider failure; tests inject `[0]`. */
+  retryDelaysMs?: readonly number[];
+}
+
+/**
+ * One retry, at the shared transport's first delay. The free tier fans out to
+ * five providers per query, so a second retry per provider would add up to
+ * six seconds of waiting to a search whose other providers already answered.
+ */
+export const FREE_SEARCH_RETRY_DELAYS_MS: readonly number[] = Object.freeze([400]);
+
+/** A provider that could not answer after its retry, with a bounded reason. */
+export interface FreeSearchProviderFailure {
+  provider: FreeSearchProviderId;
+  /** `http_<status>`, `invalid_response`, `transport_error`, or `aborted`. */
+  code: string;
+}
+
+export interface FreeSearchOutcome {
+  results: FreeSearchResult[];
+  providerFailures: FreeSearchProviderFailure[];
+}
+
+/** Typed failure so the outcome can name the HTTP status a provider returned. */
+export class FreeSearchProviderError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "FreeSearchProviderError";
+    this.code = code;
+  }
 }
 
 /** Every index a mission may name directly. */
@@ -184,15 +222,35 @@ export async function runFreeSearchFallback(
 export async function runFreeSearchProviders(
   input: FreeSearchInput & { providers?: readonly FreeSearchProviderId[] },
 ): Promise<FreeSearchResult[]> {
+  return (await runFreeSearchProvidersDetailed(input)).results;
+}
+
+/**
+ * Same fusion, plus the list of providers that failed after their retry.
+ *
+ * A failed provider is partial, not fatal: the fusion continues with the
+ * providers that answered. Before this the failure was swallowed as an empty
+ * list, so a run could not tell an empty index from an outage and reported
+ * neither.
+ */
+export async function runFreeSearchProvidersDetailed(
+  input: FreeSearchInput & { providers?: readonly FreeSearchProviderId[] },
+): Promise<FreeSearchOutcome> {
   const selected =
     input.providers && input.providers.length > 0
       ? input.providers
       : DEFAULT_FREE_SEARCH_PROVIDERS;
   const perProvider = Math.max(1, Math.min(10, input.maxResults));
   const providerInput = { ...input, maxResults: perProvider };
-  const batches = await Promise.all(
-    selected.map((id) => safeProvider(() => FREE_SEARCH_PROVIDERS[id](providerInput))),
+  const outcomes = await Promise.all(
+    selected.map((id) =>
+      safeProvider(id, () => FREE_SEARCH_PROVIDERS[id](providerInput)),
+    ),
   );
+  const providerFailures = outcomes.flatMap((outcome) =>
+    outcome.failure ? [outcome.failure] : [],
+  );
+  const batches = outcomes.map((outcome) => outcome.results);
 
   const fused = new Map<string, RankedResult>();
   for (const batch of batches) {
@@ -228,7 +286,7 @@ export async function runFreeSearchProviders(
     }
   }
 
-  return [...fused.values()]
+  const results = [...fused.values()]
     .sort(
       (left, right) =>
         right.score - left.score ||
@@ -237,6 +295,7 @@ export async function runFreeSearchProviders(
     )
     .slice(0, Math.max(0, input.maxResults))
     .map((entry) => entry.result);
+  return { results, providerFailures };
 }
 
 export async function wikipediaSearch(
@@ -684,28 +743,43 @@ async function getResponse(
     typeof target === "string"
       ? REQUEST_HEADERS
       : { ...REQUEST_HEADERS, Accept: target.accept };
-  const response: HttpResponse = await input.transport({
-    url,
-    method: "GET",
-    headers,
-    throw: false,
-    timeoutMs: input.timeoutMs,
-    abortSignal: input.signal,
-  });
+  const response: HttpResponse = await requestWithRetry(
+    input.transport,
+    {
+      url,
+      method: "GET",
+      headers,
+      throw: false,
+      timeoutMs: input.timeoutMs,
+      abortSignal: input.signal,
+    },
+    { retryDelaysMs: [...(input.retryDelaysMs ?? FREE_SEARCH_RETRY_DELAYS_MS)] },
+  );
   if (response.status >= 400) {
-    throw new Error(`Free search provider returned HTTP ${response.status}.`);
+    throw new FreeSearchProviderError(
+      `http_${response.status}`,
+      `Free search provider returned HTTP ${response.status}.`,
+    );
   }
   return response;
 }
 
 async function safeProvider(
+  provider: FreeSearchProviderId,
   run: () => Promise<FreeSearchResult[]>,
-): Promise<FreeSearchResult[]> {
+): Promise<{ results: FreeSearchResult[]; failure?: FreeSearchProviderFailure }> {
   try {
-    return (await run()).filter((result) => result.url.trim());
-  } catch {
-    return [];
+    return { results: (await run()).filter((result) => result.url.trim()) };
+  } catch (error) {
+    return { results: [], failure: { provider, code: classifyProviderFailure(error) } };
   }
+}
+
+function classifyProviderFailure(error: unknown): string {
+  if (error instanceof FreeSearchProviderError) return error.code;
+  if (isAbortError(error)) return "aborted";
+  if (error instanceof SyntaxError) return "invalid_response";
+  return "transport_error";
 }
 
 /**

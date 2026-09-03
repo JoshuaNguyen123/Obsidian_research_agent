@@ -62,6 +62,7 @@ describe("daily-use Playwright failure classification", () => {
       ["CODE-DELIVERY-01", "CODE-DELIVERY-01 scratch delivery", "code"],
       ["INTERRUPT-01", "INTERRUPT-01 durable continuation", "notes"],
       ["NOTEBOOK-01", "NOTEBOOK-01 executed notebook delivery", "code"],
+      ["RESEARCH-WEB-01", "RESEARCH-WEB-01 STEM cited summary from the live web", "research"],
     ] as const) {
       assert.deepEqual(
         classifyDailyUseFailure({

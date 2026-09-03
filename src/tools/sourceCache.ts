@@ -322,6 +322,57 @@ async function upsertSourceCacheManifest(
   });
 }
 
+/**
+ * Write one auxiliary JSON file under the source-cache folder through the same
+ * serialized, folder-ensuring path the manifest uses. The search-result cache
+ * rides this so its writes share the manifest queue (no interleaved
+ * read-modify-write) and the same exemptions: a file under
+ * `Agent Sources/` is cache, never a note write or a mutation receipt.
+ *
+ * `mutate` receives the current file text (null when absent) and returns the
+ * text to write, or null to leave the file untouched.
+ */
+export async function updateSourceCacheJsonFile(
+  ctx: ToolExecutionContext,
+  path: string,
+  mutate: (current: string | null) => string | null,
+): Promise<void> {
+  await enqueueManifestWrite(ctx, async () => {
+    await ensureVaultFolderPath(ctx, parentPath(path));
+    const file = ctx.app.vault.getFileByPath(path);
+    const current = file ? await ctx.app.vault.read(file) : null;
+    const next = mutate(current);
+    if (next === null) {
+      return;
+    }
+    if (file) {
+      await ctx.app.vault.modify(file, next);
+    } else {
+      await ctx.app.vault.create(path, next);
+    }
+  });
+}
+
+/** Read an auxiliary source-cache file after any queued write has landed. */
+export async function readSourceCacheJsonFile(
+  ctx: ToolExecutionContext,
+  path: string,
+): Promise<string | null> {
+  const pendingWrite = manifestWriteQueues.get(getVaultQueueKey(ctx));
+  if (pendingWrite) {
+    await pendingWrite.catch(() => undefined);
+  }
+  const file = ctx.app.vault.getFileByPath(path);
+  if (!file) {
+    return null;
+  }
+  try {
+    return await ctx.app.vault.read(file);
+  } catch {
+    return null;
+  }
+}
+
 export async function readSourceCacheManifest(
   ctx: ToolExecutionContext,
 ): Promise<SourceCacheManifest> {

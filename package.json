@@ -41,6 +41,7 @@
     "test:e2e:desktop-code-delivery": "node scripts/run-e2e-exclusive.mjs --real-ai --project=desktop-code-delivery-real-live",
     "test:e2e:vault-sibling-code-delivery": "node scripts/run-e2e-exclusive.mjs --real-ai --project=vault-sibling-code-delivery-real-live",
     "test:e2e:research": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-research",
+    "test:e2e:research-real-web": "node scripts/run-e2e-exclusive.mjs --real-ai --project=research-real-web",
     "test:e2e:code": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-code-live",
     "test:e2e:compound": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-compound",
     "test:e2e:compound-real": "node scripts/run-e2e-exclusive.mjs --real-ai --project=compound-flow-real-live",
