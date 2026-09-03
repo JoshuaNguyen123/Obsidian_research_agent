@@ -82,10 +82,15 @@ const REVISE_DESIGN_INTENT =
 // shared authority for telling a design deliverable apart from design-flavored
 // research topic prose; planner, loop budget, required-write selection, and
 // continuation replans must all consult it so no two of them disagree.
-const GROUNDED_RESEARCH_TASK = /\b(?:research|investigate)\b/i;
-
 const NARRATIVE_NOTE_DELIVERABLE =
   /\b(?:write|draft|compose|summari[sz]e)\b[\s\S]{0,120}\b(?:notes?|essay|summary|article|paragraphs?|report|write[-\s]?up)\b/i;
+
+// Subject-matter nouns that satisfy DESIGN_INTENT when they sit near a
+// write/draft verb, even though the user asked for a note about the topic
+// rather than a canvas. "research|investigate" used to be required, so
+// "write a note on transformer architecture" still planted design nodes.
+const DESIGN_TOPIC_AS_SUBJECT =
+  /\b(?:transformer\s+)?architecture\b|\bdistributed(?:\s+\w+){0,3}\s+systems?\b|\bsystem\s+design\b|\bsoftware\s+architecture\b|\bcloud\s+architecture\b|\bworking\s+memory\b/i;
 
 // Vocabulary that names a visual artifact as the requested deliverable. Topic
 // nouns that merely say what a mission is ABOUT (architecture, system design,
@@ -139,12 +144,19 @@ export function hasReviseDesignIntent(prompt: string): boolean {
  * mission.
  */
 export function isResearchTopicDesignProse(prompt: string): boolean {
-  return (
-    hasDesignIntent(prompt) &&
-    GROUNDED_RESEARCH_TASK.test(prompt) &&
-    NARRATIVE_NOTE_DELIVERABLE.test(prompt) &&
-    !EXPLICIT_DESIGN_ARTIFACT_REQUEST.test(prompt)
-  );
+  if (EXPLICIT_DESIGN_ARTIFACT_REQUEST.test(prompt)) {
+    return false;
+  }
+  if (hasExplicitCanvasDestinationIntent(prompt)) {
+    return false;
+  }
+  if (!NARRATIVE_NOTE_DELIVERABLE.test(prompt)) {
+    return false;
+  }
+  // A note about architecture / distributed systems / working memory is
+  // subject matter whether or not the user also said "research". A genuine
+  // design deliverable names a canvas, diagram, or similar artifact above.
+  return hasDesignIntent(prompt) || DESIGN_TOPIC_AS_SUBJECT.test(prompt);
 }
 
 /**

@@ -14,6 +14,7 @@ import {
 import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
 import { planLoopBudget } from "./loopPlanner";
 import type { ReflexDecision } from "./reflex/types";
+import { missionGrantsDesignCapability } from "./codeDesignIntent";
 import { isTitleOnlyIntent } from "./titleIntent";
 import {
   isCurrentNoteEditOrganizeIntent,
@@ -429,7 +430,7 @@ export function createRunPlan({
   // Research→code (and other code-shaped) missions must take this path before
   // the pure web-search route so the step budget includes the code ladder.
   if (
-    hasSharedDesignIntent(prompt) ||
+    missionGrantsDesignCapability(prompt) ||
     hasCodeExecutionIntent(prompt) ||
     routedCodeExecutionProposal ||
     hasHtmlPreviewIntent(prompt) ||
@@ -467,7 +468,7 @@ export function createRunPlan({
       slowPathReason: "needs_model_planning",
       expectedTimeClass: "normal",
       traceReasons: [
-        hasSharedDesignIntent(prompt)
+        missionGrantsDesignCapability(prompt)
           ? "design_intent"
           : hasCodeExecutionIntent(prompt)
             ? hasWebSearchIntent(prompt)

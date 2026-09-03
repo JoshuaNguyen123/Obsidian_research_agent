@@ -27,6 +27,7 @@ import {
   hasDesignIntent as hasSharedDesignIntent,
   hasExplicitCanvasDestinationIntent,
   hasReviseDesignIntent,
+  isResearchTopicDesignProse,
 } from "./codeDesignIntent";
 import { hasDeepResearchIntent as hasSharedDeepResearchIntent } from "./researchDepthIntent";
 import {
@@ -169,6 +170,9 @@ export function hasGraphConnectionIntent(prompt: string): boolean {
     " [markdown-path] ",
   ).replace(
     /\bpreserve\b[^.\n]{0,100}\b(?:note\s+)?backlinks?\b/giu,
+    " ",
+  ).replace(
+    /\b(?:a\s+)?references?(?:\s+section|\s+heading|\s+list)\b|\b(?:section|heading)\s+(?:called\s+|named\s+)?references?\b|\binclude\s+(?:a\s+)?references?\s+section\b|(?:^|[.\n])\s*#*\s*references?\s*(?:[.\n]|$)/giu,
     " ",
   );
   return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
@@ -409,6 +413,9 @@ export function hasAffirmativeCodePathAction(prompt: string, action: RegExp): bo
 // delegating wrapper, but a wrapper is still a second declaration site.
 
 export function hasDesignPackageIntent(prompt: string): boolean {
+  if (isResearchTopicDesignProse(prompt)) {
+    return false;
+  }
   return /\b(design\s*package|service\s*blueprint|logistics\s*system|project\s*ideation|canvas\s+plus\s+(brief|markdown)|canvas[\s\S]{0,80}(?:brief|svg\s+image|image)|brief\s+plus\s+canvas|ui\s*flow|mind\s*map|distributed(?:\s+\w+){0,3}\s+systems?|cloud\s+architecture|microservices?(?:\s+architecture)?|event[-\s]?driven\s+architecture|c4\s+(?:model|diagram)|business\s+process(?:es)?|manufacturing(?:\s+\w+){0,2}\s+process(?:es)?|production\s+lines?|plant\s+workflows?|value\s+streams?|bpmn|sipoc)\b/i.test(
     prompt,
   );
@@ -430,6 +437,9 @@ export function hasNarrativeDesignOutputIntent(prompt: string): boolean {
 export function hasCanvasDesignIntent(prompt: string): boolean {
   if (hasExplicitCanvasDestinationIntent(prompt)) {
     return true;
+  }
+  if (isResearchTopicDesignProse(prompt)) {
+    return false;
   }
   if (hasSvgDesignIntent(prompt) || hasMermaidDesignIntent(prompt)) {
     return false;
@@ -790,33 +800,37 @@ export function hasResearchMemoryIntent(prompt: string): boolean {
   );
 }
 
+function withoutWorkingMemoryTopic(prompt: string): string {
+  return prompt.replace(/\bworking\s+memory\b/giu, " ");
+}
+
 export function hasResearchMemoryReadIntent(prompt: string): boolean {
   return /\b(research\s+memory|topic\s+memory|memory|remember|recall|long[-\s]?term|continue\s+(?:this|the)\s+research|build\s+on\s+(?:this|the)\s+research)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryWriteIntent(prompt: string): boolean {
   return /\b(save|store|remember|record|persist|append|add|update)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory|long[-\s]?term|research\s+topic)\b|\b(research\s+memory|topic\s+memory|memory|long[-\s]?term|research\s+topic)\b[\s\S]{0,120}\b(save|store|remember|record|persist|append|add|update)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryReviewIntent(prompt: string): boolean {
   return /\b(review|audit|inspect|check|hygiene|duplicates?|stale|clean(?:up)?)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory)\b|\b(research\s+memory|topic\s+memory|memory)\b[\s\S]{0,120}\b(review|audit|inspect|check|hygiene|duplicates?|stale|clean(?:up)?)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryCompactIntent(prompt: string): boolean {
   return /\b(compact|compress|summari[sz]e|dedupe|merge|clean(?:up)?)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory)\b|\b(research\s+memory|topic\s+memory|memory)\b[\s\S]{0,120}\b(compact|compress|summari[sz]e|dedupe|merge|clean(?:up)?)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryDeleteIntent(prompt: string): boolean {
   return /\b(delete|remove|trash|forget)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory|research\s+topic)\b|\b(research\s+memory|topic\s+memory|memory|research\s+topic)\b[\s\S]{0,120}\b(delete|remove|trash|forget)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
