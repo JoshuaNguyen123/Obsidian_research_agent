@@ -13,6 +13,8 @@
  * Comparing against an instant the lane recorded *after* `startRealAiHarness`
  * returned instead demands a second physical probe the product deliberately
  * never runs, and fails on every host whose load-time probe already succeeded.
+ * That is a `harness:*` pin, not a sandbox failure: classify it as such and
+ * bound on this helper instead of restamping `observedAt`.
  */
 export function sandboxProbeProvenInSessionV1(input: {
   observedAt: string | null | undefined;

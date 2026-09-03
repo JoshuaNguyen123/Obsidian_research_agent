@@ -1338,7 +1338,13 @@ export class CodeExtensionRuntimeV2 {
     const probeFresh =
       Number.isFinite(observedMs) &&
       this.now().getTime() - observedMs <= maxProbeAgeMs;
-    if (cached.executionAvailable && probeFresh) return cached;
+    if (cached.executionAvailable && probeFresh) {
+      // Serve the existing physical proof. Do not restamp lastProbe.observedAt:
+      // that timestamp is when the boundary was actually proved, not when a
+      // later caller reused it. A consumer that demands a newer stamp is
+      // asserting a second probe this path deliberately never runs.
+      return cached;
+    }
     return this.probeConfiguredSandboxProviders(signal);
   }
 

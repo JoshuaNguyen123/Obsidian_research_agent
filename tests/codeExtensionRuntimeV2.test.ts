@@ -1912,13 +1912,14 @@ test("CodeExtensionRuntimeV2 re-proves a durable probe once per session and then
 
     // A later session loads that observation far outside the freshness window.
     const later = new Date(Date.parse(NOW) + 4 * 24 * 60 * 60_000).toISOString();
+    let currentSessionNow = later;
     const currentSession = new CodeExtensionRuntimeV2({
       plugin: plugin as unknown as Plugin,
       workspaceManager: new WorkspaceManagerV2({
         applicationDataRoot: path.join(root, "app-data-current"),
       }),
       sandboxRunner: runner,
-      now: () => new Date(later),
+      now: () => new Date(currentSessionNow),
     });
     await currentSession.initialize();
     assert.equal(
@@ -1949,6 +1950,41 @@ test("CodeExtensionRuntimeV2 re-proves a durable probe once per session and then
       currentSession.readState().sandbox.lastProbe?.observedAt,
       later,
       "serving a fresh session proof must not restamp its observation time",
+    );
+
+    // Same session, clock advanced but still inside the 10-minute window:
+    // still one physical probe, still the original stamp. Restamping here
+    // would satisfy a post-startup Date.now() pin without proving the
+    // boundary again.
+    const stillInsideWindow = new Date(
+      Date.parse(later) + 2 * 60_000,
+    ).toISOString();
+    currentSessionNow = stillInsideWindow;
+    const reused = await currentSession.ensureHostProvisionedSandboxReadinessV1();
+    assert.deepEqual(reused, startup);
+    assert.equal(
+      probeCalls,
+      2,
+      "a still-valid session proof must not be physically re-run",
+    );
+    assert.equal(
+      currentSession.readState().sandbox.lastProbe?.observedAt,
+      later,
+      "serving a still-valid proof must not restamp observedAt",
+    );
+
+    // Once the window expires, a real re-probe is due and must restamp.
+    const pastWindow = new Date(
+      Date.parse(later) + 11 * 60_000,
+    ).toISOString();
+    currentSessionNow = pastWindow;
+    const refreshed = await currentSession.ensureHostProvisionedSandboxReadinessV1();
+    assert.equal(refreshed.executionAvailable, true);
+    assert.equal(probeCalls, 3, "an expired session proof must be re-proven");
+    assert.equal(
+      currentSession.readState().sandbox.lastProbe?.observedAt,
+      pastWindow,
+      "a due re-probe must restamp observedAt",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
