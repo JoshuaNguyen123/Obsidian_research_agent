@@ -17,7 +17,7 @@ export type SemanticProfilePreset = "balanced" | "thorough" | "custom";
 
 export interface SemanticProfileLimits {
   semanticEmbeddingModel: string;
-  semanticEmbeddingDim: 256 | 512;
+  semanticEmbeddingDim: number;
   semanticChunkMinTokens: number;
   semanticChunkTargetTokens: number;
   semanticChunkMaxTokens: number;

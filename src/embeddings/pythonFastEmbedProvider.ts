@@ -1,10 +1,14 @@
 import type { AgentSettings } from "../settings";
 import type {
+  SemanticEmbeddingPriority,
   SemanticEmbeddingProvider,
   SemanticEmbeddingRequest,
   SemanticEmbeddingResponse,
 } from "./types";
 import { getNodeRequireForObsidian } from "../platform/nodeRequire";
+
+/** Recorded in every index this provider builds; see `SemanticEmbeddingProvider.id`. */
+export const PYTHON_FASTEMBED_PROVIDER_ID = "python-fastembed";
 
 const REQUEST_TIMEOUT_MS = 180000;
 const IDLE_SHUTDOWN_MS = 120000;
@@ -86,7 +90,17 @@ export function createPythonFastEmbedProvider(
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   let requestSeq = 0;
-  let queueTail: Promise<unknown> = Promise.resolve();
+  // Serial queue with two classes. The helper answers one request at a time,
+  // so an index rebuild that queued 40 batches used to hold every search behind
+  // them; now a queued interactive request runs as soon as the in-flight
+  // request settles, ahead of any queued background batch.
+  const pendingTasks: Array<{
+    priority: SemanticEmbeddingPriority;
+    seq: number;
+    start: () => Promise<unknown>;
+  }> = [];
+  let queueSeq = 0;
+  let activeTask: Promise<unknown> | null = null;
 
   const clearIdleTimer = () => {
     if (idleTimer) {
@@ -389,21 +403,52 @@ export function createPythonFastEmbedProvider(
     }
   };
 
-  const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
-    const run = queueTail.then(task, task);
-    queueTail = run.then(
+  const pumpQueue = () => {
+    if (activeTask || pendingTasks.length === 0) {
+      return;
+    }
+    pendingTasks.sort(
+      (left, right) =>
+        priorityRank(left.priority) - priorityRank(right.priority) ||
+        left.seq - right.seq,
+    );
+    const next = pendingTasks.shift()!;
+    activeTask = next.start().then(
       () => undefined,
       () => undefined,
     );
-    return run;
+    void activeTask.then(() => {
+      activeTask = null;
+      pumpQueue();
+    });
   };
 
+  const enqueue = <T>(
+    task: () => Promise<T>,
+    priority: SemanticEmbeddingPriority = "interactive",
+  ): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      pendingTasks.push({
+        priority,
+        seq: ++queueSeq,
+        start: () => {
+          const run = task();
+          run.then(resolve, reject);
+          return run;
+        },
+      });
+      pumpQueue();
+    });
+
   return {
+    id: PYTHON_FASTEMBED_PROVIDER_ID,
     embed: (request) =>
-      enqueue(() =>
-        request.signal?.aborted
-          ? Promise.resolve(abortedResponse(request))
-          : embedNow(request),
+      enqueue(
+        () =>
+          request.signal?.aborted
+            ? Promise.resolve(abortedResponse(request))
+            : embedNow(request).then((result) => verifyResponseDim(request, result)),
+        request.priority ?? "interactive",
       ),
     dispose: () => {
       disposed = true;
@@ -413,6 +458,37 @@ export function createPythonFastEmbedProvider(
       }
     },
   };
+}
+
+/**
+ * A vector of the wrong width must never reach the index. The helper only
+ * truncates Matryoshka models, so a non-Matryoshka model configured with a
+ * dimension other than its native one comes back at its native width; naming
+ * that width here turns a silent shape mismatch into a settings fix.
+ */
+function verifyResponseDim(
+  request: SemanticEmbeddingRequest,
+  response: SemanticEmbeddingResponse,
+): SemanticEmbeddingResponse {
+  if (!response.ok) {
+    return response;
+  }
+  const vectors = [...(response.documents ?? []), ...(response.queries ?? [])];
+  const mismatched = vectors.find((vector) => vector.length !== request.dim);
+  if (!mismatched) {
+    return response;
+  }
+  return {
+    ok: false,
+    model: request.model,
+    dim: mismatched.length,
+    code: "dim_mismatch",
+    message: `${request.model} returned ${mismatched.length}-dimension vectors but ${request.dim} was requested. Set the semantic embedding dimension to ${mismatched.length}, or choose a catalogued model so the plugin can resolve it.`,
+  };
+}
+
+function priorityRank(priority: SemanticEmbeddingPriority): number {
+  return priority === "interactive" ? 0 : 1;
 }
 
 function isRetryableHelperFailure(response: SemanticEmbeddingResponse): boolean {
@@ -499,6 +575,11 @@ import math
 import os
 import sys
 
+try:
+    import numpy as np
+except Exception:
+    np = None
+
 MODELS = {}
 
 def emit(payload):
@@ -528,10 +609,39 @@ def l2_norm(values):
     return [item / magnitude for item in values]
 
 def matryoshka(values, dim):
+    # nomic's recipe: layer-norm, truncate, L2-normalise. Only meaningful for a
+    # model trained with Matryoshka Representation Learning; the caller decides
+    # (see postprocess) and every other model keeps its native vectors.
+    if np is not None:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if arr.shape[0] < dim:
+            raise ValueError("embedding dimension %d is smaller than requested dim %d" % (arr.shape[0], dim))
+        arr = (arr - arr.mean()) / math.sqrt(float(arr.var()) + 1e-12)
+        arr = arr[:dim]
+        magnitude = float(np.linalg.norm(arr))
+        if magnitude > 0:
+            arr = arr / magnitude
+        return arr.tolist()
     normalized = layer_norm(as_vector(values))
     if len(normalized) < dim:
         raise ValueError("embedding dimension %d is smaller than requested dim %d" % (len(normalized), dim))
     return l2_norm(normalized[:dim])
+
+def native_normalized(values):
+    # Non-Matryoshka models: keep every dimension, only guarantee unit length so
+    # cosine similarity reduces to a dot product like it does for the recipe.
+    if np is not None:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        magnitude = float(np.linalg.norm(arr))
+        if magnitude > 0:
+            arr = arr / magnitude
+        return arr.tolist()
+    return l2_norm(as_vector(values))
+
+def postprocess(values, dim, use_matryoshka):
+    if use_matryoshka:
+        return matryoshka(values, dim)
+    return native_normalized(values)
 
 def iter_vectors(values):
     for item in values:
@@ -573,12 +683,16 @@ def handle(request):
     query_prefix = str(request.get("queryPrefix") or "")
     document_prefix = str(request.get("documentPrefix") or "")
     dim = int(request.get("dim") or 512)
+    # Absent means the pre-flag behaviour (truncate), which only nomic ever saw.
+    use_matryoshka = bool(request.get("matryoshka", True))
     cache_dir = str(request.get("cacheDir") or "").strip()
     documents = request.get("documents") or []
     queries = request.get("queries") or []
 
-    if dim not in (256, 512):
-        fail(rid, "invalid_dim", "dim must be 256 or 512", model, dim)
+    if dim < 1:
+
+        fail(rid, "invalid_dim", "dim must be a positive integer", model, dim)
+
         return
 
     try:
@@ -597,10 +711,10 @@ def handle(request):
         query_vectors = []
         if document_inputs:
             for vector in iter_vectors(embedding_model.embed(document_inputs, batch_size=16)):
-                document_vectors.append(matryoshka(vector, dim))
+                document_vectors.append(postprocess(vector, dim, use_matryoshka))
         if query_inputs:
             for vector in iter_vectors(embedding_model.embed(query_inputs, batch_size=16)):
-                query_vectors.append(matryoshka(vector, dim))
+                query_vectors.append(postprocess(vector, dim, use_matryoshka))
     except Exception as error:
         fail(rid, "embed_failed", str(error), model, dim)
         return

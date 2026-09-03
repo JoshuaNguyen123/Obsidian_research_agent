@@ -4271,3 +4271,55 @@ test("markdown-only tools still refuse research data files", async () => {
     false,
   );
 });
+
+test("semantic_search_notes live path embeds documents in bounded batches, never one giant request", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  // Enough notes that a single request would carry more than one batch.
+  for (let index = 0; index < 150; index += 1) {
+    mock.content.set(
+      `Bulk/Note ${index}.md`,
+      `# Note ${index}\n\n${index === 7 ? "The elusive answer about lighthouse keepers." : "Filler paragraph about nothing in particular."}`,
+    );
+  }
+  const requests: Array<{ documents: number; queries: number; priority?: string }> = [];
+  mock.context.semanticEmbeddingProvider = {
+    async embed(request) {
+      requests.push({
+        documents: request.documents.length,
+        queries: request.queries.length,
+        priority: request.priority,
+      });
+      return {
+        ok: true,
+        model: request.model,
+        dim: request.dim,
+        queries: request.queries.map(() => [1, 0]),
+        documents: request.documents.map((document) =>
+          document.includes("lighthouse") ? [1, 0] : [0.1, 0.9],
+        ),
+      };
+    },
+  };
+
+  const result = await registry.execute(
+    {
+      name: "semantic_search_notes",
+      arguments: { query: "lighthouse keepers", limit: 3 },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    fallbackUsed: boolean;
+    results: Array<{ path: string }>;
+  };
+  assert.equal(output.fallbackUsed, false);
+  assert.equal(output.results[0].path, "Bulk/Note 7.md");
+  const documentRequests = requests.filter((request) => request.documents > 0);
+  assert.ok(documentRequests.length >= 2, `expected batched document requests, got ${JSON.stringify(requests)}`);
+  assert.ok(documentRequests.every((request) => request.documents <= 64));
+  assert.equal(requests.filter((request) => request.queries > 0).length, 1);
+  assert.ok(requests.every((request) => request.priority === "interactive"));
+});

@@ -6,6 +6,8 @@ import {
   embeddingPrefixFingerprintV1,
   resolveEmbeddingPrefixesV1,
 } from "./embeddingPrefixes";
+import { resolveEffectiveEmbeddingDimV1 } from "./embeddingModelCatalogV1";
+import { PYTHON_FASTEMBED_PROVIDER_ID } from "./pythonFastEmbedProvider";
 import {
   chunkMarkdownForSemanticSearch,
   type SemanticChunkingOptions,
@@ -13,7 +15,7 @@ import {
 import { normalizeVaultPath } from "../tools/validation";
 import { isPathUnderVaultFolder, isVaultPathExcluded } from "../tools/vaultExclusions";
 import { mapWithBoundedConcurrency } from "../utils/boundedConcurrency";
-import type { SemanticEmbeddingProvider } from "./types";
+import type { SemanticEmbeddingPriority, SemanticEmbeddingProvider } from "./types";
 import {
   buildSemanticGraphPrior,
   type SemanticGraphPrior,
@@ -26,6 +28,7 @@ import type {
   SemanticIndexRowMeta,
   SemanticIndexShardV2,
   SemanticIndexSearchHit,
+  SemanticIndexStaleReportV1,
   SemanticIndexSearchTimingsV1,
   SemanticIndexSearchRequest,
   SemanticIndexSearchResult,
@@ -44,6 +47,19 @@ const LEGACY_INDEX_VERSION = 1;
 const INDEX_SHARD_ROW_LIMIT = 2048;
 const INDEX_SHARD_NAME_PREFIX = "semantic-vault-index-shard-";
 const MAX_INDEX_SNIPPET_CHARS = 360;
+/**
+ * How many changed notes one search embeds live so the note being edited is
+ * still searchable before the debounced reindex lands. Bounded because each is
+ * a full chunk-and-embed of that note on the helper's serial queue.
+ */
+export const MAX_LIVE_STALE_NOTES_PER_SEARCH = 3;
+/**
+ * Beyond this share of the index (or this many notes) the stale set is no
+ * longer a few edits but a different vault; the search fails as before and the
+ * tool takes the live path, which at least reads current content.
+ */
+const STALE_MAJORITY_NOTE_FLOOR = 50;
+const STALE_MAJORITY_RATIO = 0.2;
 export const SEMANTIC_INDEX_READ_CONCURRENCY = 8;
 const STOP_TERMS = new Set([
   "the",
@@ -97,6 +113,28 @@ interface SemanticIndexBuildPayload {
 interface Freshness {
   fresh: boolean;
   reason?: string;
+}
+
+/**
+ * The full picture behind {@link Freshness}: which notes drifted, not just
+ * that one did. `incompatibleReason` names the defects that no partial search
+ * can work around (settings changed, vectors disabled, shards missing).
+ */
+export interface SemanticIndexStalenessV1 {
+  incompatibleReason: string | null;
+  changedPaths: string[];
+  missingPaths: string[];
+  unindexedPaths: string[];
+}
+
+const semanticManifestReadCache = new Map<
+  string,
+  { mtime: number; size: number; index: SemanticVaultIndex }
+>();
+
+/** Test hook; the production caches are keyed by file (mtime, size). */
+export function clearSemanticManifestReadCache(): void {
+  semanticManifestReadCache.clear();
 }
 
 interface CachedSemanticShard {
@@ -194,13 +232,32 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     const { jsonPath } = getSemanticIndexPaths(this.getSettings());
     const file = this.app.vault.getFileByPath(jsonPath);
     if (!file) {
+      semanticManifestReadCache.delete(jsonPath);
       return null;
     }
 
+    // The manifest (every note's metadata) used to be re-parsed on every
+    // search; the shards already had a (mtime, size) cache and the manifest
+    // is the same shape of file.
+    const stat = file.stat ?? { mtime: 0, size: 0 };
+    const cached = semanticManifestReadCache.get(jsonPath);
+    if (cached && cached.mtime === stat.mtime && cached.size === stat.size) {
+      return cached.index;
+    }
     try {
       const parsed = JSON.parse(await this.app.vault.cachedRead(file));
-      return isSemanticVaultIndex(parsed) ? parsed : null;
+      if (!isSemanticVaultIndex(parsed)) {
+        semanticManifestReadCache.delete(jsonPath);
+        return null;
+      }
+      semanticManifestReadCache.set(jsonPath, {
+        mtime: stat.mtime,
+        size: stat.size,
+        index: parsed,
+      });
+      return parsed;
     } catch {
+      semanticManifestReadCache.delete(jsonPath);
       return null;
     }
   }
@@ -353,16 +410,36 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       return makeSearchFailure(model, dim, "missing_index", "No semantic index exists.");
     }
 
-    const freshness = this.checkFreshness(index);
-    if (!freshness.fresh) {
+    const staleness = assessSemanticIndexStalenessV1(
+      this.app,
+      settings,
+      index,
+      this.getEmbeddingProviderId(),
+    );
+    if (staleness.incompatibleReason) {
       return makeSearchFailure(
         model,
         dim,
-        freshness.reason ?? "stale_index",
-        `Semantic index is stale: ${freshness.reason ?? "unknown"}.`,
+        staleness.incompatibleReason,
+        `Semantic index is stale: ${staleness.incompatibleReason}.`,
         index.indexedAt,
       );
     }
+    const staleNoteCount = staleness.changedPaths.length + staleness.missingPaths.length;
+    if (
+      staleNoteCount > 0 &&
+      staleNoteCount >= Math.max(STALE_MAJORITY_NOTE_FLOOR, index.notes.length * STALE_MAJORITY_RATIO)
+    ) {
+      return makeSearchFailure(
+        model,
+        dim,
+        "stale_index_majority",
+        `Semantic index is stale: ${staleNoteCount} of ${index.notes.length} indexed notes changed or vanished since it was built.`,
+        index.indexedAt,
+      );
+    }
+    const excludePaths = new Set([...staleness.changedPaths, ...staleness.missingPaths]);
+    const indexFresh = excludePaths.size === 0 && staleness.unindexedPaths.length === 0;
 
     const query = request.query.trim();
     if (!query) {
@@ -377,6 +454,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       this.getEmbeddingProvider().embed({
         model,
         dim,
+        matryoshka: getSemanticMatryoshka(settings),
         documents: [],
         queries: [query],
         queryPrefix: prefixes.query,
@@ -423,6 +501,19 @@ class DefaultSemanticIndexService implements SemanticIndexService {
           minScore: request.minScore,
           cursor: request.cursor ?? null,
           graphPrior,
+          excludePaths,
+          liveHits: await this.scoreStaleNotesLive({
+            settings,
+            index,
+            queryVector: response.queries[0],
+            queryTerms: tokenize(query),
+            folder: request.folder ?? null,
+            maxSnippetChars: request.maxSnippetChars ?? MAX_INDEX_SNIPPET_CHARS,
+            graphPrior,
+            candidatePaths: staleness.changedPaths,
+            maxNotes: request.maxLiveStaleNotes ?? MAX_LIVE_STALE_NOTES_PER_SEARCH,
+            signal: request.signal,
+          }),
         })
       : {
           hits: searchIndexChunks({
@@ -435,17 +526,30 @@ class DefaultSemanticIndexService implements SemanticIndexService {
             minScore: request.minScore,
             cursor: request.cursor ?? null,
             graphPrior,
+            excludePaths,
           }),
           candidateCount: index.notes.reduce((sum, note) => sum + note.chunks.length, 0),
           nextCursor: null,
         };
 
+    const liveMergedPaths =
+      "liveMergedPaths" in searchResult ? searchResult.liveMergedPaths : [];
     return {
       ok: true,
       operation: "semantic_index_search",
       mode: "indexed_semantic",
       indexUsed: true,
-      indexFresh: true,
+      indexFresh,
+      ...(indexFresh
+        ? {}
+        : {
+            stale: {
+              changedPaths: staleness.changedPaths,
+              missingPaths: staleness.missingPaths,
+              unindexedPaths: staleness.unindexedPaths,
+              liveMergedPaths,
+            } satisfies SemanticIndexStaleReportV1,
+          }),
       model: index.model,
       dim: index.dim,
       indexedAt: index.indexedAt,
@@ -460,8 +564,138 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     };
   }
 
+  /**
+   * Embed a handful of changed notes on the spot and score them the way the
+   * shard scan would, so the note the user is editing still turns up. Any
+   * failure (helper down, run stopped) degrades to "excluded", never to an
+   * error: the indexed hits are still right for every other note.
+   */
+  private async scoreStaleNotesLive({
+    settings,
+    index,
+    queryVector,
+    queryTerms,
+    folder,
+    maxSnippetChars,
+    graphPrior,
+    candidatePaths,
+    maxNotes,
+    signal,
+  }: {
+    settings: AgentSettings;
+    index: SemanticVaultIndexV2;
+    queryVector: number[];
+    queryTerms: Set<string>;
+    folder: string | null;
+    maxSnippetChars: number;
+    graphPrior: SemanticGraphPrior | null;
+    candidatePaths: string[];
+    maxNotes: number;
+    signal?: AbortSignal;
+  }): Promise<{ hits: Array<SemanticIndexSearchHit & { sortPath: string }>; paths: string[] }> {
+    const empty = { hits: [], paths: [] };
+    const scoped = candidatePaths.filter(
+      (path) => !folder || path.startsWith(`${folder}/`),
+    );
+    if (maxNotes <= 0 || scoped.length === 0 || scoped.length > maxNotes) {
+      return empty;
+    }
+    const chunking = getChunking(settings);
+    const pending: Array<{
+      note: SemanticIndexNoteMeta;
+      row: SemanticIndexRowMeta;
+      embeddingText: string;
+    }> = [];
+    for (const path of scoped) {
+      const file = this.app.vault.getFileByPath(path);
+      if (!file) {
+        continue;
+      }
+      const built = await buildPendingNote(this.app, file, chunking);
+      if (!built) {
+        continue;
+      }
+      const noteMeta: SemanticIndexNoteMeta = {
+        ...built.note,
+        chunkCount: built.chunkInputs.length,
+        firstSnippet: built.chunkInputs[0]?.snippet ?? "",
+      };
+      for (const chunk of built.chunkInputs) {
+        pending.push({
+          note: noteMeta,
+          row: {
+            id: chunk.id,
+            notePath: chunk.path,
+            title: chunk.title,
+            heading: chunk.heading,
+            textHash: chunk.textHash,
+            tokenCount: chunk.tokenCount,
+            snippet: chunk.snippet,
+          },
+          embeddingText: chunk.embeddingText,
+        });
+      }
+    }
+    if (pending.length === 0 || signal?.aborted) {
+      return empty;
+    }
+    const embedded = await embedIndexDocuments({
+      provider: this.getEmbeddingProvider(),
+      settings,
+      documents: pending.map((item) => item.embeddingText),
+      signal,
+      priority: "interactive",
+    });
+    if (!embedded.ok || embedded.vectors.length !== pending.length) {
+      return empty;
+    }
+    const hits: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
+    const paths = new Set<string>();
+    pending.forEach((item, position) => {
+      const vector = embedded.vectors[position];
+      if (vector.length !== index.dim) {
+        return;
+      }
+      const semanticScore = normalizeCosine(cosineSimilarity(queryVector, vector));
+      const lexicalScore = lexicalScoreForRow(item.note, item.row, queryTerms);
+      const graphScore = graphScoreFor(graphPrior, item.row.notePath);
+      if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
+        return;
+      }
+      paths.add(item.row.notePath);
+      hits.push({
+        path: item.row.notePath,
+        title: item.row.title,
+        score: roundScore(blendSemanticScore(semanticScore, lexicalScore.score, graphScore)),
+        semanticScore: roundScore(semanticScore),
+        lexicalScore: roundScore(lexicalScore.score),
+        reasons: dedupeStrings([
+          "live_reembedded_changed_note",
+          ...(semanticScore > 0.55
+            ? ["indexed_semantic_similarity", ...lexicalScore.reasons]
+            : lexicalScore.reasons),
+          ...(graphScore ? ["graph_proximity"] : []),
+        ]),
+        heading: item.row.heading,
+        snippet: boundedSnippet(item.row.snippet, maxSnippetChars),
+        sortPath: item.row.notePath,
+      });
+    });
+    return { hits, paths: [...paths] };
+  }
+
   private checkFreshness(index: SemanticVaultIndex): Freshness {
-    return getSemanticIndexFreshness(this.app, this.getSettings(), index);
+    return getSemanticIndexFreshness(
+      this.app,
+      this.getSettings(),
+      index,
+      this.getEmbeddingProviderId(),
+    );
+  }
+
+  /** Identity recorded in the index; a provider without one is the Python helper. */
+  private getEmbeddingProviderId(): string {
+    return this.getEmbeddingProvider().id ?? PYTHON_FASTEMBED_PROVIDER_ID;
   }
 
   private async updateV2Index({
@@ -628,6 +862,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
             model: getSemanticModel(settings),
             dim: getSemanticDim(settings),
             promptPrefixes: embeddingPrefixFingerprintV1(getSemanticModel(settings)),
+            providerId: this.getEmbeddingProviderId(),
             chunking,
             indexedAt: this.now().toISOString(),
             notes,
@@ -685,6 +920,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
         model: getSemanticModel(settings),
         dim,
         promptPrefixes: embeddingPrefixFingerprintV1(getSemanticModel(settings)),
+        providerId: this.getEmbeddingProviderId(),
         chunking,
         indexedAt,
         notes,
@@ -792,7 +1028,7 @@ function buildIndexShards({
   rowVectors: number[][];
   folder: string;
   model: string;
-  dim: 256 | 512;
+  dim: number;
   indexedAt: string;
 }): SemanticIndexShardV2[] {
   const shards: SemanticIndexShardV2[] = [];
@@ -898,11 +1134,17 @@ export async function embedIndexDocuments({
   settings,
   documents,
   batchSize = SEMANTIC_EMBED_BATCH_SIZE,
+  signal,
+  priority = "background",
 }: {
   provider: SemanticEmbeddingProvider;
   settings: AgentSettings;
   documents: string[];
   batchSize?: number;
+  /** A stopped run skips batches still waiting in the provider queue. */
+  signal?: AbortSignal;
+  /** Index builds queue behind any interactive search; the live merge of a few changed notes is interactive. */
+  priority?: SemanticEmbeddingPriority;
 }): Promise<{ ok: true; vectors: number[][] } | { ok: false; code: string; message: string }> {
   if (documents.length === 0) {
     return { ok: true, vectors: [] };
@@ -916,11 +1158,14 @@ export async function embedIndexDocuments({
     const response = await provider.embed({
       model: getSemanticModel(settings),
       dim: getSemanticDim(settings),
+      matryoshka: getSemanticMatryoshka(settings),
       cacheDir: settings.semanticModelCacheDir || undefined,
       documents: batch,
       queries: [],
       queryPrefix: indexPrefixes.query,
       documentPrefix: indexPrefixes.document,
+      signal,
+      priority,
     });
     if (!response.ok || response.documents?.length !== batch.length) {
       return {
@@ -982,6 +1227,7 @@ function searchIndexChunks({
   graphPrior?: SemanticGraphPrior | null;
   maxSnippetChars: number;
   minScore?: number;
+  excludePaths?: Set<string>;
   cursor?: string | null;
 }): SemanticIndexSearchHit[] {
   const scored: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
@@ -1047,6 +1293,8 @@ async function searchIndexShards({
   minScore,
   cursor,
   graphPrior,
+  excludePaths,
+  liveHits,
 }: {
   graphPrior?: SemanticGraphPrior | null;
   app: App;
@@ -1059,11 +1307,16 @@ async function searchIndexShards({
   candidateLimit: number;
   minScore?: number;
   cursor: string | null;
+  /** Notes the index no longer describes; their rows are skipped. */
+  excludePaths?: Set<string>;
+  /** Freshly embedded rows for a few excluded notes, merged into the ranking. */
+  liveHits?: { hits: Array<SemanticIndexSearchHit & { sortPath: string }>; paths: string[] };
 }): Promise<{
   hits: SemanticIndexSearchHit[];
   candidateCount: number;
   nextCursor: string | null;
   timings: SemanticIndexSearchTimingsV1;
+  liveMergedPaths: string[];
 }> {
   const scored: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
   let candidateCount = 0;
@@ -1086,6 +1339,9 @@ async function searchIndexShards({
     for (let rowIndex = 0; rowIndex < shard.rows.length; rowIndex += 1) {
       const row = shard.rows[rowIndex];
       if (folder && !row.notePath.startsWith(`${folder}/`)) {
+        continue;
+      }
+      if (excludePaths?.has(row.notePath)) {
         continue;
       }
       const note = noteByPath.get(row.notePath);
@@ -1125,6 +1381,13 @@ async function searchIndexShards({
     }
     scoreMs += Math.max(0, Date.now() - scoreStartedAt);
   }
+  for (const hit of liveHits?.hits ?? []) {
+    if (minScore !== undefined && hit.score < minScore) {
+      continue;
+    }
+    candidateCount += 1;
+    pushBoundedHit(scored, hit, candidateLimit);
+  }
 
   const byPath = new Map<string, SemanticIndexSearchHit & { sortPath: string }>();
   for (const hit of scored.sort(compareHits)) {
@@ -1141,6 +1404,7 @@ async function searchIndexShards({
     candidateCount,
     nextCursor: nextOffset < allHits.length ? String(nextOffset) : null,
     timings: { decodeMs, scoreMs, rowsScored: candidateCount },
+    liveMergedPaths: liveHits?.paths ?? [],
   };
 }
 
@@ -1430,24 +1694,80 @@ export function getSemanticIndexFreshness(
   app: App,
   settings: AgentSettings,
   index: SemanticVaultIndex,
+  providerId: string = PYTHON_FASTEMBED_PROVIDER_ID,
 ): Freshness {
-  if (!isIndexCompatible(index, settings)) {
-    return { fresh: false, reason: "settings_changed" };
+  const staleness = assessSemanticIndexStalenessV1(app, settings, index, providerId);
+  if (staleness.incompatibleReason) {
+    return { fresh: false, reason: staleness.incompatibleReason };
+  }
+  if (staleness.missingPaths.length > 0) {
+    return { fresh: false, reason: "indexed_file_missing" };
+  }
+  if (staleness.changedPaths.length > 0) {
+    return { fresh: false, reason: "indexed_file_changed" };
+  }
+  if (staleness.unindexedPaths.length > 0) {
+    return { fresh: false, reason: "new_file_not_indexed" };
+  }
+  return { fresh: true };
+}
+
+/**
+ * Every way the index can disagree with the vault, in one pass. Reindex
+ * decisions read the first defect through {@link getSemanticIndexFreshness};
+ * search reads the whole list so it can work around drift instead of
+ * refusing.
+ */
+export function assessSemanticIndexStalenessV1(
+  app: App,
+  settings: AgentSettings,
+  index: SemanticVaultIndex,
+  providerId: string = PYTHON_FASTEMBED_PROVIDER_ID,
+): SemanticIndexStalenessV1 {
+  const none: SemanticIndexStalenessV1 = {
+    incompatibleReason: null,
+    changedPaths: [],
+    missingPaths: [],
+    unindexedPaths: [],
+  };
+  if (!isIndexCompatible(index, settings, providerId)) {
+    return { ...none, incompatibleReason: "settings_changed" };
   }
   if (!settings.semanticIndexPersistVectors) {
-    return { fresh: false, reason: "vectors_disabled" };
+    return { ...none, incompatibleReason: "vectors_disabled" };
+  }
+  const structural = structuralIndexDefect(app, index);
+  if (structural) {
+    return { ...none, incompatibleReason: structural };
   }
 
   const indexedByPath = new Map(index.notes.map((note) => [note.path, note]));
+  const changedPaths: string[] = [];
+  const missingPaths: string[] = [];
   for (const note of index.notes) {
     const file = app.vault.getFileByPath(note.path);
     if (!file) {
-      return { fresh: false, reason: "indexed_file_missing" };
+      missingPaths.push(note.path);
+      continue;
     }
     if (file.stat?.mtime !== note.mtime || file.stat?.size !== note.size) {
-      return { fresh: false, reason: "indexed_file_changed" };
+      changedPaths.push(note.path);
     }
   }
+  const unindexedPaths: string[] = [];
+  for (const file of getIndexableFiles(app, settings).slice(
+    0,
+    getIndexMaxFiles(settings),
+  )) {
+    if (!indexedByPath.has(file.path)) {
+      unindexedPaths.push(file.path);
+    }
+  }
+  return { incompatibleReason: null, changedPaths, missingPaths, unindexedPaths };
+}
+
+/** Defects in the stored vectors themselves; no per-note workaround exists. */
+function structuralIndexDefect(app: App, index: SemanticVaultIndex): string | null {
 
   if (index.version === 1) {
     for (const note of index.notes) {
@@ -1455,7 +1775,7 @@ export function getSemanticIndexFreshness(
       (note.chunks.length === 0 ||
         note.chunks.some((chunk) => chunk.vector.length !== index.dim))
     ) {
-      return { fresh: false, reason: "missing_vectors" };
+      return "missing_vectors";
     }
     }
   }
@@ -1463,30 +1783,21 @@ export function getSemanticIndexFreshness(
   if (index.version === 2) {
     for (const note of index.notes) {
       if (note.chunkCount === 0) {
-      return { fresh: false, reason: "missing_rows" };
+      return "missing_rows";
     }
   }
 
     if (index.shards.length === 0 && index.totalRows > 0) {
-      return { fresh: false, reason: "missing_shards" };
+      return "missing_shards";
     }
     for (const shard of index.shards) {
       if (shard.rowCount <= 0 || !app.vault.getFileByPath(shard.path)) {
-        return { fresh: false, reason: "missing_shards" };
+        return "missing_shards";
       }
     }
   }
 
-  for (const file of getIndexableFiles(app, settings).slice(
-    0,
-    getIndexMaxFiles(settings),
-  )) {
-    if (!indexedByPath.has(file.path)) {
-      return { fresh: false, reason: "new_file_not_indexed" };
-    }
-  }
-
-  return { fresh: true };
+  return null;
 }
 
 /**
@@ -1500,12 +1811,20 @@ export function getSemanticIndexFreshness(
  */
 const LEGACY_HARDCODED_PREFIX_FINGERPRINT = "search_query: |search_document: ";
 
-function isIndexCompatible(index: SemanticVaultIndex, settings: AgentSettings): boolean {
+function isIndexCompatible(
+  index: SemanticVaultIndex,
+  settings: AgentSettings,
+  providerId: string = PYTHON_FASTEMBED_PROVIDER_ID,
+): boolean {
   const chunking = getChunking(settings);
   const storedPrefixes =
     index.promptPrefixes ?? LEGACY_HARDCODED_PREFIX_FINGERPRINT;
+  // Every index written before providers carried an id came from the Python
+  // helper, so a missing id is that helper, not a wildcard.
+  const storedProvider = index.providerId ?? PYTHON_FASTEMBED_PROVIDER_ID;
   return (
     (index.version === INDEX_VERSION || index.version === LEGACY_INDEX_VERSION) &&
+    storedProvider === providerId &&
     // Embeddings built under one prefix pair are not comparable with those
     // built under another, so this invalidates a stored index exactly the way a
     // model change does.
@@ -1519,6 +1838,11 @@ function isIndexCompatible(index: SemanticVaultIndex, settings: AgentSettings): 
   );
 }
 
+/** Any width a catalogued or probed model actually produces; 256/512 was nomic's. */
+function isPositiveIntegerDim(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
 function isSemanticVaultIndex(value: unknown): value is SemanticVaultIndex {
   if (!isRecord(value)) {
     return false;
@@ -1526,7 +1850,7 @@ function isSemanticVaultIndex(value: unknown): value is SemanticVaultIndex {
   return (
     (value.version === INDEX_VERSION || value.version === LEGACY_INDEX_VERSION) &&
     typeof value.model === "string" &&
-    (value.dim === 256 || value.dim === 512) &&
+    isPositiveIntegerDim(value.dim) &&
     isRecord(value.chunking) &&
     typeof value.indexedAt === "string" &&
     Array.isArray(value.notes)
@@ -1539,7 +1863,7 @@ function isSemanticIndexShardV2(value: unknown): value is SemanticIndexShardV2 {
     value.version === INDEX_VERSION &&
     typeof value.id === "string" &&
     typeof value.model === "string" &&
-    (value.dim === 256 || value.dim === 512) &&
+    isPositiveIntegerDim(value.dim) &&
     typeof value.indexedAt === "string" &&
     Array.isArray(value.rows) &&
     typeof value.vectorsBase64 === "string"
@@ -1690,8 +2014,18 @@ function getSemanticModel(settings: AgentSettings): string {
   return settings.semanticEmbeddingModel.trim() || "nomic-ai/nomic-embed-text-v1.5-Q";
 }
 
-function getSemanticDim(settings: AgentSettings): 256 | 512 {
-  return settings.semanticEmbeddingDim === 256 ? 256 : 512;
+function getSemanticDim(settings: AgentSettings): number {
+  return resolveEffectiveEmbeddingDimV1(
+    getSemanticModel(settings),
+    settings.semanticEmbeddingDim,
+  ).dim;
+}
+
+function getSemanticMatryoshka(settings: AgentSettings): boolean {
+  return resolveEffectiveEmbeddingDimV1(
+    getSemanticModel(settings),
+    settings.semanticEmbeddingDim,
+  ).matryoshka;
 }
 
 function getIndexMaxFiles(settings: AgentSettings): number {

@@ -643,3 +643,69 @@ test("reflex classification yields the aborted fallback while the embedder is st
   assert.equal(lateCalls, 0);
   assert.equal(late.intent.reason, "run_aborted");
 });
+
+test("reflex embeds prototypes and the prompt with the index's prefixes and effective dimension", async () => {
+  // The prototypes used to be embedded bare while every document in the vault
+  // index carried the model's prefix; on nomic that is two input conventions
+  // compared against each other. Both calls must carry what the index carries.
+  const requests: Array<{
+    dim: number;
+    matryoshka?: boolean;
+    queryPrefix?: string;
+    documentPrefix?: string;
+  }> = [];
+  const recordingProvider: SemanticEmbeddingProvider = {
+    async embed(request) {
+      requests.push({
+        dim: request.dim,
+        matryoshka: request.matryoshka,
+        queryPrefix: request.queryPrefix,
+        documentPrefix: request.documentPrefix,
+      });
+      return embeddingProvider.embed(request);
+    },
+  };
+  const output = await new AgenticReflexController().evaluate(
+    input({
+      embeddingProvider: recordingProvider,
+      settings: {
+        ...reflexSettings,
+        semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
+        semanticEmbeddingDim: 256,
+      },
+    }),
+  );
+  assert.equal(output.intent.label, "semantic_vault_search");
+  assert.ok(requests.length >= 1);
+  for (const request of requests) {
+    assert.equal(request.queryPrefix, "search_query: ");
+    assert.equal(request.documentPrefix, "search_document: ");
+    assert.equal(request.dim, 256);
+    assert.equal(request.matryoshka, true);
+  }
+});
+
+test("reflex asks a non-Matryoshka model for its native width whatever the setting says", async () => {
+  const dims: number[] = [];
+  const flags: Array<boolean | undefined> = [];
+  const recordingProvider: SemanticEmbeddingProvider = {
+    async embed(request) {
+      dims.push(request.dim);
+      flags.push(request.matryoshka);
+      return embeddingProvider.embed(request);
+    },
+  };
+  await new AgenticReflexController().evaluate(
+    input({
+      embeddingProvider: recordingProvider,
+      settings: {
+        ...reflexSettings,
+        semanticEmbeddingModel: "BAAI/bge-small-en-v1.5",
+        semanticEmbeddingDim: 512,
+      },
+    }),
+  );
+  assert.ok(dims.length >= 1);
+  assert.ok(dims.every((dim) => dim === 384), JSON.stringify(dims));
+  assert.ok(flags.every((flag) => flag === false));
+});

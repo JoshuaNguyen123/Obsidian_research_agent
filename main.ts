@@ -53,6 +53,7 @@ import {
 import { createModelLatencyTracker } from "./src/model/modelLatencyTracker";
 import { probeToolCallBehavior } from "./src/model/toolCallBehavioralProbe";
 import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
+import { normalizeEmbeddingDimSettingV1 } from "./src/embeddings/embeddingModelCatalogV1";
 import {
   clearSemanticShardReadCache,
   createSemanticIndexService,
@@ -2475,8 +2476,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       settings.semanticEmbeddingModel.trim()
         ? settings.semanticEmbeddingModel.trim()
         : DEFAULT_SETTINGS.semanticEmbeddingModel;
-    settings.semanticEmbeddingDim =
-      settings.semanticEmbeddingDim === 256 ? 256 : 512;
+    settings.semanticEmbeddingDim = normalizeEmbeddingDimSettingV1(
+      settings.semanticEmbeddingDim,
+    );
     settings.semanticChunkMinTokens = clampIntegerSetting(
       settings.semanticChunkMinTokens,
       50,

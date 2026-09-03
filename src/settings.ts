@@ -1,5 +1,10 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import { resetAgentSettingsKeepingConnectionsV1 } from "./agent/settingsNormalize";
+import {
+  findEmbeddingModelSpecV1,
+  normalizeEmbeddingDimSettingV1,
+  resolveEffectiveEmbeddingDimV1,
+} from "./embeddings/embeddingModelCatalogV1";
 import type AgenticResearcherPlugin from "../main";
 import type { EmbeddingProbeResultV1 } from "./embeddings/embeddingProbe";
 import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
@@ -264,7 +269,7 @@ export interface AgentSettings {
    */
   semanticProfile?: SemanticProfilePreset;
   semanticEmbeddingModel: string;
-  semanticEmbeddingDim: 256 | 512;
+  semanticEmbeddingDim: number;
   semanticChunkMinTokens: number;
   semanticChunkTargetTokens: number;
   semanticChunkMaxTokens: number;
@@ -2119,22 +2124,59 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(semanticHost)
-      .setName("Semantic embedding dimension")
-      .setDesc(
-        "Matryoshka truncation dimension. Use 512 for quality or 256 for a smaller/faster search footprint.",
-      )
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("512", "512")
-          .addOption("256", "256")
-          .setValue(String(this.plugin.settings.semanticEmbeddingDim))
-          .onChange(async (value) => {
-            this.plugin.settings.semanticEmbeddingDim =
-              value === "256" ? 256 : 512;
-            await this.plugin.saveSettings();
-          }),
+    // The catalogue decides what the dimension setting can mean for the chosen
+    // model: a Matryoshka model offers truncation points, any other known model
+    // has exactly one width, and an unknown model takes whatever is typed and
+    // is checked by the "Test embedder" probe.
+    const dimSpec = findEmbeddingModelSpecV1(
+      this.plugin.settings.semanticEmbeddingModel,
+    );
+    const effectiveDim = resolveEffectiveEmbeddingDimV1(
+      this.plugin.settings.semanticEmbeddingModel,
+      this.plugin.settings.semanticEmbeddingDim,
+    );
+    const dimSetting = new Setting(semanticHost).setName(
+      "Semantic embedding dimension",
+    );
+    if (dimSpec && dimSpec.matryoshka) {
+      dimSetting
+        .setDesc(
+          `Matryoshka truncation for ${dimSpec.id}: smaller is faster to search and store, larger keeps more detail (native ${dimSpec.nativeDim}).`,
+        )
+        .addDropdown((dropdown) => {
+          for (const option of [256, 384, 512, 768, 1024]) {
+            if (option <= dimSpec.nativeDim) {
+              dropdown.addOption(String(option), String(option));
+            }
+          }
+          dropdown
+            .setValue(String(effectiveDim.dim))
+            .onChange(async (value) => {
+              this.plugin.settings.semanticEmbeddingDim =
+                normalizeEmbeddingDimSettingV1(value);
+              await this.plugin.saveSettings();
+            });
+        });
+    } else if (dimSpec) {
+      dimSetting.setDesc(
+        `${dimSpec.id} produces ${dimSpec.nativeDim}-dimension vectors and is not a Matryoshka model, so it cannot be truncated. The index is built at ${dimSpec.nativeDim}.`,
       );
+    } else {
+      dimSetting
+        .setDesc(
+          "Unknown model: enter the width of the vectors it produces. The Test embedder button verifies it before any index is built.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder(String(DEFAULT_SETTINGS.semanticEmbeddingDim))
+            .setValue(String(this.plugin.settings.semanticEmbeddingDim))
+            .onChange(async (value) => {
+              this.plugin.settings.semanticEmbeddingDim =
+                normalizeEmbeddingDimSettingV1(value);
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
 
     const semanticChunkSetting = new Setting(semanticHost)
       .setName("Semantic chunk tokens")

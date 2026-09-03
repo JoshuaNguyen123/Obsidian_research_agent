@@ -11,6 +11,7 @@ import { repairOllamaCloudBaseUrl } from "../model/cloudProviderPresets";
 import { DEFAULT_STREAM_REQUEST_TIMEOUT_MS } from "../model/requestTimeoutDefaults";
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
+import { normalizeEmbeddingDimSettingV1 } from "../embeddings/embeddingModelCatalogV1";
 
 export const SETTINGS_SCHEMA_VERSION = 5;
 
@@ -128,7 +129,7 @@ export interface NormalizableAgentSettings {
   speechActSemanticRescueMode: SpeechActSemanticRescueMode;
   semanticSearchEnabled: boolean;
   semanticEmbeddingModel: string;
-  semanticEmbeddingDim: 256 | 512;
+  semanticEmbeddingDim: number;
   semanticChunkMinTokens: number;
   semanticChunkTargetTokens: number;
   semanticChunkMaxTokens: number;
@@ -284,6 +285,9 @@ export function normalizeAgentSettings(
   } as NormalizableAgentSettings;
 
   merged.enableStreaming = coerceBoolean(merged.enableStreaming, true);
+  merged.semanticEmbeddingDim = normalizeEmbeddingDimSettingV1(
+    merged.semanticEmbeddingDim,
+  );
   merged.streamWritebackMode = coerceStreamWritebackMode(
     merged.streamWritebackMode,
   );

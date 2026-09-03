@@ -18,6 +18,7 @@ import type {
 } from "../embeddings/semanticIndexTypes";
 import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
 import { resolveEmbeddingPrefixesV1 } from "../embeddings/embeddingPrefixes";
+import { resolveEffectiveEmbeddingDimV1 } from "../embeddings/embeddingModelCatalogV1";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import { isVaultPathExcluded } from "./vaultExclusions";
 import { resolveSemanticSearchCapsForCompoundRun } from "../agent/setLooseCompoundAutonomy";
@@ -225,48 +226,21 @@ export const semanticSearchNotesTool: AgentTool = {
     let scored: ScoredChunk[] = [];
 
     if (context.semanticEmbeddingProvider && chunks.length > 0) {
-      const livePrefixes = resolveEmbeddingPrefixesV1(getSemanticModel(context));
-      // A stopped run falls through to lexical scoring instead of waiting
-      // out the embedding helper (which cannot cancel an in-flight request).
-      const response = await raceAbort(
-        context.semanticEmbeddingProvider.embed({
-          model: getSemanticModel(context),
-          dim: getSemanticDim(context),
-          cacheDir: context.settings.semanticModelCacheDir || undefined,
-          documents: chunks.map((chunk) => chunk.embeddingText),
-          queries: [query],
-          queryPrefix: livePrefixes.query,
-          documentPrefix: livePrefixes.document,
-          signal: context.abortSignal,
-        }),
-        context.abortSignal,
-      ).catch((error: unknown): SemanticEmbeddingResponse => {
-        if (context.abortSignal?.aborted) {
-          return {
-            ok: false,
-            model: getSemanticModel(context),
-            dim: getSemanticDim(context),
-            code: "aborted",
-            message: "The run was stopped before the embedding helper answered.",
-          };
-        }
-        throw error;
+      const embedded = await embedLiveChunks({
+        context,
+        query,
+        documents: chunks.map((chunk) => chunk.embeddingText),
       });
-
-      if (
-        response.ok &&
-        response.documents?.length === chunks.length &&
-        response.queries?.length === 1
-      ) {
+      if (embedded.ok) {
         scored = scoreSemanticChunks({
           chunks,
-          queryVector: response.queries[0],
-          documentVectors: response.documents,
+          queryVector: embedded.queryVector,
+          documentVectors: embedded.documentVectors,
           queryTerms,
         });
       } else {
         fallbackUsed = true;
-        fallbackReason = response.code ?? "semantic_embedding_failed";
+        fallbackReason = embedded.code;
       }
     }
 
@@ -478,7 +452,8 @@ async function searchSemanticIndexFirst({
     operation: "semantic_search_notes",
     mode: "indexed_semantic",
     indexUsed: true,
-    indexFresh: true,
+    indexFresh: search.indexFresh,
+    ...(search.stale ? { stale: search.stale } : {}),
     indexedAt: search.indexedAt,
     model: search.model,
     dim: search.dim,
@@ -500,7 +475,18 @@ async function searchSemanticIndexFirst({
       skipped: Math.max(0, (search.candidateCount ?? search.results.length) - search.results.length),
       truncated: Boolean(search.nextCursor),
       fallbackUsed: false,
-      reasons: ["fresh_persisted_semantic_index"],
+      // Editing a note used to fail the whole indexed search and route the
+      // tool to the 300-note live path; now drifted notes are excluded (or
+      // re-embedded live) and the coverage record says exactly which.
+      reasons: search.stale
+        ? [
+            "persisted_semantic_index_with_stale_notes",
+            `changed_notes_excluded:${search.stale.changedPaths.length - search.stale.liveMergedPaths.length}`,
+            `changed_notes_live_merged:${search.stale.liveMergedPaths.length}`,
+            `missing_notes_excluded:${search.stale.missingPaths.length}`,
+            `unindexed_notes:${search.stale.unindexedPaths.length}`,
+          ]
+        : ["fresh_persisted_semantic_index"],
     }),
     // Where this search's wall clock actually went. The tool metric records a
     // single duration; only this split says whether it was shard decode or
@@ -937,6 +923,81 @@ function normalizeChunkingOptions(
   return { minTokens, targetTokens, maxTokens, overlapTokens };
 }
 
+/**
+ * The live path used to send every chunk of up to 300 notes in ONE request:
+ * exactly the shape that produced `output_too_large` and 180 s helper
+ * timeouts, and which the index path already avoided with bounded batches.
+ * Documents now go in batches of `LIVE_EMBED_BATCH_SIZE`, the query in its
+ * own request, all marked interactive so a rebuild in progress cannot delay
+ * them. A stopped run falls through to lexical scoring instead of waiting
+ * out the helper (which cannot cancel an in-flight request).
+ */
+export const LIVE_EMBED_BATCH_SIZE = 64;
+
+async function embedLiveChunks({
+  context,
+  query,
+  documents,
+}: {
+  context: ToolExecutionContext;
+  query: string;
+  documents: string[];
+}): Promise<
+  | { ok: true; queryVector: number[]; documentVectors: number[][] }
+  | { ok: false; code: string }
+> {
+  const provider = context.semanticEmbeddingProvider;
+  if (!provider) {
+    return { ok: false, code: "semantic_embedding_provider_unavailable" };
+  }
+  const model = getSemanticModel(context);
+  const dim = getSemanticDim(context);
+  const matryoshka = getSemanticMatryoshka(context);
+  const prefixes = resolveEmbeddingPrefixesV1(model);
+  const send = (input: { documents: string[]; queries: string[] }) =>
+    raceAbort(
+      provider.embed({
+        model,
+        dim,
+        matryoshka,
+        cacheDir: context.settings.semanticModelCacheDir || undefined,
+        documents: input.documents,
+        queries: input.queries,
+        queryPrefix: prefixes.query,
+        documentPrefix: prefixes.document,
+        signal: context.abortSignal,
+        priority: "interactive",
+      }),
+      context.abortSignal,
+    ).catch((error: unknown): SemanticEmbeddingResponse => {
+      if (context.abortSignal?.aborted) {
+        return {
+          ok: false,
+          model,
+          dim,
+          code: "aborted",
+          message: "The run was stopped before the embedding helper answered.",
+        };
+      }
+      throw error;
+    });
+
+  const queryResponse = await send({ documents: [], queries: [query] });
+  if (!queryResponse.ok || queryResponse.queries?.length !== 1) {
+    return { ok: false, code: queryResponse.code ?? "semantic_embedding_failed" };
+  }
+  const documentVectors: number[][] = [];
+  for (let start = 0; start < documents.length; start += LIVE_EMBED_BATCH_SIZE) {
+    const batch = documents.slice(start, start + LIVE_EMBED_BATCH_SIZE);
+    const response = await send({ documents: batch, queries: [] });
+    if (!response.ok || response.documents?.length !== batch.length) {
+      return { ok: false, code: response.code ?? "semantic_embedding_failed" };
+    }
+    documentVectors.push(...response.documents);
+  }
+  return { ok: true, queryVector: queryResponse.queries[0], documentVectors };
+}
+
 function getSemanticModel(context: ToolExecutionContext): string {
   return (
     context.settings.semanticEmbeddingModel?.trim() ||
@@ -944,8 +1005,18 @@ function getSemanticModel(context: ToolExecutionContext): string {
   );
 }
 
-function getSemanticDim(context: ToolExecutionContext): 256 | 512 {
-  return context.settings.semanticEmbeddingDim === 256 ? 256 : DEFAULT_SEMANTIC_DIM;
+function getSemanticDim(context: ToolExecutionContext): number {
+  return resolveEffectiveEmbeddingDimV1(
+    getSemanticModel(context),
+    context.settings.semanticEmbeddingDim ?? DEFAULT_SEMANTIC_DIM,
+  ).dim;
+}
+
+function getSemanticMatryoshka(context: ToolExecutionContext): boolean {
+  return resolveEffectiveEmbeddingDimV1(
+    getSemanticModel(context),
+    context.settings.semanticEmbeddingDim ?? DEFAULT_SEMANTIC_DIM,
+  ).matryoshka;
 }
 
 function normalizeOptionalFolder(folder: string | undefined): string | null {

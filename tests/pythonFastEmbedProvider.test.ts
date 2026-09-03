@@ -15,7 +15,9 @@ const SETTINGS = {
 
 const REQUEST: SemanticEmbeddingRequest = {
   model: "nomic-ai/nomic-embed-text-v1.5-Q",
-  dim: 512,
+  // The fake helper answers with two-dimensional vectors; the provider now
+  // refuses any response whose width differs from the request.
+  dim: 2,
   documents: ["persistent helper doc"],
   queries: ["persistent helper query"],
 };
@@ -447,4 +449,127 @@ test("a queued embed whose run is already stopped never reaches the helper", asy
   assert.equal(result.code, "aborted");
   assert.equal(spawned.length, 0, "no helper was spawned for a stopped run");
   provider.dispose?.();
+});
+
+test("the provider names itself so an index can record which runtime built it", () => {
+  const { runtime } = createFakeRuntime();
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  try {
+    assert.equal(provider.id, "python-fastembed");
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("a vector of the wrong width is refused as dim_mismatch instead of reaching the index", async () => {
+  // A non-Matryoshka model configured with a dimension other than its native
+  // one comes back at its native width. The old helper truncated it into noise
+  // or threw; now the mismatch is named so it is fixed in settings.
+  const { runtime } = createFakeRuntime((child) => {
+    child.onWrite = (line: string) => {
+      const request = JSON.parse(line) as { id: string; model: string; dim: number };
+      child.emitStdout(
+        JSON.stringify({
+          id: request.id,
+          ok: true,
+          model: request.model,
+          dim: 384,
+          documents: [[0.1, 0.2, 0.3]],
+          queries: [[0.3, 0.2, 0.1]],
+        }) + "\n",
+      );
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  try {
+    const result = await provider.embed({
+      ...REQUEST,
+      model: "BAAI/bge-small-en-v1.5",
+      dim: 512,
+      matryoshka: false,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "dim_mismatch");
+    assert.equal(result.dim, 3);
+    assert.match(result.message ?? "", /returned 3-dimension vectors but 512 was requested/);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("the matryoshka flag is forwarded to the helper verbatim", async () => {
+  const { runtime, spawned } = createFakeRuntime();
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  try {
+    await provider.embed({ ...REQUEST, dim: 2, matryoshka: false });
+    await provider.embed({ ...REQUEST, dim: 2, matryoshka: true });
+    await provider.embed({ ...REQUEST, dim: 2 });
+    const bodies = spawned[0].writes.map((line) => JSON.parse(line) as { matryoshka?: boolean });
+    assert.equal(bodies[0].matryoshka, false);
+    assert.equal(bodies[1].matryoshka, true);
+    // Omitted stays omitted: the helper treats absence as the pre-flag
+    // behaviour, which is what every request carried before the flag existed.
+    assert.equal("matryoshka" in bodies[2], false);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("a queued interactive request runs before queued background batches", async () => {
+  // An index rebuild queues dozens of background batches; a search that
+  // arrives while one is in flight must run as soon as it settles, not after
+  // every batch. Never preempts the request the helper is already executing.
+  const order: string[] = [];
+  let release: (() => void) | null = null;
+  const { runtime } = createFakeRuntime((child) => {
+    child.onWrite = (line: string) => {
+      const request = JSON.parse(line) as { id: string; model: string; dim: number; documents: string[] };
+      const label = request.documents[0];
+      const answer = () => {
+        order.push(label);
+        child.emitStdout(
+          JSON.stringify({ id: request.id, ok: true, model: request.model, dim: request.dim, documents: [[1, 0]], queries: [] }) + "\n",
+        );
+      };
+      if (label === "bg-1") {
+        // Hold the first background batch so the others queue behind it.
+        release = answer;
+      } else {
+        answer();
+      }
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, { loadRuntime: () => runtime });
+  try {
+    const request = (label: string, priority?: "interactive" | "background") => ({
+      ...REQUEST,
+      documents: [label],
+      queries: [],
+      ...(priority ? { priority } : {}),
+    });
+    const bg1 = provider.embed(request("bg-1", "background"));
+    const bg2 = provider.embed(request("bg-2", "background"));
+    const bg3 = provider.embed(request("bg-3", "background"));
+    // Wait until bg-1 is actually in flight (its write is recorded), then queue
+    // the interactive search.
+    await sleep(10);
+    const search = provider.embed(request("search"));
+    const legacy = provider.embed(request("legacy-default-is-interactive"));
+    await sleep(10);
+    // Read through a fresh binding: the closure assignment above is invisible
+    // to control-flow narrowing, which otherwise types `release` as never here.
+    const fire = release as (() => void) | null;
+    assert.ok(fire, "bg-1 must be in flight");
+    fire();
+    await Promise.all([bg1, bg2, bg3, search, legacy]);
+    assert.deepEqual(order, ["bg-1", "search", "legacy-default-is-interactive", "bg-2", "bg-3"]);
+  } finally {
+    provider.dispose?.();
+  }
 });
