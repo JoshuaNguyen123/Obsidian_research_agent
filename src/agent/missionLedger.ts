@@ -33,6 +33,11 @@ import {
   type ContinuationHandoffV1,
 } from "./continuationMemory";
 import type { ReflexCheckpointReceiptV1 } from "./reflex/types";
+import {
+  applyPluginVersionStampIfMissing,
+  normalizePluginVersionStamp,
+  readPluginVersionStampFromHost,
+} from "./pluginVersionStamp";
 
 const MAX_CLAIM_PASSAGES = 64;
 
@@ -218,6 +223,13 @@ export interface MissionLedger {
    * written before this field; recover from expectedTools / route instead.
    */
   currentNoteWriteKind?: CurrentNoteWriteKindV1;
+  /**
+   * Secret-free plugin build id from `manifest.version`. Optional so ledgers
+   * written before this field still parse (`pluginVersion` omitted / null).
+   */
+  pluginVersion?: string;
+  /** Secret-free Obsidian minimum from `manifest.minAppVersion`. */
+  minAppVersion?: string;
 }
 
 export const CURRENT_NOTE_WRITE_KINDS_V1 = [
@@ -325,6 +337,9 @@ export interface MissionLedgerSummary {
   };
   /** Operational projection retained for Run Details/live attestation. */
   orchestrator?: OrchestratorSnapshotV1;
+  /** Secret-free plugin build id when the host stamped this run. */
+  pluginVersion?: string;
+  minAppVersion?: string;
   iterationCount: number;
   progressScore: number;
   stalledCount: number;
@@ -339,6 +354,8 @@ export function createMissionLedger({
   loopBudget,
   researchPlan,
   currentNoteWriteKind,
+  pluginVersion,
+  minAppVersion,
   now = new Date(),
 }: {
   runId: string;
@@ -347,6 +364,8 @@ export function createMissionLedger({
   loopBudget: LoopBudgetPlan;
   researchPlan?: ResearchPlan | null;
   currentNoteWriteKind?: CurrentNoteWriteKindV1;
+  pluginVersion?: string;
+  minAppVersion?: string;
   now?: Date;
 }): MissionLedger {
   const timestamp = now.toISOString();
@@ -430,6 +449,7 @@ export function createMissionLedger({
     ...(isCurrentNoteWriteKindV1(currentNoteWriteKind)
       ? { currentNoteWriteKind }
       : {}),
+    ...normalizePluginVersionStamp({ pluginVersion, minAppVersion }),
   };
 }
 
@@ -477,11 +497,15 @@ export function createPrePlanningAnchorLedger({
   runId,
   mission,
   targetNotePath,
+  pluginVersion,
+  minAppVersion,
   now = new Date(),
 }: {
   runId: string;
   mission: string;
   targetNotePath?: string | null;
+  pluginVersion?: string;
+  minAppVersion?: string;
   now?: Date;
 }): MissionLedger {
   const ledger = createMissionLedger({
@@ -495,6 +519,8 @@ export function createPrePlanningAnchorLedger({
       expectedTools: [],
       stopWhenSatisfied: false,
     },
+    pluginVersion,
+    minAppVersion,
     now,
   });
   ledger.milestones = [
@@ -1010,6 +1036,13 @@ export function summarizeMissionLedger(
   if (ledger.lastMeaningfulAction) {
     summary.lastMeaningfulAction = ledger.lastMeaningfulAction;
   }
+  const versionStamp = normalizePluginVersionStamp(ledger);
+  if (versionStamp.pluginVersion) {
+    summary.pluginVersion = versionStamp.pluginVersion;
+  }
+  if (versionStamp.minAppVersion) {
+    summary.minAppVersion = versionStamp.minAppVersion;
+  }
   return summary;
 }
 
@@ -1023,6 +1056,10 @@ export async function writeMissionLedger(
 
   const vault = context.app.vault;
   const requestedLedger = cloneMissionLedger(ledger);
+  applyPluginVersionStampIfMissing(
+    requestedLedger,
+    readPluginVersionStampFromHost(context),
+  );
   return withSerializedRunWrite(vault, ledger.runId, async () => {
     const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
     const path = getMissionLedgerPath(requestedLedger.runId);
@@ -1061,6 +1098,7 @@ export async function writeMissionLedger(
       await vault.create(path, content);
       ledger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
       ledger.revision = Math.max(ledger.revision, requestedLedger.revision);
+      applyPluginVersionStampIfMissing(ledger, requestedLedger);
       return {
         path,
         bytesWritten: getByteLength(content),
@@ -1085,6 +1123,7 @@ export async function writeMissionLedger(
     });
     ledger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
     ledger.revision = Math.max(ledger.revision, requestedLedger.revision);
+    applyPluginVersionStampIfMissing(ledger, requestedLedger);
     return {
       path,
       bytesWritten: getByteLength(block),
@@ -1224,6 +1263,8 @@ export function formatMissionLedgerBlock(ledger: MissionLedger): string {
     "",
     "### Mission Summary",
     `- Status: ${ledger.status}`,
+    `- Plugin version: ${ledger.pluginVersion ?? "unspecified"}`,
+    `- Min app version: ${ledger.minAppVersion ?? "unspecified"}`,
     `- Route: ${ledger.route}`,
     `- Expected tools: ${ledger.loopBudget.expectedTools.join(", ") || "none"}`,
     `- Evidence: ${ledger.evidence.length}`,
@@ -1401,6 +1442,7 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
     ...(isCurrentNoteWriteKindV1(value.currentNoteWriteKind)
       ? { currentNoteWriteKind: value.currentNoteWriteKind }
       : {}),
+    ...normalizePluginVersionStamp(value),
   };
 }
 

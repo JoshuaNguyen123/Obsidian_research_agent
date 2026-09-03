@@ -7,6 +7,10 @@ import {
   type MissionLedger,
 } from "./missionLedger";
 import {
+  applyPluginVersionStampIfMissing,
+  readPluginVersionStampFromHost,
+} from "./pluginVersionStamp";
+import {
   createMissionRuntimeSnapshot,
   readMissionRuntimeSnapshotByRunId,
   writeMissionRuntimeSnapshot,
@@ -35,6 +39,7 @@ export async function seedDurableChildRun(
   input: DurableChildSeedInput,
 ): Promise<void> {
   const now = input.now ?? context.now?.() ?? new Date();
+  const versionStamp = readPluginVersionStampFromHost(context);
   const priorLedger = input.parentSegmentId
     ? (await readMissionLedgerByRunId(context, input.parentSegmentId))?.ledger
     : undefined;
@@ -61,7 +66,9 @@ export async function seedDurableChildRun(
           stopWhenSatisfied: true,
         },
         now,
+        ...versionStamp,
       });
+  applyPluginVersionStampIfMissing(ledger, versionStamp);
   const ledgerWrite = await writeMissionLedger(context, ledger);
   if (!ledgerWrite) {
     throw new Error("Unable to persist the durable child mission ledger.");
@@ -93,6 +100,14 @@ export async function seedDurableChildRun(
     ],
     createdAt: now,
     updatedAt: now,
+    pluginVersion:
+      versionStamp.pluginVersion ??
+      priorRuntime?.pluginVersion ??
+      priorLedger?.pluginVersion,
+    minAppVersion:
+      versionStamp.minAppVersion ??
+      priorRuntime?.minAppVersion ??
+      priorLedger?.minAppVersion,
   });
   const snapshotWrite = await writeMissionRuntimeSnapshot(context, snapshot);
   if (!snapshotWrite) {

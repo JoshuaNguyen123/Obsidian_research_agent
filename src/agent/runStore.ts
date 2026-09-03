@@ -11,6 +11,11 @@ import {
 } from "./evidenceConflicts";
 import type { MissionEvidence } from "./missionLedger";
 import {
+  applyPluginVersionStampIfMissing,
+  normalizePluginVersionStamp,
+  readPluginVersionStampFromHost,
+} from "./pluginVersionStamp";
+import {
   normalizeMissionScorecard,
   type MissionScorecardV1,
 } from "./missionScorecard";
@@ -348,6 +353,12 @@ export interface MissionRuntimeSnapshotV2 {
    */
   missionScorecard?: MissionScorecardV1;
   notes: string[];
+  /**
+   * Secret-free plugin build id from `manifest.version`. Optional so snapshots
+   * written before this field still parse.
+   */
+  pluginVersion?: string;
+  minAppVersion?: string;
 }
 
 export interface MissionRuntimeSnapshotWriteResult {
@@ -537,6 +548,8 @@ export interface CreateMissionRuntimeSnapshotInput {
   evidenceConflicts?: EvidenceConflict[] | null;
   missionScorecard?: MissionScorecardV1 | null;
   notes?: string[];
+  pluginVersion?: string;
+  minAppVersion?: string;
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -569,6 +582,8 @@ export function createMissionRuntimeSnapshot({
   evidenceConflicts,
   missionScorecard,
   notes = [],
+  pluginVersion,
+  minAppVersion,
   createdAt = new Date(),
   updatedAt = createdAt,
 }: CreateMissionRuntimeSnapshotInput): MissionRuntimeSnapshotV2 {
@@ -634,6 +649,7 @@ export function createMissionRuntimeSnapshot({
       : {}),
     ...(normalizedScorecard ? { missionScorecard: normalizedScorecard } : {}),
     notes: notes.slice(-32).map((note) => note.slice(0, 2000)),
+    ...normalizePluginVersionStamp({ pluginVersion, minAppVersion }),
   };
 }
 
@@ -729,6 +745,7 @@ export function normalizeMissionRuntimeSnapshot(
     notes: getStringArray(value.notes)
       .slice(-32)
       .map((note) => note.slice(0, 2000)),
+    ...normalizePluginVersionStamp(value),
   };
 }
 
@@ -887,6 +904,11 @@ async function persistMissionRuntimeSnapshotUnlocked(
 
   requested.revision = Math.max(requested.revision, persistedRevision) + 1;
   requested.updatedAt = (context.now?.() ?? new Date()).toISOString();
+  applyPluginVersionStampIfMissing(
+    requested,
+    readPluginVersionStampFromHost(context),
+  );
+  applyPluginVersionStampIfMissing(revisionTarget, requested);
   const block = formatMissionRuntimeSnapshotBlock(requested);
 
   if (!file) {

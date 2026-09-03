@@ -126,6 +126,13 @@ export interface ToolExecutionContext {
    */
   researchPackEligible?: boolean;
   runId?: string;
+  /**
+   * Secret-free plugin build id from `manifest.version`. Hosts should set this
+   * so persisted mission ledgers and runtime snapshots can name the build.
+   */
+  pluginVersion?: string;
+  /** Secret-free Obsidian minimum from `manifest.minAppVersion`. */
+  minAppVersion?: string;
   /** Host-verified durable root shared by continuation segments. */
   rootMissionId?: string;
   operationId?: string;
