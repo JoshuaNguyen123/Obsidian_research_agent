@@ -425,6 +425,7 @@ import {
   rememberVerifiedMermaidReadResult,
   rememberVerifiedWorkspaceReadResult,
   resolveSingleNamedTrustedRepositoryProfileKey,
+  shouldAcceptHeldFinalProjectionCandidateV1,
   shouldFinalizeVerifiedHostExportAfterToolUse,
   shouldRequestStreamingFinalProjection,
   verifiedWorkspaceReadKey,
@@ -1183,6 +1184,7 @@ export {
   receiptProvesWorkspaceContentChangeV1,
   rememberVerifiedWorkspaceReadResult,
   resolveSingleNamedTrustedRepositoryProfileKey,
+  shouldAcceptHeldFinalProjectionCandidateV1,
   shouldFinalizeVerifiedHostExportAfterToolUse,
   shouldRequestStreamingFinalProjection,
 } from "./agent/verifiedWorkspaceBinding";
@@ -24476,6 +24478,51 @@ export async function runAgentMission({
       }
       if (isRepeatedToolBudgetSpent()) {
         await stopRepeatedToolBudget();
+        return;
+      }
+      const heldFinalNode =
+        (missionGraphSession?.graph ?? missionGraph)?.nodes.final;
+      const heldFinalAcceptance = lastFinalOutput.trim()
+        ? evaluateCurrentAcceptance(lastFinalOutput)
+        : null;
+      if (
+        shouldAcceptHeldFinalProjectionCandidateV1({
+          loopAction: loopDecision.action,
+          graphFinalOnly: missionGraphFinalSynthesisOnly,
+          heldCandidate: lastFinalOutput,
+          acceptanceMissing: heldFinalAcceptance?.missing ?? [],
+          hasReadyToollessFinalNode:
+            Boolean(heldFinalNode) &&
+            (heldFinalNode.status === "ready" ||
+              heldFinalNode.status === "queued" ||
+              heldFinalNode.status === "running") &&
+            heldFinalNode.allowedTools.length === 0,
+          setLooseDeliveryStillUnpaid,
+          pendingRequiredWriteCount:
+            pendingRequiredWriteToolsAfterToolUse.length,
+        })
+      ) {
+        events.onStatus?.(
+          "Held final draft pays remaining projection debt; closing the run.",
+        );
+        events.onTrace?.({
+          id: `held-final-projection-accepted-${step}`,
+          kind: "verification",
+          step,
+          message:
+            "Accepted the held final-projection candidate instead of reopening a set-loose tool frontier.",
+          outputPreview: {
+            missing: heldFinalAcceptance?.missing ?? [],
+            graph_final_only: missionGraphFinalSynthesisOnly,
+            payloadFingerprint: hashOperationInput(lastFinalOutput),
+          },
+        });
+        emitDirectAssistantAnswer(
+          lastFinalOutput,
+          events,
+          runPlan.requiresEnglishGuard,
+        );
+        await finishRun("final", lastStep, stepLimit);
         return;
       }
       events.onStatus?.(
