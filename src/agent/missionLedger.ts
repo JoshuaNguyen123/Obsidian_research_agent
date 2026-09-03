@@ -213,6 +213,78 @@ export interface MissionLedger {
    * return after reload; the run remains in Agent Runs for inspection.
    */
   userDismissedAt?: string;
+  /**
+   * Additive current-note write kind for resume splicing. Absent on ledgers
+   * written before this field; recover from expectedTools / route instead.
+   */
+  currentNoteWriteKind?: CurrentNoteWriteKindV1;
+}
+
+export const CURRENT_NOTE_WRITE_KINDS_V1 = [
+  "append",
+  "replace",
+  "edit",
+] as const;
+export type CurrentNoteWriteKindV1 = (typeof CURRENT_NOTE_WRITE_KINDS_V1)[number];
+
+export function isCurrentNoteWriteKindV1(
+  value: unknown,
+): value is CurrentNoteWriteKindV1 {
+  return (
+    value === "append" || value === "replace" || value === "edit"
+  );
+}
+
+export function currentNoteWriteToolNameV1(
+  kind: CurrentNoteWriteKindV1,
+): string {
+  if (kind === "replace") {
+    return "replace_current_file";
+  }
+  if (kind === "edit") {
+    return "edit_current_section";
+  }
+  return "append_to_current_file";
+}
+
+/**
+ * Recover the current-note write kind from an explicit field, then expected
+ * tools, then a streaming/direct writeback route suffix. Defaults to append
+ * so older ledgers keep their historical heal.
+ */
+export function resolveCurrentNoteWriteKindV1(input: {
+  writeKind?: unknown;
+  expectedTools?: readonly string[];
+  route?: string;
+}): CurrentNoteWriteKindV1 {
+  if (isCurrentNoteWriteKindV1(input.writeKind)) {
+    return input.writeKind;
+  }
+  const tools = input.expectedTools ?? [];
+  if (tools.includes("replace_current_file")) {
+    return "replace";
+  }
+  if (tools.includes("edit_current_section")) {
+    return "edit";
+  }
+  if (tools.includes("append_to_current_file")) {
+    return "append";
+  }
+  const routed =
+    /(?:streaming_writeback|direct_current_note_writeback):(append|replace|edit)/.exec(
+      input.route ?? "",
+    )?.[1];
+  return isCurrentNoteWriteKindV1(routed) ? routed : "append";
+}
+
+export function resolveLedgerCurrentNoteWriteKind(
+  ledger: Pick<MissionLedger, "currentNoteWriteKind" | "route" | "loopBudget">,
+): CurrentNoteWriteKindV1 {
+  return resolveCurrentNoteWriteKindV1({
+    writeKind: ledger.currentNoteWriteKind,
+    expectedTools: ledger.loopBudget.expectedTools,
+    route: ledger.route,
+  });
 }
 
 export interface MissionLedgerWriteResult {
@@ -266,6 +338,7 @@ export function createMissionLedger({
   route,
   loopBudget,
   researchPlan,
+  currentNoteWriteKind,
   now = new Date(),
 }: {
   runId: string;
@@ -273,6 +346,7 @@ export function createMissionLedger({
   route: string;
   loopBudget: LoopBudgetPlan;
   researchPlan?: ResearchPlan | null;
+  currentNoteWriteKind?: CurrentNoteWriteKindV1;
   now?: Date;
 }): MissionLedger {
   const timestamp = now.toISOString();
@@ -353,6 +427,9 @@ export function createMissionLedger({
     lastSafeStep: 0,
     continuationCommand: getContinuationCommand(runId),
     reflexCheckpoints: [],
+    ...(isCurrentNoteWriteKindV1(currentNoteWriteKind)
+      ? { currentNoteWriteKind }
+      : {}),
   };
 }
 
@@ -1320,6 +1397,9 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
     ...(typeof value.userDismissedAt === "string" &&
     Number.isFinite(Date.parse(value.userDismissedAt))
       ? { userDismissedAt: value.userDismissedAt }
+      : {}),
+    ...(isCurrentNoteWriteKindV1(value.currentNoteWriteKind)
+      ? { currentNoteWriteKind: value.currentNoteWriteKind }
       : {}),
   };
 }

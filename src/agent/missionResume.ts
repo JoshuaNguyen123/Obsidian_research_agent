@@ -3,6 +3,8 @@ import {
   isUserDismissedMissionLedger,
   readLatestMissionLedger,
   readMissionLedgerByRunId,
+  resolveLedgerCurrentNoteWriteKind,
+  type CurrentNoteWriteKindV1,
   type MissionLedger,
 } from "./missionLedger";
 import {
@@ -34,6 +36,8 @@ export interface MissionResumePlan {
   continuationCommand: string;
   restoredEvidenceCount: number;
   proofDebt: ProofDebt;
+  /** Recovered current-note write kind so resume splice is not hardcoded append. */
+  currentNoteWriteKind: CurrentNoteWriteKindV1;
 }
 
 export function hasMissionResumeIntent(prompt: string): boolean {
@@ -156,6 +160,7 @@ export function buildMissionResumePlan(ledger: MissionLedger): MissionResumePlan
     continuationCommand: ledger.continuationCommand || `continue run ${ledger.runId}`,
     restoredEvidenceCount: ledger.evidence.length,
     proofDebt,
+    currentNoteWriteKind: resolveLedgerCurrentNoteWriteKind(ledger),
   };
 }
 
