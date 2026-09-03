@@ -562,8 +562,11 @@ test("a queued interactive request runs before queued background batches", async
     const search = provider.embed(request("search"));
     const legacy = provider.embed(request("legacy-default-is-interactive"));
     await sleep(10);
-    assert.ok(release, "bg-1 must be in flight");
-    release!();
+    // Read through a fresh binding: the closure assignment above is invisible
+    // to control-flow narrowing, which otherwise types `release` as never here.
+    const fire = release as (() => void) | null;
+    assert.ok(fire, "bg-1 must be in flight");
+    fire();
     await Promise.all([bg1, bg2, bg3, search, legacy]);
     assert.deepEqual(order, ["bg-1", "search", "legacy-default-is-interactive", "bg-2", "bg-3"]);
   } finally {
