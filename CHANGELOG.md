@@ -29,7 +29,7 @@ All notable changes to Agentic Researcher are documented here.
 - **Disk time is named in the wall-clock line.** Durable run-note writes, mission-graph patch transactions, and prompt compaction are attributed as `host_work` metrics, and the Run Details wall-clock line appends `host work …` with a per-phase split when anything was attributed.
 - **The Agent Runs retention sweep no longer reads every run note at layout-ready.** It counts notes older than the retention cutoff first and reads nothing when none can be pruned (an active vault of recent runs), reads only the aged notes otherwise, prefers the cache-backed read, and yields between batches.
 - **Research planning asks the utility model two questions at once.** The starting-effort assist and the subquestion assist depend only on the deterministic plan, so they run concurrently instead of back to back; the effort verdict is still applied first and an explicit closed source set still skips the subquestion assist.
-- **Developer latency:** the unit runner drops its undocumented `--test-concurrency=1` pin (bounded parallelism; 7.9 min → about 4.5–5.5 min wall clock) and the post-test dashboard skips regeneration when nothing changed. README states the real minimum Obsidian version (1.11.4).
+- **Developer latency:** the unit runner drops its undocumented `--test-concurrency=1` pin (bounded parallelism) and the post-test dashboard skips regeneration when nothing changed; together with the run-note persistence work below, the full suite fell from 7.9 min to about 1.5–3 min wall clock (4,507 tests; the runner-heavy tests were dominated by run-note persist cost). README states the real minimum Obsidian version (1.11.4).
 
 
 ## [0.4.0] — unified desktop plugin
