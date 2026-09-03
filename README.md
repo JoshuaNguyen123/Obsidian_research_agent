@@ -53,6 +53,57 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 The recommended model is `glm-5.3-flash:cloud`. The eval record (`docs/eval/kpi-dashboard.md`, generated 2026-09-03T01:40:14.084Z from 194 product rows) measures it at **83.3% green** (95/114 runs) and **92.9% tool-call success** (1002/1078 succeeded across 110 rows with tool data). `deepseek-v4-pro` is **55.7% green** (39/70) and **47.1% tool-call success** (65/138 across 4 tool-bearing rows). Cheaper models still fail composed journeys: `minimax-m3:cloud` measured **33.3% green** (2/6). Research is the mature path; complex multi-stage code work is still being hardened.
 
+## What this plugin executes and writes
+
+This section is for community-plugin reviewers and users. It states what the installed plugin may start, where it writes besides ordinary note edit, and which network families it can call. The plugin does not download code or extra artifacts at runtime.
+
+### External programs
+
+When the matching capability is used, the plugin may start:
+
+- `git` for trusted worktrees, verified local commits, and GitHub push
+- `python` (or `py` / `python3`) as the optional FastEmbed semantic-embedding helper; retrieval degrades to non-semantic search if Python or FastEmbed is missing
+- `wsl.exe` when the host-provisioned WSL2 sandbox is the bound code-execution provider
+- an optional background companion service: a separate local loopback process, not another Obsidian plugin. Install and control materialize a Python helper under the application-data root and may resolve a host `node` executable for the worker. Vault operations still wait for connected Obsidian.
+
+Research-only vault work does not need git, WSL, or the companion.
+
+### Writes outside ordinary note edit
+
+- `%LOCALAPPDATA%\AgenticResearcher` on Windows (companion runtime under `companion\`, durable code workspace state under `code\`). Other desktops use `~/Library/Application Support/AgenticResearcher` on macOS and `$XDG_DATA_HOME/agentic-researcher` or `~/.local/share/agentic-researcher` on Linux.
+- `os.tmpdir()/agentic-researcher-workspaces` for ephemeral scratch workspaces
+- `.agent-backups/` inside the vault before replacements and other destructive edits
+
+Intended product writes still go into the vault as notes, receipts, and run records.
+
+### Network
+
+Model and integration calls are bring-your-own-key. You pay the provider you configured. This plugin does not bill usage and does not send product telemetry.
+
+Outbound families, only when that capability is enabled or the mission needs them:
+
+- Ollama Cloud or a local/compatible Ollama endpoint
+- OpenAI, OpenRouter, and other OpenAI-compatible BYOK endpoints
+- GitHub
+- Linear
+- Keyless scholarly and reference fallbacks already implemented in `src/tools/freeSearchProviders.ts`: Wikipedia, OpenAlex, arXiv, Crossref, PubMed, ClinicalTrials.gov, and CourtListener
+
+Missions that search or fetch the web also call the configured primary search provider and the pages they retrieve.
+
+### Fourth install artifact
+
+Obsidian's community installer downloads three files: `main.js`, `manifest.json`, and `styles.css`.
+
+`companion-assets.json` (~984 KB) is a fourth artifact. It is not fetched at runtime. Without it the plugin still loads; chat, research, and vault tools keep working, and the companion service stays disabled.
+
+To enable the companion after a community install, copy a `companion-assets.json` that matches this plugin build from the repository (or a matching release zip) into:
+
+```text
+<vault>/.obsidian/plugins/agentic-researcher/
+```
+
+A missing, stale, or hash-mismatched file is refused. The companion stays off. The rest of the plugin keeps running.
+
 ## Install For Development
 
 ```bash
@@ -66,19 +117,21 @@ Copy the plugin files into an Obsidian vault plugin folder:
 <vault>/.obsidian/plugins/agentic-researcher/
 ```
 
-Required files:
+Community-installer files:
 
 ```text
 main.js
 manifest.json
 styles.css
+```
+
+Optional fourth file for the local companion service (see [What this plugin executes and writes](#what-this-plugin-executes-and-writes)):
+
+```text
 companion-assets.json
 ```
 
 Then enable `Agentic Researcher` in Obsidian's community plugin settings.
-
-Without `companion-assets.json` the plugin still loads and runs; only the
-optional local companion service is disabled until the file is installed.
 
 ## Development
 
