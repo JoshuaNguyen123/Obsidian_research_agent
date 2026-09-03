@@ -1,3 +1,4 @@
+import { raceAbort } from "../../utils/raceAbort";
 import type { AgentSettings } from "../../settings";
 import type { SemanticEmbeddingProvider } from "../../embeddings/types";
 import type { AgenticReflexInput, ReflexDecision, ReflexLabel } from "./types";
@@ -173,31 +174,6 @@ function abortedDecision(): ReflexDecision {
     0,
     ["Semantic routing skipped: the run was stopped before the embedding helper answered."],
   );
-}
-
-function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (!signal) {
-    return work;
-  }
-  if (signal.aborted) {
-    return Promise.reject(new DOMException("The operation was aborted.", "AbortError"));
-  }
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => {
-      reject(new DOMException("The operation was aborted.", "AbortError"));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    work.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
 }
 
 export function fallbackDecision(

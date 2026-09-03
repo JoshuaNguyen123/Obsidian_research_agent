@@ -1076,7 +1076,7 @@ export class CodeExtensionRuntimeV2 {
         manifest.workspaceId,
         ["."],
       );
-      const sandboxStatus = await this.probeConfiguredSandboxProviders();
+      const sandboxStatus = await this.probeConfiguredSandboxProviders(context?.abortSignal);
       if (!sandboxStatus.executionAvailable) {
         throw new CodeSandboxContributionErrorV2(
           "sandbox_provider_unavailable",
@@ -1179,7 +1179,7 @@ export class CodeExtensionRuntimeV2 {
       );
     }
     if (manifest.kind === "repository") {
-      const sandboxStatus = await this.probeConfiguredSandboxProviders();
+      const sandboxStatus = await this.probeConfiguredSandboxProviders(context?.abortSignal);
       if (!sandboxStatus.executionAvailable) {
         throw new CodeSandboxContributionErrorV2(
           "sandbox_provider_unavailable",

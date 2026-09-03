@@ -287,6 +287,16 @@ export function createPythonFastEmbedProvider(
     message: "FastEmbed provider is disposed.",
   });
 
+  const abortedResponse = (
+    request: SemanticEmbeddingRequest,
+  ): SemanticEmbeddingResponse => ({
+    ok: false,
+    model: request.model,
+    dim: request.dim,
+    code: "aborted",
+    message: "The run was stopped before the embedding request started.",
+  });
+
   const embedNow = async (
     request: SemanticEmbeddingRequest,
   ): Promise<SemanticEmbeddingResponse> => {
@@ -389,7 +399,12 @@ export function createPythonFastEmbedProvider(
   };
 
   return {
-    embed: (request) => enqueue(() => embedNow(request)),
+    embed: (request) =>
+      enqueue(() =>
+        request.signal?.aborted
+          ? Promise.resolve(abortedResponse(request))
+          : embedNow(request),
+      ),
     dispose: () => {
       disposed = true;
       clearIdleTimer();

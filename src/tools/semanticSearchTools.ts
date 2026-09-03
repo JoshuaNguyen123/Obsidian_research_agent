@@ -1,3 +1,5 @@
+import type { SemanticEmbeddingResponse } from "../embeddings/types";
+import { raceAbort } from "../utils/raceAbort";
 import type { TFile } from "obsidian";
 import { cosineSimilarity, normalizeCosine } from "../utils/vectorMath";
 import { MAX_LISTED_FILES } from "./constants";
@@ -224,14 +226,31 @@ export const semanticSearchNotesTool: AgentTool = {
 
     if (context.semanticEmbeddingProvider && chunks.length > 0) {
       const livePrefixes = resolveEmbeddingPrefixesV1(getSemanticModel(context));
-      const response = await context.semanticEmbeddingProvider.embed({
-        model: getSemanticModel(context),
-        dim: getSemanticDim(context),
-        cacheDir: context.settings.semanticModelCacheDir || undefined,
-        documents: chunks.map((chunk) => chunk.embeddingText),
-        queries: [query],
-        queryPrefix: livePrefixes.query,
-        documentPrefix: livePrefixes.document,
+      // A stopped run falls through to lexical scoring instead of waiting
+      // out the embedding helper (which cannot cancel an in-flight request).
+      const response = await raceAbort(
+        context.semanticEmbeddingProvider.embed({
+          model: getSemanticModel(context),
+          dim: getSemanticDim(context),
+          cacheDir: context.settings.semanticModelCacheDir || undefined,
+          documents: chunks.map((chunk) => chunk.embeddingText),
+          queries: [query],
+          queryPrefix: livePrefixes.query,
+          documentPrefix: livePrefixes.document,
+          signal: context.abortSignal,
+        }),
+        context.abortSignal,
+      ).catch((error: unknown): SemanticEmbeddingResponse => {
+        if (context.abortSignal?.aborted) {
+          return {
+            ok: false,
+            model: getSemanticModel(context),
+            dim: getSemanticDim(context),
+            code: "aborted",
+            message: "The run was stopped before the embedding helper answered.",
+          };
+        }
+        throw error;
       });
 
       if (
@@ -333,6 +352,7 @@ export const inspectSemanticIndexTool: AgentTool = {
       const search = await context.semanticIndexService.search({
         query,
         limit,
+        signal: context.abortSignal,
         maxSnippetChars: DEFAULT_MAX_SNIPPET_CHARS,
       });
       return {
@@ -441,6 +461,7 @@ async function searchSemanticIndexFirst({
     query,
     limit,
     folder,
+    signal: context.abortSignal,
     maxSnippetChars,
     mode,
     candidateLimit,

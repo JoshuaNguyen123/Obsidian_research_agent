@@ -171,3 +171,26 @@ test("multiple verifiers all run and passes stay passes", async () => {
     ["pass", "pass"],
   );
 });
+
+test("a stopped run does not wait for a verifier that ignores its signal", async () => {
+  // The verifier receives the signal through its scoped context, but a
+  // contribution that never looks at it must not hold the run for the full
+  // verifier timeout (30 s by default, the whole harness shutdown budget).
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const pending = runExtensionVerifiers(
+    {
+      verifiers: [
+        registered("slow", () => new Promise<never>(() => undefined)),
+      ],
+    },
+    INPUT,
+    { ...ACTIVE, signal: controller.signal, timeoutMs: 60_000 },
+  );
+  setTimeout(() => controller.abort(new Error("Mission was stopped.")), 20);
+  const checks = await pending;
+  assert.ok(Date.now() - startedAt < 2_000, "the verifier wait outlived the stop");
+  assert.equal(checks.length, 1);
+  assert.equal(checks[0].status, "blocked");
+  assert.match(checks[0].missing.join(" "), /cancelled because the run was stopped/u);
+});

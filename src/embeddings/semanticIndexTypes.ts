@@ -123,6 +123,8 @@ export interface SemanticIndexSearchRequest {
   candidateLimit?: number;
   minScore?: number;
   cursor?: string | null;
+  /** The run's abort signal; a stopped run does not wait for the embedder. */
+  signal?: AbortSignal;
   /**
    * Vault paths whose graph neighbourhood should receive a small ranking
    * boost — typically the note the user is working in. Omitting this (the

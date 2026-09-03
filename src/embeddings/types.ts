@@ -7,6 +7,12 @@ export interface SemanticEmbeddingRequest {
   documents: string[];
   queries: string[];
   /**
+   * The run's abort signal. The helper cannot cancel an in-flight request,
+   * but a request still waiting in the provider queue when the run stops
+   * is skipped instead of starting a pointless (and blocking) helper call.
+   */
+  signal?: AbortSignal;
+  /**
    * Instruction prefixes this model expects. Resolved by the caller from
    * embeddingPrefixes.ts rather than assumed by the provider, because the
    * convention is per model and applying the wrong one silently costs recall.

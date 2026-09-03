@@ -76,6 +76,7 @@ async function runOneVerifier(
       registered.contribution.verify(input, scopedContext(registered.token, options)),
       timeoutMs,
       verifierId,
+      options.signal,
     );
     return {
       ...base,
@@ -141,8 +142,10 @@ async function withTimeout<TResult>(
   promise: Promise<TResult>,
   timeoutMs: number,
   label: string,
+  signal?: AbortSignal,
 ): Promise<TResult> {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let onAbort: (() => void) | null = null;
   try {
     return await Promise.race([
       promise,
@@ -152,8 +155,23 @@ async function withTimeout<TResult>(
           timeoutMs,
         );
       }),
+      // The verifier gets the signal through its scoped context, but a
+      // contribution that ignores it must not hold a stopped run for the
+      // full timeout; the host-side wait races the signal as well.
+      new Promise<never>((_resolve, reject) => {
+        if (!signal) return;
+        const cancel = () =>
+          reject(new Error(`${label} was cancelled because the run was stopped.`));
+        if (signal.aborted) {
+          cancel();
+          return;
+        }
+        onAbort = cancel;
+        signal.addEventListener("abort", cancel, { once: true });
+      }),
     ]);
   } finally {
     if (timer !== null) clearTimeout(timer);
+    if (signal && onAbort !== null) signal.removeEventListener("abort", onAbort);
   }
 }

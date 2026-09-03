@@ -9688,6 +9688,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     missionId: string;
     nodeId: string;
     objective: string;
+    abortSignal?: AbortSignal;
   }): Promise<VerificationCheck[]> {
     if (this.coreApiHost.state !== "ready") return [];
     let snapshot;
@@ -9709,7 +9710,10 @@ export default class AgenticResearcherPlugin extends Plugin {
         evidence: [],
         receiptIds: [],
       },
-      { isTokenActive: (token) => this.coreApiHost.isTokenActive(token) },
+      {
+        isTokenActive: (token) => this.coreApiHost.isTokenActive(token),
+        signal: input.abortSignal,
+      },
     );
   }
 
@@ -10666,6 +10670,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       // node and fail closed: any fail/needs_more_work/blocked check blocks the
       // node instead of the previous unconditional success.
       const extensionVerifierChecks = await this.runMissionExtensionVerifiers({
+        abortSignal: input.abortSignal,
         missionId: runId,
         nodeId: verifyNodeId,
         objective: input.prompt,

@@ -431,3 +431,20 @@ test("dispose settles an in-flight embed without respawning a helper", async () 
   assert.equal(afterDispose.code, "disposed");
   assert.equal(spawned.length, 1);
 });
+
+test("a queued embed whose run is already stopped never reaches the helper", async () => {
+  // Every embed goes through one queue. A request parked behind a background
+  // index batch used to start its own helper call after the run had stopped,
+  // holding the caller for the full request timeout.
+  const { runtime, spawned } = createFakeRuntime(() => undefined);
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  const controller = new AbortController();
+  controller.abort(new Error("Mission was stopped."));
+  const result = await provider.embed({ ...REQUEST, signal: controller.signal });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "aborted");
+  assert.equal(spawned.length, 0, "no helper was spawned for a stopped run");
+  provider.dispose?.();
+});

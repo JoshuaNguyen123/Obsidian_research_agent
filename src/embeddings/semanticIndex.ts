@@ -1,3 +1,4 @@
+import { raceAbort } from "../utils/raceAbort";
 import type { App, TFile } from "obsidian";
 import { cosineSimilarity, normalizeCosine, cosineSimilarityAt, vectorNorm } from "../utils/vectorMath";
 import type { AgentSettings } from "../settings";
@@ -369,14 +370,33 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     }
 
     const prefixes = resolveEmbeddingPrefixesV1(model);
-    const response = await this.getEmbeddingProvider().embed({
-      model,
-      dim,
-      documents: [],
-      queries: [query],
-      queryPrefix: prefixes.query,
-      documentPrefix: prefixes.document,
+    // The helper cannot cancel an in-flight request (a Python subprocess
+    // with a 3-minute timeout); racing the run's signal lets a stopped run
+    // reach its stop boundary instead of waiting out the helper.
+    const embedded = await raceAbort(
+      this.getEmbeddingProvider().embed({
+        model,
+        dim,
+        documents: [],
+        queries: [query],
+        queryPrefix: prefixes.query,
+        documentPrefix: prefixes.document,
+        signal: request.signal,
+      }),
+      request.signal,
+    ).catch((error: unknown) => {
+      if (request.signal?.aborted) return null;
+      throw error;
     });
+    if (embedded === null) {
+      return makeSearchFailure(
+        model,
+        dim,
+        "aborted",
+        "The run was stopped before the embedding helper answered.",
+      );
+    }
+    const response = embedded;
     if (!response.ok || response.queries?.length !== 1) {
       return makeSearchFailure(
         model,
