@@ -5,6 +5,10 @@ import {
   hasExplicitSingleWebFetchOnlyIntent,
   hasPrimaryTextCitationIntent,
 } from "./evidenceIntent";
+import {
+  matchesFetchedWebSourceLanguageV1,
+  matchesSourcesOrWebLanguageV1,
+} from "./sourceIntent";
 import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
 // The MissionGraph node this planner plants and the tool the route offers must
 // come from ONE predicate. Both of these were private copies here until
@@ -135,7 +139,7 @@ function getExpectedTools(
   }
 
   if (
-    (generated.requiresGrounding || /\b(sources?)\b/i.test(prompt)) &&
+    (generated.requiresGrounding || matchesFetchedWebSourceLanguageV1(prompt)) &&
     // Literary primary-text citations are not a fetched-web expectation.
     !hasPrimaryTextCitationIntent(prompt)
   ) {
@@ -301,8 +305,11 @@ function hasExplicitWebGroundingIntent(prompt: string): boolean {
   if (hasPrimaryTextCitationIntent(prompt)) {
     return false;
   }
-  return /\bweb\b|\bonline\b|\bexternal\s+sources?\b|\bsource\s+urls?\b|\bcitations?\b|\blatest\b|\bcurrent\s+(?:events?|news|information|data)\b|https?:\/\//iu.test(
-    prompt,
+  return (
+    matchesSourcesOrWebLanguageV1(prompt) ||
+    /\bexternal\s+sources?\b|\blatest\b|\bcurrent\s+(?:events?|news|information|data)\b/iu.test(
+      prompt,
+    )
   );
 }
 

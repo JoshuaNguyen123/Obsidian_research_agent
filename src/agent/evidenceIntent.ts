@@ -1,4 +1,8 @@
 import type { MissionIntent } from "../tools/types";
+import {
+  matchesFetchedWebSourceLanguageV1,
+  withoutCodeSourceArtifactsV1,
+} from "./sourceIntent";
 import { hasWordCountIntent } from "./wordCountIntent";
 
 /**
@@ -164,12 +168,9 @@ export function requiresWebEvidenceProof(
   // those exact artifact phrases before interpreting a remaining bare
   // "source" as research intent. Explicit web/citation cues were already
   // handled above, so this cannot suppress a real public-network request.
-  const promptWithoutCodeSourceArtifacts = prompt.replace(
-    /\bsource(?:\s+code|\s+files?|\s+and\s+tests?\s+files?)\b/giu,
-    " ",
-  );
+  const promptWithoutCodeSourceArtifacts = withoutCodeSourceArtifactsV1(prompt);
   const asksForGenericSources =
-    /\bsources?\b/i.test(promptWithoutCodeSourceArtifacts) ||
+    matchesFetchedWebSourceLanguageV1(promptWithoutCodeSourceArtifacts) ||
     /^\s*(?:please\s+)?(?:research|investigate)\b/i.test(prompt) ||
     /\bverify\b/i.test(prompt);
   if (!asksForGenericSources) {

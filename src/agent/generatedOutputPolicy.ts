@@ -11,6 +11,7 @@ import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
 import { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 import { detectExplicitReplaceIntent } from "./noteOutputPolicy";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { matchesFetchedWebSourceLanguageV1 } from "./sourceIntent";
 
 export type GeneratedOutputKind =
   | "essay"
@@ -140,7 +141,8 @@ export function analyzeGeneratedOutputPrompt(
   const requiresGrounding = primaryTextOnly
     ? false
     : requiresTextQuotes ||
-      /\b(citations?|cited|cite|sources?|source\s+urls?|quotation|quotations|quotes?|text[-\s]?level|evidence|verify|fact[-\s]?check|real\s+events?)\b/i.test(
+      matchesFetchedWebSourceLanguageV1(prompt) ||
+      /\b(quotation|quotations|quotes?|text[-\s]?level|evidence|verify|fact[-\s]?check|real\s+events?)\b/i.test(
         prompt,
       );
 

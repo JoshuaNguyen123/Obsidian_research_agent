@@ -35,6 +35,7 @@ import {
 } from "./currentNoteResetPolicy";
 import { isCurrentNoteEditOrganizeIntent, isNamedSectionEditIntent, isVaultWideOrganizeIntent, isWholeNoteEditIntent } from "./editOrganizeIntent";
 import { hasExplicitNoWebIntent, hasExplicitPublicWebSignal, hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { matchesFetchedWebSourceLanguageV1 } from "./sourceIntent";
 import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
 import { detectLinearIntent } from "./linearIntent";
 import { hasMissionResumeIntent } from "./missionResume";
@@ -67,6 +68,7 @@ export {
 } from "./noNoteWriteIntent";
 export { hasWordCountIntent } from "./wordCountIntent";
 export { hasPageContentClearIntent } from "./currentNoteResetPolicy";
+export { matchesFetchedWebSourceLanguageV1, matchesSourcesOrWebLanguageV1 } from "./sourceIntent";
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
   return (
@@ -1396,6 +1398,11 @@ export function hasWebSearchIntent(prompt: string): boolean {
     return true;
   }
 
+  // Static generation is local drafting unless the shared source-intent
+  // family says the user asked for fetched/public sources. This gate must
+  // not be able to contradict the proof / generated / effort / catalog
+  // seats: they all read `hasFetchedWebSourceIntent` /
+  // `matchesFetchedWebSourceLanguageV1`.
   if (hasStaticGenerationIntent(prompt) && !hasFetchedWebSourceIntent(prompt)) {
     return false;
   }
@@ -1428,9 +1435,7 @@ export function hasFetchedWebSourceIntent(prompt: string): boolean {
   ) {
     return false;
   }
-  return /\b(cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?)|cite(?:d)?\s+at\s+least\b[\s\S]{0,60}\bsources?|(?:scholarly|academic|peer[-\s]?reviewed)\s+(?:and\s+(?:academic|scholarly)\s+)?sources?)\b/i.test(
-    prompt,
-  );
+  return matchesFetchedWebSourceLanguageV1(prompt);
 }
 
 export function hasCurrentWebFactIntent(prompt: string): boolean {
