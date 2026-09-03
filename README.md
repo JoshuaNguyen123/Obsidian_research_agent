@@ -51,7 +51,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 ## Model requirements and reliability status
 
-The recommended model is `deepseek-v4-pro`. Cheaper models (`minimax-m3`, `deepseek-v4-flash`) complete individual stages but fail composed journeys on quality variance. Research is the mature path; complex multi-stage code work is still being hardened.
+The recommended model is `glm-5.3-flash:cloud`. The eval record (`docs/eval/kpi-dashboard.md`, generated 2026-09-03T01:40:14.084Z from 194 product rows) measures it at **83.3% green** (95/114 runs) and **92.9% tool-call success** (1002/1078 succeeded across 110 rows with tool data). `deepseek-v4-pro` is **55.7% green** (39/70) and **47.1% tool-call success** (65/138 across 4 tool-bearing rows). Cheaper models still fail composed journeys: `minimax-m3:cloud` measured **33.3% green** (2/6). Research is the mature path; complex multi-stage code work is still being hardened.
 
 ## Install For Development
 
