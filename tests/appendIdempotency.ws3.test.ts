@@ -8,6 +8,18 @@ import {
 } from "../src/tools/vaultTools";
 import type { ToolExecutionContext } from "../src/tools/types";
 
+type AppendReceipt = {
+  path?: string;
+  operation?: string;
+  bytesWritten?: number;
+  reason?: string;
+  duplicateSkip?: boolean;
+};
+
+function asAppendReceipt(value: unknown): AppendReceipt {
+  return value as AppendReceipt;
+}
+
 test("append identity requires run/root plus operation id and never keys on content alone", () => {
   assert.equal(resolveAppendOperationIdentity({}), null);
   assert.equal(resolveAppendOperationIdentity({ runId: "run-a" }), null);
@@ -50,18 +62,22 @@ test("same-identity retry of append_to_current_file skips a second write", async
     runId: "run-append-1",
     operationId: "run-append-1:2:0:append_to_current_file",
   };
-  const first = await appendToCurrentFileTool.execute(
-    { text: "Durable mutation proof" },
-    { ...mock.context, ...identity },
+  const first = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      { ...mock.context, ...identity },
+    ),
   );
-  assert.equal(first.bytesWritten > 0, true);
+  assert.equal((first.bytesWritten ?? 0) > 0, true);
   assert.equal(first.reason, undefined);
   assert.equal(mock.content.get("Current.md"), "Initial note\nDurable mutation proof");
   assert.equal(mock.modifies, 1);
 
-  const retry = await appendToCurrentFileTool.execute(
-    { text: "Durable mutation proof" },
-    { ...mock.context, ...identity },
+  const retry = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      { ...mock.context, ...identity },
+    ),
   );
   assert.equal(retry.path, "Current.md");
   assert.equal(retry.operation, "append_to_current_file");
@@ -86,16 +102,18 @@ test("a second mission with the same line still appends", async () => {
       operationId: "mission-1:1:0:append_to_current_file",
     },
   );
-  const second = await appendToCurrentFileTool.execute(
-    { text: "Same line" },
-    {
-      ...mock.context,
-      runId: "mission-2",
-      operationId: "mission-2:1:0:append_to_current_file",
-    },
+  const second = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Same line" },
+      {
+        ...mock.context,
+        runId: "mission-2",
+        operationId: "mission-2:1:0:append_to_current_file",
+      },
+    ),
   );
   assert.equal(second.reason, undefined);
-  assert.equal(second.bytesWritten > 0, true);
+  assert.equal((second.bytesWritten ?? 0) > 0, true);
   assert.equal(
     mock.content.get("Current.md"),
     "Initial note\nSame line\nSame line",
@@ -117,12 +135,14 @@ test("same identity with a different payload still writes", async () => {
     { text: "First block" },
     { ...mock.context, ...identity },
   );
-  const second = await appendToCurrentFileTool.execute(
-    { text: "Second block" },
-    { ...mock.context, ...identity },
+  const second = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Second block" },
+      { ...mock.context, ...identity },
+    ),
   );
   assert.equal(second.reason, undefined);
-  assert.equal(second.bytesWritten > 0, true);
+  assert.equal((second.bytesWritten ?? 0) > 0, true);
   assert.equal(
     mock.content.get("Current.md"),
     "Initial note\nFirst block\nSecond block",
@@ -144,12 +164,14 @@ test("same identity rewrites when the note tail no longer matches", async () => 
     { ...mock.context, ...identity },
   );
   mock.content.set("Current.md", "User edited the tail away");
-  const retry = await appendToCurrentFileTool.execute(
-    { text: "Durable mutation proof" },
-    { ...mock.context, ...identity },
+  const retry = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      { ...mock.context, ...identity },
+    ),
   );
   assert.equal(retry.reason, undefined);
-  assert.equal(retry.bytesWritten > 0, true);
+  assert.equal((retry.bytesWritten ?? 0) > 0, true);
   assert.equal(
     mock.content.get("Current.md"),
     "User edited the tail away\nDurable mutation proof",
@@ -162,12 +184,14 @@ test("content-only repeats without operation identity still write", async () => 
     prompt: "Append one proof line to the current note.",
     initial: "Initial note\nAlready there",
   });
-  const first = await appendToCurrentFileTool.execute(
-    { text: "Already there" },
-    mock.context,
+  const first = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Already there" },
+      mock.context,
+    ),
   );
   assert.equal(first.reason, undefined);
-  assert.equal(first.bytesWritten > 0, true);
+  assert.equal((first.bytesWritten ?? 0) > 0, true);
   assert.equal(
     mock.content.get("Current.md"),
     "Initial note\nAlready there\nAlready there",
