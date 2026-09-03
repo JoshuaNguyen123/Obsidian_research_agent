@@ -337,7 +337,7 @@ test("required WAL persistence failure stops before mutation with a resumable er
       if (
         !blockedWalWrite &&
         isDirectRunArtifact &&
-        /"state": "intent_recorded"/u.test(nextContent)
+        /"state": ?"intent_recorded"/u.test(nextContent)
       ) {
         blockedWalWrite = true;
         throw new Error("Simulated required WAL snapshot persistence failure.");

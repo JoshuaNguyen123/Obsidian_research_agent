@@ -6,6 +6,8 @@ import {
   persistAgentRunMarkdownExact,
   readAgentRunMarkdown,
   withSerializedRunWrite,
+  readAgentRunMarkdownForUpdate,
+  rememberAgentRunMarkdownWrite,
 } from "./runStore";
 
 const AGENT_RUNS_FOLDER = "Agent Runs";
@@ -77,11 +79,9 @@ export async function appendAgentRunCheckpoint(
       };
     }
 
-    const current = await readAgentRunMarkdown({
-      adapterRead:
-        typeof vault.adapter?.read === "function"
-          ? () => vault.adapter.read(path)
-          : undefined,
+    const current = await readAgentRunMarkdownForUpdate({
+      path,
+      adapter: vault.adapter,
       vaultRead: () => vault.read(existingFile as TFile),
     });
     const separator = current.endsWith("\n") ? "\n" : "\n\n";
@@ -99,6 +99,11 @@ export async function appendAgentRunCheckpoint(
           : undefined,
       modify: () => vault.modify(existingFile as TFile, next),
       readback: () => vault.read(existingFile as TFile),
+    });
+    await rememberAgentRunMarkdownWrite({
+      path,
+      adapter: vault.adapter,
+      markdown: next,
     });
 
     return {

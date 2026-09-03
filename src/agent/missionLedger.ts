@@ -24,6 +24,8 @@ import {
   persistAgentRunMarkdownExact,
   readAgentRunMarkdown,
   withSerializedRunWrite,
+  readAgentRunMarkdownForUpdate,
+  rememberAgentRunMarkdownWrite,
 } from "./runStore";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
 import type { ModelUsageAggregateV1 } from "../model/modelCallEvidence";
@@ -1078,11 +1080,9 @@ export async function writeMissionLedger(
     let current = "";
     let persistedRevision = 0;
     if (file) {
-      current = await readAgentRunMarkdown({
-        adapterRead:
-          typeof vault.adapter?.read === "function"
-            ? () => vault.adapter.read(path)
-            : undefined,
+      current = await readAgentRunMarkdownForUpdate({
+        path,
+        adapter: vault.adapter,
         vaultRead: () => vault.read(file as TFile),
       });
       persistedRevision = parseMissionLedgerFromMarkdown(current)?.revision ?? 0;
@@ -1120,6 +1120,11 @@ export async function writeMissionLedger(
           : undefined,
       modify: () => vault.modify(file as TFile, next),
       readback: () => vault.read(file as TFile),
+    });
+    await rememberAgentRunMarkdownWrite({
+      path,
+      adapter: vault.adapter,
+      markdown: next,
     });
     ledger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
     ledger.revision = Math.max(ledger.revision, requestedLedger.revision);

@@ -27099,8 +27099,8 @@ test("ambiguous WAL snapshot persistence keeps a racing stop fail-closed", async
     if (
       !injectedAmbiguousWrite &&
       isDirectRunArtifact &&
-      data.includes('"toolName": "promote_workspace_item"') &&
-      data.includes('"state": "applying"')
+      /"toolName": ?"promote_workspace_item"/.test(data) &&
+      /"state": ?"applying"/.test(data)
     ) {
       injectedAmbiguousWrite = true;
       abortController.abort(new Error("stop raced ambiguous WAL persistence"));

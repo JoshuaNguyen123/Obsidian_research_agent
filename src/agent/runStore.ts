@@ -78,6 +78,14 @@ export const MISSION_RUNTIME_SNAPSHOT_VERSION = 2 as const;
 export const ACTION_JOURNAL_RECORD_VERSION = 2 as const;
 export const MAX_RUNTIME_RECEIPTS = 256;
 export const MAX_OPERATION_JOURNAL_RECORDS = 256;
+/**
+ * Evidence retained in the persisted snapshot (most recent first to go is
+ * the oldest). The in-memory run keeps every record; the durable projection
+ * was uncapped while receipts, journal, and notes were bounded, so a long
+ * research mission re-serialized an ever-growing evidence array on every
+ * write-ahead-log write.
+ */
+export const MAX_RUNTIME_EVIDENCE = 512;
 export const MAX_EXTERNAL_ACTION_RUNTIME_LOOKUP_FILES = 256;
 export const RUNTIME_SNAPSHOT_MODIFY_TIMEOUT_MS = 15_000;
 export const RUNTIME_SNAPSHOT_READBACK_TIMEOUT_MS = 5_000;
@@ -501,6 +509,118 @@ export async function readAgentRunMarkdown({
   return adapterRead ? adapterRead() : vaultRead();
 }
 
+/**
+ * Bytes this process last read from or wrote to an Agent Runs note, keyed by
+ * path, with the adapter stat observed at that moment.
+ *
+ * Every run-note persist was a read-modify-write of the whole note, and the
+ * notes grow to 40-200 KB per mission: the pre-read alone was one full read
+ * per write-ahead-log entry, several times per mutating tool call. When the
+ * adapter reports the same mtime and size that we recorded after our own exact
+ * write (or last read), the file cannot have changed underneath us, and the
+ * remembered bytes are the current content. Any stat difference -- an external
+ * edit, a sync client, an unavailable stat -- falls back to a real read, so the
+ * exact-readback proof that follows every write is unchanged.
+ */
+interface AgentRunAdapterLike {
+  read?: (path: string) => Promise<string>;
+  write?: (path: string, data: string) => Promise<unknown>;
+  stat?: (path: string) => Promise<{ mtime: number; size: number } | null>;
+}
+
+interface CachedAgentRunMarkdown {
+  markdown: string;
+  mtime: number;
+  size: number;
+}
+
+const MAX_CACHED_AGENT_RUN_NOTES = 64;
+const agentRunMarkdownCache = new Map<string, CachedAgentRunMarkdown>();
+
+export function clearAgentRunMarkdownCacheForTests(): void {
+  agentRunMarkdownCache.clear();
+}
+
+async function statAgentRunNote(
+  adapter: AgentRunAdapterLike | undefined,
+  path: string,
+): Promise<{ mtime: number; size: number } | null> {
+  if (!adapter || typeof adapter.stat !== "function") {
+    return null;
+  }
+  try {
+    const stat = await adapter.stat(path);
+    return stat && Number.isFinite(stat.mtime) && Number.isFinite(stat.size)
+      ? { mtime: stat.mtime, size: stat.size }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberAgentRunMarkdown(
+  path: string,
+  markdown: string,
+  stat: { mtime: number; size: number },
+): void {
+  agentRunMarkdownCache.delete(path);
+  agentRunMarkdownCache.set(path, { markdown, mtime: stat.mtime, size: stat.size });
+  while (agentRunMarkdownCache.size > MAX_CACHED_AGENT_RUN_NOTES) {
+    const oldest = agentRunMarkdownCache.keys().next().value;
+    if (oldest === undefined) break;
+    agentRunMarkdownCache.delete(oldest);
+  }
+}
+
+/** The current note text for a read-modify-write; see the cache note above. */
+export async function readAgentRunMarkdownForUpdate({
+  path,
+  adapter,
+  vaultRead,
+}: {
+  path: string;
+  adapter: AgentRunAdapterLike | undefined;
+  vaultRead: () => Promise<string>;
+}): Promise<string> {
+  const stat = await statAgentRunNote(adapter, path);
+  const cached = stat ? agentRunMarkdownCache.get(path) : undefined;
+  if (stat && cached && cached.mtime === stat.mtime && cached.size === stat.size) {
+    return cached.markdown;
+  }
+  const markdown = await readAgentRunMarkdown({
+    adapterRead:
+      adapter && typeof adapter.read === "function"
+        ? () => adapter.read!(path)
+        : undefined,
+    vaultRead,
+  });
+  if (stat) {
+    rememberAgentRunMarkdown(path, markdown, stat);
+  }
+  return markdown;
+}
+
+/**
+ * After an exact write (write plus verified readback), remember the bytes now
+ * on disk with the stat the adapter reports for them.
+ */
+export async function rememberAgentRunMarkdownWrite({
+  path,
+  adapter,
+  markdown,
+}: {
+  path: string;
+  adapter: AgentRunAdapterLike | undefined;
+  markdown: string;
+}): Promise<void> {
+  const stat = await statAgentRunNote(adapter, path);
+  if (stat) {
+    rememberAgentRunMarkdown(path, markdown, stat);
+  } else {
+    agentRunMarkdownCache.delete(path);
+  }
+}
+
 export const persistInternalFileExact = persistAgentRunMarkdownExact;
 export const readInternalFile = readAgentRunMarkdown;
 
@@ -628,7 +748,7 @@ export function createMissionRuntimeSnapshot({
           })!,
         }
       : {}),
-    evidence: evidence.map(cloneEvidence),
+    evidence: capRuntimeEvidence(evidence.map(cloneEvidence)),
     receipts: receipts
       .map((receipt, index) => normalizeRuntimeReceipt(receipt, index, updated))
       .filter(isRuntimeReceipt)
@@ -759,10 +879,13 @@ export function getMissionRuntimeSnapshotPath(runId: string): string {
 export function formatMissionRuntimeSnapshotBlock(
   snapshot: MissionRuntimeSnapshotV2,
 ): string {
+  // Compact JSON. The snapshot is the machine write-ahead log, rewritten
+  // several times per mutating tool call; pretty-printing roughly doubled
+  // the bytes of every one of those rewrites. The parser accepts both forms.
   return [
     RUNTIME_SNAPSHOT_HEADING,
     "```json",
-    JSON.stringify(snapshot, null, 2),
+    JSON.stringify(snapshot),
     "```",
     "",
   ].join("\n");
@@ -891,11 +1014,9 @@ async function persistMissionRuntimeSnapshotUnlocked(
   let current = "";
   let persistedRevision = 0;
   if (file) {
-    current = await readAgentRunMarkdown({
-      adapterRead:
-        typeof vault.adapter?.read === "function"
-          ? () => vault.adapter.read(path)
-          : undefined,
+    current = await readAgentRunMarkdownForUpdate({
+      path,
+      adapter: vault.adapter as AgentRunAdapterLike | undefined,
       vaultRead: () => vault.read(file as TFile),
     });
     persistedRevision =
@@ -941,6 +1062,11 @@ async function persistMissionRuntimeSnapshotUnlocked(
         : undefined,
     modify: () => vault.modify(file as TFile, next),
     readback: () => vault.read(file as TFile),
+  });
+  await rememberAgentRunMarkdownWrite({
+    path,
+    adapter: vault.adapter as AgentRunAdapterLike | undefined,
+    markdown: next,
   });
   revisionTarget.revision = Math.max(
     revisionTarget.revision,
@@ -4031,6 +4157,29 @@ function normalizeClaimPassages(value: unknown): ClaimPassageRef[] | undefined {
 
 function cloneEvidence(value: MissionEvidence): MissionEvidence {
   return { ...value };
+}
+
+/**
+ * Bound the persisted evidence projection to MAX_RUNTIME_EVIDENCE records:
+ * the oldest records that never produced usable source content go first,
+ * then the oldest overall. Order is preserved.
+ */
+export function capRuntimeEvidence(
+  evidence: readonly MissionEvidence[],
+): MissionEvidence[] {
+  if (evidence.length <= MAX_RUNTIME_EVIDENCE) {
+    return [...evidence];
+  }
+  let excess = evidence.length - MAX_RUNTIME_EVIDENCE;
+  const kept: MissionEvidence[] = [];
+  for (const record of evidence) {
+    if (excess > 0 && record.usableSource !== true) {
+      excess -= 1;
+      continue;
+    }
+    kept.push(record);
+  }
+  return excess > 0 ? kept.slice(excess) : kept;
 }
 
 function normalizeOperationGoals(value: unknown): Record<string, string> {
