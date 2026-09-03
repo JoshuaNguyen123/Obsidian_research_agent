@@ -9,6 +9,13 @@ import {
 } from "obsidian";
 import { AgentView, AGENT_VIEW_TYPE } from "./src/AgentView";
 import {
+  buildDiagnosticsReportV1,
+  copyDiagnosticsReportToClipboardV1,
+  formatDiagnosticsReportMarkdownV1,
+  writeDiagnosticsExportNoteV1,
+  type DiagnosticsExportInputV1,
+} from "./src/ui/diagnosticsExport";
+import {
   buildSelectionResearchPrompt,
   CONTINUATION_LEAD_IN_LINES,
   isUsableContinuationLeadIn,
@@ -1245,6 +1252,14 @@ export default class AgenticResearcherPlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "export-diagnostics",
+      name: "Export diagnostics",
+      callback: () => {
+        void this.exportDiagnostics();
+      },
+    });
+
     this.startupPhase = "registering_settings";
     this.agentSettingTab = new AgentSettingTab(this.app, this);
     this.addSettingTab(this.agentSettingTab);
@@ -1381,6 +1396,170 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (this.activeAgentView === view) {
       this.activeAgentView = null;
     }
+  }
+
+  private readSandboxLastProbeForDiagnostics(): DiagnosticsExportInputV1["sandboxLastProbe"] {
+    const codeRuntime = this.getCapabilityRuntime<{
+      readCapabilityState?(): {
+        sandbox: {
+          lastProbe: {
+            observedAt?: string;
+            status?: {
+              mode?: string;
+              executionAvailable?: boolean;
+              editingAvailable?: boolean;
+              selectedProvider?: string | null;
+              blocker?: {
+                code?: string;
+                message?: string;
+                requiredAction?: string;
+              } | null;
+            };
+          } | null;
+        };
+      };
+    }>("agentic-researcher-code");
+    try {
+      const probe = codeRuntime?.readCapabilityState?.()?.sandbox.lastProbe ?? null;
+      if (!probe) return null;
+      return {
+        observedAt: probe.observedAt ?? null,
+        status: probe.status
+          ? {
+              mode: probe.status.mode ?? null,
+              executionAvailable: probe.status.executionAvailable ?? null,
+              editingAvailable: probe.status.editingAvailable ?? null,
+              selectedProvider: probe.status.selectedProvider ?? null,
+              blocker: probe.status.blocker
+                ? {
+                    code: probe.status.blocker.code ?? null,
+                    message: probe.status.blocker.message ?? null,
+                    requiredAction: probe.status.blocker.requiredAction ?? null,
+                  }
+                : null,
+            }
+          : null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private collectDiagnosticsExportInput(): DiagnosticsExportInputV1 {
+    const snapshot = this.runCoordinator.getSnapshot();
+    const appRecord = this.app as typeof this.app & {
+      version?: unknown;
+      appVersion?: unknown;
+    };
+    const obsidianVersion =
+      typeof appRecord.version === "string"
+        ? appRecord.version
+        : typeof appRecord.appVersion === "string"
+          ? appRecord.appVersion
+          : null;
+    const hasRunSnapshot = Boolean(
+      snapshot.lastComplete ||
+        snapshot.lastMissionGraph ||
+        snapshot.diagnosticAttestations.length > 0,
+    );
+    return {
+      pluginVersion: this.manifest?.version ?? null,
+      obsidianVersion,
+      platform: typeof process !== "undefined" ? process.platform : null,
+      startupPhase: this.startupPhase,
+      sandboxLastProbe: this.readSandboxLastProbeForDiagnostics(),
+      model: {
+        id: this.settings.model,
+        provider: this.settings.modelProvider,
+      },
+      runSnapshot: hasRunSnapshot
+        ? {
+            stopReason: snapshot.lastComplete?.stopReason ?? null,
+            stopDetail: snapshot.lastComplete?.stopDetail ?? null,
+            lastComplete: snapshot.lastComplete
+              ? {
+                  stopReason: snapshot.lastComplete.stopReason,
+                  stopDetail: snapshot.lastComplete.stopDetail ?? null,
+                }
+              : null,
+            lastMissionGraph: snapshot.lastMissionGraph
+              ? {
+                  nodes: Object.fromEntries(
+                    Object.entries(snapshot.lastMissionGraph.nodes).map(
+                      ([id, node]) => [
+                        id,
+                        {
+                          id: node.id,
+                          status: node.status,
+                          blocker: node.blocker
+                            ? {
+                                code: node.blocker.code,
+                                message: node.blocker.message,
+                                requiredAction: node.blocker.requiredAction,
+                              }
+                            : null,
+                        },
+                      ],
+                    ),
+                  ),
+                  continuationCheckpoint: snapshot.lastMissionGraph
+                    .continuationCheckpoint
+                    ? {
+                        activeNodeIds:
+                          snapshot.lastMissionGraph.continuationCheckpoint
+                            .activeNodeIds,
+                      }
+                    : null,
+                }
+              : null,
+            diagnosticAttestations: snapshot.diagnosticAttestations.map(
+              (item) => ({
+                id: item.id,
+                kind: item.kind,
+                toolName: item.toolName ?? null,
+                message: item.message,
+                errorCode: item.errorCode ?? null,
+              }),
+            ),
+          }
+        : null,
+    };
+  }
+
+  private async exportDiagnostics(): Promise<void> {
+    const report = buildDiagnosticsReportV1(this.collectDiagnosticsExportInput());
+    const markdown = formatDiagnosticsReportMarkdownV1(report);
+    const copied = await copyDiagnosticsReportToClipboardV1(markdown, {
+      writeText: async (text) => {
+        if (!navigator.clipboard?.writeText) {
+          throw new Error("clipboard unavailable");
+        }
+        await navigator.clipboard.writeText(text);
+      },
+    });
+    let writtenPath: string | null = null;
+    try {
+      const written = await writeDiagnosticsExportNoteV1({
+        markdown,
+        vault: this.app.vault,
+      });
+      writtenPath = written.path;
+    } catch (error) {
+      console.warn("Unable to write diagnostics export note.", error);
+    }
+    if (copied && writtenPath) {
+      new Notice(`Diagnostics copied. Also wrote ${writtenPath}.`);
+      return;
+    }
+    if (copied) {
+      new Notice("Diagnostics copied to the clipboard.");
+      return;
+    }
+    if (writtenPath) {
+      new Notice(`Diagnostics wrote ${writtenPath}. Clipboard copy failed.`);
+      return;
+    }
+    new Notice("Unable to export diagnostics.");
   }
 
   async activateView() {
