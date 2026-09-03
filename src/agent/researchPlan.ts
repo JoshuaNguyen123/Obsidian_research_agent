@@ -56,6 +56,14 @@ export interface ResearchCoverageRequirements {
   expandWhenSampledOrTruncated: boolean;
 }
 
+/**
+ * Structural marker for the host-appended limitations/confidence question.
+ * It is verified from final-output sections, never from an evidence item, so
+ * its minimum is 0 at every effort tier. The flag — not the question text —
+ * is what exempts it.
+ */
+export type ResearchSubquestionRole = "limitations_confidence";
+
 export interface ResearchSubquestion {
   id: string;
   question: string;
@@ -64,6 +72,7 @@ export interface ResearchSubquestion {
   status: "pending" | "in_progress" | "complete" | "blocked";
   evidenceIds: string[];
   unansweredReason?: string;
+  role?: ResearchSubquestionRole;
 }
 
 export interface ResearchNextAction {
@@ -201,10 +210,14 @@ export function createResearchPlan({
     mode === "deep_vault"
       ? 0
       : (explicitSourceCount ?? semanticFloor ?? configuredFloor ?? 3);
+  // The distinct-domain floor is tier-dependent (deep/extended raise it to
+  // three); assignResearchEffort sets the final value once the tier is known.
   const sourceRequirements: ResearchSourceRequirements = {
     minFetchedSources,
-    minDistinctDomains:
-      mode === "deep_vault" ? 0 : Math.min(2, minFetchedSources),
+    minDistinctDomains: minDistinctDomainsForEffort({
+      mode,
+      minFetchedSources,
+    }),
   };
   const coverageRequirements: ResearchCoverageRequirements = {
     minVaultCoverageConfidence: mode === "deep_web" ? "medium" : "medium",
@@ -223,16 +236,141 @@ export function createResearchPlan({
     evidenceIds: [],
     status: "in_progress",
   };
-  plan.effort = selectResearchEffort(
-    prompt,
-    missionIntent,
-    runPlan,
+  assignResearchEffort(
     plan,
-    undefined,
-    researchEffortCeiling,
+    selectResearchEffort(
+      prompt,
+      missionIntent,
+      runPlan,
+      plan,
+      undefined,
+      researchEffortCeiling,
+    ),
   );
   plan.nextAction = getNextResearchAction(plan);
   return plan;
+}
+
+/**
+ * Per-question fetched-evidence minimum the plan's effort tier warrants.
+ *
+ * quick/standard: one usable source per evidence-bearing question.
+ * deep/extended: two, so a deep answer is never a single-source answer per
+ * question. The limitations/confidence question ({@link ResearchSubquestionRole})
+ * is 0 at every tier: it is verified from the final output's sections.
+ * Vault-side questions stay at 1 at every tier — a typical expand+read path
+ * (two semantic searches + one content read) must be able to complete a
+ * deep_vault gather, and the hybrid vault question reads the same way.
+ *
+ * The web minimum is a per-question floor inside the fetched-source contract,
+ * not an addition to it: {@link allocateWebEvidenceMinima} distributes
+ * `minFetchedSources` across the web questions and reserves the floor for
+ * each later question when the total can fund it, so the sum of minima never
+ * exceeds the sources the fetch ladder owes (an explicit "two sources" stays a
+ * closed two-source contract).
+ */
+export function minEvidenceForSubquestion(input: {
+  tier?: ResearchEffortTier;
+  requiredEvidenceType: ResearchEvidenceType;
+  role?: ResearchSubquestionRole;
+}): number {
+  if (input.role === "limitations_confidence") {
+    return 0;
+  }
+  if (input.requiredEvidenceType !== "web_source") {
+    return 1;
+  }
+  return isDeepOrExtendedTier(input.tier) ? 2 : 1;
+}
+
+/**
+ * Distinct-domain floor the tier warrants: deep/extended research must not
+ * rest on three pages of one site, so its floor rises to three (still bounded
+ * by the fetched-source count); quick/standard keep two.
+ */
+export function minDistinctDomainsForEffort(input: {
+  mode: ResearchMode;
+  tier?: ResearchEffortTier;
+  minFetchedSources: number;
+}): number {
+  if (input.mode === "deep_vault") {
+    return 0;
+  }
+  return Math.min(
+    isDeepOrExtendedTier(input.tier) ? 3 : 2,
+    Math.max(0, input.minFetchedSources),
+  );
+}
+
+function isDeepOrExtendedTier(tier: ResearchEffortTier | undefined): boolean {
+  return tier === "deep" || tier === "extended";
+}
+
+/**
+ * Record a selected effort on the plan and re-derive the parts of the plan
+ * that depend on the tier. Every path that selects an effort — the
+ * deterministic plan, the utility-model assessment, and the assisted rebuild
+ * — goes through here so the minima and the tier can never disagree.
+ */
+function assignResearchEffort(
+  plan: ResearchPlan,
+  effort: ResearchEffortSelection,
+): void {
+  plan.effort = effort;
+  plan.sourceRequirements = {
+    ...plan.sourceRequirements,
+    minDistinctDomains: minDistinctDomainsForEffort({
+      mode: plan.mode,
+      tier: effort.tier,
+      minFetchedSources: plan.sourceRequirements.minFetchedSources,
+    }),
+  };
+  plan.subquestions = allocateWebEvidenceMinima(
+    plan.subquestions,
+    plan.sourceRequirements,
+    effort.tier,
+  );
+}
+
+/**
+ * Distribute the fetched-source contract across the evidence-bearing web
+ * questions. Only questions that already carry required evidence
+ * (`minEvidence > 0`) take part: advisory utility questions and the
+ * limitations question stay at 0. Each question gets at least one source;
+ * when the total can fund it, the tier floor is reserved for every later
+ * question instead of front-loading the surplus onto the first.
+ */
+function allocateWebEvidenceMinima(
+  subquestions: readonly ResearchSubquestion[],
+  sourceRequirements: ResearchSourceRequirements,
+  tier: ResearchEffortTier | undefined,
+): ResearchSubquestion[] {
+  const next = subquestions.map((item) => ({ ...item }));
+  const webQuestionIndexes = next
+    .map((item, index) => ({ item, index }))
+    .filter(
+      ({ item }) =>
+        item.requiredEvidenceType === "web_source" &&
+        item.role !== "limitations_confidence" &&
+        item.minEvidence > 0,
+    )
+    .map(({ index }) => index);
+  const floor = minEvidenceForSubquestion({ tier, requiredEvidenceType: "web_source" });
+  let remainingSources = sourceRequirements.minFetchedSources;
+  for (let position = 0; position < webQuestionIndexes.length; position += 1) {
+    const index = webQuestionIndexes[position]!;
+    const remainingQuestions = webQuestionIndexes.length - position - 1;
+    const allocated = Math.max(
+      1,
+      Math.min(
+        remainingSources - remainingQuestions,
+        Math.max(floor, remainingSources - floor * remainingQuestions),
+      ),
+    );
+    next[index] = { ...next[index]!, minEvidence: allocated };
+    remainingSources = Math.max(0, remainingSources - allocated);
+  }
+  return next;
 }
 
 export type ResearchSubquestionAssist = (request: {
@@ -408,13 +546,16 @@ export async function createResearchPlanWithAssist(
         }),
   ]);
   if (effortAssessment) {
-    plan.effort = selectResearchEffort(
-      input.prompt,
-      input.missionIntent,
-      input.runPlan,
+    assignResearchEffort(
       plan,
-      effortAssessment,
-      input.researchEffortCeiling,
+      selectResearchEffort(
+        input.prompt,
+        input.missionIntent,
+        input.runPlan,
+        plan,
+        effortAssessment,
+        input.researchEffortCeiling,
+      ),
     );
   }
   if (explicitSourceSet || !assisted || assisted.source !== "utility_assist") {
@@ -452,12 +593,16 @@ export async function createResearchPlanWithAssist(
     };
   });
   plan.subquestions = rebuilt;
-  plan.effort = selectResearchEffort(
-    input.prompt,
-    input.missionIntent,
-    input.runPlan,
+  assignResearchEffort(
     plan,
-    effortAssessment,
+    selectResearchEffort(
+      input.prompt,
+      input.missionIntent,
+      input.runPlan,
+      plan,
+      effortAssessment,
+      input.researchEffortCeiling,
+    ),
   );
   plan.nextAction = getNextResearchAction(plan);
   return plan;
@@ -1257,34 +1402,29 @@ function createSubquestions(
       ? decomposed
       : defaultResearchQuestions(prompt, mode, sourceRequirements);
   const withLimitations = ensureLimitationsConfidenceQuestion(questions, mode);
-  const capped = capAndMergeSubquestionTexts(withLimitations, 2, 8);
-  const subquestions = capped.map((question, index) =>
-    makeSubquestion(
+  const capped = capAndMergeSubquestionTexts(withLimitations.questions, 2, 8);
+  const appendedLimitations = withLimitations.appended
+    ? normalizeQuestionText(withLimitations.appended).toLowerCase()
+    : null;
+  const subquestions = capped.map((question, index) => {
+    const requiredEvidenceType = evidenceTypeForSubquestion(mode, index, capped.length);
+    const role: ResearchSubquestionRole | undefined =
+      appendedLimitations !== null &&
+      normalizeQuestionText(question).toLowerCase() === appendedLimitations
+        ? "limitations_confidence"
+        : undefined;
+    return makeSubquestion(
       `rq-${index + 1}`,
       question,
-      evidenceTypeForSubquestion(mode, index, capped.length),
-      minEvidenceForSubquestion(mode, index, capped.length),
-    ),
-  );
-  const webQuestionIndexes = subquestions
-    .map((item, index) => ({ item, index }))
-    .filter(
-      ({ item }) =>
-        item.requiredEvidenceType === "web_source" && item.minEvidence > 0,
-    )
-    .map(({ index }) => index);
-  let remainingSources = sourceRequirements.minFetchedSources;
-  for (let position = 0; position < webQuestionIndexes.length; position += 1) {
-    const index = webQuestionIndexes[position]!;
-    const remainingQuestions = webQuestionIndexes.length - position - 1;
-    const allocated = Math.max(1, remainingSources - remainingQuestions);
-    subquestions[index] = {
-      ...subquestions[index]!,
-      minEvidence: allocated,
-    };
-    remainingSources = Math.max(0, remainingSources - allocated);
-  }
-  return subquestions;
+      requiredEvidenceType,
+      minEvidenceForSubquestion({ requiredEvidenceType, role }),
+      role,
+    );
+  });
+  // The tier is selected after the questions exist (it counts them), so this
+  // pass uses the quick/standard floor; assignResearchEffort re-runs it with
+  // the selected tier.
+  return allocateWebEvidenceMinima(subquestions, sourceRequirements, undefined);
 }
 
 /**
@@ -1414,29 +1554,20 @@ function defaultResearchQuestions(
 function ensureLimitationsConfidenceQuestion(
   questions: string[],
   mode: ResearchMode,
-): string[] {
+): { questions: string[]; appended: string | null } {
   const hasLimitations = questions.some((item) =>
     /\blimitations?\b|\bconfidence\b|\bcontradict|\bopen questions?\b/i.test(item),
   );
   if (hasLimitations) {
-    return questions;
+    return { questions, appended: null };
   }
-  if (mode === "deep_hybrid") {
-    return [
-      ...questions,
-      "Resolve contradictions between sources and state limitations and confidence.",
-    ];
-  }
-  if (mode === "deep_vault") {
-    return [
-      ...questions,
-      "Identify limitations, sampled areas, and confidence from local evidence.",
-    ];
-  }
-  return [
-    ...questions,
-    "Synthesize findings with limitations and confidence.",
-  ];
+  const appended =
+    mode === "deep_hybrid"
+      ? "Resolve contradictions between sources and state limitations and confidence."
+      : mode === "deep_vault"
+        ? "Identify limitations, sampled areas, and confidence from local evidence."
+        : "Synthesize findings with limitations and confidence.";
+  return { questions: [...questions, appended], appended };
 }
 
 function evidenceTypeForSubquestion(
@@ -1454,20 +1585,6 @@ function evidenceTypeForSubquestion(
     return index % 2 === 0 ? "web_source" : "vault_note";
   }
   return "web_source";
-}
-
-function minEvidenceForSubquestion(
-  mode: ResearchMode,
-  index: number,
-  total: number,
-): number {
-  void mode;
-  void index;
-  void total;
-  // Keep deep_vault subquestion minima at 1 so a typical expand+read path
-  // (two semantic searches + one content read) can complete gather including
-  // the limitations/confidence subquestion.
-  return 1;
 }
 
 function extractNumberedOrBulletedItems(prompt: string): string[] {
@@ -1654,12 +1771,15 @@ function makeSubquestion(
   question: string,
   requiredEvidenceType: ResearchEvidenceType,
   minEvidence: number,
+  role?: ResearchSubquestionRole,
 ): ResearchSubquestion {
   // Limitations/confidence coaching is verified from final-output sections, not
-  // from an extra vault/web evidence item.
+  // from an extra vault/web evidence item. The host-appended question carries
+  // the structural role; the text test remains for a user-authored one.
   const limitationsOnly =
-    /\blimitations?\b|\bconfidence\b/i.test(question) &&
-    !/\b(find|retrieve|gather|map|compare|fetch|search)\b/i.test(question);
+    role === "limitations_confidence" ||
+    (/\blimitations?\b|\bconfidence\b/i.test(question) &&
+      !/\b(find|retrieve|gather|map|compare|fetch|search)\b/i.test(question));
   return {
     id,
     question,
@@ -1667,6 +1787,7 @@ function makeSubquestion(
     minEvidence: limitationsOnly ? 0 : minEvidence,
     status: limitationsOnly ? "complete" : "pending",
     evidenceIds: [],
+    ...(role ? { role } : {}),
   };
 }
 
@@ -1909,6 +2030,9 @@ function normalizeSubquestion(value: unknown): ResearchSubquestion | null {
     status,
     evidenceIds: getStringArray(value.evidenceIds),
     unansweredReason: getString(value.unansweredReason),
+    ...(value.role === "limitations_confidence"
+      ? { role: "limitations_confidence" as const }
+      : {}),
   };
 }
 
