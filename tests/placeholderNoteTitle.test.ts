@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  hasTitleIntent,
   isExplicitVisibleFileRenameIntent,
   isPlaceholderNoteBasename,
   isTitleOnlyIntent,
@@ -85,10 +86,20 @@ test("generate-with-title is visible title intent but not explicit rename", () =
   assert.equal(isVisibleTitleRenameIntent(prompt), true);
   assert.equal(isExplicitVisibleFileRenameIntent(prompt), false);
   assert.equal(isTitleOnlyIntent(prompt), false);
+  assert.equal(hasTitleIntent(prompt), false);
   assert.equal(
     isExplicitVisibleFileRenameIntent("Rename the current note to Purple Horizon."),
     true,
   );
+});
+
+test("change the title as well is a sidecar rename, not a title-primary mission", () => {
+  const prompt =
+    "Write a 50 word piece of text on this page. Change the title as well.";
+  assert.equal(isExplicitVisibleFileRenameIntent(prompt), true);
+  assert.equal(isVisibleTitleRenameIntent(prompt), true);
+  assert.equal(isTitleOnlyIntent(prompt), false);
+  assert.equal(hasTitleIntent(prompt), false);
 });
 
 test("numeric word targets do not manufacture a visible-note rename", () => {

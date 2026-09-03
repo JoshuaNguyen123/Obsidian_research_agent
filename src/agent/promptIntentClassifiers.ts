@@ -27,6 +27,7 @@ import {
   hasDesignIntent as hasSharedDesignIntent,
   hasExplicitCanvasDestinationIntent,
   hasReviseDesignIntent,
+  isResearchTopicDesignProse,
 } from "./codeDesignIntent";
 import { hasDeepResearchIntent as hasSharedDeepResearchIntent } from "./researchDepthIntent";
 import {
@@ -35,6 +36,7 @@ import {
 } from "./currentNoteResetPolicy";
 import { isCurrentNoteEditOrganizeIntent, isNamedSectionEditIntent, isVaultWideOrganizeIntent, isWholeNoteEditIntent } from "./editOrganizeIntent";
 import { hasExplicitNoWebIntent, hasExplicitPublicWebSignal, hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { matchesFetchedWebSourceLanguageV1 } from "./sourceIntent";
 import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
 import { detectLinearIntent } from "./linearIntent";
 import { hasMissionResumeIntent } from "./missionResume";
@@ -43,7 +45,8 @@ import { hasAffirmativeProjectIdeationIntentV1 } from "./projectIdeationIntent";
 import { detectProjectLifecycleStagesV1 } from "./projectLifecycle";
 import { canonicalizeKeywordTypos } from "./promptNormalization";
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
-import { isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
+import { hasTitleIntent, isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
+import { hasReplaceIntent } from "./replaceIntent";
 
 /**
  * Ideas whose single definition lives in a lower-level module, re-exported
@@ -67,6 +70,9 @@ export {
 } from "./noNoteWriteIntent";
 export { hasWordCountIntent } from "./wordCountIntent";
 export { hasPageContentClearIntent } from "./currentNoteResetPolicy";
+export { hasReplaceIntent };
+export { matchesFetchedWebSourceLanguageV1, matchesSourcesOrWebLanguageV1 } from "./sourceIntent";
+export { hasTitleIntent };
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
   return (
@@ -167,6 +173,9 @@ export function hasGraphConnectionIntent(prompt: string): boolean {
     " [markdown-path] ",
   ).replace(
     /\bpreserve\b[^.\n]{0,100}\b(?:note\s+)?backlinks?\b/giu,
+    " ",
+  ).replace(
+    /\b(?:a\s+)?references?(?:\s+section|\s+heading|\s+list)\b|\b(?:section|heading)\s+(?:called\s+|named\s+)?references?\b|\binclude\s+(?:a\s+)?references?\s+section\b|(?:^|[.\n])\s*#*\s*references?\s*(?:[.\n]|$)/giu,
     " ",
   );
   return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
@@ -407,6 +416,9 @@ export function hasAffirmativeCodePathAction(prompt: string, action: RegExp): bo
 // delegating wrapper, but a wrapper is still a second declaration site.
 
 export function hasDesignPackageIntent(prompt: string): boolean {
+  if (isResearchTopicDesignProse(prompt)) {
+    return false;
+  }
   return /\b(design\s*package|service\s*blueprint|logistics\s*system|project\s*ideation|canvas\s+plus\s+(brief|markdown)|canvas[\s\S]{0,80}(?:brief|svg\s+image|image)|brief\s+plus\s+canvas|ui\s*flow|mind\s*map|distributed(?:\s+\w+){0,3}\s+systems?|cloud\s+architecture|microservices?(?:\s+architecture)?|event[-\s]?driven\s+architecture|c4\s+(?:model|diagram)|business\s+process(?:es)?|manufacturing(?:\s+\w+){0,2}\s+process(?:es)?|production\s+lines?|plant\s+workflows?|value\s+streams?|bpmn|sipoc)\b/i.test(
     prompt,
   );
@@ -428,6 +440,9 @@ export function hasNarrativeDesignOutputIntent(prompt: string): boolean {
 export function hasCanvasDesignIntent(prompt: string): boolean {
   if (hasExplicitCanvasDestinationIntent(prompt)) {
     return true;
+  }
+  if (isResearchTopicDesignProse(prompt)) {
+    return false;
   }
   if (hasSvgDesignIntent(prompt) || hasMermaidDesignIntent(prompt)) {
     return false;
@@ -788,33 +803,37 @@ export function hasResearchMemoryIntent(prompt: string): boolean {
   );
 }
 
+function withoutWorkingMemoryTopic(prompt: string): string {
+  return prompt.replace(/\bworking\s+memory\b/giu, " ");
+}
+
 export function hasResearchMemoryReadIntent(prompt: string): boolean {
   return /\b(research\s+memory|topic\s+memory|memory|remember|recall|long[-\s]?term|continue\s+(?:this|the)\s+research|build\s+on\s+(?:this|the)\s+research)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryWriteIntent(prompt: string): boolean {
   return /\b(save|store|remember|record|persist|append|add|update)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory|long[-\s]?term|research\s+topic)\b|\b(research\s+memory|topic\s+memory|memory|long[-\s]?term|research\s+topic)\b[\s\S]{0,120}\b(save|store|remember|record|persist|append|add|update)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryReviewIntent(prompt: string): boolean {
   return /\b(review|audit|inspect|check|hygiene|duplicates?|stale|clean(?:up)?)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory)\b|\b(research\s+memory|topic\s+memory|memory)\b[\s\S]{0,120}\b(review|audit|inspect|check|hygiene|duplicates?|stale|clean(?:up)?)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryCompactIntent(prompt: string): boolean {
   return /\b(compact|compress|summari[sz]e|dedupe|merge|clean(?:up)?)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory)\b|\b(research\s+memory|topic\s+memory|memory)\b[\s\S]{0,120}\b(compact|compress|summari[sz]e|dedupe|merge|clean(?:up)?)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
 export function hasResearchMemoryDeleteIntent(prompt: string): boolean {
   return /\b(delete|remove|trash|forget)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory|research\s+topic)\b|\b(research\s+memory|topic\s+memory|memory|research\s+topic)\b[\s\S]{0,120}\b(delete|remove|trash|forget)\b/i.test(
-    prompt,
+    withoutWorkingMemoryTopic(prompt),
   );
 }
 
@@ -1141,29 +1160,6 @@ export function hasAppendIntent(prompt: string): boolean {
   );
 }
 
-export function hasReplaceIntent(prompt: string): boolean {
-  if (hasExplicitNoNoteWriteIntent(prompt)) {
-    return false;
-  }
-  const positivePrompt = prompt
-    .replace(
-      /\b(?:do\s+not|don't|never)\s+(?:rewrite|replace|reset|overwrite)\b[^.;\n]*/giu,
-      " ",
-    )
-    .replace(
-      /\bwithout\s+(?:rewriting|replacing|resetting|overwriting)\b[^.;\n]*/giu,
-      " ",
-    );
-  return (
-    isCurrentNoteReplaceResetPrompt(positivePrompt) ||
-    hasPageContentClearIntent(positivePrompt) ||
-    hasWholeNoteRevisionIntent(positivePrompt) ||
-    /\b(re-?write|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\breplace\s+(?:the\s+)?existing\s+contents?\b/i.test(
-      positivePrompt,
-    ) || hasClearPageAndWriteIntent(positivePrompt)
-  );
-}
-
 export function hasWholeNoteReplaceIntent(prompt: string): boolean {
   if (
     hasPageContentClearIntent(prompt) ||
@@ -1396,6 +1392,11 @@ export function hasWebSearchIntent(prompt: string): boolean {
     return true;
   }
 
+  // Static generation is local drafting unless the shared source-intent
+  // family says the user asked for fetched/public sources. This gate must
+  // not be able to contradict the proof / generated / effort / catalog
+  // seats: they all read `hasFetchedWebSourceIntent` /
+  // `matchesFetchedWebSourceLanguageV1`.
   if (hasStaticGenerationIntent(prompt) && !hasFetchedWebSourceIntent(prompt)) {
     return false;
   }
@@ -1428,9 +1429,7 @@ export function hasFetchedWebSourceIntent(prompt: string): boolean {
   ) {
     return false;
   }
-  return /\b(cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?)|cite(?:d)?\s+at\s+least\b[\s\S]{0,60}\bsources?|(?:scholarly|academic|peer[-\s]?reviewed)\s+(?:and\s+(?:academic|scholarly)\s+)?sources?)\b/i.test(
-    prompt,
-  );
+  return matchesFetchedWebSourceLanguageV1(prompt);
 }
 
 export function hasCurrentWebFactIntent(prompt: string): boolean {
@@ -1478,42 +1477,6 @@ export function hasAmbiguousDatePrompt(prompt: string): boolean {
 
 export function hasStaticGenerationIntent(prompt: string): boolean {
   return /\b(generate|write|draft|compose|create)\b[\s\S]{0,80}\b(essay|article|paragraph|summary|brief|outline|report|note|content|post)\b|\b(essay|article|paragraph|summary|brief|outline|report)\b[\s\S]{0,80}\b\d+\s*words?\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,80}\b\d{1,5}\s*words?\b/i.test(
-    prompt,
-  );
-}
-
-/**
- * "This mission is about the note's title" for both the route and the tool
- * frontier. Every consumer uses it to WITHHOLD a fast path -- it keeps a
- * mission on the tool loop, forces a current-note read, and blocks streamed
- * writeback -- so the two must not disagree about which missions get that
- * care. The rename and retitle capabilities themselves are promised by
- * isVisibleTitleRenameIntent / isMarkdownTitleContentIntent, which offer and
- * authority already consume as a matched pair; widening here cannot open a
- * gap between them.
- */
-export function hasTitleIntent(prompt: string): boolean {
-  if (isMarkdownTitleContentIntent(prompt) || isVisibleTitleRenameIntent(prompt)) {
-    return true;
-  }
-
-  // Restructuring a note repositions its heading, so the route treated this as
-  // title work and stayed on the tool loop. A genuine content-organize mission
-  // owns its own route and must not be pulled into rename-only handling.
-  if (
-    isCurrentNoteEditOrganizeIntent(prompt) ||
-    isVaultWideOrganizeIntent(prompt) ||
-    isWholeNoteEditIntent(prompt)
-  ) {
-    return false;
-  }
-
-  // The verb has to govern the note itself. Proximity alone matched "write on
-  // this note ... find and organize information about the market", where the
-  // thing being organized is the research, not the document -- which turned a
-  // web-research mission into current-note work and made it read the note
-  // before searching.
-  return /\b(?:organi[sz]e|reorgani[sz]e|restructure|improve)\s+(?:the\s+|this\s+|my\s+|its\s+)?(?:note|file)\b/i.test(
     prompt,
   );
 }

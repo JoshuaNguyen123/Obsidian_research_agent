@@ -6,6 +6,7 @@ import {
   resolveNoteOutputPlan,
   type NoteOutputPlan,
 } from "../src/agent/noteOutputPolicy";
+import { hasTitleIntent } from "../src/agent/titleIntent";
 
 function plan(
   partial: Partial<Parameters<typeof resolveNoteOutputPlan>[0]> & {
@@ -180,6 +181,21 @@ describe("noteOutputPolicy decision table", () => {
     assert.equal(result.destination, "active_note");
     assert.equal(result.mutation, "replace");
     assert.equal(result.reason, "replace_explicit");
+  });
+
+  it("body write plus change the title as well stays on the active note stream", () => {
+    const prompt =
+      "Write a 50 word piece of text on this page. Change the title as well.";
+    const result = plan({
+      prompt,
+      hasActiveMarkdownNote: true,
+      activeNoteIsPlaceholder: false,
+      specializedRoute: hasTitleIntent(prompt),
+    });
+    assert.equal(hasTitleIntent(prompt), false);
+    assert.equal(result.destination, "active_note");
+    assert.equal(result.delivery, "stream");
+    assert.notEqual(result.destination, "chat");
   });
 
   it("fresh word-count essay stays append", () => {

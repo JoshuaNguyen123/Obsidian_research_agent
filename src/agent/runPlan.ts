@@ -14,7 +14,8 @@ import {
 import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
 import { planLoopBudget } from "./loopPlanner";
 import type { ReflexDecision } from "./reflex/types";
-import { isTitleOnlyIntent } from "./titleIntent";
+import { missionGrantsDesignCapability } from "./codeDesignIntent";
+import { isExplicitVisibleFileRenameIntent, isTitleOnlyIntent } from "./titleIntent";
 import {
   isCurrentNoteEditOrganizeIntent,
   isNamedSectionEditIntent,
@@ -429,7 +430,7 @@ export function createRunPlan({
   // Research→code (and other code-shaped) missions must take this path before
   // the pure web-search route so the step budget includes the code ladder.
   if (
-    hasSharedDesignIntent(prompt) ||
+    missionGrantsDesignCapability(prompt) ||
     hasCodeExecutionIntent(prompt) ||
     routedCodeExecutionProposal ||
     hasHtmlPreviewIntent(prompt) ||
@@ -467,7 +468,7 @@ export function createRunPlan({
       slowPathReason: "needs_model_planning",
       expectedTimeClass: "normal",
       traceReasons: [
-        hasSharedDesignIntent(prompt)
+        missionGrantsDesignCapability(prompt)
           ? "design_intent"
           : hasCodeExecutionIntent(prompt)
             ? hasWebSearchIntent(prompt)
@@ -524,24 +525,29 @@ export function createRunPlan({
     });
   }
 
-  // Title + content needs a tool step for rename_current_file before streamed
-  // writeback. Do not take the single-step writeback route or the rename never
-  // runs (or the run ends after rename with maxSteps=1 and no stream).
-  // External Bound mutations already returned above; keep this note-only.
+  // Body write stays on streamed writeback. An explicit "change the title
+  // as well" is one extra rename tool step, not a flip to the tool loop
+  // and not a chat destination.
   if (
     streamingWritebackKind !== null &&
     !hasTitleIntent(prompt) &&
     !isTitleOnlyIntent(prompt)
   ) {
+    const sidecarTitleRename = isExplicitVisibleFileRenameIntent(prompt);
     return plan({
       route: "single_model_writeback",
-      maxStepsForRun: capSteps(streamingWritebackKind === "edit" ? 3 : 1),
+      maxStepsForRun: capSteps(
+        streamingWritebackKind === "edit" ? 3 : sidecarTitleRename ? 2 : 1,
+      ),
       thinking: undefined,
       allowedTools: tools,
       slowPathReason:
         streamingWritebackKind === "edit" ? "needs_edit_or_replace" : "none",
       expectedTimeClass: streamingWritebackKind === "edit" ? "normal" : "quick",
-      traceReasons: [`streaming_writeback:${streamingWritebackKind}`],
+      traceReasons: [
+        `streaming_writeback:${streamingWritebackKind}`,
+        ...(sidecarTitleRename ? ["sidecar_title_rename"] : []),
+      ],
     });
   }
 

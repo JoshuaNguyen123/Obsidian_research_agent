@@ -6,6 +6,14 @@ import {
   isResearchTopicDesignProse,
   missionGrantsDesignCapability,
 } from "../src/agent/codeDesignIntent";
+import {
+  hasCanvasDesignIntent,
+  hasDesignPackageIntent,
+  hasGraphConnectionIntent,
+  hasResearchMemoryIntent,
+  hasVaultBrowseIntent,
+  hasVaultContextQuestionIntent,
+} from "../src/agent/promptIntentClassifiers";
 import { analyzeGeneratedOutputPrompt } from "../src/agent/generatedOutputPolicy";
 import { planLoopBudget } from "../src/agent/loopPlanner";
 import { getRequiredWriteToolNamesForTests } from "../src/AgentRunner";
@@ -70,6 +78,46 @@ test("research topic design prose is classified apart from design deliverables",
       "Explain how distributed systems reach consensus.",
     ),
     false,
+  );
+});
+
+test("architecture and distributed-systems subject matter do not need research|investigate", () => {
+  const architectureNote =
+    "Write a short note on transformer architecture and how self-attention works.";
+  const distributedNote =
+    "Draft an essay about distributed systems and the CAP trade-offs.";
+  const workingMemoryNote =
+    "Write a note about working memory and how it relates to attention.";
+  for (const mission of [architectureNote, distributedNote, workingMemoryNote]) {
+    assert.equal(
+      isResearchTopicDesignProse(mission),
+      true,
+      `narrative note about a design-flavored topic must be topic prose: ${mission}`,
+    );
+    assert.equal(
+      missionGrantsDesignCapability(mission),
+      false,
+      `must not grant design capability: ${mission}`,
+    );
+    assert.equal(hasCanvasDesignIntent(mission), false, mission);
+    assert.equal(hasDesignPackageIntent(mission), false, mission);
+  }
+});
+
+test("working memory and References as subject matter do not plant vault or graph nodes", () => {
+  const workingMemory =
+    "Write a note about working memory and how it relates to attention.";
+  const referencesHeading =
+    "Write a short note on attention. Include a References section.";
+  assert.equal(hasResearchMemoryIntent(workingMemory), false);
+  assert.equal(hasGraphConnectionIntent(workingMemory), false);
+  assert.equal(hasVaultBrowseIntent(workingMemory), false);
+  assert.equal(hasVaultContextQuestionIntent(workingMemory), false);
+  assert.equal(hasGraphConnectionIntent(referencesHeading), false);
+  assert.equal(hasVaultContextQuestionIntent(referencesHeading), false);
+  assert.equal(
+    hasGraphConnectionIntent("What notes is this note connected to?"),
+    true,
   );
 });
 

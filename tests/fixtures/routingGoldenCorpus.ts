@@ -99,22 +99,18 @@ export const FULL_DESKTOP_LADDER = [
  * History: 14/21 measured 2026-07-25 before any routing change; 61/62 after
  * the deterministic tier landed (write-as-execution, "make" verb, how-to and
  * conversational-revision guards, write-a-note guards, and fuzzy typo
- * rescue). The one open miss is
- * guard-desk-notes, whose route false-positive lives in the shared design
- * gate (`codeDesignIntent.ts` DESIGN_INTENT matching topical "game design");
- * narrowing it risks real design missions, so it waits for the semantic
- * shadow tier evidence. 64/65 after the executable-notebook deliverable
- * predicate landed (notebook-execution-live lane prompt, fast-path deferral,
- * and the jupyter-reflection guard all pass). 66/67 after Genesis-shaped
- * STEM research notes ("cite at least N scholarly sources" + stream to page)
- * were pinned as persist / grounded_workflow with no code ladder.
- * 67/68 after "Write me brief about dfs and bfs in python" stopped matching
- * the write…python code-deliverable arm and stayed a streamed note brief.
+ * rescue). 64/65 after the executable-notebook deliverable predicate landed
+ * (notebook-execution-live lane prompt, fast-path deferral, and the
+ * jupyter-reflection guard all pass). 66/67 after Genesis-shaped STEM
+ * research notes ("cite at least N scholarly sources" + stream to page) were
+ * pinned as persist / grounded_workflow with no code ladder. 67/68 after
+ * "Write me brief about dfs and bfs in python" stopped matching the
+ * write…python code-deliverable arm and stayed a streamed note brief.
  * 75/85 after WS-5 rebuilt observe() on the production writeback pipeline
- * and added the missing prompt families. Two STEM title+stream destination
- * pins and seven new-family misses are known_miss for WS-2 classifiers.
+ * and added the missing prompt families. 76/85 after WS-2 topic-noun
+ * containment flipped guard-desk-notes (topical "game design") to pass.
  */
-export const ROUTING_BASELINE_ACCURACY = 75 / 85;
+export const ROUTING_BASELINE_ACCURACY = 76 / 85;
 
 export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
   {
@@ -285,11 +281,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "atomic",
     },
-    current: {
-      // Shared DESIGN_INTENT gate false-fires on topical "game design".
-      route: "grounded_workflow",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
     id: "guard-haiku",

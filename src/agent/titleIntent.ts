@@ -1,3 +1,9 @@
+import {
+  isCurrentNoteEditOrganizeIntent,
+  isVaultWideOrganizeIntent,
+  isWholeNoteEditIntent,
+} from "./editOrganizeIntent";
+
 export interface RenameReceiptLike {
   toolName?: string;
   operation?: string;
@@ -66,6 +72,39 @@ export function isVisibleTitleRenameIntent(prompt: string): boolean {
   }
 
   return /\b(title|untitled)\b/i.test(prompt);
+}
+
+/**
+ * "This mission is about the note's title" for the route and the tool
+ * frontier. It withholds a fast path only when the mission is title-primary
+ * (rename-only, retitle, h1/frontmatter, or organize-the-file residue).
+ *
+ * A body write that also says "change the title as well" or "with the title
+ * Purple Horizon" is not title-primary: streamed current-note writeback
+ * stays, and an explicit rename is a sidecar tool step. Do not treat
+ * `isVisibleTitleRenameIntent` alone as hasTitleIntent — that matcher is
+ * true for any "title" word, including generate-with-title prompts.
+ */
+export function hasTitleIntent(prompt: string): boolean {
+  if (
+    isCurrentNoteEditOrganizeIntent(prompt) ||
+    isVaultWideOrganizeIntent(prompt) ||
+    isWholeNoteEditIntent(prompt)
+  ) {
+    return false;
+  }
+
+  if (isMarkdownTitleContentIntent(prompt)) {
+    return true;
+  }
+
+  if (isVisibleTitleRenameIntent(prompt) && isTitleOnlyIntent(prompt)) {
+    return true;
+  }
+
+  return /\b(?:organi[sz]e|reorgani[sz]e|restructure|improve)\s+(?:the\s+|this\s+|my\s+|its\s+)?(?:note|file)\b/i.test(
+    prompt,
+  );
 }
 
 export function isTitleOnlyIntent(prompt: string): boolean {

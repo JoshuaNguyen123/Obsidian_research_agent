@@ -48,6 +48,21 @@ test("copy-last-assistant-essay onto the page stays an append follow-up", () => 
   assert.equal(hasPageContentClearIntent(COPY_LAST_ESSAY), false);
 });
 
+test("wipe this, start over, and scratch that are page-clear replace", () => {
+  for (const prompt of ["wipe this", "start over", "scratch that"]) {
+    assert.equal(hasPageContentClearIntent(prompt), true, prompt);
+    assert.equal(hasReplaceIntent(prompt), true, prompt);
+    assert.equal(hasAuthorizedCurrentNoteReplaceIntent(prompt), true, prompt);
+    assert.equal(detectExplicitReplaceIntent(prompt), true, prompt);
+    assert.deepEqual(
+      analyzeCurrentNoteResetPrompt(prompt),
+      { kind: "replace_current_note", reason: "clear_then_write" },
+      prompt,
+    );
+    assert.equal(hasDeleteIntent(prompt), false, prompt);
+  }
+});
+
 test("delete the current note still means trash the file", () => {
   assert.equal(hasPageContentClearIntent(TRASH_CURRENT_NOTE), false);
   assert.deepEqual(analyzeCurrentNoteResetPrompt(TRASH_CURRENT_NOTE), {

@@ -3,8 +3,9 @@
  * One plan controls destination, mutation, delivery, and title policy.
  */
 
-import { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
+import { detectExplicitReplaceIntent } from "./replaceIntent";
+export { detectExplicitReplaceIntent };
 
 export type NoteOutputDestination = "active_note" | "new_note" | "chat";
 export type NoteOutputMutation =
@@ -91,9 +92,6 @@ const EXPLICIT_ACTIVE_NOTE_TARGET_PATTERN =
 const UNTARGETED_REPORT_ARTIFACT_PATTERN =
   /\b(?:guide|report)\b/iu;
 
-const EXPLICIT_REPLACE_PATTERN =
-  /\b(replace|re-?write|overwrite|start\s+fresh|reset|clear\s+(?:and\s+)?write|delete\s+(?:the\s+)?(?:content|body)\s+and\s+write|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b[\s\S]{0,120}\b(?:entire|whole)\s+(?:page|note|file|document|essay|draft|article|content|body)\b|\b(replace|re-?write|overwrite|start\s+fresh|reset|clear\s+(?:and\s+)?write|delete\s+(?:the\s+)?(?:content|body)\s+and\s+write)\b/i;
-
 const PRESERVE_TITLE_PATTERN =
   /\b(keep|preserve|do\s+not\s+(?:change|rename|retitle)|don'?t\s+(?:change|rename|retitle))\b[\s\S]{0,40}\b(title|name|filename)\b/i;
 
@@ -113,12 +111,6 @@ export function detectExplicitNewNoteIntent(prompt: string): boolean {
 
 export function detectExplicitActiveNoteTarget(prompt: string): boolean {
   return EXPLICIT_ACTIVE_NOTE_TARGET_PATTERN.test(prompt);
-}
-
-export function detectExplicitReplaceIntent(prompt: string): boolean {
-  return (
-    EXPLICIT_REPLACE_PATTERN.test(prompt) || hasPageContentClearIntent(prompt)
-  );
 }
 
 export function detectPreserveTitleIntent(prompt: string): boolean {

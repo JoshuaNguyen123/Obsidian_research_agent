@@ -1,6 +1,10 @@
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import type { NoteOutputDestination } from "./noteOutputPolicy";
 import { stripNegatedResearchDepthClausesV1 } from "./researchDepthIntent";
+import {
+  matchesFetchedWebSourceLanguageV1,
+  matchesSourcesOrWebLanguageV1,
+} from "./sourceIntent";
 
 export type MissionEffortProfileV1 =
   | "direct"
@@ -66,8 +70,8 @@ export interface ResolveMissionEffortDecisionV1Input {
 const OUTPUT_DEPTH_PATTERN =
   /\b(?:in[-\s]?depth|comprehensive|detailed|thorough|extensive|long[-\s]?form|full\s+(?:guide|report|analysis))\b/iu;
 
-const EXPLICIT_GROUNDING_PATTERN =
-  /\b(?:sources?|citations?|cited|cite|references?|bibliograph\w*|verify|verification|fact[-\s]?check|evidence|current|latest|recent|as\s+of|up[-\s]?to[-\s]?date|online|internet|web|urls?|compare\s+(?:sources?|evidence))\b|https?:\/\//iu;
+const EXPLICIT_GROUNDING_RESIDUAL_PATTERN =
+  /\b(?:references?|bibliograph\w*|verify|verification|evidence|current|latest|recent|as\s+of|up[-\s]?to[-\s]?date|compare\s+(?:sources?|evidence))\b/iu;
 
 const EXPLICIT_EXTENDED_PATTERN =
   /\b(?:deep\s+research|long\s+research|in[-\s]?depth\s+research|exhaustive\s+research|systematic\s+review|all\s+available\s+sources|overnight\s+research|multi[-\s]?source\s+(?:research|review|comparison)|evidence\s+ledger|long[-\s]?running\s+research)\b/iu;
@@ -76,7 +80,11 @@ const SIMPLE_DIRECT_PATTERN =
   /^(?:\s*(?:hi|hello|hey|thanks|thank\s+you|ok|okay|yes|no|sure)\s*[.!?…]*)+$/iu;
 
 export function hasExplicitGroundingIntentV1(prompt: string): boolean {
-  return EXPLICIT_GROUNDING_PATTERN.test(prompt);
+  return (
+    matchesFetchedWebSourceLanguageV1(prompt) ||
+    matchesSourcesOrWebLanguageV1(prompt) ||
+    EXPLICIT_GROUNDING_RESIDUAL_PATTERN.test(prompt)
+  );
 }
 
 /**
