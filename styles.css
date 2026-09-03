@@ -1005,42 +1005,6 @@
   text-decoration: underline;
 }
 
-.agentic-researcher-live-workstream {
-  align-self: stretch;
-  background: transparent;
-  border: 0;
-  border-top: 1px solid var(--agent-rule);
-  color: var(--agent-text-muted);
-  flex: 0 0 auto;
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
-  margin-top: var(--agent-space-1);
-  max-height: 4.5em;
-  min-height: 0;
-  opacity: 0.9;
-  overflow-y: auto;
-  padding: var(--agent-space-2) var(--agent-space-1) 0;
-}
-
-.agentic-researcher-live-workstream.is-hidden {
-  display: none;
-}
-
-.agentic-researcher-live-workstream-line {
-  border-bottom: 0;
-  opacity: 0.85;
-  overflow: hidden;
-  padding: 1px 0;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agentic-researcher-live-workstream-line:last-child {
-  border-bottom: 0;
-  color: var(--text-normal);
-  opacity: 1;
-}
-
 .agentic-researcher-thinking-stream {
   color: var(--agent-text-muted);
   font-family: var(--font-monospace);
@@ -1383,6 +1347,23 @@
   display: none;
 }
 
+/*
+ * The banner is a stack of keyed cards (readiness, blocked, approval,
+ * clarification); each renderer owns one card, so a question arriving while a
+ * blocker is showing sits under it instead of replacing it. Hairlines, not
+ * nested boxes, separate the cards.
+ */
+.agentic-researcher-chat-attention-card {
+  display: grid;
+  gap: var(--agent-space-3);
+  min-width: 0;
+}
+
+.agentic-researcher-chat-attention-card + .agentic-researcher-chat-attention-card {
+  border-top: var(--agent-hairline);
+  padding-top: var(--agent-space-3);
+}
+
 .agentic-researcher-chat-attention-title {
   font-weight: 600;
   overflow-wrap: anywhere;
@@ -1441,8 +1422,9 @@
 }
 
 /* Clarifying question: a quiet prompt, not an alarm. */
-.agentic-researcher-chat-attention.is-clarification {
+.agentic-researcher-chat-attention-card.is-clarification {
   border-left: 2px solid var(--interactive-accent);
+  padding-left: var(--agent-space-3);
 }
 
 .agentic-researcher-clarification-chip {

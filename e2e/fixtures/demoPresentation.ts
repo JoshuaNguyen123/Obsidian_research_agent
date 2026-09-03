@@ -190,34 +190,6 @@ export async function prepareDemoPresentationV1(
             item.remove();
           }
         }
-        for (const line of Array.from(
-          document.querySelectorAll<HTMLElement>(
-            ".agentic-researcher-live-workstream-line",
-          ),
-        )) {
-          const text = line.textContent?.replace(/\s+/gu, " ").trim() ?? "";
-          if (
-            /^(?:Research-team routing:|Classifying mission|Agent step \d+ of \d+|Thinking\.\.\.|Run diagnostics:|Tool complete:)/iu.test(
-              text,
-            )
-          ) {
-            line.remove();
-            continue;
-          }
-          const readableToolEvent = [
-            [/^Used code_workspace_create_file\b/iu, "Created text_file_organizer.py"],
-            [/^Used code_validate_fast\b/iu, "Fast validation passed"],
-            [/^Used code_validate_targeted\b/iu, "Targeted validation passed"],
-            [/^Used code_validate_full\b/iu, "Full validation passed"],
-            [
-              /^Used code_workspace_export_directory\b/iu,
-              "Delivered verified Desktop folder",
-            ],
-          ].find(([pattern]) => (pattern as RegExp).test(text));
-          if (readableToolEvent) {
-            line.textContent = readableToolEvent[1] as string;
-          }
-        }
       };
       redactPersonalPaths(document.body);
       hideEphemeralRows();

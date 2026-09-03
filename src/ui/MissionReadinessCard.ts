@@ -4,6 +4,7 @@ import type {
   MissionReadinessPreflightV1,
 } from "../agent/missionReadinessPreflight";
 import { missionReadinessMissingSummaries } from "../agent/missionReadinessPreflight";
+import { upsertChatAttentionCard } from "./chatAttentionStack";
 
 export interface MissionReadinessCardMissingItemV1 {
   id: string;
@@ -92,25 +93,26 @@ export interface MissionReadinessCardHandlersV1 {
 
 /**
  * Renders one attention card: missing items list + single Set up & resume CTA.
+ * Owns the "readiness" slot of the chat attention stack; other cards (a
+ * blocker, an approval, a question) are left in place.
  */
 export function renderMissionReadinessCard(
   banner: HTMLElement,
   model: MissionReadinessCardModelV1,
   handlers: MissionReadinessCardHandlersV1,
-): void {
-  banner.empty();
-  banner.removeClass("is-hidden");
-  banner.show();
-  banner.createDiv({
+): HTMLElement {
+  const card = upsertChatAttentionCard(banner, "readiness");
+  card.addClass("agentic-researcher-mission-readiness-card");
+  card.createDiv({
     text: model.title,
     cls: "agentic-researcher-chat-attention-title",
   });
-  banner.createDiv({
+  card.createDiv({
     text: `What: ${model.what}`,
     cls: "agentic-researcher-chat-attention-body",
   });
   if (model.missingItems.length > 1) {
-    const missingList = banner.createDiv({
+    const missingList = card.createDiv({
       cls: "agentic-researcher-chat-attention-body",
       attr: { "data-testid": "chat-mission-readiness-missing" },
     });
@@ -140,15 +142,15 @@ export function renderMissionReadinessCard(
       });
     }
   }
-  banner.createDiv({
+  card.createDiv({
     text: `Why: ${model.why}`,
     cls: "agentic-researcher-chat-attention-body",
   });
-  banner.createDiv({
+  card.createDiv({
     text: `Next: ${model.next}`,
     cls: "agentic-researcher-chat-attention-body",
   });
-  const controls = banner.createDiv({
+  const controls = card.createDiv({
     cls: "agentic-researcher-chat-attention-controls",
   });
   const setupButton = controls.createEl("button", {
@@ -163,6 +165,7 @@ export function renderMissionReadinessCard(
     event.preventDefault();
     handlers.onSetupAndResume(model.primarySetupTarget);
   });
+  return card;
 }
 
 /** Test helper: summarize missing items for assertions without DOM. */

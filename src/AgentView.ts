@@ -69,10 +69,7 @@ import {
   inferCapabilitySetupTarget,
   type CapabilitySetupTarget,
 } from "./agent/capabilitySetup";
-import {
-  compoundLifecycleStageLabel,
-  formatCompoundLifecycleStageStrip,
-} from "./agent/compoundLifecycleReadiness";
+import { compoundLifecycleStageLabel } from "./agent/compoundLifecycleReadiness";
 import { evaluateMissionReadinessPreflightV1 } from "./agent/missionReadinessPreflight";
 import { githubCleanupAuthorityFromScopesV1 } from "./agent/capabilityReadiness";
 import {
@@ -93,7 +90,6 @@ import {
 import {
   clearChatConfirmCopy,
   clearChatDoneCopy,
-  chatApprovalAttentionTitle,
   chatModelConnectionGateTitle,
   chatMissionGraphBlockerTitle,
   chatProviderBlockerTitle,
@@ -104,9 +100,6 @@ import {
   inferTeamRolePhaseFromStatus,
   missionReceiptWrittenChatLine,
   noteStreamingActiveChatLine,
-  receiptUrlWorkstreamLine,
-  teamRoleStripCopy,
-  toolStepChatLine,
   isToolIntentGateFailure,
   type TeamRoleStripPhase,
 } from "./ui/agentViewCopy";
@@ -144,6 +137,16 @@ import {
   buildMissionReadinessCardModelV1,
   renderMissionReadinessCard,
 } from "./ui/MissionReadinessCard";
+import {
+  type ChatAttentionKey,
+  clearAllChatAttentionCards,
+  clearChatAttentionCard,
+  upsertChatAttentionCard,
+} from "./ui/chatAttentionStack";
+import {
+  renderChatApprovalCard,
+  renderClarificationCard,
+} from "./ui/chatAttentionCards";
 import type { AutonomyRunStatsV1 } from "./agent/autonomyRunStats";
 import {
   projectMissionGraphRunDetails,
@@ -237,14 +240,11 @@ export class AgentView extends ItemView {
   private chatAttentionEl: HTMLElement | null = null;
   private firstRunEl: HTMLElement | null = null;
   private chatEmptyStateEl: HTMLElement | null = null;
-  private liveWorkstreamEl: HTMLElement | null = null;
   private lifecycleStageStripEl: HTMLElement | null = null;
   private developerMissionCompletionEl: HTMLElement | null = null;
-  private chatTeamStripEl: HTMLElement | null = null;
   private thinkingStreamEl: HTMLElement | null = null;
   private liveThinkingMessageEl: HTMLElement | null = null;
   private teamPhase: TeamRoleStripPhase = "idle";
-  private teamHandoffReady: boolean | undefined = undefined;
   private lifecycleStripActive = false;
   private autonomyRunStats: AutonomyRunStatsV1 | null = null;
   private chatStatsStepLabel = "step —";
@@ -342,7 +342,6 @@ export class AgentView extends ItemView {
     { tab: AgentViewTab; preserveUserPosition: boolean }
   >();
   private lastStatusRowKey: string | null = null;
-  private lastWorkstreamLine: string | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: AgenticResearcherPlugin) {
     super(leaf);
@@ -682,7 +681,6 @@ export class AgentView extends ItemView {
     this.receiptKeys.clear();
     this.chatLoaderEl = null;
     this.chatLoaderTextEl = null;
-    this.liveWorkstreamEl = null;
     this.lifecycleStageStripEl = null;
     this.developerMissionCompletionEl = null;
     this.runStatusEl = null;
@@ -712,7 +710,6 @@ export class AgentView extends ItemView {
     this.orchestratorTab = null;
     this.orchestratorReferenceRunId = null;
     this.lastStatusRowKey = null;
-    this.lastWorkstreamLine = null;
     this.tabsEl = null;
     this.orchestratorTabButtonEl = null;
     this.orchestratorPanelEl = null;
@@ -1218,10 +1215,8 @@ export class AgentView extends ItemView {
         this.createConversationLogItem(message);
       }
     }
-
     // Active work is summarized by the one live-run card outside conversation.
     // Full tool and status streams remain available in Run Details.
-    this.liveWorkstreamEl = null;
   }
 
   private renderChatEmptyState(): void {
@@ -1834,6 +1829,11 @@ export class AgentView extends ItemView {
       return null;
     }
     const lifecycleReadiness = missionReadiness;
+    // Both pre-run gates passed, so a readiness card or blocker left from an
+    // earlier attempt is settled; approval and clarification cards belong to
+    // the run that raised them and are cleared with it.
+    this.clearChatAttentionCard("readiness");
+    this.clearChatAttentionCard("blocked");
 
     const conversationHistory = [...this.plugin.conversationHistory];
     this.missionSubmittedSinceOpen = true;
@@ -1849,9 +1849,6 @@ export class AgentView extends ItemView {
     this.pendingAssistantContent = "";
     if (lifecycleReadiness.compound) {
       this.showLifecycleStageStrip(lifecycleReadiness.stages);
-      this.appendWorkstreamLine(
-        `Lifecycle: ${formatCompoundLifecycleStageStrip(lifecycleReadiness.stages)}`,
-      );
     }
     // One mission, one visible prompt. The shared projection is also used by
     // renderConversationLog, so the persistence refresh below cannot erase a
@@ -2205,7 +2202,6 @@ export class AgentView extends ItemView {
     this.pendingTextDeltas.clear();
     this.pendingScrollTargets.clear();
     this.lastStatusRowKey = null;
-    this.lastWorkstreamLine = null;
     this.toolTimelineItems.clear();
     this.toolTimelineOrdinal = 0;
     this.traceRowEls.clear();
@@ -2228,7 +2224,6 @@ export class AgentView extends ItemView {
     this.autonomyRunStats = null;
     this.chatStatsStepLabel = "step —";
     this.teamPhase = "idle";
-    this.teamHandoffReady = undefined;
     this.runConfig = null;
     this.liveRunModelCalls = 0;
     this.liveRunToolCalls = 0;
@@ -2274,13 +2269,6 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.approvalDetailsEl, "No approval required.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
-    if (this.liveWorkstreamEl) {
-      this.liveWorkstreamEl.empty();
-      this.liveWorkstreamEl.removeClass("is-hidden");
-      this.liveWorkstreamEl.show();
-      this.setSectionPlaceholder(this.liveWorkstreamEl, "Live workstream starting…");
-    }
-    this.renderChatTeamStrip();
     this.renderChatStatsStrip();
     this.hideLifecycleStageStrip();
     this.hideDeveloperMissionCompletion();
@@ -2360,7 +2348,6 @@ export class AgentView extends ItemView {
     }
     if (kind === "status") {
       this.updateChatLoader(display);
-      if (!duplicate) this.appendWorkstreamLine(display);
       this.updateTeamStripFromStatus(display);
     }
     if (!duplicate) this.appendTrace(kind, display);
@@ -2370,10 +2357,6 @@ export class AgentView extends ItemView {
     const inferred = inferTeamRolePhaseFromStatus(message);
     if (!inferred) return;
     this.teamPhase = inferred.phase;
-    if (inferred.handoffReady !== undefined) {
-      this.teamHandoffReady = inferred.handoffReady;
-    }
-    this.renderChatTeamStrip();
     if (this.teamPhase !== "idle" && !this.orchestratorTabButtonEl) {
       this.refreshOrchestratorAvailability();
     }
@@ -2428,7 +2411,6 @@ export class AgentView extends ItemView {
     );
     this.setMetric(this.activeToolValueEl, event.name);
     this.updateChatLoader(`RUN> ${event.name}`);
-    this.appendWorkstreamLine(`Tool start: ${event.name}`);
 
     const itemEl = this.ensureToolTimelineItem(event);
     itemEl.removeClass("is-complete");
@@ -2520,12 +2502,8 @@ export class AgentView extends ItemView {
       ok || skipped ? "tool" : "error",
       event.message ?? `${event.name} ${ok ? "complete" : skipped ? "skipped" : "error"}`,
     );
-    const toolLine = toolStepChatLine(event.name, ok, event.message, {
-      skipped,
-    });
-    // Keep Chat prompt-first: tool steps live in the workstream + Run Details
-    // timeline, not as a stack of system bubbles in the main stream.
-    this.appendWorkstreamLine(toolLine);
+    // Keep Chat prompt-first: tool steps live in the Run Details timeline,
+    // not as a stack of system bubbles in the main stream.
   }
 
   private renderToolVerification(event: AgentToolRunEvent) {
@@ -2755,7 +2733,6 @@ export class AgentView extends ItemView {
     this.appendTrace("complete", formatStopReasonLabel(missionStop));
     const stopLine = stopReasonChatLine(missionStop, event.stopDetail);
     this.appendLog("system", stopLine);
-    this.appendWorkstreamLine(stopLine);
     if (
       missionStop === "provider_error" ||
       missionStop === "orchestration_deadlock" ||
@@ -2891,9 +2868,7 @@ export class AgentView extends ItemView {
       ),
     });
     if (written?.created) {
-      const line = missionReceiptWrittenChatLine(written.path);
-      this.appendLog("system", line);
-      this.appendWorkstreamLine(line);
+      this.appendLog("system", missionReceiptWrittenChatLine(written.path));
     }
   }
 
@@ -3004,7 +2979,7 @@ export class AgentView extends ItemView {
         cardEl.querySelectorAll("button").forEach((button) => {
           (button as HTMLButtonElement).disabled = true;
         });
-        this.clearChatAttention();
+        this.clearChatAttentionCard("approval");
       }
     };
     approveButton.addEventListener("click", (event) => {
@@ -3023,7 +2998,7 @@ export class AgentView extends ItemView {
     request: ApprovalRequest,
     decision: ApprovalDecision,
   ) {
-    this.clearChatAttention();
+    this.clearChatAttentionCard("approval");
     this.setRunDetailsNeedsAttention(false);
     const cardEl = this.approvalCardEls.get(request.id);
     if (!cardEl) {
@@ -3068,10 +3043,6 @@ export class AgentView extends ItemView {
       ".agentic-researcher-code-output-row",
       MAX_CODE_OUTPUT_ROWS,
     );
-    const preview = event.chunk.replace(/\s+/g, " ").trim().slice(0, 120);
-    if (preview) {
-      this.appendWorkstreamLine(`code ${event.stream}: ${preview}`);
-    }
   }
 
   private handleStreamLifecycle(event: AgentStreamLifecycleEvent) {
@@ -3095,7 +3066,6 @@ export class AgentView extends ItemView {
     ) {
       this.noteStreamingAnnounced = true;
       this.appendLog("system", noteStreamingActiveChatLine());
-      this.appendWorkstreamLine(noteStreamingActiveChatLine());
     }
   }
 
@@ -3332,8 +3302,6 @@ export class AgentView extends ItemView {
     const artifact: MissionReceiptArtifactLinkV1 = { system, label, url };
     if (!this.runArtifactLinks.some((item) => item.url === url)) {
       this.runArtifactLinks.push(artifact);
-      // Receipt row keeps the URL; workstream gets a short ping (no Artifacts panel).
-      this.appendWorkstreamLine(receiptUrlWorkstreamLine(system, url));
     }
     this.trackReceiptMetadata(receipt);
   }
@@ -4461,9 +4429,6 @@ export class AgentView extends ItemView {
       return;
     }
 
-    if (this.liveWorkstreamEl?.isConnected) {
-      this.logEl.appendChild(this.liveWorkstreamEl);
-    }
     if (this.chatLoaderEl?.isConnected) {
       this.logEl.appendChild(this.chatLoaderEl);
     }
@@ -4800,27 +4765,6 @@ export class AgentView extends ItemView {
       this.chatStatsStepLabel = `step ${value}`;
       this.renderChatStatsStrip();
     }
-  }
-
-  private renderChatTeamStrip(): void {
-    const el = this.chatTeamStripEl;
-    if (!el) return;
-    const copy = teamRoleStripCopy({
-      phase: this.teamPhase,
-      handoffReady: this.teamHandoffReady,
-    });
-    el.empty();
-    if (this.teamPhase === "idle") {
-      el.addClass("is-hidden");
-      el.hide();
-      return;
-    }
-    el.removeClass("is-hidden");
-    el.show();
-    el.createDiv({
-      text: copy,
-      cls: "agentic-researcher-chat-team-line",
-    });
   }
 
   private renderChatStatsStrip(): void {
@@ -5411,32 +5355,6 @@ export class AgentView extends ItemView {
     return formatStopReasonLabel(fromAgentRunStopReason(stopReason));
   }
 
-  private appendWorkstreamLine(message: string): void {
-    const normalized = message.trim();
-    if (
-      !normalized ||
-      normalized === this.lastWorkstreamLine ||
-      !this.liveWorkstreamEl
-    ) {
-      return;
-    }
-    this.lastWorkstreamLine = normalized;
-    this.liveWorkstreamEl.removeClass("is-hidden");
-    this.liveWorkstreamEl.show();
-    this.clearPlaceholder(this.liveWorkstreamEl);
-    this.liveWorkstreamEl.createDiv({
-      text: normalized,
-      cls: "agentic-researcher-live-workstream-line",
-    });
-    this.trimRows(
-      this.liveWorkstreamEl,
-      ".agentic-researcher-live-workstream-line",
-      MAX_STATUS_ROWS,
-    );
-    this.moveChatActivityToEnd();
-    this.scheduleScrollToEnd(this.liveWorkstreamEl, "chat");
-  }
-
   private showLifecycleStageStrip(
     stages: readonly ProjectLifecycleStageV1[],
     activeStage?: ProjectLifecycleStageV1 | null,
@@ -5813,10 +5731,8 @@ export class AgentView extends ItemView {
     if (!banner) {
       return;
     }
-    banner.empty();
-    banner.removeClass("is-hidden");
-    banner.show();
-    banner.createDiv({
+    const card = upsertChatAttentionCard(banner, "blocked");
+    card.createDiv({
       text: title,
       cls: "agentic-researcher-chat-attention-title",
     });
@@ -5825,7 +5741,7 @@ export class AgentView extends ItemView {
     // are what it actually recorded.
     const facts = options.facts ?? [];
     if (facts.length > 0) {
-      const evidenceEl = banner.createDiv({
+      const evidenceEl = card.createDiv({
         cls: "agentic-researcher-chat-attention-evidence",
         attr: { "data-testid": "chat-blocked-evidence" },
       });
@@ -5848,27 +5764,27 @@ export class AgentView extends ItemView {
         });
       }
     }
-    banner.createDiv({
+    card.createDiv({
       text: `What: ${copy.what}`,
       cls: "agentic-researcher-chat-attention-body",
     });
-    banner.createDiv({
+    card.createDiv({
       text: `Why: ${reframeBlockedWhyV1({ why: copy.why, facts })}`,
       cls: "agentic-researcher-chat-attention-body",
     });
-    banner.createDiv({
+    card.createDiv({
       text: `Next: ${copy.next}`,
       cls: "agentic-researcher-chat-attention-body",
     });
     const suppression = continuationSuppressionSentence(this.lastAutoContinuation);
     if (suppression) {
-      banner.createDiv({
+      card.createDiv({
         text: suppression,
         cls: "agentic-researcher-continuation-suppression",
         attr: { "data-testid": "chat-blocked-continue-suppression" },
       });
     }
-    const controls = banner.createDiv({
+    const controls = card.createDiv({
       cls: "agentic-researcher-chat-attention-controls",
     });
 
@@ -5895,7 +5811,7 @@ export class AgentView extends ItemView {
       });
       continueButton.addEventListener("click", (event) => {
         event.preventDefault();
-        this.clearChatAttention();
+        this.clearChatAttentionCard("blocked");
         void this.submitMissionContinuation(ledger.continuationCommand);
       });
     } else if (options.allowOpenSettings || options.forceSettingsOnly) {
@@ -5931,73 +5847,16 @@ export class AgentView extends ItemView {
     if (!banner) {
       return;
     }
-    banner.empty();
-    banner.removeClass("is-hidden");
-    banner.show();
-    banner.createDiv({
-      text: chatApprovalAttentionTitle(request.toolName),
-      cls: "agentic-researcher-chat-attention-title",
-    });
-    banner.createDiv({
-      text: request.reason,
-      cls: "agentic-researcher-chat-attention-body",
-    });
-    // The chat banner offers the same Approve/Deny authority as Run Details.
-    // card, so it owes the user the same minimum context: WHERE the mutation
-    // is going. Title and reason alone let a user approve an outbound write
-    // without ever seeing its destination.
-    const attentionModel = formatApprovalCardModelV1(request);
-    if (attentionModel.preview?.destination) {
-      banner.createDiv({
-        text: attentionModel.preview.destination,
-        cls: "agentic-researcher-chat-attention-body",
-        attr: { "data-testid": "chat-approval-destination" },
-      });
-    }
-    const controls = banner.createDiv({
-      cls: "agentic-researcher-chat-attention-controls",
-    });
-    const approveButton = controls.createEl("button", {
-      text: "Approve",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "chat-approval-approve" },
-    });
-    const denyButton = controls.createEl("button", {
-      text: "Deny",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "chat-approval-deny" },
-    });
-    const openDetails = controls.createEl("button", {
-      text: "Open Run Details",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button" },
-    });
-    const resolve = (decision: "approved" | "denied") => {
-      const accepted = this.plugin.resolveMissionApproval(request.id, decision);
-      if (accepted) {
-        approveButton.disabled = true;
-        denyButton.disabled = true;
-        this.clearChatAttention();
-      }
-    };
-    approveButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      resolve("approved");
-    });
-    denyButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      resolve("denied");
-    });
-    openDetails.addEventListener("click", (event) => {
-      event.preventDefault();
-      this.setActiveTab("details");
+    renderChatApprovalCard(banner, request, {
+      resolve: (decision) =>
+        this.plugin.resolveMissionApproval(request.id, decision),
+      openRunDetails: () => this.setActiveTab("details"),
     });
   }
 
   /**
-   * The agent is unsure and asked one question. Rendered inline in chat with
-   * one-click suggested answers plus a free-text box, so answering is a single
-   * gesture and the transcript keeps the exchange.
+   * The agent is unsure and asked one question. Rendered as its own card in
+   * the attention stack so it never displaces a blocker or an approval.
    */
   private renderClarificationRequest(
     request: ClarificationRequest,
@@ -6007,93 +5866,27 @@ export class AgentView extends ItemView {
     if (!banner) {
       return;
     }
-    banner.empty();
-    banner.removeClass("is-hidden");
-    banner.show();
-    banner.addClass("is-clarification");
-    banner.createDiv({
-      text: request.question,
-      cls: "agentic-researcher-chat-attention-title",
+    renderClarificationCard(banner, request, {
+      answer: (value) => broker.answer(request.id, value),
+      skip: () => broker.skip(request.id),
     });
-    if (request.context) {
-      banner.createDiv({
-        text: request.context,
-        cls: "agentic-researcher-chat-attention-body",
-      });
-    }
-
-    const controls = banner.createDiv({
-      cls: "agentic-researcher-chat-attention-controls",
-    });
-    const settle = (run: () => boolean) => {
-      if (!run()) return;
-      banner.removeClass("is-clarification");
-      this.clearChatAttention();
-    };
-
-    for (const [index, option] of request.options.entries()) {
-      const chip = controls.createEl("button", {
-        text: option,
-        cls: "agentic-researcher-secondary-action agentic-researcher-clarification-chip",
-        attr: {
-          type: "button",
-          "data-testid": `clarification-option-${index}`,
-        },
-      });
-      chip.addEventListener("click", (event) => {
-        event.preventDefault();
-        settle(() => broker.answer(request.id, option));
-      });
-    }
-
-    const freeForm = banner.createDiv({
-      cls: "agentic-researcher-clarification-input",
-    });
-    const input = freeForm.createEl("input", {
-      attr: {
-        type: "text",
-        placeholder: "Type an answer…",
-        "data-testid": "clarification-answer",
-      },
-    });
-    const submit = () => {
-      const value = input.value.trim();
-      if (!value) return;
-      settle(() => broker.answer(request.id, value));
-    };
-    input.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter") return;
-      event.preventDefault();
-      submit();
-    });
-    const sendButton = freeForm.createEl("button", {
-      text: "Send",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "clarification-send" },
-    });
-    sendButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      submit();
-    });
-    const skipButton = freeForm.createEl("button", {
-      text: "Skip",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "clarification-skip" },
-    });
-    skipButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      settle(() => broker.skip(request.id));
-    });
-    input.focus();
   }
 
+  /** Clears every attention card: the transcript or the run they belong to is gone. */
   private clearChatAttention() {
     if (!this.chatAttentionEl) {
       return;
     }
-    this.chatAttentionEl.empty();
-    this.chatAttentionEl.addClass("is-hidden");
-    this.chatAttentionEl.hide();
+    clearAllChatAttentionCards(this.chatAttentionEl);
+    this.refreshChatContinuationAction();
+  }
+
+  /** Clears one attention card; the banner hides only when none remain. */
+  private clearChatAttentionCard(key: ChatAttentionKey) {
+    if (!this.chatAttentionEl) {
+      return;
+    }
+    clearChatAttentionCard(this.chatAttentionEl, key);
     this.refreshChatContinuationAction();
   }
 
