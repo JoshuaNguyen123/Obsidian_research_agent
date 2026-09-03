@@ -77,6 +77,7 @@ test("host refusals are product failures, whatever the tool", () => {
     "prepared_action_required",
     "vault_precondition_changed",
     "approval_denied",
+    "proof_gated_writeback_required",
   ];
   for (const errorCode of productCodes) {
     assert.equal(

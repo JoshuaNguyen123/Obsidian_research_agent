@@ -786,6 +786,35 @@ export function missionAcceptanceHasOnlyTerminalFinalizationDebt(
 }
 
 /**
+ * One deterministic closure for the circular terminal hold classified as
+ * `product:final_projection_candidate_rejected`. The eval signature is a
+ * `force_final_no_tools` decision with `graph_final_only=true` followed by a
+ * nonempty set-loose `mission-graph-tool-frontier`. When a held candidate
+ * already exists and acceptance owes only `final_output` / `final_relevance`
+ * (optionally plus `mission_plan_incomplete` on a tool-less final node),
+ * finish the run instead of asking the model again.
+ */
+export function shouldAcceptHeldFinalProjectionCandidateV1(input: {
+  loopAction: string;
+  graphFinalOnly: boolean;
+  heldCandidate: string;
+  acceptanceMissing: readonly string[];
+  hasReadyToollessFinalNode: boolean;
+  setLooseDeliveryStillUnpaid: boolean;
+  pendingRequiredWriteCount: number;
+}): boolean {
+  if (input.loopAction !== "force_final_no_tools") return false;
+  if (!input.graphFinalOnly) return false;
+  if (input.setLooseDeliveryStillUnpaid) return false;
+  if (input.pendingRequiredWriteCount > 0) return false;
+  if (!input.heldCandidate.trim()) return false;
+  return missionAcceptanceHasOnlyTerminalFinalizationDebt(
+    { missing: [...input.acceptanceMissing] },
+    input.hasReadyToollessFinalNode,
+  );
+}
+
+/**
  * A verified host-directory export is already a complete, receipt-backed
  * terminal answer. Once acceptance passes and every explicit proof debt is
  * paid, a controller routing label cannot add authority; another provider turn
