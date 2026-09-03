@@ -185,7 +185,7 @@ export async function armToolCallCollector(page: Page): Promise<void> {
       ({ pluginId, slotKey, eventCap }) => {
         const host = window as typeof window & Record<string, any>;
         const existing = host[slotKey] as
-          | { segments: any[]; unsubscribe?: () => void }
+          | { segments: any[]; recent?: string[]; unsubscribe?: () => void }
           | undefined;
         try {
           existing?.unsubscribe?.();
@@ -215,12 +215,23 @@ export async function armToolCallCollector(page: Page): Promise<void> {
             ...(Array.isArray(existing?.segments) ? existing!.segments : []),
             segment,
           ],
+          // Bounded ring of the run's most recent status and trace lines.
+          // Never harvested into counts; the harness reads it only to say
+          // what a coordinator that failed to settle after disablePlugin
+          // was last doing (the view, and its DOM log, are gone by then).
+          recent: Array.isArray(existing?.recent)
+            ? (existing!.recent as string[]).slice(-24)
+            : ([] as string[]),
           unsubscribe: undefined as (() => void) | undefined,
         };
         host[slotKey] = state;
 
         const text = (value: unknown): string | null =>
           typeof value === "string" && value.length > 0 ? value : null;
+        const remember = (line: string): void => {
+          if (state.recent.length >= 24) state.recent.shift();
+          state.recent.push(line.slice(0, 220));
+        };
         const codeOf = (value: any): string | null =>
           value && typeof value === "object" ? text(value.code) : null;
         const push = (event: unknown): void => {
@@ -232,9 +243,15 @@ export async function armToolCallCollector(page: Page): Promise<void> {
         };
         state.unsubscribe = plugin.subscribeMissionEvents(
           {
+            onStatus: (message: unknown) => {
+              remember(`status: ${String(message)}`);
+            },
             onTrace: (event: any) => {
               const kind = text(event?.kind);
               const id = text(event?.id);
+              remember(
+                `trace ${kind ?? "?"} ${id ?? ""}: ${text(event?.message) ?? ""}`,
+              );
               if (!id) return;
               if (kind === "tool_start") {
                 push({ kind: "tool_start", id, toolName: text(event?.toolName) });

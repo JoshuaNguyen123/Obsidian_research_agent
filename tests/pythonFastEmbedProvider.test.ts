@@ -401,3 +401,33 @@ test("persistent FastEmbed provider refuses work after dispose", async () => {
   assert.equal(afterDispose.code, "disposed");
   assert.equal(spawned.length, 1);
 });
+
+test("dispose settles an in-flight embed without respawning a helper", async () => {
+  // A silent helper (cold Python start, or a request that never answers):
+  // dispose() used to settle the pending request as helper_exited, which the
+  // retry path read as a crash worth a fresh helper. That respawned a zombie
+  // process after unload and held the caller for the full request timeout,
+  // so a stopped mission could not settle.
+  const { runtime, spawned } = createFakeRuntime(() => undefined);
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  const startedAt = Date.now();
+  const pending = provider.embed(REQUEST);
+  await sleep(5);
+  assert.equal(spawned.length, 1);
+  provider.dispose?.();
+  const result = await pending;
+  assert.ok(Date.now() - startedAt < 2_000, "dispose did not settle the request");
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.code === "disposed" || result.code === "helper_exited",
+    `unexpected code ${result.code}`,
+  );
+  assert.equal(spawned.length, 1, "no helper was respawned after dispose");
+  assert.equal(spawned[0].killed, true);
+
+  const afterDispose = await provider.embed(REQUEST);
+  assert.equal(afterDispose.code, "disposed");
+  assert.equal(spawned.length, 1);
+});

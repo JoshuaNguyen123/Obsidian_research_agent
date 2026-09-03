@@ -3190,6 +3190,7 @@ export async function runAgentMission({
   }
   let reflexOutput = await reflexController.evaluate({
     prompt: activeIntentPrompt,
+    abortSignal,
     missionIntent,
     allowedToolNames: new Set(),
     recentActions,
@@ -3854,6 +3855,7 @@ export async function runAgentMission({
   allowedToolNames = new Set(tools.map((tool) => tool.function.name));
   const capabilityAwareReflexOutput = await reflexController.evaluate({
     prompt: activeIntentPrompt,
+    abortSignal,
     missionIntent,
     allowedToolNames,
     recentActions,
@@ -4423,6 +4425,7 @@ export async function runAgentMission({
     routedMissionIntent = null;
     reflexOutput = await reflexController.evaluate({
       prompt: activeIntentPrompt,
+      abortSignal,
       missionIntent,
       allowedToolNames: new Set(),
       recentActions,
@@ -6235,6 +6238,7 @@ export async function runAgentMission({
     }
     reflexOutput = await reflexController.evaluate({
       prompt: activeIntentPrompt,
+      abortSignal,
       missionIntent,
       allowedToolNames: new Set(),
       recentActions,
@@ -6385,6 +6389,7 @@ export async function runAgentMission({
     allowedToolNames = new Set(tools.map((tool) => tool.function.name));
     const capabilityAwarePromptPageReflexOutput = await reflexController.evaluate({
       prompt: activeIntentPrompt,
+      abortSignal,
       missionIntent,
       allowedToolNames,
       recentActions,
@@ -17196,6 +17201,7 @@ export async function runAgentMission({
 
     reflexOutput = await reflexController.evaluate({
       prompt: activeIntentPrompt,
+      abortSignal,
       missionIntent,
       allowedToolNames,
       recentActions,
@@ -21852,6 +21858,7 @@ export async function runAgentMission({
 
       reflexOutput = await reflexController.evaluate({
         prompt: activeIntentPrompt,
+        abortSignal,
         missionIntent,
         allowedToolNames,
         recentActions,

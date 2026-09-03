@@ -187,6 +187,12 @@ export interface AgenticReflexInput {
   outcomeMemoryNow?: Date;
   checkpoint?: ReflexCheckpointKind;
   frontierFingerprint?: string | null;
+  /**
+   * The run's abort signal. Semantic classification waits on an embedding
+   * helper that cannot be cancelled; racing it lets a stopped run reach its
+   * stop boundary instead of waiting out the helper.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface AgenticReflexOutput {

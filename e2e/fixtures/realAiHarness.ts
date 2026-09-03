@@ -25,6 +25,7 @@ import {
   verifyWithWorkerConnectionAttestation,
 } from "./realAiConnectionAttestation";
 import {
+  TOOL_CALL_COLLECTOR_SLOT,
   armToolCallCollector,
   harvestToolCallCollector,
 } from "./toolCallCollector";
@@ -504,7 +505,7 @@ async function restartCorePlugin(
   provider: "ollama" | "openai_compatible",
   stage?: ProjectLifecycleStageName,
 ): Promise<{ usageScopeId: string | null; modelCalls: number | null }> {
-  const priorUsage = await page.evaluate(async ({ pluginId, requiredLifecycleTool }) => {
+  const priorUsage = await page.evaluate(async ({ pluginId, requiredLifecycleTool, collectorSlotKey }) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.plugins?.disablePlugin || !app?.plugins?.enablePlugin) {
       throw new Error("Obsidian plugin lifecycle APIs are unavailable.");
@@ -544,8 +545,33 @@ async function restartCorePlugin(
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     if (activePlugin?.getMissionRunSnapshot?.().isRunning === true) {
+      // Say what the old coordinator was doing: the class alone cannot tell a
+      // stuck await from a slow one, and the run note is gone by the time a
+      // human looks.
+      const stuck = activePlugin.getMissionRunSnapshot?.() ?? {};
+      // The view is already detached, so the DOM log is gone. The tool-call
+      // collector is the single mission-event seat and is still armed on the
+      // old instance during this wait; it keeps a bounded ring of the run's
+      // last status and trace lines for exactly this diagnosis.
+      const collectorState = (window as typeof window & Record<string, any>)[
+        collectorSlotKey
+      ];
+      const recent: string[] = Array.isArray(collectorState?.recent)
+        ? collectorState.recent.map((line: unknown) => String(line).slice(0, 220))
+        : [];
+      const stuckSummary = JSON.stringify({
+        state: stuck.state ?? null,
+        runId: stuck.runId ?? null,
+        recentEventCount: recent.length,
+        lastEvents: recent.slice(-14),
+        modelCalls: stuck.providerUsage?.modelCallCount ?? null,
+        receipts: Array.isArray(stuck.lastReceipts) ? stuck.lastReceipts.length : null,
+        graphNodes: Object.values(stuck.lastMissionGraph?.nodes ?? {}).map(
+          (node: any) => `${node?.id ?? "?"}:${node?.status ?? "?"}`,
+        ),
+      });
       throw new Error(
-        "process:prior_plugin_run_did_not_settle — the disabled coordinator remained active after its bounded shutdown window.",
+        `process:prior_plugin_run_did_not_settle — the disabled coordinator remained active after its bounded shutdown window. stuck=${stuckSummary}`,
       );
     }
     const settledSnapshot = activePlugin?.getMissionRunSnapshot?.();
@@ -574,6 +600,7 @@ async function restartCorePlugin(
     return priorUsage;
   }, {
     pluginId: NATIVE_CORE_PLUGIN_ID,
+    collectorSlotKey: TOOL_CALL_COLLECTOR_SLOT,
     requiredLifecycleTool: stage
       ? PROJECT_STAGE_COMPLETION_TOOL[stage]
       : null,

@@ -98,18 +98,27 @@ export async function classifyIntent(
     );
   }
 
+  if (input.abortSignal?.aborted) {
+    return abortedDecision();
+  }
   let scored: PrototypeScoreV1<ReflexLabel>[];
   try {
-    scored = await scorePromptAgainstPrototypes({
-      prompt: input.prompt,
-      settings: input.settings,
-      embeddingProvider: input.embeddingProvider,
-      prototypes: PROTOTYPES,
-      prototypeVersion: PROTOTYPE_VERSION,
-      cacheNamespace: "agentic-reflex",
-      fallbackLabel: "unknown",
-    });
+    scored = await raceAbort(
+      scorePromptAgainstPrototypes({
+        prompt: input.prompt,
+        settings: input.settings,
+        embeddingProvider: input.embeddingProvider,
+        prototypes: PROTOTYPES,
+        prototypeVersion: PROTOTYPE_VERSION,
+        cacheNamespace: "agentic-reflex",
+        fallbackLabel: "unknown",
+      }),
+      input.abortSignal,
+    );
   } catch {
+    if (input.abortSignal?.aborted) {
+      return abortedDecision();
+    }
     return fallbackDecision(
       "embedding_provider_failed",
       "embedding_provider_unavailable",
@@ -148,6 +157,47 @@ export async function classifyIntent(
       ? ["Semantic routing may add only a safe read already allowed by host authority."]
       : ["Semantic routing cannot add mutation or external-action authority."],
   };
+}
+
+/**
+ * A stopped run does not wait for the embedding helper. The helper itself
+ * cannot be cancelled (a Python subprocess with a 3-minute request timeout),
+ * so the classification races the run's abort signal and yields the
+ * deterministic fallback the moment the run is stopped.
+ */
+function abortedDecision(): ReflexDecision {
+  return fallbackDecision(
+    "run_aborted",
+    "embedding_provider_unavailable",
+    0,
+    0,
+    ["Semantic routing skipped: the run was stopped before the embedding helper answered."],
+  );
+}
+
+function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) {
+    return work;
+  }
+  if (signal.aborted) {
+    return Promise.reject(new DOMException("The operation was aborted.", "AbortError"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(new DOMException("The operation was aborted.", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 export function fallbackDecision(

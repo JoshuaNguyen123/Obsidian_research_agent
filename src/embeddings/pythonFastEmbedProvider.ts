@@ -277,17 +277,21 @@ export function createPythonFastEmbedProvider(
     });
   };
 
+  const disposedResponse = (
+    request: SemanticEmbeddingRequest,
+  ): SemanticEmbeddingResponse => ({
+    ok: false,
+    model: request.model,
+    dim: request.dim,
+    code: "disposed",
+    message: "FastEmbed provider is disposed.",
+  });
+
   const embedNow = async (
     request: SemanticEmbeddingRequest,
   ): Promise<SemanticEmbeddingResponse> => {
     if (disposed) {
-      return {
-        ok: false,
-        model: request.model,
-        dim: request.dim,
-        code: "disposed",
-        message: "FastEmbed provider is disposed.",
-      };
+      return disposedResponse(request);
     }
     clearIdleTimer();
     try {
@@ -317,6 +321,14 @@ export function createPythonFastEmbedProvider(
         if (!isRetryableHelperFailure(result) || helperRecoveriesRemaining <= 0) {
           return result;
         }
+        // dispose() settles the in-flight request as helper_exited; that
+        // must not read as a crash worth a fresh helper. Respawning here
+        // after unload used to start a zombie Python process and hold the
+        // caller for the full request timeout, so a stopped mission could
+        // not settle.
+        if (disposed) {
+          return disposedResponse(request);
+        }
         helperRecoveriesRemaining -= 1;
       } else if (session) {
         destroySession(session);
@@ -325,6 +337,9 @@ export function createPythonFastEmbedProvider(
       const errors: string[] = [];
       for (const command of commands) {
         while (true) {
+          if (disposed) {
+            return disposedResponse(request);
+          }
           const fresh = spawnSession(runtime, command);
           session = fresh;
           const result = await sendRequest(fresh, request, activeSettings);

@@ -596,3 +596,50 @@ test("completion evaluator does not demand research a mission explicitly forswea
   assert.equal(demanding.missing.includes("web_evidence"), true);
   assert.equal(demanding.missing.includes("vault_evidence"), true);
 });
+
+test("reflex classification yields the aborted fallback while the embedder is still pending", async () => {
+  // The interrupted-continuation lane died seven times in a row because the
+  // runner awaited an embedding helper that cannot be cancelled: after
+  // disablePlugin the old coordinator could not reach its stop boundary. The
+  // classification must race the run's abort signal instead.
+  let embedCalls = 0;
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const pending = new AgenticReflexController().evaluate(
+    input({
+      embeddingProvider: {
+        embed() {
+          embedCalls += 1;
+          return new Promise(() => undefined);
+        },
+      },
+      abortSignal: controller.signal,
+    }),
+  );
+  setTimeout(() => controller.abort(new Error("Mission was stopped.")), 20);
+  const output = await pending;
+  assert.ok(Date.now() - startedAt < 2_000, "the aborted run did not wait for the helper");
+  assert.equal(embedCalls, 1);
+  assert.equal(output.intent.label, "unknown");
+  assert.equal(output.intent.reason, "run_aborted");
+  assert.equal(output.intent.reasonCode, "embedding_provider_unavailable");
+  assert.equal(output.intent.applied, false);
+
+  // An already-stopped run never asks the helper at all.
+  let lateCalls = 0;
+  const stopped = new AbortController();
+  stopped.abort(new Error("Mission was stopped."));
+  const late = await new AgenticReflexController().evaluate(
+    input({
+      embeddingProvider: {
+        async embed() {
+          lateCalls += 1;
+          throw new Error("must not be called");
+        },
+      },
+      abortSignal: stopped.signal,
+    }),
+  );
+  assert.equal(lateCalls, 0);
+  assert.equal(late.intent.reason, "run_aborted");
+});
