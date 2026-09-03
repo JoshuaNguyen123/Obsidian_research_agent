@@ -27,6 +27,8 @@ export interface CliDriverState {
   responses: number;
   /** Next value to try once the driver has given up on feedback-driven bisection. */
   sequentialNext: number | null;
+  /** The bisection value the sequential walk must skip. */
+  bisectionTried: number | null;
 }
 
 export const CLI_DRIVER_RESPONSE_CAP = 300;
@@ -45,6 +47,7 @@ export function createCliDriverState(): CliDriverState {
     repeats: 0,
     responses: 0,
     sequentialNext: null,
+    bisectionTried: null,
   };
 }
 
@@ -138,9 +141,12 @@ export function decideCliResponse(
   let guess: number;
   if (!state.feedbackSeen && state.guessesWithoutFeedback >= 3) {
     // No higher/lower feedback at all: walk the range from the bottom,
-    // skipping the value bisection already tried.
-    if (state.sequentialNext === null) state.sequentialNext = state.low;
-    while (state.sequentialNext === state.lastGuess) state.sequentialNext += 1;
+    // skipping the one value bisection already tried (repeatedly).
+    if (state.sequentialNext === null) {
+      state.sequentialNext = state.low;
+      state.bisectionTried = state.lastGuess;
+    }
+    while (state.sequentialNext === state.bisectionTried) state.sequentialNext += 1;
     guess = state.sequentialNext;
     state.sequentialNext += 1;
   } else {
