@@ -2308,6 +2308,41 @@ export const appendToCurrentFileTool: AgentTool = {
     }
     const prefix = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
     const appendedText = `${prefix}${text}`;
+    const operationIdentity = resolveAppendOperationIdentity(context);
+    const contentFingerprint = await sha256Fingerprint(text);
+    const idempotencyKey = operationIdentity
+      ? `${operationIdentity}::${contentFingerprint}`
+      : null;
+    // Duplicate-skip is identity + payload, never content alone. A second
+    // mission appending the same line has a different run/operation identity
+    // and must write. A Continue/retry of THIS identity may skip only after
+    // the note tail already shows the exact block. PreparedAction.runId is
+    // not consulted or rewritten here (it stays the executing segment runId).
+    if (
+      idempotencyKey &&
+      hasAppliedAppendIdempotencyKey(idempotencyKey) &&
+      noteTailHasExactAppendedBlock(current, appendedText)
+    ) {
+      const checkedAt = (context.now?.() ?? new Date()).toISOString();
+      const observedFingerprint = await sha256Fingerprint(current);
+      return {
+        path: file.path,
+        operation: "append_to_current_file",
+        bytesWritten: 0,
+        reason: "duplicate-skip",
+        duplicateSkip: true,
+        idempotencyKey,
+        readback: {
+          status: "verified",
+          checkedAt,
+          observedRevision: observedFingerprint,
+          observedFingerprint,
+        },
+      };
+    }
+    if (idempotencyKey) {
+      recordAppliedAppendIdempotencyKey(idempotencyKey);
+    }
 
     const nextContent = `${current}${appendedText}`;
     await context.app.vault.modify(file, nextContent);
@@ -2324,6 +2359,7 @@ export const appendToCurrentFileTool: AgentTool = {
 
     return {
       path: file.path,
+      operation: "append_to_current_file",
       bytesWritten: getByteLength(appendedText),
       readback: {
         status: "verified",
@@ -4904,6 +4940,69 @@ function getFolderPath(path: string): string {
 
 function getByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
+}
+
+/**
+ * Logical-operation identity for append idempotency. Requires both a durable
+ * run/root id and a step/node operation id so two missions appending the same
+ * line cannot collide on content. Callers that want Continue/segment-turnover
+ * to share a key must pass a node-stable `operationId` (rootMissionId + graph
+ * node + tool); the legacy `runId:step:toolIndex:tool` shape only dedupes a
+ * same-identity retry. Never rewrite PreparedAction.runId here.
+ */
+export function resolveAppendOperationIdentity(
+  context: Pick<ToolExecutionContext, "runId" | "rootMissionId" | "operationId">,
+): string | null {
+  const durableId =
+    context.rootMissionId?.trim() || context.runId?.trim() || "";
+  const operationId = context.operationId?.trim() || "";
+  if (!durableId || !operationId) {
+    return null;
+  }
+  return `${durableId}::${operationId}`;
+}
+
+/** Bound tail compare: only the last `block.length` characters are inspected. */
+export function noteTailHasExactAppendedBlock(
+  current: string,
+  block: string,
+): boolean {
+  if (!block) {
+    return false;
+  }
+  const tailLength = block.length;
+  if (current.length < tailLength) {
+    return false;
+  }
+  return current.slice(current.length - tailLength) === block;
+}
+
+const MAX_APPLIED_APPEND_IDEMPOTENCY_KEYS = 512;
+const appliedAppendIdempotencyKeys: string[] = [];
+const appliedAppendIdempotencyKeySet = new Set<string>();
+
+function hasAppliedAppendIdempotencyKey(key: string): boolean {
+  return appliedAppendIdempotencyKeySet.has(key);
+}
+
+function recordAppliedAppendIdempotencyKey(key: string): void {
+  if (appliedAppendIdempotencyKeySet.has(key)) {
+    return;
+  }
+  appliedAppendIdempotencyKeySet.add(key);
+  appliedAppendIdempotencyKeys.push(key);
+  while (appliedAppendIdempotencyKeys.length > MAX_APPLIED_APPEND_IDEMPOTENCY_KEYS) {
+    const evicted = appliedAppendIdempotencyKeys.shift();
+    if (evicted) {
+      appliedAppendIdempotencyKeySet.delete(evicted);
+    }
+  }
+}
+
+/** Test-only: isolate append idempotency memory between cases. */
+export function resetAppendIdempotencyStateForTests(): void {
+  appliedAppendIdempotencyKeys.length = 0;
+  appliedAppendIdempotencyKeySet.clear();
 }
 
 function refuseUnpreparedVaultExecution(toolName: string): never {

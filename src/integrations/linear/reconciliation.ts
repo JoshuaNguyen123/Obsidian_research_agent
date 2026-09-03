@@ -141,22 +141,62 @@ export function reconcileLinearMutation(
   };
 }
 
+export interface LinearNodeScopeV1 {
+  rootMissionId: string;
+  nodeId: string;
+  toolName: string;
+}
+
 export function buildLinearOperationId(input: {
   resourceType: LinearResourceType;
   verb: string;
   runId: string;
   taskId: string;
   sequence?: number;
+  /**
+   * Node-scoped stable identity. When the caller supplies a complete
+   * rootMissionId + graph node id + tool triple, the minted key stays
+   * stable across segment runIds and retried steps. Absent or incomplete
+   * scope falls back to the legacy `runId:taskId` shape.
+   */
+  nodeScope?: LinearNodeScopeV1;
 }): string {
-  const parts = [
-    "linear",
-    input.resourceType,
-    input.verb,
-    input.runId,
-    input.taskId,
-    String(Math.max(0, Math.trunc(input.sequence ?? 0))),
-  ].map(toSafePart);
-  return parts.join(":").slice(0, 240);
+  const nodeScope = normalizeLinearNodeScope(input.nodeScope);
+  const parts = nodeScope
+    ? [
+        "linear",
+        input.resourceType,
+        input.verb,
+        "node",
+        nodeScope.rootMissionId,
+        nodeScope.nodeId,
+        nodeScope.toolName,
+        String(Math.max(0, Math.trunc(input.sequence ?? 0))),
+      ]
+    : [
+        "linear",
+        input.resourceType,
+        input.verb,
+        input.runId,
+        input.taskId,
+        String(Math.max(0, Math.trunc(input.sequence ?? 0))),
+      ];
+  return parts.map(toSafePart).join(":").slice(0, 240);
+}
+
+export function normalizeLinearNodeScope(
+  value: LinearNodeScopeV1 | undefined,
+): LinearNodeScopeV1 | null {
+  if (!value) {
+    return null;
+  }
+  const rootMissionId = value.rootMissionId.trim();
+  const nodeId = value.nodeId.trim();
+  const toolName = value.toolName.trim();
+  if (!rootMissionId || !nodeId || !toolName) {
+    return null;
+  }
+  return { rootMissionId, nodeId, toolName };
 }
 
 function isAllowedTransition(

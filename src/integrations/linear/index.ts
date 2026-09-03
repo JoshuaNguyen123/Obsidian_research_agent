@@ -16,8 +16,10 @@ export {
 export {
   buildLinearOperationId,
   createLinearMutationJournalRecord,
+  normalizeLinearNodeScope,
   reconcileLinearMutation,
   transitionLinearMutationJournalRecord,
+  type LinearNodeScopeV1,
 } from "./reconciliation";
 export * from "./LinearIntegrationState";
 export * from "./LinearCapabilityDiscovery";

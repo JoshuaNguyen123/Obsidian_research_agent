@@ -29,6 +29,11 @@ import {
   type MissionGraphStoreRecordV1,
 } from "./missionGraphStore";
 import type { MissionGraphStoreReferenceV1 } from "./runStore";
+import {
+  currentNoteWriteToolNameV1,
+  resolveCurrentNoteWriteKindV1,
+  type CurrentNoteWriteKindV1,
+} from "./missionLedger";
 import { missionGraphToolNodeWallClockMs } from "./missionGraphHost";
 import { collectRequiredDependencyIds, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
 import { sha256Fingerprint } from "../../packages/headless-runtime/src/canonicalize";
@@ -3164,13 +3169,26 @@ export class MissionGraphSession {
      * beside paid work on faith would replay a paid write.
      */
     contentVerifiedOwedWork?: boolean;
+    /**
+     * Original current-note write kind. Interrupted replace/edit must resume
+     * as replace/edit, not a silent append. Recovered from the ledger field,
+     * expected tools, or writeback route when the caller omits it.
+     */
+    writeKind?: CurrentNoteWriteKindV1;
+    expectedTools?: readonly string[];
+    route?: string;
   }): Promise<{
     graph: MissionGraphV3;
     splicedNodeId: string | null;
     /** Named guard that refused the heal; absent when the splice landed. */
     refusedReason?: MissionGraphWritebackSpliceRefusalV1;
   }> {
-    const toolName = "append_to_current_file";
+    const writeKind = resolveCurrentNoteWriteKindV1({
+      writeKind: input.writeKind,
+      expectedTools: input.expectedTools,
+      route: input.route,
+    });
+    const toolName = currentNoteWriteToolNameV1(writeKind);
     const owedWriteCount = Math.min(
       8,
       Math.max(1, Math.floor(input.owedWriteCount ?? 1)),
