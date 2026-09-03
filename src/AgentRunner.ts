@@ -255,6 +255,7 @@ import {
 import {
   applyResearchPhaseToLoopDecision,
   decideNextLoopAction,
+  unresolvedFailedTools,
   type LoopLedger,
 } from "./agent/loopDecision";
 import {
@@ -3647,6 +3648,7 @@ export async function runAgentMission({
   let executedCodeRunCount = 0;
   const successfulToolNames: string[] = [];
   const currentSegmentSuccessfulToolNames: string[] = [];
+  const hostPrefetchedSuccessfulToolNames: string[] = [];
   const failedToolNames: string[] = [];
   const writeReceipts: AgentRunReceipt[] = [];
   let completedSetLooseTerminalReplayNoOpCount = 0;
@@ -6045,6 +6047,9 @@ export async function runAgentMission({
       );
       if (!successfulToolNames.includes("read_current_file")) {
         successfulToolNames.push("read_current_file");
+      }
+      if (!hostPrefetchedSuccessfulToolNames.includes("read_current_file")) {
+        hostPrefetchedSuccessfulToolNames.push("read_current_file");
       }
     } catch (error) {
       if (graphExecution) {
@@ -24030,7 +24035,12 @@ export async function runAgentMission({
       // and restored parent-segment proof may satisfy acceptance, but must not
       // consume one of this segment's model-driven tool slots.
       successfulTools: [...currentSegmentSuccessfulToolNames],
-      failedTools: [...failedToolNames],
+      hostPrefetchedSuccesses: [...hostPrefetchedSuccessfulToolNames],
+      failedTools: unresolvedFailedTools(failedToolNames, [
+        ...currentSegmentSuccessfulToolNames,
+        ...hostPrefetchedSuccessfulToolNames,
+        ...successfulToolNames,
+      ]),
       repeatedToolCalls: consecutiveNoProgressSteps,
       // Set-loose note reflection (and other delivery proofs) are not MissionGraph
       // required-write tools; keep the tool loop open until those proofs pay.
@@ -24176,13 +24186,10 @@ export async function runAgentMission({
       loopDecision.action === "stop_budget" &&
       loopDecision.reason === "required_tools_failed"
     ) {
-      const unresolvedFailures = [
-        ...new Set(
-          failedToolNames.filter(
-            (toolName) => !successfulToolNames.includes(toolName),
-          ),
-        ),
-      ];
+      const unresolvedFailures = unresolvedFailedTools(
+        failedToolNames,
+        successfulToolNames,
+      );
       const message =
         `Required tool execution failed without producing usable proof: ${
           unresolvedFailures.join(", ") || "unknown tool"

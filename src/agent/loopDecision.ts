@@ -7,6 +7,13 @@ import type {
 export interface LoopLedger {
   successfulTools: string[];
   failedTools: string[];
+  /**
+   * Host-owned successes that never entered the segment's model-driven
+   * tool slots (automatic `read_current_file`, restored parent-segment
+   * proof). They must not consume the finalization budget, but they do
+   * count as successes for the first-failure kill.
+   */
+  hostPrefetchedSuccesses?: string[];
   repeatedToolCalls: number;
   requiredToolsSatisfied: boolean;
   finalizationReserved: boolean;
@@ -40,6 +47,17 @@ export type LoopDecision =
   | { action: "stop_verified_complete"; reason: string }
   | { action: "stop_budget"; reason: string }
   | { action: "escalate_to_second_agent"; reason: string };
+
+/**
+ * Acceptance's resolved-failure filter: a tool that later succeeded is not
+ * still failed. Host-prefetched successes belong in `successfulTools` here.
+ */
+export function unresolvedFailedTools(
+  failedTools: readonly string[],
+  successfulTools: readonly string[],
+): string[] {
+  return [...new Set(failedTools.filter((name) => !successfulTools.includes(name)))];
+}
 
 export function decideNextLoopAction(
   ledger: LoopLedger,
@@ -109,7 +127,15 @@ export function decideNextLoopAction(
     };
   }
 
-  if (ledger.failedTools.length > 0 && ledger.successfulTools.length === 0) {
+  const successesForSurvival = [
+    ...ledger.successfulTools,
+    ...(ledger.hostPrefetchedSuccesses ?? []),
+  ];
+  const unresolvedFailures = unresolvedFailedTools(
+    ledger.failedTools,
+    successesForSurvival,
+  );
+  if (unresolvedFailures.length > 0 && successesForSurvival.length === 0) {
     return { action: "stop_budget", reason: "required_tools_failed" };
   }
 
