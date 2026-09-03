@@ -7,8 +7,9 @@ import { defineConfig } from "@playwright/test";
  * — they injected the sandbox provider configuration the product never adopted,
  * which is exactly the failure they were supposed to catch. Each lane below
  * calls a real model, a real external service, or both, except for explicit
- * native UI security probes and `offline-core`. Offline-core reaches an
- * authenticated loopback backend through the production HTTP model client;
+ * native UI security probes and the offline-core / offline-expand pair.
+ * Those offline projects reach an authenticated loopback backend through the
+ * production HTTP model client;
  * it does not replace the plugin's client or provision capabilities.
  * Every lane asserts on items that really exist afterwards.
  */
@@ -63,6 +64,14 @@ export default defineConfig({
     {
       name: "offline-core",
       testMatch: /offline-core\.spec\.ts/u,
+      retries: 0,
+      timeout: 240_000,
+      expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "only-on-failure", video: "off" },
+    },
+    {
+      name: "offline-expand",
+      testMatch: /offline-expand\.spec\.ts/u,
       retries: 0,
       timeout: 240_000,
       expect: { timeout: 30_000 },
