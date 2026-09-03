@@ -69,6 +69,7 @@ export {
 } from "./noNoteWriteIntent";
 export { hasWordCountIntent } from "./wordCountIntent";
 export { hasPageContentClearIntent } from "./currentNoteResetPolicy";
+export { hasReplaceIntent } from "./replaceIntent";
 export { matchesFetchedWebSourceLanguageV1, matchesSourcesOrWebLanguageV1 } from "./sourceIntent";
 export { hasTitleIntent } from "./titleIntent";
 
@@ -1155,29 +1156,6 @@ export function hasAppendIntent(prompt: string): boolean {
   }
   return /\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,80}\b(note|file|markdown|vault|page|document)\b|\b(note|file|markdown|vault|page|document)\b[\s\S]{0,80}\b(append|save|write|update|add|insert|copy|paste|put)\b|\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,120}\.md\b/i.test(
     intentPrompt,
-  );
-}
-
-export function hasReplaceIntent(prompt: string): boolean {
-  if (hasExplicitNoNoteWriteIntent(prompt)) {
-    return false;
-  }
-  const positivePrompt = prompt
-    .replace(
-      /\b(?:do\s+not|don't|never)\s+(?:rewrite|replace|reset|overwrite)\b[^.;\n]*/giu,
-      " ",
-    )
-    .replace(
-      /\bwithout\s+(?:rewriting|replacing|resetting|overwriting)\b[^.;\n]*/giu,
-      " ",
-    );
-  return (
-    isCurrentNoteReplaceResetPrompt(positivePrompt) ||
-    hasPageContentClearIntent(positivePrompt) ||
-    hasWholeNoteRevisionIntent(positivePrompt) ||
-    /\b(re-?write|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\breplace\s+(?:the\s+)?existing\s+contents?\b/i.test(
-      positivePrompt,
-    ) || hasClearPageAndWriteIntent(positivePrompt)
   );
 }
 
