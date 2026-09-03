@@ -32,6 +32,7 @@ import {
   peekToolCallCollectorDiagnosticsV1,
   recordToolCallOutcomesAfterEach,
 } from "./fixtures/toolCallCollector";
+import { runInteractiveCliProgram } from "./fixtures/interactiveCliDriver";
 
 recordToolCallOutcomesAfterEach();
 
@@ -241,6 +242,10 @@ test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game",
     observed.proofs.add("validation:python_compile");
 
     const runtime = await runNumberGuessingGame(pythonFiles[0]!, canonicalExport);
+    await testInfo.attach("number-guessing-driver-responses", {
+      body: runtime.responses.join("\n"),
+      contentType: "text/plain",
+    });
     await testInfo.attach("number-guessing-runtime", {
       body: JSON.stringify(runtime, null, 2),
       contentType: "application/json",
@@ -436,52 +441,22 @@ async function assertPathAbsent(target: string): Promise<void> {
 async function runNumberGuessingGame(
   entryPoint: string,
   cwd: string,
-): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> {
-  const scriptedInput = [
-    ...Array.from({ length: 1000 }, (_, index) => String(index + 1)),
-    "n",
-    "quit",
-    "exit",
-    "",
-  ].join("\n");
-  return new Promise((resolve) => {
-    const child = spawn("python", ["-X", "utf8", entryPoint], {
-      cwd,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-    });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    const deadline = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, 20_000);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      if (stdout.length > 500_000) child.kill("SIGKILL");
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-      if (stderr.length > 100_000) child.kill("SIGKILL");
-    });
-    child.on("error", (error) => {
-      clearTimeout(deadline);
-      resolve({
-        stdout,
-        stderr: `${stderr}\n${String(error)}`,
-        exitCode: null,
-        timedOut,
-      });
-    });
-    child.on("close", (code) => {
-      clearTimeout(deadline);
-      resolve({ stdout, stderr, exitCode: code, timedOut });
-    });
-    child.stdin.write(scriptedInput);
-    child.stdin.end();
+): Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  responses: string[];
+}> {
+  // Drive the delivered game by its own prompts (difficulty menus, play-again
+  // questions, higher/lower feedback) instead of a fixed number script: the
+  // acceptance is "a runnable game", not "a game that reads exactly the
+  // input the harness guessed it would".
+  return runInteractiveCliProgram({
+    command: "python",
+    args: ["-X", "utf8", entryPoint],
+    cwd,
+    env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    timeoutMs: 30_000,
   });
 }
