@@ -80,6 +80,10 @@ const PRODUCT_ERROR_CODES = new Set([
   "vault_readback_failed",
   "operation_deadline_exceeded",
   "reconcile_required",
+  // The pre-write proof gate refused a write whose evidence debt is unpaid.
+  // Repeating the write cannot pay it; only a search/fetch/read can, so the
+  // retry policy must treat it as a route change, not an unknown blip.
+  "proof_gated_writeback_required",
 ]);
 
 /**

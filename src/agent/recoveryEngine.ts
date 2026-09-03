@@ -129,10 +129,28 @@ export function applyRecoveryToPlan(
   return decision.updatedAction ? { ...plan, nextAction: decision.updatedAction } : plan;
 }
 
-function chooseAlternativeTool(
+const SEARCH_THEN_WRITE_TOOLS = new Set([
+  "append_to_current_file",
+  "replace_current_file",
+  "edit_current_section",
+  "append_to_current_section",
+]);
+
+/**
+ * When a current-note write is held or stalled, splice search before the
+ * write: prefer `web_search`, then `web_fetch`. Other failures keep the
+ * existing read-fallback order.
+ */
+export function chooseAlternativeTool(
   allowedToolNames: string[],
   failedAction?: string,
 ): string | undefined {
+  if (failedAction && SEARCH_THEN_WRITE_TOOLS.has(failedAction)) {
+    const splice = ["web_search", "web_fetch"].find(
+      (tool) => allowedToolNames.includes(tool),
+    );
+    if (splice) return splice;
+  }
   const readFallbacks = [
     "web_search",
     "web_fetch",

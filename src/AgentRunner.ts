@@ -1144,6 +1144,7 @@ export {
   getPendingMissionGraphWriteToolNames,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
+  injectProofGateForcedGatherToolsV1,
   missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
 } from "./agent/missionGraphFrontier";
@@ -18966,6 +18967,27 @@ export async function runAgentMission({
           .flatMap(getMissionGraphNodeFrontierToolNames),
       );
     }
+    const proofGateForcedGather =
+      proofGateWriteRejectionCountsByTool.size > 0 &&
+      !hasSatisfiedDurablePreWriteProof() &&
+      blockingProofsAreWebFetchOnlyV1(
+        evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof),
+      )
+        ? {
+            injectWebTools: true,
+            heldWriteToolName:
+              lastProofGatedHoldToolName ??
+              [...proofGateWriteRejectionCountsByTool.keys()][0] ??
+              null,
+          }
+        : undefined;
+    if (proofGateForcedGather) {
+      tools = addToolDefinitions(tools, toolRegistry, [
+        "web_search",
+        "web_fetch",
+      ]);
+      allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    }
     let stepTools = bindVerifiedWorkspaceIdentityToolSchemas(
       constrainValidationRecoveryWorkspaceToolsV1({
         tools: bindExactWorkspaceDestinationToolSchemas(
@@ -18993,6 +19015,7 @@ export async function runAgentMission({
                 route: runPlan.route,
                 maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
                 setLooseOfferedToolNames,
+                proofGateForcedGather,
               },
             ),
             // The authoritative graph, even when the menu above was built
@@ -19021,9 +19044,13 @@ export async function runAgentMission({
     );
     if (proofGateWriteRejectionCountsByTool.size > 0) {
       const beforeContainment = stepTools;
+      const liveBlockingProofs = hasSatisfiedDurablePreWriteProof()
+        ? []
+        : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
       stepTools = containProofGateRejectedWriteToolsV1(stepTools, {
         rejectionCounts: proofGateWriteRejectionCountsByTool,
         blockingProofsOutstanding: !hasSatisfiedDurablePreWriteProof(),
+        blockingProofs: liveBlockingProofs,
       });
       if (stepTools.length !== beforeContainment.length) {
         const withheld = beforeContainment
@@ -19725,8 +19752,20 @@ export async function runAgentMission({
         remainingToolCalls: Math.max(0, maxToolCalls - observedToolCallCount),
         remainingModelCalls: Math.max(0, stepLimit - step + 1),
       });
+      const proofGateGatherContract = proofGateForcedGather
+        ? buildProofGateForcedGatherContractV1({
+            heldWriteToolName: proofGateForcedGather.heldWriteToolName,
+            offeredGatherTools: stepTools.map((tool) => tool.function.name),
+          })
+        : null;
+      const contractedStepMessages = proofGateGatherContract
+        ? [
+            ...stepMessages,
+            { role: "system" as const, content: proofGateGatherContract },
+          ]
+        : stepMessages;
       const stepChatRequestBuilt = buildChatRequest(
-        attachSegmentBudgetToMessages(stepMessages, segmentBudgetPrompt),
+        attachSegmentBudgetToMessages(contractedStepMessages, segmentBudgetPrompt),
         stepTools,
         escalateThisStep ? false : activeThink,
         modelOptions,
@@ -26014,6 +26053,37 @@ export function preWriteProofGateAppliesV1(input: {
   );
 }
 
+/**
+ * True when every outstanding pre-write proof is a web/fetch debt.
+ * Vault, word-count, and code proofs stay on the contain-the-write path.
+ */
+export function blockingProofsAreWebFetchOnlyV1(
+  proofs: readonly string[],
+): boolean {
+  if (proofs.length === 0) return false;
+  return proofs.every((item) =>
+    /web_evidence|source_coverage|source_domains|citation_coverage|fetched_sources|distinct_domains|tool:web_search|tool:web_fetch/i.test(
+      item,
+    ),
+  );
+}
+
+export function buildProofGateForcedGatherContractV1(input: {
+  heldWriteToolName: string | null;
+  offeredGatherTools: readonly string[];
+}): string {
+  const gather = input.offeredGatherTools.filter(
+    (name) => name === "web_search" || name === "web_fetch",
+  );
+  const names = gather.length > 0 ? gather.join(", ") : "web_search, web_fetch";
+  const write = input.heldWriteToolName?.trim() || "the held write tool";
+  return [
+    `Request one of these allowed gather tools now: ${names}.`,
+    `Then call ${write} only after those proofs exist.`,
+    "Do not retry the write first.",
+  ].join(" ");
+}
+
 export function containProofGateRejectedWriteToolsV1<
   T extends { function: { name: string } },
 >(
@@ -26021,9 +26091,15 @@ export function containProofGateRejectedWriteToolsV1<
   input: {
     rejectionCounts: ReadonlyMap<string, number>;
     blockingProofsOutstanding: boolean;
+    blockingProofs?: readonly string[];
   },
 ): T[] {
   if (!input.blockingProofsOutstanding) return [...tools];
+  // Web/fetch debt is paid by gathering, not by hiding the write. Keep the
+  // held write visible and let the frontier inject search/fetch instead.
+  if (blockingProofsAreWebFetchOnlyV1(input.blockingProofs ?? [])) {
+    return [...tools];
+  }
   return tools.filter(
     (tool) =>
       (input.rejectionCounts.get(tool.function.name) ?? 0) <

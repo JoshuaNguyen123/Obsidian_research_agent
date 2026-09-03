@@ -453,6 +453,42 @@ const RESUME_EMPTY_FRONTIER_WRITE_TOOLS = new Set([
   "count_words",
 ]);
 
+export const PROOF_GATE_FORCED_GATHER_TOOL_NAMES = [
+  "web_search",
+  "web_fetch",
+] as const;
+
+/**
+ * After a web/fetch-only proof-gated write hold, keep the held write visible
+ * and add search/fetch from the catalog. Used by both the fresh frontier and
+ * the Continue empty-frontier fallback so they cannot disagree.
+ */
+export function injectProofGateForcedGatherToolsV1<
+  T extends { function: { name: string } },
+>(
+  offered: readonly T[],
+  catalog: readonly T[],
+  input: {
+    injectWebTools?: boolean;
+    heldWriteToolName?: string | null;
+  } = {},
+): T[] {
+  if (!input.injectWebTools) return [...offered];
+  const names = new Set(offered.map((tool) => tool.function.name));
+  const extra: T[] = [];
+  for (const name of PROOF_GATE_FORCED_GATHER_TOOL_NAMES) {
+    if (names.has(name)) continue;
+    const schema = catalog.find((tool) => tool.function.name === name);
+    if (schema) extra.push(schema);
+  }
+  const held = input.heldWriteToolName?.trim();
+  if (held && !names.has(held)) {
+    const write = catalog.find((tool) => tool.function.name === held);
+    if (write) extra.push(write);
+  }
+  return extra.length > 0 ? [...offered, ...extra] : [...offered];
+}
+
 /**
  * True when a required (non-optional, non-final) node already paid a tool.
  * A streaming writeback stub is only `final` (and maybe a tool-less dispatch),
@@ -805,6 +841,15 @@ export function constrainToolsToMissionGraphFrontier(
      * of a single ready-node tool name.
      */
     setLooseOfferedToolNames?: readonly string[] | null;
+    /**
+     * After a web/fetch-only proof-gated write hold: keep the held write and
+     * inject search/fetch on both the fresh frontier and the Continue
+     * empty-frontier fallback.
+     */
+    proofGateForcedGather?: {
+      injectWebTools?: boolean;
+      heldWriteToolName?: string | null;
+    };
   } = {},
 ): ModelToolDefinition[] {
   const applyEffectClass = (
@@ -815,14 +860,21 @@ export function constrainToolsToMissionGraphFrontier(
     // MissionGraph frontiers already authorize Bound/Hard tools (approval broker
     // still gates execution). Soft maxEffectClassWithoutGrant must not strip
     // linear_*/github_* nodes when the host authored a graph.
-    if (!max || !opts.respectMaxEffectClass) return schemas;
-    const allowed = new Set(
-      filterToolNamesByMaxEffectClass(
-        schemas.map((schema) => schema.function.name),
-        max,
-      ),
+    let next = schemas;
+    if (max && opts.respectMaxEffectClass) {
+      const allowed = new Set(
+        filterToolNamesByMaxEffectClass(
+          schemas.map((schema) => schema.function.name),
+          max,
+        ),
+      );
+      next = schemas.filter((schema) => allowed.has(schema.function.name));
+    }
+    return injectProofGateForcedGatherToolsV1(
+      next,
+      tools,
+      options.proofGateForcedGather ?? {},
     );
-    return schemas.filter((schema) => allowed.has(schema.function.name));
   };
 
   let setLooseNames = (options.setLooseOfferedToolNames ?? [])
@@ -1011,16 +1063,22 @@ export function constrainToolsToMissionGraphFrontier(
     // the write set — otherwise any empty frontier (for example a blocked
     // create-collision node) would resurrect the very tool the graph just
     // refused.
+    const emptyFrontierNames = new Set(RESUME_EMPTY_FRONTIER_WRITE_TOOLS);
+    if (options.proofGateForcedGather?.injectWebTools) {
+      for (const name of PROOF_GATE_FORCED_GATHER_TOOL_NAMES) {
+        emptyFrontierNames.add(name);
+      }
+    }
     const fallback = (
       schemasForStep({
         route: options.route ?? "single_model_writeback",
         frontier: tools
           .map((tool) => tool.function.name)
-          .filter((name) => RESUME_EMPTY_FRONTIER_WRITE_TOOLS.has(name)),
+          .filter((name) => emptyFrontierNames.has(name)),
         graphRequired: [],
         allSchemas: tools,
       }) as ModelToolDefinition[]
-    ).filter((tool) => RESUME_EMPTY_FRONTIER_WRITE_TOOLS.has(tool.function.name));
+    ).filter((tool) => emptyFrontierNames.has(tool.function.name));
     if (fallback.length > 0) {
       return applyEffectClass(fallback, { respectMaxEffectClass: false });
     }
