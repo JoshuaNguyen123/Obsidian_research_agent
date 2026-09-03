@@ -109,8 +109,16 @@ export const FULL_DESKTOP_LADDER = [
  * 75/85 after WS-5 rebuilt observe() on the production writeback pipeline
  * and added the missing prompt families. 76/85 after WS-2 topic-noun
  * containment flipped guard-desk-notes (topical "game design") to pass.
+ * 82/85 after WS-2 classifiers landed on the WS-5 production-shaped
+ * corpus: title+stream STEM notes, page-clear wipe/start-over, transformer
+ * architecture scholarly stream, and working-memory / References-section
+ * topic-noun containment now match expected. guard-desk-notes is a
+ * known_miss again (desired single_model_answer/chat; observe now
+ * single_model_writeback + append stream kind). title-clause-stream-with-rename
+ * dest/delivery now match but route is still single_model_writeback.
+ * new-note-titled is still current-note writeback, not new_note create.
  */
-export const ROUTING_BASELINE_ACCURACY = 76 / 85;
+export const ROUTING_BASELINE_ACCURACY = 82 / 85;
 
 export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
   {
@@ -281,7 +289,12 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "atomic",
     },
-    status: "pass",
+    current: {
+      // Past-tense "write notes" narrative; observe now writeback-routes it.
+      route: "single_model_writeback",
+      streamingWritebackKind: "append",
+    },
+    status: "known_miss",
   },
   {
     id: "guard-haiku",
@@ -1108,12 +1121,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "stream",
     },
-    current: {
-      // WS-2: title+stream should land on active_note append/stream after rename.
-      noteOutputDestination: "chat",
-      noteOutputDelivery: "atomic",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
     id: "guard-brief-about-dfs-bfs-in-python",
@@ -1144,12 +1152,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "stream",
     },
-    current: {
-      // WS-2: title+stream should land on active_note append/stream after rename.
-      noteOutputDestination: "chat",
-      noteOutputDelivery: "atomic",
-    },
-    status: "known_miss",
+    status: "pass",
   },
 
   // --- Missing prompt families (WS-5) ---
@@ -1261,7 +1264,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     status: "pass",
   },
   {
-    // known_miss WS-2: Wipe this note. should page-clear-replace, not default-append.
+    // Page-clear family: wipe replaces the current note.
     id: "page-clear-wipe-this-note",
     prompt: "Wipe this note.",
     expected: {
@@ -1274,18 +1277,10 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "replace",
       noteOutputDelivery: "stream",
     },
-    current: {
-      route: "direct_writeback",
-      streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: "append",
-      noteOutputDestination: "active_note",
-      noteOutputMutation: "append",
-      noteOutputDelivery: "stream",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
-    // known_miss WS-2: Start over on this page. should page-clear-replace.
+    // Page-clear family: start-over replaces the current note.
     id: "page-clear-start-over",
     prompt: "Start over on this page.",
     expected: {
@@ -1298,18 +1293,10 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "replace",
       noteOutputDelivery: "stream",
     },
-    current: {
-      route: "direct_writeback",
-      streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: "append",
-      noteOutputDestination: "active_note",
-      noteOutputMutation: "append",
-      noteOutputDelivery: "stream",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
-    // known_miss WS-2: title+stream destination should be active_note append/stream after rename.
+    // dest/delivery now match; route is still single_model_writeback, not tool_required.
     id: "title-clause-stream-with-rename",
     prompt: "Write a 200 word brief on photosynthesis. Stream onto this page. Change the title as well.",
     expected: {
@@ -1323,12 +1310,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputDelivery: "stream",
     },
     current: {
-      route: "tool_required",
-      streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: null,
-      noteOutputDestination: "chat",
-      noteOutputMutation: "append",
-      noteOutputDelivery: "atomic",
+      route: "single_model_writeback",
     },
     status: "known_miss",
   },
@@ -1425,7 +1407,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     status: "known_miss",
   },
   {
-    // known_miss WS-2: architecture is a design noun; this must stay scholarly stream-to-page, not a design mission.
+    // architecture is a design noun; this stays scholarly stream-to-page.
     id: "transformer-architecture-without-research-word",
     prompt: "Write a 1000 word note on the transformer architecture. Cite scholarly sources. Stream onto this page.",
     expected: {
@@ -1440,16 +1422,10 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputDelivery: "stream",
       requiredCodeToolNames: [],
     },
-    current: {
-      route: "grounded_workflow",
-      streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: null,
-      noteOutputDestination: "active_note",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
-    // known_miss WS-2: working memory is the topic, not research-memory read.
+    // working memory is the topic, not research-memory read.
     id: "working-memory-steal",
     prompt: "Write a note about working memory onto this page.",
     expected: {
@@ -1462,16 +1438,10 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "stream",
     },
-    current: {
-      route: "tool_required",
-      streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: null,
-      noteOutputDestination: "active_note",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
-    // known_miss WS-2: a References section is note structure, not graph-connection.
+    // a References section is note structure, not graph-connection.
     id: "references-section-steal",
     prompt: "Write a research note with a References section onto this page.",
     expected: {
@@ -1484,13 +1454,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "stream",
     },
-    current: {
-      route: "grounded_workflow",
-      streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: null,
-      noteOutputDestination: "active_note",
-    },
-    status: "known_miss",
+    status: "pass",
   },
 ];
 

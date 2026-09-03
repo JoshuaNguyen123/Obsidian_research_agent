@@ -15864,6 +15864,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       getCapabilityReadiness: () => this.getCapabilityReadiness(),
       semanticEmbeddingProvider: this.getSemanticEmbeddingProvider(),
       semanticIndexService: this.getSemanticIndexService(),
+      pluginVersion: this.manifest.version,
+      minAppVersion: this.manifest.minAppVersion,
     };
   }
 

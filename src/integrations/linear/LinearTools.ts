@@ -546,11 +546,21 @@ async function prepareMutation(
       context.operationId ?? `call-${randomToken()}`,
       "tool call ID",
     );
+    const nodeId = resolveLinearGraphNodeId(context);
     const operationId = buildLinearOperationId({
       resourceType: config.resourceType,
       verb: config.action,
       runId,
       taskId: toolCallId,
+      ...(nodeId
+        ? {
+            nodeScope: {
+              rootMissionId: context.rootMissionId ?? "",
+              nodeId,
+              toolName: config.name,
+            },
+          }
+        : {}),
     });
     let effectiveArgs =
       config.kind === "issue_create" &&
@@ -2324,6 +2334,13 @@ async function maybeAssociateIssueProject(
     );
     return args;
   }
+}
+
+function resolveLinearGraphNodeId(context: ToolExecutionContext): string | undefined {
+  const fromContext = context.nodeId?.trim();
+  if (fromContext) return fromContext;
+  const fromExecution = context.missionGraphExecution?.nodeId?.trim();
+  return fromExecution || undefined;
 }
 
 function requestOptions(context: ToolExecutionContext): LinearRequestOptions {

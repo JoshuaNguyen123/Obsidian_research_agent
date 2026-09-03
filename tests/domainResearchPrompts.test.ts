@@ -80,15 +80,10 @@ test("STEM Genesis-shaped prompts route as streamed sourced writeback, not copy-
 
     assert.equal(observed.route, "grounded_workflow", id);
     assert.equal(observed.streamingWritebackKind, "append", id);
-    // known_miss WS-2: title+stream should dest active_note, mutation append,
-    // delivery stream after rename. This base sets specializedRoute via
-    // hasTitleIntent, so production destination is chat.
-    assert.equal(
-      observed.noteOutput.destination,
-      "chat",
-      `${id} known_miss WS-2: target dest is active_note append/stream after rename`,
-    );
-    assert.equal(observed.noteOutput.reason, "specialized_route", id);
+    assert.equal(observed.noteOutput.destination, "active_note", id);
+    assert.equal(observed.noteOutput.mutation, "append", id);
+    assert.equal(observed.noteOutput.delivery, "stream", id);
+    assert.equal(observed.noteOutput.reason, "active_note_available", id);
 
     assert.equal(effort.profile, "grounded_research", id);
     assert.equal(effort.researchDepth, "grounded", id);
@@ -121,13 +116,9 @@ test("compact live STEM prompts keep the same sourced stream-to-page contract", 
     assert.equal(generated.requiresGrounding, true, item.id);
     assert.equal(generated.target, "current_note_append", item.id);
     assert.equal(generated.wordTarget?.target, 150, item.id);
-    // Same title-clause known_miss as the full Genesis shape. WS-2 flips dest
-    // to active_note / append / stream after rename.
-    assert.equal(
-      observed.noteOutput.destination,
-      "chat",
-      `${item.id} known_miss WS-2: target dest is active_note`,
-    );
+    assert.equal(observed.noteOutput.destination, "active_note", item.id);
+    assert.equal(observed.noteOutput.mutation, "append", item.id);
+    assert.equal(observed.noteOutput.delivery, "stream", item.id);
     assert.equal(team.useTeam, true, item.id);
     assert.ok(team.specialistModes.includes("researcher"), item.id);
   }
@@ -142,10 +133,10 @@ test("transformer architecture research note does not grant a design deliverable
   assert.equal(generated.requiresGrounding, true);
   assert.equal(hasFetchedWebSourceIntent(prompt), true);
   assert.equal(hasWebSearchIntent(prompt), true);
-  // Production-shaped observe still routes grounded_workflow; dest is chat
-  // because the Genesis title clause sets specializedRoute (WS-2).
   assert.equal(observed.route, "grounded_workflow");
-  assert.equal(observed.noteOutput.destination, "chat");
+  assert.equal(observed.noteOutput.destination, "active_note");
+  assert.equal(observed.noteOutput.mutation, "append");
+  assert.equal(observed.noteOutput.delivery, "stream");
 });
 
 test("cite-at-least scholarly sources is fetched-web intent; literary book citations are not", () => {

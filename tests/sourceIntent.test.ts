@@ -13,6 +13,7 @@ import {
   matchesFetchedWebSourceLanguageV1,
   matchesSourcesOrWebLanguageV1,
 } from "../src/agent/sourceIntent";
+import type { MissionIntent } from "../src/tools/types";
 
 const PARAPHRASE_SOURCE_PROMPTS = [
   "Write a 1000 word essay on photosynthesis. Cite your sources.",
@@ -30,11 +31,20 @@ const LITERARY =
 const CODE_SOURCE_FILES =
   "Read the source files and add tests. Do not search the web.";
 
-const EMPTY_INTENT = {
+const EMPTY_INTENT: MissionIntent = {
+  mode: "note_output",
   vaultContext: false,
   noteOutput: true,
+  explicitPersistence: false,
   explicitMutation: false,
+  explicitDelete: false,
+  allowAutonomousWrite: false,
   requireWriteCompletion: false,
+  autonomyScope: {
+    read: { currentNote: false, vault: false, folders: [], files: [], web: false },
+    write: { currentNote: false, folders: [], files: [], artifacts: false, researchMemory: false },
+    destructive: { replaceCurrentNote: false, deleteCurrentNote: false, deletePaths: false },
+  },
 };
 
 function seatsAgreeOnFetchedSources(prompt: string): {

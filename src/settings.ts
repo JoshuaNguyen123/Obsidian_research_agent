@@ -609,7 +609,7 @@ export class AgentSettingTab extends PluginSettingTab {
         },
       });
       modelSetting.descEl.createSpan({
-        text: ". The current pipeline recommendation is deepseek-v4-pro; paste another exact tag or apply the recommendation, then Test connection.",
+        text: ". The current pipeline recommendation is glm-5.3-flash:cloud; paste another exact tag or apply the recommendation, then Test connection.",
       });
     } else {
       modelSetting.setDesc("Exact model name, then Test connection.");
@@ -624,7 +624,7 @@ export class AgentSettingTab extends PluginSettingTab {
       // cloud model on every keystroke — that blocks changing models in Obsidian.
       return text
         .setPlaceholder(
-          provider === "ollama" ? "e.g. deepseek-v4-pro" : "e.g. gpt-4o-mini",
+          provider === "ollama" ? "e.g. glm-5.3-flash:cloud" : "e.g. gpt-4o-mini",
         )
         .setValue(this.plugin.settings.model)
         .onChange(async (value) => {
@@ -640,14 +640,14 @@ export class AgentSettingTab extends PluginSettingTab {
     if (provider === "ollama") {
       modelSetting.addButton((button) =>
         button
-          .setButtonText("Use deepseek-v4-pro")
-          .setTooltip("Apply the current Tools + Thinking + Cloud lead model")
+          .setButtonText("Use glm-5.3-flash:cloud")
+          .setTooltip("Apply the current measured-best Cloud lead model")
           .onClick(async () => {
-            this.plugin.settings.model = "deepseek-v4-pro";
+            this.plugin.settings.model = "glm-5.3-flash:cloud";
             this.plugin.settings.ollamaBaseUrl = "https://ollama.com/api";
             this.plugin.invalidateModelConnectionStatus();
             await this.plugin.saveSettings();
-            new Notice("Ollama Cloud lead model deepseek-v4-pro applied. Add your API key, then Test connection.");
+            new Notice("Ollama Cloud lead model glm-5.3-flash:cloud applied. Add your API key, then Test connection.");
             this.display();
           }),
       );
@@ -788,7 +788,7 @@ export class AgentSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
         new Notice(
           preset.provider === "ollama"
-            ? `${preset.label} endpoint applied. The current model tag is preserved; use deepseek-v4-pro above for the recommended lead model, then Test connection.`
+            ? `${preset.label} endpoint applied. The current model tag is preserved; use glm-5.3-flash:cloud above for the recommended lead model, then Test connection.`
             : `${preset.label} preset applied. Add your API key, then Test connection.`,
         );
         this.display();

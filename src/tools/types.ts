@@ -135,6 +135,22 @@ export interface ToolExecutionContext {
   minAppVersion?: string;
   /** Host-verified durable root shared by continuation segments. */
   rootMissionId?: string;
+  /**
+   * Mission-graph node id when this tool call is executing a planned node.
+   * Linear mutation mint uses this (or `missionGraphExecution.nodeId`) for
+   * stable node-scoped operation ids across segment retries. Hosts may omit
+   * it; Linear then keeps the legacy `runId:taskId` shape.
+   */
+  nodeId?: string;
+  /**
+   * Active mission-graph tool execution. LinearTools reads `nodeId` from
+   * here when `context.nodeId` is absent. Optional; AgentRunner is not
+   * required to set it for compilation.
+   */
+  missionGraphExecution?: {
+    nodeId: string;
+    toolName?: string;
+  };
   operationId?: string;
   abortSignal?: AbortSignal;
   /** Absolute Unix timestamp in milliseconds after which the operation should stop. */

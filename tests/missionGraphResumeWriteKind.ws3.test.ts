@@ -118,27 +118,24 @@ test("a replace writeKind on a dual-envelope stub does not silently append", asy
     context: harness.context,
     initialGraph: graph,
   });
-  await assert.rejects(
-    () =>
-      session.spliceResumeCurrentNoteWriteNode({
-        objective: "Pay the owed current-note replace.",
-        currentNotePath: "Research/Brief.md",
-        wallClockMs: 30_000,
-        minimumReceipts: 1,
-        requiredReceiptKinds: ["vault_write"],
-        writeKind: "replace",
-      }),
-    (error: unknown) =>
-      error instanceof Error &&
-      /authority_widening|new mutation/i.test(error.message),
-  );
-  assert.equal(session.graph.nodes["resume-current-note-write"], undefined);
+  const healed = await session.spliceResumeCurrentNoteWriteNode({
+    objective: "Pay the owed current-note replace.",
+    currentNotePath: "Research/Brief.md",
+    wallClockMs: 30_000,
+    minimumReceipts: 1,
+    requiredReceiptKinds: ["vault_write"],
+    writeKind: "replace",
+  });
+  assert.equal(healed.splicedNodeId, "resume-current-note-write");
+  assert.deepEqual(session.graph.nodes["resume-current-note-write"]?.allowedTools, [
+    "replace_current_file",
+  ]);
   assert.equal(
-    Object.values(session.graph.nodes).some((node) =>
-      node.allowedTools.includes("append_to_current_file"),
+    session.graph.nodes["resume-current-note-write"]?.allowedTools.includes(
+      "append_to_current_file",
     ),
     false,
-    "Interrupted replace must not heal as append while waiting for the reducer allowlist to accept replace_current_file.",
+    "Interrupted replace must heal as replace, not append, once the stub allowlist includes replace_current_file.",
   );
 });
 

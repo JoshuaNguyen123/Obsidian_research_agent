@@ -203,8 +203,10 @@ import {
   isGitHubCatalogToolName,
 } from "./tools/githubCatalogTools";
 import {
+  attachAutoContinuationSuppressionReason,
   decideAutoContinuation,
   resolvePendingToolsForAutoContinuation,
+  suppressedBudgetContinuationDecisionV1,
   suppressedBudgetTerminalBlockerV1,
   type AutoContinuationDecision,
   type AutoContinuationReason,
@@ -600,6 +602,7 @@ import {
   addMissionMilestone,
   createMissionLedger,
   createPrePlanningAnchorLedger,
+  resolveCurrentNoteWriteKindV1,
   isPrePlanningAnchorLedger,
   markLedgerResumeLoaded,
   removePrePlanningAnchorArtifact,
@@ -1498,6 +1501,8 @@ export interface AgentRunCompleteEvent {
   stopDetail?: string | null;
   autoContinueRecommended?: boolean;
   autoContinueReason?: AutoContinuationReason;
+  suppressionReason?: string;
+  autoContinuation?: AutoContinuationDecision;
   autonomyStats?: import("./agent/autonomyRunStats").AutonomyRunStatsV1 | null;
   /**
    * Research evidence saturated before any hard cap: further retrieval was not
@@ -2466,6 +2471,8 @@ export async function runAgentMission({
       runId,
       mission: anchorMission,
       targetNotePath: anchorTargetNotePath,
+      pluginVersion: anchorContext.pluginVersion,
+      minAppVersion: anchorContext.minAppVersion,
       now: anchorContext.now?.() ?? new Date(),
     });
     anchorLedger.providerUsage = mergeModelUsageAggregatesV1(
@@ -5484,6 +5491,12 @@ export async function runAgentMission({
             // live note; anchor-less missions splice solely on the bare
             // unpaid stub, where the guard has nothing to protect.
             contentVerifiedOwedWork: owedLiteralAnchors.length > 0,
+            writeKind: resolveCurrentNoteWriteKindV1({
+              expectedTools: requiredWriteTools,
+              route: runPlan.route,
+            }),
+            expectedTools: requiredWriteTools,
+            route: runPlan.route,
           });
         if (writebackSplice.splicedNodeId) {
           events.onTrace?.({
@@ -7059,6 +7072,12 @@ export async function runAgentMission({
     route: runPlan.route,
     loopBudget: loopBudgetPlan,
     researchPlan,
+    currentNoteWriteKind: resolveCurrentNoteWriteKindV1({
+      expectedTools: loopBudgetPlan.expectedTools,
+      route: runPlan.route,
+    }),
+    pluginVersion: runToolContext.pluginVersion,
+    minAppVersion: runToolContext.minAppVersion,
     now: runToolContext.now?.() ?? new Date(),
   });
   // Routing, research planning, and graph planning may call the provider before
@@ -10539,9 +10558,16 @@ export async function runAgentMission({
     // so budget Continues can finish Linear→code→GitHub→reflection.
     const setLooseIgnoreStaleBlockers =
       setLooseCompoundEnabled && setLooseDeliveryUnpaid;
-    const autoContinuation = suppressAutoContinuation
-      ? ({ recommended: false, reason: "not_budget" } as const)
-      : decideAutoContinuation({
+    const autoContinuation = attachAutoContinuationSuppressionReason(
+      suppressAutoContinuation
+        ? suppressedBudgetContinuationDecisionV1({
+            stopReason: effectiveStopReason,
+            suppressAutoContinuation: true,
+            reason:
+              nextAction?.trim() ||
+              "this budget stop is marked not auto-continuable.",
+          }) ?? { recommended: false, reason: "not_budget" }
+        : decideAutoContinuation({
       stopReason: effectiveStopReason,
       acceptance: acceptanceForAutoContinue,
       blockerCategory: setLooseIgnoreStaleBlockers
@@ -10570,7 +10596,9 @@ export async function runAgentMission({
       hasMatchingGrant,
       compoundLifecycleDetected,
       unchangedReadOnlySegment,
-    });
+    }),
+      effectiveStopReason,
+    );
     if (autoContinuation.recommended) {
       recordContinue(autonomyRunStats);
     }
@@ -12055,7 +12083,7 @@ export async function runAgentMission({
         executedCodeRunCount += 1;
       }
       const nestedApprovalContext: ToolExecutionContext = {
-        ...toolContext,
+        ...withGraphNodeContext(toolContext),
         // Certify a genuine research run so the transactional research pack is
         // reachable without the user naming it. Evaluated per call against
         // current evidence: a plan alone is not enough, the run must actually
@@ -12336,6 +12364,19 @@ export async function runAgentMission({
         };
       }
     }
+    const withGraphNodeContext = (
+      toolContext: ToolExecutionContext,
+    ): ToolExecutionContext =>
+      missionGraphExecution
+        ? {
+            ...toolContext,
+            nodeId: missionGraphExecution.nodeId,
+            missionGraphExecution: {
+              nodeId: missionGraphExecution.nodeId,
+              toolName: missionGraphExecution.toolName,
+            },
+          }
+        : toolContext;
     if (descriptor?.execution.preparation === "required") {
       if (!toolRegistry.prepare || !toolRegistry.executePrepared) {
         return {
@@ -12352,9 +12393,11 @@ export async function runAgentMission({
       }
       const preparedResult = await toolRegistry.prepare(
         toolCall,
-        operationId
-          ? { ...runToolContext, operationId }
-          : runToolContext,
+        withGraphNodeContext(
+          operationId
+            ? { ...runToolContext, operationId }
+            : runToolContext,
+        ),
       );
       if (!preparedResult.ok) {
         return {
@@ -12912,11 +12955,11 @@ export async function runAgentMission({
         toolRegistry,
         preparedAction,
         authorization,
-        toolContext: {
+        toolContext: withGraphNodeContext({
           ...runToolContext,
           ...(operationId ? { operationId } : {}),
           authorizedAction: authorization,
-        },
+        }),
         events,
         step,
       });
@@ -38052,6 +38095,10 @@ function completeRun(
       ? {
           autoContinueRecommended: autoContinuation.recommended,
           autoContinueReason: autoContinuation.reason,
+          ...(autoContinuation.suppressionReason
+            ? { suppressionReason: autoContinuation.suppressionReason }
+            : {}),
+          autoContinuation,
         }
       : {}),
     ...(researchSaturated ? { researchSaturated: true } : {}),
@@ -38068,6 +38115,9 @@ function completeRun(
       stopDetail: stopDetail ?? autoContinuation?.reason ?? null,
       autoContinueRecommended: autoContinuation?.recommended ?? false,
       autoContinueReason: autoContinuation?.reason ?? "not_budget",
+      ...(autoContinuation?.suppressionReason
+        ? { suppressionReason: autoContinuation.suppressionReason }
+        : {}),
     },
   });
   if (runStartedAt !== undefined) {

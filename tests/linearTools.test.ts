@@ -219,6 +219,67 @@ test("issue creation prepares a canonical action without dispatching a mutation"
   assert.equal(tool.descriptor?.execution.preparation, "required");
   assert.equal(tool.descriptor?.durability.readback, "required");
   assert.deepEqual(calls, ["issues.get"]);
+  assert.equal(
+    prepared.action.idempotencyKey,
+    "linear:issue:create:run-linear-1:call-linear-1:0",
+  );
+  assert.equal(prepared.action.runId, "run-linear-1");
+});
+
+test("prepared Linear mutation uses a node-scoped operation id when nodeId is present", async () => {
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      if (key === "issues.get") throw notFound(key);
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const tool = requireTool(
+    createLinearTools({ client, gate: 1 }),
+    "linear_create_issue",
+  );
+  const first = await tool.prepare!(
+    { teamId: "team-1", title: "Research ticket" },
+    contextFixture({
+      runId: "segment-run-1",
+      operationId: "segment-run-1:3:0:linear_create_issue",
+      rootMissionId: "root-mission-a",
+      nodeId: "linear-publish",
+    }),
+  );
+  const retried = await tool.prepare!(
+    { teamId: "team-1", title: "Research ticket" },
+    contextFixture({
+      runId: "segment-run-2",
+      operationId: "segment-run-2:1:0:linear_create_issue",
+      rootMissionId: "root-mission-a",
+      missionGraphExecution: { nodeId: "linear-publish" },
+    }),
+  );
+  const legacy = await tool.prepare!(
+    { teamId: "team-1", title: "Research ticket" },
+    contextFixture({
+      runId: "segment-run-2",
+      operationId: "segment-run-2:1:0:linear_create_issue",
+      rootMissionId: "root-mission-a",
+    }),
+  );
+
+  assert.equal(first.ok && retried.ok && legacy.ok, true);
+  if (!first.ok || !retried.ok || !legacy.ok) return;
+  assert.equal(first.action.runId, "segment-run-1");
+  assert.equal(retried.action.runId, "segment-run-2");
+  assert.equal(
+    first.action.idempotencyKey,
+    "linear:issue:create:node:root-mission-a:linear-publish:linear_create_issue:0",
+  );
+  assert.equal(first.action.idempotencyKey, retried.action.idempotencyKey);
+  assert.equal(first.action.reconciliationKey, retried.action.reconciliationKey);
+  assert.ok((first.action.idempotencyKey ?? "").length <= 240);
+  assert.notEqual(retried.action.idempotencyKey, legacy.action.idempotencyKey);
+  assert.equal(
+    legacy.action.idempotencyKey,
+    "linear:issue:create:segment-run-2:segment-run-2-1-0-linear_create_issue:0",
+  );
 });
 
 test("issue creation resolves an omitted team only from the trusted host setting", async () => {

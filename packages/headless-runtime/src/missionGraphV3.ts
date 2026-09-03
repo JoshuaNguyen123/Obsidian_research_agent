@@ -2380,7 +2380,9 @@ function isResumeCurrentNoteWritebackHealNode(
   const toolName = candidate.allowedTools[0];
   if (
     candidate.allowedTools.length !== 1 ||
-    toolName !== "append_to_current_file" ||
+    (toolName !== "append_to_current_file" &&
+      toolName !== "replace_current_file" &&
+      toolName !== "edit_current_section") ||
     candidate.effect !== "mutation" ||
     candidate.status !== "ready" ||
     candidate.dependencyIds.length !== 0 ||
