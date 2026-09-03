@@ -80,12 +80,10 @@ export function classifyDurableResumeScanCandidate(
     case "segment_budget_exhausted":
     case "model_step_budget_exhausted":
     case "tool_call_budget_exhausted":
-      return {
-        type: "terminalize",
-        status: "blocked",
-        code: recoverability.reason,
-        message: `The durable mission cannot resume because ${recoverability.reason.replace(/_/g, " ")}.`,
-      };
+      // A spent segment/step/tool budget is the most resumable stop: the
+      // next segment mints a fresh budget. Terminalizing here hid unfinished
+      // work behind a blocked manifest.
+      return { type: "resume" };
     case "retry_exhausted":
       return {
         type: "terminalize",
