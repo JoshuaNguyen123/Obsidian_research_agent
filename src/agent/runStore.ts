@@ -992,6 +992,56 @@ export async function updateMissionRuntimeSnapshotByRunId(
   });
 }
 
+/** A normalized deep copy of a snapshot: the shape every writer persists. */
+export function cloneNormalizedMissionRuntimeSnapshot(
+  snapshot: MissionRuntimeSnapshotV2,
+): MissionRuntimeSnapshotV2 {
+  const requested = normalizeMissionRuntimeSnapshot(
+    JSON.parse(JSON.stringify(snapshot)),
+  );
+  if (!requested) {
+    throw new Error("Cannot serialize invalid mission runtime snapshot.");
+  }
+  return requested;
+}
+
+/**
+ * Stage the next snapshot revision against the note text about to be
+ * rewritten: bump the revision past the persisted one, stamp updatedAt and
+ * the plugin version, and return the formatted block. Shared by the snapshot
+ * writer and the combined ledger + snapshot writer so the two cannot drift.
+ */
+export function stageMissionRuntimeSnapshotRevision(
+  context: ToolExecutionContext,
+  requested: MissionRuntimeSnapshotV2,
+  revisionTarget: MissionRuntimeSnapshotV2,
+  current: string,
+): string {
+  const persistedRevision = current
+    ? parseMissionRuntimeSnapshotFromMarkdown(current)?.revision ?? 0
+    : 0;
+  requested.revision = Math.max(requested.revision, persistedRevision) + 1;
+  requested.updatedAt = (context.now?.() ?? new Date()).toISOString();
+  applyPluginVersionStampIfMissing(
+    requested,
+    readPluginVersionStampFromHost(context),
+  );
+  applyPluginVersionStampIfMissing(revisionTarget, requested);
+  return formatMissionRuntimeSnapshotBlock(requested);
+}
+
+/** Once the bytes are durable, carry the staged revision to the live object. */
+export function commitMissionRuntimeSnapshotRevision(
+  requested: MissionRuntimeSnapshotV2,
+  revisionTarget: MissionRuntimeSnapshotV2,
+): void {
+  revisionTarget.revision = Math.max(
+    revisionTarget.revision,
+    requested.revision,
+  );
+  revisionTarget.updatedAt = requested.updatedAt;
+}
+
 async function persistMissionRuntimeSnapshotUnlocked(
   context: ToolExecutionContext,
   requested: MissionRuntimeSnapshotV2,
@@ -1012,34 +1062,24 @@ async function persistMissionRuntimeSnapshotUnlocked(
   const path = getMissionRuntimeSnapshotPath(requested.runId);
   const file = vault.getFileByPath(path);
   let current = "";
-  let persistedRevision = 0;
   if (file) {
     current = await readAgentRunMarkdownForUpdate({
       path,
       adapter: vault.adapter as AgentRunAdapterLike | undefined,
       vaultRead: () => vault.read(file as TFile),
     });
-    persistedRevision =
-      parseMissionRuntimeSnapshotFromMarkdown(current)?.revision ?? 0;
   }
-
-  requested.revision = Math.max(requested.revision, persistedRevision) + 1;
-  requested.updatedAt = (context.now?.() ?? new Date()).toISOString();
-  applyPluginVersionStampIfMissing(
+  const block = stageMissionRuntimeSnapshotRevision(
+    context,
     requested,
-    readPluginVersionStampFromHost(context),
+    revisionTarget,
+    current,
   );
-  applyPluginVersionStampIfMissing(revisionTarget, requested);
-  const block = formatMissionRuntimeSnapshotBlock(requested);
 
   if (!file) {
     const content = `# Agent Run ${sanitizeRunId(requested.runId)}\n\n${block}`;
     await vault.create(path, content);
-    revisionTarget.revision = Math.max(
-      revisionTarget.revision,
-      requested.revision,
-    );
-    revisionTarget.updatedAt = requested.updatedAt;
+    commitMissionRuntimeSnapshotRevision(requested, revisionTarget);
     return {
       path,
       bytesWritten: getByteLength(content),
@@ -1068,11 +1108,7 @@ async function persistMissionRuntimeSnapshotUnlocked(
     adapter: vault.adapter as AgentRunAdapterLike | undefined,
     markdown: next,
   });
-  revisionTarget.revision = Math.max(
-    revisionTarget.revision,
-    requested.revision,
-  );
-  revisionTarget.updatedAt = requested.updatedAt;
+  commitMissionRuntimeSnapshotRevision(requested, revisionTarget);
   return {
     path,
     bytesWritten: getByteLength(block),
@@ -4366,7 +4402,7 @@ export async function settleBounded<T>(
   }
 }
 
-function replaceRuntimeSnapshotBlock(current: string, block: string): string {
+export function replaceRuntimeSnapshotBlock(current: string, block: string): string {
   if (RUNTIME_SNAPSHOT_BLOCK_PATTERN.test(current)) {
     return current.replace(
       RUNTIME_SNAPSHOT_BLOCK_PATTERN,

@@ -21,11 +21,18 @@ import {
 import type { ToolExecutionContext } from "../tools/types";
 import { normalizeVaultPath } from "../tools/validation";
 import {
+  cloneNormalizedMissionRuntimeSnapshot,
+  commitMissionRuntimeSnapshotRevision,
+  getMissionRuntimeSnapshotPath,
   persistAgentRunMarkdownExact,
   readAgentRunMarkdown,
-  withSerializedRunWrite,
   readAgentRunMarkdownForUpdate,
   rememberAgentRunMarkdownWrite,
+  replaceRuntimeSnapshotBlock,
+  stageMissionRuntimeSnapshotRevision,
+  withSerializedRunWrite,
+  type MissionRuntimeSnapshotV2,
+  type MissionRuntimeSnapshotWriteResult,
 } from "./runStore";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
 import type { ModelUsageAggregateV1 } from "../model/modelCallEvidence";
@@ -1133,6 +1140,144 @@ export async function writeMissionLedger(
       path,
       bytesWritten: getByteLength(block),
       revision: requestedLedger.revision,
+    };
+  });
+}
+
+export interface MissionLedgerAndSnapshotWriteResult {
+  ledger: MissionLedgerWriteResult;
+  snapshot: MissionRuntimeSnapshotWriteResult;
+}
+
+/**
+ * Persist the mission ledger and the runtime snapshot in ONE rewrite of the
+ * shared Agent Runs note.
+ *
+ * Every ledger persist used to be followed by a "duplicate" snapshot write of
+ * the same note: two read-modify-write cycles and two exact readbacks per
+ * persist, several persists per tool call. Both blocks now land in a single
+ * exact write, which also removes the window in which a crash left the
+ * ledger one write ahead of the snapshot. Revision bumps, plugin-version
+ * stamps, block placement, and the readback proof are exactly those of the
+ * two single-block writers, whose staging helpers this shares.
+ */
+export async function writeMissionLedgerWithRuntimeSnapshot(
+  context: ToolExecutionContext,
+  ledger: MissionLedger,
+  snapshot: MissionRuntimeSnapshotV2,
+): Promise<MissionLedgerAndSnapshotWriteResult | null> {
+  if (!hasLedgerVaultApi(context)) {
+    return null;
+  }
+  const path = getMissionLedgerPath(ledger.runId);
+  if (getMissionRuntimeSnapshotPath(snapshot.runId) !== path) {
+    throw new Error(
+      "The mission ledger and runtime snapshot resolve to different run notes.",
+    );
+  }
+  const vault = context.app.vault;
+  const requestedLedger = cloneMissionLedger(ledger);
+  applyPluginVersionStampIfMissing(
+    requestedLedger,
+    readPluginVersionStampFromHost(context),
+  );
+  const requestedSnapshot = cloneNormalizedMissionRuntimeSnapshot(snapshot);
+  return withSerializedRunWrite(vault, ledger.runId, async () => {
+    const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
+    if (!vault.getFolderByPath(folderPath)) {
+      try {
+        await vault.createFolder(folderPath);
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) {
+          throw error;
+        }
+      }
+    }
+
+    const file = vault.getFileByPath(path);
+    let current = "";
+    if (file) {
+      current = await readAgentRunMarkdownForUpdate({
+        path,
+        adapter: vault.adapter,
+        vaultRead: () => vault.read(file as TFile),
+      });
+    }
+    const persistedLedgerRevision = current
+      ? parseMissionLedgerFromMarkdown(current)?.revision ?? 0
+      : 0;
+    requestedLedger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
+    requestedLedger.revision =
+      Math.max(requestedLedger.revision, persistedLedgerRevision) + 1;
+    const ledgerBlock = formatMissionLedgerBlock(requestedLedger);
+    const snapshotBlock = stageMissionRuntimeSnapshotRevision(
+      context,
+      requestedSnapshot,
+      snapshot,
+      current,
+    );
+    const commitBoth = () => {
+      ledger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
+      ledger.revision = Math.max(ledger.revision, requestedLedger.revision);
+      applyPluginVersionStampIfMissing(ledger, requestedLedger);
+      commitMissionRuntimeSnapshotRevision(requestedSnapshot, snapshot);
+    };
+
+    if (!file) {
+      const content = replaceRuntimeSnapshotBlock(
+        `# Agent Run ${sanitizeRunId(requestedLedger.runId)}\n\n${ledgerBlock}`,
+        snapshotBlock,
+      );
+      await vault.create(path, content);
+      commitBoth();
+      const bytesWritten = getByteLength(content);
+      return {
+        ledger: { path, bytesWritten, revision: requestedLedger.revision },
+        snapshot: {
+          path,
+          bytesWritten,
+          revision: requestedSnapshot.revision,
+          commitProof: "vault_acknowledged",
+        },
+      };
+    }
+
+    const next = replaceRuntimeSnapshotBlock(
+      replaceMissionLedgerBlock(current, ledgerBlock),
+      snapshotBlock,
+    );
+    const commitProof = await persistAgentRunMarkdownExact({
+      path,
+      expectedMarkdown: next,
+      adapterWrite:
+        typeof vault.adapter?.write === "function"
+          ? () => vault.adapter.write(path, next)
+          : undefined,
+      adapterRead:
+        typeof vault.adapter?.read === "function"
+          ? () => vault.adapter.read(path)
+          : undefined,
+      modify: () => vault.modify(file as TFile, next),
+      readback: () => vault.read(file as TFile),
+    });
+    await rememberAgentRunMarkdownWrite({
+      path,
+      adapter: vault.adapter,
+      markdown: next,
+    });
+    commitBoth();
+    return {
+      ledger: {
+        path,
+        bytesWritten: getByteLength(ledgerBlock),
+        revision: requestedLedger.revision,
+      },
+      snapshot: {
+        path,
+        bytesWritten: getByteLength(snapshotBlock),
+        revision: requestedSnapshot.revision,
+        commitProof,
+      },
     };
   });
 }

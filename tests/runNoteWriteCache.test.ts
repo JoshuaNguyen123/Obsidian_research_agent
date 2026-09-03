@@ -5,6 +5,7 @@ import {
   createMissionLedger,
   parseMissionLedgerFromMarkdown,
   writeMissionLedger,
+  writeMissionLedgerWithRuntimeSnapshot,
   type MissionEvidence,
 } from "../src/agent/missionLedger";
 import {
@@ -326,6 +327,97 @@ test("snapshot, ledger, and checkpoint writers share one remembered note", async
   assert.equal(parseMissionLedgerFromMarkdown(markdown)?.runId, runId);
   assert.match(markdown, /Checkpoint survives\./);
   assert.deepEqual([...vault.files.keys()], [path]);
+});
+
+test("the combined writer lands the ledger and the snapshot in one exact write", async () => {
+  clearAgentRunMarkdownCacheForTests();
+  const vault = createAdapterVault();
+  const runId = "run-combined";
+  const path = "Agent Runs/run-combined.md";
+  const ledger = createMissionLedger({
+    runId,
+    mission: "Combine the writes.",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 30,
+      toolStepBudget: 5,
+      finalizationReserve: 1,
+      expectedTools: ["web_search"],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-09-03T03:00:00.000Z"),
+  });
+  const snapshot = createMissionRuntimeSnapshot({
+    runId,
+    originalMission: "Combine the writes.",
+    status: "running",
+    createdAt: new Date("2026-09-03T03:00:00.000Z"),
+  });
+
+  const created = await writeMissionLedgerWithRuntimeSnapshot(
+    vault.context,
+    ledger,
+    snapshot,
+  );
+  assert.ok(created);
+  assert.equal(created.ledger.revision, 1);
+  assert.equal(created.snapshot.revision, 1);
+  assert.equal(created.snapshot.commitProof, "vault_acknowledged");
+  assert.equal(ledger.revision, 1, "the live ledger carries the staged revision");
+  assert.equal(snapshot.revision, 1, "the live snapshot carries the staged revision");
+  assert.equal(vault.counts.adapterWrite, 0, "creation goes through vault.create");
+  let markdown = vault.files.get(path) ?? "";
+  assert.equal(parseMissionLedgerFromMarkdown(markdown)?.revision, 1);
+  assert.equal(parseMissionRuntimeSnapshotFromMarkdown(markdown)?.revision, 1);
+
+  vault.counts.adapterRead = 0;
+  vault.counts.adapterWrite = 0;
+  const second = await writeMissionLedgerWithRuntimeSnapshot(
+    vault.context,
+    ledger,
+    snapshot,
+  );
+  assert.ok(second);
+  assert.equal(second.ledger.revision, 2);
+  assert.equal(second.snapshot.revision, 2);
+  assert.equal(second.snapshot.commitProof, "adapter_exact_readback");
+  assert.equal(vault.counts.adapterWrite, 1, "both blocks in one write");
+  assert.equal(vault.counts.adapterRead, 2, "unremembered note: pre-read + readback");
+  markdown = vault.files.get(path) ?? "";
+  assert.equal(parseMissionLedgerFromMarkdown(markdown)?.revision, 2);
+  assert.equal(parseMissionRuntimeSnapshotFromMarkdown(markdown)?.revision, 2);
+  assert.equal((markdown.match(/## Mission Ledger/g) ?? []).length, 1);
+  assert.equal((markdown.match(/## Runtime Snapshot/g) ?? []).length, 1);
+
+  vault.counts.adapterRead = 0;
+  vault.counts.adapterWrite = 0;
+  const third = await writeMissionLedgerWithRuntimeSnapshot(
+    vault.context,
+    ledger,
+    snapshot,
+  );
+  assert.equal(third?.ledger.revision, 3);
+  assert.equal(third?.snapshot.revision, 3);
+  assert.equal(vault.counts.adapterWrite, 1);
+  assert.equal(vault.counts.adapterRead, 1, "remembered note: readback only");
+
+  // The single-block writers continue the same revision lines.
+  const ledgerOnly = await writeMissionLedger(vault.context, ledger);
+  assert.equal(ledgerOnly?.revision, 4);
+  const snapshotOnly = await writeMissionRuntimeSnapshot(vault.context, snapshot);
+  assert.equal(snapshotOnly?.revision, 4);
+  markdown = vault.files.get(path) ?? "";
+  assert.equal(parseMissionLedgerFromMarkdown(markdown)?.revision, 4);
+  assert.equal(parseMissionRuntimeSnapshotFromMarkdown(markdown)?.revision, 4);
+  assert.deepEqual([...vault.files.keys()], [path]);
+
+  await assert.rejects(
+    writeMissionLedgerWithRuntimeSnapshot(vault.context, ledger, {
+      ...snapshot,
+      runId: "run-other",
+    }),
+    /different run notes/,
+  );
 });
 
 test("the runtime snapshot fence is compact JSON that the parser round-trips", () => {

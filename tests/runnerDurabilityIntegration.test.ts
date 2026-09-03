@@ -4723,3 +4723,89 @@ test("a two-marker write contract is not discharged by one receipt", async () =>
     JSON.stringify({ rule: "half-paid literal contract must not close as a completed write", completion }),
   );
 });
+
+test("run-note rewrites per tool call stay within the write budget", async () => {
+  // Every rewrite of the run note (Agent Runs/<runId>.md, not the mission
+  // graph store) is attributed to the phase the run is in when it happens.
+  // The budget is a ratchet on the measured shape after the combined
+  // ledger + snapshot writer and the deferred post-tool ledger persists.
+  let phase = "start";
+  const rewrites = new Map<string, number>();
+  const vault = createVaultHarness({
+    beforeModify(path) {
+      if (/^Agent Runs\/[^/]+\.md$/u.test(path)) {
+        rewrites.set(phase, (rewrites.get(phase) ?? 0) + 1);
+      }
+    },
+  });
+  const defaultRegistry = createDefaultToolRegistry();
+  const registry: ToolRegistry = {
+    getDefinitions: () => defaultRegistry.getDefinitions(),
+    execute: async (call, context) => {
+      phase = `during:${call.name}`;
+      const result = await defaultRegistry.execute(call, context);
+      phase = `after:${call.name}`;
+      return result;
+    },
+  };
+  const completions: AgentRunCompleteEvent[] = [];
+  const traces: AgentTraceEvent[] = [];
+
+  await runAgentMission({
+    prompt: "Search the vault for the initial note, then append a summary to the current note.",
+    modelClient: createModelClient([
+      responseWithToolCall("search_markdown_files", { query: "Initial" }),
+      responseWithToolCall("append_to_current_file", {
+        text: "Summary: the initial note was found.",
+      }),
+      responseWithContent("Appended the summary."),
+    ]),
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onRunComplete: (event) => completions.push(event),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  if (process.env.PRINT_RUN_NOTE_WRITE_SHAPE) {
+    for (const event of traces) {
+      console.log(
+        `trace ${event.kind} id=${event.id} step=${event.step ?? "-"} tool=${event.toolName ?? "-"} ${(event.message ?? "").slice(0, 120)}`,
+      );
+    }
+  }
+  assert.equal(completions.length, 1);
+  // The host schedules its own read follow-ups after the search and the
+  // terminal gate may downgrade the scripted final answer to a resumable
+  // stop; the write budget is about the rewrites, not the verdict.
+  assert.ok(
+    ["final", "write_completed", "budget"].includes(completions[0].stopReason),
+    completions[0].stopReason,
+  );
+  assert.match(vault.files.get("Current.md") ?? "", /Summary: the initial note was found/);
+  const byPhase = Object.fromEntries(rewrites);
+  const readToolRewrites =
+    (byPhase["during:search_markdown_files"] ?? 0) +
+    (byPhase["after:search_markdown_files"] ?? 0);
+  const mutationRewrites =
+    (byPhase["during:append_to_current_file"] ?? 0) +
+    (byPhase["after:append_to_current_file"] ?? 0);
+  const total = [...rewrites.values()].reduce((sum, count) => sum + count, 0);
+  const shape = JSON.stringify({ byPhase, readToolRewrites, mutationRewrites, total });
+  if (process.env.PRINT_RUN_NOTE_WRITE_SHAPE) {
+    console.log(`run-note rewrite shape: ${shape}`);
+  }
+  // Measured 2026-09-03: before the combined writer and deferred persists the
+  // same run cost 34 rewrites (read tool 4, mutation 12); after, 11 (1 and 4).
+  assert.ok(
+    readToolRewrites <= 1,
+    `an evidence-bearing read tool costs one run-note rewrite: ${shape}`,
+  );
+  assert.ok(
+    mutationRewrites <= 4,
+    `a mutation costs at most four run-note rewrites (intent, applying, committed+ledger, pre-model flush): ${shape}`,
+  );
+  assert.ok(total <= 11, `whole-run rewrite budget: ${shape}`);
+});

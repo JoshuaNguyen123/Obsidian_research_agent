@@ -630,6 +630,7 @@ import {
   type MissionLedgerSummary,
   type MissionBlockerCategory,
   type MissionDependencyStatus,
+  writeMissionLedgerWithRuntimeSnapshot,
 } from "./agent/missionLedger";
 import {
   ApprovalBroker,
@@ -1867,6 +1868,11 @@ const OFF_TOPIC_MODEL_OUTPUT_MESSAGE =
 // grounded missions (DU-02, 2026-08-20). Slow planners must fall back.
 const MAX_STRUCTURED_PLANNING_TIMEOUT_MS = 120_000;
 const BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS = 5_000;
+/**
+ * A ledger persist that may ride the next run-note rewrite waits at most this
+ * long for one; past it, the deferred persist flushes on its own.
+ */
+const DEFERRED_MISSION_LEDGER_FLUSH_MS = 1_000;
 const SHADOW_ROUTER_ABORT_SETTLE_GRACE_MS = 1_000;
 
 export async function settleToolOutcomeMemoryPersistence(
@@ -2154,6 +2160,15 @@ export async function runAgentMission({
   // shares this circuit so cancellation cannot bypass it. Declared with the
   // anchor flags above because the pre-router anchor seam consults it.
   let runtimeSnapshotPersistenceBlockedError: unknown = null;
+  /**
+   * A ledger persist that may ride the next run-note rewrite (a WAL
+   * transition or the pre-model-call flush) instead of forcing one of its
+   * own: the trace id of the deferred persist, and the idle timer that
+   * flushes it when no rewrite follows.
+   */
+  let deferredMissionLedgerTraceId: string | null = null;
+  let deferredMissionLedgerFlushTimer: ReturnType<typeof setTimeout> | null =
+    null;
   const metricEvents: AgentRunMetricEvent[] = [];
   const autonomyRunStats = createAutonomyRunStats();
   const runStartedMs = Date.now();
@@ -7748,10 +7763,39 @@ export async function runAgentMission({
     }
     syncRuntimeSnapshotFromRunState();
     try {
-      const result = await writeMissionRuntimeSnapshot(
-        runToolContext,
-        runtimeSnapshot,
-      );
+      // A deferred ledger persist rides this rewrite instead of its own.
+      const deferredLedgerTraceId = deferredMissionLedgerTraceId;
+      const ledgerForRewrite =
+        deferredLedgerTraceId !== null &&
+        missionLedger &&
+        runPlan.executionTier !== "direct_chat"
+          ? missionLedger
+          : null;
+      let result: Awaited<ReturnType<typeof writeMissionRuntimeSnapshot>>;
+      if (ledgerForRewrite) {
+        clearDeferredMissionLedger();
+        const combined = await writeMissionLedgerWithRuntimeSnapshot(
+          runToolContext,
+          ledgerForRewrite,
+          runtimeSnapshot,
+        );
+        result = combined?.snapshot ?? null;
+        if (combined) {
+          emitLedgerRunConfig();
+          events.onTrace?.({
+            id: deferredLedgerTraceId ?? traceId,
+            kind: "status",
+            path: combined.ledger.path,
+            message: `Saved mission ledger to ${combined.ledger.path}`,
+            outputPreview: summarizeMissionLedger(ledgerForRewrite),
+          });
+        }
+      } else {
+        result = await writeMissionRuntimeSnapshot(
+          runToolContext,
+          runtimeSnapshot,
+        );
+      }
       if (result) {
         events.onTrace?.({
           id: `${traceId}:runtime`,
@@ -8241,7 +8285,41 @@ export async function runAgentMission({
       return null;
     }
   };
-  const persistMissionLedger = async (traceId: string) => {
+  const clearDeferredMissionLedger = () => {
+    deferredMissionLedgerTraceId = null;
+    if (deferredMissionLedgerFlushTimer !== null) {
+      clearTimeout(deferredMissionLedgerFlushTimer);
+      deferredMissionLedgerFlushTimer = null;
+    }
+  };
+  /**
+   * Write a ledger persist that was deferred onto "the next run-note
+   * rewrite" now, because none is coming soon: a model call is about to
+   * start, or the idle timer fired.
+   */
+  const flushDeferredMissionLedger = async (): Promise<void> => {
+    const traceId = deferredMissionLedgerTraceId;
+    if (traceId === null) {
+      return;
+    }
+    clearDeferredMissionLedger();
+    await persistMissionLedger(traceId);
+  };
+  const armDeferredMissionLedgerFlush = () => {
+    if (deferredMissionLedgerFlushTimer !== null) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      deferredMissionLedgerFlushTimer = null;
+      void flushDeferredMissionLedger().catch(() => undefined);
+    }, DEFERRED_MISSION_LEDGER_FLUSH_MS);
+    (timer as { unref?: () => void }).unref?.();
+    deferredMissionLedgerFlushTimer = timer;
+  };
+  const persistMissionLedger = async (
+    traceId: string,
+    { defer = false }: { defer?: boolean } = {},
+  ) => {
     if (!missionLedger) {
       return;
     }
@@ -8255,6 +8333,16 @@ export async function runAgentMission({
     if (runtimeSnapshotPersistenceBlockedError !== null) {
       return;
     }
+    if (defer && runtimeSnapshot && runtimeSnapshotPersistenceAvailable) {
+      // The ledger state is already in memory (Run Details reads that); the
+      // next runtime-snapshot persist or the next model call carries it to
+      // disk in the same rewrite.
+      deferredMissionLedgerTraceId = traceId;
+      emitLedgerRunConfig();
+      armDeferredMissionLedgerFlush();
+      return;
+    }
+    clearDeferredMissionLedger();
     const latestOrchestrator = resolveOrchestratorSnapshot();
     if (latestOrchestrator) {
       missionLedger.orchestrator = latestOrchestrator;
@@ -8264,6 +8352,85 @@ export async function runAgentMission({
     // initiated the anchor is no longer removable state — even a timed-out
     // settle may still land, so the flag flips before the attempt.
     prePlanningAnchorSuperseded = true;
+    if (runtimeSnapshot) {
+      // One rewrite carries both blocks (writeMissionLedgerWithRuntimeSnapshot)
+      // where the ledger write used to be followed by a duplicate snapshot
+      // write of the same note.
+      syncRuntimeSnapshotFromRunState();
+      const snapshotForWrite = runtimeSnapshot;
+      try {
+        const settlement = await settleBounded(
+          writeMissionLedgerWithRuntimeSnapshot(
+            runToolContext,
+            missionLedger,
+            snapshotForWrite,
+          ),
+          BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
+        );
+        emitLedgerRunConfig();
+        if (settlement.kind === "rejected") {
+          throw settlement.value;
+        }
+        if (settlement.kind === "timed_out") {
+          events.onTrace?.({
+            id: `${traceId}:timeout`,
+            kind: "error",
+            message:
+              "Mission ledger persistence did not settle within 5 seconds; terminal UI ownership was released after the bounded durability wait.",
+            error: {
+              code: "mission_ledger_save_timed_out",
+              message:
+                "The vault write remained pending after the bounded durability wait.",
+            },
+          });
+          return;
+        }
+        const result = settlement.value;
+        if (result) {
+          events.onTrace?.({
+            id: traceId,
+            kind: "status",
+            path: result.ledger.path,
+            message: `Saved mission ledger to ${result.ledger.path}`,
+            outputPreview: summarizeMissionLedger(missionLedger),
+          });
+          events.onTrace?.({
+            id: `${traceId}:runtime`,
+            kind: "status",
+            path: result.snapshot.path,
+            message: `Saved resumable runtime snapshot revision ${result.snapshot.revision}.`,
+            outputPreview: {
+              version: snapshotForWrite.version,
+              revision: result.snapshot.revision,
+              rootRunId: snapshotForWrite.lineage.rootRunId,
+              segmentIndex: snapshotForWrite.lineage.segmentIndex,
+              lastSafeStep: snapshotForWrite.lastSafeStep,
+              commitProof: result.snapshot.commitProof,
+            },
+          });
+        }
+      } catch (error) {
+        const ambiguousWrite = isRuntimeSnapshotWriteAmbiguousError(error);
+        if (ambiguousWrite) {
+          runtimeSnapshotPersistenceBlockedError = error;
+        }
+        events.onTrace?.({
+          id: `${traceId}:error`,
+          kind: "error",
+          message: `Could not save mission ledger: ${getUnknownErrorMessage(error)}`,
+          error: {
+            code: ambiguousWrite
+              ? "runtime_snapshot_write_ambiguous"
+              : "mission_ledger_save_failed",
+            message: getUnknownErrorMessage(error),
+          },
+        });
+        if (ambiguousWrite) {
+          throw error;
+        }
+      }
+      return;
+    }
     try {
       const ledgerSettlement = await settleBounded(
         writeMissionLedger(runToolContext, missionLedger),
@@ -10870,7 +11037,9 @@ export async function runAgentMission({
       },
       runToolContext.now?.() ?? new Date(),
     );
-    await persistMissionLedger(`mission-ledger-tool-${toolName}`);
+    await persistMissionLedger(`mission-ledger-tool-${toolName}`, {
+      defer: result.mutationState === "applied" || !evidence,
+    });
   };
   const recordLedgerReceipt = async (receipt: AgentRunReceipt, step = lastStep) => {
     if (!missionLedger) {
@@ -10928,7 +11097,9 @@ export async function runAgentMission({
       },
       runToolContext.now?.() ?? new Date(),
     );
-    await persistMissionLedger(`mission-ledger-receipt-${receipt.operation}`);
+    await persistMissionLedger(`mission-ledger-receipt-${receipt.operation}`, {
+      defer: true,
+    });
   };
   const recordLedgerBlocker = (blocker: string) => {
     if (!missionLedger) {
@@ -16546,6 +16717,7 @@ export async function runAgentMission({
         );
         await persistMissionLedger(
           `mission-ledger-graph-${toolCall.name}-${step}`,
+          { defer: true },
         );
       }
       if (origin === "model" && !deferAutoFollowups) {
@@ -16995,7 +17167,9 @@ export async function runAgentMission({
     });
     emitOutcomeRankingDiagnostic(reflexOutput, step);
     recordReflexCheckpoint("material_context_change");
-    await persistMissionLedger(`mission-ledger-reflex-material-${step}`);
+    await persistMissionLedger(`mission-ledger-reflex-material-${step}`, {
+      defer: true,
+    });
 
     return result;
   };
@@ -18475,6 +18649,9 @@ export async function runAgentMission({
   }
 
   for (let step = 1; step <= stepLimit + finalRetryExtraSteps; step += 1) {
+    // The previous step's deferred ledger persist lands before the next
+    // model wait, so a kill mid-call cannot leave the ledger a tool behind.
+    await flushDeferredMissionLedger();
     if (await stopIfRequested(step)) {
       return;
     }
