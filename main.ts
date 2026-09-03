@@ -46,6 +46,7 @@ import { createModelLatencyTracker } from "./src/model/modelLatencyTracker";
 import { probeToolCallBehavior } from "./src/model/toolCallBehavioralProbe";
 import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
 import {
+  clearSemanticShardReadCache,
   createSemanticIndexService,
   getSemanticIndexPaths,
   shouldSemanticIndexTrackPath,
@@ -1351,6 +1352,9 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   onunload() {
     this.projectMemoryReload.cancel();
+    // Parsed shards and their decoded vectors are module-level; a disabled
+    // plugin must not keep an index's worth of Float32Arrays alive.
+    clearSemanticShardReadCache();
     this.unloading = true;
     const activeLinearOAuthLoopback = this.activeLinearOAuthLoopback;
     this.activeLinearOAuthLoopback = null;

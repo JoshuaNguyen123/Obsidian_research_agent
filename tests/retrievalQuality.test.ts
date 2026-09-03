@@ -59,27 +59,29 @@ test("the fixture is large and varied enough to discriminate", () => {
 test("records the measured lexical retrieval baseline", async () => {
   const score = await scoreAll();
 
-  // Measured, not aspirational. The headline number is recall@1 = 0: on every
-  // one of the ten queries, a keyword-stuffed note that states no fact outranks
-  // the note that answers the question. The answer lands at rank 2 almost
-  // every time, which is what MRR = 0.5 says.
+  // Measured, not aspirational. History of this ratchet:
+  //   2026-08-26  recall@1 = 0.00, recall@3 = 1.00, MRR = 0.50 -- additive term
+  //               frequency; a keyword-stuffed note outranked every answer.
+  //   2026-09-03  recall@1 = 1.00, recall@3 = 1.00, MRR = 1.00 -- corpus-aware
+  //               ranking (src/tools/lexicalRanking.ts): informative occurrence
+  //               counting, BM25 IDF over the scanned corpus, saturating
+  //               length-normalized term frequency (b = 0.5), query coverage.
   //
   // Pinned as a ratchet. An improvement raises these floors in the same commit
   // and cites the numbers; a drop is a regression to explain, not a threshold
   // to relax.
   assert.equal(score.queriesScored, queries.length);
-  assert.equal(
-    score.recallAt1,
-    0,
-    `recall@1 moved off the recorded baseline of 0 — if this improved, raise the floor: ${JSON.stringify(score)}`,
+  assert.ok(
+    score.recallAt1 >= 1,
+    `recall@1 regressed below the recorded floor of 1.0: ${JSON.stringify(score)}`,
   );
   assert.ok(
     score.recallAt3 >= 1,
-    `recall@3 regressed below the recorded baseline of 1.0: ${JSON.stringify(score)}`,
+    `recall@3 regressed below the recorded floor of 1.0: ${JSON.stringify(score)}`,
   );
   assert.ok(
-    score.meanReciprocalRank >= 0.5,
-    `MRR regressed below the recorded baseline of 0.5: ${JSON.stringify(score)}`,
+    score.meanReciprocalRank >= 1,
+    `MRR regressed below the recorded floor of 1.0: ${JSON.stringify(score)}`,
   );
 });
 
@@ -101,15 +103,13 @@ test("a match past the snippet boundary is still findable by full-content search
   );
 });
 
-test("a keyword distractor currently outranks every answering note", async () => {
-  // Not a soft observation: measured on all ten queries. The distractor repeats
-  // the query term five times and states nothing, so raw term frequency puts it
-  // first every time. This is precisely what IDF (A1's BM25) and the A5 rerank
-  // exist to fix.
-  //
-  // Asserted in its failing form deliberately. When A1 or A5 lands, this test
-  // is what proves it worked, and it must be inverted in that commit rather
-  // than deleted.
+test("a keyword distractor never outranks an answering note", async () => {
+  // Measured on all ten queries. Until 2026-09-03 the distractor -- the query
+  // term repeated five times with no fact stated -- won every query under raw
+  // term frequency. Informative occurrence counting collapses that repeat run
+  // to one discounted match, and the answering note wins 10/10. This is the
+  // inverted form of the failing assertion that pinned the defect; it stays
+  // exact so a regression to "the distractor wins one query" is loud.
   let distractorFirst = 0;
   for (const query of queries) {
     const paths = await rank(query);
@@ -118,7 +118,7 @@ test("a keyword distractor currently outranks every answering note", async () =>
 
   assert.equal(
     distractorFirst,
-    queries.length,
-    `baseline says the distractor wins every query; it now wins ${distractorFirst}/${queries.length}. If ranking improved, invert this assertion and cite the new score.`,
+    0,
+    `a keyword distractor outranked an answering note on ${distractorFirst}/${queries.length} queries.`,
   );
 });

@@ -20,6 +20,15 @@ import {
 } from "./constants";
 import { withDiscriminativeDescription } from "./discriminativeToolDescriptions";
 import {
+  bm25ContentScoreV1,
+  buildLexicalCorpusStatsV1,
+  buildLexicalDocumentTermStatsV1,
+  informativeOccurrenceCountV1,
+  queryCoverageBonusV1,
+  type LexicalCorpusStatsV1,
+  type LexicalDocumentTermStatsV1,
+} from "./lexicalRanking";
+import {
   ToolExecutionError,
   type AgentTool,
   type AgentToolActionExecution,
@@ -409,6 +418,20 @@ export const searchMarkdownFilesTool: AgentTool = {
       snippet: string;
     }> = [];
 
+    // Pass 1 reads every note once (as before) and keeps only small per-note
+    // statistics: informative term and phrase counts, the note length, and,
+    // for notes that can score at all, the snippet and match count. Note
+    // contents are not retained. The corpus statistics BM25 needs (document
+    // frequencies, average length) fall out of the same pass.
+    const corpusDocuments: LexicalDocumentTermStatsV1[] = [];
+    const candidates: Array<{
+      file: TFile;
+      documentStats: LexicalDocumentTermStatsV1;
+      phraseCount: number;
+      matchCount: number;
+      snippet: string;
+    }> = [];
+
     for (const file of context.app.vault.getFiles()) {
       if (file.extension !== "md" || isBlockedSystemPath(file.path)) {
         continue;
@@ -416,35 +439,65 @@ export const searchMarkdownFilesTool: AgentTool = {
 
       const content = await context.app.vault.cachedRead(file);
       const contentLower = content.toLowerCase();
+      const documentStats = buildLexicalDocumentTermStatsV1(contentLower, queryTerms);
+      corpusDocuments.push(documentStats);
       const phraseIndex = contentLower.indexOf(normalizedQuery);
-      const scored = scoreMarkdownSearchResult({
-        file,
-        content,
-        query: normalizedQuery,
-        queryTerms,
-      });
-      if (scored.score <= 0) {
+      const phraseCount =
+        phraseIndex >= 0
+          ? informativeOccurrenceCountV1(contentLower, normalizedQuery, queryTerms)
+          : 0;
+      const titleLower = file.basename.toLowerCase();
+      const pathLower = file.path.toLowerCase();
+      const couldScore =
+        phraseCount > 0 ||
+        documentStats.termFrequencies.size > 0 ||
+        titleLower.includes(normalizedQuery) ||
+        pathLower.includes(normalizedQuery) ||
+        queryTerms.some((term) => titleLower.includes(term) || pathLower.includes(term));
+      if (!couldScore) {
         continue;
       }
       const snippetIndex =
         phraseIndex >= 0
           ? phraseIndex
           : findFirstTermIndex(contentLower, queryTerms);
-
-      results.push({
-        path: file.path,
-        basename: file.basename,
+      candidates.push({
+        file,
+        documentStats,
+        phraseCount,
         matchCount:
           phraseIndex >= 0
             ? countMatches(content, query)
             : countSearchTermMatches(contentLower, queryTerms),
-        score: scored.score,
-        reasons: scored.reasons,
         snippet: buildSearchSnippet(
           content,
           snippetIndex >= 0 ? snippetIndex : 0,
           maxSnippetChars,
         ),
+      });
+    }
+
+    // Pass 2 scores the candidates against the whole scanned corpus.
+    const corpus = buildLexicalCorpusStatsV1(corpusDocuments);
+    for (const candidate of candidates) {
+      const scored = scoreMarkdownSearchResult({
+        file: candidate.file,
+        query: normalizedQuery,
+        queryTerms,
+        phraseCount: candidate.phraseCount,
+        documentStats: candidate.documentStats,
+        corpus,
+      });
+      if (scored.score <= 0) {
+        continue;
+      }
+      results.push({
+        path: candidate.file.path,
+        basename: candidate.file.basename,
+        matchCount: candidate.matchCount,
+        score: scored.score,
+        reasons: scored.reasons,
+        snippet: candidate.snippet,
       });
     }
 
@@ -4267,23 +4320,33 @@ function countMatches(content: string, query: string): number {
   return count;
 }
 
+/**
+ * Title, path, and phrase bonuses keep their historical shape and range. The
+ * phrase count and the content component are corpus-aware now (see
+ * lexicalRanking.ts): adjacent repeats collapse, keyword-list lines are
+ * discounted, terms are IDF-weighted over the scanned corpus, and frequency
+ * saturates with length normalization. Raw additive term frequency let a
+ * short keyword-stuffed note outrank the note that answered the query.
+ */
 function scoreMarkdownSearchResult({
   file,
-  content,
   query,
   queryTerms,
+  phraseCount,
+  documentStats,
+  corpus,
 }: {
   file: TFile;
-  content: string;
   query: string;
   queryTerms: string[];
+  phraseCount: number;
+  documentStats: LexicalDocumentTermStatsV1;
+  corpus: LexicalCorpusStatsV1;
 }): { score: number; reasons: string[] } {
   const reasons: string[] = [];
   let score = 0;
-  const contentLower = content.toLowerCase();
   const titleLower = file.basename.toLowerCase();
   const pathLower = file.path.toLowerCase();
-  const phraseMatches = countMatches(content, query);
 
   if (titleLower === query || pathLower === query) {
     score += 120;
@@ -4293,14 +4356,13 @@ function scoreMarkdownSearchResult({
     reasons.push("path_or_title_match");
   }
 
-  if (phraseMatches > 0) {
-    score += Math.min(80, phraseMatches * 16);
+  if (phraseCount > 0) {
+    score += Math.min(80, Math.round(phraseCount * 16));
     reasons.push("phrase_match");
   }
 
   let titleTermMatches = 0;
   let pathTermMatches = 0;
-  let bodyTermMatches = 0;
 
   for (const term of queryTerms) {
     if (titleLower.includes(term)) {
@@ -4309,10 +4371,6 @@ function scoreMarkdownSearchResult({
 
     if (pathLower.includes(term)) {
       pathTermMatches += 1;
-    }
-
-    if (contentLower.includes(term)) {
-      bodyTermMatches += countTermOccurrences(contentLower, term);
     }
   }
 
@@ -4326,9 +4384,16 @@ function scoreMarkdownSearchResult({
     reasons.push("path_terms");
   }
 
-  if (bodyTermMatches > 0) {
-    score += Math.min(50, bodyTermMatches * 4);
+  const contentScore = bm25ContentScoreV1(documentStats, corpus);
+  if (contentScore > 0) {
+    score += Math.round(contentScore);
     reasons.push("content_terms");
+  }
+
+  const coverageBonus = queryCoverageBonusV1(documentStats, queryTerms.length);
+  if (coverageBonus > 0) {
+    score += coverageBonus;
+    reasons.push("query_coverage");
   }
 
   return {

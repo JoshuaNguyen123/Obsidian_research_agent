@@ -1,5 +1,5 @@
 import type { App, TFile } from "obsidian";
-import { cosineSimilarity, normalizeCosine } from "../utils/vectorMath";
+import { cosineSimilarity, normalizeCosine, cosineSimilarityAt, vectorNorm } from "../utils/vectorMath";
 import type { AgentSettings } from "../settings";
 import {
   embeddingPrefixFingerprintV1,
@@ -102,9 +102,34 @@ interface CachedSemanticShard {
   mtime: number;
   size: number;
   shard: SemanticIndexShardV2;
+  /**
+   * The shard's vectors decoded once per (mtime, size). The base64 payload
+   * used to be decoded on EVERY query for EVERY shard into boxed number[]
+   * (eight bytes per element plus a full spread); the typed array is decoded
+   * lazily on the first search that touches the shard and reused until the
+   * file changes.
+   */
+  vectors?: Float32Array;
 }
 
 const semanticShardReadCache = new Map<string, CachedSemanticShard>();
+
+/** Drop every cached shard (called on plugin unload and after a rebuild). */
+export function clearSemanticShardReadCache(): void {
+  semanticShardReadCache.clear();
+}
+
+function resolveShardVectors(path: string, shard: SemanticIndexShardV2): Float32Array {
+  const cached = semanticShardReadCache.get(path);
+  if (cached && cached.shard === shard && cached.vectors) {
+    return cached.vectors;
+  }
+  const vectors = decodeFloat32Base64Typed(shard.vectorsBase64);
+  if (cached && cached.shard === shard) {
+    cached.vectors = vectors;
+  }
+  return vectors;
+}
 
 export function createSemanticIndexService(
   options: SemanticIndexServiceOptions,
@@ -795,6 +820,28 @@ function encodeFloat32Base64(values: number[]): string {
   return buffer ? buffer.from(bytes).toString("base64") : "";
 }
 
+/** Typed decode: the row-major matrix as one Float32Array, no boxing. */
+export function decodeFloat32Base64Typed(value: string): Float32Array {
+  if (typeof atob === "function") {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return new Float32Array(bytes.buffer, 0, Math.floor(bytes.byteLength / 4));
+  }
+  const buffer = (globalThis as unknown as {
+    Buffer?: { from: (value: string, encoding: string) => Uint8Array };
+  }).Buffer;
+  if (!buffer) {
+    return new Float32Array(0);
+  }
+  const bytes = buffer.from(value, "base64");
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return new Float32Array(copy.buffer, 0, Math.floor(copy.byteLength / 4));
+}
+
 function decodeFloat32Base64(value: string): number[] {
   let binary = "";
   if (typeof atob === "function") {
@@ -1003,6 +1050,8 @@ async function searchIndexShards({
   let decodeMs = 0;
   let scoreMs = 0;
   const noteByPath = new Map(index.notes.map((note) => [note.path, note]));
+  const queryTyped = Float32Array.from(queryVector);
+  const queryNorm = vectorNorm(queryTyped);
 
   for (const ref of index.shards) {
     const shard = await readIndexShard(app, ref.path);
@@ -1010,7 +1059,8 @@ async function searchIndexShards({
       continue;
     }
     const decodeStartedAt = Date.now();
-    const vectors = decodeFloat32Base64(shard.vectorsBase64);
+    // Decoded once per shard file version and reused across queries.
+    const vectors = resolveShardVectors(ref.path, shard);
     decodeMs += Math.max(0, Date.now() - decodeStartedAt);
     const scoreStartedAt = Date.now();
     for (let rowIndex = 0; rowIndex < shard.rows.length; rowIndex += 1) {
@@ -1018,13 +1068,14 @@ async function searchIndexShards({
       if (folder && !row.notePath.startsWith(`${folder}/`)) {
         continue;
       }
-      const vector = vectors.slice(rowIndex * index.dim, rowIndex * index.dim + index.dim);
       const note = noteByPath.get(row.notePath);
       if (!note) {
         continue;
       }
       candidateCount += 1;
-      const semanticScore = normalizeCosine(cosineSimilarity(queryVector, vector));
+      const semanticScore = normalizeCosine(
+        cosineSimilarityAt(vectors, rowIndex * index.dim, index.dim, queryTyped, queryNorm),
+      );
       const lexicalScore = lexicalScoreForRow(note, row, queryTerms);
       const graphScore = graphScoreFor(graphPrior ?? null, row.notePath);
       const score = blendSemanticScore(semanticScore, lexicalScore.score, graphScore);
