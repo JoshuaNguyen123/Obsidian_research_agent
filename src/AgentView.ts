@@ -111,6 +111,11 @@ import {
   type TeamRoleStripPhase,
 } from "./ui/agentViewCopy";
 import {
+  continuationDecisionFromCompleteEvent,
+  continuationSuppressionSentence,
+  type ContinuationSuppressionDecision,
+} from "./ui/continuationSuppressionCopy";
+import {
   blockedSummaryFromFactsV1,
   buildRunFailureEvidenceV1,
   isRunFailureDiagnosticTraceV1,
@@ -209,6 +214,12 @@ export class AgentView extends ItemView {
   private steeringButtonEl: HTMLButtonElement | null = null;
   private steeringStatusEl: HTMLElement | null = null;
   private continueButtonEl: HTMLButtonElement | null = null;
+  private continueSuppressionEl: HTMLElement | null = null;
+  /**
+   * Last auto-continuation decision the view received. Runner on this branch
+   * may omit `autoContinuation.suppressionReason`; read via optional chaining.
+   */
+  private lastAutoContinuation: ContinuationSuppressionDecision | null = null;
   private chatOnlyToggleEl: HTMLInputElement | null = null;
   private clearButtonEl: HTMLButtonElement | null = null;
   private tabsEl: HTMLElement | null = null;
@@ -1035,6 +1046,14 @@ export class AgentView extends ItemView {
       },
     });
     this.continueButtonEl.hidden = true;
+    this.continueSuppressionEl = actionsEl.createDiv({
+      cls: "agentic-researcher-continuation-suppression",
+      attr: {
+        "data-testid": "chat-continue-suppression",
+        "aria-live": "polite",
+      },
+    });
+    this.continueSuppressionEl.hidden = true;
 
     const secondaryOptionsEl = actionsEl.createEl("details", {
       cls: "agentic-researcher-composer-options",
@@ -2720,6 +2739,8 @@ export class AgentView extends ItemView {
     if (event.autonomyStats) {
       this.setAutonomyRunStats(event.autonomyStats);
     }
+    this.lastAutoContinuation = continuationDecisionFromCompleteEvent(event);
+    this.refreshContinuationSuppressionCopy();
     this.clearChatAttention();
     this.setRunDetailsNeedsAttention(false);
     const missionStop = fromAgentRunStopReason(
@@ -3675,6 +3696,7 @@ export class AgentView extends ItemView {
     }
 
     this.renderContinuationAction(this.modelConfigEl, ledger);
+    this.renderContinuationSuppressionLine(this.modelConfigEl);
     this.refreshChatContinuationAction();
   }
 
@@ -3754,6 +3776,34 @@ export class AgentView extends ItemView {
     this.continueButtonEl.setAttribute("aria-label", "Continue Latest Run");
     this.continueButtonEl.title =
       available && ledger ? `Continue latest run ${ledger.runId}` : "";
+    this.refreshContinuationSuppressionCopy();
+  }
+
+  private refreshContinuationSuppressionCopy(): void {
+    const sentence = continuationSuppressionSentence(this.lastAutoContinuation);
+    const el = this.continueSuppressionEl;
+    if (!el) {
+      return;
+    }
+    if (!sentence) {
+      el.hidden = true;
+      el.setText("");
+      return;
+    }
+    el.hidden = false;
+    el.setText(sentence);
+  }
+
+  private renderContinuationSuppressionLine(container: HTMLElement): void {
+    const sentence = continuationSuppressionSentence(this.lastAutoContinuation);
+    if (!sentence) {
+      return;
+    }
+    container.createDiv({
+      text: sentence,
+      cls: "agentic-researcher-continuation-suppression",
+      attr: { "data-testid": "details-continue-suppression" },
+    });
   }
 
   private renderPersistedMissionConfig(ledger: MissionLedgerSummary): void {
@@ -3778,6 +3828,7 @@ export class AgentView extends ItemView {
       });
     }
     this.renderContinuationAction(this.modelConfigEl, ledger);
+    this.renderContinuationSuppressionLine(this.modelConfigEl);
   }
 
   private renderMissionGraph() {
@@ -4261,6 +4312,8 @@ export class AgentView extends ItemView {
     this.isRunning = isRunning;
     if (isRunning) {
       this.setClearConfirmPending(false);
+      this.lastAutoContinuation = null;
+      this.refreshContinuationSuppressionCopy();
     }
     this.contentEl.classList.toggle("is-running", isRunning);
     this.contentEl.setAttribute("aria-busy", String(isRunning));
@@ -5787,6 +5840,14 @@ export class AgentView extends ItemView {
       text: `Next: ${copy.next}`,
       cls: "agentic-researcher-chat-attention-body",
     });
+    const suppression = continuationSuppressionSentence(this.lastAutoContinuation);
+    if (suppression) {
+      banner.createDiv({
+        text: suppression,
+        cls: "agentic-researcher-continuation-suppression",
+        attr: { "data-testid": "chat-blocked-continue-suppression" },
+      });
+    }
     const controls = banner.createDiv({
       cls: "agentic-researcher-chat-attention-controls",
     });
