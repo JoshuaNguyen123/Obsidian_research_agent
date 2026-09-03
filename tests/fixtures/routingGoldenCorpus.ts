@@ -63,19 +63,17 @@ export const FULL_DESKTOP_LADDER = [
  * History: 14/21 measured 2026-07-25 before any routing change; 61/62 after
  * the deterministic tier landed (write-as-execution, "make" verb, how-to and
  * conversational-revision guards, write-a-note guards, and fuzzy typo
- * rescue). The one open miss is
- * guard-desk-notes, whose route false-positive lives in the shared design
- * gate (`codeDesignIntent.ts` DESIGN_INTENT matching topical "game design");
- * narrowing it risks real design missions, so it waits for the semantic
- * shadow tier evidence. 64/65 after the executable-notebook deliverable
- * predicate landed (notebook-execution-live lane prompt, fast-path deferral,
- * and the jupyter-reflection guard all pass). 66/67 after Genesis-shaped
- * STEM research notes ("cite at least N scholarly sources" + stream to page)
- * were pinned as persist / grounded_workflow with no code ladder.
- * 67/68 after "Write me brief about dfs and bfs in python" stopped matching
- * the write…python code-deliverable arm and stayed a streamed note brief.
+ * rescue). 64/65 after the executable-notebook deliverable predicate landed
+ * (notebook-execution-live lane prompt, fast-path deferral, and the
+ * jupyter-reflection guard all pass). 66/67 after Genesis-shaped STEM
+ * research notes ("cite at least N scholarly sources" + stream to page) were
+ * pinned as persist / grounded_workflow with no code ladder. 67/68 after
+ * "Write me brief about dfs and bfs in python" stopped matching the
+ * write…python code-deliverable arm and stayed a streamed note brief. 68/68
+ * after topical "game design" in a write-notes prompt stopped granting
+ * design capability (research-topic prose containment).
  */
-export const ROUTING_BASELINE_ACCURACY = 67 / 68;
+export const ROUTING_BASELINE_ACCURACY = 68 / 68;
 
 export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
   // --- The two live-reported desktop prompts and near variants ---
@@ -197,12 +195,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       route: "single_model_answer",
       requiredCodeToolNames: [],
     },
-    current: {
-      // Shared DESIGN_INTENT gate false-fires on the topical phrase "game
-      // design"; the code ladder is already clean for this prompt.
-      route: "grounded_workflow",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
     id: "guard-haiku",

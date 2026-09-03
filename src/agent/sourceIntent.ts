@@ -24,7 +24,7 @@ export function withoutCodeSourceArtifactsV1(prompt: string): string {
 }
 
 const FETCHED_WEB_SOURCE_LANGUAGE =
-  /\b(?:cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?)|cite(?:d)?\s+at\s+least\b[\s\S]{0,60}\bsources?|(?:scholarly|academic|peer[-\s]?reviewed)\s+(?:and\s+(?:academic|scholarly)\s+)?sources?|cite(?:s|d)?\s+(?:your|my|our|the|its)\s+sources?|(?:include|add|provide|list|give|attach)\s+(?:your\s+|the\s+|my\s+|our\s+)?sources?|back\s+(?:this|it|that|me)\s+up\s+with\s+sources?|(?:with|using)\s+(?:your\s+|the\s+|my\s+|our\s+)?(?:cited\s+)?sources?)\b/i;
+  /\b(?:cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?)|cite(?:d)?\s+at\s+least\b[\s\S]{0,60}\bsources?|(?:scholarly|academic|peer[-\s]?reviewed)\s+(?:and\s+(?:academic|scholarly)\s+)?sources?|cite(?:s|d)?\s+(?:your|my|our|the|its)\s+sources?|(?:include|add|provide|list|give|attach)\s+(?:your\s+|the\s+|my\s+|our\s+)?sources?|back\s+(?:this|it|that|me)\s+up\s+with\s+sources?|(?:with|using)\s+(?:(?:your|my|our|the|its|cited|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:cited\s+)?sources?|(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+sources?)\b/i;
 
 const PUBLIC_WEB_LANGUAGE =
   /https?:\/\/|\b(?:web|online|internet)\b/iu;

@@ -18,6 +18,7 @@ const PARAPHRASE_SOURCE_PROMPTS = [
   "Write a 1000 word essay on photosynthesis. Cite your sources.",
   "Write a 1000 word essay on photosynthesis. Include sources.",
   "Write a 1000 word essay on photosynthesis. Back this up with sources.",
+  "Write a 1000 word essay on photosynthesis using four sources.",
 ] as const;
 
 const STATIC_GEN_NO_SOURCES =
