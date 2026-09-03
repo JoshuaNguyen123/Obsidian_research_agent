@@ -8,6 +8,7 @@ import {
   parseSupportedSettingsSchemaVersion,
   SETTINGS_SCHEMA_VERSION,
 } from "../src/agent/settingsNormalize";
+import { DEFAULT_STREAM_REQUEST_TIMEOUT_MS } from "../src/model/requestTimeoutDefaults";
 import {
   allocateUniqueMarkdownPath,
 } from "../src/agent/placeholderNoteTitle";
@@ -31,7 +32,8 @@ describe("settingsNormalize", () => {
     assert.equal(settings.speechActSemanticRescueMode, "off");
     assert.equal(settings.modelRouterMode, "authority");
     assert.equal(settings.modelRouterEnabled, true);
-    assert.equal(settings.model, "deepseek-v4-pro");
+    assert.equal(settings.model, "glm-5.3-flash:cloud");
+    assert.equal(settings.requestTimeoutMs, DEFAULT_STREAM_REQUEST_TIMEOUT_MS);
     assert.equal(settings.specialistEnabled, true);
     assert.equal(settings.specialistConnectionMode, "shared_primary");
     assert.equal(settings.specialistModel, "");
@@ -107,6 +109,14 @@ describe("settingsNormalize", () => {
       "existing_install",
     );
     assert.equal(settings.model, "qwen3.5:cloud");
+  });
+
+  it("does not overwrite a persisted former default model", () => {
+    const settings = normalizeAgentSettings(
+      { model: "deepseek-v4-pro" },
+      "existing_install",
+    );
+    assert.equal(settings.model, "deepseek-v4-pro");
   });
 
   it("malformed streaming flags normalize without losing credentials", () => {
