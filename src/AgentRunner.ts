@@ -1224,6 +1224,16 @@ export { buildMissionResearchSignalsV1 } from "./agent/missionResearchSignals";
 export type { RunPlan, RunRoute, SlowPathReason } from "./agent/runPlan";
 export type { AgentConversationMessage } from "./conversationHistory";
 export type { AgentMissionMode, MissionIntent } from "./tools/types";
+// WS-5 export-only: the routing corpus harness needs the same pipeline
+// AgentRunner uses to compute writeback kind and note-output destination.
+// Visibility only — no logic changes.
+export {
+  applyDefaultActiveNoteWriteback,
+  buildMissionNoteOutputPlan,
+  classifyMissionIntent,
+  getDirectCurrentNoteWritebackKind,
+  getStreamingWritebackKind,
+};
 
 export type AgentRunPhase =
   | "idle"

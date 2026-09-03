@@ -1,37 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyMissionSpeechAct } from "../src/agent/missionSpeechAct";
-import { createRunPlan } from "../src/agent/runPlan";
-import { getRequiredCodeWorkflowToolNames } from "../src/AgentRunner";
-import type { ModelToolDefinition } from "../src/model/types";
-import type { MissionIntent } from "../src/tools/types";
 import {
   ROUTING_BASELINE_ACCURACY,
   ROUTING_GOLDEN_CORPUS,
+  observeProductionRouting,
   type RoutingGoldenCaseV1,
 } from "./fixtures/routingGoldenCorpus";
 
-const CORPUS_TOOL_NAMES = [
-  "append_to_current_file",
-  "replace_current_file",
-  "search_markdown_files",
-  "web_search",
-  "web_fetch",
-  "count_words",
-  "code_sandbox_status",
-  "code_workspace_create",
-  "code_workspace_create_file",
-  "code_validate_fast",
-  "code_repair_record_cycle",
-  "code_validate_targeted",
-  "code_validate_full",
-  "code_workspace_export_directory",
-  "code_commit_verified",
-];
-
 test("golden routing corpus pins every case at its expected or recorded-current output", () => {
   for (const item of ROUTING_GOLDEN_CORPUS) {
-    const observed = observe(item);
+    const observed = observeProductionRouting({
+      prompt: item.prompt,
+      extraTools: item.extraTools,
+    });
     const wanted = resolveAssertedFields(item);
     if (wanted.speechAct !== undefined) {
       assert.equal(observed.speechAct, wanted.speechAct, label(item, "speechAct"));
@@ -51,6 +32,41 @@ test("golden routing corpus pins every case at its expected or recorded-current 
         observed.requiredCodeToolNames,
         [...wanted.requiredCodeToolNames],
         label(item, "requiredCodeToolNames"),
+      );
+    }
+    if (wanted.streamingWritebackKind !== undefined) {
+      assert.equal(
+        observed.streamingWritebackKind,
+        wanted.streamingWritebackKind,
+        label(item, "streamingWritebackKind"),
+      );
+    }
+    if (wanted.directCurrentNoteWritebackKind !== undefined) {
+      assert.equal(
+        observed.directCurrentNoteWritebackKind,
+        wanted.directCurrentNoteWritebackKind,
+        label(item, "directCurrentNoteWritebackKind"),
+      );
+    }
+    if (wanted.noteOutputDestination !== undefined) {
+      assert.equal(
+        observed.noteOutput.destination,
+        wanted.noteOutputDestination,
+        label(item, "noteOutputDestination"),
+      );
+    }
+    if (wanted.noteOutputMutation !== undefined) {
+      assert.equal(
+        observed.noteOutput.mutation,
+        wanted.noteOutputMutation,
+        label(item, "noteOutputMutation"),
+      );
+    }
+    if (wanted.noteOutputDelivery !== undefined) {
+      assert.equal(
+        observed.noteOutput.delivery,
+        wanted.noteOutputDelivery,
+        label(item, "noteOutputDelivery"),
       );
     }
     // reasonsInclude is asserted only for pass cases: it describes the
@@ -101,23 +117,31 @@ test("every known_miss case records the differing current fields", () => {
   }
 });
 
-function observe(item: RoutingGoldenCaseV1) {
-  const speech = classifyMissionSpeechAct(item.prompt);
-  const plan = createRunPlan({
-    prompt: item.prompt,
-    missionIntent: missionIntent(item.intent),
-    tools: [...CORPUS_TOOL_NAMES, ...(item.extraTools ?? [])].map(tool),
-    streamingWritebackKind: item.streamingWritebackKind ?? null,
-    directCurrentNoteWritebackKind: null,
-  });
-  return {
-    speechAct: speech.speechAct,
-    executionTier: speech.executionTier,
-    route: plan.route,
-    traceReasons: plan.traceReasons,
-    requiredCodeToolNames: getRequiredCodeWorkflowToolNames(item.prompt),
-  };
-}
+test("every corpus case pins route, writeback kind, and note-output destination", () => {
+  for (const item of ROUTING_GOLDEN_CORPUS) {
+    const wanted = resolveAssertedFields(item);
+    assert.notEqual(
+      wanted.route,
+      undefined,
+      `${item.id}: must pin route (expected or current)`,
+    );
+    assert.notEqual(
+      wanted.streamingWritebackKind,
+      undefined,
+      `${item.id}: must pin streamingWritebackKind (expected or current)`,
+    );
+    assert.notEqual(
+      wanted.directCurrentNoteWritebackKind,
+      undefined,
+      `${item.id}: must pin directCurrentNoteWritebackKind (expected or current)`,
+    );
+    assert.notEqual(
+      wanted.noteOutputDestination,
+      undefined,
+      `${item.id}: must pin noteOutputDestination (expected or current)`,
+    );
+  }
+});
 
 /** pass → assert expected; known_miss → current overrides the differing fields. */
 function resolveAssertedFields(item: RoutingGoldenCaseV1) {
@@ -128,50 +152,4 @@ function resolveAssertedFields(item: RoutingGoldenCaseV1) {
 
 function label(item: RoutingGoldenCaseV1, field: string): string {
   return `[${item.id}] ${field} (${item.status}) :: ${item.prompt}`;
-}
-
-function tool(name: string): ModelToolDefinition {
-  return {
-    type: "function",
-    function: {
-      name,
-      description: name,
-      parameters: { type: "object", properties: {} },
-    },
-  };
-}
-
-function missionIntent(overrides: Partial<MissionIntent> = {}): MissionIntent {
-  return {
-    mode: "chat_only",
-    vaultContext: false,
-    noteOutput: false,
-    explicitPersistence: false,
-    explicitMutation: false,
-    explicitDelete: false,
-    allowAutonomousWrite: false,
-    requireWriteCompletion: false,
-    autonomyScope: {
-      read: {
-        currentNote: false,
-        vault: false,
-        folders: [],
-        files: [],
-        web: false,
-      },
-      write: {
-        currentNote: false,
-        folders: [],
-        files: [],
-        artifacts: false,
-        researchMemory: false,
-      },
-      destructive: {
-        replaceCurrentNote: false,
-        deleteCurrentNote: false,
-        deletePaths: false,
-      },
-    },
-    ...overrides,
-  };
 }

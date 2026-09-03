@@ -14,7 +14,6 @@ import {
 } from "../src/agent/missionEffortDecision";
 import {
   detectExplicitActiveNoteTarget,
-  resolveNoteOutputPlan,
 } from "../src/agent/noteOutputPolicy";
 import {
   hasCurrentPageWritebackIntent,
@@ -40,28 +39,17 @@ import {
   PAGE_CLEAR_THEN_REWRITE,
   TRANSFORMER_ARCHITECTURE_RESEARCH_PROMPT,
 } from "./fixtures/domainResearchPrompts";
-
-const STREAMING_OUTPUT_INPUT = {
-  hasActiveMarkdownNote: true,
-  activeNoteIsPlaceholder: false,
-  outputProfile: "active_or_new_note" as const,
-  enableStreaming: true,
-  streamWritebackMode: "all_current_note_content_writes" as const,
-  autoTitleOnWrite: true,
-};
+import { observeProductionRouting } from "./fixtures/routingGoldenCorpus";
 
 test("STEM Genesis-shaped prompts route as streamed sourced writeback, not copy-last-reply", async () => {
   for (const item of DOMAIN_RESEARCH_CASES) {
     const { prompt, id } = item;
     const generated = analyzeGeneratedOutputPrompt(prompt);
-    const output = resolveNoteOutputPlan({
-      ...STREAMING_OUTPUT_INPUT,
-      prompt,
-    });
+    const observed = observeProductionRouting({ prompt });
     const effort = resolveMissionEffortDecisionV1({
       prompt,
-      route: "grounded_workflow",
-      outputTarget: output.destination,
+      route: observed.route,
+      outputTarget: observed.noteOutput.destination,
     });
     const team = await resolveAdaptiveTeamDispatchV2({
       prompt,
@@ -90,9 +78,17 @@ test("STEM Genesis-shaped prompts route as streamed sourced writeback, not copy-
     assert.equal(generated.wordTarget?.target, 1000, id);
     assert.notEqual(generated.kind, "diagram", id);
 
-    assert.equal(output.destination, "active_note", id);
-    assert.equal(output.mutation, "append", id);
-    assert.equal(output.delivery, "stream", id);
+    assert.equal(observed.route, "grounded_workflow", id);
+    assert.equal(observed.streamingWritebackKind, "append", id);
+    // known_miss WS-2: title+stream should dest active_note, mutation append,
+    // delivery stream after rename. This base sets specializedRoute via
+    // hasTitleIntent, so production destination is chat.
+    assert.equal(
+      observed.noteOutput.destination,
+      "chat",
+      `${id} known_miss WS-2: target dest is active_note append/stream after rename`,
+    );
+    assert.equal(observed.noteOutput.reason, "specialized_route", id);
 
     assert.equal(effort.profile, "grounded_research", id);
     assert.equal(effort.researchDepth, "grounded", id);
@@ -110,10 +106,7 @@ test("compact live STEM prompts keep the same sourced stream-to-page contract", 
   for (const item of DOMAIN_RESEARCH_CASES) {
     const prompt = compactDomainResearchPrompt(item.topic, "e2e-marker");
     const generated = analyzeGeneratedOutputPrompt(prompt);
-    const output = resolveNoteOutputPlan({
-      ...STREAMING_OUTPUT_INPUT,
-      prompt,
-    });
+    const observed = observeProductionRouting({ prompt });
     const team = await resolveAdaptiveTeamDispatchV2({
       prompt,
       orchestratorEnabled: true,
@@ -128,9 +121,13 @@ test("compact live STEM prompts keep the same sourced stream-to-page contract", 
     assert.equal(generated.requiresGrounding, true, item.id);
     assert.equal(generated.target, "current_note_append", item.id);
     assert.equal(generated.wordTarget?.target, 150, item.id);
-    assert.equal(output.destination, "active_note", item.id);
-    assert.equal(output.mutation, "append", item.id);
-    assert.equal(output.delivery, "stream", item.id);
+    // Same title-clause known_miss as the full Genesis shape. WS-2 flips dest
+    // to active_note / append / stream after rename.
+    assert.equal(
+      observed.noteOutput.destination,
+      "chat",
+      `${item.id} known_miss WS-2: target dest is active_note`,
+    );
     assert.equal(team.useTeam, true, item.id);
     assert.ok(team.specialistModes.includes("researcher"), item.id);
   }
@@ -139,11 +136,16 @@ test("compact live STEM prompts keep the same sourced stream-to-page contract", 
 test("transformer architecture research note does not grant a design deliverable", () => {
   const prompt = TRANSFORMER_ARCHITECTURE_RESEARCH_PROMPT;
   const generated = analyzeGeneratedOutputPrompt(prompt);
+  const observed = observeProductionRouting({ prompt });
   assert.equal(missionGrantsDesignCapability(prompt), false);
   assert.notEqual(generated.kind, "diagram");
   assert.equal(generated.requiresGrounding, true);
   assert.equal(hasFetchedWebSourceIntent(prompt), true);
   assert.equal(hasWebSearchIntent(prompt), true);
+  // Production-shaped observe still routes grounded_workflow; dest is chat
+  // because the Genesis title clause sets specializedRoute (WS-2).
+  assert.equal(observed.route, "grounded_workflow");
+  assert.equal(observed.noteOutput.destination, "chat");
 });
 
 test("cite-at-least scholarly sources is fetched-web intent; literary book citations are not", () => {
@@ -186,11 +188,9 @@ test("page-clear follow-ups after a STEM draft replace the page instead of appen
       kind: "replace_current_note",
       reason: "clear_then_write",
     });
-    const output = resolveNoteOutputPlan({
-      ...STREAMING_OUTPUT_INPUT,
-      prompt,
-    });
-    assert.equal(output.destination, "active_note", prompt);
-    assert.equal(output.mutation, "replace", prompt);
+    const observed = observeProductionRouting({ prompt });
+    assert.equal(observed.noteOutput.destination, "active_note", prompt);
+    assert.equal(observed.noteOutput.mutation, "replace", prompt);
+    assert.equal(observed.streamingWritebackKind, "replace", prompt);
   }
 });

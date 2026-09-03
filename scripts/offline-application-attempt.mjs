@@ -1,6 +1,17 @@
-export const OFFLINE_REQUIRED_SCENARIOS = Object.freeze([
+export const OFFLINE_CORE_SCENARIO_IDS = Object.freeze([
   "chat_only",
   "current_note_append",
+]);
+
+export const OFFLINE_EXPAND_SCENARIO_IDS = Object.freeze([
+  "current_note_replace_with_backup",
+  "page_clear_then_write",
+  "word_count_correction",
+  "title_rename_plus_body",
+]);
+
+export const OFFLINE_REQUIRED_SCENARIOS = Object.freeze([
+  ...OFFLINE_CORE_SCENARIO_IDS,
   "grounded_writeback",
   "vault_recall",
   "sandbox_code_delivery",
@@ -11,7 +22,20 @@ export const OFFLINE_REQUIRED_SCENARIOS = Object.freeze([
   "tool_call_recovery",
   "restart_resume",
   "capability_setup_resume",
+  ...OFFLINE_EXPAND_SCENARIO_IDS,
 ]);
+
+/** Exclusive-runner gate: only the scenarios the selected offline project writes. */
+export function offlineRequiredScenarioIdsForProjects(projects) {
+  const ids = [];
+  if ((projects ?? []).includes("offline-core")) {
+    ids.push(...OFFLINE_CORE_SCENARIO_IDS);
+  }
+  if ((projects ?? []).includes("offline-expand")) {
+    ids.push(...OFFLINE_EXPAND_SCENARIO_IDS);
+  }
+  return ids;
+}
 
 const STATUS = new Set(["passed", "failed", "blocked"]);
 const ACCEPTANCE_STATUS = new Set(["pass", "needs_more_work", "not_applicable"]);

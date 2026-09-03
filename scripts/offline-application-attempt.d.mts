@@ -31,7 +31,12 @@ export interface OfflineApplicationAttemptV1 {
   durationMs: number;
 }
 
+export const OFFLINE_CORE_SCENARIO_IDS: readonly string[];
+export const OFFLINE_EXPAND_SCENARIO_IDS: readonly string[];
 export const OFFLINE_REQUIRED_SCENARIOS: readonly string[];
+export function offlineRequiredScenarioIdsForProjects(
+  projects: readonly string[],
+): string[];
 export function validateOfflineApplicationAttempt(value: unknown): OfflineApplicationAttemptV1;
 export function offlineAttemptIsProofComplete(value: unknown): boolean;
 export function evaluateOfflineApplicationRelease(input: {

@@ -11,7 +11,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertMissionScorecardSummaryFile } from "./mission-scorecard-regression.mjs";
-import { assertOfflineApplicationAttemptSummaryFile } from "./offline-application-attempt.mjs";
+import {
+  assertOfflineApplicationAttemptSummaryFile,
+  offlineRequiredScenarioIdsForProjects,
+} from "./offline-application-attempt.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLAYWRIGHT_EXECUTION_REPORT_PATH = path.join(
@@ -62,6 +65,7 @@ export const PLAYWRIGHT_PROJECTS = new Set([
   "compound-flow-real-live",
   "github-askpass-runtime-live",
   "offline-core",
+  "offline-expand",
 ]);
 // Lanes that require an explicit disposable external-service scope. They gate
 // before the lock, build, vault sync, or Obsidian boot, so a missing credential
@@ -319,7 +323,7 @@ async function main() {
       if (aiMode === "offline") {
         const foundation = await assertOfflineApplicationAttemptSummaryFile({
           filePath: OFFLINE_ATTEMPT_SUMMARY_PATH,
-          requiredScenarioIds: ["chat_only", "current_note_append"],
+          requiredScenarioIds: offlineRequiredScenarioIdsForProjects(projects),
           requiredRepetitions: 1,
           requireCleanHead: false,
         });
@@ -829,9 +833,10 @@ export function normalizeExclusiveArgs(rawArgs) {
       "--mock-ai was removed. Every Playwright lane now calls a real model, a real external service, or both.",
     );
   }
+  const offlineAiProjects = new Set(["offline-core", "offline-expand"]);
   if (
     aiMode === "offline" &&
-    (projects.length !== 1 || projects[0] !== "offline-core")
+    (projects.length === 0 || projects.some((project) => !offlineAiProjects.has(project)))
   ) {
     throw new Error("--offline-ai is restricted to the offline-core Playwright project.");
   }
