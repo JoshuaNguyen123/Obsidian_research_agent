@@ -7,6 +7,17 @@
 # npm run check:eol-hygiene reports that drift; --fix re-checks-out the files.
 * text=auto eol=lf
 
+# Explicit text types. The wildcard above already pins checkout LF; these
+# lines make the contract visible for the files the companion-asset hasher
+# and TypeScript suite actually read. Do not renormalize from a workstream
+# branch — integration runs `git add --renormalize .` after merge.
+*.ts text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+
 # PowerShell is the one consumer that prefers CRLF on disk.
 *.ps1 text eol=crlf
 
