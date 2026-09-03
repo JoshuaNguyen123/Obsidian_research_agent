@@ -1,4 +1,5 @@
 import esbuild from "esbuild";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "process";
 import builtins from "builtin-modules";
@@ -63,6 +64,8 @@ const contexts = await Promise.all(
       logLevel: "info",
       sourcemap: production ? false : "inline",
       treeShaking: true,
+      metafile: production,
+      legalComments: production ? "none" : "inline",
       loader: {
         ".py": "text",
         ".txt": "text",
@@ -76,8 +79,23 @@ const contexts = await Promise.all(
 );
 
 if (production) {
-  await Promise.all(contexts.map((context) => context.rebuild()));
+  const results = await Promise.all(
+    contexts.map((context) => context.rebuild()),
+  );
+  await writeProductionMetafile(repoRoot, results);
   await Promise.all(contexts.map((context) => context.dispose()));
 } else {
   await Promise.all(contexts.map((context) => context.watch()));
+}
+
+async function writeProductionMetafile(root, results) {
+  const metafile = results[0]?.metafile;
+  if (!metafile) return;
+  const cacheDir = path.join(root, ".cache");
+  await mkdir(cacheDir, { recursive: true });
+  await writeFile(
+    path.join(cacheDir, "esbuild-metafile.json"),
+    JSON.stringify(metafile),
+    "utf8",
+  );
 }
