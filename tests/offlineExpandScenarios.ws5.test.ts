@@ -8,6 +8,7 @@ import {
   offlineRequiredScenarioIdsForProjects,
   validateOfflineApplicationAttempt,
 } from "../scripts/offline-application-attempt.mjs";
+// @ts-ignore The exclusive runner is an intentionally unbundled Node ESM script.
 import { PLAYWRIGHT_PROJECTS, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
 import {
   OFFLINE_EXPAND_SCENARIOS,

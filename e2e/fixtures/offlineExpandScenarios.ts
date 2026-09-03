@@ -70,7 +70,7 @@ export function renderOfflineExpandPrompt(
   scenario: OfflineExpandScenarioV1,
   marker: string,
 ): string {
-  return scenario.prompt.replaceAll("{marker}", marker);
+  return scenario.prompt.split("{marker}").join(marker);
 }
 
 export function assertOfflineExpandCatalogComplete(): void {
