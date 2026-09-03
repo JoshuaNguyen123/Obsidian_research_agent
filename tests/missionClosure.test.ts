@@ -59,7 +59,7 @@ const FORCE_FINAL_BUDGET = {
 
 test("force_final_no_tools + graph_final_only accepts a held candidate instead of a nonempty set-loose frontier", () => {
   const graph = paidWriteQueuedFinalGraph();
-  assert.equal(missionGraphOnlyFinalSynthesisRemainsV1(graph), true);
+  assert.equal(missionGraphOnlyFinalSynthesisRemainsV1(graph as never), true);
   assert.equal(
     missionGraphTerminalProjectionSealsToolFrontierV1(graph as never),
     false,

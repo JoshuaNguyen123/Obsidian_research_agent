@@ -24531,18 +24531,20 @@ export async function runAgentMission({
       const heldFinalAcceptance = lastFinalOutput.trim()
         ? evaluateCurrentAcceptance(lastFinalOutput)
         : null;
+      const hasReadyToollessFinalNode = Boolean(
+        heldFinalNode &&
+          (heldFinalNode.status === "ready" ||
+            heldFinalNode.status === "queued" ||
+            heldFinalNode.status === "running") &&
+          heldFinalNode.allowedTools.length === 0,
+      );
       if (
         shouldAcceptHeldFinalProjectionCandidateV1({
           loopAction: loopDecision.action,
           graphFinalOnly: missionGraphFinalSynthesisOnly,
           heldCandidate: lastFinalOutput,
           acceptanceMissing: heldFinalAcceptance?.missing ?? [],
-          hasReadyToollessFinalNode:
-            Boolean(heldFinalNode) &&
-            (heldFinalNode.status === "ready" ||
-              heldFinalNode.status === "queued" ||
-              heldFinalNode.status === "running") &&
-            heldFinalNode.allowedTools.length === 0,
+          hasReadyToollessFinalNode,
           setLooseDeliveryStillUnpaid,
           pendingRequiredWriteCount:
             pendingRequiredWriteToolsAfterToolUse.length,
