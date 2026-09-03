@@ -17594,9 +17594,11 @@ test("compound title and essay prompt retitles then streams essay content", asyn
     },
   });
 
+  // Body write stays on streamed writeback. The title clause is one sidecar
+  // rename step, not a current-note observe/tool-loop.
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "rename_current_file"],
+    ["rename_current_file"],
   );
   assert.equal(chatRequests.length, 2);
   assert.equal(streamRequests.length, 1);
