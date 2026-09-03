@@ -328,6 +328,145 @@ test("accepted web research auto-memory uses observed tool events and commits WA
   );
 });
 
+test("an explicit no-note-write prompt suppresses the host research-memory auto-save", async () => {
+  const vault = createVaultHarness();
+  const prompt =
+    "Search the web for Ollama structured outputs documentation and summarize it. Do not write or edit any note.";
+  const receipts: AgentRunReceipt[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const definitionNames = new Set([
+    "read_current_file",
+    "web_search",
+    "web_fetch",
+    "append_research_memory",
+  ]);
+  const defaultRegistry = createDefaultToolRegistry();
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      defaultRegistry
+        .getDefinitions()
+        .filter((definition) => definitionNames.has(definition.function.name)),
+    execute: async (call): Promise<ToolExecutionResult> => {
+      executedCalls.push(call);
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: [
+              {
+                title: "Ollama structured outputs",
+                url: "https://example.com/ollama-structured-outputs",
+                snippet: "Structured outputs constrain model responses to a schema.",
+              },
+            ],
+          },
+        };
+      }
+      if (call.name === "web_fetch") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            title: "Ollama structured outputs",
+            url: "https://example.com/ollama-structured-outputs",
+            content:
+              "Ollama structured outputs constrain model responses to a supplied JSON schema and make typed application integration more reliable.",
+            links: [],
+          },
+        };
+      }
+      if (call.name === "append_research_memory") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            path: "Agent Research Memory/ollama-structured-outputs.md",
+            operation: "create",
+            topic: call.arguments.topic,
+            bytesWritten: String(call.arguments.text ?? "").length,
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: { path: "Current.md", content: "Initial note" },
+      };
+    },
+  };
+  let modelStep = 0;
+  const client: ModelClient = {
+    async chat(request) {
+      if (modelStep === 0) {
+        modelStep += 1;
+        return responseWithToolCall("web_search", {
+          query: "Ollama structured outputs documentation",
+        });
+      }
+      if (modelStep === 1) {
+        modelStep += 1;
+        return responseWithToolCall("web_fetch", {
+          url: "https://example.com/ollama-structured-outputs",
+        });
+      }
+      modelStep += 1;
+      const passageId = getPassageCitationIds(request)[0];
+      return responseWithContent(
+        [
+          "Ollama structured outputs constrain responses to a JSON schema.",
+          "Source: https://example.com/ollama-structured-outputs",
+          ...(passageId ? [`Passage evidence: [${passageId}]`] : []),
+          "Limitations: this focused source does not compare every provider.",
+          "Confidence: high.",
+        ].join("\n"),
+      );
+    },
+    async streamChat(request, events: ModelChatStreamEvents = {}) {
+      const response = await this.chat(request);
+      events.onContentDelta?.(response.message.content);
+      return response;
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  const errorTraces = traces
+    .filter((event) => event.kind === "error")
+    .map((event) => `${event.id}: ${event.message}`)
+    .join(" | ");
+  assert.equal(completions.length, 1);
+  assert.equal(
+    completions[0].stopReason,
+    "final",
+    `the research answer itself still completes; only the note write is refused. errors: ${errorTraces}`,
+  );
+  assert.ok(
+    executedCalls.some((call) => call.name === "web_fetch"),
+    "web research still runs for a chat-only answer",
+  );
+  assert.deepEqual(
+    executedCalls.filter((call) => call.name === "append_research_memory"),
+    [],
+    "the host must not auto-save research memory when the user refused every note write",
+  );
+  assert.deepEqual(receipts, [], "a refused note write leaves no receipt");
+  assert.equal(vault.files.get("Current.md"), "Initial note");
+});
+
 test("required WAL persistence failure stops before mutation with a resumable error", async () => {
   let blockedWalWrite = false;
   let runArtifactWritesAfterAmbiguity = 0;

@@ -2474,6 +2474,17 @@ export async function runAgentMission({
   ) {
     missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
   }
+  /**
+   * One answer for "may this run auto-save research memory?", read by the
+   * planner (the post-acceptance memory node) and by the post-acceptance
+   * auto-save itself, so they cannot disagree: a refused note write is
+   * neither planned nor performed. Agent Memory is a note, so "do not write
+   * or edit any note" covers it; a planned-but-skipped save otherwise leaves
+   * the graph owing a node and the terminal projections disagreeing.
+   */
+  const researchMemoryAutoSaveRefused = () =>
+    shouldForceCurrentPromptChatOnly() ||
+    hasExplicitNoNoteWriteIntent(activeIntentPrompt);
   const modelRouterMode = resolveModelRouterMode(toolContext.settings);
   const routedCodeProposalEnabled =
     toolContext.settings?.speechActSemanticRescueMode === "authority" &&
@@ -4852,6 +4863,7 @@ export async function runAgentMission({
           });
         const postAcceptanceToolNames =
           runToolContext.settings?.researchMemoryEnabled === true &&
+          !researchMemoryAutoSaveRefused() &&
           !proofBoundProviderLifecycle &&
           hasWebSearchIntent(activeIntentPrompt) &&
           !missionIntent.requireWriteCompletion &&
@@ -9416,6 +9428,10 @@ export async function runAgentMission({
   ) => {
     if (
       runPlan.executionTier === "direct_chat" ||
+      // DU-02's read-only cache check went red because this auto-save
+      // produced the one receipt the user had ruled out; the planner seat
+      // above reads the same predicate.
+      researchMemoryAutoSaveRefused() ||
       acceptance.status !== "pass" ||
       stopReason !== "final" ||
       runToolContext.settings?.researchMemoryEnabled !== true ||
