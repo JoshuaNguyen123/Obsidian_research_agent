@@ -2,9 +2,13 @@ import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import { resetAgentSettingsKeepingConnectionsV1 } from "./agent/settingsNormalize";
 import {
   findEmbeddingModelSpecV1,
+  listEmbeddingModelChoicesV1,
   normalizeEmbeddingDimSettingV1,
   resolveEffectiveEmbeddingDimV1,
 } from "./embeddings/embeddingModelCatalogV1";
+
+/** Dropdown value meaning "type a model id the catalogue does not know". */
+const CUSTOM_EMBEDDING_MODEL_OPTION = "__custom__";
 import type AgenticResearcherPlugin from "../main";
 import type { EmbeddingProbeResultV1 } from "./embeddings/embeddingProbe";
 import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
@@ -2062,12 +2066,13 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Semantic tuning")
       .setDesc(
-        "Balanced suits most vaults. Thorough uses larger chunks and a much bigger index ceiling for large vaults. Custom values exposes every individual setting.",
+        "Balanced suits most vaults. Fast indexes about three times quicker with a smaller model and shorter chunks (rebuilds the index once when chosen). Thorough uses larger chunks and a much bigger index ceiling for large vaults. Custom values exposes every individual setting.",
       )
       .addDropdown((dropdown) =>
         dropdown
           .addOptions({
             balanced: "Balanced",
+            fast: "Fast",
             thorough: "Thorough",
             custom: "Custom values",
           })
@@ -2094,23 +2099,51 @@ export class AgentSettingTab extends PluginSettingTab {
         ? section
         : document.createElement("div");
 
-    new Setting(semanticHost)
+    // The catalogue names what each model costs and produces; a free-text id
+    // stays possible for a model the catalogue does not know, and the probe
+    // then checks it. The row's description states the last measured runtime
+    // result, not the setting: a setting that says "on" while every search
+    // silently falls back to keyword matching is how that failure stayed
+    // invisible.
+    const currentModel = this.plugin.settings.semanticEmbeddingModel;
+    const currentSpec = findEmbeddingModelSpecV1(currentModel);
+    const modelSetting = new Setting(semanticHost)
       .setName("Semantic embedding model")
-      // The row states the last measured runtime result, not the setting. A
-      // setting that says "on" while every search silently falls back to
-      // keyword matching is how this failure stayed invisible.
-      .setDesc(describeEmbeddingProbe(this.plugin.lastEmbeddingProbe))
-      .addText((text) =>
+      .setDesc(
+        `${currentSpec ? `${currentSpec.summary} ` : "Model id not in the catalogue; the probe verifies its width. "}${describeEmbeddingProbe(this.plugin.lastEmbeddingProbe)}`,
+      )
+      .addDropdown((dropdown) => {
+        for (const spec of listEmbeddingModelChoicesV1()) {
+          dropdown.addOption(spec.id, `${spec.id} · ${spec.tier} · ${spec.sizeMb} MB`);
+        }
+        dropdown.addOption(CUSTOM_EMBEDDING_MODEL_OPTION, "Custom model id…");
+        dropdown
+          .setValue(currentSpec ? currentSpec.id : CUSTOM_EMBEDDING_MODEL_OPTION)
+          .onChange(async (value) => {
+            if (value === CUSTOM_EMBEDDING_MODEL_OPTION) {
+              this.plugin.settings.semanticEmbeddingModel = currentSpec
+                ? ""
+                : this.plugin.settings.semanticEmbeddingModel;
+            } else {
+              this.plugin.settings.semanticEmbeddingModel = value;
+            }
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen("agentic-settings-research-sources");
+          });
+      });
+    if (!currentSpec) {
+      modelSetting.addText((text) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS.semanticEmbeddingModel)
-          .setValue(this.plugin.settings.semanticEmbeddingModel)
+          .setValue(currentModel)
           .onChange(async (value) => {
             this.plugin.settings.semanticEmbeddingModel =
               value.trim() || DEFAULT_SETTINGS.semanticEmbeddingModel;
             await this.plugin.saveSettings();
           }),
-      )
-      .addButton((button) =>
+      );
+    }
+    modelSetting.addButton((button) =>
         button
           .setButtonText(
             this.plugin.embeddingProbeInFlight ? "Testing..." : "Test embedder",
@@ -3894,7 +3927,9 @@ function describeEmbeddingProbe(
     return "FastEmbed model used for semantic_search_notes. Not yet tested — press Test embedder to check the runtime actually works.";
   }
   return probe.ok
-    ? `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms.`
+    ? probe.throughput
+      ? `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms for one document, about ${probe.throughput.perSecond} documents/s on this machine.`
+      : `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms.`
     : probe.setupAction
       ? `Not working: ${probe.message} ${probe.setupAction}`
       : `Not working: ${probe.message}`;

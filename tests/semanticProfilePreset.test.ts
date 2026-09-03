@@ -63,3 +63,18 @@ test("chunk bounds stay internally coherent in every preset", () => {
     );
   }
 });
+
+test("fast trades the model and chunk size for indexing speed, on the benchmark's numbers", () => {
+  // docs/eval/embedder-benchmark.md (2026-09-03): jina-v2-small at a 256-token
+  // target indexed 31 chunks/s vs nomic's 10.7 with 1.00 MRR on both query
+  // sets. The preset exists so a user can take that without touching eight
+  // individual settings; it is not the default because choosing it rebuilds
+  // an existing index once.
+  const fast = SEMANTIC_PROFILE_PRESETS.fast;
+  assert.equal(fast.semanticEmbeddingModel, "jinaai/jina-embeddings-v2-small-en");
+  assert.equal(fast.semanticEmbeddingDim, 512);
+  assert.ok(
+    fast.semanticChunkTargetTokens < SEMANTIC_PROFILE_PRESETS.balanced.semanticChunkTargetTokens,
+  );
+  assert.equal(fast.semanticIndexMaxFiles, SEMANTIC_PROFILE_PRESETS.balanced.semanticIndexMaxFiles);
+});

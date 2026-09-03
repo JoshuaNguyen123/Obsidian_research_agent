@@ -54,6 +54,9 @@ import { createModelLatencyTracker } from "./src/model/modelLatencyTracker";
 import { probeToolCallBehavior } from "./src/model/toolCallBehavioralProbe";
 import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
 import { normalizeEmbeddingDimSettingV1 } from "./src/embeddings/embeddingModelCatalogV1";
+
+/** Startup embedder check waits this long after layout-ready so it never competes with load. */
+const STARTUP_EMBEDDER_CHECK_DELAY_MS = 20_000;
 import {
   clearSemanticShardReadCache,
   createSemanticIndexService,
@@ -63,6 +66,7 @@ import {
 import type { SemanticIndexService } from "./src/embeddings/semanticIndexTypes";
 import {
   formatEmbeddingProbeResultV1,
+  buildEmbeddingThroughputSampleV1,
   probeEmbeddingProviderV1,
   type EmbeddingProbeResultV1,
 } from "./src/embeddings/embeddingProbe";
@@ -1330,6 +1334,48 @@ export default class AgenticResearcherPlugin extends Plugin {
     for (const task of onloadTasksForPhase("layout_ready")) {
       await this.executeDeferredOnloadTask(task);
     }
+    this.scheduleStartupEmbedderCheck();
+  }
+
+  /**
+   * Say so at startup when semantic search is on but its runtime is not.
+   *
+   * The setting records an intent; only a probe records a fact. Without this
+   * the first sign of a missing Python or FastEmbed was a mission's degraded
+   * retrieval notice, long after the user thought semantic search was working.
+   * Delayed so it never competes with the startup path, run once per load,
+   * and only ever speaks on failure — a working runtime stays quiet (and
+   * arrives warm for the first search).
+   */
+  private scheduleStartupEmbedderCheck(): void {
+    if (!this.settings.semanticSearchEnabled || this.lastEmbeddingProbe) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void (async () => {
+        if (this.lastEmbeddingProbe || this.embeddingProbeInFlight) {
+          return;
+        }
+        try {
+          const result = await probeEmbeddingProviderV1({
+            provider: this.getSemanticEmbeddingProvider(),
+            model: this.settings.semanticEmbeddingModel,
+            dim: this.settings.semanticEmbeddingDim,
+            cacheDir: this.settings.semanticModelCacheDir || undefined,
+          });
+          this.lastEmbeddingProbe = result;
+          if (!result.ok) {
+            new Notice(
+              `Semantic search is on but its embedder is not working: ${formatEmbeddingProbeResultV1(result)} Searches fall back to keyword matching until this is fixed.`,
+              12_000,
+            );
+          }
+        } catch {
+          // A startup courtesy check must never surface as an error.
+        }
+      })();
+    }, STARTUP_EMBEDDER_CHECK_DELAY_MS);
+    this.register(() => clearTimeout(timer));
   }
 
   private async executeDeferredOnloadTask(
@@ -1774,6 +1820,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         model: this.settings.semanticEmbeddingModel,
         dim: this.settings.semanticEmbeddingDim,
         cacheDir: this.settings.semanticModelCacheDir || undefined,
+        throughputSample: buildEmbeddingThroughputSampleV1(),
       });
       this.lastEmbeddingProbe = result;
       new Notice(formatEmbeddingProbeResultV1(result));
