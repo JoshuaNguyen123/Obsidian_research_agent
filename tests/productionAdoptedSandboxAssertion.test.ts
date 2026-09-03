@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import type { Page } from "@playwright/test";
@@ -12,6 +13,8 @@ import { sandboxProbeProvenInSessionV1 } from "../e2e/fixtures/sandboxProbeSessi
  * page and a fake Code capability proves the gate itself without Obsidian, a
  * real renderer, or the real sandbox — the exact combination that made a
  * permanently unsatisfiable freshness bound look like a sandbox failure.
+ * That bound is a `harness:*` pin: the product proves once per load and does
+ * not restamp `observedAt` when it serves that proof.
  */
 
 const SESSION_STARTED_AT = Date.parse("2026-08-23T09:00:00.000Z");
@@ -147,6 +150,40 @@ test("assertProductionAdoptedSandboxV1 rejects a capability that never recorded 
     () => assertProductionAdoptedSandboxV1(page),
     /proven inside this Obsidian session/u,
   );
+});
+
+test("live code lanes do not pass a post-startup freshness instant", () => {
+  // harness:* — assertProductionAdoptedSandboxV1 used to take notBeforeMs.
+  // hello-github (and every other live code lane) passed Date.now() after
+  // startRealAiHarness, which is always later than the load-time probe the
+  // product actually runs. The gate now has one argument.
+  for (const lane of [
+    "obsidian-hello-github-live",
+    "byok-autonomous-journey",
+    "desktop-checkers-delivery-real-live",
+    "desktop-code-delivery-real-live",
+    "vault-sibling-code-delivery-real-live",
+    "daily-use-code-live",
+    "daily-use-compound",
+    "compound-flow-real-live",
+  ]) {
+    const spec = readFileSync(
+      new URL(`../e2e/${lane}.spec.ts`, import.meta.url),
+      "utf8",
+    );
+    assert.doesNotMatch(
+      spec,
+      /assertProductionAdoptedSandboxV1\(\s*[^,)]+\s*,/u,
+      `${lane} still passes a caller-supplied freshness instant`,
+    );
+  }
+  const harness = readFileSync(
+    new URL("../e2e/fixtures/realAiHarness.ts", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(harness, /notBeforeMs/u);
+  assert.match(harness, /sandboxProbeProvenInSessionV1/u);
+  assert.match(harness, /harness:\*/u);
 });
 
 test("sandboxProbeProvenInSessionV1 bounds on the session origin, never on a later instant", () => {

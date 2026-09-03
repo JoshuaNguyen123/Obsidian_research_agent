@@ -212,8 +212,9 @@ export function hostProvisionedSandboxRuntimeDigestV1(): string {
  * A lane cannot know when the plugin proved its boundary — the product does it
  * once, off the plugin-load critical path, before `startRealAiHarness` even
  * returns — so any caller-supplied instant is either redundant or, if recorded
- * after startup, permanently unsatisfiable. See
- * `sandboxProbeProvenInSessionV1`.
+ * after startup, permanently unsatisfiable. Demanding a newer
+ * `lastProbe.observedAt` after harness start is a `harness:*` pin (hello-github
+ * failed that way); this gate uses `sandboxProbeProvenInSessionV1` instead.
  */
 export async function assertProductionAdoptedSandboxV1(
   page: Page,

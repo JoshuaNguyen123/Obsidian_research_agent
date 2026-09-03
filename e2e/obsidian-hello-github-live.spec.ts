@@ -126,6 +126,9 @@ test("OBS-HELLO Obsidian prompt creates TypeScript app and private GitHub draft 
     githubOwned = await ensureGitHubConnected(harness.page, githubToken);
     // No injected provider configuration: the plugin must adopt the
     // host-provisioned binding and pass its own boundary probe.
+    // harness:* — do not pass Date.now() after startRealAiHarness. The product
+    // proves the boundary once at plugin load and serves that proof without
+    // restamping lastProbe.observedAt; the gate bounds on session origin.
     const adoptedSandbox = await assertProductionAdoptedSandboxV1(harness.page);
     expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     await expectTrustedRepositoryProfile(harness.page, PROFILE_KEY, fixture.root);
