@@ -1,3 +1,4 @@
+import { promptPrefixReuseAverageV1 } from "../src/model/modelCallEvidence";
 import { expect, test } from "@playwright/test";
 import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -837,6 +838,11 @@ test.describe("Daily-use live research contract", () => {
           // reports them). The eval CSV keeps these blank for lanes that do
           // not pass them.
           providerUsage: snapshot.providerUsage ?? null,
+          // Mean per-step prompt-prefix reuse of the phase-1 mission, read
+          // from the same aggregate (null when no step was measured).
+          promptPrefixReuseAvg: promptPrefixReuseAverageV1(
+            snapshot.providerUsage ?? null,
+          ),
         },
         { requireComplete: true },
       );

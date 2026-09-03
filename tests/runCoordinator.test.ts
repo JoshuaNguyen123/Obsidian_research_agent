@@ -1,3 +1,4 @@
+import { promptPrefixReuseAverageV1 } from "../src/model/modelCallEvidence";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RunAlreadyActiveError, RunCoordinator } from "../src/agent/runCoordinator";
@@ -1326,4 +1327,36 @@ test("a refused create-file collision replan is attested with its reason", async
   const attested = coordinator.getSnapshot().diagnosticAttestations;
   assert.equal(attested.length, 1);
   assert.equal(attested[0]?.errorCode, "create_file_collision_replan_failed");
+});
+
+test("run coordinator folds prompt-prefix reuse metrics into its usage projection", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onMetric?.({
+      kind: "run",
+      name: "prompt_prefix_reuse",
+      step: 2,
+      durationMs: 0,
+      prefixReuseRatio: 0.5,
+      prefixFirstDivergentIndex: 3,
+    });
+    events.onMetric?.({
+      kind: "run",
+      name: "prompt_prefix_reuse",
+      step: 3,
+      durationMs: 0,
+      prefixReuseRatio: 0.9,
+      prefixFirstDivergentIndex: 5,
+    });
+    // A reuse event without a ratio and unrelated metrics leave the
+    // projection alone.
+    events.onMetric?.({ kind: "run", name: "prompt_prefix_reuse", step: 4, durationMs: 0 });
+    events.onMetric?.({ kind: "tool", name: "web_fetch", step: 4, durationMs: 12 });
+    events.onRunComplete?.({ step: 4, maxSteps: 8, stopReason: "final" });
+  });
+
+  const usage = coordinator.getSnapshot().providerUsage;
+  assert.equal(usage.promptPrefixReuseSamples, 2);
+  assert.ok(Math.abs((usage.promptPrefixReuseRatioTotal ?? 0) - 1.4) < 1e-9);
+  assert.ok(Math.abs((promptPrefixReuseAverageV1(usage) ?? 0) - 0.7) < 1e-9);
 });

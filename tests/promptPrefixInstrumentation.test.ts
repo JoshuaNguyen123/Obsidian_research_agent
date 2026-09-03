@@ -1,3 +1,7 @@
+import {
+  promptPrefixReuseAverageV1,
+  type ModelUsageAggregateV1 as UsageAggregateForPrefixTest,
+} from "../src/model/modelCallEvidence";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -125,4 +129,39 @@ test("the seeded mission-plan block carries the marker and no live state", () =>
   // Deterministic: the same bytes every time, which is what makes it a
   // cacheable prefix.
   assert.equal(block, formatMissionPlanStaticPromptV1());
+});
+
+test("usage aggregates carry prompt-prefix reuse totals through a merge and average them once", () => {
+  const base: UsageAggregateForPrefixTest = {
+    schemaVersion: 1,
+    modelCallCount: 1,
+    successfulCallCount: 1,
+    failedCallCount: 0,
+    reportedTokens: 100,
+    estimatedTokens: 0,
+    retries: 0,
+    wallClockMs: 10,
+  };
+  // Never measured stays absent, and absent reads as unknown, never as 0%.
+  const unmeasured = mergeModelUsageAggregatesV1(base, base);
+  assert.equal(unmeasured.promptPrefixReuseSamples, undefined);
+  assert.equal(unmeasured.promptPrefixReuseRatioTotal, undefined);
+  assert.equal(promptPrefixReuseAverageV1(unmeasured), null);
+  assert.equal(promptPrefixReuseAverageV1(null), null);
+  // Segments add their samples and totals; the average is one division.
+  const merged = mergeModelUsageAggregatesV1(
+    { ...base, promptPrefixReuseSamples: 2, promptPrefixReuseRatioTotal: 1.5 },
+    base,
+    { ...base, promptPrefixReuseSamples: 1, promptPrefixReuseRatioTotal: 0.9 },
+  );
+  assert.equal(merged.promptPrefixReuseSamples, 3);
+  assert.ok(Math.abs((merged.promptPrefixReuseRatioTotal ?? 0) - 2.4) < 1e-9);
+  assert.ok(Math.abs((promptPrefixReuseAverageV1(merged) ?? 0) - 0.8) < 1e-9);
+  // A half-present pair is unreadable and does not merge.
+  const half = mergeModelUsageAggregatesV1({
+    ...base,
+    promptPrefixReuseSamples: 4,
+  });
+  assert.equal(half.promptPrefixReuseSamples, undefined);
+  assert.equal(promptPrefixReuseAverageV1(half), null);
 });

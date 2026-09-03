@@ -62,6 +62,16 @@ export interface ModelUsageAggregateV1 {
    * it and normalize to absent.
    */
   cachedPromptTokens?: number;
+  /**
+   * Prompt-prefix reuse measured by the runner: how many agent steps were
+   * compared against their previous step, and the sum of their reuse ratios
+   * (0..1 each). Both absent means no step was ever measured (a single-call
+   * mission, or a ledger written before the instrument existed), which is a
+   * different fact from a measured zero. Read through
+   * `promptPrefixReuseAverageV1`; never divide by hand.
+   */
+  promptPrefixReuseSamples?: number;
+  promptPrefixReuseRatioTotal?: number;
 }
 
 export interface ObservableModelClient {
@@ -101,8 +111,47 @@ export function mergeModelUsageAggregatesV1(
       merged.cachedPromptTokens =
         (merged.cachedPromptTokens ?? 0) + segment.cachedPromptTokens;
     }
+    if (
+      typeof segment.promptPrefixReuseSamples === "number" &&
+      typeof segment.promptPrefixReuseRatioTotal === "number"
+    ) {
+      merged.promptPrefixReuseSamples =
+        (merged.promptPrefixReuseSamples ?? 0) + segment.promptPrefixReuseSamples;
+      merged.promptPrefixReuseRatioTotal =
+        (merged.promptPrefixReuseRatioTotal ?? 0) +
+        segment.promptPrefixReuseRatioTotal;
+    }
   }
   return merged;
+}
+
+/**
+ * Mean per-step prompt-prefix reuse ratio (0..1) carried by a usage
+ * aggregate, or null when no step was measured. The runner measures a step
+ * only against a previous step, so a single-call mission has no sample and
+ * must read as unknown rather than as 0% reuse.
+ */
+export function promptPrefixReuseAverageV1(
+  usage:
+    | Pick<
+        ModelUsageAggregateV1,
+        "promptPrefixReuseSamples" | "promptPrefixReuseRatioTotal"
+      >
+    | null
+    | undefined,
+): number | null {
+  const samples = usage?.promptPrefixReuseSamples;
+  const total = usage?.promptPrefixReuseRatioTotal;
+  if (
+    typeof samples !== "number" ||
+    typeof total !== "number" ||
+    !Number.isFinite(samples) ||
+    !Number.isFinite(total) ||
+    samples <= 0
+  ) {
+    return null;
+  }
+  return Math.min(1, Math.max(0, total / samples));
 }
 
 const UNKNOWN_DESCRIPTOR: ModelClientDescriptor = {

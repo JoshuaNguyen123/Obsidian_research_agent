@@ -1979,6 +1979,21 @@ function normalizeProviderUsage(value: unknown): ModelUsageAggregateV1 {
           ),
         }
       : {}),
+    // Prefix-reuse totals travel as a pair; one without the other is
+    // unreadable and normalizes to absent (unknown), never to a zero average.
+    ...(getNumber(record.promptPrefixReuseSamples) !== undefined &&
+    getNumber(record.promptPrefixReuseRatioTotal) !== undefined
+      ? {
+          promptPrefixReuseSamples: Math.max(
+            0,
+            Math.floor(getNumber(record.promptPrefixReuseSamples) ?? 0),
+          ),
+          promptPrefixReuseRatioTotal: Math.max(
+            0,
+            getNumber(record.promptPrefixReuseRatioTotal) ?? 0,
+          ),
+        }
+      : {}),
   };
 }
 

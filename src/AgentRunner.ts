@@ -2263,6 +2263,11 @@ export async function runAgentMission({
   // The previous agent step's final request messages, kept so each step can
   // measure how much of its prompt a prefix-caching provider could reuse.
   let previousStepRequestMessages: ModelChatMessage[] | null = null;
+  // Run-level prefix-reuse totals for the durable usage aggregate. The
+  // per-step metric event stays the live signal; these ride the ledger's
+  // providerUsage so continuations, Run Details, and the eval lanes read the
+  // same numbers the runner measured instead of re-deriving them.
+  const promptPrefixReuseTotals = { samples: 0, ratioTotal: 0 };
   let contextCalibration = createContextCalibration();
   let modelExecutionBudget: ModelExecutionBudgetV1 = {
     schemaVersion: 1,
@@ -2294,6 +2299,17 @@ export async function runAgentMission({
       inheritedProviderUsage,
       observableModel.getUsage(),
     );
+    // The observable client never sees the prompt geometry; the inherited
+    // aggregate may already carry an earlier segment's samples, so this
+    // segment's totals are added on top rather than replacing them.
+    if (promptPrefixReuseTotals.samples > 0) {
+      providerUsage.promptPrefixReuseSamples =
+        (providerUsage.promptPrefixReuseSamples ?? 0) +
+        promptPrefixReuseTotals.samples;
+      providerUsage.promptPrefixReuseRatioTotal =
+        (providerUsage.promptPrefixReuseRatioTotal ?? 0) +
+        promptPrefixReuseTotals.ratioTotal;
+    }
     if (missionLedger) {
       missionLedger.providerUsage = providerUsage;
     } else if (prePlanningAnchorLedger) {
@@ -20126,6 +20142,11 @@ export async function runAgentMission({
           prefixReuseRatio: prefixReuse.reuseRatio,
           prefixFirstDivergentIndex: prefixReuse.firstDivergentIndex,
         });
+        promptPrefixReuseTotals.samples += 1;
+        promptPrefixReuseTotals.ratioTotal += Math.min(
+          1,
+          Math.max(0, prefixReuse.reuseRatio),
+        );
       }
       previousStepRequestMessages = stepChatRequestBuilt.messages;
       response = await chatForAgentStep(

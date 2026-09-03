@@ -1,3 +1,4 @@
+import { promptPrefixReuseAverageV1 } from "../src/model/modelCallEvidence";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -465,6 +466,31 @@ test("an explicit no-note-write prompt suppresses the host research-memory auto-
   );
   assert.deepEqual(receipts, [], "a refused note write leaves no receipt");
   assert.equal(vault.files.get("Current.md"), "Initial note");
+
+  // The persisted ledger's usage aggregate carries the prefix-reuse samples
+  // the runner measured (web_search → web_fetch → final: at least two steps
+  // compared against a previous one), so the eval lanes and continuations
+  // read the number Run Details shows instead of re-deriving it.
+  const runNotePath = [...vault.files.keys()].find(
+    (path) =>
+      path.startsWith("Agent Runs/") &&
+      path.endsWith(".md") &&
+      !path.includes("Mission Graphs"),
+  );
+  assert.ok(runNotePath, "the run persisted its note");
+  const ledger = parseMissionLedgerFromMarkdown(
+    vault.files.get(runNotePath ?? "") ?? "",
+  );
+  assert.ok(ledger, "the run note carries a ledger");
+  assert.ok(
+    (ledger?.providerUsage?.promptPrefixReuseSamples ?? 0) >= 2,
+    `prefix-reuse samples missing from the ledger usage: ${JSON.stringify(ledger?.providerUsage)}`,
+  );
+  const average = promptPrefixReuseAverageV1(ledger?.providerUsage);
+  assert.ok(
+    average !== null && average > 0 && average <= 1,
+    `prefix-reuse average ${average}`,
+  );
 });
 
 test("required WAL persistence failure stops before mutation with a resumable error", async () => {

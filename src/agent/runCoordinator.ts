@@ -2,6 +2,7 @@ import type {
   AgentRunCompleteEvent,
   AgentRunConfigEvent,
   AgentRunEvents,
+  AgentRunMetricEvent,
   ModelCallEvidenceV1,
   ModelUsageAggregateV1,
   MissionEvidenceAttestationV1,
@@ -10,6 +11,7 @@ import type {
 } from "../AgentRunner";
 import type { MissionGraphV3 } from "../../packages/headless-runtime/src/missionGraphV3";
 import type { MissionLedgerSummary } from "./missionLedger";
+import { PROMPT_PREFIX_REUSE_METRIC_NAME_V1 } from "./runContext";
 import {
   mergeMissionScorecardObservationsV1,
   type MissionScorecardV1,
@@ -615,6 +617,23 @@ export class RunCoordinator {
             (this.providerUsage.cachedPromptTokens ?? 0) +
             evidence.cachedPromptTokens;
         }
+      }
+    } else if (key === "onMetric") {
+      const metric = args[0] as AgentRunMetricEvent | undefined;
+      // The runner folds the same per-step measurement into the durable
+      // ledger aggregate; counting the metric here keeps the coordinator's
+      // projection (Run Details, the e2e snapshot) equal to the note.
+      if (
+        metric?.kind === "run" &&
+        metric.name === PROMPT_PREFIX_REUSE_METRIC_NAME_V1 &&
+        typeof metric.prefixReuseRatio === "number" &&
+        Number.isFinite(metric.prefixReuseRatio)
+      ) {
+        this.providerUsage.promptPrefixReuseSamples =
+          (this.providerUsage.promptPrefixReuseSamples ?? 0) + 1;
+        this.providerUsage.promptPrefixReuseRatioTotal =
+          (this.providerUsage.promptPrefixReuseRatioTotal ?? 0) +
+          Math.min(1, Math.max(0, metric.prefixReuseRatio));
       }
     } else if (key === "onMissionEvidence") {
       const evidence = args[0] as MissionEvidenceAttestationV1 | undefined;
