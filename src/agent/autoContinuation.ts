@@ -120,6 +120,13 @@ export type AutoContinuationReason =
 export interface AutoContinuationDecision {
   recommended: boolean;
   reason: AutoContinuationReason;
+  /**
+   * User-readable why Continue is off. Omitted on recommended continues and
+   * on non-budget stops so existing `{ recommended, reason }` deepEquals stay
+   * stable. Hosts that need the copy should call
+   * `attachAutoContinuationSuppressionReason`.
+   */
+  suppressionReason?: string;
 }
 
 /** Ledger blocker prefix for a budget terminal that forbids its own resume. */
@@ -160,6 +167,75 @@ export function suppressedBudgetTerminalBlockerV1(input: {
   return reason
     ? `${SUPPRESSED_BUDGET_TERMINAL_BLOCKER_V1}: ${reason}`
     : SUPPRESSED_BUDGET_TERMINAL_BLOCKER_V1;
+}
+
+const AUTO_CONTINUATION_SUPPRESSION_COPY: Record<
+  AutoContinuationReason,
+  string
+> = {
+  not_budget: "Continue is off because this stop is not a budget pause.",
+  budget_exhausted: "The segment budget ran out and another segment can continue.",
+  proof_satisfied: "Continue is off because proof and acceptance are already satisfied.",
+  blocked: "Continue is off because a blocker is still open.",
+  acceptance_failed:
+    "Continue is off because acceptance failed in a way that is not safe to auto-continue.",
+  required_tool_failure: "Continue is off because a required tool failed.",
+  segment_cap: "Continue is off because the configured segment cap is spent.",
+  effect_class_blocked:
+    "Continue is off because the next tool needs a grant or approval.",
+  no_progress: "Continue is off because the last segment made no progress.",
+};
+
+/** User-readable copy for a continuation refusal. Safe to render in Chat. */
+export function formatAutoContinuationSuppressionReason(
+  reason: AutoContinuationReason,
+): string {
+  return AUTO_CONTINUATION_SUPPRESSION_COPY[reason];
+}
+
+/**
+ * Attach a user-readable `suppressionReason` when a budget-shaped stop
+ * refuses Continue. Recommended continues and non-budget stops are unchanged
+ * so existing decision deepEquals stay byte-stable.
+ */
+export function attachAutoContinuationSuppressionReason(
+  decision: AutoContinuationDecision,
+  stopReason: string,
+): AutoContinuationDecision {
+  if (decision.recommended || stopReason !== "budget") {
+    return decision;
+  }
+  if (decision.suppressionReason?.trim()) {
+    return decision;
+  }
+  return {
+    ...decision,
+    suppressionReason: formatAutoContinuationSuppressionReason(decision.reason),
+  };
+}
+
+/**
+ * First-class decision for a budget terminal that forbids its own resume.
+ * AgentRunner currently returns `{ recommended: false, reason: "not_budget" }`
+ * on `suppressAutoContinuation`; hosts should use this instead so Chat can
+ * render why Continue is off without reading a ledger blocker.
+ */
+export function suppressedBudgetContinuationDecisionV1(input: {
+  stopReason: string;
+  suppressAutoContinuation: boolean;
+  reason: string;
+}): AutoContinuationDecision | null {
+  if (input.stopReason !== "budget" || input.suppressAutoContinuation !== true) {
+    return null;
+  }
+  const detail = input.reason.trim();
+  return {
+    recommended: false,
+    reason: "blocked",
+    suppressionReason: detail
+      ? `Continue is off: ${detail}`
+      : "Continue is off: this budget stop is marked not auto-continuable.",
+  };
 }
 
 export interface AutoContinuationDecisionInput {
