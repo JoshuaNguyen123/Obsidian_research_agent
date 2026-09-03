@@ -10,7 +10,7 @@ All notable changes to Agentic Researcher are documented here.
 
 ### Fixed
 - **A busy shared provider account no longer ends the mission after three quick retries.** Rate-limit errors (HTTP 429, "too many concurrent requests") now get their own retry budget: up to seven attempts with delays growing to 30 s (about 47 s of waiting, Retry-After honored), while other transient errors keep the general budget. The status line says the provider is rate limiting and how long the wait is.
- the host's research-memory auto-save.** The post-acceptance memory save ran after any accepted research answer regardless of an explicit refusal, leaving a receipt the user had ruled out; the planner's memory node and the save now read one shared refusal predicate, so a refused write is neither planned nor performed and the run still completes normally.
+- **"Do not write or edit any note" now also stops the host's research-memory auto-save.** The post-acceptance memory save ran after any accepted research answer regardless of an explicit refusal, leaving a receipt the user had ruled out; the planner's memory node and the save now read one shared refusal predicate, so a refused write is neither planned nor performed and the run still completes normally.
 
 ### Changed
 - **Plugin load no longer reads every finished run note.** Each `Agent Runs/<runId>.md` now carries an `agentic_run_status` frontmatter property written in the same rewrite as its Runtime Snapshot, and the load-path scans read it through Obsidian's metadata cache, skipping terminal notes without a read (notes without the property, or not yet indexed, are still read). With the default retention of 200 terminal runs the immediate phase used to read and parse all of them on every launch.
