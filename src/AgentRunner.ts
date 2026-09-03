@@ -1642,6 +1642,13 @@ interface RunAgentMissionOptions {
   orchestratorSnapshot?: OrchestratorSnapshotV1;
   getOrchestratorSnapshot?: () => OrchestratorSnapshotV1 | null;
   /**
+   * Host-owned in-memory cache for this run. Continuation segments of one
+   * root mission pass a cache carried from the previous segment (see
+   * createCarriedRuntimeCacheV1) so immutable web results are not fetched
+   * again; omitted, the run starts with an empty cache exactly as before.
+   */
+  runtimeCache?: AgentRuntimeCache;
+  /**
    * Optional durable authority seam for an already user-approved background
    * mission. The runner still evaluates the exact prepared action and policy;
    * the host resolves and atomically consumes the persisted grant. Interactive
@@ -2033,6 +2040,7 @@ export async function runAgentMission({
   orchestratorContext,
   orchestratorSnapshot,
   getOrchestratorSnapshot,
+  runtimeCache: providedRuntimeCache,
   preparedActionAuthority,
   interactiveApprovals = true,
   backgroundContinuation,
@@ -2380,7 +2388,7 @@ export async function runAgentMission({
   let toolCallBudgetExhausted = false;
   let missionGraphCapacityExhausted = false;
   let toolCallBudgetNoticeEmitted = false;
-  const runtimeCache = createRuntimeCache();
+  const runtimeCache = providedRuntimeCache ?? createRuntimeCache();
   /** Compound lifecycle Bound-stage authority; refreshed on stage/approval entry. */
   let missionStageEnvelope: MissionStageEnvelopeV1 | null = null;
   let activeThink = resolveThinkingMode(toolContext.settings);

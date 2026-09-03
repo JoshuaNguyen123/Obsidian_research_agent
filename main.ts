@@ -88,6 +88,12 @@ import {
   parseSupportedSettingsSchemaVersion,
 } from "./src/agent/settingsNormalize";
 import { normalizeModelRouterMode } from "./src/agent/missionRouter";
+import { createCarriedRuntimeCacheV1 } from "./src/agent/runtimeCacheCarry";
+import {
+  buildProjectMemorySignatureV1,
+  createTrailingDebounce,
+  shouldReloadProjectMemoryV1,
+} from "./src/agent/projectMemoryReloadGate";
 import {
   planTopLevelDirectMissionGraphV1,
   resolveResearchTeamOutputTargetV1,
@@ -782,6 +788,9 @@ export interface ModelConnectionStatusV1 {
   model: string;
 }
 
+/** Trailing debounce for the note-switch project-memory reload. */
+const PROJECT_MEMORY_RELOAD_DEBOUNCE_MS = 150;
+
 export default class AgenticResearcherPlugin extends Plugin {
   private readonly coreApiHost = new CoreApiHost({
     toolNameReservations: getCoreToolNameReservations(),
@@ -1155,23 +1164,29 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.semanticIndexService = this.createSemanticIndexService();
     this.semanticIndexNeedsBootstrap = this.settings.semanticIndexEnabled;
     this.updateLastActiveMarkdownFile(this.resolveCurrentMarkdownFile());
+    // Project memory and the durable-run projection read different files
+    // and share no state; awaiting them in sequence made load pay for both.
     this.startupPhase = "loading_project_memory";
-    await this.loadProjectMemoryData();
-    this.startupPhase = "hydrating_mission_projection";
-    await this.hydrateLatestMissionRunProjection();
+    await Promise.all([
+      this.loadProjectMemoryData(),
+      (async () => {
+        this.startupPhase = "hydrating_mission_projection";
+        await this.hydrateLatestMissionRunProjection();
+      })(),
+    ]);
     await this.reconcilePersistedOrchestratorProjection();
 
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         this.updateLastActiveMarkdownFile(file);
-        void this.loadProjectMemoryData();
+        this.scheduleProjectMemoryReload();
       }),
     );
 
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", (leaf) => {
         this.updateLastActiveMarkdownFile(getMarkdownFileFromLeaf(leaf));
-        void this.loadProjectMemoryData();
+        this.scheduleProjectMemoryReload();
       }),
     );
 
@@ -1335,6 +1350,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   onunload() {
+    this.projectMemoryReload.cancel();
     this.unloading = true;
     const activeLinearOAuthLoopback = this.activeLinearOAuthLoopback;
     this.activeLinearOAuthLoopback = null;
@@ -8572,15 +8588,59 @@ export default class AgenticResearcherPlugin extends Plugin {
     ) as ActionReceipt[];
   }
 
-  private async loadProjectMemoryData() {
+  /**
+   * file-open and active-leaf-change both fire for one click, and each used
+   * to re-read and parse the four Agent Memory JSON files (about eight raw
+   * reads per note switch). One trailing debounce folds the pair into one
+   * decision, and the decision itself costs no I/O: the memory location plus
+   * the files' mtime/size (already known to Obsidian) form a signature that
+   * only changes when a reload could change anything.
+   */
+  private readonly projectMemoryReload = createTrailingDebounce(
+    () => {
+      void this.loadProjectMemoryData();
+    },
+    PROJECT_MEMORY_RELOAD_DEBOUNCE_MS,
+  );
+  private lastLoadedProjectMemorySignature: string | null = null;
+
+  private scheduleProjectMemoryReload(): void {
+    this.projectMemoryReload.schedule();
+  }
+
+  private currentProjectMemorySignature(
+    location: ReturnType<typeof getProjectMemoryLocation>,
+  ): string {
+    const statOf = (path: string) => {
+      const file = this.app.vault.getFileByPath(path);
+      return {
+        path,
+        mtime: file?.stat?.mtime ?? null,
+        size: file?.stat?.size ?? null,
+      };
+    };
+    return buildProjectMemorySignatureV1(location.memoryFolder, [
+      statOf(location.conversationPath),
+      statOf(location.researchIndexPath),
+      statOf(location.vaultToolOutcomePath),
+      statOf(location.toolOutcomePath),
+    ]);
+  }
+
+  private async loadProjectMemoryData(options: { force?: boolean } = {}) {
     const generation = ++this.projectMemoryLoadGeneration;
     const location = getProjectMemoryLocation(this.getProjectMemoryAnchorPath());
-    const conversationHistory = await this.readProjectMemoryJson(
-      location.conversationPath,
-    );
-    const researchMemoryIndex = await this.readProjectMemoryJson(
-      location.researchIndexPath,
-    );
+    const signature = this.currentProjectMemorySignature(location);
+    if (
+      !options.force &&
+      !shouldReloadProjectMemoryV1(this.lastLoadedProjectMemorySignature, signature)
+    ) {
+      return;
+    }
+    const [conversationHistory, researchMemoryIndex] = await Promise.all([
+      this.readProjectMemoryJson(location.conversationPath),
+      this.readProjectMemoryJson(location.researchIndexPath),
+    ]);
     // The ledger is vault-wide now. Fold in any folder-scoped file this vault
     // still carries from before the promotion, so existing observed history
     // survives rather than being silently discarded per project.
@@ -8626,10 +8686,13 @@ export default class AgenticResearcherPlugin extends Plugin {
       readLedger(vaultToolOutcomeMemory),
       readLedger(folderToolOutcomeMemory),
     );
+    this.lastLoadedProjectMemorySignature = signature;
   }
 
   private invalidateProjectMemoryLoads(): void {
     this.projectMemoryLoadGeneration += 1;
+    // A later load must not be skipped because an earlier signature matched.
+    this.lastLoadedProjectMemorySignature = null;
   }
 
   private async saveProjectMemoryData() {
@@ -9162,6 +9225,11 @@ export default class AgenticResearcherPlugin extends Plugin {
 
           let segmentPrompt = prompt;
           let segmentHistory = conversationHistory;
+          // One in-memory cache per root mission: each continuation segment
+          // starts from the previous segment's immutable web results instead
+          // of an empty cache, so a source paid for once is not fetched again
+          // (the vault-backed source cache only covered part of that).
+          let segmentRuntimeCache = createCarriedRuntimeCacheV1(null);
 
           for (let segmentIndex = 0; segmentIndex < maxSegments; segmentIndex += 1) {
             let segmentRunId: string | null = null;
@@ -9192,6 +9260,7 @@ export default class AgenticResearcherPlugin extends Plugin {
               modelClient: this.createModelClient(),
               toolRegistry: this.createToolRegistry(),
               toolContext: this.createToolExecutionContext(segmentPrompt),
+              runtimeCache: segmentRuntimeCache,
               enableStreaming: this.settings.enableStreaming,
               abortSignal,
               approvalBroker: this.approvalBroker,
@@ -9230,6 +9299,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             });
             segmentPrompt = `continue run ${segmentRunId}`;
             segmentHistory = [];
+            segmentRuntimeCache = createCarriedRuntimeCacheV1(segmentRuntimeCache);
           }
         },
         {

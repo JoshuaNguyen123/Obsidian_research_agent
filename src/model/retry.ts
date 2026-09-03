@@ -13,6 +13,12 @@ export const DEFAULT_MODEL_RETRY_POLICY: RetryPolicy = {
 };
 
 export function isTransientModelError(error: unknown): boolean {
+  // The endpoint breaker's fail-fast error is shaped like a network failure
+  // so the specialist fallback still runs, but retrying it per call would
+  // just re-ask the breaker; it is never transient here.
+  if (isCircuitOpenModelError(error)) {
+    return false;
+  }
   if (error instanceof ModelClientError) {
     return isTransientModelErrorShape(error.category, error.status);
   }
@@ -22,6 +28,22 @@ export function isTransientModelError(error: unknown): boolean {
   }
 
   return isTransientModelErrorShape(error.category, error.status);
+}
+
+/**
+ * Kept inline (not imported from endpointBreaker.ts, which imports this
+ * module) so the two files cannot form an import cycle.
+ */
+function isCircuitOpenModelError(error: unknown): boolean {
+  const record =
+    error instanceof ModelClientError
+      ? error
+      : isRecord(error) && error.name === "ModelClientError"
+        ? error
+        : null;
+  return Boolean(
+    record && isRecord(record.details) && record.details.circuitOpen === true,
+  );
 }
 
 /**

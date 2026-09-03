@@ -20,6 +20,10 @@ import type {
 } from "./types";
 import { ModelClientError as ModelClientErrorClass } from "./types";
 import { requireSecureProviderBaseUrlV1 } from "./providerEndpointPolicy";
+import {
+  resolveModelEndpointBreaker,
+  wrapModelClientWithEndpointBreaker,
+} from "./endpointBreaker";
 
 type NodeHttpModule = typeof import("http");
 
@@ -99,6 +103,23 @@ function withStreamingRequestTimeout(
 
 export function createModelClientForSlot(slot: ModelSlotConfig): ModelClient {
   const baseUrl = requireSecureProviderBaseUrlV1(slot.baseUrl);
+  // One session-scoped breaker per endpoint identity: a dead or throttled
+  // endpoint fails fast across calls instead of being re-dialled at full
+  // timeout cost by every step of a mission. The lead and specialist slots
+  // get separate breakers, so the fallback can still reach a healthy one.
+  const breaker = resolveModelEndpointBreaker(
+    `${slot.provider}|${baseUrl}|${slot.model}`,
+  );
+  return wrapModelClientWithEndpointBreaker(
+    createRawModelClientForSlot(slot, baseUrl),
+    breaker,
+  );
+}
+
+function createRawModelClientForSlot(
+  slot: ModelSlotConfig,
+  baseUrl: string,
+): ModelClient {
   const plannerTimeoutMs = resolveModelRequestTimeoutMs({
     requestTimeoutMs: slot.requestTimeoutMs,
     streaming: false,
