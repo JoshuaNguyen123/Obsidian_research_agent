@@ -1347,6 +1347,23 @@
   display: none;
 }
 
+/*
+ * The banner is a stack of keyed cards (readiness, blocked, approval,
+ * clarification); each renderer owns one card, so a question arriving while a
+ * blocker is showing sits under it instead of replacing it. Hairlines, not
+ * nested boxes, separate the cards.
+ */
+.agentic-researcher-chat-attention-card {
+  display: grid;
+  gap: var(--agent-space-3);
+  min-width: 0;
+}
+
+.agentic-researcher-chat-attention-card + .agentic-researcher-chat-attention-card {
+  border-top: var(--agent-hairline);
+  padding-top: var(--agent-space-3);
+}
+
 .agentic-researcher-chat-attention-title {
   font-weight: 600;
   overflow-wrap: anywhere;
@@ -1405,8 +1422,9 @@
 }
 
 /* Clarifying question: a quiet prompt, not an alarm. */
-.agentic-researcher-chat-attention.is-clarification {
+.agentic-researcher-chat-attention-card.is-clarification {
   border-left: 2px solid var(--interactive-accent);
+  padding-left: var(--agent-space-3);
 }
 
 .agentic-researcher-clarification-chip {

@@ -90,7 +90,6 @@ import {
 import {
   clearChatConfirmCopy,
   clearChatDoneCopy,
-  chatApprovalAttentionTitle,
   chatModelConnectionGateTitle,
   chatMissionGraphBlockerTitle,
   chatProviderBlockerTitle,
@@ -138,6 +137,16 @@ import {
   buildMissionReadinessCardModelV1,
   renderMissionReadinessCard,
 } from "./ui/MissionReadinessCard";
+import {
+  type ChatAttentionKey,
+  clearAllChatAttentionCards,
+  clearChatAttentionCard,
+  upsertChatAttentionCard,
+} from "./ui/chatAttentionStack";
+import {
+  renderChatApprovalCard,
+  renderClarificationCard,
+} from "./ui/chatAttentionCards";
 import type { AutonomyRunStatsV1 } from "./agent/autonomyRunStats";
 import {
   projectMissionGraphRunDetails,
@@ -1820,6 +1829,11 @@ export class AgentView extends ItemView {
       return null;
     }
     const lifecycleReadiness = missionReadiness;
+    // Both pre-run gates passed, so a readiness card or blocker left from an
+    // earlier attempt is settled; approval and clarification cards belong to
+    // the run that raised them and are cleared with it.
+    this.clearChatAttentionCard("readiness");
+    this.clearChatAttentionCard("blocked");
 
     const conversationHistory = [...this.plugin.conversationHistory];
     this.missionSubmittedSinceOpen = true;
@@ -2965,7 +2979,7 @@ export class AgentView extends ItemView {
         cardEl.querySelectorAll("button").forEach((button) => {
           (button as HTMLButtonElement).disabled = true;
         });
-        this.clearChatAttention();
+        this.clearChatAttentionCard("approval");
       }
     };
     approveButton.addEventListener("click", (event) => {
@@ -2984,7 +2998,7 @@ export class AgentView extends ItemView {
     request: ApprovalRequest,
     decision: ApprovalDecision,
   ) {
-    this.clearChatAttention();
+    this.clearChatAttentionCard("approval");
     this.setRunDetailsNeedsAttention(false);
     const cardEl = this.approvalCardEls.get(request.id);
     if (!cardEl) {
@@ -5717,10 +5731,8 @@ export class AgentView extends ItemView {
     if (!banner) {
       return;
     }
-    banner.empty();
-    banner.removeClass("is-hidden");
-    banner.show();
-    banner.createDiv({
+    const card = upsertChatAttentionCard(banner, "blocked");
+    card.createDiv({
       text: title,
       cls: "agentic-researcher-chat-attention-title",
     });
@@ -5729,7 +5741,7 @@ export class AgentView extends ItemView {
     // are what it actually recorded.
     const facts = options.facts ?? [];
     if (facts.length > 0) {
-      const evidenceEl = banner.createDiv({
+      const evidenceEl = card.createDiv({
         cls: "agentic-researcher-chat-attention-evidence",
         attr: { "data-testid": "chat-blocked-evidence" },
       });
@@ -5752,27 +5764,27 @@ export class AgentView extends ItemView {
         });
       }
     }
-    banner.createDiv({
+    card.createDiv({
       text: `What: ${copy.what}`,
       cls: "agentic-researcher-chat-attention-body",
     });
-    banner.createDiv({
+    card.createDiv({
       text: `Why: ${reframeBlockedWhyV1({ why: copy.why, facts })}`,
       cls: "agentic-researcher-chat-attention-body",
     });
-    banner.createDiv({
+    card.createDiv({
       text: `Next: ${copy.next}`,
       cls: "agentic-researcher-chat-attention-body",
     });
     const suppression = continuationSuppressionSentence(this.lastAutoContinuation);
     if (suppression) {
-      banner.createDiv({
+      card.createDiv({
         text: suppression,
         cls: "agentic-researcher-continuation-suppression",
         attr: { "data-testid": "chat-blocked-continue-suppression" },
       });
     }
-    const controls = banner.createDiv({
+    const controls = card.createDiv({
       cls: "agentic-researcher-chat-attention-controls",
     });
 
@@ -5799,7 +5811,7 @@ export class AgentView extends ItemView {
       });
       continueButton.addEventListener("click", (event) => {
         event.preventDefault();
-        this.clearChatAttention();
+        this.clearChatAttentionCard("blocked");
         void this.submitMissionContinuation(ledger.continuationCommand);
       });
     } else if (options.allowOpenSettings || options.forceSettingsOnly) {
@@ -5835,73 +5847,16 @@ export class AgentView extends ItemView {
     if (!banner) {
       return;
     }
-    banner.empty();
-    banner.removeClass("is-hidden");
-    banner.show();
-    banner.createDiv({
-      text: chatApprovalAttentionTitle(request.toolName),
-      cls: "agentic-researcher-chat-attention-title",
-    });
-    banner.createDiv({
-      text: request.reason,
-      cls: "agentic-researcher-chat-attention-body",
-    });
-    // The chat banner offers the same Approve/Deny authority as Run Details.
-    // card, so it owes the user the same minimum context: WHERE the mutation
-    // is going. Title and reason alone let a user approve an outbound write
-    // without ever seeing its destination.
-    const attentionModel = formatApprovalCardModelV1(request);
-    if (attentionModel.preview?.destination) {
-      banner.createDiv({
-        text: attentionModel.preview.destination,
-        cls: "agentic-researcher-chat-attention-body",
-        attr: { "data-testid": "chat-approval-destination" },
-      });
-    }
-    const controls = banner.createDiv({
-      cls: "agentic-researcher-chat-attention-controls",
-    });
-    const approveButton = controls.createEl("button", {
-      text: "Approve",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "chat-approval-approve" },
-    });
-    const denyButton = controls.createEl("button", {
-      text: "Deny",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "chat-approval-deny" },
-    });
-    const openDetails = controls.createEl("button", {
-      text: "Open Run Details",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button" },
-    });
-    const resolve = (decision: "approved" | "denied") => {
-      const accepted = this.plugin.resolveMissionApproval(request.id, decision);
-      if (accepted) {
-        approveButton.disabled = true;
-        denyButton.disabled = true;
-        this.clearChatAttention();
-      }
-    };
-    approveButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      resolve("approved");
-    });
-    denyButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      resolve("denied");
-    });
-    openDetails.addEventListener("click", (event) => {
-      event.preventDefault();
-      this.setActiveTab("details");
+    renderChatApprovalCard(banner, request, {
+      resolve: (decision) =>
+        this.plugin.resolveMissionApproval(request.id, decision),
+      openRunDetails: () => this.setActiveTab("details"),
     });
   }
 
   /**
-   * The agent is unsure and asked one question. Rendered inline in chat with
-   * one-click suggested answers plus a free-text box, so answering is a single
-   * gesture and the transcript keeps the exchange.
+   * The agent is unsure and asked one question. Rendered as its own card in
+   * the attention stack so it never displaces a blocker or an approval.
    */
   private renderClarificationRequest(
     request: ClarificationRequest,
@@ -5911,93 +5866,27 @@ export class AgentView extends ItemView {
     if (!banner) {
       return;
     }
-    banner.empty();
-    banner.removeClass("is-hidden");
-    banner.show();
-    banner.addClass("is-clarification");
-    banner.createDiv({
-      text: request.question,
-      cls: "agentic-researcher-chat-attention-title",
+    renderClarificationCard(banner, request, {
+      answer: (value) => broker.answer(request.id, value),
+      skip: () => broker.skip(request.id),
     });
-    if (request.context) {
-      banner.createDiv({
-        text: request.context,
-        cls: "agentic-researcher-chat-attention-body",
-      });
-    }
-
-    const controls = banner.createDiv({
-      cls: "agentic-researcher-chat-attention-controls",
-    });
-    const settle = (run: () => boolean) => {
-      if (!run()) return;
-      banner.removeClass("is-clarification");
-      this.clearChatAttention();
-    };
-
-    for (const [index, option] of request.options.entries()) {
-      const chip = controls.createEl("button", {
-        text: option,
-        cls: "agentic-researcher-secondary-action agentic-researcher-clarification-chip",
-        attr: {
-          type: "button",
-          "data-testid": `clarification-option-${index}`,
-        },
-      });
-      chip.addEventListener("click", (event) => {
-        event.preventDefault();
-        settle(() => broker.answer(request.id, option));
-      });
-    }
-
-    const freeForm = banner.createDiv({
-      cls: "agentic-researcher-clarification-input",
-    });
-    const input = freeForm.createEl("input", {
-      attr: {
-        type: "text",
-        placeholder: "Type an answer…",
-        "data-testid": "clarification-answer",
-      },
-    });
-    const submit = () => {
-      const value = input.value.trim();
-      if (!value) return;
-      settle(() => broker.answer(request.id, value));
-    };
-    input.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter") return;
-      event.preventDefault();
-      submit();
-    });
-    const sendButton = freeForm.createEl("button", {
-      text: "Send",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "clarification-send" },
-    });
-    sendButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      submit();
-    });
-    const skipButton = freeForm.createEl("button", {
-      text: "Skip",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "clarification-skip" },
-    });
-    skipButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      settle(() => broker.skip(request.id));
-    });
-    input.focus();
   }
 
+  /** Clears every attention card: the transcript or the run they belong to is gone. */
   private clearChatAttention() {
     if (!this.chatAttentionEl) {
       return;
     }
-    this.chatAttentionEl.empty();
-    this.chatAttentionEl.addClass("is-hidden");
-    this.chatAttentionEl.hide();
+    clearAllChatAttentionCards(this.chatAttentionEl);
+    this.refreshChatContinuationAction();
+  }
+
+  /** Clears one attention card; the banner hides only when none remain. */
+  private clearChatAttentionCard(key: ChatAttentionKey) {
+    if (!this.chatAttentionEl) {
+      return;
+    }
+    clearChatAttentionCard(this.chatAttentionEl, key);
     this.refreshChatContinuationAction();
   }
 

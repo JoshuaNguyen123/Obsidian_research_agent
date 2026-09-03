@@ -1886,9 +1886,11 @@ async function approveFirstVisiblePreparedAction(
         buttons.find((candidate) => candidate.getClientRects().length > 0) ??
         buttons.at(-1);
       if (!button) return null;
-      const chatAttention = button.closest(
-        ".agentic-researcher-chat-attention",
-      );
+      // The banner is a stack of keyed cards; read the title of the card that
+      // owns this button, not the first title in the banner.
+      const chatAttention =
+        button.closest(".agentic-researcher-chat-attention-card") ??
+        button.closest(".agentic-researcher-chat-attention");
       const detailCard = button.closest(
         ".agentic-researcher-approval-card",
       );
