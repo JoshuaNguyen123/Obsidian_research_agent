@@ -15,7 +15,7 @@ import {
 import { normalizeVaultPath } from "../tools/validation";
 import { isPathUnderVaultFolder, isVaultPathExcluded } from "../tools/vaultExclusions";
 import { mapWithBoundedConcurrency } from "../utils/boundedConcurrency";
-import type { SemanticEmbeddingProvider } from "./types";
+import type { SemanticEmbeddingPriority, SemanticEmbeddingProvider } from "./types";
 import {
   buildSemanticGraphPrior,
   type SemanticGraphPrior,
@@ -644,6 +644,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       settings,
       documents: pending.map((item) => item.embeddingText),
       signal,
+      priority: "interactive",
     });
     if (!embedded.ok || embedded.vectors.length !== pending.length) {
       return empty;
@@ -1134,6 +1135,7 @@ export async function embedIndexDocuments({
   documents,
   batchSize = SEMANTIC_EMBED_BATCH_SIZE,
   signal,
+  priority = "background",
 }: {
   provider: SemanticEmbeddingProvider;
   settings: AgentSettings;
@@ -1141,6 +1143,8 @@ export async function embedIndexDocuments({
   batchSize?: number;
   /** A stopped run skips batches still waiting in the provider queue. */
   signal?: AbortSignal;
+  /** Index builds queue behind any interactive search; the live merge of a few changed notes is interactive. */
+  priority?: SemanticEmbeddingPriority;
 }): Promise<{ ok: true; vectors: number[][] } | { ok: false; code: string; message: string }> {
   if (documents.length === 0) {
     return { ok: true, vectors: [] };
@@ -1161,6 +1165,7 @@ export async function embedIndexDocuments({
       queryPrefix: indexPrefixes.query,
       documentPrefix: indexPrefixes.document,
       signal,
+      priority,
     });
     if (!response.ok || response.documents?.length !== batch.length) {
       return {

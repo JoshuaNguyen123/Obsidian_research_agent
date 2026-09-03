@@ -520,3 +520,53 @@ test("the matryoshka flag is forwarded to the helper verbatim", async () => {
     provider.dispose?.();
   }
 });
+
+test("a queued interactive request runs before queued background batches", async () => {
+  // An index rebuild queues dozens of background batches; a search that
+  // arrives while one is in flight must run as soon as it settles, not after
+  // every batch. Never preempts the request the helper is already executing.
+  const order: string[] = [];
+  let release: (() => void) | null = null;
+  const { runtime } = createFakeRuntime((child) => {
+    child.onWrite = (line: string) => {
+      const request = JSON.parse(line) as { id: string; model: string; dim: number; documents: string[] };
+      const label = request.documents[0];
+      const answer = () => {
+        order.push(label);
+        child.emitStdout(
+          JSON.stringify({ id: request.id, ok: true, model: request.model, dim: request.dim, documents: [[1, 0]], queries: [] }) + "\n",
+        );
+      };
+      if (label === "bg-1") {
+        // Hold the first background batch so the others queue behind it.
+        release = answer;
+      } else {
+        answer();
+      }
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, { loadRuntime: () => runtime });
+  try {
+    const request = (label: string, priority?: "interactive" | "background") => ({
+      ...REQUEST,
+      documents: [label],
+      queries: [],
+      ...(priority ? { priority } : {}),
+    });
+    const bg1 = provider.embed(request("bg-1", "background"));
+    const bg2 = provider.embed(request("bg-2", "background"));
+    const bg3 = provider.embed(request("bg-3", "background"));
+    // Wait until bg-1 is actually in flight (its write is recorded), then queue
+    // the interactive search.
+    await sleep(10);
+    const search = provider.embed(request("search"));
+    const legacy = provider.embed(request("legacy-default-is-interactive"));
+    await sleep(10);
+    assert.ok(release, "bg-1 must be in flight");
+    release!();
+    await Promise.all([bg1, bg2, bg3, search, legacy]);
+    assert.deepEqual(order, ["bg-1", "search", "legacy-default-is-interactive", "bg-2", "bg-3"]);
+  } finally {
+    provider.dispose?.();
+  }
+});

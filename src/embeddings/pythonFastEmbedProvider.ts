@@ -1,5 +1,6 @@
 import type { AgentSettings } from "../settings";
 import type {
+  SemanticEmbeddingPriority,
   SemanticEmbeddingProvider,
   SemanticEmbeddingRequest,
   SemanticEmbeddingResponse,
@@ -89,7 +90,17 @@ export function createPythonFastEmbedProvider(
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   let requestSeq = 0;
-  let queueTail: Promise<unknown> = Promise.resolve();
+  // Serial queue with two classes. The helper answers one request at a time,
+  // so an index rebuild that queued 40 batches used to hold every search behind
+  // them; now a queued interactive request runs as soon as the in-flight
+  // request settles, ahead of any queued background batch.
+  const pendingTasks: Array<{
+    priority: SemanticEmbeddingPriority;
+    seq: number;
+    start: () => Promise<unknown>;
+  }> = [];
+  let queueSeq = 0;
+  let activeTask: Promise<unknown> | null = null;
 
   const clearIdleTimer = () => {
     if (idleTimer) {
@@ -392,22 +403,52 @@ export function createPythonFastEmbedProvider(
     }
   };
 
-  const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
-    const run = queueTail.then(task, task);
-    queueTail = run.then(
+  const pumpQueue = () => {
+    if (activeTask || pendingTasks.length === 0) {
+      return;
+    }
+    pendingTasks.sort(
+      (left, right) =>
+        priorityRank(left.priority) - priorityRank(right.priority) ||
+        left.seq - right.seq,
+    );
+    const next = pendingTasks.shift()!;
+    activeTask = next.start().then(
       () => undefined,
       () => undefined,
     );
-    return run;
+    void activeTask.then(() => {
+      activeTask = null;
+      pumpQueue();
+    });
   };
+
+  const enqueue = <T>(
+    task: () => Promise<T>,
+    priority: SemanticEmbeddingPriority = "interactive",
+  ): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      pendingTasks.push({
+        priority,
+        seq: ++queueSeq,
+        start: () => {
+          const run = task();
+          run.then(resolve, reject);
+          return run;
+        },
+      });
+      pumpQueue();
+    });
 
   return {
     id: PYTHON_FASTEMBED_PROVIDER_ID,
     embed: (request) =>
-      enqueue(() =>
-        request.signal?.aborted
-          ? Promise.resolve(abortedResponse(request))
-          : embedNow(request).then((result) => verifyResponseDim(request, result)),
+      enqueue(
+        () =>
+          request.signal?.aborted
+            ? Promise.resolve(abortedResponse(request))
+            : embedNow(request).then((result) => verifyResponseDim(request, result)),
+        request.priority ?? "interactive",
       ),
     dispose: () => {
       disposed = true;
@@ -444,6 +485,10 @@ function verifyResponseDim(
     code: "dim_mismatch",
     message: `${request.model} returned ${mismatched.length}-dimension vectors but ${request.dim} was requested. Set the semantic embedding dimension to ${mismatched.length}, or choose a catalogued model so the plugin can resolve it.`,
   };
+}
+
+function priorityRank(priority: SemanticEmbeddingPriority): number {
+  return priority === "interactive" ? 0 : 1;
 }
 
 function isRetryableHelperFailure(response: SemanticEmbeddingResponse): boolean {

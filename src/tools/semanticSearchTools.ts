@@ -226,49 +226,21 @@ export const semanticSearchNotesTool: AgentTool = {
     let scored: ScoredChunk[] = [];
 
     if (context.semanticEmbeddingProvider && chunks.length > 0) {
-      const livePrefixes = resolveEmbeddingPrefixesV1(getSemanticModel(context));
-      // A stopped run falls through to lexical scoring instead of waiting
-      // out the embedding helper (which cannot cancel an in-flight request).
-      const response = await raceAbort(
-        context.semanticEmbeddingProvider.embed({
-          model: getSemanticModel(context),
-          dim: getSemanticDim(context),
-          matryoshka: getSemanticMatryoshka(context),
-          cacheDir: context.settings.semanticModelCacheDir || undefined,
-          documents: chunks.map((chunk) => chunk.embeddingText),
-          queries: [query],
-          queryPrefix: livePrefixes.query,
-          documentPrefix: livePrefixes.document,
-          signal: context.abortSignal,
-        }),
-        context.abortSignal,
-      ).catch((error: unknown): SemanticEmbeddingResponse => {
-        if (context.abortSignal?.aborted) {
-          return {
-            ok: false,
-            model: getSemanticModel(context),
-            dim: getSemanticDim(context),
-            code: "aborted",
-            message: "The run was stopped before the embedding helper answered.",
-          };
-        }
-        throw error;
+      const embedded = await embedLiveChunks({
+        context,
+        query,
+        documents: chunks.map((chunk) => chunk.embeddingText),
       });
-
-      if (
-        response.ok &&
-        response.documents?.length === chunks.length &&
-        response.queries?.length === 1
-      ) {
+      if (embedded.ok) {
         scored = scoreSemanticChunks({
           chunks,
-          queryVector: response.queries[0],
-          documentVectors: response.documents,
+          queryVector: embedded.queryVector,
+          documentVectors: embedded.documentVectors,
           queryTerms,
         });
       } else {
         fallbackUsed = true;
-        fallbackReason = response.code ?? "semantic_embedding_failed";
+        fallbackReason = embedded.code;
       }
     }
 
@@ -949,6 +921,81 @@ function normalizeChunkingOptions(
     Math.max(0, minTokens - 1),
   );
   return { minTokens, targetTokens, maxTokens, overlapTokens };
+}
+
+/**
+ * The live path used to send every chunk of up to 300 notes in ONE request:
+ * exactly the shape that produced `output_too_large` and 180 s helper
+ * timeouts, and which the index path already avoided with bounded batches.
+ * Documents now go in batches of `LIVE_EMBED_BATCH_SIZE`, the query in its
+ * own request, all marked interactive so a rebuild in progress cannot delay
+ * them. A stopped run falls through to lexical scoring instead of waiting
+ * out the helper (which cannot cancel an in-flight request).
+ */
+export const LIVE_EMBED_BATCH_SIZE = 64;
+
+async function embedLiveChunks({
+  context,
+  query,
+  documents,
+}: {
+  context: ToolExecutionContext;
+  query: string;
+  documents: string[];
+}): Promise<
+  | { ok: true; queryVector: number[]; documentVectors: number[][] }
+  | { ok: false; code: string }
+> {
+  const provider = context.semanticEmbeddingProvider;
+  if (!provider) {
+    return { ok: false, code: "semantic_embedding_provider_unavailable" };
+  }
+  const model = getSemanticModel(context);
+  const dim = getSemanticDim(context);
+  const matryoshka = getSemanticMatryoshka(context);
+  const prefixes = resolveEmbeddingPrefixesV1(model);
+  const send = (input: { documents: string[]; queries: string[] }) =>
+    raceAbort(
+      provider.embed({
+        model,
+        dim,
+        matryoshka,
+        cacheDir: context.settings.semanticModelCacheDir || undefined,
+        documents: input.documents,
+        queries: input.queries,
+        queryPrefix: prefixes.query,
+        documentPrefix: prefixes.document,
+        signal: context.abortSignal,
+        priority: "interactive",
+      }),
+      context.abortSignal,
+    ).catch((error: unknown): SemanticEmbeddingResponse => {
+      if (context.abortSignal?.aborted) {
+        return {
+          ok: false,
+          model,
+          dim,
+          code: "aborted",
+          message: "The run was stopped before the embedding helper answered.",
+        };
+      }
+      throw error;
+    });
+
+  const queryResponse = await send({ documents: [], queries: [query] });
+  if (!queryResponse.ok || queryResponse.queries?.length !== 1) {
+    return { ok: false, code: queryResponse.code ?? "semantic_embedding_failed" };
+  }
+  const documentVectors: number[][] = [];
+  for (let start = 0; start < documents.length; start += LIVE_EMBED_BATCH_SIZE) {
+    const batch = documents.slice(start, start + LIVE_EMBED_BATCH_SIZE);
+    const response = await send({ documents: batch, queries: [] });
+    if (!response.ok || response.documents?.length !== batch.length) {
+      return { ok: false, code: response.code ?? "semantic_embedding_failed" };
+    }
+    documentVectors.push(...response.documents);
+  }
+  return { ok: true, queryVector: queryResponse.queries[0], documentVectors };
 }
 
 function getSemanticModel(context: ToolExecutionContext): string {

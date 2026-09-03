@@ -6,6 +6,8 @@
  */
 export type SemanticEmbeddingDim = number;
 
+export type SemanticEmbeddingPriority = "interactive" | "background";
+
 export interface SemanticEmbeddingRequest {
   model: string;
   dim: SemanticEmbeddingDim;
@@ -18,6 +20,14 @@ export interface SemanticEmbeddingRequest {
    * before the flag existed.
    */
   matryoshka?: boolean;
+  /**
+   * Scheduling class on the provider's serial queue. A user-facing search or
+   * reflex classification is `interactive` (the default) and runs before any
+   * queued `background` work such as an index rebuild batch, so a rebuild in
+   * progress cannot hold a search for minutes. Never preempts a request the
+   * helper is already executing.
+   */
+  priority?: SemanticEmbeddingPriority;
   cacheDir?: string;
   documents: string[];
   queries: string[];
