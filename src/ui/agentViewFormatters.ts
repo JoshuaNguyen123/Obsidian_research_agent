@@ -40,6 +40,15 @@ export function formatAgentMetric(event: AgentRunMetricEvent): string {
   if (event.kind === "run" && event.name === PROMPT_PREFIX_REUSE_METRIC_NAME) {
     return formatPromptPrefixReuseMetric(event);
   }
+  if (event.kind === "host_work") {
+    const label =
+      event.name === "persist_run_note"
+        ? "run-note write"
+        : event.name === "persist_graph"
+          ? "graph write"
+          : event.name;
+    return `Host work: ${label} ${event.durationMs}ms`;
+  }
   if (event.kind === "model_chat") {
     return [
       `Timing: model step ${event.step ?? "?"}`,

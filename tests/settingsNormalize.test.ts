@@ -5,6 +5,7 @@ import {
   detectInstallKind,
   normalizeAgentSettings,
   normalizeGitHubOAuthClientIdSetting,
+  resetAgentSettingsKeepingConnectionsV1,
   parseSupportedSettingsSchemaVersion,
   SETTINGS_SCHEMA_VERSION,
 } from "../src/agent/settingsNormalize";
@@ -446,5 +447,45 @@ describe("autonomousNoteTarget path allocation", () => {
     });
     assert.equal(target.path, "Research/Untitled.md");
     assert.equal(target.reason, "explicit_folder");
+  });
+
+  it("reset keeps connections and credentials and restores every preference", () => {
+    const current = {
+      ...normalizeAgentSettings({}, "new_install"),
+      modelProvider: "openai_compatible" as const,
+      openAiCompatibleApiKey: "sk-keep-me",
+      openAiCompatibleBaseUrl: "https://example.test/v1",
+      model: "custom-lead-model",
+      specialistApiKey: "sk-specialist",
+      specialistModel: "custom-specialist",
+      modelConnectionVerifiedProvider: "openai_compatible" as const,
+      modelConnectionVerifiedModel: "custom-lead-model",
+      workingMode: "custom" as const,
+      autonomyProfile: "custom" as const,
+      agenticReflexEnabled: false,
+      thinkingMode: "off" as const,
+      enableStreaming: false,
+      modelRouterMode: "off" as const,
+    };
+
+    const reset = resetAgentSettingsKeepingConnectionsV1(current);
+
+    assert.equal(reset.modelProvider, "openai_compatible");
+    assert.equal(reset.openAiCompatibleApiKey, "sk-keep-me");
+    assert.equal(reset.openAiCompatibleBaseUrl, "https://example.test/v1");
+    assert.equal(reset.model, "custom-lead-model");
+    assert.equal(reset.specialistApiKey, "sk-specialist");
+    assert.equal(reset.specialistModel, "custom-specialist");
+    assert.equal(reset.modelConnectionVerifiedProvider, "openai_compatible");
+    assert.equal(reset.modelConnectionVerifiedModel, "custom-lead-model");
+
+    const fresh = normalizeAgentSettings({}, "new_install");
+    assert.equal(reset.workingMode, fresh.workingMode);
+    assert.equal(reset.autonomyProfile, fresh.autonomyProfile);
+    assert.equal(reset.agenticReflexEnabled, fresh.agenticReflexEnabled);
+    assert.equal(reset.thinkingMode, fresh.thinkingMode);
+    assert.equal(reset.enableStreaming, fresh.enableStreaming);
+    assert.equal(reset.modelRouterMode, fresh.modelRouterMode);
+    assert.equal(reset.ollamaApiKey, current.ollamaApiKey, "untouched credentials survive too");
   });
 });

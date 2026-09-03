@@ -243,3 +243,30 @@ test("the render derives id and message from the salient value", () => {
   assert.equal(plain.token, "30");
   assert.equal(plain.rendered, "30ms");
 });
+
+test("host work is attributed by phase and never charged to tools", () => {
+  const summary = summarizeRunWallClockV1([
+    toolCall("read_file", 30),
+    { kind: "host_work", name: "persist_run_note", durationMs: 40 },
+    { kind: "host_work", name: "persist_run_note", durationMs: 60 },
+    { kind: "host_work", name: "persist_graph", durationMs: 25 },
+    { kind: "host_work", name: "compaction", durationMs: Number.NaN },
+  ]);
+
+  assert.equal(summary.toolMs, 30, "host work is not tool time");
+  assert.equal(summary.hostWorkMs, 125);
+  assert.deepEqual(summary.hostWork, [
+    { phase: "persist_run_note", totalMs: 100, count: 2 },
+    { phase: "persist_graph", totalMs: 25, count: 1 },
+    { phase: "compaction", totalMs: 0, count: 1 },
+  ]);
+  assert.match(
+    formatRunWallClockSummaryV1(summary),
+    /host work 0\.1s \(run-note writes 0\.1s\/2, graph writes 0\.0s\/1, compaction 0\.0s\/1\)/,
+  );
+  assert.doesNotMatch(
+    formatRunWallClockSummaryV1(summarizeRunWallClockV1([toolCall("read_file", 5)])),
+    /host work/,
+    "silent when nothing was attributed",
+  );
+});

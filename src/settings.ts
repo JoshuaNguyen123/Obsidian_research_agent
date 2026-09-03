@@ -1,4 +1,5 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { resetAgentSettingsKeepingConnectionsV1 } from "./agent/settingsNormalize";
 import type AgenticResearcherPlugin from "../main";
 import type { EmbeddingProbeResultV1 } from "./embeddings/embeddingProbe";
 import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
@@ -412,6 +413,7 @@ export class AgentSettingTab extends PluginSettingTab {
   private pendingFocusTarget: CapabilitySetupTarget | null = null;
   private readinessRefreshTimer: number | null = null;
   private readinessSignature = "";
+  private resetToDefaultsArmed = false;
 
   constructor(app: App, plugin: AgenticResearcherPlugin) {
     super(app, plugin);
@@ -3247,6 +3249,39 @@ export class AgentSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.agenticReflexDiagnosticsEnabled = value;
             await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Reset settings to defaults")
+      .setDesc(
+        "Restores every preference to the shipped defaults. Keeps providers, base URLs, API keys, chosen models, and connection proofs. Click twice to confirm.",
+      )
+      .addButton((button) =>
+        button
+          .setButtonText(
+            this.resetToDefaultsArmed ? "Confirm reset" : "Reset to defaults",
+          )
+          .setWarning()
+          .onClick(async () => {
+            if (!this.resetToDefaultsArmed) {
+              this.resetToDefaultsArmed = true;
+              button.setButtonText("Confirm reset");
+              return;
+            }
+            this.resetToDefaultsArmed = false;
+            Object.assign(
+              this.plugin.settings,
+              DEFAULT_SETTINGS,
+              resetAgentSettingsKeepingConnectionsV1(
+                this.plugin.settings as unknown as Record<string, unknown>,
+              ),
+            );
+            await this.plugin.saveSettings();
+            new Notice(
+              "Settings were reset to defaults. Connections and credentials were kept.",
+            );
+            this.display();
           }),
       );
 

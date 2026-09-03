@@ -114,6 +114,9 @@ export type VerifiedLinearCodeRepositoryBindingResolutionV1 =
       reason: string;
     };
 
+/** Host-work phases the runner attributes in its wall-clock summary. */
+export type HostWorkPhaseV1 = "persist_run_note" | "persist_graph" | "compaction";
+
 export interface ToolExecutionContext {
   app: App;
   settings: AgentSettings;
@@ -202,6 +205,14 @@ export interface ToolExecutionContext {
    */
   plannedNoteOutputPath?: string;
   now?: () => Date;
+  /**
+   * Host-side work observer. The run-note and mission-graph writers report
+   * how long each durable write took (serialization wait included) and the
+   * loop reports compaction, so the run's "Wall clock" line can name disk and
+   * host time instead of leaving it unattributed. Set by the runner; absent
+   * elsewhere.
+   */
+  observeHostWork?: (phase: HostWorkPhaseV1, durationMs: number) => void;
   getCurrentMarkdownFile?: () => TFile | null;
   getCurrentMarkdownContent?: (file: TFile) => string | null;
   setCurrentMarkdownContent?: (

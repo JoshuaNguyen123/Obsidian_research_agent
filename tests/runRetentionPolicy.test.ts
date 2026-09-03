@@ -507,6 +507,108 @@ test("resolveRunRetentionPolicy reads optional settings with 30/200 fallbacks", 
   );
 });
 
+function countingSweepVault(
+  entries: Array<{ path: string; content: string; mtime: number }>,
+  options: { cachedRead?: boolean } = {},
+) {
+  const files = new Map(entries.map((entry) => [entry.path, entry]));
+  const fileObjs = [...files.values()].map((entry) => ({
+    path: entry.path,
+    extension: "md",
+    stat: { mtime: entry.mtime },
+  }));
+  const counts = { read: 0, cachedRead: 0, trashed: [] as string[] };
+  const vault = {
+    getFiles: () => fileObjs.filter((file) => files.has(file.path)),
+    read: async (file: { path: string }) => {
+      counts.read += 1;
+      return files.get(file.path)!.content;
+    },
+    ...(options.cachedRead
+      ? {
+          cachedRead: async (file: { path: string }) => {
+            counts.cachedRead += 1;
+            return files.get(file.path)!.content;
+          },
+        }
+      : {}),
+    getFileByPath: (path: string) =>
+      fileObjs.find((file) => file.path === path && files.has(path)) ?? null,
+    trash: async (file: { path: string }) => {
+      counts.trashed.push(file.path);
+      files.delete(file.path);
+    },
+  };
+  return { vault, counts };
+}
+
+test("sweep reads no run note when none is older than the age cutoff", async () => {
+  const entries = Array.from({ length: 250 }, (_, index) => {
+    const ledger = completeLedger(`run-recent-${index}`);
+    return {
+      path: `Agent Runs/run-recent-${index}.md`,
+      content: formatMissionLedgerBlock(ledger),
+      mtime: NOW.getTime() - index * 60_000,
+    };
+  });
+  const { vault, counts } = countingSweepVault(entries, { cachedRead: true });
+  const result = await sweepAgentRunsRetentionBestEffort({
+    vault,
+    policy: { retentionDays: 30, maxTerminalRuns: 200 },
+    now: NOW,
+  });
+  assert.deepEqual(result.trashed, []);
+  assert.equal(counts.read + counts.cachedRead, 0, "recent notes are never read");
+});
+
+test("sweep reads no run note when the aged notes fit within maxTerminalRuns", async () => {
+  const entries = Array.from({ length: 150 }, (_, index) => ({
+    path: `Agent Runs/run-aged-${index}.md`,
+    content: formatMissionLedgerBlock(completeLedger(`run-aged-${index}`)),
+    mtime: NOW.getTime() - (40 + index) * DAY,
+  }));
+  const { vault, counts } = countingSweepVault(entries);
+  const result = await sweepAgentRunsRetentionBestEffort({
+    vault,
+    policy: { retentionDays: 30, maxTerminalRuns: 200 },
+    now: NOW,
+  });
+  assert.deepEqual(result.trashed, []);
+  assert.equal(counts.read, 0, "nothing can overflow the cap, so nothing is read");
+});
+
+test("sweep reads only the aged notes, through cachedRead, when the cap can overflow", async () => {
+  const aged = Array.from({ length: 3 }, (_, index) => ({
+    path: `Agent Runs/run-aged-${index}.md`,
+    content: formatMissionLedgerBlock(
+      Object.assign(completeLedger(`run-aged-${index}`), {
+        updatedAt: "2026-07-01T00:00:00.000Z",
+      }),
+    ),
+    mtime: NOW.getTime() - (40 + index) * DAY,
+  }));
+  const recent = Array.from({ length: 5 }, (_, index) => ({
+    path: `Agent Runs/run-recent-${index}.md`,
+    content: formatMissionLedgerBlock(completeLedger(`run-recent-${index}`)),
+    mtime: NOW.getTime() - index * DAY,
+  }));
+  const { vault, counts } = countingSweepVault([...aged, ...recent], {
+    cachedRead: true,
+  });
+  const result = await sweepAgentRunsRetentionBestEffort({
+    vault,
+    policy: { retentionDays: 30, maxTerminalRuns: 1 },
+    now: NOW,
+  });
+  assert.equal(counts.cachedRead, 3, "only the three aged notes are read");
+  assert.equal(counts.read, 0, "cachedRead is preferred when the vault has it");
+  assert.deepEqual(
+    [...result.trashed].sort(),
+    ["Agent Runs/run-aged-1.md", "Agent Runs/run-aged-2.md"],
+    "the two oldest aged terminal runs past the cap are trashed",
+  );
+});
+
 test("sweep uses Chat plans, skips ledger-less notes, and never throws", async () => {
   const complete = completeLedger("run-old");
   complete.updatedAt = "2026-07-01T00:00:00.000Z";

@@ -119,7 +119,20 @@ export interface RunWallClockSummaryV1 {
   toolCacheHitCount: number;
   /** Slowest tools first, so the expensive host path is named, not guessed. */
   slowestTools: Array<{ name: string; totalMs: number; calls: number }>;
+  /**
+   * Host work the runner attributed itself (durable run-note and graph
+   * writes, prompt compaction). Not part of toolMs: it happens between tool
+   * calls and model calls, where it used to be invisible.
+   */
+  hostWorkMs: number;
+  hostWork: Array<{ phase: string; totalMs: number; count: number }>;
 }
+
+const HOST_WORK_PHASE_LABELS: Record<string, string> = {
+  persist_run_note: "run-note writes",
+  persist_graph: "graph writes",
+  compaction: "compaction",
+};
 
 export function summarizeRunWallClockV1(
   metrics: AgentRunMetricEvent[],
@@ -132,6 +145,8 @@ export function summarizeRunWallClockV1(
   let toolCallCount = 0;
   let toolCacheHitCount = 0;
   const byTool = new Map<string, { totalMs: number; calls: number }>();
+  let hostWorkMs = 0;
+  const byPhase = new Map<string, { totalMs: number; count: number }>();
 
   for (const event of metrics) {
     const durationMs = Number.isFinite(event.durationMs)
@@ -140,6 +155,14 @@ export function summarizeRunWallClockV1(
     if (event.kind === "model_chat" || event.kind === "model_stream") {
       modelMs += durationMs;
       modelCallCount += 1;
+      continue;
+    }
+    if (event.kind === "host_work") {
+      hostWorkMs += durationMs;
+      const phase = byPhase.get(event.name) ?? { totalMs: 0, count: 0 };
+      phase.totalMs += durationMs;
+      phase.count += 1;
+      byPhase.set(event.name, phase);
       continue;
     }
     if (event.kind !== "tool") continue;
@@ -171,6 +194,13 @@ export function summarizeRunWallClockV1(
     toolCallCount,
     toolCacheHitCount,
     slowestTools,
+    hostWorkMs,
+    hostWork: [...byPhase.entries()]
+      .map(([phase, entry]) => ({ phase, ...entry }))
+      .sort(
+        (left, right) =>
+          right.totalMs - left.totalMs || left.phase.localeCompare(right.phase),
+      ),
   };
 }
 
@@ -186,6 +216,16 @@ export function formatRunWallClockSummaryV1(
   if (summary.toolCacheHitCount > 0) {
     parts.push(
       `${summary.toolCacheHitCount} cached (${seconds(summary.toolCacheSavedMs)} avoided)`,
+    );
+  }
+  if (summary.hostWorkMs > 0) {
+    parts.push(
+      `host work ${seconds(summary.hostWorkMs)} (${summary.hostWork
+        .map(
+          (phase) =>
+            `${HOST_WORK_PHASE_LABELS[phase.phase] ?? phase.phase} ${seconds(phase.totalMs)}/${phase.count}`,
+        )
+        .join(", ")})`,
     );
   }
   if (summary.slowestTools.length > 0) {

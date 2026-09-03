@@ -14,6 +14,8 @@ import { buildMissionResumePlan } from "./missionResume";
 export const AGENT_RUN_NOTE_PATH = /^Agent Runs\/[^/]+\.md$/u;
 export const AGENT_RUN_GRAPH_PATH = /^Agent Runs\/Mission Graphs\/[^/]+\.md$/u;
 export const MAX_AGENT_RUN_TRASHES_PER_SESSION = 50;
+/** Run-note reads between event-loop yields during the load-time sweep. */
+export const RETENTION_READS_PER_YIELD = 20;
 
 /** Chat resume reasons that may age out. Not a second completeness predicate. */
 export const RETENTION_ALLOWED_CHAT_REASONS = [
@@ -138,6 +140,8 @@ export interface AgentRunRetentionVaultV1 {
     stat?: { mtime?: number };
   }>;
   read(file: { path: string }): Promise<string>;
+  /** Obsidian's cache-backed read; preferred for the sweep when present. */
+  cachedRead?(file: { path: string }): Promise<string>;
   getFileByPath?(path: string): unknown;
   getAbstractFileByPath?(path: string): unknown;
   trash?(file: unknown, system: boolean): Promise<void>;
@@ -160,6 +164,25 @@ export async function sweepAgentRunsRetentionBestEffort(input: {
 
     const files = input.vault.getFiles();
     const artifacts: RunRetentionArtifactV1[] = [];
+    // Reading a run note only matters when the selector could prune it: a
+    // note younger than the age cutoff never enters the aged-terminal set, and
+    // when the aged notes fit within maxTerminalRuns nothing can overflow the
+    // cap. Both facts come from mtimes alone, so the sweep reads nothing on the
+    // common load (an active vault of recent runs) instead of parsing every
+    // note under Agent Runs/ at layout-ready.
+    const ageCutoffMs =
+      (input.now ?? new Date()).getTime() - input.policy.retentionDays * DAY_MS;
+    const agedRunNoteCount = files.filter(
+      (file) =>
+        classifyOwnedAgentRunPath(file.path) === "run_note" &&
+        (file.stat?.mtime ?? 0) < ageCutoffMs,
+    ).length;
+    const readAgedNotes = agedRunNoteCount > input.policy.maxTerminalRuns;
+    const readNote =
+      typeof input.vault.cachedRead === "function"
+        ? (file: { path: string }) => input.vault.cachedRead!(file)
+        : (file: { path: string }) => input.vault.read(file);
+    let readsSinceYield = 0;
     for (const file of files) {
       const kind = classifyOwnedAgentRunPath(file.path);
       if (kind === "foreign") {
@@ -171,8 +194,18 @@ export async function sweepAgentRunsRetentionBestEffort(input: {
         kind,
       };
       if (kind === "run_note") {
+        if (!readAgedNotes || artifact.mtimeMs >= ageCutoffMs) {
+          // Unread notes fail closed in the selector (no Chat plan).
+          artifacts.push(artifact);
+          continue;
+        }
         try {
-          const markdown = await input.vault.read(file);
+          if (readsSinceYield >= RETENTION_READS_PER_YIELD) {
+            readsSinceYield = 0;
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          }
+          readsSinceYield += 1;
+          const markdown = await readNote(file);
           const ledger = parseMissionLedgerFromMarkdown(markdown);
           if (!ledger) {
             artifacts.push(artifact);

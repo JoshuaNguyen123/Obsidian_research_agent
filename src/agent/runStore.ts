@@ -1,3 +1,4 @@
+import { observeHostWorkV1 } from "./hostWork";
 import type { TFile } from "obsidian";
 import type { MissionAcceptanceResult } from "./missionAcceptance";
 import {
@@ -924,8 +925,10 @@ export async function writeMissionRuntimeSnapshot(
   }
 
   const vault = context.app.vault;
-  return withSerializedRunWrite(vault, requested.runId, () =>
-    persistMissionRuntimeSnapshotUnlocked(context, requested, snapshot),
+  return observeHostWorkV1(context, "persist_run_note", () =>
+    withSerializedRunWrite(vault, requested.runId, () =>
+      persistMissionRuntimeSnapshotUnlocked(context, requested, snapshot),
+    ),
   );
 }
 

@@ -283,6 +283,63 @@ test("createResearchPlanWithAssist lets the model set the starting research dept
   assert.equal(modelDeep!.effort?.tier, "extended");
 });
 
+test("the effort and subquestion assists run concurrently, effort still applied first", async () => {
+  const prompt = "Investigate onboarding validation briefly";
+  const runPlan = {
+    route: "grounded_workflow",
+    slowPathReason: "needs_web_sources",
+  } as const;
+  let releaseEffort!: (value: {
+    tier: "extended";
+    risk: "high";
+    freshness: "required";
+    rationale: string;
+  }) => void;
+  const effortVerdict = new Promise<{
+    tier: "extended";
+    risk: "high";
+    freshness: "required";
+    rationale: string;
+  }>((resolve) => {
+    releaseEffort = resolve;
+  });
+  let subquestionAssistInvoked = false;
+
+  const planPromise = createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    effortAssist: () => effortVerdict,
+    assist: async () => {
+      subquestionAssistInvoked = true;
+      return [
+        "What retention effects follow shorter onboarding?",
+        "Which validation gates catch write errors earliest?",
+      ];
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(
+    subquestionAssistInvoked,
+    true,
+    "the subquestion assist must not wait for the effort assist to answer",
+  );
+  releaseEffort({
+    tier: "extended",
+    risk: "high",
+    freshness: "required",
+    rationale: "Broad, high-stakes investigation.",
+  });
+  const plan = await planPromise;
+  assert.ok(plan);
+  assert.equal(plan!.effort?.tier, "extended", "the model-chosen depth still lands");
+  assert.ok(
+    plan!.subquestions.some((item) => /retention|validation gates/i.test(item.question)),
+    "the assisted subquestions still merge",
+  );
+});
+
 test("model effort assist is ignored without a utility model and validates its output", async () => {
   const prompt = "Investigate onboarding validation briefly";
   const runPlan = {

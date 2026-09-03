@@ -686,3 +686,61 @@ function deriveMemoryMode(input: {
   if (input.researchMemoryEnabled) return "research";
   return "off";
 }
+
+/**
+ * Settings that identify a connection or hold a credential. "Reset to
+ * defaults" keeps exactly these, so a user can recover from a mis-tuned
+ * configuration without re-entering keys or re-verifying providers.
+ */
+export const CONNECTION_SETTING_KEYS_V1 = [
+  "settingsSchemaVersion",
+  "modelProvider",
+  "ollamaApiKey",
+  "ollamaBaseUrl",
+  "openAiCompatibleApiKey",
+  "openAiCompatibleBaseUrl",
+  "model",
+  "modelConnectionVerifiedAt",
+  "modelConnectionVerifiedProvider",
+  "modelConnectionVerifiedModel",
+  "modelConnectionVerifiedBaseUrl",
+  "modelConnectionVerifiedAgenticCapabilities",
+  "modelConnectionVerifiedContextLength",
+  "specialistModel",
+  "specialistConnectionMode",
+  "specialistProvider",
+  "specialistBaseUrl",
+  "specialistApiKey",
+  "specialistConnectionVerifiedAt",
+  "specialistConnectionVerifiedProvider",
+  "specialistConnectionVerifiedModel",
+  "specialistConnectionVerifiedBaseUrl",
+  "specialistConnectionVerifiedMode",
+  "utilityModel",
+  "utilityModelProvider",
+  "utilityBaseUrl",
+  "utilityApiKey",
+  "companionBaseUrl",
+  "linearOAuthClientId",
+  "githubOAuthClientId",
+] as const;
+
+/**
+ * The new-install profile with the current connections and credentials
+ * carried over verbatim: every preference returns to its shipped default,
+ * nothing the user had to type or verify is lost. Pure; the caller persists.
+ */
+export function resetAgentSettingsKeepingConnectionsV1<
+  T extends Record<string, unknown>,
+>(current: T): NormalizedAgentSettings & Partial<T> {
+  const kept: Record<string, unknown> = {};
+  for (const key of CONNECTION_SETTING_KEYS_V1) {
+    if (key in current && current[key] !== undefined) {
+      kept[key] = current[key];
+    }
+  }
+  return {
+    ...normalizeAgentSettings(kept, "new_install"),
+    ...kept,
+  } as NormalizedAgentSettings & Partial<T>;
+}

@@ -4750,6 +4750,7 @@ test("run-note rewrites per tool call stay within the write budget", async () =>
   };
   const completions: AgentRunCompleteEvent[] = [];
   const traces: AgentTraceEvent[] = [];
+  const metrics: Array<{ kind: string; name: string; durationMs: number }> = [];
 
   await runAgentMission({
     prompt: "Search the vault for the initial note, then append a summary to the current note.",
@@ -4766,6 +4767,7 @@ test("run-note rewrites per tool call stay within the write budget", async () =>
     events: {
       onRunComplete: (event) => completions.push(event),
       onTrace: (event) => traces.push(event),
+      onMetric: (event) => metrics.push(event),
     },
   });
 
@@ -4808,4 +4810,23 @@ test("run-note rewrites per tool call stay within the write budget", async () =>
     `a mutation costs at most four run-note rewrites (intent, applying, committed+ledger, pre-model flush): ${shape}`,
   );
   assert.ok(total <= 11, `whole-run rewrite budget: ${shape}`);
+
+  // Every rewrite is attributed as host work, so the wall-clock line can name
+  // disk time; creates are observed too, hence "at least".
+  const runNoteWrites = metrics.filter(
+    (event) => event.kind === "host_work" && event.name === "persist_run_note",
+  );
+  assert.ok(
+    runNoteWrites.length >= total,
+    `host_work persist_run_note events (${runNoteWrites.length}) cover every rewrite (${total})`,
+  );
+  assert.ok(
+    runNoteWrites.every(
+      (event) => Number.isFinite(event.durationMs) && event.durationMs >= 0,
+    ),
+  );
+  assert.ok(
+    metrics.some((event) => event.kind === "host_work" && event.name === "persist_graph"),
+    "graph store writes are attributed as host work",
+  );
 });

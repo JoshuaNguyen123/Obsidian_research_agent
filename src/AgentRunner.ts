@@ -1316,7 +1316,7 @@ export interface AgentRunReceipt {
 }
 
 export interface AgentRunMetricEvent {
-  kind: "model_chat" | "model_stream" | "tool" | "run";
+  kind: "model_chat" | "model_stream" | "tool" | "run" | "host_work";
   name: string;
   step?: number;
   durationMs: number;
@@ -2823,10 +2823,21 @@ export async function runAgentMission({
     }
     return null;
   };
+  let hostWorkStep = 0;
   let runToolContext: ToolExecutionContext = {
     ...toolContext,
     originalPrompt: activeIntentPrompt,
     runtimeCache,
+    // Durable writers and the compactor report their time here; the wall-clock
+    // line at the end of the run splits it out (see summarizeRunWallClockV1).
+    // Metric only, no trace row: a line per durable write would be noise.
+    observeHostWork: (phase, durationMs) =>
+      events.onMetric?.({
+        kind: "host_work",
+        name: phase,
+        step: hostWorkStep > 0 ? hostWorkStep : undefined,
+        durationMs: Math.max(0, Math.round(durationMs)),
+      }),
     reportProgress: (message) => events.onStatus?.(message),
     reportCodeOutput: (event) => events.onCodeOutput?.(event),
     runId,
@@ -18652,6 +18663,7 @@ export async function runAgentMission({
     // The previous step's deferred ledger persist lands before the next
     // model wait, so a kill mid-call cannot leave the ledger a tool behind.
     await flushDeferredMissionLedger();
+    hostWorkStep = step;
     if (await stopIfRequested(step)) {
       return;
     }
@@ -18763,6 +18775,7 @@ export async function runAgentMission({
         missionLedger.continuationHandoffInvalid = undefined;
         await persistMissionLedger(`mission-ledger-compaction-handoff-${step}`);
       }
+      const compactionStartedAt = nowMs();
       const compacted = handoffValidation.ok
         ? compactLoopMessages({
             messages,
@@ -18796,6 +18809,12 @@ export async function runAgentMission({
             estimatedCharsAfter: estimatedPromptCharsForRun,
             rejectionReason: "invalid_handoff" as const,
           };
+      if (handoffValidation.ok) {
+        runToolContext.observeHostWork?.(
+          "compaction",
+          nowMs() - compactionStartedAt,
+        );
+      }
       if (compacted.applied) {
         messages.splice(0, messages.length, ...compacted.messages);
         estimatedPromptCharsForRun = compacted.estimatedCharsAfter;

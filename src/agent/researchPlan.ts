@@ -376,16 +376,37 @@ export async function createResearchPlanWithAssist(
   if (!plan) {
     return null;
   }
-  // Let the utility model set the starting research depth before anything else,
-  // so both the explicit-source and assisted-subquestion paths inherit it.
-  const effortAssessment =
+  // The effort assist and the subquestion assist both depend only on the
+  // prompt and the deterministic plan's mode and questions, not on each other,
+  // so they run concurrently: two utility-model round trips cost one wait.
+  // The effort verdict is still applied first, so the explicit-source and
+  // assisted-subquestion paths both inherit the model-chosen starting depth.
+  //
+  // An explicit source cardinality is a closed evidence-set contract. Do not
+  // let the optional utility planner expand a bounded two-source writeback
+  // into more evidence-bearing subquestions than the user authorized. The
+  // deterministic plan already distributes the exact source floor across the
+  // requested comparison and limitations work.
+  const explicitSourceSet = parseExplicitResearchSourceCount(input.prompt) !== null;
+  const deterministicQuestions = plan.subquestions.map((item) => item.question);
+  const [effortAssessment, assisted] = await Promise.all([
     input.utilityModelConfigured === true &&
     typeof input.effortAssist === "function"
-      ? await runResearchEffortAssist(input.effortAssist, {
+      ? runResearchEffortAssist(input.effortAssist, {
           prompt: input.prompt,
           mode: plan.mode,
         })
-      : undefined;
+      : Promise.resolve(undefined),
+    explicitSourceSet
+      ? Promise.resolve(null)
+      : maybeAssistResearchSubquestions({
+          prompt: input.prompt,
+          mode: plan.mode,
+          deterministicQuestions,
+          utilityModelConfigured: input.utilityModelConfigured === true,
+          assist: input.assist,
+        }),
+  ]);
   if (effortAssessment) {
     plan.effort = selectResearchEffort(
       input.prompt,
@@ -396,23 +417,7 @@ export async function createResearchPlanWithAssist(
       input.researchEffortCeiling,
     );
   }
-  // An explicit source cardinality is a closed evidence-set contract. Do not
-  // let the optional utility planner expand a bounded two-source writeback
-  // into more evidence-bearing subquestions than the user authorized. The
-  // deterministic plan already distributes the exact source floor across the
-  // requested comparison and limitations work.
-  if (parseExplicitResearchSourceCount(input.prompt) !== null) {
-    return plan;
-  }
-  const deterministicQuestions = plan.subquestions.map((item) => item.question);
-  const assisted = await maybeAssistResearchSubquestions({
-    prompt: input.prompt,
-    mode: plan.mode,
-    deterministicQuestions,
-    utilityModelConfigured: input.utilityModelConfigured === true,
-    assist: input.assist,
-  });
-  if (assisted.source !== "utility_assist") {
+  if (explicitSourceSet || !assisted || assisted.source !== "utility_assist") {
     return plan;
   }
   const deterministicEnvelope = new Map(

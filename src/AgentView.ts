@@ -3460,6 +3460,11 @@ export class AgentView extends ItemView {
   }
 
   private appendMetric(event: AgentRunMetricEvent) {
+    if (event.kind === "host_work") {
+      // Attributed host time is summarized in the run's wall-clock line; a
+      // status row per durable write would only be noise.
+      return;
+    }
     if (event.kind === "model_chat" || event.kind === "model_stream") {
       this.liveRunModelCalls += 1;
     } else if (event.kind === "tool") {

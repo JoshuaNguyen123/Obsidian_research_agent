@@ -1,3 +1,4 @@
+import { observeHostWorkV1 } from "./hostWork";
 import type { ToolExecutionContext } from "../tools/types";
 import {
   acquireResourceLocks,
@@ -3462,15 +3463,17 @@ export class MissionGraphSession {
       reason: reason.slice(0, 2_000),
       operations: clone(operations),
     };
-    const result = await persistMissionGraphPatchTransaction(
-      this.context,
-      this.record.missionId,
-      patch,
-      {
-        expectedStoreRevision: this.record.storeRevision,
-        preparedAt: now,
-        appliedAt: now,
-      },
+    const result = await observeHostWorkV1(this.context, "persist_graph", () =>
+      persistMissionGraphPatchTransaction(
+        this.context,
+        this.record.missionId,
+        patch,
+        {
+          expectedStoreRevision: this.record.storeRevision,
+          preparedAt: now,
+          appliedAt: now,
+        },
+      ),
     );
     this.record = result.record;
     this.emit(patch);

@@ -1,5 +1,6 @@
-import { realpathSync } from "node:fs";
+import { readdirSync, realpathSync, statSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const env = { ...process.env };
@@ -29,6 +30,36 @@ const testConcurrency = Number.isFinite(configured) && configured >= 1
   ? configured
   : Math.max(1, Math.min(6, availableParallelism() - 1));
 
+// Node starts test files in argument order, and the suite's wall clock is
+// bounded by its longest files (tests/AgentRunner.test.ts alone runs about two
+// minutes). Largest-first ordering lets those files overlap the rest of the
+// suite instead of extending its tail. File size is the proxy for duration:
+// it needs no recorded timings and is stable across machines. TEST_FILE_ORDER=
+// alpha restores the glob order for bisecting order dependence.
+function collectTestFiles(directory) {
+  const files = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...collectTestFiles(entryPath));
+    } else if (entry.isFile() && entry.name.endsWith(".test.ts")) {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
+const testFiles = collectTestFiles("tests");
+if (process.env.TEST_FILE_ORDER !== "alpha") {
+  const sizes = new Map(testFiles.map((file) => [file, statSync(file).size]));
+  testFiles.sort(
+    (left, right) =>
+      sizes.get(right) - sizes.get(left) || left.localeCompare(right),
+  );
+} else {
+  testFiles.sort((left, right) => left.localeCompare(right));
+}
+
 const result = spawnSync(
   process.execPath,
   [
@@ -36,7 +67,7 @@ const result = spawnSync(
     "tsx",
     "--test",
     `--test-concurrency=${testConcurrency}`,
-    "tests/**/*.test.ts",
+    ...testFiles,
   ],
   {
     cwd: process.cwd(),

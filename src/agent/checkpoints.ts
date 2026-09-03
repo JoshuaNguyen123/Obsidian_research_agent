@@ -1,3 +1,4 @@
+import { observeHostWorkV1 } from "./hostWork";
 import type { TFile } from "obsidian";
 import type { RunRoute } from "../AgentRunner";
 import type { ToolExecutionContext } from "../tools/types";
@@ -54,7 +55,8 @@ export async function appendAgentRunCheckpoint(
   checkpoint: AgentRunCheckpoint,
 ): Promise<AgentRunCheckpointWriteResult> {
   const vault = context.app.vault;
-  return withSerializedRunWrite(vault, checkpoint.runId, async () => {
+  return observeHostWorkV1(context, "persist_run_note", () =>
+    withSerializedRunWrite(vault, checkpoint.runId, async () => {
     const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
     const path = getAgentRunCheckpointPath(checkpoint.runId);
     const entry = formatCheckpointEntry(checkpoint);
@@ -110,7 +112,8 @@ export async function appendAgentRunCheckpoint(
       path,
       bytesWritten: getByteLength(entry),
     };
-  });
+    }),
+  );
 }
 
 export async function readLatestAgentRunCheckpoint(

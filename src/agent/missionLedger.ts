@@ -1,3 +1,4 @@
+import { observeHostWorkV1 } from "./hostWork";
 import type { TFile } from "obsidian";
 import type { LoopBudgetPlan } from "./loopPlanner";
 import {
@@ -1069,7 +1070,8 @@ export async function writeMissionLedger(
     requestedLedger,
     readPluginVersionStampFromHost(context),
   );
-  return withSerializedRunWrite(vault, ledger.runId, async () => {
+  return observeHostWorkV1(context, "persist_run_note", () =>
+    withSerializedRunWrite(vault, ledger.runId, async () => {
     const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
     const path = getMissionLedgerPath(requestedLedger.runId);
 
@@ -1141,7 +1143,8 @@ export async function writeMissionLedger(
       bytesWritten: getByteLength(block),
       revision: requestedLedger.revision,
     };
-  });
+    }),
+  );
 }
 
 export interface MissionLedgerAndSnapshotWriteResult {
@@ -1182,7 +1185,8 @@ export async function writeMissionLedgerWithRuntimeSnapshot(
     readPluginVersionStampFromHost(context),
   );
   const requestedSnapshot = cloneNormalizedMissionRuntimeSnapshot(snapshot);
-  return withSerializedRunWrite(vault, ledger.runId, async () => {
+  return observeHostWorkV1(context, "persist_run_note", () =>
+    withSerializedRunWrite(vault, ledger.runId, async () => {
     const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
     if (!vault.getFolderByPath(folderPath)) {
       try {
@@ -1279,7 +1283,8 @@ export async function writeMissionLedgerWithRuntimeSnapshot(
         commitProof,
       },
     };
-  });
+    }),
+  );
 }
 
 export async function readMissionLedgerByRunId(
