@@ -324,7 +324,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   ollamaBaseUrl: "https://ollama.com/api",
   openAiCompatibleApiKey: "",
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
-  model: "deepseek-v4-pro",
+  model: "glm-5.3-flash:cloud",
   e2eHarnessAttestationEnabled: false,
   specialistEnabled: true,
   specialistModel: "",

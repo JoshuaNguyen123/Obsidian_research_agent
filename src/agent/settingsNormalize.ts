@@ -8,6 +8,7 @@ import { normalizeScheduledMissions } from "./missionScheduler";
 import type { AutonomyProfile, OutputProfile } from "./noteOutputPolicy";
 import { deriveOutputProfileFromLegacy } from "./noteOutputPolicy";
 import { repairOllamaCloudBaseUrl } from "../model/cloudProviderPresets";
+import { DEFAULT_STREAM_REQUEST_TIMEOUT_MS } from "../model/requestTimeoutDefaults";
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 
@@ -170,7 +171,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   ollamaBaseUrl: "https://ollama.com/api",
   openAiCompatibleApiKey: "",
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
-  model: "deepseek-v4-pro",
+  model: "glm-5.3-flash:cloud",
   specialistEnabled: true,
   specialistModel: "",
   specialistConnectionMode: "shared_primary",
@@ -179,7 +180,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   modelRouterEnabled: true,
   modelRouterMode: "authority",
   enableStreaming: true,
-  requestTimeoutMs: 180000,
+  requestTimeoutMs: DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
   maxAgentSteps: MAX_AGENT_STEPS,
   maxRunMinutes: null,
   autoContinueLongRuns: true,
