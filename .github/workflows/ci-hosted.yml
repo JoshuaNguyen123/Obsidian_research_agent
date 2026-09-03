@@ -38,6 +38,9 @@ jobs:
       - name: Path hygiene
         run: npm run check:path-hygiene
 
+      - name: EOL hygiene
+        run: npm run check:eol-hygiene
+
       - name: Style tokens
         run: npm run check:style-tokens
 

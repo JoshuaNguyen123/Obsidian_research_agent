@@ -1,0 +1,73 @@
+name: Release plugin artifacts
+
+on:
+  push:
+    tags:
+      # Obsidian community releases require the tag to equal manifest.json
+      # version exactly (no "v" prefix), e.g. 0.4.0.
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# WARNING: THIS REPOSITORY IS PUBLIC.
+# Workflow logs and release assets here are world-readable. This lane runs on
+# hosted Ubuntu, injects no secret beyond the ephemeral GITHUB_TOKEN needed to
+# create the release, and must never run live e2e, load model/API keys, or
+# print vault/note content.
+jobs:
+  release:
+    name: Build, verify, and publish tagged release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Assert tag matches manifest and versions map
+        run: |
+          node -e '
+            const fs = require("fs");
+            const tag = process.env.GITHUB_REF_NAME;
+            const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            const versions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const problems = [];
+            if (manifest.version !== tag) problems.push(`manifest.json version ${manifest.version} != tag ${tag}`);
+            if (pkg.version !== tag) problems.push(`package.json version ${pkg.version} != tag ${tag}`);
+            if (versions[tag] !== manifest.minAppVersion) problems.push(`versions.json[${tag}] (${versions[tag]}) != manifest minAppVersion ${manifest.minAppVersion}`);
+            if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
+            console.log(`Tag ${tag} matches manifest (minAppVersion ${manifest.minAppVersion}).`);
+          '
+
+      - name: Production build
+        run: npm run build
+
+      - name: Bundle parity against tagged commit
+        run: npm run check:bundle-parity
+
+      - name: Create GitHub release with plugin artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            main.js manifest.json styles.css companion-assets.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Agentic Researcher $GITHUB_REF_NAME" \
+            --notes "Obsidian installs main.js, manifest.json, and styles.css automatically. companion-assets.json is optional: copy it into .obsidian/plugins/agentic-researcher/ to enable the background Companion capability; the plugin degrades gracefully without it."
