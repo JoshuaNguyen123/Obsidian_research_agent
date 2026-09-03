@@ -37,6 +37,24 @@ export interface EmbeddingProbeResultV1 {
   setupAction: string | null;
   /** Which prefix convention this model resolves to, so a mismatch is visible. */
   prefixes: EmbeddingPrefixPairV1;
+  /**
+   * Measured indexing speed when the caller supplied a sample: how many
+   * documents the runtime embedded per second. This is the number a user
+   * needs when choosing a model, and it depends on their CPU, so it is
+   * measured here rather than copied from a table.
+   */
+  throughput: { documents: number; ms: number; perSecond: number } | null;
+}
+
+/**
+ * Sixteen documents of roughly two hundred tokens: long enough that the
+ * measurement reflects note-sized chunks rather than helper overhead, short
+ * enough that a slow model finishes in a few seconds.
+ */
+export function buildEmbeddingThroughputSampleV1(): string[] {
+  const sentence =
+    "The semantic index splits each note into overlapping windows, embeds them with a local model, and stores the vectors beside the note metadata so a search can rank by meaning as well as by words. ";
+  return Array.from({ length: 16 }, (_, index) => `${sentence.repeat(6)}Sample ${index + 1}.`);
 }
 
 export async function probeEmbeddingProviderV1({
@@ -45,6 +63,7 @@ export async function probeEmbeddingProviderV1({
   dim,
   cacheDir,
   now = () => Date.now(),
+  throughputSample,
 }: {
   provider: SemanticEmbeddingProvider | null;
   model: string;
@@ -52,6 +71,8 @@ export async function probeEmbeddingProviderV1({
   dim: number;
   cacheDir?: string;
   now?: () => number;
+  /** Documents to time after the basic probe passes; omitted = no throughput figure. */
+  throughputSample?: string[];
 }): Promise<EmbeddingProbeResultV1> {
   const prefixes = resolveEmbeddingPrefixesV1(model);
   const effective = resolveEffectiveEmbeddingDimV1(model, dim);
@@ -60,6 +81,7 @@ export async function probeEmbeddingProviderV1({
     model,
     requestedDim,
     prefixes,
+    throughput: null,
   };
 
   if (!provider) {
@@ -146,14 +168,46 @@ export async function probeEmbeddingProviderV1({
     };
   }
 
+  let throughput: EmbeddingProbeResultV1["throughput"] = null;
+  if (throughputSample && throughputSample.length > 0) {
+    const sampleStartedAt = now();
+    try {
+      const sampled = await provider.embed({
+        model,
+        dim: requestedDim,
+        matryoshka: effective.matryoshka,
+        cacheDir,
+        documents: throughputSample,
+        queries: [],
+        queryPrefix: prefixes.query,
+        documentPrefix: prefixes.document,
+      });
+      const ms = Math.max(1, now() - sampleStartedAt);
+      if (sampled.ok && sampled.documents?.length === throughputSample.length) {
+        throughput = {
+          documents: throughputSample.length,
+          ms,
+          perSecond: Number(((throughputSample.length * 1000) / ms).toFixed(1)),
+        };
+      }
+    } catch {
+      // The basic probe already passed; a failed timing sample is not a
+      // broken runtime, just a missing number.
+      throughput = null;
+    }
+  }
+
   return {
     ...base,
     ok: true,
     dim: queryVector.length,
     latencyMs,
     cause: "healthy",
-    message: `Embeddings working: ${model} at ${requestedDim} dimensions in ${latencyMs}ms.`,
+    message: throughput
+      ? `Embeddings working: ${model} at ${requestedDim} dimensions, ${latencyMs}ms for one document, about ${throughput.perSecond} documents/s on this machine.`
+      : `Embeddings working: ${model} at ${requestedDim} dimensions in ${latencyMs}ms.`,
     setupAction: null,
+    throughput,
   };
 }
 

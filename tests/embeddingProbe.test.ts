@@ -156,3 +156,43 @@ test("a provider that throws is caught rather than crashing settings", async () 
   assert.equal(result.cause, "embedding_call_failed");
   assert.match(result.message, /spawn ENOENT/u);
 });
+
+test("a throughput sample reports documents per second on this machine", async () => {
+  // The number a user needs when choosing a model depends on their CPU, so
+  // it is measured by the probe rather than copied from a table.
+  let clock = 0;
+  const provider: SemanticEmbeddingProvider = {
+    embed: async (request) => {
+      // Basic probe: instant. Sample of 16 documents: two simulated seconds.
+      clock += request.documents.length > 1 ? 2000 : 10;
+      return {
+        ok: true,
+        model: request.model,
+        dim: request.dim,
+        documents: request.documents.map(() => vector(512)[0]),
+        queries: request.queries.map(() => vector(512)[0]),
+      };
+    },
+  };
+  const result = await probeEmbeddingProviderV1({
+    provider,
+    model: "nomic-ai/nomic-embed-text-v1.5-Q",
+    dim: 512,
+    now: () => clock,
+    throughputSample: Array.from({ length: 16 }, (_, index) => `sample ${index}`),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.throughput, { documents: 16, ms: 2000, perSecond: 8 });
+  assert.match(formatEmbeddingProbeResultV1(result), /about 8 documents\/s/);
+});
+
+test("without a sample the probe reports no throughput and its message is unchanged", async () => {
+  const result = await probeEmbeddingProviderV1({
+    provider: providerReturning({ documents: vector(512), queries: vector(512) }),
+    model: "nomic-ai/nomic-embed-text-v1.5-Q",
+    dim: 512,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.throughput, null);
+  assert.match(result.message, /^Embeddings working: .* in \d+ms\.$/);
+});
