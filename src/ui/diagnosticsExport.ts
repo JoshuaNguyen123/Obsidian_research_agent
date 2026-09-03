@@ -87,6 +87,12 @@ export interface DiagnosticsExportInputV1 {
   obsidianVersion?: string | null;
   platform?: string | null;
   startupPhase?: string | null;
+  /** Load-time instrument from the plugin (`getStartupTiming()`); absent until ready. */
+  startupTiming?: {
+    coreReadyMs?: number | null;
+    phases?: Record<string, number> | null;
+    runNoteCount?: number | null;
+  } | null;
   sandboxLastProbe?: {
     observedAt?: string | null;
     status?: {
@@ -156,6 +162,7 @@ export interface DiagnosticsExportReportV1 {
   obsidianVersion: string | null;
   platform: string | null;
   startupPhase: string | null;
+  startup: DiagnosticsStartupTimingV1 | null;
   sandbox: { lastProbe: DiagnosticsSandboxProbeV1 | null };
   model: DiagnosticsModelIdentityV1;
   lastFailure: DiagnosticsLastFailureV1 | null;
@@ -382,6 +389,39 @@ export function extractFailureEvidenceFromRunSnapshotV1(
   });
 }
 
+export interface DiagnosticsStartupTimingV1 {
+  coreReadyMs: number;
+  runNoteCount: number | null;
+  phases: Record<string, number>;
+}
+
+function sanitizeStartupTiming(
+  value: DiagnosticsExportInputV1["startupTiming"],
+): DiagnosticsStartupTimingV1 | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const coreReadyMs =
+    typeof value.coreReadyMs === "number" && Number.isFinite(value.coreReadyMs)
+      ? Math.max(0, value.coreReadyMs)
+      : null;
+  if (coreReadyMs === null) {
+    return null;
+  }
+  const phases: Record<string, number> = {};
+  for (const [phase, ms] of Object.entries(value.phases ?? {}).slice(0, 32)) {
+    const key = sanitizeIdentity(phase);
+    if (key && typeof ms === "number" && Number.isFinite(ms)) {
+      phases[key] = Math.max(0, ms);
+    }
+  }
+  const runNoteCount =
+    typeof value.runNoteCount === "number" && Number.isFinite(value.runNoteCount)
+      ? Math.max(0, Math.floor(value.runNoteCount))
+      : null;
+  return { coreReadyMs, runNoteCount, phases };
+}
+
 export function buildDiagnosticsReportV1(
   input: DiagnosticsExportInputV1 = {},
 ): DiagnosticsExportReportV1 {
@@ -411,6 +451,7 @@ export function buildDiagnosticsReportV1(
     obsidianVersion: sanitizeIdentity(input.obsidianVersion),
     platform: sanitizeIdentity(input.platform),
     startupPhase: sanitizeIdentity(input.startupPhase),
+    startup: sanitizeStartupTiming(input.startupTiming),
     sandbox: { lastProbe: sanitizeSandboxProbe(input.sandboxLastProbe) },
     model: {
       id: sanitizeIdentity(input.model?.id),
@@ -441,6 +482,17 @@ export function formatDiagnosticsReportMarkdownV1(
     `- Model: ${report.model.id ?? "unknown"}`,
     `- Provider: ${report.model.provider ?? "unknown"}`,
   ];
+
+  if (report.startup) {
+    lines.push("", "## Startup");
+    lines.push(`- Core ready: ${report.startup.coreReadyMs} ms`);
+    if (report.startup.runNoteCount !== null) {
+      lines.push(`- Run notes in vault: ${report.startup.runNoteCount}`);
+    }
+    for (const [phase, ms] of Object.entries(report.startup.phases)) {
+      lines.push(`- ${phase}: ${ms} ms`);
+    }
+  }
 
   const probe = report.sandbox.lastProbe;
   if (probe) {

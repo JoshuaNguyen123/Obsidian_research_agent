@@ -1,3 +1,4 @@
+import * as runStoreForStatusTest from "../src/agent/runStore";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -343,8 +344,12 @@ async function createGraph(
 function createVaultHarness(): {
   context: ToolExecutionContext;
   files: Map<string, string>;
+  reads: string[];
+  frontmatter: Map<string, Record<string, unknown>>;
 } {
   const files = new Map<string, string>();
+  const reads: string[] = [];
+  const frontmatter = new Map<string, Record<string, unknown>>();
   const folders = new Set<string>();
   const mtimes = new Map<string, number>();
   let mtime = 1_000;
@@ -377,7 +382,10 @@ function createVaultHarness(): {
       mtimes.set(path, ++mtime);
       return getFileByPath(path);
     },
-    read: async (file: { path: string }) => files.get(file.path) ?? "",
+    read: async (file: { path: string }) => {
+      reads.push(file.path);
+      return files.get(file.path) ?? "";
+    },
     modify: async (file: { path: string }, content: string) => {
       files.set(file.path, content);
       mtimes.set(file.path, ++mtime);
@@ -385,8 +393,18 @@ function createVaultHarness(): {
   };
   return {
     files,
+    reads,
+    frontmatter,
     context: {
-      app: { vault },
+      app: {
+        vault,
+        metadataCache: {
+          getFileCache: (file: { path: string }) => {
+            const cached = frontmatter.get(file.path);
+            return cached ? { frontmatter: cached } : null;
+          },
+        },
+      },
       settings: {},
       originalPrompt: "startup hydration test",
       httpTransport: {},
@@ -429,4 +447,74 @@ test("startup hydration stops at the newest resumable run and never reads the ol
     [],
     `older run notes must not be read on the load path: ${JSON.stringify([...readsByPath])}`,
   );
+});
+
+test("terminal run notes announced by the metadata cache are skipped without a read", async () => {
+  const { context, files, reads, frontmatter } = createVaultHarness();
+  const write = (
+    runId: string,
+    status: "running" | "complete",
+    createdAt: string,
+  ) =>
+    runStoreForStatusTest.writeMissionRuntimeSnapshot(
+      context,
+      runStoreForStatusTest.createMissionRuntimeSnapshot({
+        runId,
+        originalMission: `mission ${runId}`,
+        status,
+        createdAt: new Date(createdAt),
+      }),
+    );
+  await write("run-old-running", "running", "2026-07-11T10:00:00.000Z");
+  await writeMissionLedger(
+    context,
+    createMissionLedger({
+      runId: "run-old-running",
+      mission: "mission run-old-running",
+      route: "grounded_workflow",
+      loopBudget: {
+        hardCap: 4,
+        toolStepBudget: 2,
+        finalizationReserve: 1,
+        expectedTools: ["web_search"],
+        stopWhenSatisfied: true,
+      },
+    }),
+  );
+  await write("run-new-complete-1", "complete", "2026-07-11T11:00:00.000Z");
+  await write("run-new-complete-2", "complete", "2026-07-11T12:00:00.000Z");
+
+  // The product wrote the status property in the same rewrite as the fence;
+  // the metadata cache is what Obsidian would index from those bytes.
+  for (const runId of ["run-new-complete-1", "run-new-complete-2"]) {
+    const note = files.get(`Agent Runs/${runId}.md`) ?? "";
+    assert.match(note, /^---\nagentic_run_status: complete\n---\n/);
+    frontmatter.set(`Agent Runs/${runId}.md`, { agentic_run_status: "complete" });
+  }
+  // The ledger write spliced into the marked note without disturbing the
+  // property (a ledger-only rewrite carries no status of its own).
+  assert.match(
+    files.get("Agent Runs/run-old-running.md") ?? "",
+    /^---\nagentic_run_status: running\n---\n# Agent Run run-old-running\n/,
+  );
+  assert.match(files.get("Agent Runs/run-old-running.md") ?? "", /## Mission Ledger/);
+
+  reads.length = 0;
+  await loadLatestPersistedMissionRunProjection(context);
+  assert.deepEqual(
+    reads.filter((path) => path.startsWith("Agent Runs/run-new-complete")),
+    [],
+    `terminal notes were read on the load path: ${reads.join(", ")}`,
+  );
+  assert.ok(
+    reads.includes("Agent Runs/run-old-running.md"),
+    "the resumable note is still read",
+  );
+
+  // A missing (or stale) cache entry falls back to reading, never to skipping.
+  frontmatter.delete("Agent Runs/run-new-complete-2.md");
+  reads.length = 0;
+  await loadLatestPersistedMissionRunProjection(context);
+  assert.ok(reads.includes("Agent Runs/run-new-complete-2.md"));
+  assert.ok(!reads.includes("Agent Runs/run-new-complete-1.md"));
 });

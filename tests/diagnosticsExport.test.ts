@@ -54,6 +54,32 @@ describe("diagnostics export builder", () => {
     assert.doesNotMatch(markdown, /api[_-]?key/i);
   });
 
+  it("carries startup timing into the report and the markdown when the plugin measured it", () => {
+    const report = buildDiagnosticsReportV1({
+      startupPhase: "ready",
+      startupTiming: {
+        coreReadyMs: 87.4,
+        runNoteCount: 214,
+        phases: { load_settings: 12, load_project_memory: 31.2, negative: -3 },
+      },
+    });
+    assert.deepEqual(report.startup, {
+      coreReadyMs: 87.4,
+      runNoteCount: 214,
+      phases: { load_settings: 12, load_project_memory: 31.2, negative: 0 },
+    });
+    const markdown = formatDiagnosticsReportMarkdownV1(report);
+    assert.match(markdown, /## Startup/);
+    assert.match(markdown, /Core ready: 87\.4 ms/);
+    assert.match(markdown, /Run notes in vault: 214/);
+    assert.match(markdown, /load_project_memory: 31\.2 ms/);
+    assert.equal(buildDiagnosticsReportV1({ startupPhase: "ready" }).startup, null);
+    assert.doesNotMatch(
+      formatDiagnosticsReportMarkdownV1(buildDiagnosticsReportV1({})),
+      /## Startup/,
+    );
+  });
+
   it("redacts secrets from stop detail and tool errors", () => {
     const { json, markdown } = reportText({
       pluginVersion: "0.4.0",

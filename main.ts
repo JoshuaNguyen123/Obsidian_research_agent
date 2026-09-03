@@ -1,4 +1,9 @@
 import {
+  createStartupTimer,
+  formatStartupTimingLine,
+  type PluginStartupTimingV1,
+} from "./src/pluginStartupTiming";
+import {
   Notice,
   Plugin,
   TAbstractFile,
@@ -1069,11 +1074,13 @@ export default class AgenticResearcherPlugin extends Plugin {
   private extensionHealthPostMigrationTimer: ReturnType<typeof setTimeout> | null = null;
   private startupPhase = "constructed";
   private startupFailure: string | null = null;
+  private startupTiming: PluginStartupTimingV1 | null = null;
   private startupExistingViewCreator: string | null = null;
 
   async onload() {
     // Register the native view before the first asynchronous boundary. If a
     // migration is slow, a persisted pane can otherwise render as an orphan.
+    const startupTimer = createStartupTimer();
     this.startupPhase = "registering_view";
     const viewCreator = (leaf: WorkspaceLeaf) => new AgentView(leaf, this);
     Object.defineProperty(viewCreator, "__agenticResearcherViewOwner", {
@@ -1152,6 +1159,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         () => this.scheduleCompanionMissionReconciliation(0),
       ),
     );
+    startupTimer.mark("register_view");
     this.startupPhase = "loading_settings";
     try {
       await this.loadSettings();
@@ -1161,12 +1169,14 @@ export default class AgenticResearcherPlugin extends Plugin {
       console.error("Agentic Researcher failed to load persisted settings.", error);
       throw error;
     }
+    startupTimer.mark("load_settings");
     this.startupPhase = "initializing_semantic_index";
     this.semanticIndexService = this.createSemanticIndexService();
     this.semanticIndexNeedsBootstrap = this.settings.semanticIndexEnabled;
     this.updateLastActiveMarkdownFile(this.resolveCurrentMarkdownFile());
     // Project memory and the durable-run projection read different files
     // and share no state; awaiting them in sequence made load pay for both.
+    startupTimer.mark("create_semantic_index_service");
     this.startupPhase = "loading_project_memory";
     await Promise.all([
       this.loadProjectMemoryData(),
@@ -1175,7 +1185,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         await this.hydrateLatestMissionRunProjection();
       })(),
     ]);
+    startupTimer.mark("load_project_memory");
     await this.reconcilePersistedOrchestratorProjection();
+    startupTimer.mark("reconcile_orchestrator_projection");
 
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
@@ -1280,9 +1292,15 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.agentSettingTab = new AgentSettingTab(this.app, this);
     this.addSettingTab(this.agentSettingTab);
     this.coreApiHost.markReady();
+    startupTimer.mark("register_settings_tab");
     this.startupPhase = "initializing_bundled_capabilities";
     await this.initializeBundledCapabilities();
     this.startupPhase = "ready";
+    startupTimer.mark("initialize_bundled_capabilities");
+    this.startupTiming = startupTimer.finish({
+      runNoteCount: this.countAgentRunNotesForStartupTiming(),
+    });
+    console.info(formatStartupTimingLine(this.startupTiming));
     this.app.workspace.trigger(AGENTIC_RESEARCHER_CORE_READY_EVENT);
     this.refreshAgentView();
     this.startMissionScheduler();
@@ -1487,6 +1505,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       obsidianVersion,
       platform: typeof process !== "undefined" ? process.platform : null,
       startupPhase: this.startupPhase,
+      startupTiming: this.startupTiming,
       sandboxLastProbe: this.readSandboxLastProbeForDiagnostics(),
       model: {
         id: this.settings.model,
@@ -8773,6 +8792,33 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   isMissionRunning(): boolean {
     return this.runCoordinator.isRunning();
+  }
+
+  private countAgentRunNotesForStartupTiming(): number | null {
+    try {
+      const prefix = "Agent Runs/";
+      return this.app.vault
+        .getFiles()
+        .filter(
+          (file) =>
+            file.extension === "md" &&
+            file.path.startsWith(prefix) &&
+            !file.path.slice(prefix.length).includes("/"),
+        ).length;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Load-time instrument: onload entry to the core-ready event, split by
+   * immediate-phase task. Null until the plugin is ready. Read by the
+   * diagnostics export and by `scripts/measure-startup-timing.mjs`.
+   */
+  getStartupTiming(): PluginStartupTimingV1 | null {
+    return this.startupTiming
+      ? { ...this.startupTiming, phases: { ...this.startupTiming.phases } }
+      : null;
   }
 
   getMissionRunSnapshot(): RunCoordinatorSnapshot {

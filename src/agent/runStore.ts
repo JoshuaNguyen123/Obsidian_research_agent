@@ -1,3 +1,9 @@
+import {
+  applyRunNoteStatusFrontmatter,
+  isIncompleteRuntimeStatus,
+  readRunNoteStatusFromMetadataCache,
+  type MissionRuntimeStatus,
+} from "./runNoteStatus";
 import { observeHostWorkV1 } from "./hostWork";
 import type { TFile } from "obsidian";
 import type { MissionAcceptanceResult } from "./missionAcceptance";
@@ -97,13 +103,11 @@ const RUNTIME_SNAPSHOT_HEADING = "## Runtime Snapshot";
 const RUNTIME_SNAPSHOT_BLOCK_PATTERN =
   /## Runtime Snapshot\r?\n```json\r?\n[\s\S]*?\r?\n```/;
 
-export type MissionRuntimeStatus =
-  | "running"
-  | "paused"
-  | "blocked"
-  | "complete"
-  | "stopped"
-  | "failed";
+/**
+ * Derived from the frontmatter vocabulary in `runNoteStatus.ts`, so the
+ * snapshot writer, the load-path cache skip, and the parser share one list.
+ */
+export type { MissionRuntimeStatus } from "./runNoteStatus";
 
 export interface MissionRunLineage {
   rootRunId: string;
@@ -1080,7 +1084,10 @@ async function persistMissionRuntimeSnapshotUnlocked(
   );
 
   if (!file) {
-    const content = `# Agent Run ${sanitizeRunId(requested.runId)}\n\n${block}`;
+    const content = applyRunNoteStatusFrontmatter(
+      `# Agent Run ${sanitizeRunId(requested.runId)}\n\n${block}`,
+      requested.status,
+    );
     await vault.create(path, content);
     commitMissionRuntimeSnapshotRevision(requested, revisionTarget);
     return {
@@ -1091,7 +1098,11 @@ async function persistMissionRuntimeSnapshotUnlocked(
     };
   }
 
-  const next = replaceRuntimeSnapshotBlock(current, block);
+  // The status property rides the same rewrite as the fence it summarizes.
+  const next = applyRunNoteStatusFrontmatter(
+    replaceRuntimeSnapshotBlock(current, block),
+    requested.status,
+  );
   const commitProof = await persistAgentRunMarkdownExact({
     path,
     expectedMarkdown: next,
@@ -1285,6 +1296,12 @@ export async function readLatestIncompleteMissionRuntimeSnapshot(
     .sort((left, right) => (right.stat?.mtime ?? 0) - (left.stat?.mtime ?? 0));
 
   for (const file of candidates) {
+    // Terminal notes announce their status in frontmatter; the metadata cache
+    // answers without a read (unknown or stale entries fall back to reading).
+    const cachedStatus = readRunNoteStatusFromMetadataCache(context.app, file);
+    if (cachedStatus && !isIncompleteRuntimeStatus(cachedStatus)) {
+      continue;
+    }
     const runKey = file.basename || file.path;
     const loaded = await withSerializedRunWrite(vault, runKey, async () => {
       const markdown = await vault.read(file);
@@ -4432,7 +4449,7 @@ function hasRuntimeSnapshotVaultApi(context: ToolExecutionContext): boolean {
 function isIncompleteRuntimeSnapshot(
   snapshot: MissionRuntimeSnapshotV2,
 ): boolean {
-  return snapshot.status !== "complete";
+  return isIncompleteRuntimeStatus(snapshot.status);
 }
 
 function isAlreadyExistsError(error: unknown): boolean {

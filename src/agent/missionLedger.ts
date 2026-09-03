@@ -1,3 +1,8 @@
+import {
+  applyRunNoteStatusFrontmatter,
+  isIncompleteRuntimeStatus,
+  readRunNoteStatusFromMetadataCache,
+} from "./runNoteStatus";
 import { observeHostWorkV1 } from "./hostWork";
 import type { TFile } from "obsidian";
 import type { LoopBudgetPlan } from "./loopPlanner";
@@ -1228,9 +1233,12 @@ export async function writeMissionLedgerWithRuntimeSnapshot(
     };
 
     if (!file) {
-      const content = replaceRuntimeSnapshotBlock(
-        `# Agent Run ${sanitizeRunId(requestedLedger.runId)}\n\n${ledgerBlock}`,
-        snapshotBlock,
+      const content = applyRunNoteStatusFrontmatter(
+        replaceRuntimeSnapshotBlock(
+          `# Agent Run ${sanitizeRunId(requestedLedger.runId)}\n\n${ledgerBlock}`,
+          snapshotBlock,
+        ),
+        requestedSnapshot.status,
       );
       await vault.create(path, content);
       commitBoth();
@@ -1246,9 +1254,12 @@ export async function writeMissionLedgerWithRuntimeSnapshot(
       };
     }
 
-    const next = replaceRuntimeSnapshotBlock(
-      replaceMissionLedgerBlock(current, ledgerBlock),
-      snapshotBlock,
+    const next = applyRunNoteStatusFrontmatter(
+      replaceRuntimeSnapshotBlock(
+        replaceMissionLedgerBlock(current, ledgerBlock),
+        snapshotBlock,
+      ),
+      requestedSnapshot.status,
     );
     const commitProof = await persistAgentRunMarkdownExact({
       path,
@@ -1339,6 +1350,13 @@ export async function readMissionLedgerByRunId(
       .slice(0, 256);
     for (const candidate of candidates) {
       if (candidate.path === path && file) continue;
+      // A note the metadata cache marks terminal cannot carry the ledger of
+      // a resumable run (ledger and snapshot share one run id and one note).
+      const cachedStatus = readRunNoteStatusFromMetadataCache(
+        context.app,
+        candidate,
+      );
+      if (cachedStatus && !isIncompleteRuntimeStatus(cachedStatus)) continue;
       const content = await context.app.vault.read(candidate);
       const ledger = parseMissionLedgerFromMarkdown(content);
       if (ledger?.runId === runId) {

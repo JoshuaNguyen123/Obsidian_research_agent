@@ -1,3 +1,7 @@
+import {
+  isIncompleteRuntimeStatus,
+  readRunNoteStatusFromMetadataCache,
+} from "./runNoteStatus";
 import type { TFile } from "obsidian";
 import type { ToolExecutionContext } from "../tools/types";
 import { buildMissionResumePlan } from "./missionResume";
@@ -92,7 +96,7 @@ async function loadProjectionForCandidate(
   context: ToolExecutionContext,
   candidate: { path: string; snapshot: MissionRuntimeSnapshotV2 },
 ): Promise<PersistedMissionRunProjection | null> {
-  if (candidate.snapshot.status === "complete") {
+  if (!isIncompleteRuntimeStatus(candidate.snapshot.status)) {
     return null;
   }
   const ledgerReadback = await readMissionLedgerByRunId(
@@ -233,6 +237,16 @@ async function* iterateRuntimeCandidatesNewestFirst(
     .filter((file) => /^Agent Runs\/[^/]+\.md$/i.test(file.path))
     .sort((left, right) => (right.stat?.mtime ?? 0) - (left.stat?.mtime ?? 0));
   for (const file of files) {
+    // A terminal note announces its status in frontmatter; the metadata cache
+    // answers without a read, so a vault full of finished runs costs the load
+    // path a listing instead of one read and parse per note.
+    const cachedStatus = readRunNoteStatusFromMetadataCache(
+      context.app,
+      file as TFile,
+    );
+    if (cachedStatus && !isIncompleteRuntimeStatus(cachedStatus)) {
+      continue;
+    }
     const markdown = await readNote(file as TFile);
     const snapshot = parseMissionRuntimeSnapshotFromMarkdown(markdown);
     if (!snapshot) {
