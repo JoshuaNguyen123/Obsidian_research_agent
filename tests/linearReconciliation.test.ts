@@ -163,6 +163,86 @@ test("operation ids are deterministic, sanitized, and bounded", () => {
   assert.ok(operationId.length <= 240);
 });
 
+test("node-scoped operation ids stay stable across segment runIds", () => {
+  const first = buildLinearOperationId({
+    resourceType: "issue",
+    verb: "create",
+    runId: "segment-run-1",
+    taskId: "segment-run-1:3:0:linear_create_issue",
+    nodeScope: {
+      rootMissionId: "root-mission-a",
+      nodeId: "linear-publish",
+      toolName: "linear_create_issue",
+    },
+  });
+  const retried = buildLinearOperationId({
+    resourceType: "issue",
+    verb: "create",
+    runId: "segment-run-2",
+    taskId: "segment-run-2:1:0:linear_create_issue",
+    nodeScope: {
+      rootMissionId: "root-mission-a",
+      nodeId: "linear-publish",
+      toolName: "linear_create_issue",
+    },
+  });
+  const legacy = buildLinearOperationId({
+    resourceType: "issue",
+    verb: "create",
+    runId: "segment-run-2",
+    taskId: "segment-run-2:1:0:linear_create_issue",
+  });
+
+  assert.equal(first, retried);
+  assert.match(
+    first,
+    /^linear:issue:create:node:root-mission-a:linear-publish:linear_create_issue:0$/,
+  );
+  assert.notEqual(retried, legacy);
+  assert.ok(first.length <= 240);
+  assert.ok(legacy.length <= 240);
+});
+
+test("incomplete node scope falls back to the legacy runId:taskId shape", () => {
+  const fallback = buildLinearOperationId({
+    resourceType: "issue",
+    verb: "create",
+    runId: "run-legacy",
+    taskId: "run-legacy:2:0:linear_create_issue",
+    nodeScope: {
+      rootMissionId: "root-mission-a",
+      nodeId: "",
+      toolName: "linear_create_issue",
+    },
+  });
+  assert.equal(
+    fallback,
+    buildLinearOperationId({
+      resourceType: "issue",
+      verb: "create",
+      runId: "run-legacy",
+      taskId: "run-legacy:2:0:linear_create_issue",
+    }),
+  );
+});
+
+test("node-scoped operation ids remain bounded at 240 characters", () => {
+  const operationId = buildLinearOperationId({
+    resourceType: "issue",
+    verb: "create ticket\nnow",
+    runId: `run/${"a".repeat(120)}`,
+    taskId: "task 42",
+    sequence: 9,
+    nodeScope: {
+      rootMissionId: `root/${"b".repeat(120)}`,
+      nodeId: `node ${"c".repeat(80)}`,
+      toolName: "linear_create_issue",
+    },
+  });
+  assert.ok(operationId.length <= 240);
+  assert.match(operationId, /^linear:issue:create-ticket-now:node:/);
+});
+
 function makeRecord(
   overrides: Partial<Parameters<typeof createLinearMutationJournalRecord>[0]> = {},
 ): LinearMutationJournalRecord {
