@@ -3244,6 +3244,7 @@ test("web_search normalizes request and response", async () => {
         snippet: "Search snippet",
       },
     ],
+    fromCache: false,
   });
 });
 
@@ -3288,6 +3289,7 @@ test("web_search defaults to compact result count and snippet caps", async () =>
         snippet: `${"s".repeat(MAX_WEB_SEARCH_SNIPPET_CHARS)}\n\n[truncated]`,
       },
     ],
+    fromCache: false,
   });
 });
 
