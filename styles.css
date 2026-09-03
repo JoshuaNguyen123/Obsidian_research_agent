@@ -1834,6 +1834,17 @@
   padding-top: var(--agent-space-3);
 }
 
+.agentic-researcher-continuation-suppression {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-body);
+  grid-column: 1 / -1;
+  overflow-wrap: anywhere;
+}
+
+.agentic-researcher-continuation-suppression[hidden] {
+  display: none;
+}
+
 /* The primary action reads as primary through a flat accent tint and weight —
    the gradient and full-strength outline were doing the same job three times. */
 .agentic-researcher-view button.agentic-researcher-run {
