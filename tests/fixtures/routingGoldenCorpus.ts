@@ -277,7 +277,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     prompt: "I sat at my desk to write notes about the game design.",
     expected: {
       speechAct: "explain",
-      route: "grounded_workflow",
+      route: "single_model_answer",
       requiredCodeToolNames: [],
       streamingWritebackKind: null,
       directCurrentNoteWritebackKind: null,
