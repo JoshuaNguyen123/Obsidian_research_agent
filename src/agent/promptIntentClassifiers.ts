@@ -70,6 +70,7 @@ export {
 export { hasWordCountIntent } from "./wordCountIntent";
 export { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 export { matchesFetchedWebSourceLanguageV1, matchesSourcesOrWebLanguageV1 } from "./sourceIntent";
+export { hasTitleIntent } from "./titleIntent";
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
   return (
@@ -1497,42 +1498,6 @@ export function hasAmbiguousDatePrompt(prompt: string): boolean {
 
 export function hasStaticGenerationIntent(prompt: string): boolean {
   return /\b(generate|write|draft|compose|create)\b[\s\S]{0,80}\b(essay|article|paragraph|summary|brief|outline|report|note|content|post)\b|\b(essay|article|paragraph|summary|brief|outline|report)\b[\s\S]{0,80}\b\d+\s*words?\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,80}\b\d{1,5}\s*words?\b/i.test(
-    prompt,
-  );
-}
-
-/**
- * "This mission is about the note's title" for both the route and the tool
- * frontier. Every consumer uses it to WITHHOLD a fast path -- it keeps a
- * mission on the tool loop, forces a current-note read, and blocks streamed
- * writeback -- so the two must not disagree about which missions get that
- * care. The rename and retitle capabilities themselves are promised by
- * isVisibleTitleRenameIntent / isMarkdownTitleContentIntent, which offer and
- * authority already consume as a matched pair; widening here cannot open a
- * gap between them.
- */
-export function hasTitleIntent(prompt: string): boolean {
-  if (isMarkdownTitleContentIntent(prompt) || isVisibleTitleRenameIntent(prompt)) {
-    return true;
-  }
-
-  // Restructuring a note repositions its heading, so the route treated this as
-  // title work and stayed on the tool loop. A genuine content-organize mission
-  // owns its own route and must not be pulled into rename-only handling.
-  if (
-    isCurrentNoteEditOrganizeIntent(prompt) ||
-    isVaultWideOrganizeIntent(prompt) ||
-    isWholeNoteEditIntent(prompt)
-  ) {
-    return false;
-  }
-
-  // The verb has to govern the note itself. Proximity alone matched "write on
-  // this note ... find and organize information about the market", where the
-  // thing being organized is the research, not the document -- which turned a
-  // web-research mission into current-note work and made it read the note
-  // before searching.
-  return /\b(?:organi[sz]e|reorgani[sz]e|restructure|improve)\s+(?:the\s+|this\s+|my\s+|its\s+)?(?:note|file)\b/i.test(
     prompt,
   );
 }

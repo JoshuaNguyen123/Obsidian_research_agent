@@ -239,6 +239,29 @@ test("run planner exposes route decisions, allowed tool names, and trace reasons
   }
 });
 
+test("change the title as well keeps streamed writeback plus one rename step", () => {
+  const prompt =
+    "Write a 50 word piece of text on this page. Change the title as well.";
+  const plan = createRunPlan({
+    prompt,
+    missionIntent: missionIntent({
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: allTools,
+    settings: settings(),
+    streamingWritebackKind: "append",
+    directCurrentNoteWritebackKind: null,
+  });
+  assert.equal(plan.route, "single_model_writeback");
+  assert.equal(plan.maxStepsForRun, 2);
+  assert.ok(plan.traceReasons.includes("streaming_writeback:append"));
+  assert.ok(plan.traceReasons.includes("sidecar_title_rename"));
+  assert.notEqual(plan.route, "tool_required");
+});
+
 test("authority router code proposal selects the code route only above direct chat", () => {
   const codeTools = [
     "code_sandbox_status",
@@ -317,7 +340,7 @@ test("provider backlink preservation does not trigger vault graph retrieval", ()
   assert.notEqual(plan.slowPathReason, "needs_graph_context");
 });
 
-test("compound title and current-note content reserves rename, writeback, and correction steps", () => {
+test("compound title and current-note content stays streamed with a sidecar rename step", () => {
   const plan = createRunPlan({
     prompt:
       "Write a concise summary of the first five laws of power, retitle this document, and generate it onto the page.",
@@ -334,9 +357,11 @@ test("compound title and current-note content reserves rename, writeback, and co
     directCurrentNoteWritebackKind: null,
   });
 
-  assert.equal(plan.route, "tool_required");
-  assert.equal(plan.maxStepsForRun, 4);
-  assert.ok(plan.traceReasons.includes("compound_title_writeback"));
+  assert.equal(plan.route, "single_model_writeback");
+  assert.equal(plan.maxStepsForRun, 2);
+  assert.ok(plan.traceReasons.includes("streaming_writeback:append"));
+  assert.ok(plan.traceReasons.includes("sidecar_title_rename"));
+  assert.notEqual(plan.route, "tool_required");
 });
 
 test("explicit code workspace tools receive a grounded multi-step budget", () => {
