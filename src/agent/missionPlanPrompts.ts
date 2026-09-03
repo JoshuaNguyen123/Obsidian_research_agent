@@ -43,6 +43,23 @@ function describeNextActionTool(
     : { callable: false, toolName };
 }
 
+/**
+ * The seeded, byte-stable mission-plan system message. It carries the marker
+ * (so `keepPrefixMessages` still retains it as an authority block and the
+ * runner can still retire it in place) but NO live state: status, active task,
+ * remaining count, and next action change every step, and rewriting them in
+ * the prompt prefix made the request diverge mid-prefix on every step, so no
+ * provider prefix cache could ever reuse the prompt. The live projection now
+ * rides in the per-step turn card near the end of the prompt instead.
+ */
+export function formatMissionPlanStaticPromptV1(): string {
+  return [
+    `${MISSION_PLAN_PROMPT_MARKER} is active. Use it as transient execution state only.`,
+    "The live plan state (status, active task, remaining tasks, next action) is delivered each turn in the turn-state card near the end of this prompt; follow that card, not any earlier snapshot.",
+    "Do not quote or persist this mission-plan text in chat history.",
+  ].join("\n");
+}
+
 export function formatMissionPlanForPrompt(
   plan: MissionPlan | null | undefined,
   callableToolNames?: ReadonlySet<string>,

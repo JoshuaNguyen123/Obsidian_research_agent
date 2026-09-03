@@ -1,4 +1,5 @@
 import test from "node:test";
+import { MISSION_ROUTER_SYSTEM_PROMPT } from "../src/agent/missionRouter";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
@@ -28509,4 +28510,323 @@ test("replayed verified-commit receipts name their commit from the checkpoint ta
     "code-repair:run-replay:workspace-1:request-1",
   );
   assert.equal(withoutCommit?.resource.revision, "1");
+});
+
+test("prompt prefix stays byte-stable across agent steps", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const compactStatuses: string[] = [];
+  const metricEvents: AgentRunMetricEvent[] = [];
+  const baseRegistry = createDefaultToolRegistry();
+  const vault = createRunnerVaultContext({
+    prompt: "Research MCP servers and append a concise cited summary to this note.",
+    content: "n".repeat(12000),
+  });
+  const fetchedSourceContent =
+    "MCP servers research cited summary explains MCP servers and source context. " +
+    "f".repeat(6000);
+  const compactPassageId = extractEvidencePassages(fetchedSourceContent, {
+    sourceLocator: "https://example.com/1",
+  }).passages[0]?.id;
+
+  const registry: ToolRegistry = {
+    getDefinitions: () => baseRegistry.getDefinitions(),
+    execute: async (call): Promise<ToolExecutionResult> => {
+      executedCalls.push(call);
+
+      if (call.name === "read_current_file") {
+        const maxChars =
+          typeof call.arguments.maxChars === "number"
+            ? call.arguments.maxChars
+            : 12000;
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            path: "Current.md",
+            content: "n".repeat(maxChars),
+          },
+        };
+      }
+
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: Array.from({ length: 3 }, (_, index) => ({
+              title: `Result ${index + 1}`,
+              url: `https://example.com/${index + 1}`,
+              snippet: "s".repeat(800),
+            })),
+          },
+        };
+      }
+
+      if (call.name === "web_fetch") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            title: "Fetched source",
+            url: call.arguments.url,
+            content: fetchedSourceContent,
+            links: [],
+          },
+        };
+      }
+
+      if (call.name === "append_to_current_file") {
+        const text = String(call.arguments.text ?? "");
+        const previous = vault.content.get("Current.md") ?? "";
+        vault.content.set("Current.md", `${previous}\n${text}`);
+        vault.operations.push("modify:Current.md");
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            path: "Current.md",
+            operation: "append",
+            bytesWritten: Buffer.byteLength(text, "utf8"),
+          },
+        };
+      }
+
+      return {
+        ok: true,
+        toolName: call.name,
+        output: { path: "Current.md", bytesWritten: 20 },
+      };
+    },
+  };
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () => responseWithToolCall("web_fetch", { url: "https://example.com/1" }),
+      () => responseWithContent("MCP servers research cited summary."),
+      (request) => {
+        const evidence =
+          getPassageCitationIds(request).join(" ") || compactPassageId || "";
+        return responseWithContent(
+          `MCP servers research cited summary. This concise summary covers MCP servers. Source: https://example.com/1 ${evidence}`.trim(),
+        );
+      },
+    ],
+    streamResponders: [
+      () => responseWithContentDeltas(["MCP servers research cited summary."]),
+      (request) => {
+        const evidence = getPassageCitationIds(request).join(" ") || compactPassageId || "";
+        return responseWithContentDeltas([
+          `MCP servers research cited summary. This concise summary covers MCP servers. Source: https://example.com/1 ${evidence}`.trim(),
+        ]);
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Research MCP servers and append a concise cited summary to this note.",
+    modelClient: client,
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => compactStatuses.push(message),
+      onMetric: (event) => metricEvents.push(event),
+    },
+  });
+
+  // The fixture must have driven a real multi-step tool loop, or the
+  // assertions below would be vacuous.
+  assert.ok(
+    chatRequests.length >= 3,
+    `expected at least three agent-step requests, got ${chatRequests.length}`,
+  );
+
+  // The per-step budget line used to be folded into messages[0] (the stage
+  // system prompt) with counts that decrement every step, and the mission-plan
+  // system message was re-rendered in place with the live active task. Both
+  // rewrote the prompt PREFIX on every step, so a provider with automatic
+  // prefix caching (Ollama KV reuse, OpenAI-compatible cached_tokens) could
+  // never reuse the prompt across steps. The prefix must now be byte-stable:
+  const first = chatRequests[0]!;
+  for (const [index, request] of chatRequests.entries()) {
+    assert.equal(
+      request.messages[0]?.content,
+      first.messages[0]?.content,
+      `request ${index} rewrote the first system message`,
+    );
+    assert.doesNotMatch(
+      request.messages[0]?.content ?? "",
+      /- Budget:/,
+      `request ${index} folded the budget line into the system prompt`,
+    );
+    const planBlocks = request.messages.filter(
+      (message) =>
+        message.role === "system" &&
+        message.content.startsWith("Mission Plan v1"),
+    );
+    // The seeded plan block is the same bytes on every step; the live
+    // projection ("Active task:") rides in the per-step turn card instead.
+    const firstPlanBlock = first.messages.find(
+      (message) =>
+        message.role === "system" &&
+        message.content.startsWith("Mission Plan v1"),
+    );
+    if (firstPlanBlock && planBlocks.length > 0) {
+      assert.equal(planBlocks[0]?.content, firstPlanBlock.content);
+      assert.doesNotMatch(planBlocks[0]?.content ?? "", /Active task:/);
+    }
+    const budgetCards = request.messages.filter((message) =>
+      /^- Budget:/m.test(message.content),
+    );
+    assert.equal(
+      budgetCards.length,
+      1,
+      `request ${index} carried ${budgetCards.length} budget cards`,
+    );
+    // The last message stays whatever the loop made last-bearing (tool
+    // result, user turn, or a correction contract); the card sits before it.
+    assert.notEqual(request.messages.at(-1), budgetCards[0]);
+  }
+
+  // The runner measures reuse against the previous step and reports it as a
+  // metric. With a stable prefix the first divergent index can never be 0,
+  // and most of every request (the seed plus the settled history) is reused.
+  const reuseEvents = metricEvents.filter(
+    (event) => event.kind === "run" && event.name === "prompt_prefix_reuse",
+  );
+  assert.ok(
+    reuseEvents.length >= 2,
+    `expected prefix-reuse metrics from step 2 onward, got ${reuseEvents.length}`,
+  );
+  // Geometry of the reuse: the per-step cards sit immediately before the
+  // last message, so step n+1 reuses everything step n sent EXCEPT its final
+  // message and its cards. At step 2 that is just the seed (about half of a
+  // request that also carries the first tool payload); every later step
+  // also reuses the settled history, so the ratio climbs toward 1.
+  const ratios = reuseEvents.map((event) => event.prefixReuseRatio ?? 0);
+  for (const event of reuseEvents) {
+    assert.notEqual(event.prefixFirstDivergentIndex, 0);
+    assert.ok(
+      (event.prefixReuseRatio ?? 0) >= 0.3,
+      `step ${event.step} reused only ${event.prefixReuseRatio} of its prompt`,
+    );
+  }
+  assert.ok(
+    Math.max(...ratios) >= 0.6,
+    `no step reused most of its prompt: ${ratios.map((r) => r.toFixed(2)).join(", ")}`,
+  );
+});
+
+test("a continuation segment skips the structured router because its verdict is discarded on resume", async () => {
+  const statuses: string[] = [];
+  const traces: string[] = [];
+  const routerChatRequests: ModelChatRequest[] = [];
+  const broker = new ApprovalBroker();
+  const partialEssay = [
+    "# Catcher Partial",
+    "",
+    Array.from({ length: 60 }, (_, i) => `keep${i + 1}`).join(" "),
+  ].join("\n");
+  const expandedEssay = [
+    "# Catcher Partial",
+    "",
+    Array.from({ length: 98 }, (_, i) => `exp${i + 1}`).join(" "),
+  ].join("\n");
+  const mission = "Write a 100 word essay about the catcher in the rye.";
+  const vault = createRunnerVaultContext({
+    prompt: mission,
+    content: partialEssay,
+    now: new Date(5151),
+  });
+  // The router is ON for this run. Fresh missions consult it; a continuation
+  // segment must not, because the resume branch discards its verdict anyway.
+  vault.context.settings.modelRouterMode = "authority";
+
+  // Seed a failed/incomplete run ledger so Continue restores originalMission.
+  const runId = "run-partial-essay-expand-1";
+  const { writeMissionLedger, createMissionLedger } = await import(
+    "../src/agent/missionLedger"
+  );
+  const ledger = createMissionLedger({
+    runId,
+    mission,
+    route: "direct_writeback",
+    loopBudget: {
+      hardCap: 12,
+      toolStepBudget: 4,
+      finalizationReserve: 2,
+      expectedTools: [],
+      stopWhenSatisfied: true,
+    },
+    now: new Date(5151),
+  });
+  ledger.status = "blocked";
+  ledger.nextActions = [
+    "Streamed writeback cannot safely retry after partial note apply (partial_write_no_safe_retry). Partial draft was kept.",
+  ];
+  ledger.continuationCommand = `continue run ${runId}`;
+  ledger.blockers = ["partial_write_no_safe_retry"];
+  await writeMissionLedger(vault.context, ledger);
+
+  await runAgentMission({
+    prompt: `continue run ${runId}`,
+    modelClient: createClient({
+      chatRequests: routerChatRequests,
+      streamRequests: [],
+      streamResponders: [
+        () => responseWithContentDeltas([expandedEssay]),
+        () => responseWithContentDeltas([expandedEssay]),
+      ],
+      chatResponders: [
+        () => responseWithContent(expandedEssay),
+        () => responseWithContent(expandedEssay),
+        () => responseWithContent(expandedEssay),
+      ],
+    }),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onStatus: (message) => statuses.push(message),
+      onTrace: (trace) => traces.push(trace.id),
+    },
+  });
+
+  const note = vault.content.get("Current.md") ?? "";
+  assert.ok(
+    statuses.some((line) =>
+      /Partial draft under word target|expand-in-place|Streaming writeback/i.test(
+        line,
+      ),
+    ),
+    statuses.join(" | "),
+  );
+  assert.equal(note.includes("keep1"), false, `old partial still present:\n${note}`);
+  assert.ok(note.includes("exp1"), note);
+  assert.equal(
+    note.includes(partialEssay),
+    false,
+    "must replace the under-target draft, not append a second essay",
+  );
+  // No request carried the router's system prompt, and the loop said why.
+  assert.equal(
+    routerChatRequests.filter(
+      (request) => request.messages[0]?.content === MISSION_ROUTER_SYSTEM_PROMPT,
+    ).length,
+    0,
+    "a continuation segment must not spend a round trip on the structured router",
+  );
+  assert.ok(
+    traces.includes("structured-router-skipped-continuation"),
+    traces.join(" | "),
+  );
 });

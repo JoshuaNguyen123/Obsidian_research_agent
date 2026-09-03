@@ -746,6 +746,12 @@ test("new CSV columns are APPENDED - the legacy header survives as an exact pref
     "retries",
     "artifact_proof_count",
     "cleanup_proof_count",
+    // Cost/latency instruments (2026-09-03), blank when a lane did not
+    // annotate them.
+    "model_calls",
+    "reported_tokens",
+    "cached_prompt_tokens",
+    "prompt_prefix_reuse_avg",
   ]);
 });
 

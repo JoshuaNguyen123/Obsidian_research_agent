@@ -135,6 +135,20 @@ export function summarizeAttemptAcceptance(
   summaryFresh: boolean,
   expectedScenarioId?: string | null,
 ): AttemptAcceptanceSummary;
+export interface AttemptUsageSummary {
+  modelCalls: number | null;
+  reportedTokens: number | null;
+  cachedPromptTokens: number | null;
+  promptPrefixReuseAvg: number | null;
+}
+export function summarizeAttemptUsage(
+  summary: unknown,
+  summaryFresh: boolean,
+  expectedScenarioId?: string | null,
+): AttemptUsageSummary;
+export function usageCsvCells(
+  usage: AttemptUsageSummary | null | undefined,
+): Array<string | number>;
 export interface CampaignAttemptVerdict {
   green: boolean;
   failureClass: string;

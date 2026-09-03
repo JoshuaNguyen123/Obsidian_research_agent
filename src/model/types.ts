@@ -92,6 +92,7 @@ export interface ModelRequestOptions {
   temperature?: number;
   top_k?: number;
   top_p?: number;
+  /** Ollama context window. Not sent to OpenAI-compatible endpoints (no equivalent field). */
   num_ctx?: number;
 }
 

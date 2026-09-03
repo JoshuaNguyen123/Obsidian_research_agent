@@ -1816,6 +1816,14 @@ function normalizeProviderUsage(value: unknown): ModelUsageAggregateV1 {
     estimatedTokens: Math.max(0, Math.floor(getNumber(record.estimatedTokens) ?? 0)),
     retries: Math.max(0, Math.floor(getNumber(record.retries) ?? 0)),
     wallClockMs: Math.max(0, Math.floor(getNumber(record.wallClockMs) ?? 0)),
+    ...(getNumber(record.cachedPromptTokens) !== undefined
+      ? {
+          cachedPromptTokens: Math.max(
+            0,
+            Math.floor(getNumber(record.cachedPromptTokens) ?? 0),
+          ),
+        }
+      : {}),
   };
 }
 

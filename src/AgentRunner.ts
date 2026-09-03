@@ -639,6 +639,8 @@ import {
   resolveRunContextBudgetSource,
   DEFAULT_ASSUMED_NUM_CTX,
   estimatePromptChars,
+  measurePromptPrefixReuseV1,
+  PROMPT_PREFIX_REUSE_METRIC_NAME_V1,
   shouldCompactLoopMessages,
   compactLoopMessages,
   resolveKeepRecentLoopSteps,
@@ -897,6 +899,7 @@ import type {
 } from "./agent/reflex/types";
 import {
   MISSION_PLAN_PROMPT_MARKER,
+  formatMissionPlanStaticPromptV1,
   formatMissionPlanForPrompt,
   formatMissionPlanNextActionPrompt,
 } from "./agent/missionPlanPrompts";
@@ -1326,6 +1329,18 @@ export interface AgentRunMetricEvent {
   totalTokens?: number;
   /** Prompt tokens the provider served from cache; absent when it never says. */
   cachedPromptTokens?: number;
+  /**
+   * Prompt-prefix reuse against the previous agent step's request. Present
+   * only on kind "run" / name PROMPT_PREFIX_REUSE_METRIC_NAME_V1 events.
+   * `prefixFirstDivergentIndex` is the first message index whose role or
+   * content changed (null when the new request is a pure append). A provider
+   * with automatic prefix caching can reuse everything before that index; a
+   * decrementing counter written into messages[0] pins it at 0 every step.
+   */
+  prefixStableChars?: number;
+  prefixTotalChars?: number;
+  prefixReuseRatio?: number;
+  prefixFirstDivergentIndex?: number | null;
   /**
    * Consecutive model responses that carried no work, counted UP TO AND
    * INCLUDING the response this event describes. Present only on
@@ -2220,6 +2235,9 @@ export async function runAgentMission({
   // Declared ahead of the observable client so its evidence callback can pair
   // each provider-reported token count with the prompt size that produced it.
   let estimatedPromptCharsForRun = 0;
+  // The previous agent step's final request messages, kept so each step can
+  // measure how much of its prompt a prefix-caching provider could reuse.
+  let previousStepRequestMessages: ModelChatMessage[] | null = null;
   let contextCalibration = createContextCalibration();
   let modelExecutionBudget: ModelExecutionBudgetV1 = {
     schemaVersion: 1,
@@ -2366,6 +2384,20 @@ export async function runAgentMission({
   /** Compound lifecycle Bound-stage authority; refreshed on stage/approval entry. */
   let missionStageEnvelope: MissionStageEnvelopeV1 | null = null;
   let activeThink = resolveThinkingMode(toolContext.settings);
+  // Writeback-class calls -- streamed note drafts, the final answer stream,
+  // the word-count correction pass, the English repair pass -- generate long
+  // visible text from an already-decided plan. `resolveThinkForCall` keeps
+  // thinking OFF for that role (the agent-step loop keeps `activeThink`);
+  // when the run has no thinking configured or the provider refused it,
+  // stay silent so the request matches the retry paths exactly.
+  const writebackThink = (): ModelThink | undefined =>
+    activeThink === undefined
+      ? undefined
+      : resolveThinkForCall({
+          role: "writeback",
+          settings: toolContext.settings,
+          model: toolContext.settings?.model,
+        });
   const intentPrompt = resolvePromptForIntent(prompt, conversationHistory);
   let activeIntentPrompt = intentPrompt;
   let speechActClassification = classifyMissionSpeechAct(activeIntentPrompt);
@@ -2560,17 +2592,33 @@ export async function runAgentMission({
   // command), the refusal paths must exit artifact-free, and an id-less
   // "continue" scans for the LATEST non-terminal ledger — which a pre-router
   // anchor write would satisfy with this very segment's own record.
-  if (
-    !hasCheckpointResumeIntent(prompt) &&
-    !hasCheckpointResumeIntent(activeIntentPrompt)
-  ) {
+  const checkpointContinuationRequested =
+    hasCheckpointResumeIntent(prompt) ||
+    hasCheckpointResumeIntent(activeIntentPrompt);
+  if (!checkpointContinuationRequested) {
     await persistPrePlanningAnchor(
       activeIntentPrompt,
       speechActClassification.executionTier,
       toolContext,
     );
   }
+  if (checkpointContinuationRequested && modelRouterMode !== "off") {
+    // A continuation segment restores the persisted mission's route and
+    // discards any fresh router verdict (the resume branch nulls
+    // routedMissionIntent), so this round trip -- up to four provider
+    // requests behind the planner timeout -- bought nothing but latency and
+    // tokens on every Continue. The same predicate gates the pre-planning
+    // anchor above; the two must keep agreeing about what a continuation is.
+    routedModelFailureReason = "continuation_prompt";
+    events.onTrace?.({
+      id: "structured-router-skipped-continuation",
+      kind: "mission_intent",
+      message:
+        "Structured router skipped: continuation segments reuse the persisted mission route.",
+    });
+  }
   if (
+    !checkpointContinuationRequested &&
     modelRouterMode !== "off" &&
     (speechActClassification.executionTier !== "direct_chat" ||
       // Direct-chat router empowerment is part of the opt-in semantic
@@ -17298,10 +17346,9 @@ export async function runAgentMission({
       : [
           {
             role: "system" as const,
-            content: [
-              formatMissionPlanForPrompt(missionPlan),
-              formatMissionPlanNextActionPrompt(missionPlan),
-            ].join("\n\n"),
+            // Byte-stable: the live plan projection rides in the per-step
+            // turn card (see refreshMissionPlanPromptMessage), never here.
+            content: formatMissionPlanStaticPromptV1(),
           },
         ]),
     ...(hasNarrativeDesignOutputIntent(activeIntentPrompt)
@@ -17789,7 +17836,7 @@ export async function runAgentMission({
         toolContext: runToolContext,
         knownToolNames,
         relevancePrompt: finalAnswerRelevancePrompt,
-        think: activeThink,
+        think: writebackThink(),
         options: modelOptions,
         abortSignal,
         onThinkingUnsupported: disableThinkingForRun,
@@ -17864,7 +17911,7 @@ export async function runAgentMission({
         toolContext: runToolContext,
         knownToolNames,
         relevancePrompt: finalAnswerRelevancePrompt,
-        think: activeThink,
+        think: writebackThink(),
         options: modelOptions,
         abortSignal,
         onThinkingUnsupported: disableThinkingForRun,
@@ -17938,7 +17985,7 @@ export async function runAgentMission({
         finalInstruction: buildCurrentNoteFinalAnswerPrompt(activeIntentPrompt),
         metricName: "current_note_answer",
         relevancePrompt: finalAnswerRelevancePrompt,
-        think: activeThink,
+        think: writebackThink(),
         options: modelOptions,
         abortSignal,
         onThinkingUnsupported: disableThinkingForRun,
@@ -17986,7 +18033,7 @@ export async function runAgentMission({
       finalInstruction: null,
       metricName: "direct_answer",
       relevancePrompt: finalAnswerRelevancePrompt,
-      think: activeThink,
+      think: writebackThink(),
       options: modelOptions,
       abortSignal,
         onThinkingUnsupported: disableThinkingForRun,
@@ -19691,8 +19738,13 @@ export async function runAgentMission({
         });
       }
       // stepTools is the same array the schemas below are built from, so the
-      // plan header cannot name a tool this step will refuse.
-      refreshMissionPlanPromptMessage(messages, missionPlan, stepTools);
+      // plan header cannot name a tool this step will refuse. The projection
+      // is delivered in the per-step turn card, not written into the prefix.
+      const missionPlanTurnProjection = refreshMissionPlanPromptMessage(
+        messages,
+        missionPlan,
+        stepTools,
+      );
       const currentToolNames = stepTools.map((tool) => tool.function.name);
       const completedAbsentToolTurnGuard =
         buildCompletedAbsentToolTurnGuardV1({
@@ -19818,7 +19870,12 @@ export async function runAgentMission({
           ]
         : stepMessages;
       const stepChatRequestBuilt = buildChatRequest(
-        attachSegmentBudgetToMessages(contractedStepMessages, segmentBudgetPrompt),
+        attachSegmentBudgetToMessages(
+          contractedStepMessages,
+          [missionPlanTurnProjection, segmentBudgetPrompt]
+            .filter((card): card is string => Boolean(card))
+            .join("\n\n"),
+        ),
         stepTools,
         escalateThisStep ? false : activeThink,
         modelOptions,
@@ -19832,6 +19889,23 @@ export async function runAgentMission({
         stepChatRequestBuilt.toolChoice = "required";
       }
       stepChatRequest = stepChatRequestBuilt;
+      if (previousStepRequestMessages) {
+        const prefixReuse = measurePromptPrefixReuseV1(
+          previousStepRequestMessages,
+          stepChatRequestBuilt.messages,
+        );
+        emitMetricEvent(events, {
+          kind: "run",
+          name: PROMPT_PREFIX_REUSE_METRIC_NAME_V1,
+          step,
+          durationMs: 0,
+          prefixStableChars: prefixReuse.stableChars,
+          prefixTotalChars: prefixReuse.totalChars,
+          prefixReuseRatio: prefixReuse.reuseRatio,
+          prefixFirstDivergentIndex: prefixReuse.firstDivergentIndex,
+        });
+      }
+      previousStepRequestMessages = stepChatRequestBuilt.messages;
       response = await chatForAgentStep(
         modelClient,
         stepChatRequestBuilt,
@@ -21348,7 +21422,7 @@ export async function runAgentMission({
             toolContext: runToolContext,
             knownToolNames,
             relevancePrompt: finalAnswerRelevancePrompt,
-            think: activeThink,
+            think: writebackThink(),
             options: modelOptions,
             abortSignal,
             onThinkingUnsupported: disableThinkingForRun,
@@ -21628,7 +21702,7 @@ export async function runAgentMission({
                 toolContext: runToolContext,
                 knownToolNames,
                 relevancePrompt: finalAnswerRelevancePrompt,
-                think: activeThink,
+                think: writebackThink(),
                 options: modelOptions,
                 abortSignal,
                 onThinkingUnsupported: disableThinkingForRun,
@@ -21842,7 +21916,7 @@ export async function runAgentMission({
             fallbackContent: response.message.content,
             finalInstruction: buildFinalAnswerPrompt(activeIntentPrompt),
             relevancePrompt: finalAnswerRelevancePrompt,
-            think: activeThink,
+            think: writebackThink(),
             options: modelOptions,
             abortSignal,
             onThinkingUnsupported: disableThinkingForRun,
@@ -21905,7 +21979,7 @@ export async function runAgentMission({
                 wordTarget,
                 currentCount: initialCount,
                 events,
-                think: activeThink,
+                think: writebackThink(),
                 options: modelOptions,
                 abortSignal,
                 onThinkingUnsupported: disableThinkingForRun,
@@ -21949,7 +22023,7 @@ export async function runAgentMission({
               messages,
               draft: directContent,
               events,
-              think: activeThink,
+              think: writebackThink(),
               options: modelOptions,
               abortSignal,
               onThinkingUnsupported: disableThinkingForRun,
@@ -31348,12 +31422,16 @@ const FRONTIER_CORRECTION_SENTINEL =
 const MAX_VERIFIED_LINEAR_SPEC_ANCHOR_CHARS = 8_000;
 
 /**
- * Re-render the mission-plan system message from the live plan. It was built
- * once at run start and never updated while missionPlan was reassigned
- * throughout the run, leaving a step-0 snapshot ("Active task:
- * tool-01-read_template") contradicting the per-step stage prompt
- * ("stage=code_validation") for the entire mission. Content is replaced in
- * place — never spliced — so message indices stay stable.
+ * Project the live mission plan for this step. Historically the plan block
+ * was built once at run start and never updated while missionPlan was
+ * reassigned, leaving a step-0 snapshot ("Active task: tool-01-read_template")
+ * contradicting the per-step stage prompt for the entire mission; the fix
+ * re-rendered the seeded system message in place every step. That kept the
+ * plan honest but rewrote the prompt prefix on every step, which defeats
+ * provider prefix caching for the whole mission. The seeded message is now a
+ * byte-stable marker block and the live projection is RETURNED, so the step
+ * loop delivers it in the per-step turn card next to the segment budget line.
+ * Only the one-time retirement still rewrites the seeded message in place.
  */
 function refreshMissionPlanPromptMessage(
   messages: ModelChatMessage[],
@@ -31364,23 +31442,32 @@ function refreshMissionPlanPromptMessage(
    * two are projected by different code, and mid-stage they disagree.
    */
   stepTools: readonly ModelToolDefinition[] = [],
-): void {
+): string | null {
   const index = messages.findIndex(
     (message) =>
       message.role === "system" &&
       message.content.startsWith(MISSION_PLAN_PROMPT_MARKER),
   );
-  if (index < 0) return;
+  if (index < 0) return null;
+  if (!plan) {
+    // The retirement rewrite happens exactly once. Rewriting it every step
+    // would break the stable prefix for no information gain.
+    const retired = `${MISSION_PLAN_PROMPT_MARKER} is retired for this run; follow the stage prompt.`;
+    if (messages[index]!.content !== retired) {
+      messages[index] = { ...messages[index]!, content: retired };
+    }
+    return null;
+  }
+  // The seeded message stays byte-identical across steps (it is part of the
+  // prompt prefix providers cache); the live projection is returned so the
+  // step loop can deliver it in the per-step turn card near the tail.
   const callableToolNames = new Set(
     stepTools.map((tool) => tool.function.name),
   );
-  const content = plan
-    ? [
-        formatMissionPlanForPrompt(plan, callableToolNames),
-        formatMissionPlanNextActionPrompt(plan, callableToolNames),
-      ].join("\n\n")
-    : `${MISSION_PLAN_PROMPT_MARKER} is retired for this run; follow the stage prompt.`;
-  messages[index] = { ...messages[index]!, content };
+  return [
+    formatMissionPlanForPrompt(plan, callableToolNames),
+    formatMissionPlanNextActionPrompt(plan, callableToolNames),
+  ].join("\n\n");
 }
 
 function pruneStaleFrontierCorrections(messages: ModelChatMessage[]): void {
@@ -36464,7 +36551,11 @@ async function requestWordCountCorrection({
         content: buildWordCountCorrectionPrompt(wordTarget, currentCount),
       },
     ],
-    think: undefined,
+    // Honour the caller's flag. This used to be pinned to `undefined`
+    // (provider default -- thinking ON for glm/qwen-class models on Ollama),
+    // which made the correction pass the most expensive call of a note
+    // mission while every caller believed it had passed a thinking mode.
+    think,
     options,
     abortSignal,
     evidencePhase: "retry",

@@ -607,6 +607,14 @@ export class RunCoordinator {
           : Math.max(0, Math.ceil(evidence.responseChars / 4));
         this.providerUsage.retries += evidence.phase === "retry" ? 1 : 0;
         this.providerUsage.wallClockMs += evidence.durationMs;
+        if (
+          evidence.cachedTokensReported &&
+          typeof evidence.cachedPromptTokens === "number"
+        ) {
+          this.providerUsage.cachedPromptTokens =
+            (this.providerUsage.cachedPromptTokens ?? 0) +
+            evidence.cachedPromptTokens;
+        }
       }
     } else if (key === "onMissionEvidence") {
       const evidence = args[0] as MissionEvidenceAttestationV1 | undefined;

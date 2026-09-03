@@ -130,6 +130,7 @@ import {
   formatTeamStatsLine,
 } from "./ui/autonomyStatsCopy";
 import {
+  PROMPT_PREFIX_REUSE_METRIC_NAME,
   formatAgentMetric,
   formatChars,
   formatOptionalNumber,
@@ -3685,7 +3686,8 @@ export class AgentView extends ItemView {
           ]
         : []),
       `usage_chars=request ${formatChars(this.usageTotals.requestChars)}, response ${formatChars(this.usageTotals.responseChars)}`,
-      `usage_tokens=prompt ${formatOptionalNumber(this.usageTotals.promptTokens)}, completion ${formatOptionalNumber(this.usageTotals.completionTokens)}, total ${formatOptionalNumber(this.usageTotals.totalTokens)}`,
+      `usage_tokens=prompt ${formatOptionalNumber(this.usageTotals.promptTokens)}, completion ${formatOptionalNumber(this.usageTotals.completionTokens)}, total ${formatOptionalNumber(this.usageTotals.totalTokens)}, cached prompt ${formatOptionalNumber(this.usageTotals.cachedPromptTokens)}`,
+      `prompt_prefix_reuse=${this.usageTotals.prefixReuseSamples > 0 ? `${Math.round((100 * this.usageTotals.prefixReuseRatioTotal) / this.usageTotals.prefixReuseSamples)}% avg over ${this.usageTotals.prefixReuseSamples} steps` : "n/a"}`,
     ];
 
     for (const line of lines) {
@@ -4099,6 +4101,16 @@ export class AgentView extends ItemView {
     this.usageTotals.promptTokens += event.promptTokens ?? 0;
     this.usageTotals.completionTokens += event.completionTokens ?? 0;
     this.usageTotals.totalTokens += event.totalTokens ?? 0;
+    this.usageTotals.cachedPromptTokens += event.cachedPromptTokens ?? 0;
+    if (
+      event.kind === "run" &&
+      event.name === PROMPT_PREFIX_REUSE_METRIC_NAME &&
+      typeof event.prefixReuseRatio === "number" &&
+      Number.isFinite(event.prefixReuseRatio)
+    ) {
+      this.usageTotals.prefixReuseSamples += 1;
+      this.usageTotals.prefixReuseRatioTotal += event.prefixReuseRatio;
+    }
   }
 
   private createEmptyUsageTotals() {
@@ -4108,6 +4120,9 @@ export class AgentView extends ItemView {
       promptTokens: 0,
       completionTokens: 0,
       totalTokens: 0,
+      cachedPromptTokens: 0,
+      prefixReuseSamples: 0,
+      prefixReuseRatioTotal: 0,
     };
   }
 

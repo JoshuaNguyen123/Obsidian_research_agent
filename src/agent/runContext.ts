@@ -677,6 +677,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * So the prefix can shrink mid-run, and it does so on long missions -- exactly
  * the expensive ones. This measures that instead of assuming it.
  */
+/**
+ * Metric event name for the per-step prefix-reuse measurement the runner
+ * emits (kind "run"). One event per agent step from step 2 onward; the
+ * previous step's final request is the baseline.
+ */
+export const PROMPT_PREFIX_REUSE_METRIC_NAME_V1 = "prompt_prefix_reuse";
+
 export interface PromptPrefixReuseV1 {
   /** Characters identical to the previous prompt, counted from the start. */
   stableChars: number;

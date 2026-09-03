@@ -2,9 +2,17 @@
  * Pure onload schedule for Agentic Researcher.
  *
  * View registration, settings, and command surfaces stay immediate so a
- * persisted pane can render. Disk scans and companion probes wait for
- * workspace layout-ready. The table is the scheduling decision; main.ts
+ * persisted pane can render. The table is the scheduling decision; main.ts
  * only executes it.
+ *
+ * Honest about the immediate phase: `load_settings` reads plugin data and up
+ * to two legacy data.json files, `load_project_memory` reads four memory
+ * JSON files, `hydrate_mission_projection` scans `Agent Runs/` for the
+ * latest resumable run, and `initialize_bundled_capabilities` kicks off the
+ * fire-and-forget sandbox boundary probe (a child process on hosts with a
+ * provisioned provider). Only the template library, workspace cleanup, the
+ * Agent Runs retention sweep, the semantic-index flush, durable resume, and
+ * companion reconciliation wait for workspace layout-ready.
  */
 export type OnloadSchedulePhase = "immediate" | "layout_ready";
 

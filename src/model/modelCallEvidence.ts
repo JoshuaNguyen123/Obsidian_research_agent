@@ -54,6 +54,14 @@ export interface ModelUsageAggregateV1 {
   estimatedTokens: number;
   retries: number;
   wallClockMs: number;
+  /**
+   * Prompt tokens the provider reported serving from its cache, summed over
+   * the calls that reported it. Optional and additive: absent means no call
+   * ever reported caching (a silent provider), which is a different fact from
+   * a measured zero. Persisted ledgers written before this field simply lack
+   * it and normalize to absent.
+   */
+  cachedPromptTokens?: number;
 }
 
 export interface ObservableModelClient {
@@ -89,6 +97,10 @@ export function mergeModelUsageAggregatesV1(
     merged.estimatedTokens += segment.estimatedTokens;
     merged.retries += segment.retries;
     merged.wallClockMs += segment.wallClockMs;
+    if (typeof segment.cachedPromptTokens === "number") {
+      merged.cachedPromptTokens =
+        (merged.cachedPromptTokens ?? 0) + segment.cachedPromptTokens;
+    }
   }
   return merged;
 }
@@ -286,6 +298,10 @@ export function createObservableModelClient({
       usage.successfulCallCount += 1;
       usage.reportedTokens += tokenUsage.totalTokens;
       usage.estimatedTokens += estimatedTokens;
+      if (tokenUsage.cachedReported) {
+        usage.cachedPromptTokens =
+          (usage.cachedPromptTokens ?? 0) + tokenUsage.cachedPromptTokens;
+      }
       usage.wallClockMs = Math.max(usage.wallClockMs, now() - startedAt);
       onEvidence?.(
         buildEvidence({

@@ -193,7 +193,15 @@ export const RUN_CSV_HEADER =
   "secondary_failure_classes,classification_confidence,tool_calls_vacuous," +
   "frontier_narrowed_mid_response,frontier_withheld_since_earlier_step," +
   "harness_outcome,acceptance_status,scorecard_total,scorecard_acceptance_passed," +
-  "retries,artifact_proof_count,cleanup_proof_count";
+  "retries,artifact_proof_count,cleanup_proof_count," +
+  // Appended 2026-09-03 (cost/latency instruments): all four come from the
+  // attempt's fresh daily-use summary and are BLANK when the lane did not
+  // annotate them — blank is unknown, never zero.
+  //   model_calls              provider calls the lane counted
+  //   reported_tokens          provider-reported prompt+completion tokens
+  //   cached_prompt_tokens     provider-reported cached prompt tokens
+  //   prompt_prefix_reuse_avg  mean per-step prompt-prefix reuse ratio (0..1)
+  "model_calls,reported_tokens,cached_prompt_tokens,prompt_prefix_reuse_avg";
 
 /**
  * Upgrade an existing CSV's header line in place when it is a strict
@@ -693,6 +701,50 @@ export function resolveAttemptToolEvents({ summary, summaryFresh, minedCounts })
 }
 
 /** Separate mission/acceptance evidence from the Playwright process verdict. */
+/**
+ * Cost/latency instruments for one attempt, from its fresh daily-use summary.
+ * Every field is null when no summary record knew it; the CSV writes blanks
+ * for nulls so unknown never reads as zero.
+ */
+export function summarizeAttemptUsage(summary, summaryFresh, expectedScenarioId = null) {
+  const allSummaries = summaryFresh && Array.isArray(summary?.summaries)
+    ? summary.summaries
+    : [];
+  const summaries = expectedScenarioId
+    ? allSummaries.filter((record) => record?.scenarioId === expectedScenarioId)
+    : allSummaries;
+  const sumKnown = (key) => {
+    let total = null;
+    for (const record of summaries) {
+      const value = record?.[key];
+      if (Number.isSafeInteger(value) && value >= 0) total = (total ?? 0) + value;
+    }
+    return total;
+  };
+  const ratios = summaries
+    .map((record) => record?.promptPrefixReuseAvg)
+    .filter((value) => typeof value === "number" && Number.isFinite(value));
+  return {
+    modelCalls: sumKnown("modelCalls"),
+    reportedTokens: sumKnown("reportedTokens"),
+    cachedPromptTokens: sumKnown("cachedPromptTokens"),
+    promptPrefixReuseAvg: ratios.length > 0
+      ? ratios.reduce((total, value) => total + value, 0) / ratios.length
+      : null,
+  };
+}
+
+export function usageCsvCells(usage) {
+  return [
+    usage?.modelCalls ?? "",
+    usage?.reportedTokens ?? "",
+    usage?.cachedPromptTokens ?? "",
+    typeof usage?.promptPrefixReuseAvg === "number"
+      ? usage.promptPrefixReuseAvg.toFixed(3)
+      : "",
+  ];
+}
+
 export function summarizeAttemptAcceptance(summary, summaryFresh, expectedScenarioId = null) {
   const allSummaries = summaryFresh && Array.isArray(summary?.summaries)
     ? summary.summaries
@@ -2106,6 +2158,7 @@ async function main() {
         summaryFresh,
         cell.scenarioId,
       );
+      const usage = summarizeAttemptUsage(summary, summaryFresh, cell.scenarioId);
       const campaignVerdict = resolveCampaignAttemptVerdict({
         green,
         failureClass,
@@ -2211,6 +2264,7 @@ async function main() {
         acceptance.retries ?? "",
         acceptance.artifactProofCount ?? "",
         acceptance.cleanupProofCount ?? "",
+        ...usageCsvCells(usage),
       ]);
 
       // The attempt finished (green or red) — the in-flight marker is now

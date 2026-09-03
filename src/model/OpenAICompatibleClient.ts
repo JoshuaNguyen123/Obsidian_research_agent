@@ -202,6 +202,12 @@ export function buildOpenAIChatBody(
         }
       : undefined,
     stream,
+    // Ask for the usage block on the final streamed chunk. Without it every
+    // streamed call reported zero tokens, which left context calibration,
+    // compaction, budgets, and cached-token accounting blind on this path.
+    // extractProviderTokenUsage scans the raw chunk array, so the usage
+    // chunk is picked up without any parser change.
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
   };
   addOpenAIOptions(body, request.options);
   return body;
@@ -346,9 +352,10 @@ function addOpenAIOptions(
   if (options.top_p !== undefined) {
     body.top_p = options.top_p;
   }
-  if (options.num_ctx !== undefined) {
-    body.max_tokens = options.num_ctx;
-  }
+  // `num_ctx` is Ollama's context-window option. It used to be sent here as
+  // `max_tokens`, which is an OUTPUT cap on OpenAI-compatible endpoints: a
+  // 100k context setting became a 100k completion cap and a provider 400.
+  // The context window is not expressible on this API; nothing is sent.
 }
 
 function firstChoiceMessage(body: unknown): Record<string, unknown> {

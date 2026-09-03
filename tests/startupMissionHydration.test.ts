@@ -394,3 +394,39 @@ function createVaultHarness(): {
     } as unknown as ToolExecutionContext,
   };
 }
+
+test("startup hydration stops at the newest resumable run and never reads the older notes", async () => {
+  // This scan runs in the immediate phase of plugin load. It used to read and
+  // parse EVERY note under Agent Runs/ before returning; with three resumable
+  // runs seeded, only the newest may be opened.
+  const harness = createVaultHarness();
+  await seedRun(harness, "run-startup-older-1");
+  await seedRun(harness, "run-startup-older-2");
+  await seedRun(harness, "run-startup-newest");
+
+  const vault = harness.context.app.vault as unknown as {
+    read: (file: { path: string }) => Promise<string>;
+  };
+  const readsByPath = new Map<string, number>();
+  const originalRead = vault.read;
+  vault.read = async (file) => {
+    readsByPath.set(file.path, (readsByPath.get(file.path) ?? 0) + 1);
+    return originalRead(file);
+  };
+
+  const projection = await loadLatestPersistedMissionRunProjection(
+    harness.context,
+  );
+
+  assert.ok(projection);
+  assert.equal(projection.runId, "run-startup-newest");
+  const olderReads = [...readsByPath.entries()].filter(
+    ([path, count]) =>
+      /^Agent Runs\/run-startup-older-/.test(path) && count > 0,
+  );
+  assert.deepEqual(
+    olderReads,
+    [],
+    `older run notes must not be read on the load path: ${JSON.stringify([...readsByPath])}`,
+  );
+});

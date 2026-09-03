@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 
 const env = { ...process.env };
@@ -16,13 +16,26 @@ env.TMPDIR = canonicalTemp;
 env.TMP = canonicalTemp;
 env.TEMP = canonicalTemp;
 
+// Node runs each test file in its own child process, so file-level
+// parallelism is safe here: the suite has no process.chdir, no shared fixed
+// fixture paths (every filesystem fixture is an mkdtemp), and no env mutation.
+// The old --test-concurrency=1 pin was undocumented and cost ~58% of the
+// 7.9-minute wall clock in serial spawn + tsx transform overhead (measured
+// 2026-09-02, 4,345 tests). Concurrency is capped so a dozen tsx processes
+// transforming the 40k-line runner cannot exhaust memory; TEST_CONCURRENCY
+// overrides it (1 restores the serial order for bisecting order dependence).
+const configured = Number.parseInt(process.env.TEST_CONCURRENCY ?? "", 10);
+const testConcurrency = Number.isFinite(configured) && configured >= 1
+  ? configured
+  : Math.max(1, Math.min(6, availableParallelism() - 1));
+
 const result = spawnSync(
   process.execPath,
   [
     "--import",
     "tsx",
     "--test",
-    "--test-concurrency=1",
+    `--test-concurrency=${testConcurrency}`,
     "tests/**/*.test.ts",
   ],
   {

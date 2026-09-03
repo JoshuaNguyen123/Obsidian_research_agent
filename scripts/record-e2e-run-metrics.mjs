@@ -9,7 +9,9 @@ import {
   fileMtimeMs,
   resolveAttemptToolEvents,
   summarizeAttemptAcceptance,
+  summarizeAttemptUsage,
   summaryWrittenSince,
+  usageCsvCells,
 } from "./run-proof-matrix.mjs";
 
 /**
@@ -67,6 +69,7 @@ export function buildExclusiveRunMetricRow(input) {
     input.summary,
     input.summaryFresh,
   );
+  const usage = summarizeAttemptUsage(input.summary, input.summaryFresh);
   const observedKnown = toolEvents.observed !== null;
   const failedKnown = observedKnown && toolEvents.failed !== null;
   const pctFailed = failedKnown && toolEvents.observed > 0
@@ -124,6 +127,7 @@ export function buildExclusiveRunMetricRow(input) {
     acceptance.retries ?? "",
     acceptance.artifactProofCount ?? "",
     acceptance.cleanupProofCount ?? "",
+    ...usageCsvCells(usage),
   ];
 }
 

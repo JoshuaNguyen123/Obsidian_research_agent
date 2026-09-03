@@ -7,6 +7,7 @@ import {
   parseOpenAIChatStream,
   toOpenAIMessages,
 } from "../src/model/OpenAICompatibleClient";
+import { extractProviderTokenUsage } from "../src/model/modelCallEvidence";
 import type { HttpRequest } from "../src/model/types";
 import { ModelClientError } from "../src/model/types";
 
@@ -94,7 +95,18 @@ test("builds OpenAI-compatible chat body with tools and options", () => {
   assert.equal(body.tool_choice, "auto");
   assert.equal(body.temperature, 0.2);
   assert.equal(body.top_p, 0.9);
-  assert.equal(body.max_tokens, 1024);
+  // num_ctx is Ollama's context window, not an output cap; it must not
+  // become max_tokens on this API.
+  assert.equal(body.max_tokens, undefined);
+  assert.equal(body.stream_options, undefined);
+
+  const streamingBody = buildOpenAIChatBody(
+    { messages: [{ role: "user", content: "Search" }] },
+    "gpt-test",
+    true,
+  ) as Record<string, unknown>;
+  assert.equal(streamingBody.stream, true);
+  assert.deepEqual(streamingBody.stream_options, { include_usage: true });
 
   const requiredBody = buildOpenAIChatBody(
     {
@@ -162,6 +174,26 @@ test("parses OpenAI-compatible streaming text and tool deltas", async () => {
   assert.equal(response.message.content, "Hello world");
   assert.equal(response.toolCalls[0].id, "call_1");
   assert.deepEqual(response.toolCalls[0].arguments, { query: "MCP" });
+});
+
+test("a streamed usage chunk reaches token accounting, cached tokens included", async () => {
+  const response = await parseOpenAIChatStream(
+    asyncIterable([
+      'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      // stream_options.include_usage: the provider appends one chunk with an
+      // empty choices array carrying the usage block.
+      'data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":5,"total_tokens":1205,"prompt_tokens_details":{"cached_tokens":1100}}}\n\n',
+      "data: [DONE]\n\n",
+    ]),
+  );
+  assert.equal(response.message.content, "Hello");
+  const usage = extractProviderTokenUsage(response.raw);
+  assert.equal(usage.reported, true);
+  assert.equal(usage.promptTokens, 1200);
+  assert.equal(usage.totalTokens, 1205);
+  assert.equal(usage.cachedReported, true);
+  assert.equal(usage.cachedPromptTokens, 1100);
 });
 
 test("OpenAI-compatible client sends auth and maps errors", async () => {

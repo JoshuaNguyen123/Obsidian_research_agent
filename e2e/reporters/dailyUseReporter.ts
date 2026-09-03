@@ -132,6 +132,15 @@ export interface DailyUseRunRecord extends Pick<
    */
   toolCallsUndetermined: number | null;
   /**
+   * Provider-reported prompt+completion tokens for the run, or null when the
+   * lane did not annotate usage. Unknown ≠ zero, as everywhere in this file.
+   */
+  reportedTokens: number | null;
+  /** Provider-reported cached prompt tokens, or null when never reported. */
+  cachedPromptTokens: number | null;
+  /** Mean per-step prompt-prefix reuse ratio (0..1), or null when unmeasured. */
+  promptPrefixReuseAvg: number | null;
+  /**
    * Refusal-marker sightings, keyed by the same six bucket names the proof
    * matrix's graph mining uses. Provenance is explicit in
    * `refusalBucketsSource`: "annotation" means the spec counted them from
@@ -478,6 +487,9 @@ export default class DailyUseReporter implements Reporter {
       refusalBuckets: refusal.buckets,
       refusalBucketsSource: refusal.source,
       modelCalls: metrics?.modelCalls ?? 0,
+      reportedTokens: annotatedMetrics?.reportedTokens ?? null,
+      cachedPromptTokens: annotatedMetrics?.cachedPromptTokens ?? null,
+      promptPrefixReuseAvg: annotatedMetrics?.promptPrefixReuseAvg ?? null,
       // Null — never 0 — when the spec annotated nothing. `metrics` is null for
       // every record without a typed DailyUseScenarioId, so the old `?? 0`
       // printed explicit observed=0 CSV rows for lanes that certainly called
@@ -605,6 +617,15 @@ export function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         toolCallsUndetermined: sumNullableCounters(
           group.map((record) => record.toolCallsUndetermined),
         ),
+        reportedTokens: sumNullableCounters(
+          group.map((record) => record.reportedTokens),
+        ),
+        cachedPromptTokens: sumNullableCounters(
+          group.map((record) => record.cachedPromptTokens),
+        ),
+        promptPrefixReuseAvg: averageNullableRatios(
+          group.map((record) => record.promptPrefixReuseAvg),
+        ),
         continuations: metrics?.continuations ?? 0,
         approvals: metrics?.approvals ?? 0,
         interactiveApprovals: metrics?.approvals ?? 0,
@@ -659,6 +680,9 @@ function parseMetricsAnnotation(
   toolCallsIntentionalNoOp: number | null;
   toolCallsUndetermined: number | null;
   refusalBuckets: Record<string, number> | null;
+  reportedTokens: number | null;
+  cachedPromptTokens: number | null;
+  promptPrefixReuseAvg: number | null;
 }) | null {
   const raw = [...test.annotations]
     .reverse()
@@ -668,6 +692,10 @@ function parseMetricsAnnotation(
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
     if (value.scenarioId !== scenarioId) return null;
+    const usageRecord =
+      value.providerUsage && typeof value.providerUsage === "object"
+        ? (value.providerUsage as Record<string, unknown>)
+        : null;
     return {
       modelCalls: safeCounter(value.modelCalls),
       toolCalls: safeCounter(value.toolCalls),
@@ -680,6 +708,9 @@ function parseMetricsAnnotation(
       toolCallsIntentionalNoOp: nullableCounter(value.toolCallsIntentionalNoOp),
       toolCallsUndetermined: nullableCounter(value.toolCallsUndetermined),
       refusalBuckets: counterRecord(value.refusalBuckets),
+      reportedTokens: nullableCounter(usageRecord?.reportedTokens),
+      cachedPromptTokens: nullableCounter(usageRecord?.cachedPromptTokens),
+      promptPrefixReuseAvg: nullableRatio(value.promptPrefixReuseAvg),
     };
   } catch {
     return null;
@@ -751,6 +782,22 @@ export function resolveToolCallCounters(
 }
 
 /** A non-negative safe integer, else null — unknown is never coerced to 0. */
+/** A 0..1 ratio, or null when absent or malformed (unknown, never zero). */
+export function nullableRatio(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1
+    ? value
+    : null;
+}
+
+/** Mean of the known ratios; null when no record knew one. */
+export function averageNullableRatios(
+  values: readonly (number | null)[],
+): number | null {
+  const known = values.filter((value): value is number => value !== null);
+  if (known.length === 0) return null;
+  return known.reduce((total, value) => total + value, 0) / known.length;
+}
+
 export function nullableCounter(value: unknown): number | null {
   return Number.isSafeInteger(value) && (value as number) >= 0
     ? (value as number)

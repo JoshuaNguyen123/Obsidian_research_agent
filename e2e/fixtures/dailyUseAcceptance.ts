@@ -77,6 +77,18 @@ export async function recordDailyUseAcceptance(
     toolCallsIntentionalNoOp?: number | null;
     /** Refusal counts keyed by the proof matrix's six bucket names. */
     refusalBuckets?: Record<string, number> | null;
+    /**
+     * The run's durable provider usage (the coordinator/ledger
+     * `providerUsage` aggregate). Only `reportedTokens` and
+     * `cachedPromptTokens` are carried into the summary; null or absent
+     * means the lane did not observe usage (unknown, never zero).
+     */
+    providerUsage?: {
+      reportedTokens?: number | null;
+      cachedPromptTokens?: number | null;
+    } | null;
+    /** Mean per-step prompt-prefix reuse ratio (0..1) when the lane measured it. */
+    promptPrefixReuseAvg?: number | null;
   } = {},
   options: { requireComplete?: boolean } = {},
 ) {
@@ -94,6 +106,8 @@ export async function recordDailyUseAcceptance(
     toolCallsVacuous = null,
     toolCallsIntentionalNoOp = null,
     refusalBuckets = null,
+    providerUsage = null,
+    promptPrefixReuseAvg = null,
     ...metricCounters
   } = counters;
   const metrics = createDailyUseRunMetricsV1({
@@ -119,6 +133,15 @@ export async function recordDailyUseAcceptance(
       toolCallsVacuous,
       toolCallsIntentionalNoOp,
       ...(refusalBuckets ? { refusalBuckets } : {}),
+      // Cost/latency instruments (2026-09-03): provider token usage and the
+      // prompt-prefix reuse ratio. Null when the lane did not measure them.
+      providerUsage: providerUsage
+        ? {
+            reportedTokens: providerUsage.reportedTokens ?? null,
+            cachedPromptTokens: providerUsage.cachedPromptTokens ?? null,
+          }
+        : null,
+      promptPrefixReuseAvg,
     }),
   });
   if (missionScorecard) {

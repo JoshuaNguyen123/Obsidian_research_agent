@@ -37,6 +37,9 @@ export function formatReceiptOperationLabel(
 }
 
 export function formatAgentMetric(event: AgentRunMetricEvent): string {
+  if (event.kind === "run" && event.name === PROMPT_PREFIX_REUSE_METRIC_NAME) {
+    return formatPromptPrefixReuseMetric(event);
+  }
   if (event.kind === "model_chat") {
     return [
       `Timing: model step ${event.step ?? "?"}`,
@@ -119,9 +122,34 @@ export function formatTokenParts(event: AgentRunMetricEvent): string | null {
       ? `completion tokens ${event.completionTokens}`
       : null,
     event.totalTokens !== undefined ? `total tokens ${event.totalTokens}` : null,
+    // Reported only when the provider says so; a silent provider stays silent
+    // here too, so "0" is always a measured cache miss, never an assumption.
+    event.cachedPromptTokens !== undefined
+      ? `cached prompt tokens ${event.cachedPromptTokens}`
+      : null,
   ].filter((part): part is string => Boolean(part));
 
   return parts.length > 0 ? parts.join(", ") : null;
+}
+
+/** Metric name the runner uses for the per-step prompt-prefix reuse event. */
+export const PROMPT_PREFIX_REUSE_METRIC_NAME = "prompt_prefix_reuse";
+
+export function formatPromptPrefixReuseMetric(
+  event: AgentRunMetricEvent,
+): string {
+  const ratio = event.prefixReuseRatio;
+  const percent =
+    typeof ratio === "number" && Number.isFinite(ratio)
+      ? `${Math.round(Math.max(0, Math.min(1, ratio)) * 100)}%`
+      : "unknown";
+  const divergence =
+    event.prefixFirstDivergentIndex === null
+      ? "pure append"
+      : typeof event.prefixFirstDivergentIndex === "number"
+        ? `first change at message ${event.prefixFirstDivergentIndex}`
+        : "divergence unknown";
+  return `Prefix reuse: step ${event.step ?? "?"} reuses ${percent} of the previous prompt (${divergence})`;
 }
 
 export function formatOptionalNumber(value: number | undefined): string {

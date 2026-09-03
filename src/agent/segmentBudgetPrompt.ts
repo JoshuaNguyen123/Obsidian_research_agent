@@ -42,9 +42,16 @@ export function formatSegmentBudgetExhaustedCopy(): string {
 }
 
 /**
- * Fold the one-line budget into the existing stage system prompt.
- * A trailing extra system message would hide last-message allowlist/correction
- * contracts the runner and tests rely on.
+ * Deliver the one-line budget as a per-step card inserted BEFORE the last
+ * message. Two contracts meet here. The last message carries the allowlist and
+ * correction contracts the runner and tests read from `messages.at(-1)`, so
+ * the card must never displace it. And the first system message is the stable
+ * prompt prefix that providers cache byte-for-byte across steps (Ollama KV
+ * reuse, OpenAI-compatible cached_tokens), so a line whose counts change every
+ * step must never be folded into it: doing so made the request diverge at
+ * index 0 on every step of every tool-loop mission, and no prefix cache could
+ * ever hit. The card is ephemeral turn context, rebuilt from the history each
+ * step and never pushed into it, exactly like the frontier turn card.
  */
 export function attachSegmentBudgetToMessages<
   T extends { role: string; content?: string },
@@ -53,18 +60,10 @@ export function attachSegmentBudgetToMessages<
   if (!line) {
     return [...messages];
   }
-  const index = messages.findIndex((message) => message.role === "system");
-  if (index < 0) {
-    return [...messages, { role: "system", content: line } as T];
+  const card = { role: "system", content: line } as T;
+  if (messages.length < 2) {
+    return [...messages, card];
   }
-  return messages.map((message, offset) => {
-    if (offset !== index) {
-      return message;
-    }
-    const existing = String(message.content ?? "").trimEnd();
-    return {
-      ...message,
-      content: existing ? `${existing}\n${line}` : line,
-    };
-  });
+  const insertAt = messages.length - 1;
+  return [...messages.slice(0, insertAt), card, ...messages.slice(insertAt)];
 }

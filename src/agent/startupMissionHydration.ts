@@ -61,9 +61,13 @@ export function getDurablyCompletedLifecycleToolNames(
 export async function loadLatestPersistedMissionRunProjection(
   context: ToolExecutionContext,
 ): Promise<PersistedMissionRunProjection | null> {
-  const candidates = await readRuntimeCandidatesNewestFirst(context);
-
-  for (const candidate of candidates) {
+  // Newest first, one note at a time, stopping at the first usable
+  // projection. This runs in the IMMEDIATE phase of plugin load (main.ts
+  // awaits it before the view can render), and it used to read and
+  // JSON-parse every note under Agent Runs/ before returning -- with the
+  // default retention keeping 200 terminal runs, that was 200 full reads on
+  // the load path to find the one run that can resume.
+  for await (const candidate of iterateRuntimeCandidatesNewestFirst(context)) {
     const projection = await loadProjectionForCandidate(context, candidate);
     if (projection) return projection;
   }
@@ -195,10 +199,20 @@ function assertExactGraphReference(
   }
 }
 
-async function readRuntimeCandidatesNewestFirst(
+/**
+ * Lazily yields run-note candidates newest first. Reads go through
+ * `cachedRead` when the vault offers it (startup reads a note nobody is
+ * writing, so the cache is authoritative) and fall back to `read`; each note
+ * is read only when the caller asks for the next candidate, so a consumer
+ * that stops at the first usable projection pays for one note, not for the
+ * whole folder.
+ */
+async function* iterateRuntimeCandidatesNewestFirst(
   context: ToolExecutionContext,
-): Promise<
-  Array<{ path: string; snapshot: MissionRuntimeSnapshotV2; mtime: number }>
+): AsyncGenerator<
+  { path: string; snapshot: MissionRuntimeSnapshotV2; mtime: number },
+  void,
+  undefined
 > {
   const vault = context.app?.vault;
   if (
@@ -206,30 +220,28 @@ async function readRuntimeCandidatesNewestFirst(
     typeof vault.getFiles !== "function" ||
     typeof vault.read !== "function"
   ) {
-    return [];
+    return;
   }
+  const readNote =
+    typeof vault.cachedRead === "function"
+      ? (file: TFile) => vault.cachedRead(file)
+      : (file: TFile) => vault.read(file);
 
   const files = vault
     .getFiles()
     .filter((file) => file.extension === "md")
     .filter((file) => /^Agent Runs\/[^/]+\.md$/i.test(file.path))
     .sort((left, right) => (right.stat?.mtime ?? 0) - (left.stat?.mtime ?? 0));
-  const candidates: Array<{
-    path: string;
-    snapshot: MissionRuntimeSnapshotV2;
-    mtime: number;
-  }> = [];
   for (const file of files) {
-    const markdown = await vault.read(file as TFile);
+    const markdown = await readNote(file as TFile);
     const snapshot = parseMissionRuntimeSnapshotFromMarkdown(markdown);
     if (!snapshot) {
       continue;
     }
-    candidates.push({
+    yield {
       path: file.path,
       snapshot,
       mtime: file.stat?.mtime ?? 0,
-    });
+    };
   }
-  return candidates;
 }

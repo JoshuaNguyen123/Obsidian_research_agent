@@ -45,7 +45,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 ## Requirements
 
-- Obsidian Desktop 1.5.0 or newer. Version 0.4.0 is desktop-only because the unified Code and Companion modules require guarded Node/Electron capabilities.
+- Obsidian Desktop 1.11.4 or newer (`manifest.json` `minAppVersion`; the credential system is built on `app.secretStorage`, which shipped in 1.11.4). Version 0.4.0 is desktop-only because the unified Code and Companion modules require guarded Node/Electron capabilities.
 - Node.js and npm.
 - An Ollama Cloud API key for the default BYOK experience. Local Ollama and compatible Ollama endpoints are optional alternatives.
 

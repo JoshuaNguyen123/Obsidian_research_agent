@@ -15,7 +15,7 @@
 // notebook's Python predicate is GENERATED from the same constants the JS
 // uses (scripts/product-evidence.mjs), because a hand-copied third-and-fourth
 // definition is how this drifted in the first place.
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -32,6 +32,29 @@ import {
 const EVAL_DIR = path.dirname(fileURLToPath(new URL("../docs/eval/playwright-run-metrics.csv", import.meta.url)));
 const CSV = path.join(EVAL_DIR, "playwright-run-metrics.csv");
 const QUIET = process.argv.includes("--quiet");
+const DASHBOARD = path.join(EVAL_DIR, "kpi-dashboard.md");
+const TOOL_EVENTS = path.join(EVAL_DIR, "tool-events.csv");
+
+// The posttest hook (--quiet) runs after every `npm test`. When neither CSV
+// has changed since the dashboard was last written there is nothing to
+// regenerate, so skip the tool-event mining and notebook execution instead of
+// paying for them on every unit run. An explicit `npm run eval:dashboard`
+// (no --quiet) always regenerates, which is what the eval duty asks for after
+// appending rows.
+function dashboardIsCurrent() {
+  try {
+    if (!existsSync(DASHBOARD) || !existsSync(CSV)) return false;
+    const written = statSync(DASHBOARD).mtimeMs;
+    const inputs = [CSV, TOOL_EVENTS].filter((file) => existsSync(file));
+    return inputs.every((file) => statSync(file).mtimeMs <= written);
+  } catch {
+    return false;
+  }
+}
+
+if (QUIET && dashboardIsCurrent()) {
+  process.exit(0);
+}
 
 try {
   try { execFileSync(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "eval-tool-events.mjs"), "--quiet"], { timeout: 120_000 }); } catch {}

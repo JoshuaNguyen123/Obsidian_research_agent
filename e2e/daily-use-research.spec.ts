@@ -832,6 +832,11 @@ test.describe("Daily-use live research contract", () => {
           // Emit the runtime's graded scorecard so this lane can be baselined
           // for regression (acceptance stays the independent gate).
           missionScorecard: snapshot.lastMissionScorecard,
+          // Cost instruments: the coordinator's durable provider usage for
+          // this run (tokens, and cached prompt tokens when the provider
+          // reports them). The eval CSV keeps these blank for lanes that do
+          // not pass them.
+          providerUsage: snapshot.providerUsage ?? null,
         },
         { requireComplete: true },
       );
