@@ -8,6 +8,7 @@ import {
   resolveEmbeddingPrefixesV1,
   type EmbeddingPrefixPairV1,
 } from "./embeddingPrefixes";
+import { resolveEffectiveEmbeddingDimV1 } from "./embeddingModelCatalogV1";
 
 /**
  * A proactive check that the embedding runtime actually works.
@@ -47,14 +48,17 @@ export async function probeEmbeddingProviderV1({
 }: {
   provider: SemanticEmbeddingProvider | null;
   model: string;
-  dim: 256 | 512;
+  /** The user's setting; the catalogue decides what the runtime is asked for. */
+  dim: number;
   cacheDir?: string;
   now?: () => number;
 }): Promise<EmbeddingProbeResultV1> {
   const prefixes = resolveEmbeddingPrefixesV1(model);
+  const effective = resolveEffectiveEmbeddingDimV1(model, dim);
+  const requestedDim = effective.dim;
   const base = {
     model,
-    requestedDim: dim,
+    requestedDim,
     prefixes,
   };
 
@@ -75,7 +79,8 @@ export async function probeEmbeddingProviderV1({
   try {
     response = await provider.embed({
       model,
-      dim,
+      dim: requestedDim,
+      matryoshka: effective.matryoshka,
       cacheDir,
       // One of each: an asymmetric model prefixes them differently, so probing
       // only one side would miss a prefix that breaks just the other.
@@ -129,14 +134,14 @@ export async function probeEmbeddingProviderV1({
     };
   }
 
-  if (queryVector.length !== dim || documentVector.length !== dim) {
+  if (queryVector.length !== requestedDim || documentVector.length !== requestedDim) {
     return {
       ...base,
       ok: false,
       dim: queryVector.length,
       latencyMs,
       cause: "embedding_call_failed",
-      message: `The runtime returned ${queryVector.length}-dimension vectors but ${dim} was requested. The persisted index would not be comparable with these.`,
+      message: `The runtime returned ${queryVector.length}-dimension vectors but ${requestedDim} was requested. The persisted index would not be comparable with these.`,
       setupAction: null,
     };
   }
@@ -147,7 +152,7 @@ export async function probeEmbeddingProviderV1({
     dim: queryVector.length,
     latencyMs,
     cause: "healthy",
-    message: `Embeddings working: ${model} at ${dim} dimensions in ${latencyMs}ms.`,
+    message: `Embeddings working: ${model} at ${requestedDim} dimensions in ${latencyMs}ms.`,
     setupAction: null,
   };
 }

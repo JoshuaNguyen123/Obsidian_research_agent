@@ -3,6 +3,11 @@ import type { AgentSettings } from "../../settings";
 import type { SemanticEmbeddingProvider } from "../../embeddings/types";
 import type { AgenticReflexInput, ReflexDecision, ReflexLabel } from "./types";
 import { cosineSimilarity, normalizeCosine } from "../../utils/vectorMath";
+import {
+  embeddingPrefixFingerprintV1,
+  resolveEmbeddingPrefixesV1,
+} from "../../embeddings/embeddingPrefixes";
+import { resolveEffectiveEmbeddingDimV1 } from "../../embeddings/embeddingModelCatalogV1";
 
 const INTENT_CONFIDENCE_THRESHOLD = 0.72;
 const INTENT_WINNING_MARGIN = 0.08;
@@ -276,12 +281,19 @@ export async function scorePromptAgainstPrototypes<TLabel extends string>({
   fallbackLabel: TLabel;
 }): Promise<PrototypeScoreV1<TLabel>[]> {
   const model = settings.semanticEmbeddingModel.trim();
-  const dim = settings.semanticEmbeddingDim === 256 ? 256 : 512;
+  // Same dimension, truncation rule, and instruction prefixes the vault index
+  // uses. The prototypes used to be embedded bare while every document in the
+  // index carried the model's prefix, so the reflex compared vectors from two
+  // different input conventions and quietly lost recall on nomic.
+  const effective = resolveEffectiveEmbeddingDimV1(model, settings.semanticEmbeddingDim);
+  const dim = effective.dim;
+  const prefixes = resolveEmbeddingPrefixesV1(model);
   const cacheKey = [
     cacheNamespace,
     prototypeVersion,
     model,
     dim,
+    embeddingPrefixFingerprintV1(model),
     settings.semanticModelCacheDir,
   ].join(":");
   let prototypes = prototypeVectorCache.get(cacheKey);
@@ -299,9 +311,12 @@ export async function scorePromptAgainstPrototypes<TLabel extends string>({
     const response = await embeddingProvider.embed({
       model,
       dim,
+      matryoshka: effective.matryoshka,
       cacheDir: settings.semanticModelCacheDir || undefined,
       documents,
       queries: [],
+      queryPrefix: prefixes.query,
+      documentPrefix: prefixes.document,
     });
     if (!response.ok || !response.documents || response.documents.length !== documents.length) {
       return [];
@@ -313,9 +328,12 @@ export async function scorePromptAgainstPrototypes<TLabel extends string>({
   const query = await embeddingProvider.embed({
     model,
     dim,
+    matryoshka: effective.matryoshka,
     cacheDir: settings.semanticModelCacheDir || undefined,
     documents: [],
     queries: [prompt],
+    queryPrefix: prefixes.query,
+    documentPrefix: prefixes.document,
   });
   if (!query.ok || !query.queries?.[0]) {
     return [];

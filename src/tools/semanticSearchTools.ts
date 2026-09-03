@@ -18,6 +18,7 @@ import type {
 } from "../embeddings/semanticIndexTypes";
 import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
 import { resolveEmbeddingPrefixesV1 } from "../embeddings/embeddingPrefixes";
+import { resolveEffectiveEmbeddingDimV1 } from "../embeddings/embeddingModelCatalogV1";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import { isVaultPathExcluded } from "./vaultExclusions";
 import { resolveSemanticSearchCapsForCompoundRun } from "../agent/setLooseCompoundAutonomy";
@@ -232,6 +233,7 @@ export const semanticSearchNotesTool: AgentTool = {
         context.semanticEmbeddingProvider.embed({
           model: getSemanticModel(context),
           dim: getSemanticDim(context),
+          matryoshka: getSemanticMatryoshka(context),
           cacheDir: context.settings.semanticModelCacheDir || undefined,
           documents: chunks.map((chunk) => chunk.embeddingText),
           queries: [query],
@@ -478,7 +480,8 @@ async function searchSemanticIndexFirst({
     operation: "semantic_search_notes",
     mode: "indexed_semantic",
     indexUsed: true,
-    indexFresh: true,
+    indexFresh: search.indexFresh,
+    ...(search.stale ? { stale: search.stale } : {}),
     indexedAt: search.indexedAt,
     model: search.model,
     dim: search.dim,
@@ -500,7 +503,18 @@ async function searchSemanticIndexFirst({
       skipped: Math.max(0, (search.candidateCount ?? search.results.length) - search.results.length),
       truncated: Boolean(search.nextCursor),
       fallbackUsed: false,
-      reasons: ["fresh_persisted_semantic_index"],
+      // Editing a note used to fail the whole indexed search and route the
+      // tool to the 300-note live path; now drifted notes are excluded (or
+      // re-embedded live) and the coverage record says exactly which.
+      reasons: search.stale
+        ? [
+            "persisted_semantic_index_with_stale_notes",
+            `changed_notes_excluded:${search.stale.changedPaths.length - search.stale.liveMergedPaths.length}`,
+            `changed_notes_live_merged:${search.stale.liveMergedPaths.length}`,
+            `missing_notes_excluded:${search.stale.missingPaths.length}`,
+            `unindexed_notes:${search.stale.unindexedPaths.length}`,
+          ]
+        : ["fresh_persisted_semantic_index"],
     }),
     // Where this search's wall clock actually went. The tool metric records a
     // single duration; only this split says whether it was shard decode or
@@ -944,8 +958,18 @@ function getSemanticModel(context: ToolExecutionContext): string {
   );
 }
 
-function getSemanticDim(context: ToolExecutionContext): 256 | 512 {
-  return context.settings.semanticEmbeddingDim === 256 ? 256 : DEFAULT_SEMANTIC_DIM;
+function getSemanticDim(context: ToolExecutionContext): number {
+  return resolveEffectiveEmbeddingDimV1(
+    getSemanticModel(context),
+    context.settings.semanticEmbeddingDim ?? DEFAULT_SEMANTIC_DIM,
+  ).dim;
+}
+
+function getSemanticMatryoshka(context: ToolExecutionContext): boolean {
+  return resolveEffectiveEmbeddingDimV1(
+    getSemanticModel(context),
+    context.settings.semanticEmbeddingDim ?? DEFAULT_SEMANTIC_DIM,
+  ).matryoshka;
 }
 
 function normalizeOptionalFolder(folder: string | undefined): string | null {

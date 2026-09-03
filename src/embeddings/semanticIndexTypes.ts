@@ -24,9 +24,11 @@ export interface SemanticIndexNote {
 export interface SemanticVaultIndexV1 {
   version: 1;
   model: string;
-  dim: 256 | 512;
+  dim: number;
   /** Prefix-pair fingerprint the vectors were built under. Absent = legacy. */
   promptPrefixes?: string;
+  /** Embedding provider that produced the vectors. Absent = the Python FastEmbed helper. */
+  providerId?: string;
   chunking: {
     minTokens: number;
     targetTokens: number;
@@ -71,9 +73,11 @@ export interface SemanticIndexShardV2 {
   version: 2;
   id: string;
   model: string;
-  dim: 256 | 512;
+  dim: number;
   /** Prefix-pair fingerprint the vectors were built under. Absent = legacy. */
   promptPrefixes?: string;
+  /** Embedding provider that produced the vectors. Absent = the Python FastEmbed helper. */
+  providerId?: string;
   indexedAt: string;
   rows: SemanticIndexRowMeta[];
   vectorsBase64: string;
@@ -82,9 +86,11 @@ export interface SemanticIndexShardV2 {
 export interface SemanticVaultIndexV2 {
   version: 2;
   model: string;
-  dim: 256 | 512;
+  dim: number;
   /** Prefix-pair fingerprint the vectors were built under. Absent = legacy. */
   promptPrefixes?: string;
+  /** Embedding provider that produced the vectors. Absent = the Python FastEmbed helper. */
+  providerId?: string;
   chunking: {
     minTokens: number;
     targetTokens: number;
@@ -126,6 +132,13 @@ export interface SemanticIndexSearchRequest {
   /** The run's abort signal; a stopped run does not wait for the embedder. */
   signal?: AbortSignal;
   /**
+   * Cap on how many changed-but-not-yet-reindexed notes a search will embed
+   * live and merge into the indexed hits. Defaults to
+   * `MAX_LIVE_STALE_NOTES_PER_SEARCH`; 0 disables the merge and simply
+   * excludes stale notes.
+   */
+  maxLiveStaleNotes?: number;
+  /**
    * Vault paths whose graph neighbourhood should receive a small ranking
    * boost — typically the note the user is working in. Omitting this (the
    * default) leaves scoring byte-identical to the pure semantic+lexical blend.
@@ -142,12 +155,31 @@ export interface SemanticIndexSearchTimingsV1 {
   rowsScored: number;
 }
 
+/**
+ * What a search did about notes the index no longer describes. Editing one
+ * note used to fail the whole search as `stale_index` and route the tool to the
+ * unindexed live path; now the stale notes are excluded (or, for a handful,
+ * embedded live and merged) and the search says so.
+ */
+export interface SemanticIndexStaleReportV1 {
+  /** Indexed notes whose mtime or size no longer matches; excluded or merged. */
+  changedPaths: string[];
+  /** Indexed notes that no longer exist; excluded. */
+  missingPaths: string[];
+  /** Indexable notes the index has never seen; not searchable until reindexed. */
+  unindexedPaths: string[];
+  /** Subset of `changedPaths` that was embedded live and merged into the hits. */
+  liveMergedPaths: string[];
+}
+
 export interface SemanticIndexSearchResult {
   ok: boolean;
   operation: "semantic_index_search";
   mode: "indexed_semantic";
   indexUsed: boolean;
   indexFresh: boolean;
+  /** Present when `indexFresh` is false on a successful search. */
+  stale?: SemanticIndexStaleReportV1;
   model: string;
   dim: number;
   indexedAt?: string;
