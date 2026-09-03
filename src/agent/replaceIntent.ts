@@ -1,3 +1,4 @@
+import { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 import { prefersStreamedReplaceForEditOrganize } from "./editOrganizeIntent";
 import { hasWordCountShortfallFollowUp } from "./generatedOutputPolicy";
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
@@ -54,6 +55,7 @@ export function hasAuthorizedCurrentNoteReplaceIntent(prompt: string): boolean {
     CLASSIC_REPLACE_INTENT_PATTERN.test(
       promptWithoutNegatedClassicReplaceClauses,
     ) ||
+    hasPageContentClearIntent(promptWithoutNegatedClassicReplaceClauses) ||
     PRONOUN_REVISION_INTENT_PATTERN.test(
       promptWithoutNegatedClassicReplaceClauses,
     ) ||

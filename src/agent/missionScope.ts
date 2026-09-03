@@ -1,5 +1,6 @@
 import { hasDesignIntent } from "./codeDesignIntent";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 import {
   hasAuthorizedCurrentNoteReplaceIntent,
   stripNegatedReplaceClauses,
@@ -152,10 +153,11 @@ export function deriveAutonomyScope(
   // hasAuthorizedCurrentNoteReplaceIntent judges.
   const replaceScopePrompt = stripNegatedReplaceClauses(prompt);
   scope.destructive.replaceCurrentNote =
-    /\b(replace|rewrite|clear|empty|delete all|overwrite|start\s+(?:fresh|cleanly)|reset|edit\s+over)\b[\s\S]{0,180}\b(note|page|document|file|space|contents?|text|writing)\b/i.test(
+    hasPageContentClearIntent(replaceScopePrompt) ||
+    /\b(replace|re-?write|clear|empty|delete all|overwrite|start\s+(?:fresh|cleanly)|reset|edit\s+over)\b[\s\S]{0,180}\b(note|page|document|file|space|contents?|text|writing)\b/i.test(
       replaceScopePrompt,
     ) ||
-    /\b(note|page|document|file|space|contents?|text|writing)\b[\s\S]{0,180}\b(replace|rewrite|clear|empty|delete all|overwrite|start\s+(?:fresh|cleanly)|reset|edit\s+over)\b/i.test(
+    /\b(note|page|document|file|space|contents?|text|writing)\b[\s\S]{0,180}\b(replace|re-?write|clear|empty|delete all|overwrite|start\s+(?:fresh|cleanly)|reset|edit\s+over)\b/i.test(
       replaceScopePrompt,
     ) ||
     /\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i.test(

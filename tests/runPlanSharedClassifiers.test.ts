@@ -185,6 +185,24 @@ test("the reconciled predicates answer the prompts that used to split them", () 
     sharedClassifiers.hasReplaceIntent("Rewrite the whole note from scratch."),
     true,
   );
+  assert.equal(
+    sharedClassifiers.hasReplaceIntent("Delete all the notes on the page first."),
+    true,
+  );
+  assert.equal(
+    sharedClassifiers.hasReplaceIntent("Delate all the notes on the page first."),
+    true,
+  );
+  assert.equal(
+    sharedClassifiers.isRecentAssistantWritebackFollowup(
+      "Delete all the notes on the page, and re-write your essay from a more informative perspective.",
+    ),
+    false,
+  );
+  assert.equal(
+    sharedClassifiers.hasDeleteIntent("Delete all the notes on the page first."),
+    false,
+  );
 
   // A scope restriction says WHERE a mutation may land; it is not a second
   // append instruction. Reading it as one planted an append node ahead of
@@ -261,6 +279,12 @@ test("a typo-rescued code prompt is admitted by the predicate the frontier consu
   assert.equal(
     sharedClassifiers.hasCodeExecutionIntent(
       "Research the CAP theorem and write a note.",
+    ),
+    false,
+  );
+  assert.equal(
+    sharedClassifiers.hasCodeExecutionIntent(
+      "Write me brief about dfs and bfs in python",
     ),
     false,
   );

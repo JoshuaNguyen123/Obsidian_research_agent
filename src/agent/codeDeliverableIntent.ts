@@ -120,6 +120,37 @@ export function hasExecutableNotebookDeliverableIntent(
   );
 }
 
+const PROSE_DOCUMENT_NOUN =
+  "(?:note|notes|memo|summar(?:y|ies)|essay|report|brief|document|documentation|article|paragraph|outline|explanation)";
+
+const PROSE_DOCUMENT_WRITE_OBJECT = new RegExp(
+  String.raw`\b(?:build|implement|create|write|make|code|generate|save|draft|compose)\s+(?:(?:me|us)\s+)?(?:a\s+|an\s+|the\s+|some\s+|your\s+|my\s+)?${PROSE_DOCUMENT_NOUN}(?:\s+(?:about|on|regarding|explaining|covering|for)\b|\s*$|[.,;:!?])`,
+  "i",
+);
+
+const TOPIC_LANGUAGE_MODIFIER =
+  /\b(?:about|regarding|explaining|covering)\b[\s\S]{0,120}\bin\s+(?:python|javascript|typescript|rust|golang|java)\b/i;
+
+/**
+ * True when the direct object of a write/create verb is a vault document
+ * (brief, note, essay), including informal "write me brief about X".
+ * "write me a brief python script" stays false: `brief` is an adjective there.
+ */
+export function hasProseDocumentWriteObject(prompt: string): boolean {
+  return PROSE_DOCUMENT_WRITE_OBJECT.test(prompt);
+}
+
+/**
+ * True when a language name is only the topic of a prose document
+ * ("brief about DFS in python"), not the requested implementation language.
+ */
+export function isLanguageNamedOnlyAsTopicModifier(prompt: string): boolean {
+  return (
+    TOPIC_LANGUAGE_MODIFIER.test(prompt) &&
+    new RegExp(String.raw`\b${PROSE_DOCUMENT_NOUN}\b`, "i").test(prompt)
+  );
+}
+
 export function hasCodeDeliverableIntent(prompt: string): boolean {
   if (hasCurrentNoteCodeSampleWriteSurface(prompt)) {
     return false;
@@ -170,12 +201,12 @@ export function hasCodeDeliverableIntent(prompt: string): boolean {
     ) {
       return false;
     }
-    // "write notes about the game design" writes prose whose TOPIC is a
-    // deliverable noun; the direct object is a vault document, not code.
+    // "write me brief about dfs and bfs in python" is a note whose TOPIC
+    // mentions a language. The language-as-deliverable arm below would
+    // otherwise plant a code ladder and block when the model writes the brief.
     if (
-      /\b(?:build|implement|create|write|make|code|generate|save)\s+(?:a\s+|the\s+|some\s+|your\s+|my\s+)?(?:note|notes|memo|summar(?:y|ies)|essay|report|brief|document|documentation)\b/i.test(
-        clause,
-      )
+      hasProseDocumentWriteObject(clause) ||
+      isLanguageNamedOnlyAsTopicModifier(clause)
     ) {
       return false;
     }

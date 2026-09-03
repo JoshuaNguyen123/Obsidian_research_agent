@@ -30,6 +30,27 @@ test("expand resume prompt authorizes replace", () => {
   assert.equal(hasAuthorizedCurrentNoteReplaceIntent(prompt), true);
 });
 
+test("delete all notes on the page authorizes replace even without a write verb", () => {
+  assert.equal(
+    hasAuthorizedCurrentNoteReplaceIntent(
+      "Delete all the notes on the page first.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasAuthorizedCurrentNoteReplaceIntent(
+      "Delate all the notes on the page first.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasAuthorizedCurrentNoteReplaceIntent(
+      "Delete all the notes on the page, and re-write your essay from a more informative perspective.",
+    ),
+    true,
+  );
+});
+
 test("plain write essay does not authorize replace", () => {
   assert.equal(
     hasAuthorizedCurrentNoteReplaceIntent(

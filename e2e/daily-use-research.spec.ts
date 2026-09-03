@@ -12,6 +12,11 @@ import { missionCommittedWorkV1 } from "../src/agent/missionEffortEscalation";
 import { resolveConfiguredAgentStepSettingV1 } from "../src/agent/runBudget";
 import { MAX_AGENT_STEPS } from "../src/tools/constants";
 import { resolveNoteOutputPlan } from "../src/agent/noteOutputPolicy";
+import { hasCodeDeliverableIntent } from "../src/agent/codeDeliverableIntent";
+import {
+  hasCodeExecutionIntent,
+  hasStaticGenerationIntent,
+} from "../src/agent/promptIntentClassifiers";
 import { resolveAdaptiveTeamDispatchV2 } from "../src/agent/researchTeamDispatch";
 import { extractClaimsFromDraft } from "../src/agent/claimLedger";
 import {
@@ -24,6 +29,10 @@ import {
   startAuthenticatedOllamaProxyV1,
   type AuthenticatedOllamaProxyV1,
 } from "./fixtures/authenticatedOllamaProxy";
+import {
+  compactDomainResearchPrompt,
+  DOMAIN_RESEARCH_CASES,
+} from "../tests/fixtures/domainResearchPrompts";
 
 // The fingerprinted `toolCalls` counter this lane annotates is an EVIDENCE
 // count (missionEvidence.length, successes only). This records the real
@@ -84,6 +93,25 @@ test.describe("Daily-use live research contract", () => {
     });
     expect(sourced.profile).toBe("grounded_research");
     expect(sourced.researchDepth).toBe("grounded");
+  });
+
+  test("exact dfs/bfs python brief is streamed note writeback, not a code ladder", () => {
+    const prompt = "Write me brief about dfs and bfs in python";
+    const output = resolveNoteOutputPlan({
+      prompt,
+      hasActiveMarkdownNote: true,
+      activeNoteIsPlaceholder: false,
+      outputProfile: "active_or_new_note",
+      enableStreaming: true,
+      streamWritebackMode: "all_current_note_content_writes",
+      autoTitleOnWrite: true,
+    });
+    expect(hasStaticGenerationIntent(prompt)).toBe(true);
+    expect(hasCodeDeliverableIntent(prompt)).toBe(false);
+    expect(hasCodeExecutionIntent(prompt)).toBe(false);
+    expect(output.destination).toBe("active_note");
+    expect(output.mutation).toBe("append");
+    expect(output.delivery).toBe("stream");
   });
 
   test("Agent settings expose a selectable Specialist model and explicit API slot", async () => {
@@ -1561,3 +1589,118 @@ async function readActiveNoteIdentityV1(harness: RealAiHarness): Promise<{
     fingerprint: fingerprintNoteContentV1(content),
   };
 }
+
+test.describe("STEM domain research prompts", () => {
+  test.describe.configure({ mode: "default", timeout: 3_600_000, retries: 0 });
+
+  test("STEM domain research prompts stream cited writeback", async ({}, testInfo) => {
+    test.skip(
+      process.env.E2E_DOMAIN_RESEARCH !== "1",
+      "opt-in live smoke; set E2E_DOMAIN_RESEARCH=1",
+    );
+
+    let harness: RealAiHarness | null = null;
+    const results: Array<{
+      id: string;
+      domain: string;
+      ok: boolean;
+      detail: string;
+    }> = [];
+    try {
+      harness = await startRealAiHarness(
+        "live-stem-domain-research",
+        {
+          missionTimeoutMs: 540_000,
+          completionTimeoutMs: 540_000,
+        },
+        {
+          enableStreaming: true,
+          streamWritebackMode: "all_current_note_content_writes",
+          autoTitleOnWrite: true,
+          thinkingMode: "off",
+          maxAgentSteps: 16,
+          maxRunMinutes: 8,
+          orchestratorEnabled: true,
+        },
+      );
+
+      for (const item of DOMAIN_RESEARCH_CASES) {
+        const notePath = `E2E Agent Tests/stem-${item.id}-${harness.marker}.md`;
+        const oldBody = `OLD-BODY-${item.id}`;
+        await harness.seedNote(
+          notePath,
+          `# Draft ${item.domain}\n\n${oldBody}\n`,
+          true,
+        );
+        const before = await readActiveNoteIdentityV1(harness);
+        const prompt = compactDomainResearchPrompt(item.topic, harness.marker);
+        try {
+          await harness.submitMission(prompt, { timeoutMs: 540_000 });
+          const after = await readActiveNoteIdentityV1(harness);
+          const snapshot = await harness.attestProductionRun();
+          const remapped =
+            /Append the most recent assistant response/i.test(
+              String(snapshot.lastConfig?.missionPrompt ?? ""),
+            ) ||
+            /most recent assistant response/i.test(
+              JSON.stringify(snapshot.lastComplete ?? {}),
+            );
+          const timeline = JSON.stringify(snapshot.lastToolTimeline ?? []);
+          const usedWeb = /web_search|web_fetch/i.test(timeline);
+          const cited = /source:[a-z0-9-]+:passage:\d+-\d+|https?:\/\/|\(\d{4}\)/i.test(
+            after.content,
+          );
+          const wrote = after.content.includes(harness.marker);
+          const mutated = after.fingerprint !== before.fingerprint;
+          const modelCalls = snapshot.providerUsage?.modelCallCount ?? 0;
+          const ok =
+            wrote &&
+            mutated &&
+            !remapped &&
+            modelCalls > 0 &&
+            (usedWeb || cited);
+          const detail = JSON.stringify({
+            wrote,
+            mutated,
+            remapped,
+            modelCalls,
+            usedWeb,
+            cited,
+            titleBefore: before.title,
+            titleAfter: after.title,
+            bytes: after.content.length,
+            receiptOps: (snapshot.lastReceipts ?? []).map(
+              (receipt: { operation?: string }) => receipt.operation ?? null,
+            ),
+          });
+          results.push({
+            id: item.id,
+            domain: item.domain,
+            ok,
+            detail,
+          });
+        } catch (error) {
+          results.push({
+            id: item.id,
+            domain: item.domain,
+            ok: false,
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    } finally {
+      await harness?.close();
+    }
+
+    await testInfo.attach("stem-domain-research-results", {
+      body: JSON.stringify(results, null, 2),
+      contentType: "application/json",
+    });
+    const failed = results.filter((result) => !result.ok);
+    expect(
+      failed,
+      `STEM domain failures: ${JSON.stringify(failed, null, 2)}`,
+    ).toEqual([]);
+    expect(results).toHaveLength(DOMAIN_RESEARCH_CASES.length);
+  });
+});

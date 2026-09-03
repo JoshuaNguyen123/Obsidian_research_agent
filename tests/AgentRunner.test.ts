@@ -42,6 +42,7 @@ import {
   hasConcreteWriteReceipt,
   getCodeCapabilityRegistrationBlockerV1,
   getRequiredCodeWorkflowToolNames,
+  shouldRefuseInheritedCodeWorkflowOnResumeV1,
   getExplicitLinearMutationToolNames,
   getExplicitLinearReadToolNames,
   getActiveValidationRecoveryFrontierV1,
@@ -840,6 +841,31 @@ test("standalone nested code delivery routes through workspace creation and appr
       "code_validate_full",
       "code_workspace_export_directory",
     ],
+  );
+});
+
+test("a topic brief about algorithms in python is not a code deliverable", () => {
+  const prompt = "Write me brief about dfs and bfs in python";
+  assert.equal(hasCodeDeliverableIntent(prompt), false);
+  assert.deepEqual(getRequiredCodeWorkflowToolNames(prompt), []);
+  assert.equal(
+    shouldRefuseInheritedCodeWorkflowOnResumeV1({
+      prompt,
+      resumeRoute: "grounded_workflow",
+      expectedTools: [
+        "code_sandbox_status",
+        "code_workspace_create",
+        "code_workspace_create_file",
+      ],
+    }),
+    true,
+  );
+  assert.equal(
+    shouldRefuseInheritedCodeWorkflowOnResumeV1({
+      prompt: "write a number guessing game in Python on my desktop",
+      resumeRoute: "grounded_workflow",
+    }),
+    false,
   );
 });
 
@@ -5033,6 +5059,73 @@ test("streaming word-count near-miss within ±5% keeps draft without correction"
   assert.equal(chatRequests.length, 0);
 });
 
+test("a topic brief about dfs and bfs in python streams instead of blocking on a code frontier", async () => {
+  const prompt = "Write me brief about dfs and bfs in python";
+  const brief = [
+    "# DFS and BFS in Python",
+    "",
+    "Depth-first search explores as far as possible along each branch before backtracking.",
+    "Breadth-first search visits neighbors level by level using a queue.",
+    "",
+    "```python",
+    "from collections import deque",
+    "def bfs(graph, start):",
+    "    seen = {start}",
+    "    q = deque([start])",
+    "    while q:",
+    "        node = q.popleft()",
+    "        for nxt in graph[node]:",
+    "            if nxt not in seen:",
+    "                seen.add(nxt)",
+    "                q.append(nxt)",
+    "    return seen",
+    "```",
+  ].join("\n");
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Existing note",
+  });
+  vault.context.settings.modelRouterMode = "off";
+  vault.context.settings.researchMemoryEnabled = false;
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      streamRequests,
+      streamResponders: [() => responseWithContentDeltas([brief])],
+      chatResponders: [
+        () => {
+          throw new Error(
+            "topic brief must stream; a tool-loop chat turn means the code frontier still owns the mission",
+          );
+        },
+      ],
+    }),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.equal(streamRequests.length, 1, statuses.join(" | "));
+  assert.equal(chatRequests.length, 0, statuses.join(" | "));
+  assert.doesNotMatch(
+    statuses.join("\n"),
+    /twice returned no tool call/iu,
+  );
+  assert.equal(completions[0]?.stopReason, "write_completed");
+  assert.match(vault.content.get("Current.md") ?? "", /Depth-first search/u);
+  assert.match(vault.content.get("Current.md") ?? "", /Breadth-first search/u);
+});
+
 test("streaming word-count far under soft band still requests one correction", async () => {
   const statuses: string[] = [];
   const chatRequests: ModelChatRequest[] = [];
@@ -6233,6 +6326,131 @@ test("delete all notes on the page routes to replace-current-page with backup", 
   assert.equal(receipts.length, 1);
   assert.equal(receipts[0].operation, "replace");
   assert.equal(receipts[0].toolName, "replace_current_file");
+});
+
+test("delete all notes on the page then hyphenated re-write replaces instead of appending the last reply", async () => {
+  const streamRequests: ModelChatRequest[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
+  const prompt =
+    "Delete all the notes on the page, and re-write your essay from a more informative perspective. Tell me what is Genesis, what is it about, what is the lesson?";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Old Notes\n\nPrior Genesis draft that must be replaced.",
+    now: new Date(988),
+  });
+  const client = createClient({
+    chatRequests,
+    chatResponders: [() => responseWithContent("Ready to replace the page.")],
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# What Genesis Is\n\n",
+          "Genesis is the first book of the Hebrew Bible.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    conversationHistory: [
+      {
+        role: "assistant",
+        content: "Claim-Evidence-Warrant Revision of Genesis\nThe Argumentative Core",
+      },
+    ],
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.equal(
+    chatRequests.some((request) =>
+      request.messages.some((message) =>
+        /Append the most recent assistant response/.test(message.content),
+      ),
+    ),
+    false,
+  );
+  assert.equal(
+    vault.content.get("Current.md"),
+    "# What Genesis Is\n\nGenesis is the first book of the Hebrew Bible.",
+  );
+  assert.equal(receipts.at(-1)?.operation, "replace");
+  assert.equal(receipts.at(-1)?.toolName, "replace_current_file");
+});
+
+test("delate-all-notes-on-the-page-first typo still replaces current page content", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
+  const replacement =
+    "# What Genesis Is\n\nGenesis opens the Torah with origins.";
+  const prompt = "Delate all the notes on the page first.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Old Notes\n\nOld Genesis notes that must not remain.",
+    now: new Date(989),
+  });
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("replace_current_file", {
+          text: replacement,
+        }),
+    ],
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# What Genesis Is\n\n",
+          "Genesis opens the Torah with origins.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.equal(
+    chatRequests.some((request) =>
+      request.messages.some((message) =>
+        /Append the most recent assistant response/.test(message.content),
+      ),
+    ),
+    false,
+  );
+  const observed = vault.content.get("Current.md") ?? "";
+  assert.equal(observed.includes("Old Genesis notes"), false);
+  assert.equal(observed.includes("Genesis opens the Torah with origins."), true);
+  assert.equal(receipts.at(-1)?.operation, "replace");
+  assert.equal(receipts.at(-1)?.toolName, "replace_current_file");
 });
 
 test("research memory save uses durable memory tool with streaming enabled", async () => {

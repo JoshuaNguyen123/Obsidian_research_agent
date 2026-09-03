@@ -438,6 +438,20 @@ test("current note reset policy separates delete-only from delete-then-write", (
   );
 });
 
+test("current note reset policy treats delete-all-notes-on-the-page as replace", () => {
+  for (const prompt of [
+    "Delete all the notes on the page first.",
+    "Delate all the notes on the page first.",
+    "Delete all the notes on the page, and re-write your essay.",
+  ]) {
+    assert.deepEqual(
+      analyzeCurrentNoteResetPrompt(prompt),
+      { kind: "replace_current_note", reason: "clear_then_write" },
+      prompt,
+    );
+  }
+});
+
 test("current note reset policy treats keep-note clear wording as replace", () => {
   for (const prompt of [
     "Keep the note, but delete all the contents on the note. Start cleanly. Then write the essay again.",

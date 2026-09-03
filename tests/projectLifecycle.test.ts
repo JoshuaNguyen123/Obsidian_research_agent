@@ -488,6 +488,13 @@ test("each of the six developer stages remains independently routable", () => {
   }
 });
 
+test("a topic brief about algorithms in python is not a code_execution stage", () => {
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1("Write me brief about dfs and bfs in python"),
+    [],
+  );
+});
+
 test("V2 lifecycle generalizes GitHub publication while projecting valid V1 private state", () => {
   const legacy = createProjectLifecycleIntentV1({
     runId: "run-project-1",

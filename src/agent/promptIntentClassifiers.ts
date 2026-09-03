@@ -29,7 +29,10 @@ import {
   hasReviseDesignIntent,
 } from "./codeDesignIntent";
 import { hasDeepResearchIntent as hasSharedDeepResearchIntent } from "./researchDepthIntent";
-import { isCurrentNoteReplaceResetPrompt } from "./currentNoteResetPolicy";
+import {
+  hasPageContentClearIntent,
+  isCurrentNoteReplaceResetPrompt,
+} from "./currentNoteResetPolicy";
 import { isCurrentNoteEditOrganizeIntent, isNamedSectionEditIntent, isVaultWideOrganizeIntent, isWholeNoteEditIntent } from "./editOrganizeIntent";
 import { hasExplicitNoWebIntent, hasExplicitPublicWebSignal, hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import { analyzeGeneratedOutputPrompt } from "./generatedOutputPolicy";
@@ -63,6 +66,7 @@ export {
   hasExplicitNoNoteWriteIntent as hasChatOnlyResponseIntent,
 } from "./noNoteWriteIntent";
 export { hasWordCountIntent } from "./wordCountIntent";
+export { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
   return (
@@ -79,8 +83,17 @@ export function isPromptOnCurrentPageIntent(prompt: string): boolean {
 }
 
 export function isRecentAssistantWritebackFollowup(prompt: string): boolean {
+  if (
+    hasPageContentClearIntent(prompt) ||
+    isCurrentNoteReplaceResetPrompt(prompt)
+  ) {
+    return false;
+  }
+  // "re-write your essay" is a revision verb, not "write your essay onto
+  // the page" (copy the last assistant reply).
+  const copyIntentPrompt = prompt.replace(/\bre-writes?\b/gi, " ");
   return /\b(write|copy|save|append|add|insert|paste|put)\b[\s\S]{0,100}\b(this|that|the|your|previous|prior|last|above)\s+(essay|answer|response|reply|summary|analysis|content|text|draft|paragraph|article|report)\b[\s\S]{0,100}\b(?:on|onto|to|into|in)\s+(?:the\s+)?(?:page|note|document|file|markdown)\b|\b(?:on|onto|to|into|in)\s+(?:the\s+)?(?:page|note|document|file|markdown)\b[\s\S]{0,100}\b(write|copy|save|append|add|insert|paste|put)\b[\s\S]{0,100}\b(this|that|the|your|previous|prior|last|above)\s+(essay|answer|response|reply|summary|analysis|content|text|draft|paragraph|article|report)\b/i.test(
-    prompt,
+    copyIntentPrompt,
   );
 }
 
@@ -1143,8 +1156,9 @@ export function hasReplaceIntent(prompt: string): boolean {
     );
   return (
     isCurrentNoteReplaceResetPrompt(positivePrompt) ||
+    hasPageContentClearIntent(positivePrompt) ||
     hasWholeNoteRevisionIntent(positivePrompt) ||
-    /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\breplace\s+(?:the\s+)?existing\s+contents?\b/i.test(
+    /\b(re-?write|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\breplace\s+(?:the\s+)?existing\s+contents?\b/i.test(
       positivePrompt,
     ) || hasClearPageAndWriteIntent(positivePrompt)
   );
@@ -1152,6 +1166,7 @@ export function hasReplaceIntent(prompt: string): boolean {
 
 export function hasWholeNoteReplaceIntent(prompt: string): boolean {
   if (
+    hasPageContentClearIntent(prompt) ||
     (isCurrentNoteReplaceResetPrompt(prompt) &&
       hasExplicitCurrentNoteMutationIntent(prompt)) ||
     hasWholeNoteRevisionIntent(prompt)
@@ -1165,14 +1180,17 @@ export function hasWholeNoteReplaceIntent(prompt: string): boolean {
 
   return (
     hasClearPageAndWriteIntent(prompt) ||
-    /\b(rewrite|replace|reset|overwrite|clean\s+up|start\s+(?:fresh|cleanly)|edit\s+over)\b[\s\S]{0,100}\b(current|this|active|whole|entire|existing)\s+(note|file|markdown|document|page|content|contents)\b|\b(current|this|active|whole|entire|existing)\s+(note|file|markdown|document|page|content|contents)\b[\s\S]{0,100}\b(rewrite|replace|reset|overwrite|clean\s+up|start\s+(?:fresh|cleanly)|edit\s+over)\b/i.test(
+    /\b(re-?write|replace|reset|overwrite|clean\s+up|start\s+(?:fresh|cleanly)|edit\s+over)\b[\s\S]{0,100}\b(current|this|active|whole|entire|existing)\s+(note|file|markdown|document|page|content|contents)\b|\b(current|this|active|whole|entire|existing)\s+(note|file|markdown|document|page|content|contents)\b[\s\S]{0,100}\b(re-?write|replace|reset|overwrite|clean\s+up|start\s+(?:fresh|cleanly)|edit\s+over)\b/i.test(
       prompt,
     )
   );
 }
 
 export function hasClearPageAndWriteIntent(prompt: string): boolean {
-  return /\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,180}\b(?:after|then)\b[\s\S]{0,120}\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
+  if (hasPageContentClearIntent(prompt)) {
+    return true;
+  }
+  return /\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,180}\b(write|draft|compose|generate|create|re-?write)\b|\b(write|draft|compose|generate|create|re-?write)\b[\s\S]{0,180}\b(?:after|then)\b[\s\S]{0,120}\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
     prompt,
   );
 }
@@ -1203,7 +1221,7 @@ export function hasWholeNoteRevisionIntent(prompt: string): boolean {
 
   if (
     hasAppendIntent(prompt) &&
-    !/\b(?:rewrite|replace|reset|overwrite|whole|entire)\b/iu.test(prompt)
+    !/\b(?:re-?write|replace|reset|overwrite|whole|entire)\b/iu.test(prompt)
   ) {
     // Append-first authority: a generic request to "expand" research or
     // related-note coverage must not become whole-note replacement merely
@@ -1212,7 +1230,7 @@ export function hasWholeNoteRevisionIntent(prompt: string): boolean {
   }
 
   const revisionVerb =
-    /\b(edit(?:ing)?|revise|revising|revised|revision|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b/i;
+    /\b(edit(?:ing)?|revise|revising|revised|revision|re-?write|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b/i;
   const wholeTextTarget =
     /\b(essay|draft|article|paragraphs?|body|content|document|version)\b|\b(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown)\b|\b(?:note|page|file|markdown)\b[\s\S]{0,40}\b(?:whole|entire|current|this|active)\b/i;
   const updateVerb = /\b(update|updating)\b/i;
@@ -1248,6 +1266,9 @@ export function hasNegatedDeleteClause(clause: string): boolean {
 }
 
 export function hasDeleteIntent(prompt: string): boolean {
+  if (hasPageContentClearIntent(prompt)) {
+    return false;
+  }
   if (
     isCurrentNoteReplaceResetPrompt(prompt) &&
     hasExplicitCurrentNoteMutationIntent(prompt)
@@ -1401,13 +1422,13 @@ export function hasWebSearchIntent(prompt: string): boolean {
 export function hasFetchedWebSourceIntent(prompt: string): boolean {
   if (
     hasPrimaryTextCitationIntent(prompt) &&
-    !/\b(?:web|online|internet|https?:\/\/|bibliography|reference\s+list|source\s+urls?|verified\s+sources?|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
+    !/\b(?:web|online|internet|https?:\/\/|bibliography|reference\s+list|source\s+urls?|verified\s+sources?|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?)|scholarly|academic|peer[-\s]?reviewed)\b/iu.test(
       prompt,
     )
   ) {
     return false;
   }
-  return /\b(cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?))\b/i.test(
+  return /\b(cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?)|cite(?:d)?\s+at\s+least\b[\s\S]{0,60}\bsources?|(?:scholarly|academic|peer[-\s]?reviewed)\s+(?:and\s+(?:academic|scholarly)\s+)?sources?)\b/i.test(
     prompt,
   );
 }

@@ -8,6 +8,7 @@ import {
   isWholeNoteEditIntent,
 } from "./editOrganizeIntent";
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
+import { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 import { detectExplicitReplaceIntent } from "./noteOutputPolicy";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 
@@ -218,12 +219,16 @@ function getGeneratedOutputTarget(
     return "current_note_replace";
   }
 
+  if (hasPageContentClearIntent(prompt)) {
+    return "current_note_replace";
+  }
+
   // "revised 2000 word version" / revise-the-draft language must replace.
   if (
-    /\b(revised|revise|revising|rewrite|rewriting)\b[\s\S]{0,80}\b(essay|draft|article|version|note|page)\b/i.test(
+    /\b(revised|revise|revising|re-?write|rewriting)\b[\s\S]{0,80}\b(essay|draft|article|version|note|page)\b/i.test(
       prompt,
     ) ||
-    /\b(essay|draft|article|version|note|page)\b[\s\S]{0,80}\b(revised|revise|revising|rewrite|rewriting)\b/i.test(
+    /\b(essay|draft|article|version|note|page)\b[\s\S]{0,80}\b(revised|revise|revising|re-?write|rewriting)\b/i.test(
       prompt,
     )
   ) {

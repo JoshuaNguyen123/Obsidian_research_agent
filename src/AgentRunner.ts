@@ -244,6 +244,7 @@ import {
   stripRepeatedCurrentNotePrefixFromAppend,
 } from "./agent/vaultWriteContentGuard";
 import {
+  allowsDestructiveShortCurrentNoteReplace,
   analyzeCurrentNoteResetPrompt,
   isCurrentNoteReplaceResetPrompt,
 } from "./agent/currentNoteResetPolicy";
@@ -1690,7 +1691,7 @@ Operating rules:
 11. Use append_to_current_section when the user asks to write, add, append, or insert content below, under, after, or inside a named heading section.
 12. Only request replace_current_file when the user explicitly asks to rewrite, replace, clean up, reset, start fresh, overwrite the whole current note, or clear/delete page content and then write new content.
 13. Treat whole-note/essay/body/paragraph revision and current-note edit/organize requests as current-note replacement with backup. Use edit_current_section only when the user names a heading or section.
-14. Only request delete_current_file when the user explicitly asks to delete, remove, or trash the current note. Treat "delete all notes on the page and write..." as replacing current page content, not trashing the note.
+14. Only request delete_current_file when the user explicitly asks to delete, remove, or trash the current note. Treat "delete all notes on the page", "delete all notes on the page first", and "delete all notes on the page and write..." as replacing current page content, not trashing the note.
 15. Use list_current_folder before broad vault traversal when the mission depends on where the active note lives.
 16. Use list_folder and get_path_info to inspect vault folder structure before making path-based file changes.
 17. Use path-based CRUD tools only for explicit file or folder create, append, replace, move, rename, delete, remove, or trash requests.
@@ -4351,9 +4352,18 @@ export async function runAgentMission({
     // reference keeps host-owned streaming — its sourced writeback replays
     // under WAL and reconcile protection, and dropping streaming there
     // strands the draft in unbounded tool-less planning turns.
+    // Skip the drop when the inherited graph is a stale code ladder for a
+    // note brief: re-opening that frontier is what blocked Resume twice.
+    const refuseInheritedCodeWorkflow =
+      shouldRefuseInheritedCodeWorkflowOnResumeV1({
+        prompt: activeIntentPrompt,
+        resumeRoute: resumeLedger?.route,
+        expectedTools: resumeLedger?.loopBudget.expectedTools,
+      });
     if (
       streamingWritebackKind === "append" &&
-      resumeSnapshot?.missionGraphRef
+      resumeSnapshot?.missionGraphRef &&
+      !refuseInheritedCodeWorkflow
     ) {
       resumeContinuesStreamedCurrentNoteAppend = true;
       streamingWritebackKind = null;
@@ -4439,6 +4449,7 @@ export async function runAgentMission({
     });
     if (
       isRunRouteValue(resumeLedger?.route) &&
+      !refuseInheritedCodeWorkflow &&
       !(
         streamingWritebackKind === null &&
         (resumeLedger.route === "single_model_writeback" ||
@@ -5241,6 +5252,35 @@ export async function runAgentMission({
               outputPreview: {
                 missionId: graphPlan.graph.missionId,
                 prunedNodeIds: designPrune.prunedNodeIds,
+              },
+            });
+          }
+        }
+        if (
+          exactResumeRunId &&
+          shouldRefuseInheritedCodeWorkflowOnResumeV1({
+            prompt: activeIntentPrompt,
+            resumeRoute: resumeLedger?.route,
+            expectedTools: resumeLedger?.loopBudget.expectedTools,
+          })
+        ) {
+          const codePrune =
+            await missionGraphSession.pruneNeverExecutedToolNodes(
+              (toolName) =>
+                (CODE_EXECUTION_TOOL_ALLOW as readonly string[]).includes(
+                  toolName,
+                ),
+              "Prune inherited code-workflow nodes the restored original mission never granted.",
+            );
+          if (codePrune.prunedNodeIds.length > 0) {
+            events.onTrace?.({
+              id: "mission-graph-stale-code-workflow-prune",
+              kind: "status",
+              message:
+                "Removed inherited code-workflow nodes the restored original mission never granted.",
+              outputPreview: {
+                missionId: graphPlan.graph.missionId,
+                prunedNodeIds: codePrune.prunedNodeIds,
               },
             });
           }
@@ -30777,6 +30817,35 @@ export function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
 }
 
 /**
+ * A prior segment can persist `grounded_workflow` plus a code-ladder graph
+ * for a prompt that is only a topic brief ("write me brief about dfs and bfs
+ * in python"). Resume must not inherit that route or keep those unpaid nodes:
+ * the model writes the brief as prose and the unchanged-frontier breaker
+ * fires again.
+ */
+export function shouldRefuseInheritedCodeWorkflowOnResumeV1(input: {
+  prompt: string;
+  resumeRoute?: string | null;
+  expectedTools?: readonly string[];
+}): boolean {
+  if (
+    hasCodeExecutionIntent(input.prompt) ||
+    getRequiredCodeWorkflowToolNames(input.prompt).length > 0
+  ) {
+    return false;
+  }
+  if (
+    input.resumeRoute === "grounded_workflow" ||
+    input.resumeRoute === "tool_required"
+  ) {
+    return true;
+  }
+  return (input.expectedTools ?? []).some((name) =>
+    (CODE_EXECUTION_TOOL_ALLOW as readonly string[]).includes(name),
+  );
+}
+
+/**
  * Minimal code-delivery ladder that a high-confidence, opt-in router proposal
  * may seed when deterministic wording grants a bounded execution turn but does
  * not identify code work itself. It intentionally excludes commit, dependency
@@ -35593,9 +35662,7 @@ async function streamCurrentNoteWriteback({
           kind === "replace" ? originalNoteContentForSafety : undefined,
         allowDestructiveShortReplace:
           typeof resolvedMissionPrompt === "string" &&
-          /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
-            resolvedMissionPrompt,
-          ),
+          allowsDestructiveShortCurrentNoteReplace(resolvedMissionPrompt),
       });
       emitStatus(events, "Committing verified writeback to note...", "final_answer");
       // No unverified draft was released, so the verified candidate is the
@@ -35738,9 +35805,7 @@ async function streamCurrentNoteWriteback({
         kind === "replace" ? originalNoteContentForSafety : undefined,
       allowDestructiveShortReplace:
         typeof resolvedMissionPrompt === "string" &&
-        /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
-          resolvedMissionPrompt,
-        ),
+        allowsDestructiveShortCurrentNoteReplace(resolvedMissionPrompt),
     });
 
     await writer.finish({ force: true });

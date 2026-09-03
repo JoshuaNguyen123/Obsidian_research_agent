@@ -22,7 +22,11 @@ import {
   type AcceptedResearchArtifactV1,
 } from "../integrations/linear/AcceptedResearchArtifactV1";
 import type { RepositoryVisibility } from "../integrations/github/RepositoryVisibility";
-import { hasExecutableNotebookDeliverableIntent } from "./codeDeliverableIntent";
+import {
+  hasCodeDeliverableIntent,
+  hasExecutableNotebookDeliverableIntent,
+  hasProseDocumentWriteObject,
+} from "./codeDeliverableIntent";
 
 export const RESEARCHER_HANDOFF_SCHEMA_VERSION = 1 as const;
 export const RESEARCH_PROJECT_PLAN_SCHEMA_VERSION = 1 as const;
@@ -1108,11 +1112,17 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   // Do not treat "write … Linear issue URL" (note reflection) as code_execution.
   // Prefer repository/workspace/language nouns; "implement Linear issues in the
   // workspace" still matches via workspace/repository.
+  // A topic brief ("write me brief about dfs and bfs in python") matches the
+  // write…python bag-of-words without granting a code ladder. Keep that skip
+  // aligned with hasCodeDeliverableIntent so the two seats cannot disagree.
+  const proseTopicOnly =
+    hasProseDocumentWriteObject(command) && !hasCodeDeliverableIntent(command);
   if (
-    positive(
-      /\b(?:implement|code|execute|work|build|fix|write)\b[^.\n]{0,140}\b(?:code|repository|repo|workspace|game|app|script|module|library|package|python|javascript|typescript|rust|golang)\b/u,
-      "code|implement(?:ation)?|repository|repo|workspace",
-    ) ||
+    (!proseTopicOnly &&
+      positive(
+        /\b(?:implement|code|execute|work|build|fix|write)\b[^.\n]{0,140}\b(?:code|repository|repo|workspace|game|app|script|module|library|package|python|javascript|typescript|rust|golang)\b/u,
+        "code|implement(?:ation)?|repository|repo|workspace",
+      )) ||
     positive(
       /\b(?:then|afterwards|and\s+then|next)\b[^.\n]{0,120}\b(?:implement|build|code|write)\b[^.\n]{0,120}\b(?:code|game|app|script|module|python|javascript|typescript|workspace|repository|repo)\b/u,
       "code|implement(?:ation)?|repository|repo|workspace",

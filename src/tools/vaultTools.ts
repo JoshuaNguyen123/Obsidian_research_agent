@@ -27,6 +27,7 @@ import {
   type ToolExecutionContext,
 } from "./types";
 import { hasExplicitNoNoteWriteIntent } from "../agent/noNoteWriteIntent";
+import { allowsDestructiveShortCurrentNoteReplace } from "../agent/currentNoteResetPolicy";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "../agent/replaceIntent";
 import { currentNoteReplaceCatalogEligible } from "../agent/missionScope";
 import {
@@ -2284,9 +2285,7 @@ export const appendToCurrentFileTool: AgentTool = {
       text,
       currentContent: current,
       allowDestructiveShortReplace:
-        /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
-          context.originalPrompt,
-        ),
+        allowsDestructiveShortCurrentNoteReplace(context.originalPrompt),
     });
     // Revision missions must not "append" process talk or a second draft when
     // whole-note replace is the authorized path — fail closed instead of
@@ -5138,9 +5137,7 @@ async function prepareReplaceCurrentFile(
       text,
       currentContent: current,
       allowDestructiveShortReplace:
-        /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
-          context.originalPrompt,
-        ),
+        allowsDestructiveShortCurrentNoteReplace(context.originalPrompt),
     });
     const contentRevision = await sha256Fingerprint(current);
     const outboundBytes = getByteLength(text);
@@ -5204,9 +5201,7 @@ async function executePreparedReplaceCurrentFile(
     text,
     currentContent: current,
     allowDestructiveShortReplace:
-      /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
-        context.originalPrompt,
-      ),
+      allowsDestructiveShortCurrentNoteReplace(context.originalPrompt),
   });
   const startedAt = vaultNow(context).toISOString();
   const backupPath = await backupCurrentFile(context, file, current);
@@ -5262,9 +5257,7 @@ async function prepareReplaceFile(
       text,
       currentContent: current,
       allowDestructiveShortReplace:
-        /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
-          context.originalPrompt,
-        ),
+        allowsDestructiveShortCurrentNoteReplace(context.originalPrompt),
     });
     const contentRevision = await sha256Fingerprint(current);
     const outboundBytes = getByteLength(text);
@@ -5321,9 +5314,7 @@ async function executePreparedReplaceFile(
     text,
     currentContent: current,
     allowDestructiveShortReplace:
-      /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
-        context.originalPrompt,
-      ),
+      allowsDestructiveShortCurrentNoteReplace(context.originalPrompt),
   });
   const startedAt = vaultNow(context).toISOString();
   const backupPath = await backupCurrentFile(context, file, current);

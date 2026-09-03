@@ -69,9 +69,13 @@ export const FULL_DESKTOP_LADDER = [
  * narrowing it risks real design missions, so it waits for the semantic
  * shadow tier evidence. 64/65 after the executable-notebook deliverable
  * predicate landed (notebook-execution-live lane prompt, fast-path deferral,
- * and the jupyter-reflection guard all pass).
+ * and the jupyter-reflection guard all pass). 66/67 after Genesis-shaped
+ * STEM research notes ("cite at least N scholarly sources" + stream to page)
+ * were pinned as persist / grounded_workflow with no code ladder.
+ * 67/68 after "Write me brief about dfs and bfs in python" stopped matching
+ * the write…python code-deliverable arm and stayed a streamed note brief.
  */
-export const ROUTING_BASELINE_ACCURACY = 64 / 65;
+export const ROUTING_BASELINE_ACCURACY = 67 / 68;
 
 export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
   // --- The two live-reported desktop prompts and near variants ---
@@ -617,6 +621,51 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     prompt: "Write the final reflection to a Jupyter notebook.",
     expected: {
       speechAct: "persist",
+      requiredCodeToolNames: [],
+    },
+    status: "pass",
+  },
+  {
+    id: "stem-cs-raft-research-note",
+    prompt:
+      "I want you to write me a 1000 word research note on the Raft consensus algorithm. Cite at least 5-10 scholarly and academic sources. I want you to stream your results into this note page. Change the title as well.",
+    expected: {
+      speechAct: "persist",
+      executionTier: "bounded_tool",
+      route: "grounded_workflow",
+      reasonsInclude: ["web_search_intent"],
+      requiredCodeToolNames: [],
+    },
+    status: "pass",
+  },
+  {
+    // Live failure 2026-09-02: informal "write me brief about dfs and bfs in
+    // python" matched write…python as a code deliverable, planned the sandbox
+    // ladder, and blocked when the model wrote the brief as prose.
+    id: "guard-brief-about-dfs-bfs-in-python",
+    prompt: "Write me brief about dfs and bfs in python",
+    streamingWritebackKind: "append",
+    intent: {
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    },
+    expected: {
+      route: "single_model_writeback",
+      reasonsInclude: ["streaming_writeback:append"],
+      requiredCodeToolNames: [],
+    },
+    status: "pass",
+  },
+  {
+    id: "stem-ai-rlhf-research-note",
+    prompt:
+      "I want you to write me a 1000 word research note on reinforcement learning from human feedback. Cite at least 5-10 scholarly and academic sources. I want you to stream your results into this note page. Change the title as well.",
+    expected: {
+      speechAct: "persist",
+      executionTier: "bounded_tool",
+      route: "grounded_workflow",
       requiredCodeToolNames: [],
     },
     status: "pass",
