@@ -40,11 +40,68 @@ export interface RetrievalFixtureQuery {
 }
 
 const TOPICS = [
-  { slug: "photosynthesis", term: "chlorophyll", field: "biology" },
-  { slug: "monetary-policy", term: "quantitative easing", field: "economics" },
-  { slug: "byzantine-fault", term: "consensus quorum", field: "distributed systems" },
-  { slug: "baroque-counterpoint", term: "fugue subject", field: "music theory" },
-  { slug: "protein-folding", term: "tertiary structure", field: "biochemistry" },
+  {
+    slug: "photosynthesis",
+    term: "chlorophyll",
+    field: "biology",
+    // A second sentence in the answer note that says the same thing without
+    // the query term, so a paraphrased question has something to land on.
+    gloss: "It is the green pigment that lets leaves turn sunlight into sugar.",
+    paraphrases: [
+      "which pigment makes leaves green and captures sunlight",
+      "how do plants turn light into food",
+      "what absorbs sunlight inside a leaf",
+      "green molecule behind plant energy production",
+    ],
+  },
+  {
+    slug: "monetary-policy",
+    term: "quantitative easing",
+    field: "economics",
+    gloss: "A central bank buys long-dated bonds to push down interest rates when cutting the policy rate is no longer possible.",
+    paraphrases: [
+      "central bank buying government bonds to lower borrowing costs",
+      "what does a central bank do when rates are already near zero",
+      "bond purchases as a stimulus tool",
+      "how do reserve banks expand their balance sheet to support the economy",
+    ],
+  },
+  {
+    slug: "byzantine-fault",
+    term: "consensus quorum",
+    field: "distributed systems",
+    gloss: "Enough honest nodes must agree before a value is committed, so a minority of lying replicas cannot fork the log.",
+    paraphrases: [
+      "how many nodes must agree before a distributed system commits a value",
+      "tolerating replicas that lie in a replicated log",
+      "why a majority of honest servers is needed to agree",
+      "agreement among machines when some of them are faulty",
+    ],
+  },
+  {
+    slug: "baroque-counterpoint",
+    term: "fugue subject",
+    field: "music theory",
+    gloss: "The short opening melody that each voice imitates in turn as the piece unfolds.",
+    paraphrases: [
+      "the opening theme that every voice copies in a fugue",
+      "melody imitated by successive voices in baroque music",
+      "what is the main tune of a fugue called",
+      "theme stated first and then answered by other voices",
+    ],
+  },
+  {
+    slug: "protein-folding",
+    term: "tertiary structure",
+    field: "biochemistry",
+    gloss: "The overall three-dimensional shape a single polypeptide chain settles into.",
+    paraphrases: [
+      "the 3D shape a protein chain folds into",
+      "how a polypeptide arranges itself in space",
+      "overall three dimensional form of an enzyme",
+      "what determines the folded shape of a protein",
+    ],
+  },
 ] as const;
 
 /** Filler that shares no vocabulary with any query, so it cannot accidentally rank. */
@@ -66,7 +123,15 @@ function filler(seed: string, sentences: number): string {
 
 export function buildRetrievalFixture(): {
   notes: RetrievalFixtureNote[];
+  /** Exact-vocabulary queries; the lexical ratchet scores these. */
   queries: RetrievalFixtureQuery[];
+  /**
+   * Paraphrases that share no words with the answer note's term. Only an
+   * embedder can answer these; the lexical path is expected to miss them,
+   * so they are kept out of the lexical ratchet and scored separately by
+   * `scripts/benchmark-embedders.ts`.
+   */
+  semanticQueries: RetrievalFixtureQuery[];
 } {
   const notes: RetrievalFixtureNote[] = [];
 
@@ -77,7 +142,7 @@ export function buildRetrievalFixture(): {
       content: [
         `# ${topic.slug.replace(/-/gu, " ")}`,
         "",
-        `This note explains ${topic.term} in ${topic.field}.`,
+        `This note explains ${topic.term} in ${topic.field}. ${topic.gloss}`,
         filler(topic.slug, 6),
       ].join("\n"),
       mtime: 5_000,
@@ -137,7 +202,15 @@ export function buildRetrievalFixture(): {
     },
   ]);
 
-  return { notes, queries };
+  const semanticQueries: RetrievalFixtureQuery[] = TOPICS.flatMap((topic) =>
+    topic.paraphrases.map((text) => ({
+      text,
+      relevantPaths: [`Research/${topic.slug}.md`],
+      probes: "paraphrase with none of the answer's vocabulary; only an embedder can rank it",
+    })),
+  );
+
+  return { notes, queries, semanticQueries };
 }
 
 /** Minimal execution context over a fixture corpus. Read paths only. */
