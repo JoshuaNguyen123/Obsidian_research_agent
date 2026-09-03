@@ -45,7 +45,8 @@ import { hasAffirmativeProjectIdeationIntentV1 } from "./projectIdeationIntent";
 import { detectProjectLifecycleStagesV1 } from "./projectLifecycle";
 import { canonicalizeKeywordTypos } from "./promptNormalization";
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
-import { isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
+import { hasTitleIntent, isMarkdownTitleContentIntent, isTitleOnlyIntent, isVisibleTitleRenameIntent } from "./titleIntent";
+import { hasReplaceIntent } from "./replaceIntent";
 
 /**
  * Ideas whose single definition lives in a lower-level module, re-exported
@@ -69,9 +70,9 @@ export {
 } from "./noNoteWriteIntent";
 export { hasWordCountIntent } from "./wordCountIntent";
 export { hasPageContentClearIntent } from "./currentNoteResetPolicy";
-export { hasReplaceIntent } from "./replaceIntent";
+export { hasReplaceIntent };
 export { matchesFetchedWebSourceLanguageV1, matchesSourcesOrWebLanguageV1 } from "./sourceIntent";
-export { hasTitleIntent } from "./titleIntent";
+export { hasTitleIntent };
 
 export function isPromptOnCurrentPageIntent(prompt: string): boolean {
   return (
