@@ -1,3 +1,4 @@
+import { isRateLimitModelError } from "./model/retry";
 import type {
   ModelChatRequest,
   ModelChatResponse,
@@ -27750,12 +27751,18 @@ async function chatForAgentStep(
             : undefined,
         abortSignal: request.abortSignal,
         onRetry: (attempt, error, delayMs) => {
-          events.onStatus?.(
-            "Transient model provider error; retrying model step...",
-          );
-          events.onStatus?.(
-            `Transient model provider error; retrying model step ${step} (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
-          );
+          if (isRateLimitModelError(error)) {
+            events.onStatus?.(
+              `Model provider is rate limiting this account; waiting ${Math.round(delayMs / 1000)} s before retrying model step ${step} (attempt ${attempt}): ${getUnknownErrorMessage(error)}`,
+            );
+          } else {
+            events.onStatus?.(
+              "Transient model provider error; retrying model step...",
+            );
+            events.onStatus?.(
+              `Transient model provider error; retrying model step ${step} (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
+            );
+          }
           emitModelRetryDiagnostic(events, step, attempt, delayMs, error);
         },
       },

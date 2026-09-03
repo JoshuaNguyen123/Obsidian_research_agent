@@ -194,6 +194,25 @@ async function oneLaunch(index) {
       60_000,
       "startup timing",
     );
+    // The layout-ready tasks (retention sweep, durable-resume scan, template
+    // library, workspace cleanup) carry the backlog cost on a cold start,
+    // when the vault index is still empty at core-ready.
+    const settled = await waitFor(
+      page,
+      () => {
+        const plugin = window.app?.plugins?.plugins?.["agentic-researcher"];
+        const value = plugin?.getStartupTiming?.();
+        return value && value.deferredSettled ? value : null;
+      },
+      90_000,
+      "layout-ready tasks",
+    ).catch(() => null);
+    const finalTiming =
+      settled ??
+      (await page.evaluate(
+        () => window.app?.plugins?.plugins?.["agentic-researcher"]?.getStartupTiming?.() ?? null,
+      )) ??
+      timing;
     // Let the metadata cache index the seeded files before the next launch:
     // the last seeded file must report frontmatter through the cache.
     const lastSeeded = `Agent Runs/${SEED_PREFIX}${String(noteCount - 1).padStart(4, "0")}.md`;
@@ -213,7 +232,7 @@ async function oneLaunch(index) {
       () => window.app.vault.getFiles().filter((file) => /^Agent Runs\/[^/]+\.md$/i.test(file.path)).length,
     );
     await closeObsidian(page, browser, child);
-    return { launch: index, timing, cacheReady, runNoteCount };
+    return { launch: index, timing: finalTiming, deferredSettled: Boolean(settled), cacheReady, runNoteCount };
   } catch (error) {
     if (child.exitCode === null) {
       spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
@@ -236,7 +255,8 @@ async function main() {
       log(`launch ${index}/${launches}`);
       const result = await oneLaunch(index);
       results.push(result);
-      log(`launch ${index}: core ready ${result.timing.coreReadyMs} ms (cache ${result.cacheReady}, ${result.runNoteCount} run notes)`);
+      const deferredTotal = Object.values(result.timing.deferred ?? {}).reduce((sum, ms) => sum + ms, 0);
+      log(`launch ${index}: core ready ${result.timing.coreReadyMs} ms; layout ready +${result.timing.layoutReadyAfterMs ?? "?"} ms; layout-ready work ${Math.round(deferredTotal)} ms${result.deferredSettled ? "" : " (unsettled)"} (cache ${result.cacheReady}, ${result.runNoteCount} run notes)`);
       await sleep(2_000);
     }
   } finally {

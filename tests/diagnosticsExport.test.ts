@@ -61,18 +61,24 @@ describe("diagnostics export builder", () => {
         coreReadyMs: 87.4,
         runNoteCount: 214,
         phases: { load_settings: 12, load_project_memory: 31.2, negative: -3 },
+        layoutReadyAfterMs: 640.5,
+        deferred: { sweep_agent_runs_retention: 12.5 },
       },
     });
     assert.deepEqual(report.startup, {
       coreReadyMs: 87.4,
       runNoteCount: 214,
       phases: { load_settings: 12, load_project_memory: 31.2, negative: 0 },
+      layoutReadyAfterMs: 640.5,
+      deferred: { sweep_agent_runs_retention: 12.5 },
     });
     const markdown = formatDiagnosticsReportMarkdownV1(report);
     assert.match(markdown, /## Startup/);
     assert.match(markdown, /Core ready: 87\.4 ms/);
     assert.match(markdown, /Run notes in vault: 214/);
     assert.match(markdown, /load_project_memory: 31\.2 ms/);
+    assert.match(markdown, /Layout ready after: 640\.5 ms/);
+    assert.match(markdown, /layout-ready sweep_agent_runs_retention: 12\.5 ms/);
     assert.equal(buildDiagnosticsReportV1({ startupPhase: "ready" }).startup, null);
     assert.doesNotMatch(
       formatDiagnosticsReportMarkdownV1(buildDiagnosticsReportV1({})),

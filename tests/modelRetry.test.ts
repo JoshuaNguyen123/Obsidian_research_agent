@@ -1,3 +1,4 @@
+import { isRateLimitModelError as isRateLimitModelErrorForTest } from "../src/model/retry";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ModelClientError } from "../src/model/types";
@@ -270,5 +271,110 @@ test("withModelRetry gives an invoked observation call bounded time to settle af
     neverSettles,
     (error: unknown) =>
       error instanceof DOMException && error.name === "AbortError",
+  );
+});
+
+test("rate limits get a longer attempt budget than other transient errors", async () => {
+  // "too many concurrent requests" from a shared account is contention, not a
+  // fault: the general budget (3 attempts) used to end the step after ~16 s.
+  let rateLimitedAttempts = 0;
+  const result = await withModelRetry(
+    async () => {
+      rateLimitedAttempts += 1;
+      if (rateLimitedAttempts < 6) {
+        throw new ModelClientError("rate_limit", "too many concurrent requests", {
+          status: 429,
+        });
+      }
+      return "ok";
+    },
+    { policy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 2 } },
+  );
+  assert.equal(result, "ok");
+  assert.equal(rateLimitedAttempts, 6);
+
+  let serverErrorAttempts = 0;
+  await assert.rejects(
+    withModelRetry(
+      async () => {
+        serverErrorAttempts += 1;
+        throw new ModelClientError("api", "temporary", { status: 500 });
+      },
+      { policy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 2 } },
+    ),
+    /temporary/,
+  );
+  assert.equal(serverErrorAttempts, 3, "other transient errors keep the general budget");
+});
+
+test("rate-limit delays honor Retry-After up to the larger rate-limit cap", async () => {
+  const delays: number[] = [];
+  await withModelRetry(
+    async () => {
+      if (delays.length === 0) {
+        throw new ModelClientError("rate_limit", "slow down", {
+          status: 429,
+          details: { retryAfterMs: 40 },
+        });
+      }
+      return "ok";
+    },
+    {
+      policy: { baseDelayMs: 1, maxDelayMs: 2, rateLimitMaxDelayMs: 50 },
+      onRetry: (_attempt, _error, delayMs) => delays.push(delayMs),
+    },
+  );
+  assert.deepEqual(delays, [40], "the general delay cap does not clamp a rate-limit wait");
+
+  const clamped: number[] = [];
+  await withModelRetry(
+    async () => {
+      if (clamped.length === 0) {
+        throw new ModelClientError("api", "temporary", {
+          status: 503,
+          details: { retryAfterMs: 40 },
+        });
+      }
+      return "ok";
+    },
+    {
+      policy: { baseDelayMs: 1, maxDelayMs: 2, rateLimitMaxDelayMs: 50 },
+      onRetry: (_attempt, _error, delayMs) => clamped.push(delayMs),
+    },
+  );
+  assert.deepEqual(clamped, [2], "a 5xx keeps the general delay cap");
+});
+
+test("an exhausted rate-limit budget still fails the step", async () => {
+  let attempts = 0;
+  await assert.rejects(
+    withModelRetry(
+      async () => {
+        attempts += 1;
+        throw new ModelClientError("rate_limit", "slow down", { status: 429 });
+      },
+      {
+        policy: {
+          maxAttempts: 2,
+          rateLimitMaxAttempts: 3,
+          baseDelayMs: 1,
+          maxDelayMs: 1,
+        },
+      },
+    ),
+    /slow down/,
+  );
+  assert.equal(attempts, 3);
+  assert.equal(
+    isRateLimitModelErrorForTest(new ModelClientError("rate_limit", "slow down")),
+    true,
+  );
+  assert.equal(
+    isRateLimitModelErrorForTest({ name: "ModelClientError", category: "rate_limit" }),
+    true,
+  );
+  assert.equal(
+    isRateLimitModelErrorForTest(new ModelClientError("network", "offline")),
+    false,
   );
 });

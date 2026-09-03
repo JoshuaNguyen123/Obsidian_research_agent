@@ -4,12 +4,27 @@ export interface RetryPolicy {
   maxAttempts: number;
   baseDelayMs: number;
   maxDelayMs: number;
+  /**
+   * Budget for provider rate limits (HTTP 429, "too many concurrent
+   * requests"). A shared account can be busy for tens of seconds while
+   * another process drains its concurrency allowance; the general budget
+   * (3 attempts, delays capped at 8 s) let a mission die after ~16 s of
+   * such contention. Rate-limit attempts get their own count and delay cap,
+   * both taken as the larger of the general value and these; Retry-After is
+   * still honored up to the cap. Auth, budget, and abort never retry.
+   */
+  rateLimitMaxAttempts?: number;
+  rateLimitMaxDelayMs?: number;
 }
 
-export const DEFAULT_MODEL_RETRY_POLICY: RetryPolicy = {
+export const DEFAULT_MODEL_RETRY_POLICY: Required<RetryPolicy> = {
   maxAttempts: 3,
   baseDelayMs: 750,
   maxDelayMs: 8000,
+  // 750 → 1.5 s → 3 s → 6 s → 12 s → 24 s: about 47 s of waiting across
+  // seven attempts before a rate limit is allowed to end a step.
+  rateLimitMaxAttempts: 7,
+  rateLimitMaxDelayMs: 30_000,
 };
 
 export function isTransientModelError(error: unknown): boolean {
@@ -65,6 +80,18 @@ export function isModelRequestTimeoutError(error: unknown): boolean {
   return /\btimed out after \d+ms\b/iu.test(message);
 }
 
+/** HTTP 429 / provider concurrency refusals, in either error shape. */
+export function isRateLimitModelError(error: unknown): boolean {
+  if (error instanceof ModelClientError) {
+    return error.category === "rate_limit";
+  }
+  return (
+    isRecord(error) &&
+    error.name === "ModelClientError" &&
+    error.category === "rate_limit"
+  );
+}
+
 /** Request timeouts are retried at most this many times in total. */
 export const MAX_MODEL_REQUEST_TIMEOUT_RETRIES = 1;
 
@@ -113,16 +140,26 @@ export async function withModelRetry<T>(
         options.abortSettleGraceMs,
       );
     } catch (error) {
+      // A rate limit is capacity contention, not a fault: it gets the
+      // larger attempt count and delay cap so a busy shared account can
+      // drain before the step gives up.
+      const rateLimited = isRateLimitModelError(error);
+      const attemptCap = rateLimited
+        ? Math.max(policy.maxAttempts, policy.rateLimitMaxAttempts)
+        : policy.maxAttempts;
       if (
-        attempt >= policy.maxAttempts ||
+        attempt >= attemptCap ||
         !isRetryableModelError(error, attempt) ||
         options.shouldRetry?.(error, attempt) === false
       ) {
         throw error;
       }
 
+      const delayCap = rateLimited
+        ? Math.max(policy.maxDelayMs, policy.rateLimitMaxDelayMs)
+        : policy.maxDelayMs;
       const delayMs = Math.min(
-        policy.maxDelayMs,
+        delayCap,
         Math.max(
           policy.baseDelayMs * 2 ** (attempt - 1),
           getRetryAfterMs(error) ?? 0,
@@ -201,7 +238,9 @@ function getRetryAfterMs(error: unknown): number | undefined {
     : undefined;
 }
 
-function normalizeRetryPolicy(policy: Partial<RetryPolicy> | undefined): RetryPolicy {
+function normalizeRetryPolicy(
+  policy: Partial<RetryPolicy> | undefined,
+): Required<RetryPolicy> {
   return {
     maxAttempts: Math.max(
       1,
@@ -214,6 +253,20 @@ function normalizeRetryPolicy(policy: Partial<RetryPolicy> | undefined): RetryPo
     maxDelayMs: Math.max(
       0,
       Math.trunc(policy?.maxDelayMs ?? DEFAULT_MODEL_RETRY_POLICY.maxDelayMs),
+    ),
+    rateLimitMaxAttempts: Math.max(
+      1,
+      Math.trunc(
+        policy?.rateLimitMaxAttempts ??
+          DEFAULT_MODEL_RETRY_POLICY.rateLimitMaxAttempts,
+      ),
+    ),
+    rateLimitMaxDelayMs: Math.max(
+      0,
+      Math.trunc(
+        policy?.rateLimitMaxDelayMs ??
+          DEFAULT_MODEL_RETRY_POLICY.rateLimitMaxDelayMs,
+      ),
     ),
   };
 }

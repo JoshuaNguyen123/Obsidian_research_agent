@@ -3,9 +3,11 @@ import test from "node:test";
 import { ONLOAD_STARTUP_TASKS } from "../src/onloadSchedule";
 import {
   createStartupTimer,
+  formatDeferredStartupTimingLine,
   formatStartupTimingLine,
   STARTUP_TIMING_PHASES,
 } from "../src/pluginStartupTiming";
+import { onloadTasksForPhase } from "../src/onloadSchedule";
 
 test("startup timer attributes elapsed time to the phase that ended at each mark", () => {
   let clock = 100;
@@ -52,4 +54,42 @@ test("every timed phase is an immediate-phase startup task", () => {
   for (const phase of STARTUP_TIMING_PHASES) {
     assert.equal(ONLOAD_STARTUP_TASKS[phase], "immediate", phase);
   }
+});
+
+test("layout-ready tasks record into the same timing record and settle once all are in", () => {
+  let clock = 0;
+  const timer = createStartupTimer(() => clock);
+  assert.equal(timer.snapshot(), null, "nothing to report before core-ready");
+  clock = 100;
+  timer.mark("register_view");
+  const finished = timer.finish({ measuredAt: "2026-09-03T10:00:00.000Z" });
+  assert.equal(finished.layoutReadyAfterMs, null);
+  assert.deepEqual(finished.deferred, {});
+  assert.equal(finished.deferredSettled, false);
+
+  clock = 640;
+  timer.markLayoutReady();
+  clock = 700;
+  timer.markLayoutReady();
+  const tasks = onloadTasksForPhase("layout_ready");
+  tasks.forEach((task, index) => timer.recordDeferred(task, 10 * (index + 1)));
+  const snapshot = timer.snapshot();
+  assert.ok(snapshot);
+  assert.equal(snapshot.layoutReadyAfterMs, 640, "the first layout-ready mark wins");
+  assert.equal(snapshot.deferredSettled, true);
+  assert.equal(snapshot.deferred[tasks[0]], 10);
+  assert.equal(snapshot.deferred[tasks[tasks.length - 1]], 10 * tasks.length);
+  // The finish() return value was a copy: later deferred records do not leak
+  // into it, and the snapshot is a copy too.
+  assert.deepEqual(finished.deferred, {});
+  snapshot.deferred[tasks[0]] = 999;
+  assert.equal(timer.snapshot()?.deferred[tasks[0]], 10);
+  assert.match(
+    formatDeferredStartupTimingLine(timer.snapshot() ?? finished),
+    /^Agentic Researcher layout-ready work \(layout ready 640 ms after onload\): initialize_template_library 10, /,
+  );
+  assert.match(
+    formatDeferredStartupTimingLine(finished),
+    /layout ready: not yet\): none recorded$/,
+  );
 });

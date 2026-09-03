@@ -1,7 +1,10 @@
 import {
   createStartupTimer,
+  formatDeferredStartupTimingLine,
   formatStartupTimingLine,
+  startupTimingNow,
   type PluginStartupTimingV1,
+  type StartupTimer,
 } from "./src/pluginStartupTiming";
 import {
   Notice,
@@ -1074,13 +1077,14 @@ export default class AgenticResearcherPlugin extends Plugin {
   private extensionHealthPostMigrationTimer: ReturnType<typeof setTimeout> | null = null;
   private startupPhase = "constructed";
   private startupFailure: string | null = null;
-  private startupTiming: PluginStartupTimingV1 | null = null;
+  private startupTimer: StartupTimer | null = null;
   private startupExistingViewCreator: string | null = null;
 
   async onload() {
     // Register the native view before the first asynchronous boundary. If a
     // migration is slow, a persisted pane can otherwise render as an orphan.
     const startupTimer = createStartupTimer();
+    this.startupTimer = startupTimer;
     this.startupPhase = "registering_view";
     const viewCreator = (leaf: WorkspaceLeaf) => new AgentView(leaf, this);
     Object.defineProperty(viewCreator, "__agenticResearcherViewOwner", {
@@ -1297,10 +1301,13 @@ export default class AgenticResearcherPlugin extends Plugin {
     await this.initializeBundledCapabilities();
     this.startupPhase = "ready";
     startupTimer.mark("initialize_bundled_capabilities");
-    this.startupTiming = startupTimer.finish({
-      runNoteCount: this.countAgentRunNotesForStartupTiming(),
-    });
-    console.info(formatStartupTimingLine(this.startupTiming));
+    console.info(
+      formatStartupTimingLine(
+        startupTimer.finish({
+          runNoteCount: this.countAgentRunNotesForStartupTiming(),
+        }),
+      ),
+    );
     this.app.workspace.trigger(AGENTIC_RESEARCHER_CORE_READY_EVENT);
     this.refreshAgentView();
     this.startMissionScheduler();
@@ -1318,6 +1325,7 @@ export default class AgenticResearcherPlugin extends Plugin {
    * only the start time moves.
    */
   private async runDeferredOnloadWork(): Promise<void> {
+    this.startupTimer?.markLayoutReady();
     for (const task of onloadTasksForPhase("layout_ready")) {
       await this.executeDeferredOnloadTask(task);
     }
@@ -1326,6 +1334,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   private async executeDeferredOnloadTask(
     task: OnloadStartupTaskId,
   ): Promise<void> {
+    const startedAt = startupTimingNow();
     switch (task) {
       case "initialize_template_library":
         try {
@@ -1339,12 +1348,16 @@ export default class AgenticResearcherPlugin extends Plugin {
             "Agent templates could not be initialized. Existing vault files were left unchanged.",
           );
         }
+        this.observeDeferredOnloadTask(task, startedAt);
         return;
       case "cleanup_old_workspaces":
-        void cleanupOldWorkspaces(7);
+        this.observeDeferredOnloadTask(task, startedAt, cleanupOldWorkspaces(7));
         return;
       case "sweep_agent_runs_retention":
-        void sweepAgentRunsRetentionBestEffort({
+        this.observeDeferredOnloadTask(
+          task,
+          startedAt,
+          sweepAgentRunsRetentionBestEffort({
           vault: this.app.vault,
           policy: resolveRunRetentionPolicy(
             this.settings as {
@@ -1352,16 +1365,23 @@ export default class AgenticResearcherPlugin extends Plugin {
               runRetentionMaxRuns?: number;
             },
           ),
-        });
+          }),
+        );
         return;
       case "schedule_semantic_index_flush":
         this.scheduleSemanticIndexFlush(5_000);
+        this.observeDeferredOnloadTask(task, startedAt);
         return;
       case "resume_latest_durable_mission":
-        void this.resumeLatestDurableMission(false);
+        this.observeDeferredOnloadTask(
+          task,
+          startedAt,
+          this.resumeLatestDurableMission(false),
+        );
         return;
       case "schedule_companion_mission_reconciliation":
         this.scheduleCompanionMissionReconciliation(3_000);
+        this.observeDeferredOnloadTask(task, startedAt);
         return;
       default:
         return;
@@ -1505,7 +1525,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       obsidianVersion,
       platform: typeof process !== "undefined" ? process.platform : null,
       startupPhase: this.startupPhase,
-      startupTiming: this.startupTiming,
+      startupTiming: this.getStartupTiming(),
       sandboxLastProbe: this.readSandboxLastProbeForDiagnostics(),
       model: {
         id: this.settings.model,
@@ -8816,9 +8836,30 @@ export default class AgenticResearcherPlugin extends Plugin {
    * diagnostics export and by `scripts/measure-startup-timing.mjs`.
    */
   getStartupTiming(): PluginStartupTimingV1 | null {
-    return this.startupTiming
-      ? { ...this.startupTiming, phases: { ...this.startupTiming.phases } }
-      : null;
+    return this.startupTimer?.snapshot() ?? null;
+  }
+
+  /**
+   * Record a layout-ready task's wall time once it settles; fire-and-forget
+   * tasks pass their promise so the clock covers the work, not the dispatch.
+   */
+  private observeDeferredOnloadTask(
+    task: OnloadStartupTaskId,
+    startedAt: number,
+    work?: Promise<unknown> | void,
+  ): void {
+    const settle = () => {
+      this.startupTimer?.recordDeferred(task, startupTimingNow() - startedAt);
+      const timing = this.startupTimer?.snapshot();
+      if (timing?.deferredSettled) {
+        console.info(formatDeferredStartupTimingLine(timing));
+      }
+    };
+    if (work && typeof (work as Promise<unknown>).then === "function") {
+      void (work as Promise<unknown>).then(settle, settle);
+    } else {
+      settle();
+    }
   }
 
   getMissionRunSnapshot(): RunCoordinatorSnapshot {

@@ -92,6 +92,8 @@ export interface DiagnosticsExportInputV1 {
     coreReadyMs?: number | null;
     phases?: Record<string, number> | null;
     runNoteCount?: number | null;
+    layoutReadyAfterMs?: number | null;
+    deferred?: Record<string, number> | null;
   } | null;
   sandboxLastProbe?: {
     observedAt?: string | null;
@@ -393,6 +395,21 @@ export interface DiagnosticsStartupTimingV1 {
   coreReadyMs: number;
   runNoteCount: number | null;
   phases: Record<string, number>;
+  layoutReadyAfterMs: number | null;
+  deferred: Record<string, number>;
+}
+
+function sanitizeDurationRecord(
+  value: Record<string, number> | null | undefined,
+): Record<string, number> {
+  const record: Record<string, number> = {};
+  for (const [name, ms] of Object.entries(value ?? {}).slice(0, 32)) {
+    const key = sanitizeIdentity(name);
+    if (key && typeof ms === "number" && Number.isFinite(ms)) {
+      record[key] = Math.max(0, ms);
+    }
+  }
+  return record;
 }
 
 function sanitizeStartupTiming(
@@ -408,18 +425,18 @@ function sanitizeStartupTiming(
   if (coreReadyMs === null) {
     return null;
   }
-  const phases: Record<string, number> = {};
-  for (const [phase, ms] of Object.entries(value.phases ?? {}).slice(0, 32)) {
-    const key = sanitizeIdentity(phase);
-    if (key && typeof ms === "number" && Number.isFinite(ms)) {
-      phases[key] = Math.max(0, ms);
-    }
-  }
+  const phases = sanitizeDurationRecord(value.phases);
+  const deferred = sanitizeDurationRecord(value.deferred);
+  const layoutReadyAfterMs =
+    typeof value.layoutReadyAfterMs === "number" &&
+    Number.isFinite(value.layoutReadyAfterMs)
+      ? Math.max(0, value.layoutReadyAfterMs)
+      : null;
   const runNoteCount =
     typeof value.runNoteCount === "number" && Number.isFinite(value.runNoteCount)
       ? Math.max(0, Math.floor(value.runNoteCount))
       : null;
-  return { coreReadyMs, runNoteCount, phases };
+  return { coreReadyMs, runNoteCount, phases, layoutReadyAfterMs, deferred };
 }
 
 export function buildDiagnosticsReportV1(
@@ -491,6 +508,12 @@ export function formatDiagnosticsReportMarkdownV1(
     }
     for (const [phase, ms] of Object.entries(report.startup.phases)) {
       lines.push(`- ${phase}: ${ms} ms`);
+    }
+    if (report.startup.layoutReadyAfterMs !== null) {
+      lines.push(`- Layout ready after: ${report.startup.layoutReadyAfterMs} ms`);
+    }
+    for (const [task, ms] of Object.entries(report.startup.deferred)) {
+      lines.push(`- layout-ready ${task}: ${ms} ms`);
     }
   }
 
