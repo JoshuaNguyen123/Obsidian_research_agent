@@ -32,6 +32,9 @@ All notable changes to Agentic Researcher are documented here.
 - **Developer latency:** the unit runner drops its undocumented `--test-concurrency=1` pin (bounded parallelism) and the post-test dashboard skips regeneration when nothing changed; together with the run-note persistence work below, the full suite fell from 7.9 min to about 1.5–3 min wall clock (4,507 tests; the runner-heavy tests were dominated by run-note persist cost). README states the real minimum Obsidian version (1.11.4).
 
 
+### Removed
+- **The dead chat-side activity mirror.** `AgentView` still carried a `liveWorkstreamEl` "live workstream" strip and a `chatTeamStripEl` team strip that were never created (both were only ever assigned `null`), so every `appendWorkstreamLine` call returned at its guard and `renderChatTeamStrip` was unreachable; the fields, both renderers, their call sites, the `.agentic-researcher-live-workstream*` CSS, and the demo-recording probe that waited on `.agentic-researcher-live-workstream-line` are gone. Chat activity is summarized by the live-run card; the full status and tool streams stay in Run Details.
+
 ## [0.4.0] — unified desktop plugin
 
 Desktop-only unified Agentic Researcher (`package.json` / `manifest.json` 0.4.0).
