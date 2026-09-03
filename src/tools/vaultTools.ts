@@ -5008,20 +5008,39 @@ function getByteLength(text: string): number {
 }
 
 /**
- * Logical-operation identity for append idempotency. Requires both a durable
- * run/root id and a step/node operation id so two missions appending the same
- * line cannot collide on content. Callers that want Continue/segment-turnover
- * to share a key must pass a node-stable `operationId` (rootMissionId + graph
- * node + tool); the legacy `runId:step:toolIndex:tool` shape only dedupes a
- * same-identity retry. Never rewrite PreparedAction.runId here.
+ * Logical-operation identity for append idempotency. Requires a durable
+ * run/root id plus either the mission-graph node this call executes or a
+ * step-scoped operation id, so two missions appending the same line cannot
+ * collide on content.
+ *
+ * The node-scoped form is what survives a retry, a Continue segment, or a
+ * segment turnover: the runner mints `operationId` as
+ * `runId:step:toolIndex:tool`, which changes on every retry and every segment,
+ * so before this the guard could only ever dedupe a same-identity retry --
+ * never the resumed append that duplicated content in a user's note. A graph
+ * node completes at its first receipt (multi-append missions get one node per
+ * append), so one identity per node is exact. The payload fingerprint and the
+ * note-tail check still apply: a different payload under the same node always
+ * writes. Never rewrite PreparedAction.runId here.
  */
 export function resolveAppendOperationIdentity(
-  context: Pick<ToolExecutionContext, "runId" | "rootMissionId" | "operationId">,
+  context: Pick<
+    ToolExecutionContext,
+    "runId" | "rootMissionId" | "operationId" | "nodeId" | "missionGraphExecution"
+  >,
 ): string | null {
   const durableId =
     context.rootMissionId?.trim() || context.runId?.trim() || "";
+  if (!durableId) {
+    return null;
+  }
+  const nodeId =
+    context.nodeId?.trim() || context.missionGraphExecution?.nodeId?.trim() || "";
+  if (nodeId) {
+    return `${durableId}::node:${nodeId}:append_to_current_file`;
+  }
   const operationId = context.operationId?.trim() || "";
-  if (!durableId || !operationId) {
+  if (!operationId) {
     return null;
   }
   return `${durableId}::${operationId}`;

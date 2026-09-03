@@ -42,6 +42,32 @@ test("append identity requires run/root plus operation id and never keys on cont
     }),
     "root-1::root-1:write-node:append_to_current_file",
   );
+  // The graph node outranks the per-step operation id: the runner mints
+  // operationId as runId:step:toolIndex:tool, which changes on every retry
+  // and every segment, so only the node makes a resumed append recognizable.
+  assert.equal(
+    resolveAppendOperationIdentity({
+      runId: "segment-1",
+      rootMissionId: "root-1",
+      nodeId: "tool-03-append_to_current_file",
+      operationId: "segment-1:2:0:append_to_current_file",
+    }),
+    "root-1::node:tool-03-append_to_current_file:append_to_current_file",
+  );
+  assert.equal(
+    resolveAppendOperationIdentity({
+      runId: "segment-2",
+      rootMissionId: "root-1",
+      missionGraphExecution: { nodeId: "tool-03-append_to_current_file" },
+      operationId: "segment-2:1:0:append_to_current_file",
+    }),
+    "root-1::node:tool-03-append_to_current_file:append_to_current_file",
+  );
+  // A node without a durable id still yields nothing: content alone never keys.
+  assert.equal(
+    resolveAppendOperationIdentity({ nodeId: "tool-03-append_to_current_file" }),
+    null,
+  );
 });
 
 test("tail compare only inspects the last block-length characters", () => {
@@ -253,3 +279,59 @@ function createAppendVaultContext(options: {
     },
   };
 }
+
+test("a retried append after segment turnover is skipped exactly once under its graph node", async () => {
+  resetAppendIdempotencyStateForTests();
+  const mock = createAppendVaultContext({
+    prompt: "Append one proof line to the current note.",
+    initial: "Initial note",
+  });
+  const first = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      {
+        ...mock.context,
+        runId: "segment-1",
+        rootMissionId: "root-1",
+        nodeId: "tool-03-append_to_current_file",
+        operationId: "segment-1:2:0:append_to_current_file",
+      },
+    ),
+  );
+  assert.equal((first.bytesWritten ?? 0) > 0, true);
+  assert.equal(mock.modifies, 1);
+
+  // Segment turnover: new runId, new step-scoped operationId, same graph node.
+  const resumed = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      {
+        ...mock.context,
+        runId: "segment-2",
+        rootMissionId: "root-1",
+        missionGraphExecution: { nodeId: "tool-03-append_to_current_file" },
+        operationId: "segment-2:1:0:append_to_current_file",
+      },
+    ),
+  );
+  assert.equal(resumed.duplicateSkip, true);
+  assert.equal(resumed.bytesWritten, 0);
+  assert.equal(mock.content.get("Current.md"), "Initial note\nDurable mutation proof");
+  assert.equal(mock.modifies, 1);
+
+  // A different node under the same root mission is a different append.
+  const nextNode = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      {
+        ...mock.context,
+        runId: "segment-2",
+        rootMissionId: "root-1",
+        nodeId: "tool-05-append_to_current_file",
+        operationId: "segment-2:3:0:append_to_current_file",
+      },
+    ),
+  );
+  assert.equal(nextNode.reason, undefined);
+  assert.equal(mock.modifies, 2);
+});

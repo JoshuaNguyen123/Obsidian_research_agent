@@ -24,6 +24,7 @@ import {
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
+import { shouldEnforceEnglishOutput } from "../languageGuard";
 import type { RoutedMissionIntent } from "./missionRouter";
 import type { MissionSpeechActClassificationV1 } from "./missionSpeechAct";
 import type { AutonomyEffectClass } from "./autonomyEffectClass";
@@ -185,7 +186,7 @@ export function createRunPlan({
     routedIntent?.mode === "code_workflow" &&
     routedIntent.needsCodeExecution === true &&
     speechAct.executionTier !== "direct_chat";
-  const requiresEnglishGuard = isLikelyEnglishPrompt(prompt);
+  const requiresEnglishGuard = shouldEnforceEnglishOutput(prompt);
   const configuredMaxSteps = resolveConfiguredMaxAgentSteps(settings?.maxAgentSteps);
   // The loop cap and the per-mission budget are different questions, and
   // `resolveConfiguredMaxAgentSteps` answers only the first: it materializes
@@ -656,13 +657,6 @@ function parseExplicitModelStepTarget(prompt: string): number | null {
 
   const target = Number.parseInt(match[1], 10);
   return Number.isFinite(target) && target > 0 ? target : null;
-}
-
-function isLikelyEnglishPrompt(prompt: string): boolean {
-  const englishLetters = prompt.match(/[A-Za-z]/g)?.length ?? 0;
-  const nonAsciiChars = prompt.match(/[^\x00-\x7F]/g)?.length ?? 0;
-
-  return englishLetters > 0 && englishLetters >= nonAsciiChars;
 }
 
 function hasSafeReflexLabel(

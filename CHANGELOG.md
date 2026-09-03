@@ -2,6 +2,22 @@
 
 All notable changes to Agentic Researcher are documented here.
 
+## [Unreleased] — performance, latency, and retrieval wave (2026-09-03)
+
+### Changed
+- **The prompt prefix is byte-stable across agent steps.** The per-step segment budget line was folded into the stage system prompt with counts that changed every step, and the mission-plan block was re-rendered in place with the live active task, so every tool-loop request diverged inside its prefix and no provider prefix cache could reuse it. Both now ride one ephemeral system card inserted before the last message; the seeded plan block is a static marker block. The runner emits a per-step `prompt_prefix_reuse` metric, Run Details shows cached prompt tokens and the average reuse, and the eval CSV gains `model_calls`, `reported_tokens`, `cached_prompt_tokens`, and `prompt_prefix_reuse_avg` (blank when unknown).
+- **Fewer and cheaper model calls per mission.** Continuation segments skip the structured router whose verdict the resume branch discards. Writeback-class calls (streamed note drafts, the final answer stream, the word-count correction pass, the English repair pass) resolve thinking through the writeback role instead of the lead flag; the correction pass had silently ignored its thinking argument and run at provider default. OpenAI-compatible streams now request `stream_options.include_usage` so streamed calls report tokens, and `num_ctx` is no longer sent as `max_tokens`.
+- **A dead model endpoint stops being re-dialled.** A session-scoped circuit breaker per provider/base URL/model opens after five consecutive provider-health failures, fails fast for a cooldown, and admits one probe; auth, rate limits, budget, policy refusals, and cancellations never trip it, and the specialist fallback still runs against its own endpoint.
+- **Continuation segments keep the previous segment's web results** (successful `web_fetch`/`web_search` results and trusted hash-bound reads) instead of starting from an empty cache.
+- **Plugin load and note switches do less disk work.** Startup hydration stops at the newest resumable run instead of reading every note under `Agent Runs/`; project memory and the run projection load in parallel; note switches reload memory through a 150 ms debounce gated on file mtimes, so an unchanged vault costs no reads per click.
+- **Vault search ranks by corpus statistics.** `search_markdown_files` counts occurrences informatively (adjacent repeats collapse, keyword-list lines weigh a quarter), weights terms by BM25 IDF over the scanned notes, saturates and length-normalizes frequency, and rewards covering every term of a multi-term query. On the retrieval fixture recall@1 went from 0.00 to 1.00 and MRR from 0.50 to 1.00. No index is persisted.
+- **Semantic search scores shards in place**: vectors are decoded once per shard version into a typed array and compared without per-row allocation (scores identical to six decimals); the shard cache is cleared on unload.
+- **Append idempotency keys on the mission-graph node**, so a retried or resumed `append_to_current_file` under the same node is skipped exactly once instead of duplicating content; the step-scoped key remains the fallback for graphless runs.
+- **The English-only output guard stands down for an English prompt that explicitly asks for Chinese, Japanese, or Korean output**, and the prompt-language predicate lives in one module instead of two private copies.
+- **Tool results carrying external content** (`web_*`, `browser_*`, `github_*`, `linear_*`, `read_source_section`) open with a machine-readable `trust: "untrusted_external_content"` marker and a one-line guard before any content.
+- **Developer latency:** the unit runner drops its undocumented `--test-concurrency=1` pin (bounded parallelism; 7.9 min → about 4.5–5.5 min wall clock) and the post-test dashboard skips regeneration when nothing changed. README states the real minimum Obsidian version (1.11.4).
+
+
 ## [0.4.0] — unified desktop plugin
 
 Desktop-only unified Agentic Researcher (`package.json` / `manifest.json` 0.4.0).

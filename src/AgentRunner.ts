@@ -121,6 +121,8 @@ import {
   assertEnglishOnlyOutput,
   buildEnglishOnlyRepairPrompt,
   inspectEnglishOnlyOutput,
+  isLikelyEnglishPrompt,
+  shouldEnforceEnglishOutput,
 } from "./languageGuard";
 import {
   estimateLoopBudget,
@@ -1798,7 +1800,7 @@ function buildFinalAnswerPrompt(prompt: string): string {
     FINAL_ANSWER_PROMPT,
     `Current user mission: ${JSON.stringify(truncateForPromptAnchor(prompt))}.`,
     "Answer only that mission. If any prior model content is empty, unrelated, or off topic, ignore it and produce the requested answer from the current mission.",
-    ...(isLikelyEnglishPrompt(prompt) ? [FINAL_ENGLISH_ONLY_RULE] : []),
+    ...(shouldEnforceEnglishOutput(prompt) ? [FINAL_ENGLISH_ONLY_RULE] : []),
   ].join(" ");
 }
 
@@ -1810,7 +1812,7 @@ function buildCurrentNoteFinalAnswerPrompt(prompt: string): string {
     isPromptOnCurrentPageIntent(prompt)
       ? "The user wants the prompt written on the active note/page to be extracted and executed."
       : `Current user mission: ${JSON.stringify(truncateForPromptAnchor(prompt))}.`,
-    ...(isLikelyEnglishPrompt(prompt) ? [FINAL_ENGLISH_ONLY_RULE] : []),
+    ...(shouldEnforceEnglishOutput(prompt) ? [FINAL_ENGLISH_ONLY_RULE] : []),
   ].join(" ");
 }
 
@@ -25059,13 +25061,6 @@ function formatResponseLanguageContext(prompt: string): string {
   ].join(" ");
 }
 
-function isLikelyEnglishPrompt(prompt: string): boolean {
-  const englishLetters = prompt.match(/[A-Za-z]/g)?.length ?? 0;
-  const nonAsciiChars = prompt.match(/[^\x00-\x7F]/g)?.length ?? 0;
-
-  return englishLetters > 0 && englishLetters >= nonAsciiChars;
-}
-
 function formatMissionIntentContext(intent: MissionIntent): string {
   const scope = intent.autonomyScope;
   return [
@@ -27838,7 +27833,7 @@ async function emitFinalAnswer({
   let observedContent = false;
   const wordTarget = parseGeneratedWordCountTargetFromMessages(messages);
   const verifyWordCount = wordTarget !== null;
-  const englishGuard = isLikelyEnglishPrompt(relevancePrompt ?? "");
+  const englishGuard = shouldEnforceEnglishOutput(relevancePrompt ?? "");
   const contentSanitizer = createAssistantContentSanitizer();
   const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
   const thinkingStream = createThinkingStream(events);
@@ -28212,7 +28207,7 @@ function buildRelevanceProfile(prompt: string): RelevanceProfile | null {
     // Compound lifecycle answers often open with stage/status prose before the
     // first topic anchor; give them more runway before declaring off-topic.
     minOutputChars: compoundLifecycle ? 1_200 : 360,
-    expectedEnglish: isLikelyEnglishPrompt(prompt),
+    expectedEnglish: shouldEnforceEnglishOutput(prompt),
     acceptsCodeOutput,
     acceptsNumericOutput:
       hasWordCountIntent(prompt) || hasDirectNumericAnswerIntent(prompt),
@@ -36316,7 +36311,7 @@ function createLiveWritebackEmitter({
   let toolRequestDetected = false;
   const writeSession: StreamWriteSession = createStreamWriteSession();
   const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
-  const englishGuard = isLikelyEnglishPrompt(relevancePrompt ?? "");
+  const englishGuard = shouldEnforceEnglishOutput(relevancePrompt ?? "");
 
   const emit = (delta: string) => {
     if (!delta) {
