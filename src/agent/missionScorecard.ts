@@ -123,7 +123,7 @@ export interface MissionScorecardInput {
 
 export interface MissionScoreDimension {
   id: MissionScoreDimensionId;
-  /** 0..1, higher is better. Held at 1 when {@link applicable} is false. */
+  /** 0..1, higher is better. */
   score: number;
   weight: number;
   detail: string;
@@ -136,6 +136,13 @@ export interface MissionScoreDimension {
    * means applicable, which is what every pre-existing record meant.
    */
   applicable?: boolean;
+  /**
+   * True when the raw ratio used the empty-set convention (denominator 0 → 1)
+   * even though the dimension still reports that numeric 1. Reports can tell
+   * "earned 1.0" from "nothing measured". Additive only — parsers that ignore
+   * unknown fields keep working; numeric scores do not change.
+   */
+  vacuous?: boolean;
 }
 
 export interface MissionScorecardV1 {
@@ -162,18 +169,21 @@ export function scoreMissionV1(
       ratioMet(input.acceptanceCriteriaTotal, input.acceptanceCriteriaMissing),
       `${input.acceptanceCriteriaTotal - clampCount(input.acceptanceCriteriaMissing, input.acceptanceCriteriaTotal)}/${input.acceptanceCriteriaTotal} criteria met`,
       input.acceptanceCriteriaTotal > 0,
+      input.acceptanceCriteriaTotal <= 0,
     ),
     dimension(
       "evidence_grounding",
       coverage(input.claimsWithEvidence, input.claimsRequiringEvidence),
       `${input.claimsWithEvidence}/${input.claimsRequiringEvidence} claims cited`,
       input.evidenceGroundingApplicable ?? input.claimsRequiringEvidence > 0,
+      input.claimsRequiringEvidence <= 0,
     ),
     dimension(
       "receipt_coverage",
       coverage(input.mutationsWithReceipts, input.mutationsPerformed),
       `${input.mutationsWithReceipts}/${input.mutationsPerformed} mutations receipted`,
       input.mutationsPerformed > 0,
+      input.mutationsPerformed <= 0,
     ),
     dimension(
       "source_independence",
@@ -182,6 +192,7 @@ export function scoreMissionV1(
         ? `${distinctDomainCount(input.research.usableSourceUrls)}/${input.research.requiredDistinctDomains} distinct domains`
         : "no web sources required",
       Boolean(input.research),
+      !input.research,
     ),
     dimension(
       "research_depth",
@@ -190,6 +201,7 @@ export function scoreMissionV1(
         ? `${input.research.citedPassageCount} cited passages, ${distinctDomainCount(input.research.usableSourceUrls)} domains, ${input.research.quotedSpanCount} quotes, ${input.research.sectionCount} sections`
         : "no web sources required",
       Boolean(input.research),
+      !input.research,
     ),
     dimension(
       "recovery_cleanliness",
@@ -346,6 +358,9 @@ export function normalizeMissionScorecard(
     if (dim.applicable !== undefined && typeof dim.applicable !== "boolean") {
       return null;
     }
+    if (dim.vacuous !== undefined && typeof dim.vacuous !== "boolean") {
+      return null;
+    }
     seen.add(dim.id);
     dimensions.push({
       id: dim.id as MissionScoreDimensionId,
@@ -355,6 +370,8 @@ export function normalizeMissionScorecard(
       // Absent means applicable: that is what every record written before the
       // field existed meant, so old baselines keep parsing unchanged.
       applicable: dim.applicable !== false,
+      // Additive: absent on old cards, preserved when present.
+      ...(typeof dim.vacuous === "boolean" ? { vacuous: dim.vacuous } : {}),
     });
   }
   if (!isUnitInterval(record.total)) return null;
@@ -375,7 +392,8 @@ export function formatMissionScorecard(card: MissionScorecardV1): string {
   return [
     `mission_score=${card.total.toFixed(3)} acceptance=${card.acceptancePassed ? "pass" : "needs_more_work"}`,
     ...card.dimensions.map(
-      (item) => `- ${item.id}: ${item.score.toFixed(3)} (${item.detail})`,
+      (item) =>
+        `- ${item.id}: ${item.score.toFixed(3)} (${item.detail})${item.vacuous ? " vacuous" : ""}`,
     ),
   ].join("\n");
 }
@@ -385,6 +403,7 @@ function dimension(
   score: number,
   detail: string,
   applicable = true,
+  vacuous = false,
 ): MissionScoreDimension {
   return {
     id,
@@ -392,6 +411,7 @@ function dimension(
     weight: MISSION_SCORE_WEIGHTS[id],
     detail,
     applicable,
+    vacuous,
   };
 }
 
