@@ -2066,12 +2066,13 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Semantic tuning")
       .setDesc(
-        "Balanced suits most vaults. Thorough uses larger chunks and a much bigger index ceiling for large vaults. Custom values exposes every individual setting.",
+        "Balanced suits most vaults. Fast indexes about three times quicker with a smaller model and shorter chunks (rebuilds the index once when chosen). Thorough uses larger chunks and a much bigger index ceiling for large vaults. Custom values exposes every individual setting.",
       )
       .addDropdown((dropdown) =>
         dropdown
           .addOptions({
             balanced: "Balanced",
+            fast: "Fast",
             thorough: "Thorough",
             custom: "Custom values",
           })

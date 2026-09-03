@@ -13,7 +13,7 @@ import type { AgentSettings } from "../settings";
  *
  * Deliberately free of any Obsidian import so it stays unit-testable.
  */
-export type SemanticProfilePreset = "balanced" | "thorough" | "custom";
+export type SemanticProfilePreset = "fast" | "balanced" | "thorough" | "custom";
 
 export interface SemanticProfileLimits {
   semanticEmbeddingModel: string;
@@ -45,6 +45,24 @@ export const SEMANTIC_PROFILE_PRESETS: Readonly<
     semanticChunkTargetTokens: 500,
     semanticChunkMaxTokens: 700,
     semanticChunkOverlapTokens: 80,
+    semanticIndexDebounceMs: 3000,
+    semanticIndexMaxFiles: 10000,
+    semanticIndexPersistVectors: true,
+  }),
+  // Measured on 2026-09-03 (scripts/benchmark-embedders.ts, i7-1165G7, CPU
+  // only): jina-embeddings-v2-small-en indexed 31 chunks/s against nomic's
+  // 10.7 and scored 1.00/1.00/1.00 on both the exact-term and paraphrase
+  // query sets at a 256-token chunk target, with the lowest query latency and
+  // an 8192-token input limit. Opt-in rather than the new default because
+  // choosing it rebuilds an existing vault's index once (different model and
+  // chunking); a fresh vault loses nothing by starting here.
+  fast: Object.freeze({
+    semanticEmbeddingModel: "jinaai/jina-embeddings-v2-small-en",
+    semanticEmbeddingDim: 512,
+    semanticChunkMinTokens: 150,
+    semanticChunkTargetTokens: 256,
+    semanticChunkMaxTokens: 360,
+    semanticChunkOverlapTokens: 40,
     semanticIndexDebounceMs: 3000,
     semanticIndexMaxFiles: 10000,
     semanticIndexPersistVectors: true,
