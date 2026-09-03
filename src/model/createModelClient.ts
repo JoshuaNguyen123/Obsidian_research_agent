@@ -4,11 +4,16 @@ import type {
   AgentSettings,
   AgentSlotId,
 } from "../settings";
+import {
+  DEFAULT_PLANNER_REQUEST_TIMEOUT_MS,
+  DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
+} from "./requestTimeoutDefaults";
 import { OllamaClient } from "./OllamaClient";
 import { OpenAICompatibleClient } from "./OpenAICompatibleClient";
 import type {
   HttpRequest,
   HttpResponse,
+  HttpTransport,
   ModelClient,
   ModelProvider,
   StreamingHttpResponse,
@@ -55,13 +60,61 @@ export interface AgentModelSlotResolutionV2 {
   unavailableReason: AgentModelSlotUnavailableReasonV2 | null;
 }
 
+export function resolveModelRequestTimeoutMs(input: {
+  requestTimeoutMs: number;
+  streaming: boolean;
+}): number {
+  const configured = Number(input.requestTimeoutMs);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return input.streaming
+      ? DEFAULT_STREAM_REQUEST_TIMEOUT_MS
+      : DEFAULT_PLANNER_REQUEST_TIMEOUT_MS;
+  }
+  const timeoutMs = Math.trunc(configured);
+  // Persisted explicit values always win. Only the shipped stream default
+  // (180s) is treated as implicit and split into planner vs stream ceilings.
+  if (timeoutMs !== DEFAULT_STREAM_REQUEST_TIMEOUT_MS) {
+    return timeoutMs;
+  }
+  return input.streaming
+    ? DEFAULT_STREAM_REQUEST_TIMEOUT_MS
+    : DEFAULT_PLANNER_REQUEST_TIMEOUT_MS;
+}
+
+function withRequestTimeout(
+  transport: HttpTransport,
+  timeoutMs: number,
+): HttpTransport {
+  return (request) => transport({ ...request, timeoutMs });
+}
+
+function withStreamingRequestTimeout(
+  transport: (
+    request: HttpRequest,
+  ) => Promise<StreamingHttpResponse>,
+  timeoutMs: number,
+): (request: HttpRequest) => Promise<StreamingHttpResponse> {
+  return (request) => transport({ ...request, timeoutMs });
+}
+
 export function createModelClientForSlot(slot: ModelSlotConfig): ModelClient {
   const baseUrl = requireSecureProviderBaseUrlV1(slot.baseUrl);
+  const plannerTimeoutMs = resolveModelRequestTimeoutMs({
+    requestTimeoutMs: slot.requestTimeoutMs,
+    streaming: false,
+  });
+  const streamTimeoutMs = resolveModelRequestTimeoutMs({
+    requestTimeoutMs: slot.requestTimeoutMs,
+    streaming: true,
+  });
   const common = {
     model: slot.model,
-    transport: requestUrlTransport,
-    streamingTransport: hybridStreamingTransport,
-    requestTimeoutMs: slot.requestTimeoutMs,
+    transport: withRequestTimeout(requestUrlTransport, plannerTimeoutMs),
+    streamingTransport: withStreamingRequestTimeout(
+      hybridStreamingTransport,
+      streamTimeoutMs,
+    ),
+    requestTimeoutMs: streamTimeoutMs,
   };
 
   if (slot.provider === "openai_compatible") {

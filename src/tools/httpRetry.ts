@@ -9,7 +9,8 @@ import type { HttpRequest, HttpResponse, HttpTransport } from "../model/types";
  * 500/502/504 join 503 here because a bare provider hiccup used to get zero
  * retries and end whole missions on the first blip; they are as transient as
  * the "temporarily unavailable" status they sit beside, and every caller is a
- * read.
+ * read. Thrown transport failures (DNS, reset, hang-up) use the same
+ * `[400, 1200]` budget. AbortError is never retried.
  */
 export async function requestWithRetry(
   transport: HttpTransport,
@@ -22,16 +23,44 @@ export async function requestWithRetry(
   );
   let attempt = 0;
   for (;;) {
-    const response = await transport(request);
-    if (!retryStatuses.has(response.status) || attempt >= delays.length) {
-      return response;
+    try {
+      const response = await transport(request);
+      if (!retryStatuses.has(response.status) || attempt >= delays.length) {
+        return response;
+      }
+      if (request.abortSignal?.aborted) {
+        return response;
+      }
+      await sleep(delays[attempt]!, request.abortSignal);
+      attempt += 1;
+    } catch (error) {
+      // Cancellation is sacred: never convert a user abort into a retry.
+      if (isAbortError(error)) {
+        throw error;
+      }
+      if (request.abortSignal?.aborted || attempt >= delays.length) {
+        throw error;
+      }
+      await sleep(delays[attempt]!, request.abortSignal);
+      if (request.abortSignal?.aborted) {
+        throw createAbortError();
+      }
+      attempt += 1;
     }
-    if (request.abortSignal?.aborted) {
-      return response;
-    }
-    await sleep(delays[attempt]!, request.abortSignal);
-    attempt += 1;
   }
+}
+
+export function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    (error as { name?: unknown }).name === "AbortError"
+  );
+}
+
+function createAbortError(): DOMException {
+  return new DOMException("The operation was aborted.", "AbortError");
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

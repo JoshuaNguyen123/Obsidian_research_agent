@@ -12,6 +12,7 @@ import {
   type CloudProviderPresetId,
 } from "./model/cloudProviderPresets";
 import { MAX_AGENT_STEPS, MAX_CODE_RUNS_PER_MISSION } from "./tools/constants";
+import { DEFAULT_STREAM_REQUEST_TIMEOUT_MS } from "./model/requestTimeoutDefaults";
 import {
   SAFETY_CEILING_PRESETS,
   applySafetyCeilingPreset,
@@ -307,6 +308,11 @@ export interface AgentSettings {
   scheduledMissions?: ScheduledMission[];
 }
 
+export {
+  DEFAULT_PLANNER_REQUEST_TIMEOUT_MS,
+  DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
+} from "./model/requestTimeoutDefaults";
+
 export const DEFAULT_SETTINGS: AgentSettings = {
   settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
   workingMode: "automatic",
@@ -329,7 +335,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   modelRouterEnabled: true,
   modelRouterMode: "authority",
   enableStreaming: true,
-  requestTimeoutMs: 180000,
+  requestTimeoutMs: DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
   safetyCeiling: "balanced",
   // Derived, never duplicated: the shipped defaults ARE the Balanced preset, so
   // the two can never silently drift apart.

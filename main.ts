@@ -149,6 +149,10 @@ import {
   sweepAgentRunsRetentionBestEffort,
 } from "./src/agent/runRetentionPolicy";
 import {
+  onloadTasksForPhase,
+  type OnloadStartupTaskId,
+} from "./src/onloadSchedule";
+import {
   canonicalMissionGraphId,
   runAgentMission,
   type AgentRunCompleteEvent,
@@ -1140,30 +1144,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       console.error("Agentic Researcher failed to load persisted settings.", error);
       throw error;
     }
-    this.startupPhase = "initializing_agent_templates";
-    try {
-      await ensureAgentTemplateLibrary(this.app.vault);
-    } catch (error) {
-      const failureCode = getAgentTemplateLibraryErrorCode(error);
-      console.warn(
-        `Agentic Researcher could not initialize its no-overwrite template library (${failureCode}). Existing vault files were left unchanged.`,
-      );
-      new Notice(
-        "Agent templates could not be initialized. Existing vault files were left unchanged.",
-      );
-    }
-    this.startupPhase = "loading_runtime";
-    void cleanupOldWorkspaces(7);
-    void sweepAgentRunsRetentionBestEffort({
-      vault: this.app.vault,
-      policy: resolveRunRetentionPolicy(
-        this.settings as { runRetentionDays?: number; runRetentionMaxRuns?: number },
-      ),
-    });
     this.startupPhase = "initializing_semantic_index";
     this.semanticIndexService = this.createSemanticIndexService();
     this.semanticIndexNeedsBootstrap = this.settings.semanticIndexEnabled;
-    this.scheduleSemanticIndexFlush(5_000);
     this.updateLastActiveMarkdownFile(this.resolveCurrentMarkdownFile());
     this.startupPhase = "loading_project_memory";
     await this.loadProjectMemoryData();
@@ -1276,9 +1259,64 @@ export default class AgenticResearcherPlugin extends Plugin {
       console.warn("Unable to start the Linear queue runtime.", error),
     );
     this.app.workspace.onLayoutReady(() => {
-      void this.resumeLatestDurableMission(false);
-      this.scheduleCompanionMissionReconciliation(3_000);
+      void this.runDeferredOnloadWork();
     });
+  }
+
+  /**
+   * Disk scans and companion probes listed as `layout_ready` in
+   * `ONLOAD_STARTUP_TASKS`. Work is identical to the former onload path;
+   * only the start time moves.
+   */
+  private async runDeferredOnloadWork(): Promise<void> {
+    for (const task of onloadTasksForPhase("layout_ready")) {
+      await this.executeDeferredOnloadTask(task);
+    }
+  }
+
+  private async executeDeferredOnloadTask(
+    task: OnloadStartupTaskId,
+  ): Promise<void> {
+    switch (task) {
+      case "initialize_template_library":
+        try {
+          await ensureAgentTemplateLibrary(this.app.vault);
+        } catch (error) {
+          const failureCode = getAgentTemplateLibraryErrorCode(error);
+          console.warn(
+            `Agentic Researcher could not initialize its no-overwrite template library (${failureCode}). Existing vault files were left unchanged.`,
+          );
+          new Notice(
+            "Agent templates could not be initialized. Existing vault files were left unchanged.",
+          );
+        }
+        return;
+      case "cleanup_old_workspaces":
+        void cleanupOldWorkspaces(7);
+        return;
+      case "sweep_agent_runs_retention":
+        void sweepAgentRunsRetentionBestEffort({
+          vault: this.app.vault,
+          policy: resolveRunRetentionPolicy(
+            this.settings as {
+              runRetentionDays?: number;
+              runRetentionMaxRuns?: number;
+            },
+          ),
+        });
+        return;
+      case "schedule_semantic_index_flush":
+        this.scheduleSemanticIndexFlush(5_000);
+        return;
+      case "resume_latest_durable_mission":
+        void this.resumeLatestDurableMission(false);
+        return;
+      case "schedule_companion_mission_reconciliation":
+        this.scheduleCompanionMissionReconciliation(3_000);
+        return;
+      default:
+        return;
+    }
   }
 
   onunload() {

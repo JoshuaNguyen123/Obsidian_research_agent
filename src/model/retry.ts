@@ -46,6 +46,13 @@ export function isModelRequestTimeoutError(error: unknown): boolean {
 /** Request timeouts are retried at most this many times in total. */
 export const MAX_MODEL_REQUEST_TIMEOUT_RETRIES = 1;
 
+/**
+ * A truncated or malformed provider body is worth one re-request. A
+ * consistently-broken provider must still fail fast — this is not the
+ * general transient budget.
+ */
+export const MAX_INVALID_RESPONSE_RETRIES = 1;
+
 export async function withModelRetry<T>(
   run: () => Promise<T>,
   options: {
@@ -86,9 +93,7 @@ export async function withModelRetry<T>(
     } catch (error) {
       if (
         attempt >= policy.maxAttempts ||
-        !isTransientModelError(error) ||
-        (isModelRequestTimeoutError(error) &&
-          attempt > MAX_MODEL_REQUEST_TIMEOUT_RETRIES) ||
+        !isRetryableModelError(error, attempt) ||
         options.shouldRetry?.(error, attempt) === false
       ) {
         throw error;
@@ -189,6 +194,52 @@ function normalizeRetryPolicy(policy: Partial<RetryPolicy> | undefined): RetryPo
       Math.trunc(policy?.maxDelayMs ?? DEFAULT_MODEL_RETRY_POLICY.maxDelayMs),
     ),
   };
+}
+
+/**
+ * `invalid_response` stays non-transient for fallback and failure-class
+ * callers. `withModelRetry` retries a malformed provider body once via
+ * {@link MAX_INVALID_RESPONSE_RETRIES}. Host policy uses the same category
+ * (off-topic and English-only gates) and must not consume that retry.
+ */
+export function isInvalidResponseModelError(error: unknown): boolean {
+  if (error instanceof ModelClientError) {
+    return error.category === "invalid_response";
+  }
+  return (
+    isRecord(error) &&
+    error.name === "ModelClientError" &&
+    error.category === "invalid_response"
+  );
+}
+
+export function isMalformedProviderBodyError(error: unknown): boolean {
+  if (!isInvalidResponseModelError(error)) {
+    return false;
+  }
+  const message =
+    error instanceof Error
+      ? error.message
+      : isRecord(error) && typeof error.message === "string"
+        ? error.message
+        : "";
+  return !HOST_POLICY_INVALID_RESPONSE_RE.test(message);
+}
+
+const HOST_POLICY_INVALID_RESPONSE_RE =
+  /off topic|drifted off topic|relevance check|non-English output|English-only guard/iu;
+
+function isRetryableModelError(error: unknown, attempt: number): boolean {
+  if (isMalformedProviderBodyError(error)) {
+    return attempt <= MAX_INVALID_RESPONSE_RETRIES;
+  }
+  if (!isTransientModelError(error)) {
+    return false;
+  }
+  return !(
+    isModelRequestTimeoutError(error) &&
+    attempt > MAX_MODEL_REQUEST_TIMEOUT_RETRIES
+  );
 }
 
 function isTransientModelErrorShape(
