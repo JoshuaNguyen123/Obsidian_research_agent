@@ -12,7 +12,8 @@ export type DailyUseScenarioId =
   | "VAULT-01"
   | "CODE-DELIVERY-01"
   | "INTERRUPT-01"
-  | "NOTEBOOK-01";
+  | "NOTEBOOK-01"
+  | "RESEARCH-WEB-01";
 
 export interface DailyUseAcceptanceV1 {
   version: 1;
@@ -295,6 +296,28 @@ export const FLOW_REAL_01_ACCEPTANCE_TOKENS = Object.freeze({
 });
 
 /**
+ * Typed RESEARCH-WEB-01 observation vocabulary: the opt-in real-web research
+ * quality lane (e2e/research-real-web.spec.ts). It installs no owned web
+ * backend, so every token is what the product promises for ANY sourced
+ * mission — completion with one append, usable parsed sources from at least
+ * two domains, citations bound to fetched passages, a limitations heading —
+ * never a pin on which live source answered. The lane is non-deterministic
+ * by design; its scorecard is a diagnostic until harvested.
+ */
+export const RESEARCH_WEB_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze(["vault:cited_summary_section"] as const),
+  proofs: Object.freeze([
+    "evidence:real_web_fetch",
+    "research:distinct_domains",
+    "receipt:single_append",
+    "research:limitations_section",
+  ] as const),
+  approvals: Object.freeze([] as const),
+  bindings: Object.freeze(["citation:fetched_source"] as const),
+  cleanup: Object.freeze([] as const),
+});
+
+/**
  * Stable acceptance contracts for the six release journeys, the exact BYOK
  * autonomy proof, and the bare-prompt scratch-to-Desktop journey. These keys
  * are intentionally provider-neutral so deterministic, live-model, sandbox,
@@ -489,6 +512,13 @@ export const DAILY_USE_ACCEPTANCE_V1: Readonly<
     approvalBoundaries: NOTEBOOK_01_ACCEPTANCE_TOKENS.approvals,
     finalBindings: NOTEBOOK_01_ACCEPTANCE_TOKENS.bindings,
     cleanupObligations: NOTEBOOK_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "RESEARCH-WEB-01": contract("RESEARCH-WEB-01", {
+    requestedArtifacts: RESEARCH_WEB_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: RESEARCH_WEB_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: RESEARCH_WEB_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: RESEARCH_WEB_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: RESEARCH_WEB_01_ACCEPTANCE_TOKENS.cleanup,
   }),
 });
 

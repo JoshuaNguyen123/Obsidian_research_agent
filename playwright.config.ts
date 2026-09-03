@@ -33,6 +33,7 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
       activeLanes.has("desktop-checkers-delivery-real-live") ||
       activeLanes.has("real-ai-soak") ||
       activeLanes.has("daily-use-research") ||
+      activeLanes.has("research-real-web") ||
       activeLanes.has("core-native") ||
       activeLanes.has("obsidian-hello-github-live")
     ? 60 * 60_000
@@ -114,6 +115,17 @@ export default defineConfig({
     {
       name: "daily-use-research",
       testMatch: /daily-use-research\.spec\.ts/u,
+      retries: 0,
+      timeout: 900_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      // Opt-in real-web research quality lane: no owned web backend, real
+      // provider search/fetch, non-deterministic by design. Two missions of
+      // up to 15 minutes each; see the spec header.
+      name: "research-real-web",
+      testMatch: /research-real-web\.spec\.ts/u,
       retries: 0,
       timeout: 900_000,
       expect: { timeout: 180_000 },

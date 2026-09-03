@@ -10,6 +10,7 @@ import {
   FLOW_REAL_01_ACCEPTANCE_TOKENS,
   INTERRUPT_01_ACCEPTANCE_TOKENS,
   NOTEBOOK_01_ACCEPTANCE_TOKENS,
+  RESEARCH_WEB_01_ACCEPTANCE_TOKENS,
   VAULT_01_ACCEPTANCE_TOKENS,
 } from "../src/agent/dailyUseAcceptance";
 
@@ -30,6 +31,7 @@ describe("DailyUseAcceptanceV1", () => {
       "CODE-DELIVERY-01",
       "INTERRUPT-01",
       "NOTEBOOK-01",
+      "RESEARCH-WEB-01",
     ]);
     for (const [scenarioId, contract] of Object.entries(DAILY_USE_ACCEPTANCE_V1)) {
       assert.equal(contract.version, 1);
@@ -215,6 +217,7 @@ describe("DailyUseAcceptanceV1", () => {
       ["CODE-DELIVERY-01", CODE_DELIVERY_01_ACCEPTANCE_TOKENS],
       ["INTERRUPT-01", INTERRUPT_01_ACCEPTANCE_TOKENS],
       ["NOTEBOOK-01", NOTEBOOK_01_ACCEPTANCE_TOKENS],
+      ["RESEARCH-WEB-01", RESEARCH_WEB_01_ACCEPTANCE_TOKENS],
     ] as const) {
       const contract = DAILY_USE_ACCEPTANCE_V1[scenarioId];
       assert.deepEqual(contract.requestedArtifacts, tokens.artifacts);
