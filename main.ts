@@ -110,6 +110,7 @@ import {
 } from "./src/agent/projectMemoryReloadGate";
 import {
   planTopLevelDirectMissionGraphV1,
+  RESEARCH_TEAM_EXECUTOR_ID_V1,
   resolveResearchTeamOutputTargetV1,
   resolveTopLevelMissionDispatchV1,
   topLevelDispatchExecutorId,
@@ -224,7 +225,7 @@ import {
   loadLatestPersistedMissionRunProjection,
   loadPersistedMissionRunProjectionByRunId,
 } from "./src/agent/startupMissionHydration";
-import { extractRequestedRunId } from "./src/agent/missionResume";
+import { extractRequestedRunId, persistOpenClarificationForRun, resolveTeamResumeIdentity, stampTeamIdentityOnLedger, stampTeamIdentityOnLedgerSummary } from "./src/agent/missionResume";
 import { createAgentRunId } from "./src/agent/checkpoints";
 import {
   followEditorStreamingEnd,
@@ -379,7 +380,7 @@ import {
   fingerprintSpecialistWorkspaceDiff,
   isDeliverableWorkerHandoffStatusV2,
 } from "./src/orchestrator/specialistHandoff";
-import { resolveAdaptiveTeamDispatchV2 } from "./src/agent/researchTeamDispatch";
+import { resolveAdaptiveTeamDispatchV2, resolveDurableAdaptiveTeamDispatchV2 } from "./src/agent/researchTeamDispatch";
 import { runExtensionVerifiers } from "./src/agent/extensionVerifiers";
 import {
   CRITIC_MAX_STEPS,
@@ -395,6 +396,7 @@ import {
   isDemotingZeroStepLeadCompletion,
   shouldContinueResearchLead,
 } from "./src/orchestrator/leadContinuation";
+import { seedLeadFromWorkerHandoff } from "./src/orchestrator/researchTeamHandoffBridge";
 import { resolveResearchTeamBudget } from "./src/orchestrator/researchTeamBudget";
 import { summarizeSourceLedger } from "./src/orchestrator/sourceLedgerSummary";
 import { buildResearcherAssignment } from "./src/orchestrator/researcherSoftCatalog";
@@ -9194,28 +9196,70 @@ export default class AgenticResearcherPlugin extends Plugin {
       }
       return await this.runCoordinator.start(
         async (abortSignal, events) => {
-          if (durableManifest) {
+          const missionEvents: AgentRunEvents = {
+            ...events,
+            onClarificationRequest: (request, broker) => {
+              void persistOpenClarificationForRun(
+                this.createToolExecutionContext(prompt),
+                request,
+              );
+              events.onClarificationRequest?.(request, broker);
+            },
+          };
+          const teamResumeIdentity = await resolveTeamResumeIdentity({
+            prompt,
+            toolContext: this.createToolExecutionContext(prompt),
+          });
+          const durableTeamDispatch = await resolveDurableAdaptiveTeamDispatchV2({
+            prompt: teamResumeIdentity?.ledger?.mission ?? prompt,
+            orchestratorEnabled: this.settings.orchestratorEnabled !== false,
+            forceChatOnly: options.forceChatOnly === true,
+            settings: this.settings,
+            embeddingProvider: this.getSemanticEmbeddingProvider(),
+            hasDurableManifest: Boolean(durableManifest),
+          });
+          const adaptiveTeamDispatch = teamResumeIdentity?.forceTeam
+            ? {
+                ...durableTeamDispatch.decision,
+                useTeam: true,
+                orchestrationMode: "adaptive_team" as const,
+                signals: [
+                  ...new Set([
+                    "resume_team_identity",
+                    ...durableTeamDispatch.decision.signals,
+                  ]),
+                ],
+                reason:
+                  "Persisted team identity restores Lead + Specialist on continue.",
+                specialistModes:
+                  durableTeamDispatch.decision.specialistModes.length > 0
+                    ? durableTeamDispatch.decision.specialistModes
+                    : (["researcher"] as SpecialistMode[]),
+                initialSpecialistMode:
+                  durableTeamDispatch.decision.initialSpecialistMode ??
+                  "researcher",
+              }
+            : durableTeamDispatch.decision;
+          missionEvents.onStatus?.(
+            `Adaptive-team routing: ${adaptiveTeamDispatch.useTeam ? "Lead + Specialist" : "single"} [${adaptiveTeamDispatch.signals.join(", ")}]${
+              durableManifest
+                ? ` durable_research_opens_team=${durableTeamDispatch.durable_research_opens_team}`
+                : ""
+            }`,
+          );
+
+          if (durableManifest && !adaptiveTeamDispatch.useTeam) {
             await this.runDurableMission(
               durableManifest,
               conversationHistory,
               abortSignal,
-              events,
+              missionEvents,
               options.forceChatOnly === true,
             );
             return;
           }
 
           const codeTeamRequest = parseExplicitCodeTeamRequest(prompt);
-          const adaptiveTeamDispatch = await resolveAdaptiveTeamDispatchV2({
-            prompt,
-            orchestratorEnabled: this.settings.orchestratorEnabled !== false,
-            forceChatOnly: options.forceChatOnly === true,
-            settings: this.settings,
-            embeddingProvider: this.getSemanticEmbeddingProvider(),
-          });
-          events.onStatus?.(
-            `Adaptive-team routing: ${adaptiveTeamDispatch.useTeam ? "Lead + Specialist" : "single"} [${adaptiveTeamDispatch.signals.join(", ")}]`,
-          );
           const directDispatch = resolveTopLevelMissionDispatchV1({
             codeTeamRequest,
             codeTeamBridgeIntent: hasCodeTeamBridgeIntent(prompt),
@@ -9234,7 +9278,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             const canonicalDispatch = await this.openTopLevelDirectMissionGraph({
               prompt,
               decision: directDispatch,
-              events,
+              events: missionEvents,
             });
             const executorId = topLevelDispatchExecutorId(
               canonicalDispatch.session.graph,
@@ -9320,10 +9364,10 @@ export default class AgenticResearcherPlugin extends Plugin {
                     })
                   : await this.runResearchTeamMission({
                       runId: canonicalDispatch.session.graph.missionId,
-                      prompt,
+                      prompt: teamResumeIdentity?.ledger?.mission ?? prompt,
                       conversationHistory,
                       abortSignal,
-                      events,
+                      events: missionEvents,
                       forceChatOnly: options.forceChatOnly === true,
                       specialistModes: adaptiveTeamDispatch.specialistModes,
                     });
@@ -9908,6 +9952,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     const verifyNodeId = scaffold.nodeIds.verify;
     const rootNodeId = scaffold.nodeIds.root;
     await runtime.start(scaffold);
+    await this.persistResearchTeamParentIdentity({
+      parentRunId: runId,
+      leadChildRunId: `${runId}-lead`,
+      mission: input.prompt,
+    });
     const teamAutonomyStats = createAutonomyRunStats();
     const teamStartedAt = Date.now();
     input.events.onStatus?.(
@@ -10107,12 +10156,25 @@ export default class AgenticResearcherPlugin extends Plugin {
         teamAutonomyStats,
         merged.evidence.filter((item) => item.usableSource !== false).length,
       );
+      const seededHandoff = seedLeadFromWorkerHandoff({
+        handoff: merged.handoff,
+        notePath: this.getCurrentMarkdownFile()?.path ?? "",
+        noteSha256: "",
+        noteReceiptId: "",
+        runId,
+        evidence: seedEvidence,
+      });
+      if (seededHandoff.handoff_artifact_seeded_on_lead === 1 && seededHandoff.attachContext) {
+        handoffContext = `${handoffContext}\n\n${seededHandoff.attachContext}`;
+      }
       input.events.onStatus?.(
-        handoffAccepted
-          ? "Handoff accepted."
-          : merged.handoff.status === "ready"
-            ? "Handoff ready."
-            : "Handoff rejected.",
+        seededHandoff.handoff_artifact_seeded_on_lead === 1
+          ? "Handoff artifact seeded on Lead."
+          : handoffAccepted
+            ? "Handoff accepted."
+            : merged.handoff.status === "ready"
+              ? "Handoff ready."
+              : "Handoff rejected.",
       );
       {
         const sanitation = workerResult.quoteSanitation;
@@ -10180,7 +10242,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     await runtime.updateParticipant("lead", {
       status: "planning",
       currentNodeId: leadNodeId,
-      lastAction: "Reviewing worker evidence and executing the mission.",
+      lastAction: `team:${RESEARCH_TEAM_EXECUTOR_ID_V1} lead:${runId}-lead`,
     });
 
     const leadCompletion: { current: AgentRunCompleteEvent | null } = {
@@ -10203,6 +10265,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     const latestLeadRunConfig: { current: AgentRunConfigEvent | null } = {
       current: null,
     };
+    let leadSegmentRunId = `${runId}-lead`;
     const enqueueLeadEvent = (operation: () => Promise<unknown>) => {
       leadEventQueue = leadEventQueue.then(operation, operation).then(() => undefined);
     };
@@ -10210,32 +10273,41 @@ export default class AgenticResearcherPlugin extends Plugin {
       event: AgentRunConfigEvent,
       snapshot = runtime.getSnapshot(),
     ) => {
+      const leadChildRunId = event.runId || leadSegmentRunId;
+      const identity = {
+        executorId: RESEARCH_TEAM_EXECUTOR_ID_V1,
+        leadChildRunId,
+      };
+      const stampedSummary = event.missionLedger
+        ? stampTeamIdentityOnLedgerSummary(event.missionLedger, identity)
+        : undefined;
       const normalizedSnapshot = snapshot
         ? normalizeOrchestratorSnapshot(snapshot)
         : null;
       const projected: AgentRunConfigEvent = {
         ...event,
         runId,
-        ...(event.missionLedger && normalizedSnapshot
+        ...(stampedSummary
           ? {
-              missionLedger: {
-                ...event.missionLedger,
-                orchestrator: normalizedSnapshot,
-              },
+              missionLedger: normalizedSnapshot
+                ? { ...stampedSummary, orchestrator: normalizedSnapshot }
+                : stampedSummary,
             }
           : {}),
       };
       latestLeadRunConfig.current = projected;
       input.events.onRunConfig?.(projected);
+      void this.persistResearchTeamParentIdentity({
+        parentRunId: runId,
+        leadChildRunId,
+        mission: input.prompt,
+      });
     };
     const leadEvents = new Proxy(input.events, {
       get: (target, property, receiver) => {
-        if (
-          property === "onMissionGraphUpdate" ||
-          property === "onOrchestratorEvent"
-        ) {
-          // The Lead's tool-loop graph is a subordinate executor detail. Do
-          // not let it replace the top-level canonical dispatch projection.
+        if (property === "onOrchestratorEvent") {
+          // Keep the two-participant orchestrator projection; Lead tool-loop
+          // graphs still forward so resume heal sees ready tools.
           return () => undefined;
         }
         if (property === "onRunConfig") {
@@ -10367,7 +10439,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     try {
       let leadPrompt = input.prompt;
       let leadHistory = input.conversationHistory;
-      let leadSegmentRunId = `${runId}-lead`;
+      leadSegmentRunId = `${runId}-lead`;
       for (
         let segmentIndex = 0;
         segmentIndex < leadMaxSegments &&
@@ -10443,6 +10515,11 @@ export default class AgenticResearcherPlugin extends Plugin {
               previousAcceptanceMissing: previousLeadAcceptanceMissing,
               availableRepairAction:
                 event.autoContinueReason !== "required_tool_failure",
+              unpaidWrite:
+                event.autoContinueReason === "acceptance_failed" ||
+                currentAcceptanceMissing.some((item) =>
+                  /write|receipt|readback/iu.test(item),
+                ),
             });
             previousLeadProgressFingerprint = currentProgressFingerprint;
             previousLeadAcceptanceMissing = currentAcceptanceMissing;
@@ -11538,6 +11615,67 @@ export default class AgenticResearcherPlugin extends Plugin {
     return false;
   }
 
+  private async persistResearchTeamParentIdentity(input: {
+    parentRunId: string;
+    leadChildRunId: string;
+    mission: string;
+  }): Promise<void> {
+    const context = this.createToolExecutionContext(input.mission);
+    const now = new Date();
+    try {
+      const stored = await readMissionLedgerByRunId(context, input.parentRunId);
+      const ledger =
+        stored?.ledger ??
+        createMissionLedger({
+          runId: input.parentRunId,
+          mission: input.mission,
+          route: "orchestrator_adaptive_team",
+          loopBudget: {
+            hardCap: MAX_AGENT_STEPS,
+            toolStepBudget: MAX_AGENT_STEPS - 4,
+            finalizationReserve: 4,
+            expectedTools: ["research_worker", "web_search", "web_fetch"],
+            stopWhenSatisfied: true,
+          },
+          now,
+        });
+      stampTeamIdentityOnLedger(ledger, {
+        executorId: RESEARCH_TEAM_EXECUTOR_ID_V1,
+        leadChildRunId: input.leadChildRunId,
+      });
+      await writeMissionLedger(context, ledger);
+    } catch (error) {
+      console.warn(
+        `Unable to persist research-team identity for ${input.parentRunId}.`,
+        error,
+      );
+    }
+  }
+
+  private async persistResearchTeamLeadChildIdentity(input: {
+    leadChildRunId: string;
+    mission: string;
+  }): Promise<void> {
+    const context = this.createToolExecutionContext(input.mission);
+    try {
+      const stored = await readMissionLedgerByRunId(
+        context,
+        input.leadChildRunId,
+      );
+      if (!stored?.ledger) return;
+      stampTeamIdentityOnLedger(stored.ledger, {
+        executorId: RESEARCH_TEAM_EXECUTOR_ID_V1,
+        leadChildRunId: input.leadChildRunId,
+      });
+      await writeMissionLedger(context, stored.ledger);
+    } catch (error) {
+      console.warn(
+        `Unable to persist Lead child identity for ${input.leadChildRunId}.`,
+        error,
+      );
+    }
+  }
+
   private async persistLatestOrchestratorToRunArtifacts(
     originalMission: string,
   ): Promise<void> {
@@ -11571,6 +11709,20 @@ export default class AgenticResearcherPlugin extends Plugin {
           now,
         });
       ledger.orchestrator = orchestrator;
+      const leadChildFromAction =
+        /lead:([A-Za-z0-9._:-]+)/u.exec(
+          orchestrator.participants.lead?.lastAction ?? "",
+        )?.[1] ?? null;
+      if (leadChildFromAction) {
+        stampTeamIdentityOnLedger(ledger, {
+          executorId: RESEARCH_TEAM_EXECUTOR_ID_V1,
+          leadChildRunId: leadChildFromAction,
+        });
+        await this.persistResearchTeamLeadChildIdentity({
+          leadChildRunId: leadChildFromAction,
+          mission: originalMission,
+        });
+      }
       updateMissionLedgerStatus(
         ledger,
         orchestrator.status === "complete"

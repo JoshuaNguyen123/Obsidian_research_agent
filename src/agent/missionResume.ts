@@ -4,8 +4,10 @@ import {
   readLatestMissionLedger,
   readMissionLedgerByRunId,
   resolveLedgerCurrentNoteWriteKind,
+  writeMissionLedger,
   type CurrentNoteWriteKindV1,
   type MissionLedger,
+  type MissionLedgerSummary,
 } from "./missionLedger";
 import {
   countRemainingMissionPlanTasks,
@@ -20,12 +22,22 @@ import {
   type ProofDebt,
 } from "./proofDebt";
 import type { ToolExecutionContext } from "../tools/types";
+import {
+  decodeOpenClarificationAction,
+  encodeOpenClarificationAction,
+  stageOpenClarificationForNextBroker,
+  type ClarificationRequest,
+  OPEN_CLARIFICATION_ACTION_PREFIX,
+} from "./clarificationBroker";
+import { RESEARCH_TEAM_EXECUTOR_ID_V1 } from "./topLevelMissionDispatch";
 
 export interface MissionResumeContext {
   path: string;
   ledger: MissionLedger;
   plan: MissionResumePlan;
   promptContext: string;
+  /** 1 when continue-run restored the team Lead child ledger instead of a parent stub. */
+  resume_loads_lead_child_ledger?: 0 | 1;
 }
 
 export interface MissionResumePlan {
@@ -102,11 +114,18 @@ export async function buildMissionResumeContext({
     return null;
   }
 
+  const resolved = await resolveLeadChildResumeLedger(toolContext, loaded);
+  const openClarification = readOpenClarificationFromLedger(resolved.ledger);
+  if (openClarification) {
+    stageOpenClarificationForNextBroker(openClarification);
+  }
+
   return {
-    path: loaded.path,
-    ledger: loaded.ledger,
-    plan: buildMissionResumePlan(loaded.ledger),
-    promptContext: formatLedgerForModel(loaded.ledger, loaded.path),
+    path: resolved.path,
+    ledger: resolved.ledger,
+    plan: buildMissionResumePlan(resolved.ledger),
+    promptContext: formatLedgerForModel(resolved.ledger, resolved.path),
+    resume_loads_lead_child_ledger: resolved.resume_loads_lead_child_ledger,
   };
 }
 
@@ -309,6 +328,8 @@ export function formatLedgerForModel(
       : "Research mode: none",
     `Status: ${ledger.status}`,
     `Route: ${ledger.route}`,
+    formatTeamIdentityForModel(ledger),
+    formatOpenClarificationForModel(ledger),
     `Expected tools: ${ledger.loopBudget.expectedTools.join(", ") || "none"}`,
     `Incomplete tasks: ${incomplete.map((task) => task.title).join("; ") || "none"}`,
     `Blockers: ${ledger.blockers.join("; ") || "none"}`,
@@ -323,6 +344,219 @@ export function formatLedgerForModel(
     "Evidence:",
     evidence.length > 0 ? evidence.join("\n") : "none",
   ].join("\n");
+}
+
+export const TEAM_EXECUTOR_ACTION_PREFIX = "team_executor:";
+export const LEAD_CHILD_RUN_ACTION_PREFIX = "lead_child_run:";
+
+export interface TeamMissionIdentityV1 {
+  executorId: string;
+  leadChildRunId: string;
+}
+
+function applyTeamIdentityActions(
+  remainingActions: string[],
+  identity: TeamMissionIdentityV1,
+): string[] {
+  const nextActions = remainingActions.filter(
+    (action) =>
+      !action.startsWith(TEAM_EXECUTOR_ACTION_PREFIX) &&
+      !action.startsWith(LEAD_CHILD_RUN_ACTION_PREFIX),
+  );
+  nextActions.unshift(
+    `${TEAM_EXECUTOR_ACTION_PREFIX}${identity.executorId}`,
+    `${LEAD_CHILD_RUN_ACTION_PREFIX}${identity.leadChildRunId}`,
+  );
+  return nextActions;
+}
+
+function teamIdentityLastAction(identity: TeamMissionIdentityV1): string {
+  return `team:${identity.executorId} lead:${identity.leadChildRunId}`;
+}
+
+export function stampTeamIdentityOnLedger(
+  ledger: MissionLedger,
+  identity: TeamMissionIdentityV1,
+): MissionLedger {
+  ledger.remainingActions = applyTeamIdentityActions(
+    ledger.remainingActions,
+    identity,
+  );
+  ledger.lastMeaningfulAction = teamIdentityLastAction(identity);
+  ledger.continuationCommand = `continue run ${identity.leadChildRunId}`;
+  return ledger;
+}
+
+export function stampTeamIdentityOnLedgerSummary(
+  summary: MissionLedgerSummary,
+  identity: TeamMissionIdentityV1,
+): MissionLedgerSummary {
+  return {
+    ...summary,
+    remainingActions: applyTeamIdentityActions(
+      summary.remainingActions,
+      identity,
+    ),
+    lastMeaningfulAction: teamIdentityLastAction(identity),
+    continuationCommand: `continue run ${identity.leadChildRunId}`,
+  };
+}
+
+export function readTeamIdentityFromLedger(
+  ledger: MissionLedger,
+): TeamMissionIdentityV1 | null {
+  let executorId: string | null = null;
+  let leadChildRunId: string | null = null;
+  for (const action of [
+    ...ledger.remainingActions,
+    ...ledger.nextActions,
+    ledger.lastMeaningfulAction ?? "",
+  ]) {
+    if (action.startsWith(TEAM_EXECUTOR_ACTION_PREFIX)) {
+      executorId = action.slice(TEAM_EXECUTOR_ACTION_PREFIX.length).trim();
+    }
+    if (action.startsWith(LEAD_CHILD_RUN_ACTION_PREFIX)) {
+      leadChildRunId = action.slice(LEAD_CHILD_RUN_ACTION_PREFIX.length).trim();
+    }
+    const compact = /team:([A-Za-z0-9._:-]+)\s+lead:([A-Za-z0-9._:-]+)/u.exec(
+      action,
+    );
+    if (compact) {
+      executorId ??= compact[1] ?? null;
+      leadChildRunId ??= compact[2] ?? null;
+    }
+  }
+  if (!executorId || !leadChildRunId) return null;
+  return { executorId, leadChildRunId };
+}
+
+export function persistOpenClarificationOnLedger(
+  ledger: MissionLedger,
+  request: ClarificationRequest,
+): MissionLedger {
+  ledger.remainingActions = [
+    encodeOpenClarificationAction(request),
+    ...ledger.remainingActions.filter(
+      (action) => !action.startsWith(OPEN_CLARIFICATION_ACTION_PREFIX),
+    ),
+  ];
+  return ledger;
+}
+
+export function readOpenClarificationFromLedger(
+  ledger: MissionLedger,
+): ClarificationRequest | null {
+  for (const action of [...ledger.remainingActions, ...ledger.nextActions]) {
+    const decoded = decodeOpenClarificationAction(action);
+    if (decoded) return decoded;
+  }
+  return null;
+}
+
+export async function resolveLeadChildResumeLedger(
+  toolContext: ToolExecutionContext,
+  loaded: { path: string; ledger: MissionLedger },
+): Promise<{
+  path: string;
+  ledger: MissionLedger;
+  resume_loads_lead_child_ledger: 0 | 1;
+}> {
+  const identity = readTeamIdentityFromLedger(loaded.ledger);
+  if (!identity) {
+    return {
+      path: loaded.path,
+      ledger: loaded.ledger,
+      resume_loads_lead_child_ledger: 0,
+    };
+  }
+  if (loaded.ledger.runId === identity.leadChildRunId) {
+    return {
+      path: loaded.path,
+      ledger: loaded.ledger,
+      resume_loads_lead_child_ledger: 1,
+    };
+  }
+  const child = await readMissionLedgerByRunId(
+    toolContext,
+    identity.leadChildRunId,
+  );
+  if (!child) {
+    return {
+      path: loaded.path,
+      ledger: loaded.ledger,
+      resume_loads_lead_child_ledger: 0,
+    };
+  }
+  return {
+    path: child.path,
+    ledger: child.ledger,
+    resume_loads_lead_child_ledger: 1,
+  };
+}
+
+/**
+ * Continue-run of a team Lead restores adaptive-team dispatch instead of
+ * classifying the tiny "continue run <id>" prompt as single-agent.
+ */
+export async function resolveTeamResumeIdentity(input: {
+  prompt: string;
+  toolContext: ToolExecutionContext;
+}): Promise<{
+  forceTeam: boolean;
+  executorId: string;
+  leadChildRunId: string;
+  resume_loads_lead_child_ledger: 0 | 1;
+  ledger: MissionLedger | null;
+} | null> {
+  const requestedRunId = extractRequestedRunId(input.prompt);
+  if (!requestedRunId) return null;
+  const loaded = await readMissionLedgerByRunId(
+    input.toolContext,
+    requestedRunId,
+  );
+  if (!loaded) return null;
+  const resolved = await resolveLeadChildResumeLedger(input.toolContext, loaded);
+  const identity =
+    readTeamIdentityFromLedger(resolved.ledger) ??
+    readTeamIdentityFromLedger(loaded.ledger);
+  if (!identity) return null;
+  const openClarification = readOpenClarificationFromLedger(resolved.ledger);
+  if (openClarification) {
+    stageOpenClarificationForNextBroker(openClarification);
+  }
+  return {
+    forceTeam:
+      identity.executorId === RESEARCH_TEAM_EXECUTOR_ID_V1 ||
+      identity.executorId === "research-team",
+    executorId: identity.executorId,
+    leadChildRunId: identity.leadChildRunId,
+    resume_loads_lead_child_ledger: resolved.resume_loads_lead_child_ledger,
+    ledger: resolved.ledger,
+  };
+}
+
+function formatTeamIdentityForModel(ledger: MissionLedger): string {
+  const identity = readTeamIdentityFromLedger(ledger);
+  return identity
+    ? `Team executor: ${identity.executorId}; Lead child run: ${identity.leadChildRunId}`
+    : "Team executor: none";
+}
+
+function formatOpenClarificationForModel(ledger: MissionLedger): string {
+  const open = readOpenClarificationFromLedger(ledger);
+  return open
+    ? `Open clarification: ${open.question}`
+    : "Open clarification: none";
+}
+
+export async function persistOpenClarificationForRun(
+  toolContext: ToolExecutionContext,
+  request: ClarificationRequest,
+): Promise<void> {
+  const loaded = await readMissionLedgerByRunId(toolContext, request.runId);
+  if (!loaded) return;
+  persistOpenClarificationOnLedger(loaded.ledger, request);
+  await writeMissionLedger(toolContext, loaded.ledger);
 }
 
 function formatDependencyStatusForModel(

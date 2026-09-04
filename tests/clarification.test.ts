@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   ClarificationBroker,
+  shouldOfferAskUser,
   type ClarificationRequest,
 } from "../src/agent/clarificationBroker";
 import { askUserTool } from "../src/tools/clarificationTools";
@@ -86,6 +87,12 @@ test("an empty answer or unknown id never resolves a question", async () => {
   assert.equal(broker.answer("clarification-nope-1", "hi"), false);
   assert.equal(broker.skip(id), true);
   await outcome;
+});
+
+test("ask_user is not offered on bare continue prompts", () => {
+  assert.equal(shouldOfferAskUser("continue"), false);
+  assert.equal(shouldOfferAskUser("help me"), false);
+  assert.equal(shouldOfferAskUser("go on"), false);
 });
 
 test("ask_user returns the answer as intent, not authority", async () => {

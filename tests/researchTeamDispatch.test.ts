@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   RESEARCH_TEAM_KEYWORD_FLOOR,
   resolveAdaptiveTeamDispatchV2,
+  resolveDurableAdaptiveTeamDispatchV2,
   resolveResearchTeamDispatchV1,
   type ResearchTeamDispatchInputV1,
 } from "../src/agent/researchTeamDispatch";
@@ -90,6 +91,21 @@ test("deliberate negatives stay single-agent", async () => {
     assert.equal(decision.useTeam, false, prompt);
     assert.equal(shouldUseResearchTeam(prompt, true), false, prompt);
   }
+});
+
+test("durable investigate-with-sources manifests open the same adaptive team as interactive research", async () => {
+  const routed = await resolveDurableAdaptiveTeamDispatchV2({
+    ...dispatchInput("Investigate this with sources overnight."),
+    hasDurableManifest: true,
+  });
+  assert.equal(routed.decision.useTeam, true);
+  assert.equal(routed.durable_research_opens_team, 1);
+
+  const chat = await resolveDurableAdaptiveTeamDispatchV2({
+    ...dispatchInput("Summarize the meeting transcript overnight."),
+    hasDurableManifest: true,
+  });
+  assert.equal(chat.durable_research_opens_team, 0);
 });
 
 test("representative complex research prompts route to one Adaptive Specialist", async () => {

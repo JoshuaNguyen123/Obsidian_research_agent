@@ -42,6 +42,27 @@ export interface AdaptiveTeamDispatchDecisionV2
   initialSpecialistMode: SpecialistMode | null;
 }
 
+export interface DurableAdaptiveTeamDispatchV2 {
+  decision: AdaptiveTeamDispatchDecisionV2;
+  /** 1 when a durable/overnight manifest still opens the adaptive team. */
+  durable_research_opens_team: 0 | 1;
+}
+
+/**
+ * Overnight and other durable manifests must run the same adaptive-team
+ * decision as interactive research. Callers must not return before this.
+ */
+export async function resolveDurableAdaptiveTeamDispatchV2(
+  input: ResearchTeamDispatchInputV1 & { hasDurableManifest: boolean },
+): Promise<DurableAdaptiveTeamDispatchV2> {
+  const decision = await resolveAdaptiveTeamDispatchV2(input);
+  return {
+    decision,
+    durable_research_opens_team:
+      input.hasDurableManifest && decision.useTeam ? 1 : 0,
+  };
+}
+
 /**
  * Layered research-team routing, replacing the bare regex trigger:
  *

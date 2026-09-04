@@ -19,6 +19,9 @@ export interface ExplicitCodeTeamDispatchRequestV1 {
   assignment: string;
 }
 
+/** Host-persisted executor id for the adaptive research team. */
+export const RESEARCH_TEAM_EXECUTOR_ID_V1 = "research-team";
+
 export type TopLevelMissionDispatchDecisionV1 =
   | { kind: "single_agent" }
   | {
@@ -221,7 +224,9 @@ async function buildRouteAuthority(
       ? "orchestrator.research.note_output"
       : "orchestrator.research.read"
     : "orchestrator.dispatch.guard";
-  const executorId = isResearch ? "research-team" : "host-dispatch-guard";
+  const executorId = isResearch
+    ? RESEARCH_TEAM_EXECUTOR_ID_V1
+    : "host-dispatch-guard";
   const objective =
     input.decision.kind === "research_team"
       ? `Run bounded multi-agent research for: ${input.objective}`

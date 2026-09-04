@@ -41,9 +41,140 @@ interface PendingClarification {
   abortHandler?: () => void;
 }
 
+const BARE_CONTINUE_OR_HELP_PROMPT =
+  /^(?:please\s+)?(?:continue|go\s+on|help(?:\s+me)?|keep\s+going)[.!?]*$/iu;
+const CONTINUE_RUN_PROMPT = /^(?:continue|resume)\s+run\s+\S+/iu;
+
+let stagedOpenClarification: ClarificationRequest | null = null;
+
+/**
+ * Bare continue / help me / go on already names the next action. Offering
+ * ask_user on those prompts burns a turn asking what to do next.
+ */
+export function shouldOfferAskUser(prompt: string): boolean {
+  const normalized = prompt.trim().replace(/\s+/gu, " ");
+  if (!normalized) return true;
+  if (
+    BARE_CONTINUE_OR_HELP_PROMPT.test(normalized) ||
+    CONTINUE_RUN_PROMPT.test(normalized)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** Quantitative gate: 1 if ask_user would still be offered on this prompt. */
+export function askUserOfferedOnBareContinue(prompt: string): 0 | 1 {
+  return shouldOfferAskUser(prompt) ? 1 : 0;
+}
+
+export const OPEN_CLARIFICATION_ACTION_PREFIX = "open_clarification:v1:";
+
+export function encodeOpenClarificationAction(
+  request: ClarificationRequest,
+): string {
+  return `${OPEN_CLARIFICATION_ACTION_PREFIX}${JSON.stringify({
+    id: request.id,
+    runId: request.runId,
+    question: request.question,
+    options: request.options,
+    ...(request.context ? { context: request.context } : {}),
+    expiresAtMs: request.expiresAtMs,
+  })}`;
+}
+
+export function decodeOpenClarificationAction(
+  action: string,
+): ClarificationRequest | null {
+  if (!action.startsWith(OPEN_CLARIFICATION_ACTION_PREFIX)) return null;
+  try {
+    const raw = JSON.parse(
+      action.slice(OPEN_CLARIFICATION_ACTION_PREFIX.length),
+    ) as Partial<ClarificationRequest>;
+    if (
+      typeof raw.id !== "string" ||
+      typeof raw.runId !== "string" ||
+      typeof raw.question !== "string" ||
+      typeof raw.expiresAtMs !== "number"
+    ) {
+      return null;
+    }
+    return {
+      id: raw.id,
+      runId: raw.runId,
+      question: raw.question,
+      options: Array.isArray(raw.options)
+        ? raw.options.filter((item): item is string => typeof item === "string")
+        : [],
+      ...(typeof raw.context === "string" ? { context: raw.context } : {}),
+      expiresAtMs: raw.expiresAtMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function stageOpenClarificationForNextBroker(
+  request: ClarificationRequest | null,
+): void {
+  stagedOpenClarification = request
+    ? {
+        ...request,
+        options: [...request.options],
+      }
+    : null;
+}
+
+function takeStagedOpenClarification(): ClarificationRequest | null {
+  const staged = stagedOpenClarification;
+  stagedOpenClarification = null;
+  return staged;
+}
+
 export class ClarificationBroker {
   private readonly pending = new Map<string, PendingClarification>();
   private sequence = 0;
+
+  constructor() {
+    const staged = takeStagedOpenClarification();
+    if (staged) {
+      this.hydrateRestoredClarification(staged);
+    }
+  }
+
+  /** Restore a ledger-persisted question onto a fresh broker after reload. */
+  restoreFromLedgerRequest(request: ClarificationRequest): void {
+    this.hydrateRestoredClarification(request);
+  }
+
+  private hydrateRestoredClarification(request: ClarificationRequest): void {
+    if (this.pending.has(request.id)) return;
+    let settle: (outcome: ClarificationOutcome) => void = () => undefined;
+    const timeoutMs = Math.max(1, request.expiresAtMs - Date.now());
+    const restored: ClarificationRequest = {
+      ...request,
+      options: [...request.options],
+      expiresAtMs: Date.now() + timeoutMs,
+    };
+    new Promise<ClarificationOutcome>((resolve) => {
+      settle = (outcome: ClarificationOutcome) => {
+        const entry = this.pending.get(request.id);
+        if (!entry) return;
+        clearTimeout(entry.timeout);
+        this.pending.delete(request.id);
+        resolve(outcome);
+      };
+      const timeout = setTimeout(
+        () => settle({ status: "expired" }),
+        timeoutMs,
+      );
+      this.pending.set(request.id, {
+        request: restored,
+        settle,
+        timeout,
+      });
+    });
+  }
 
   async request(
     request: Omit<ClarificationRequest, "id" | "expiresAtMs">,

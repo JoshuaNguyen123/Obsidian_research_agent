@@ -257,6 +257,65 @@ export function buildResearcherHandoffV1FromWorker(input: {
   }
 }
 
+export interface SeededLeadHandoffArtifactV1 {
+  handoff_artifact_seeded_on_lead: 0 | 1;
+  attachContext: string | null;
+  artifact: AcceptedResearchArtifactV1 | null;
+  reason?: string;
+}
+
+/**
+ * Host bridge used by runResearchTeamMission after mergeResearchWorkerResult.
+ * A successful artifact is attached to the Lead prompt; a failed bridge stays
+ * evidence-only and never invents a note hash.
+ */
+export function seedLeadFromWorkerHandoff(input: {
+  handoff: WorkerHandoff;
+  notePath: string;
+  noteSha256: string;
+  noteReceiptId: string;
+  runId: string;
+  evidence?: MissionEvidence[];
+}): SeededLeadHandoffArtifactV1 {
+  const artifact = buildAcceptedResearchArtifactFromWorkerHandoff(input);
+  if ("ok" in artifact && artifact.ok === false) {
+    return {
+      handoff_artifact_seeded_on_lead: 0,
+      attachContext: null,
+      artifact: null,
+      reason: artifact.reason,
+    };
+  }
+  const accepted = artifact as AcceptedResearchArtifactV1;
+  const durable = buildResearcherHandoffV1FromWorker({
+    handoff: input.handoff,
+    runId: input.runId,
+    taskId: input.handoff.taskId,
+    notePath: input.notePath,
+    noteSha256: input.noteSha256,
+    noteReceiptId: input.noteReceiptId,
+    acceptedArtifactFingerprint: accepted.artifactFingerprint,
+    artifact: accepted,
+    evidence: input.evidence,
+  });
+  if ("ok" in durable && durable.ok === false) {
+    return {
+      handoff_artifact_seeded_on_lead: 0,
+      attachContext: null,
+      artifact: accepted,
+      reason: durable.reason,
+    };
+  }
+  return {
+    handoff_artifact_seeded_on_lead: 1,
+    attachContext: formatBridgedHandoffAttachContext({
+      artifact: accepted,
+      durableHandoff: durable as ResearcherHandoffV1,
+    }),
+    artifact: accepted,
+  };
+}
+
 /** Prompt appendix after a successful host bridge (fingerprints + real refs). */
 export function formatBridgedHandoffAttachContext(input: {
   artifact: AcceptedResearchArtifactV1;

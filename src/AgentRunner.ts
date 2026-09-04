@@ -945,6 +945,7 @@ import { createResearchProgressController } from "./agent/researchProgressContro
 import { ASK_USER_TOOL_NAME } from "./tools/clarificationTools";
 import {
   ClarificationBroker,
+  shouldOfferAskUser,
   type ClarificationRequest,
 } from "./agent/clarificationBroker";
 import { missionGraphPlannerFallbackCopy } from "./ui/agentViewCopy";
@@ -25305,6 +25306,10 @@ function shouldOfferInteractiveClarificationTool(
   prompt: string,
   noteOutputPlan: NoteOutputPlan,
 ): boolean {
+  if (!shouldOfferAskUser(prompt)) {
+    return false;
+  }
+
   if (
     noteOutputPlan.reason === "section_target_ambiguous" ||
     hasAmbiguousDatePrompt(prompt)
@@ -25325,7 +25330,7 @@ function shouldOfferInteractiveClarificationTool(
     return true;
   }
 
-  return /^(?:please\s+)?(?:help(?:\s+me)?|clarify|continue|go\s+on|do\s+(?:it|this)|fix\s+(?:it|this)|work\s+on\s+(?:it|this)|what\s+about\s+this)[.!?]*$/iu.test(
+  return /^(?:please\s+)?(?:clarify|do\s+(?:it|this)|fix\s+(?:it|this)|work\s+on\s+(?:it|this)|what\s+about\s+this)[.!?]*$/iu.test(
     normalized,
   );
 }
@@ -25692,6 +25697,7 @@ async function buildCheckpointResumeContext({
                   crashRecovery.ledger,
                   crashRecovery.ledgerPath,
                 ),
+                resume_loads_lead_child_ledger: 0,
               }
             : undefined;
         events.onStatus?.(

@@ -5,6 +5,7 @@ import {
   buildResearcherHandoffV1FromWorker,
   formatBridgedHandoffAttachContext,
   resolveAcceptedResearchEvidenceFromWorker,
+  seedLeadFromWorkerHandoff,
 } from "../src/orchestrator/researchTeamHandoffBridge";
 import type { MissionEvidence } from "../src/agent/missionLedger";
 import type { WorkerHandoff } from "../src/orchestrator/types";
@@ -45,6 +46,19 @@ function usableEvidence(): MissionEvidence[] {
     },
   ];
 }
+
+test("bridge helper seeds a Lead attach context from an accepted worker handoff", () => {
+  const seeded = seedLeadFromWorkerHandoff({
+    handoff: acceptedHandoff(),
+    notePath: "Research/Checkers.md",
+    noteSha256: NOTE_SHA256,
+    noteReceiptId: NOTE_RECEIPT_ID,
+    runId: "run-team-1",
+    evidence: usableEvidence(),
+  });
+  assert.equal(seeded.handoff_artifact_seeded_on_lead, 1);
+  assert.match(seeded.attachContext ?? "", /Host-attached AcceptedResearchArtifact/u);
+});
 
 test("bridge builds accepted artifact and researcher handoff only from host-accepted, receipt-backed note evidence", () => {
   const handoff = acceptedHandoff();

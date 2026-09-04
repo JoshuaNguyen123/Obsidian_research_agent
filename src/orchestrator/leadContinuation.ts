@@ -20,6 +20,12 @@ export interface LeadContinuationDecisionInput {
   currentAcceptanceMissing?: readonly string[];
   previousAcceptanceMissing?: readonly string[];
   availableRepairAction?: boolean;
+  /**
+   * Lead writeback that produced no receipt still owes a repair segment.
+   * Distinct from a generic budget stop so acceptance_failed / unpaid write
+   * can continue even when stopReason is not "budget".
+   */
+  unpaidWrite?: boolean;
 }
 
 export function createLeadProgressFingerprintV1(input: {
@@ -72,11 +78,19 @@ export function isDemotingZeroStepLeadCompletion(
  * the Lead may spend its existing reserve to correct citations or final proof.
  * This decision never increases model, tool, segment, or wall-clock authority.
  */
+function isLeadRepairableStop(input: LeadContinuationDecisionInput): boolean {
+  return (
+    input.stopReason === "budget" ||
+    input.autoContinueReason === "acceptance_failed" ||
+    input.unpaidWrite === true
+  );
+}
+
 export function shouldContinueResearchLead(
   input: LeadContinuationDecisionInput,
 ): boolean {
   if (
-    input.stopReason !== "budget" ||
+    !isLeadRepairableStop(input) ||
     input.usedModelSteps >= input.maxModelSteps ||
     input.usedToolCalls >= input.maxToolCalls ||
     input.segmentIndex + 1 >= input.maxSegments ||
@@ -88,7 +102,8 @@ export function shouldContinueResearchLead(
   }
   const requested =
     input.autoContinueRecommended === true ||
-    input.autoContinueReason === "acceptance_failed";
+    input.autoContinueReason === "acceptance_failed" ||
+    input.unpaidWrite === true;
   if (!requested) {
     return false;
   }

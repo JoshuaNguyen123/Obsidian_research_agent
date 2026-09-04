@@ -23,6 +23,28 @@ test("orchestrated Lead may spend its existing reserve on acceptance proof repai
   assert.equal(shouldContinueResearchLead(base), true);
 });
 
+test("Lead auto-continues acceptance_failed and unpaid write even when stopReason is not budget", () => {
+  assert.equal(
+    shouldContinueResearchLead({
+      ...base,
+      stopReason: "final",
+      autoContinueRecommended: false,
+      autoContinueReason: "acceptance_failed",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldContinueResearchLead({
+      ...base,
+      stopReason: "write_completed",
+      autoContinueRecommended: true,
+      autoContinueReason: "no_progress",
+      unpaidWrite: true,
+    }),
+    true,
+  );
+});
+
 test("a later Lead segment must demonstrate measurable progress", () => {
   assert.equal(
     shouldContinueResearchLead({
