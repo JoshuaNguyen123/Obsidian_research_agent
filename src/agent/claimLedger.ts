@@ -423,7 +423,16 @@ export function bindClaimsToPassages(
   claims: ResearchClaim[],
   draft: string,
   passages: ClaimPassageRef[],
-  options: { knownPassageIds?: string[] } = {},
+  options: {
+    knownPassageIds?: string[];
+    /**
+     * Quotes a citation verifier matched verbatim against a persisted source.
+     * A sentence carrying one of these is grounded by proof the model already
+     * produced, so it binds without also citing the internal passage-id
+     * notation.
+     */
+    verifiedQuotes?: string[];
+  } = {},
 ): ResearchClaim[] {
   const known = new Set(
     (options.knownPassageIds ?? passages.map((passage) => passage.id)).filter(
@@ -432,6 +441,13 @@ export function bindClaimsToPassages(
   );
   const passageById = new Map(passages.map((passage) => [passage.id, passage]));
   const draftCitedIds = collectPassageIdsFromText(draft);
+  const verifiedQuotes = (options.verifiedQuotes ?? []).filter(
+    (quote) => quote.trim().length > 0,
+  );
+  // A URL-only draft deliberately stays ungrounded here: the closed
+  // fetched-source writeback path repairs it into a passage-cited candidate
+  // before commit, and accepting the URL would skip that repair.
+  const draftCitesKnownSource = draftCitedIds.some((id) => known.has(id));
 
   return claims.map((claim) => {
     if (claim.status === "exempt" || isExemptLimitationSentence(claim.text)) {
@@ -464,13 +480,28 @@ export function bindClaimsToPassages(
       .filter((passage) => lexicalOverlapScore(claim.text, passage.text) >= 1)
       .map((passage) => passage.id);
 
+    // A verified citation is the strongest binding available: the quote was
+    // matched verbatim against persisted source content. Attach this sentence
+    // to the passage windows that actually contain that quote.
+    const verifiedIds = dedupeStrings(
+      verifiedQuotes
+        .filter((quote) => quoteAppearsVerbatim(quote, claim.text))
+        .flatMap((quote) =>
+          passages
+            .filter((passage) => quoteAppearsVerbatim(quote, passage.text))
+            .map((passage) => passage.id),
+        ),
+    ).filter((id) => known.has(id));
+
     const boundIds = dedupeStrings([
       ...citedInClaim.filter((id) => known.has(id)),
-      // Soft bind only when the draft already cites real passages and the claim
+      ...verifiedIds,
+      // Soft bind only when the draft already cites a real source and the claim
       // lexically overlaps a known passage window. Uncited drafts stay
       // ungrounded so claim_grounding can fail closed.
       ...(citedInClaim.length === 0 &&
-      draftCitedIds.some((id) => known.has(id))
+      verifiedIds.length === 0 &&
+      draftCitesKnownSource
         ? overlapIds.length > 0
           ? overlapIds
           : softOverlapIds
@@ -694,11 +725,20 @@ export function buildClaimLedger(input: BuildClaimLedgerInput): ClaimLedger {
     ...(input.passages ?? []).map((passage) => passage.id),
   ]);
   const passages = resolvePassageRefs(input.passages, evidence);
+  // Proof the model already produced: quotes a verifier matched verbatim
+  // against persisted source content. Without this a mission can verify ten
+  // quotes and still report every claim ungrounded.
+  const verifiedQuotes = dedupeStrings(
+    evidence
+      .map((item) => item.verifiedQuote ?? "")
+      .filter((quote) => quote.length > 0),
+  );
   const extracted = extractClaimsFromDraft(input.draft, {
     maxClaims: input.maxClaims,
   });
   const bound = bindClaimsToPassages(extracted, input.draft, passages, {
     knownPassageIds,
+    verifiedQuotes,
   });
   const validated = validateClaimGrounding(bound, {
     knownPassageIds,

@@ -64,6 +64,9 @@ const LEDGER_BLOCK_PATTERN =
 const GENERATED_MISSION_SUMMARY_PATTERN =
   /^(?:\r?\n){1,2}### Mission Summary\r?\n(?:- [^\r\n]*(?:\r?\n|$))+/;
 const MAX_PASSAGE_IDS_PER_EVIDENCE = 24;
+// verify_citation accepts a 10-600 character quote; bound the persisted copy at
+// the same ceiling so a malformed record cannot grow the ledger.
+const MAX_VERIFIED_QUOTE_CHARS = 600;
 
 export type MissionLedgerStatus =
   | "running"
@@ -145,6 +148,12 @@ export interface MissionEvidence {
   sourceId?: string;
   passageId?: string;
   passageIds?: string[];
+  /**
+   * The exact quote a citation verifier matched verbatim against this source.
+   * It is what makes a verification attributable: the claim ledger binds the
+   * sentence containing this quote to the passage containing it.
+   */
+  verifiedQuote?: string;
   /** True only when fetched content produced persistable evidence passages. */
   usableSource?: boolean;
   parserStatus?: "parsed" | "empty" | "missing_content" | "legacy_unknown";
@@ -1881,6 +1890,10 @@ function normalizeMissionEvidence(value: unknown): MissionEvidence | null {
       ? value.parserStatus
       : undefined;
   const contentHash = getString(value.contentHash);
+  const verifiedQuote = getString(value.verifiedQuote)?.slice(
+    0,
+    MAX_VERIFIED_QUOTE_CHARS,
+  );
   return {
     id,
     kind,
@@ -1893,6 +1906,11 @@ function normalizeMissionEvidence(value: unknown): MissionEvidence | null {
     ...(sourceId ? { sourceId } : {}),
     ...(passageId ? { passageId } : {}),
     ...(passageIds.length > 0 ? { passageIds } : {}),
+    // Persist the verified quote. This normalizer rebuilds evidence from a
+    // whitelist, so omitting it would drop the proof on the first persist --
+    // and a continued mission scores claim grounding from the reloaded ledger,
+    // which is exactly where it is needed.
+    ...(verifiedQuote ? { verifiedQuote } : {}),
     ...(typeof value.usableSource === "boolean"
       ? { usableSource: value.usableSource }
       : {}),

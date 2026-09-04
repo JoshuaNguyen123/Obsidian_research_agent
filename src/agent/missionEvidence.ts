@@ -174,13 +174,22 @@ export function evidenceFromToolResult(
       const status = getString(result.output.status);
       if (status !== "supported") return null;
       const sourcePath = getString(result.output.sourcePath) ?? "";
+      const sourceUrl = getString(result.output.sourceUrl) ?? "";
+      const verifiedQuote = getString(result.output.quote) ?? "";
       const contentHash = getString(result.output.contentHash);
       return {
         id: `citation_check:${hashEvidenceKey(sourcePath || String(result.output.section ?? ""))}`,
         kind: "web_source",
         title: "Verified citation quote",
         ...(sourcePath ? { path: sourcePath } : {}),
-        sourceId: createEvidenceSourceId(sourcePath || "citation_check"),
+        // Carry the source URL and the verified quote. Dropping them is what
+        // made a supported verification unusable downstream: the record named
+        // no source the draft could cite and no sentence it could ground.
+        ...(sourceUrl ? { url: sourceUrl } : {}),
+        ...(verifiedQuote ? { verifiedQuote } : {}),
+        sourceId: createEvidenceSourceId(
+          sourceUrl || sourcePath || "citation_check",
+        ),
         ...(contentHash && /^sha256:[a-f0-9]{64}$/u.test(contentHash)
           ? { contentHash }
           : {}),

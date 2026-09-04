@@ -185,6 +185,11 @@ const verifyCitationTool: AgentTool = {
           sourcePath: cached.vaultPath,
           sourceUrl: cached.url,
           contentHash: sha256(cached.content),
+          // Echo the quote that was actually verified. Without it a supported
+          // verification is unattributable downstream: the claim ledger cannot
+          // tell which sentence this proof belongs to, so ten supported checks
+          // still leave every claim ungrounded.
+          quote,
           ...(pinpoint
             ? { pinpoint: { label: pinpoint.label, kind: pinpoint.kind } }
             : {}),

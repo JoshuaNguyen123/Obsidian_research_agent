@@ -347,7 +347,11 @@ export function formatMissionAcceptanceCorrection(
       (item) =>
         item.includes("claim_grounding") || item.startsWith("verifier:claim_grounding"),
     )
-      ? "Ground each material claim with a persisted passage citation before accepting."
+      ? // Name the two routes that actually discharge this debt. The old copy
+        // asked for "a persisted passage citation" without saying what one
+        // looks like, in the same breath as "Request tools only" -- so the
+        // model could neither cite nor call its way out, and the run looped.
+        "Ground each material claim: cite its source-scoped passage id in the sentence itself, or call verify_citation with that sentence's exact quote."
       : "",
     result.missing.includes(WRITE_RECEIPT_MISSING) ||
     result.missing.includes("visible_title_rename") ||

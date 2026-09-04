@@ -15,6 +15,12 @@ import {
   evidenceFromToolResult,
 } from "../src/agent/missionEvidence";
 import { runMissionVerifiers } from "../src/agent/verifiers";
+import {
+  createMissionLedger,
+  formatMissionLedgerBlock,
+  parseMissionLedgerFromMarkdown,
+  upsertLedgerEvidence,
+} from "../src/agent/missionLedger";
 import { createMissionPlan } from "../src/agent/missionPlan";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
 import type { MissionIntent, ToolExecutionResult } from "../src/tools/types";
@@ -757,4 +763,148 @@ test("an ordered write contract's 'verify that write' is not a demand for passag
   ]) {
     assert.equal(shouldRequireClaimGrounding(prompt), true, prompt);
   }
+});
+
+// A supported verify_citation is proof the model already produced: the quote
+// was matched verbatim against persisted source content. Before this that
+// proof was unattributable -- the tool echoed no quote and its evidence record
+// carried no passage id -- so a mission could verify ten quotes and still
+// report every claim ungrounded. Live BYOK died there four times.
+const TRIAL_TEXT =
+  "Independent laboratory trials compare charge retention across quantum battery prototypes and report measured cycle counts.";
+const TRIAL_URL = "https://research.example.com/quantum-trials";
+const TRIAL_QUOTE = "compare charge retention across quantum battery prototypes";
+
+function trialSource() {
+  const source = evidenceFromToolResult(
+    "web_fetch",
+    okResult("web_fetch", {
+      title: "Quantum battery trials",
+      url: TRIAL_URL,
+      normalizedUrl: TRIAL_URL,
+      query: "quantum battery charge retention trials",
+      content: TRIAL_TEXT,
+    }),
+  );
+  assert.ok(source?.passageId);
+  return source;
+}
+
+function verifiedCitation(quote: string) {
+  const evidence = evidenceFromToolResult(
+    "verify_citation",
+    okResult("verify_citation", {
+      status: "supported",
+      section: 1,
+      sectionCount: 1,
+      sourcePath: "Agent Sources/research.example.com/Quantum-trials.md",
+      sourceUrl: TRIAL_URL,
+      quote,
+    }),
+  );
+  assert.ok(evidence, "verify_citation must project evidence");
+  return evidence;
+}
+
+test("a supported verify_citation grounds the claim containing its quote", () => {
+  const source = trialSource();
+  const verified = verifiedCitation(TRIAL_QUOTE);
+  assert.equal(verified.verifiedQuote, TRIAL_QUOTE);
+  assert.equal(verified.url, TRIAL_URL);
+
+  const ledger = buildClaimLedger({
+    draft:
+      "Independent laboratory trials compare charge retention across quantum battery prototypes in peer reviewed measurements.",
+    evidence: [source, verified],
+    passages: [{ id: source.passageId!, text: TRIAL_TEXT }],
+    prompt: "Do deep research on quantum batteries and cite passages.",
+    mode: "deep_web",
+  });
+
+  assert.equal(
+    ledger.status,
+    "pass",
+    `expected pass, got ${ledger.status}: ${ledger.missing.join(",")}`,
+  );
+  assert.ok(
+    ledger.claims.some((claim) => claim.passageIds.includes(source.passageId!)),
+    "the claim must bind to the passage containing the verified quote",
+  );
+});
+
+test("the same draft without the verification stays ungrounded", () => {
+  // Proves the test above measures the new binding rather than a draft that
+  // would have passed anyway.
+  const source = trialSource();
+  const ledger = buildClaimLedger({
+    draft:
+      "Independent laboratory trials compare charge retention across quantum battery prototypes in peer reviewed measurements.",
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: TRIAL_TEXT }],
+    prompt: "Do deep research on quantum batteries and cite passages.",
+    mode: "deep_web",
+  });
+
+  assert.equal(ledger.status, "needs_more_work");
+  assert.ok(ledger.claims.some((claim) => claim.status === "ungrounded"));
+});
+
+test("a verified quote grounds only the sentence that carries it", () => {
+  // The binding must stay attributable. One supported citation cannot launder
+  // an unrelated sentence, or claim grounding stops being a bar at all.
+  const source = trialSource();
+  const verified = verifiedCitation(TRIAL_QUOTE);
+
+  const ledger = buildClaimLedger({
+    draft: [
+      "Independent laboratory trials compare charge retention across quantum battery prototypes today.",
+      "Commercial quantum batteries already outsell every lithium cell worldwide.",
+    ].join(" "),
+    evidence: [source, verified],
+    passages: [{ id: source.passageId!, text: TRIAL_TEXT }],
+    prompt: "Do deep research on quantum batteries and cite passages.",
+    mode: "deep_web",
+  });
+
+  assert.equal(ledger.status, "needs_more_work");
+  const ungrounded = ledger.claims.filter(
+    (claim) => claim.status === "ungrounded",
+  );
+  assert.ok(
+    ungrounded.some((claim) => /outsell every lithium cell/u.test(claim.text)),
+    "the uncited sentence must stay ungrounded",
+  );
+  assert.ok(
+    ungrounded.every((claim) => !/charge retention across quantum/u.test(claim.text)),
+    "the verified sentence must not appear in the ungrounded set",
+  );
+});
+
+test("a verified quote survives the mission-ledger round trip", () => {
+  // The evidence normalizer rebuilds records from a whitelist. A field it does
+  // not name is dropped on the first persist -- and a continued mission scores
+  // claim grounding from the reloaded ledger, so the proof has to survive.
+  const ledger = createMissionLedger({
+    runId: "run-verified-quote",
+    mission: "Do deep research on quantum batteries and cite passages.",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 30,
+      toolStepBudget: 5,
+      finalizationReserve: 1,
+      expectedTools: ["web_fetch", "verify_citation"],
+      stopWhenSatisfied: false,
+    },
+  });
+  const verified = verifiedCitation(TRIAL_QUOTE);
+  upsertLedgerEvidence(ledger, verified);
+
+  const reloaded = parseMissionLedgerFromMarkdown(
+    formatMissionLedgerBlock(ledger),
+  );
+  assert.ok(reloaded, "ledger must round-trip");
+  const restored = reloaded.evidence.find((item) => item.id === verified.id);
+  assert.ok(restored, "verified citation evidence must survive");
+  assert.equal(restored.verifiedQuote, TRIAL_QUOTE);
+  assert.equal(restored.url, TRIAL_URL);
 });
