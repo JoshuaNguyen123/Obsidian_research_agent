@@ -710,14 +710,33 @@ import math
 import os
 import sys
 
+from collections import OrderedDict
+
 try:
     import numpy as np
 except Exception:
     np = None
 
-MODELS = {}
-RERANKERS = {}
+# The helper outlives any single request (it idles up to an hour before shutdown),
+# so an unbounded cache means peak memory grows with the number of distinct models
+# a session touches, not with the number it uses at once. A loaded embedding model
+# plus a cross-encoder is gigabytes; four rerankers are selectable in settings.
+# Cap both caches and evict least-recently-used so residency stays proportional to
+# what is actually in play. Two keeps a model swap from reloading on every request.
+MAX_CACHED_MODELS = 2
+MAX_CACHED_RERANKERS = 2
+
+MODELS = OrderedDict()
+RERANKERS = OrderedDict()
 PROVIDERS_USED = {}
+
+def remember_bounded(cache, key, instance, limit):
+    cache[key] = instance
+    cache.move_to_end(key)
+    while len(cache) > limit:
+        evicted_key, _ = cache.popitem(last=False)
+        PROVIDERS_USED.pop(evicted_key, None)
+    return instance
 
 def load_with_providers(factory, model_name, cache_dir, providers):
     # An execution-provider list the local onnxruntime cannot satisfy must not
@@ -820,6 +839,7 @@ def get_model(model_name, cache_dir, providers=None):
     key = (model_name, cache_dir, tuple(providers or ()))
     cached = MODELS.get(key)
     if cached is not None:
+        MODELS.move_to_end(key)
         return cached
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -827,14 +847,14 @@ def get_model(model_name, cache_dir, providers=None):
     from fastembed import TextEmbedding
     instance, used = load_with_providers(TextEmbedding, model_name, cache_dir, providers)
     list(instance.embed(["warmup"], batch_size=1))
-    MODELS[key] = instance
     PROVIDERS_USED[key] = used
-    return instance
+    return remember_bounded(MODELS, key, instance, MAX_CACHED_MODELS)
 
 def get_reranker(model_name, cache_dir):
     key = (model_name, cache_dir)
     cached = RERANKERS.get(key)
     if cached is not None:
+        RERANKERS.move_to_end(key)
         return cached
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -845,8 +865,7 @@ def get_reranker(model_name, cache_dir):
     except TypeError:
         instance = TextCrossEncoder(model_name=model_name)
     list(instance.rerank("warmup", ["warmup"]))
-    RERANKERS[key] = instance
-    return instance
+    return remember_bounded(RERANKERS, key, instance, MAX_CACHED_RERANKERS)
 
 def handle_rerank(request):
     rid = str(request.get("id") or "")
