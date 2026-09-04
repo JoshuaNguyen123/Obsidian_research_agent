@@ -133,6 +133,26 @@ const LADDER_TOOL_CALL_ATTEMPTS_PER_STEP_V1 = 6;
 const LADDER_MODEL_CALLS_PER_TOOL_CALL_V1 = 1.5;
 const LADDER_WALL_CLOCK_MS_PER_STEP_V1 = 3 * 60_000;
 const LADDER_SEGMENT_TURNOVER_STEPS_V1 = 5;
+/**
+ * Wall-clock ceiling for a detected ladder, above `extended_team`'s flat 20
+ * minutes.
+ *
+ * Measured on the floor function itself: tool calls scale with the ladder
+ * until 40 steps, but wall clock stopped scaling at 7. A 14-step
+ * build-validate-commit-publish ladder therefore drew 86 tool calls and the
+ * same 20 minutes as a 7-step single-file build — twice the work in the same
+ * time. The profile is internally inconsistent in the same way: it grants 200
+ * tool calls and 20 minutes, which is six seconds per call, and one
+ * `code_validate_fast` in a fresh container is not six seconds.
+ *
+ * 45 minutes is `extended_team`'s 200 tool calls at a rounded-down 13 seconds
+ * each — enough that the time can cover the work the same profile already
+ * permits, and no more. A ladder still has to be long enough to ask for it
+ * (15 steps at 3 minutes), it applies only when a ladder was detected at all,
+ * and a configured run time still clamps afterwards, so nobody who set a
+ * limit loses it.
+ */
+const LADDER_MAX_WALL_CLOCK_MS_V1 = 45 * 60_000;
 
 export interface MissionEffortLadderFloorV1 {
   maxModelCalls: number;
@@ -165,7 +185,10 @@ export function missionEffortFloorForCommittedToolCallsV1(
       Math.ceil(toolCalls * LADDER_MODEL_CALLS_PER_TOOL_CALL_V1),
     ),
     maxWallClockMs: Math.min(
-      ceiling.maxWallClockMs,
+      // Deliberately NOT ceiling.maxWallClockMs: that flat 20 minutes is what
+      // stopped this dimension scaling with the ladder while every other one
+      // did. See LADDER_MAX_WALL_CLOCK_MS_V1.
+      Math.max(ceiling.maxWallClockMs, LADDER_MAX_WALL_CLOCK_MS_V1),
       steps * LADDER_WALL_CLOCK_MS_PER_STEP_V1,
     ),
     maxSegments:
