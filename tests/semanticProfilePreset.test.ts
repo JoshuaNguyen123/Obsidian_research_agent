@@ -1,17 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL,
+  NEW_INSTALL_SEMANTIC_PROFILE,
   SEMANTIC_PROFILE_PRESETS,
   applySemanticProfilePreset,
 } from "../src/agent/semanticProfile";
 import type { AgentSettings } from "../src/settings";
 
-// There is deliberately no "preset equals DEFAULT_SETTINGS" test here. Two
-// reasons: settings.ts imports `obsidian` at runtime so no unit test can load
-// DEFAULT_SETTINGS as a value, and more importantly the check would be
-// redundant — DEFAULT_SETTINGS spreads SEMANTIC_PROFILE_PRESETS.balanced
-// directly, exactly as it does for the safety ceiling, so the two cannot drift
-// apart. The value being asserted is a single source, not a copy.
+// settings.ts imports `obsidian`, so unit tests cannot load DEFAULT_SETTINGS
+// as a value. New installs spread SEMANTIC_PROFILE_PRESETS[NEW_INSTALL_SEMANTIC_PROFILE]
+// (Fast). Existing vaults that stored balanced keep those keys on load.
 
 test("applying a preset writes through to the individual values", () => {
   const settings = { ...SEMANTIC_PROFILE_PRESETS.balanced } as AgentSettings;
@@ -64,12 +63,27 @@ test("chunk bounds stay internally coherent in every preset", () => {
   }
 });
 
+test("new installs default to the Fast embedding preset", () => {
+  assert.equal(NEW_INSTALL_SEMANTIC_PROFILE, "fast");
+  assert.equal(
+    NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL,
+    "jinaai/jina-embeddings-v2-small-en",
+  );
+  assert.equal(
+    SEMANTIC_PROFILE_PRESETS[NEW_INSTALL_SEMANTIC_PROFILE].semanticEmbeddingModel,
+    NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL,
+  );
+  assert.equal(
+    SEMANTIC_PROFILE_PRESETS.fast.semanticChunkTargetTokens,
+    256,
+  );
+});
+
 test("fast trades the model and chunk size for indexing speed, on the benchmark's numbers", () => {
   // docs/eval/embedder-benchmark.md (2026-09-03): jina-v2-small at a 256-token
   // target indexed 31 chunks/s vs nomic's 10.7 with 1.00 MRR on both query
-  // sets. The preset exists so a user can take that without touching eight
-  // individual settings; it is not the default because choosing it rebuilds
-  // an existing index once.
+  // sets. New installs start here; an existing vault that stored balanced
+  // keeps that profile and is not migrated.
   const fast = SEMANTIC_PROFILE_PRESETS.fast;
   assert.equal(fast.semanticEmbeddingModel, "jinaai/jina-embeddings-v2-small-en");
   assert.equal(fast.semanticEmbeddingDim, 512);

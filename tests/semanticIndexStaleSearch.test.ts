@@ -222,7 +222,7 @@ test("stale notes beyond the live-merge cap are excluded rather than embedded", 
   assert.equal(requests.slice(before).filter((request) => request.documents.length > 0).length, 0);
 });
 
-test("a majority-stale index still fails closed so the tool takes the live path", async () => {
+test("a majority-stale index still fails closed so the tool can fall back to BM25", async () => {
   const { vault, app, service } = await buildFixture();
   // Fewer notes than the absolute floor cannot trip the majority rule...
   vault.put("Notes/orchard.md", noteBody("orchard", "edited"));

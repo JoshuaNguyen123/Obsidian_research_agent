@@ -214,9 +214,13 @@ test("a rare term outweighs a common one repeated in every field", async () => {
 
   const unweighted = await service.search({ query: "ledger kryptonite", limit: 5 });
   assert.equal(unweighted.ok, true, unweighted.message);
-  assert.ok(
-    unweighted.results[0]?.path.startsWith("Notes/ledger"),
-    `without corpus statistics a note that merely repeats the common term is expected to win, got ${unweighted.results
+  // Query-time BM25 over full chunk text builds its own corpus from the
+  // candidates, so stripping persisted lexicalStats must not resurrect the
+  // keyword-dense hub note.
+  assert.equal(
+    unweighted.results[0]?.path,
+    "Notes/incident.md",
+    `query-time BM25 should still prefer the rare term, got ${unweighted.results
       .map((hit) => hit.path)
       .join(", ")}`,
   );

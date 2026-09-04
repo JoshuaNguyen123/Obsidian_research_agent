@@ -1,6 +1,7 @@
 import type { TFile } from "obsidian";
 import { BACKUP_FOLDER, MAX_LISTED_FILES } from "./constants";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
+import { isVaultPathExcluded } from "./vaultExclusions";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import {
   getOptionalInteger,
@@ -140,11 +141,14 @@ export const findRelatedNotesTool: AgentTool = {
       MAX_RELATED_LIMIT,
     );
     const baseFile = path || !query ? resolveMarkdownFile(context, path) : null;
-    const { results, profileSet } = await findRelatedNotes(context, {
-      baseFile,
-      query,
-      limit,
-    });
+    const { results, profileSet, semanticIndexUsed } = await findRelatedNotes(
+      context,
+      {
+        baseFile,
+        query,
+        limit,
+      },
+    );
 
     return {
       source: baseFile
@@ -159,12 +163,17 @@ export const findRelatedNotesTool: AgentTool = {
       truncated: profileSet.truncated,
       considered: profileSet.considered,
       coverage: buildRetrievalCoverage({
-        mode: profileSet.truncated ? "sampled" : "exact",
+        mode: semanticIndexUsed
+          ? "indexed"
+          : profileSet.truncated
+            ? "sampled"
+            : "exact",
         considered: profileSet.considered,
         read: profileSet.profiles.size,
         skipped: Math.max(0, profileSet.considered - profileSet.profiles.size),
         truncated: profileSet.truncated,
         reasons: [
+          ...(semanticIndexUsed ? ["semantic_index_relatedness"] : []),
           profileSet.truncated
             ? "profile_cap_applied_most_recent_first"
             : "whole_vault_profiled",
@@ -302,6 +311,7 @@ export const linkRelatedNotesInCurrentFileTool: AgentTool = {
 interface RelatedNotesOutcome {
   results: RelatedNoteResult[];
   profileSet: VaultProfileSet;
+  semanticIndexUsed: boolean;
 }
 
 async function findRelatedNotes(
@@ -320,7 +330,7 @@ async function findRelatedNotes(
   const { profiles } = profileSet;
   const baseProfile = baseFile ? profiles.get(baseFile.path) ?? null : null;
   const queryTerms = new Set(tokenize(query ?? ""));
-  const results: RelatedNoteResult[] = [];
+  const byPath = new Map<string, RelatedNoteResult>();
 
   for (const profile of profiles.values()) {
     if (baseProfile && profile.path === baseProfile.path) {
@@ -332,7 +342,7 @@ async function findRelatedNotes(
       continue;
     }
 
-    results.push({
+    byPath.set(profile.path, {
       path: profile.path,
       basename: profile.basename,
       title: profile.title,
@@ -345,10 +355,103 @@ async function findRelatedNotes(
     });
   }
 
-  const ranked = results
+  const semanticIndexUsed = await mergeSemanticRelatedHits({
+    context,
+    baseFile,
+    baseProfile,
+    query,
+    limit,
+    byPath,
+    profiles,
+  });
+
+  const ranked = [...byPath.values()]
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
     .slice(0, limit);
-  return { results: ranked, profileSet };
+  return { results: ranked, profileSet, semanticIndexUsed };
+}
+
+/**
+ * When a semantic index exists and can search, fold its hits into the
+ * graph-scored set. Graph reasons (direct_link, backlink, shared_tag, …) stay
+ * on the row; the index only adds a relatedness signal and can surface a note
+ * the heuristic scored at 0.
+ */
+async function mergeSemanticRelatedHits({
+  context,
+  baseFile,
+  baseProfile,
+  query,
+  limit,
+  byPath,
+  profiles,
+}: {
+  context: ToolExecutionContext;
+  baseFile: TFile | null;
+  baseProfile: NoteProfile | null;
+  query?: string;
+  limit: number;
+  byPath: Map<string, RelatedNoteResult>;
+  profiles: Map<string, NoteProfile>;
+}): Promise<boolean> {
+  if (!context.semanticIndexService || context.settings?.semanticIndexEnabled === false) {
+    return false;
+  }
+  const semanticQuery =
+    query?.trim() ||
+    [
+      baseProfile?.title ?? "",
+      ...(baseProfile?.tags ?? []),
+      ...(baseProfile?.headings.slice(0, 6).map((heading) => heading.heading) ?? []),
+    ]
+      .join(" ")
+      .trim();
+  if (!semanticQuery) {
+    return false;
+  }
+  const search = await context.semanticIndexService.search({
+    query: semanticQuery,
+    limit: Math.max(limit * 2, 16),
+    seedPaths: baseFile ? [baseFile.path] : [],
+  });
+  if (!search.ok) {
+    return false;
+  }
+  for (const hit of search.results) {
+    if (baseProfile && hit.path === baseProfile.path) {
+      continue;
+    }
+    if (isVaultPathExcluded(hit.path)) {
+      continue;
+    }
+    const boost = Math.round((hit.semanticScore > 0 ? hit.semanticScore : hit.score) * 80);
+    if (boost <= 0) {
+      continue;
+    }
+    const existing = byPath.get(hit.path);
+    const semanticReasons = [
+      "semantic_index",
+      ...hit.reasons.filter((reason) => reason !== "semantic_similarity"),
+    ];
+    if (existing) {
+      existing.score += boost;
+      existing.reasons = dedupeStrings([...existing.reasons, ...semanticReasons]);
+      continue;
+    }
+    const profile = profiles.get(hit.path);
+    byPath.set(hit.path, {
+      path: hit.path,
+      basename: profile?.basename ?? hit.path.replace(/\.md$/i, "").split("/").pop() ?? hit.path,
+      title: profile?.title ?? hit.title,
+      aliases: profile?.aliases ?? [],
+      tags: profile?.tags ?? [],
+      score: boost,
+      reasons: semanticReasons,
+      alreadyLinked: baseProfile?.outgoing.has(hit.path) ?? false,
+      snippet: hit.snippet || (profile ? buildProfileSnippet(profile, new Set()) : ""),
+    });
+  }
+  return true;
 }
 
 async function buildTargetRelatedResults(
@@ -509,7 +612,7 @@ async function buildVaultProfiles(
   const profiles = new Map<string, NoteProfile>();
   const candidates = context.app.vault
     .getFiles()
-    .filter((file) => file.extension === "md" && !isBlockedSystemPath(file.path));
+    .filter((file) => file.extension === "md" && !isVaultPathExcluded(file.path));
   // Most-recently-modified first, so that when the cap bites the sample is at
   // least principled rather than an accident of vault iteration order.
   const files = [...candidates]

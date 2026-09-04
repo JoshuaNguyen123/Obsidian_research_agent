@@ -33,7 +33,13 @@ const REQUEST_TIMEOUT_MS = 180000;
  * the rerank path; it only has to pass the helper's positive-integer guard.
  */
 const RERANK_WIRE_DIM = 1;
-const IDLE_SHUTDOWN_MS = 120000;
+/**
+ * Keep the helper (and its loaded model) alive across a typical editing
+ * session so the first search after plugin load is not a cold Python spawn.
+ * Cap is one hour: longer than that is a leaked interpreter, not a warm cache.
+ */
+export const DEFAULT_FASTEMBED_IDLE_SHUTDOWN_MS = 30 * 60 * 1000;
+export const MAX_FASTEMBED_IDLE_SHUTDOWN_MS = 60 * 60 * 1000;
 const MAX_OUTPUT_CHARS = 10_000_000;
 const MAX_STDERR_CHARS = 20_000;
 const MAX_HELPER_RECOVERIES_PER_REQUEST = 1;
@@ -72,6 +78,12 @@ export interface NodeEmbeddingRuntime {
 export interface PythonFastEmbedProviderOptions {
   requestTimeoutMs?: number;
   idleShutdownMs?: number;
+  /**
+   * Spawn the helper and load the configured model as soon as the provider
+   * is created (plugin onload). Tests that count helper processes pass
+   * `false`. Default is on so the first search of a session is warm.
+   */
+  eagerWarm?: boolean;
   loadRuntime?: () => NodeEmbeddingRuntime;
 }
 
@@ -97,7 +109,9 @@ interface HelperSession {
  * Python helper process. The helper keeps loaded FastEmbed models in memory and
  * answers line-delimited JSON requests over stdin/stdout, so repeated embeds
  * skip interpreter startup and model reload. The child is killed after an idle
- * window and on dispose; it is respawned transparently on the next request.
+ * window (default 30 minutes, capped at 60) and on dispose; it is respawned
+ * transparently on the next request. Creation eagerly warms the helper so the
+ * first search of a session is not a cold spawn.
  */
 export function createPythonFastEmbedProvider(
   settings: AgentSettings | (() => AgentSettings),
@@ -105,7 +119,7 @@ export function createPythonFastEmbedProvider(
 ): SemanticEmbeddingProvider {
   const getSettings = typeof settings === "function" ? settings : () => settings;
   const requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
-  const idleShutdownMs = options.idleShutdownMs ?? IDLE_SHUTDOWN_MS;
+  const idleShutdownMs = resolveIdleShutdownMs(options.idleShutdownMs);
   const loadRuntime = options.loadRuntime ?? loadNodeEmbeddingRuntime;
 
   let session: HelperSession | null = null;
@@ -160,6 +174,10 @@ export function createPythonFastEmbedProvider(
         destroySession(session);
       }
     }, idleShutdownMs);
+    // Do not keep a test process (or a dying host) alive for the idle window.
+    // Obsidian's renderer is already running; unref only matters when the
+    // event loop would otherwise have nothing left to do.
+    idleTimer.unref?.();
   };
 
   const spawnSession = (
@@ -465,7 +483,7 @@ export function createPythonFastEmbedProvider(
       pumpQueue();
     });
 
-  return {
+  const provider: SemanticEmbeddingProvider = {
     id: PYTHON_FASTEMBED_PROVIDER_ID,
     rerank: (request: SemanticRerankRequest): Promise<SemanticRerankResponse> => {
       if (request.documents.length === 0) {
@@ -515,6 +533,36 @@ export function createPythonFastEmbedProvider(
       }
     },
   };
+
+  if (options.eagerWarm !== false) {
+    queueMicrotask(() => {
+      if (disposed) {
+        return;
+      }
+      const active = getSettings();
+      void enqueue(
+        () =>
+          embedNow({
+            model: active.semanticEmbeddingModel || "jinaai/jina-embeddings-v2-small-en",
+            dim: active.semanticEmbeddingDim || 512,
+            documents: ["warmup"],
+            queries: [],
+            priority: "background",
+          }),
+        "background",
+      );
+    });
+  }
+
+  return provider;
+}
+
+function resolveIdleShutdownMs(value: number | undefined): number {
+  const requested = value ?? DEFAULT_FASTEMBED_IDLE_SHUTDOWN_MS;
+  if (!Number.isFinite(requested) || requested < 0) {
+    return DEFAULT_FASTEMBED_IDLE_SHUTDOWN_MS;
+  }
+  return Math.min(Math.trunc(requested), MAX_FASTEMBED_IDLE_SHUTDOWN_MS);
 }
 
 /**

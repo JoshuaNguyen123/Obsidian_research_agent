@@ -6,6 +6,8 @@ export interface SemanticIndexChunk {
   textHash: string;
   tokenCount: number;
   snippet: string;
+  /** Full chunk text for BM25. Absent on indexes built before this field. */
+  text?: string;
   vector: number[];
 }
 
@@ -67,6 +69,8 @@ export interface SemanticIndexRowMeta {
   textHash: string;
   tokenCount: number;
   snippet: string;
+  /** Full chunk text for BM25. Absent on indexes built before this field. */
+  text?: string;
 }
 
 export interface SemanticIndexNoteMeta {

@@ -12,6 +12,8 @@ import {
   resolveSemanticRerankSettingsV1,
 } from "./semanticRerank";
 import { PYTHON_FASTEMBED_PROVIDER_ID } from "./pythonFastEmbedProvider";
+import { NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL } from "../agent/semanticProfile";
+import { COSINE_TIEBREAK_MARGIN_V1, scoreHybridCandidatesV1 } from "./hybridRank";
 import {
   chunkMarkdownForSemanticSearch,
   type SemanticChunkingOptions,
@@ -60,11 +62,12 @@ const MAX_INDEX_SNIPPET_CHARS = 360;
 export const MAX_LIVE_STALE_NOTES_PER_SEARCH = 3;
 /**
  * Beyond this share of the index (or this many notes) the stale set is no
- * longer a few edits but a different vault; the search fails as before and the
- * tool takes the live path, which at least reads current content.
+ * longer a few edits but a different vault. Search fails closed with
+ * `stale_index_majority`; `semantic_search_notes` then runs real BM25 over
+ * the current vault instead of advertising hybrid over a 300-note sample.
  */
-const STALE_MAJORITY_NOTE_FLOOR = 50;
-const STALE_MAJORITY_RATIO = 0.2;
+export const STALE_MAJORITY_NOTE_FLOOR = 50;
+export const STALE_MAJORITY_RATIO = 0.2;
 /** Paths named per category in a stale report; counts stay exact beyond it. */
 export const MAX_STALE_REPORT_PATHS = 25;
 export const SEMANTIC_INDEX_READ_CONCURRENCY = 8;
@@ -722,6 +725,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
             textHash: chunk.textHash,
             tokenCount: chunk.tokenCount,
             snippet: chunk.snippet,
+            text: chunk.text,
           },
           embeddingText: chunk.embeddingText,
         });
@@ -740,42 +744,50 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     if (!embedded.ok || embedded.vectors.length !== pending.length) {
       return empty;
     }
+    const ready = pending
+      .map((item, position) => {
+        const vector = embedded.vectors[position];
+        if (!vector || vector.length !== index.dim) {
+          return null;
+        }
+        return {
+          item,
+          cosine: normalizeCosine(cosineSimilarity(queryVector, vector)),
+          graph: graphScoreFor(graphPrior, item.row.notePath),
+        };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+    const hybrid = scoreHybridCandidatesV1(
+      ready.map((entry) => ({
+        cosine: entry.cosine,
+        lexicalText: hybridLexicalTextForRow(entry.item.note, entry.item.row),
+        graph: entry.graph,
+      })),
+      [...queryTerms],
+    );
     const hits: Array<ScoredIndexHitV1> = [];
     const paths = new Set<string>();
-    pending.forEach((item, position) => {
-      const vector = embedded.vectors[position];
-      if (vector.length !== index.dim) {
+    ready.forEach((entry, index) => {
+      const fused = hybrid[index]!;
+      if (entry.cosine <= 0.1 && fused.bm25 <= 0) {
         return;
       }
-      const semanticScore = normalizeCosine(cosineSimilarity(queryVector, vector));
-      const lexicalScore = lexicalScoreForRow(
-        item.note,
-        item.row,
-        queryTerms,
-        index.lexicalStats,
-      );
-      const graphScore = graphScoreFor(graphPrior, item.row.notePath);
-      if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
-        return;
-      }
-      paths.add(item.row.notePath);
+      paths.add(entry.item.row.notePath);
       hits.push({
-        path: item.row.notePath,
-        title: item.row.title,
-        score: roundScore(blendSemanticScore(semanticScore, lexicalScore.score, graphScore)),
-        semanticScore: roundScore(semanticScore),
-        lexicalScore: roundScore(lexicalScore.score),
+        path: entry.item.row.notePath,
+        title: entry.item.row.title,
+        score: roundScore(fused.score),
+        semanticScore: roundScore(entry.cosine),
+        lexicalScore: roundScore(fused.lexicalScore),
         reasons: dedupeStrings([
           "live_reembedded_changed_note",
-          ...(semanticScore > 0.55
-            ? ["indexed_semantic_similarity", ...lexicalScore.reasons]
-            : lexicalScore.reasons),
-          ...(graphScore ? ["graph_proximity"] : []),
+          ...(entry.cosine > 0.55 ? ["indexed_semantic_similarity"] : []),
+          ...fused.reasons.filter((reason) => reason !== "semantic_similarity"),
         ]),
-        heading: item.row.heading,
-        snippet: boundedSnippet(item.row.snippet, maxSnippetChars),
-        sortPath: item.row.notePath,
-        rowTextHash: item.row.textHash,
+        heading: entry.item.row.heading,
+        snippet: boundedSnippet(entry.item.row.snippet, maxSnippetChars),
+        sortPath: entry.item.row.notePath,
+        rowTextHash: entry.item.row.textHash,
       });
     });
     return { hits, paths: [...paths] };
@@ -951,6 +963,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
           textHash: chunk.textHash,
           tokenCount: chunk.tokenCount,
           snippet: chunk.snippet,
+          text: chunk.text,
           vector: settings.semanticIndexPersistVectors
             ? vectors.vectors[vectorIndex++] ?? []
             : [],
@@ -991,6 +1004,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
           textHash: chunk.textHash,
           tokenCount: chunk.tokenCount,
           snippet: chunk.snippet,
+          text: chunk.text,
         });
         rowVectors.push(
           settings.semanticIndexPersistVectors
@@ -1295,24 +1309,11 @@ type ScoredIndexHitV1 = SemanticIndexSearchHit & {
   rowTextHash?: string;
 };
 
-/**
- * Blend the three retrieval signals.
- *
- * With no graph prior the weights are 0.85/0.15 — byte-identical to the
- * scoring this index has always used, which is what makes the graph tier
- * strictly opt-in. With a prior, 5% is taken from the semantic term: enough to
- * break a tie between comparably relevant notes, never enough to let a
- * densely-linked hub outrank a genuinely better match.
- */
-function blendSemanticScore(
-  semanticScore: number,
-  lexicalScore: number,
-  graphScore: number | null,
-): number {
-  if (graphScore === null) {
-    return semanticScore * 0.85 + lexicalScore * 0.15;
-  }
-  return semanticScore * 0.8 + lexicalScore * 0.15 + graphScore * 0.05;
+function hybridLexicalTextForRow(
+  note: { title: string; tags: string[] },
+  row: { heading: string | null; snippet: string; text?: string },
+): string {
+  return rowLexicalTextV1(note, row);
 }
 
 function graphScoreFor(
@@ -1345,42 +1346,61 @@ function searchIndexChunks({
   excludePaths?: Set<string>;
   cursor?: string | null;
 }): SemanticIndexSearchHit[] {
-  const scored: Array<ScoredIndexHitV1> = [];
+  const pending: Array<{
+    note: SemanticIndexNote;
+    chunk: SemanticIndexChunk;
+    cosine: number;
+    graph: number | null;
+  }> = [];
 
   for (const note of index.notes) {
     if (folder && !note.path.startsWith(`${folder}/`)) {
       continue;
     }
     for (const chunk of note.chunks) {
-      const semanticScore = normalizeCosine(cosineSimilarity(queryVector, chunk.vector));
-      const lexicalScore = lexicalScoreForChunk(note, chunk, queryTerms);
-      const graphScore = graphScoreFor(graphPrior ?? null, note.path);
-      const score = blendSemanticScore(semanticScore, lexicalScore.score, graphScore);
-      const reasons = [
-        ...(semanticScore > 0.55
-          ? ["indexed_semantic_similarity", ...lexicalScore.reasons]
-          : lexicalScore.reasons),
-        ...(graphScore ? ["graph_proximity"] : []),
-      ];
-      if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
-        continue;
-      }
-      const hit = {
-        path: note.path,
-        title: note.title,
-        score: roundScore(score),
-        semanticScore: roundScore(semanticScore),
-        lexicalScore: roundScore(lexicalScore.score),
-        reasons: dedupeStrings(reasons),
-        heading: chunk.heading,
-        snippet: boundedSnippet(chunk.snippet, maxSnippetChars),
-        sortPath: note.path,
-      };
-      if (minScore === undefined || hit.score >= minScore) {
-        scored.push(hit);
-      }
+      const cosine = normalizeCosine(cosineSimilarity(queryVector, chunk.vector));
+      const graph = graphScoreFor(graphPrior ?? null, note.path);
+      pending.push({ note, chunk, cosine, graph });
     }
   }
+
+  const hybrid = scoreHybridCandidatesV1(
+    pending.map((item) => ({
+      cosine: item.cosine,
+      lexicalText: hybridLexicalTextForRow(item.note, {
+        heading: item.chunk.heading,
+        snippet: item.chunk.snippet,
+        text: item.chunk.text,
+      }),
+      graph: item.graph,
+    })),
+    [...queryTerms],
+  );
+
+  const scored: Array<ScoredIndexHitV1> = [];
+  pending.forEach((item, index) => {
+    const fused = hybrid[index]!;
+    if (item.cosine <= 0.1 && fused.bm25 <= 0) {
+      return;
+    }
+    const hit = {
+      path: item.note.path,
+      title: item.note.title,
+      score: roundScore(fused.score),
+      semanticScore: roundScore(item.cosine),
+      lexicalScore: roundScore(fused.lexicalScore),
+      reasons: dedupeStrings([
+        ...(item.cosine > 0.55 ? ["indexed_semantic_similarity"] : []),
+        ...fused.reasons.filter((reason) => reason !== "semantic_similarity"),
+      ]),
+      heading: item.chunk.heading,
+      snippet: boundedSnippet(item.chunk.snippet, maxSnippetChars),
+      sortPath: item.note.path,
+    };
+    if (minScore === undefined || hit.score >= minScore) {
+      scored.push(hit);
+    }
+  });
 
   const byPath = new Map<string, ScoredIndexHitV1>();
   for (const hit of scored.sort(compareHits)) {
@@ -1456,6 +1476,13 @@ async function searchIndexShards({
   const noteByPath = new Map(index.notes.map((note) => [note.path, note]));
   const queryTyped = Float32Array.from(queryVector);
   const queryNorm = vectorNorm(queryTyped);
+  const pending: Array<{
+    row: SemanticIndexRowMeta;
+    note: SemanticIndexNoteMeta;
+    cosine: number;
+    graph: number | null;
+    live?: boolean;
+  }> = [];
 
   for (const ref of index.shards) {
     const shard = await readIndexShard(app, ref.path);
@@ -1480,39 +1507,54 @@ async function searchIndexShards({
         continue;
       }
       candidateCount += 1;
-      const semanticScore = normalizeCosine(
-        cosineSimilarityAt(vectors, rowIndex * index.dim, index.dim, queryTyped, queryNorm),
-      );
-      const lexicalScore = lexicalScoreForRow(note, row, queryTerms, index.lexicalStats);
-      const graphScore = graphScoreFor(graphPrior ?? null, row.notePath);
-      const score = blendSemanticScore(semanticScore, lexicalScore.score, graphScore);
-      if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
-        continue;
-      }
-      const hit = {
-        path: row.notePath,
-        title: row.title,
-        score: roundScore(score),
-        semanticScore: roundScore(semanticScore),
-        lexicalScore: roundScore(lexicalScore.score),
-        reasons: dedupeStrings([
-          ...(semanticScore > 0.55
-            ? ["indexed_semantic_similarity", ...lexicalScore.reasons]
-            : lexicalScore.reasons),
-          ...(graphScore ? ["graph_proximity"] : []),
-        ]),
-        heading: row.heading,
-        snippet: boundedSnippet(row.snippet, maxSnippetChars),
-        sortPath: row.notePath,
-        rowTextHash: row.textHash,
-      };
-      if (minScore !== undefined && hit.score < minScore) {
-        continue;
-      }
-      pushBoundedHit(scored, hit, candidateLimit);
+      pending.push({
+        row,
+        note,
+        cosine: normalizeCosine(
+          cosineSimilarityAt(vectors, rowIndex * index.dim, index.dim, queryTyped, queryNorm),
+        ),
+        graph: graphScoreFor(graphPrior ?? null, row.notePath),
+      });
     }
     scoreMs += Math.max(0, Date.now() - scoreStartedAt);
   }
+
+  const fuseStartedAt = Date.now();
+  const hybrid = scoreHybridCandidatesV1(
+    pending.map((item) => ({
+      cosine: item.cosine,
+      lexicalText: hybridLexicalTextForRow(item.note, item.row),
+      graph: item.graph,
+    })),
+    [...queryTerms],
+  );
+  pending.forEach((item, index) => {
+    const fused = hybrid[index]!;
+    if (item.cosine <= 0.1 && fused.bm25 <= 0) {
+      return;
+    }
+    const hit = {
+      path: item.row.notePath,
+      title: item.row.title,
+      score: roundScore(fused.score),
+      semanticScore: roundScore(item.cosine),
+      lexicalScore: roundScore(fused.lexicalScore),
+      reasons: dedupeStrings([
+        ...(item.cosine > 0.55 ? ["indexed_semantic_similarity"] : []),
+        ...fused.reasons.filter((reason) => reason !== "semantic_similarity"),
+      ]),
+      heading: item.row.heading,
+      snippet: boundedSnippet(item.row.snippet, maxSnippetChars),
+      sortPath: item.row.notePath,
+      rowTextHash: item.row.textHash,
+    };
+    if (minScore !== undefined && hit.score < minScore) {
+      return;
+    }
+    pushBoundedHit(scored, hit, candidateLimit);
+  });
+  scoreMs += Math.max(0, Date.now() - fuseStartedAt);
+
   for (const hit of liveHits?.hits ?? []) {
     if (minScore !== undefined && hit.score < minScore) {
       continue;
@@ -2161,7 +2203,7 @@ function getChunking(settings: AgentSettings): SemanticChunkingOptions {
 }
 
 function getSemanticModel(settings: AgentSettings): string {
-  return settings.semanticEmbeddingModel.trim() || "nomic-ai/nomic-embed-text-v1.5-Q";
+  return settings.semanticEmbeddingModel.trim() || NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL;
 }
 
 function getSemanticDim(settings: AgentSettings): number {
@@ -2243,9 +2285,9 @@ function tokenize(text: string): Set<string> {
  */
 function rowLexicalTextV1(
   note: { title: string; tags: string[] },
-  row: { heading: string | null; snippet: string },
+  row: { heading: string | null; snippet: string; text?: string },
 ): string {
-  return [note.title, row.heading ?? "", note.tags.join(" "), row.snippet].join(" ");
+  return [note.title, row.heading ?? "", note.tags.join(" "), row.text ?? row.snippet].join(" ");
 }
 
 /** Terms kept in the manifest's frequency table; the rest count as rare. */
@@ -2272,7 +2314,7 @@ function buildLexicalStatsForRowsV1(
 export function buildSemanticLexicalStatsV1(
   entries: ReadonlyArray<{
     note: { title: string; tags: string[] };
-    row: { heading: string | null; snippet: string };
+    row: { heading: string | null; snippet: string; text?: string };
   }>,
 ): SemanticIndexLexicalStatsV1 {
   const frequencies = new Map<string, number>();
@@ -2342,10 +2384,13 @@ function compareHits(
   left: ScoredIndexHitV1,
   right: ScoredIndexHitV1,
 ): number {
+  const rrf = right.score - left.score;
+  if (rrf !== 0) return rrf;
+  const cosineGap = right.semanticScore - left.semanticScore;
+  if (Math.abs(cosineGap) > COSINE_TIEBREAK_MARGIN_V1) return cosineGap;
   return (
-    right.score - left.score ||
-    right.semanticScore - left.semanticScore ||
     right.lexicalScore - left.lexicalScore ||
+    cosineGap ||
     left.sortPath.localeCompare(right.sortPath)
   );
 }
