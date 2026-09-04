@@ -15,8 +15,9 @@ import { validateWorkspaceLinks } from "./scripts/check-workspace-links.mjs";
 const production = process.argv[2] === "production";
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
-// Before anything is bundled: a node_modules borrowed from another checkout
-// would silently bundle every workspace module twice.
+// Before anything is bundled: a node_modules borrowed from another checkout —
+// or missing here entirely, so the resolution walk climbs into one — would
+// silently bundle every workspace module twice.
 await validateWorkspaceLinks(repoRoot);
 await validatePluginCatalog(repoRoot);
 await buildCompanionWorker(repoRoot);
