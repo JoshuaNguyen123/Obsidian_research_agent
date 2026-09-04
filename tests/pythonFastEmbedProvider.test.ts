@@ -2,8 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   createPythonFastEmbedProvider,
+  DEFAULT_FASTEMBED_IDLE_SHUTDOWN_MS,
+  MAX_FASTEMBED_IDLE_SHUTDOWN_MS,
   type HelperChildLike,
   type NodeEmbeddingRuntime,
+  type PythonFastEmbedProviderOptions,
 } from "../src/embeddings/pythonFastEmbedProvider";
 import type { AgentSettings } from "../src/settings";
 import type { SemanticEmbeddingRequest } from "../src/embeddings/types";
@@ -122,9 +125,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function createTestProvider(options: PythonFastEmbedProviderOptions = {}) {
+  return createPythonFastEmbedProvider(SETTINGS, { eagerWarm: false, ...options });
+}
+
 test("persistent FastEmbed provider reuses one helper process across embeds", async () => {
   const { runtime, spawned } = createFakeRuntime();
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -147,7 +154,7 @@ test("persistent FastEmbed provider reuses one helper process across embeds", as
 
 test("persistent FastEmbed provider shuts helper down after idle window and respawns", async () => {
   const { runtime, spawned } = createFakeRuntime();
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
     idleShutdownMs: 10,
   });
@@ -178,7 +185,7 @@ test("an oversized helper response fails fast with output_too_large instead of h
       child.emitStdout("\n");
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
     // If the overflow path regressed to the old hang, this test would only
     // fail after the timeout below rather than blocking the suite for 3 min.
@@ -220,7 +227,7 @@ test("persistent FastEmbed provider recovers with a fresh helper after an overfl
       );
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
     requestTimeoutMs: 5_000,
   });
@@ -251,7 +258,7 @@ test("persistent FastEmbed provider respawns once when a reused helper dies mid-
       respond?.(line);
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -279,7 +286,7 @@ test("persistent FastEmbed provider respawns once when a reused helper times out
       respond?.(line);
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
     requestTimeoutMs: 15,
   });
@@ -307,7 +314,7 @@ test("persistent FastEmbed provider falls back to the next python command on ENO
     }
     respondOk(child);
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -333,7 +340,7 @@ test("persistent FastEmbed provider retries one timed-out cold helper and succee
     }
     respondOk(child);
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
     requestTimeoutMs: 15,
   });
@@ -353,7 +360,7 @@ test("persistent FastEmbed provider stops after one timeout recovery", async () 
   const { runtime, spawned } = createFakeRuntime((child) => {
     child.onWrite = () => {};
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
     requestTimeoutMs: 15,
   });
@@ -375,7 +382,7 @@ test("persistent FastEmbed provider reports helper stderr when the process exits
       child.emitClose();
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -391,7 +398,7 @@ test("persistent FastEmbed provider reports helper stderr when the process exits
 
 test("persistent FastEmbed provider refuses work after dispose", async () => {
   const { runtime, spawned } = createFakeRuntime();
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   await provider.embed(REQUEST);
@@ -411,7 +418,7 @@ test("dispose settles an in-flight embed without respawning a helper", async () 
   // process after unload and held the caller for the full request timeout,
   // so a stopped mission could not settle.
   const { runtime, spawned } = createFakeRuntime(() => undefined);
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   const startedAt = Date.now();
@@ -439,7 +446,7 @@ test("a queued embed whose run is already stopped never reaches the helper", asy
   // index batch used to start its own helper call after the run had stopped,
   // holding the caller for the full request timeout.
   const { runtime, spawned } = createFakeRuntime(() => undefined);
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   const controller = new AbortController();
@@ -453,7 +460,7 @@ test("a queued embed whose run is already stopped never reaches the helper", asy
 
 test("the provider names itself so an index can record which runtime built it", () => {
   const { runtime } = createFakeRuntime();
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -482,7 +489,7 @@ test("a vector of the wrong width is refused as dim_mismatch instead of reaching
       );
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -503,7 +510,7 @@ test("a vector of the wrong width is refused as dim_mismatch instead of reaching
 
 test("the matryoshka flag is forwarded to the helper verbatim", async () => {
   const { runtime, spawned } = createFakeRuntime();
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -545,7 +552,7 @@ test("a queued interactive request runs before queued background batches", async
       }
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, { loadRuntime: () => runtime });
+  const provider = createTestProvider( { loadRuntime: () => runtime });
   try {
     const request = (label: string, priority?: "interactive" | "background") => ({
       ...REQUEST,
@@ -611,7 +618,7 @@ test("the rerank op rides the same helper session and returns one score per docu
       );
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -636,7 +643,7 @@ test("the rerank op rides the same helper session and returns one score per docu
 
 test("an empty rerank shortlist never reaches the helper", async () => {
   const { runtime, spawned } = createFakeRuntime();
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -668,7 +675,7 @@ test("a helper that cannot rerank reports the code instead of vectors", async ()
       );
     };
   });
-  const provider = createPythonFastEmbedProvider(SETTINGS, {
+  const provider = createTestProvider( {
     loadRuntime: () => runtime,
   });
   try {
@@ -680,6 +687,28 @@ test("a helper that cannot rerank reports the code instead of vectors", async ()
     assert.equal(result.ok, false);
     assert.equal(result.code, "missing_reranker");
     assert.equal(result.scores, undefined);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("FastEmbed idle-keep is a documented 30-minute default capped at 60 minutes", () => {
+  assert.equal(DEFAULT_FASTEMBED_IDLE_SHUTDOWN_MS, 30 * 60 * 1000);
+  assert.equal(MAX_FASTEMBED_IDLE_SHUTDOWN_MS, 60 * 60 * 1000);
+  assert.ok(DEFAULT_FASTEMBED_IDLE_SHUTDOWN_MS < MAX_FASTEMBED_IDLE_SHUTDOWN_MS);
+});
+
+test("creating the provider eagerly warms the helper so the first search is not a cold spawn", async () => {
+  const { runtime, spawned } = createFakeRuntime();
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  try {
+    await sleep(20);
+    assert.equal(spawned.length, 1, "onload warm must spawn the helper");
+    const first = await provider.embed(REQUEST);
+    assert.equal(first.ok, true);
+    assert.equal(spawned.length, 1, "the first real embed must reuse the warm helper");
   } finally {
     provider.dispose?.();
   }

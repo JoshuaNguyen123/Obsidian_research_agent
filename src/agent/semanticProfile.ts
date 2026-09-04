@@ -24,6 +24,19 @@ export type SemanticProfilePreset =
   | "thorough"
   | "custom";
 
+/**
+ * New installs ship Fast. Existing vaults that stored `semanticProfile:
+ * "balanced"` (or the balanced field values) keep them — the preset is only
+ * the empty-data default, never a migration.
+ */
+export const NEW_INSTALL_SEMANTIC_PROFILE = "fast" satisfies Exclude<
+  SemanticProfilePreset,
+  "custom"
+>;
+
+export const NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL =
+  "jinaai/jina-embeddings-v2-small-en";
+
 export interface SemanticProfileLimits {
   semanticEmbeddingModel: string;
   semanticEmbeddingDim: number;
@@ -52,9 +65,8 @@ export interface SemanticProfileLimits {
 export const SEMANTIC_PROFILE_PRESETS: Readonly<
   Record<Exclude<SemanticProfilePreset, "custom">, Readonly<SemanticProfileLimits>>
 > = Object.freeze({
-  // Exactly the values this plugin has always shipped. An existing vault must
-  // see no behavioural change on upgrade, so these are copied, not re-chosen —
-  // a unit test pins them to DEFAULT_SETTINGS.
+  // Preserved for existing vaults that stored this profile. New installs
+  // start on `fast` instead — see NEW_INSTALL_SEMANTIC_PROFILE.
   balanced: Object.freeze({
     semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
     semanticEmbeddingDim: 512,
@@ -73,11 +85,11 @@ export const SEMANTIC_PROFILE_PRESETS: Readonly<
   // only): jina-embeddings-v2-small-en indexed 31 chunks/s against nomic's
   // 10.7 and scored 1.00/1.00/1.00 on both the exact-term and paraphrase
   // query sets at a 256-token chunk target, with the lowest query latency and
-  // an 8192-token input limit. Opt-in rather than the new default because
-  // choosing it rebuilds an existing vault's index once (different model and
-  // chunking); a fresh vault loses nothing by starting here.
+  // an 8192-token input limit. New installs start here. Choosing it on an
+  // existing balanced vault rebuilds the index once (different model and
+  // chunking); stored balanced settings are never rewritten on upgrade.
   fast: Object.freeze({
-    semanticEmbeddingModel: "jinaai/jina-embeddings-v2-small-en",
+    semanticEmbeddingModel: NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL,
     semanticEmbeddingDim: 512,
     semanticChunkMinTokens: 150,
     semanticChunkTargetTokens: 256,

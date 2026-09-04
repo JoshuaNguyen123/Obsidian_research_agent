@@ -90,7 +90,7 @@ export const EMBEDDING_MODEL_CATALOG_V1: readonly EmbeddingModelSpecV1[] = Objec
     sizeMb: 137,
     tier: "balanced",
     prefixes: NOMIC_PREFIXES,
-    summary: "Shipped default. Quantized nomic v1.5; long inputs; truncates to 256–768 dimensions.",
+    summary: "Balanced preset. Quantized nomic v1.5; long inputs; truncates to 256–768 dimensions.",
   }),
   spec({
     id: "nomic-ai/nomic-embed-text-v1.5",
@@ -207,7 +207,7 @@ export const EMBEDDING_MODEL_CATALOG_V1: readonly EmbeddingModelSpecV1[] = Objec
     maxTokens: 8192,
     sizeMb: 120,
     tier: "fast",
-    summary: "Small English model with an 8192-token input limit.",
+    summary: "New-install Fast default. Small English model with an 8192-token input limit.",
   }),
   spec({
     id: "jinaai/jina-embeddings-v2-base-en",

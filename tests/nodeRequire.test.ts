@@ -24,20 +24,27 @@ test("requireNodeModule loads Node builtins through the available require", () =
 test("FastEmbed provider returns fallback-compatible failure when Node require is unavailable", async () => {
   __setNodeRequireForTests(null);
   try {
-    const provider = createPythonFastEmbedProvider({
-      semanticPythonCommand: "",
-      semanticModelCacheDir: "",
-    } as AgentSettings);
-    const result = await provider.embed({
-      model: "nomic-ai/nomic-embed-text-v1.5-Q",
-      dim: 512,
-      documents: ["local semantic note"],
-      queries: ["local semantic query"],
-    });
+    const provider = createPythonFastEmbedProvider(
+      {
+        semanticPythonCommand: "",
+        semanticModelCacheDir: "",
+      } as AgentSettings,
+      { eagerWarm: false },
+    );
+    try {
+      const result = await provider.embed({
+        model: "nomic-ai/nomic-embed-text-v1.5-Q",
+        dim: 512,
+        documents: ["local semantic note"],
+        queries: ["local semantic query"],
+      });
 
-    assert.equal(result.ok, false);
-    assert.equal(result.code, "node_runtime_unavailable");
-    assert.match(result.message ?? "", /Node require is unavailable/);
+      assert.equal(result.ok, false);
+      assert.equal(result.code, "node_runtime_unavailable");
+      assert.match(result.message ?? "", /Node require is unavailable/);
+    } finally {
+      provider.dispose?.();
+    }
   } finally {
     __setNodeRequireForTests(undefined);
   }

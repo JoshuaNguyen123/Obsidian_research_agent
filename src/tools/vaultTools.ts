@@ -67,6 +67,7 @@ import { createGraphTools } from "./graphTools";
 import { countMarkdownVisibleText } from "./wordCount";
 import { getProjectMemoryLocation } from "../agent/projectMemory";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
+import { isVaultPathExcluded } from "./vaultExclusions";
 import {
   AGENT_TEMPLATE_FOLDER,
   LINEAR_ISSUE_TEMPLATE_PATH,
@@ -433,7 +434,7 @@ export const searchMarkdownFilesTool: AgentTool = {
     }> = [];
 
     for (const file of context.app.vault.getFiles()) {
-      if (file.extension !== "md" || isBlockedSystemPath(file.path)) {
+      if (file.extension !== "md" || isVaultPathExcluded(file.path)) {
         continue;
       }
 

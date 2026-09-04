@@ -23,17 +23,27 @@ import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import { isVaultPathExcluded } from "./vaultExclusions";
 import { resolveSemanticSearchCapsForCompoundRun } from "../agent/setLooseCompoundAutonomy";
 import type { AutonomyProfile } from "../agent/autonomyEffectClass";
+import { NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL } from "../agent/semanticProfile";
+import {
+  COSINE_TIEBREAK_MARGIN_V1,
+  scoreHybridCandidatesV1,
+} from "../embeddings/hybridRank";
+import {
+  bm25ContentScoreV1,
+  buildLexicalCorpusStatsV1,
+  buildLexicalDocumentTermStatsV1,
+} from "./lexicalRanking";
 
 const DEFAULT_SEMANTIC_LIMIT = 8;
 const MAX_SEMANTIC_LIMIT = 20;
 const DEFAULT_MAX_SNIPPET_CHARS = 360;
 const MAX_SNIPPET_CHARS = 800;
-const DEFAULT_SEMANTIC_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q";
+const DEFAULT_SEMANTIC_MODEL = NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL;
 const DEFAULT_SEMANTIC_DIM = 512;
-const DEFAULT_CHUNK_MIN_TOKENS = 300;
-const DEFAULT_CHUNK_TARGET_TOKENS = 500;
-const DEFAULT_CHUNK_MAX_TOKENS = 700;
-const DEFAULT_CHUNK_OVERLAP_TOKENS = 80;
+const DEFAULT_CHUNK_MIN_TOKENS = 150;
+const DEFAULT_CHUNK_TARGET_TOKENS = 256;
+const DEFAULT_CHUNK_MAX_TOKENS = 360;
+const DEFAULT_CHUNK_OVERLAP_TOKENS = 40;
 const STOP_TERMS = new Set([
   "the",
   "and",
@@ -213,8 +223,21 @@ export const semanticSearchNotesTool: AgentTool = {
       minScore,
       cursor,
     });
-    if (indexed) {
-      return indexed;
+    if (indexed.kind === "indexed") {
+      return indexed.payload;
+    }
+    if (indexed.kind === "closed") {
+      return searchVaultBm25Fallback({
+        context,
+        query,
+        limit,
+        folder,
+        maxSnippetChars,
+        minScore,
+        cursor,
+        chunking,
+        fallbackReason: indexed.code,
+      });
     }
 
     const chunks = await buildSemanticChunkProfiles(context, folder, chunking);
@@ -400,6 +423,13 @@ export const rebuildSemanticIndexTool: AgentTool = {
   },
 };
 
+type IndexFirstResult =
+  | { kind: "indexed"; payload: Record<string, unknown> }
+  | { kind: "closed"; code: string }
+  | { kind: "skip" };
+
+const INDEX_CLOSED_CODES = new Set(["stale_index_majority", "missing_index"]);
+
 async function searchSemanticIndexFirst({
   context,
   query,
@@ -420,9 +450,9 @@ async function searchSemanticIndexFirst({
   candidateLimit: number;
   minScore?: number;
   cursor: string | null;
-}) {
+}): Promise<IndexFirstResult> {
   if (!context.settings.semanticIndexEnabled || !context.semanticIndexService) {
-    return null;
+    return { kind: "skip" };
   }
 
   // Seed the graph prior with the note the user is working in, so notes the
@@ -445,10 +475,15 @@ async function searchSemanticIndexFirst({
   });
 
   if (!search.ok) {
-    return null;
+    if (search.code && INDEX_CLOSED_CODES.has(search.code)) {
+      return { kind: "closed", code: search.code };
+    }
+    return { kind: "skip" };
   }
 
   return {
+    kind: "indexed",
+    payload: {
     operation: "semantic_search_notes",
     mode: "indexed_semantic",
     indexUsed: true,
@@ -499,6 +534,71 @@ async function searchSemanticIndexFirst({
     // scoring, which is what decides whether optimising the scan is worth
     // building. Absent on the in-memory v1 index, which has no decode step.
     ...(search.timings ? { timings: search.timings } : {}),
+    },
+  };
+}
+
+/**
+ * Real BM25 over the excluded-filtered vault. Used when the semantic index is
+ * missing or majority-stale so we never advertise hybrid/semantic over a
+ * 300-note live sample.
+ */
+async function searchVaultBm25Fallback({
+  context,
+  query,
+  limit,
+  folder,
+  maxSnippetChars,
+  minScore,
+  cursor,
+  chunking,
+  fallbackReason,
+}: {
+  context: ToolExecutionContext;
+  query: string;
+  limit: number;
+  folder: string | null;
+  maxSnippetChars: number;
+  minScore?: number;
+  cursor: string | null;
+  chunking: SemanticChunkingOptions;
+  fallbackReason: string;
+}) {
+  const queryTerms = tokenizeConceptText(query);
+  const chunks = await buildSemanticChunkProfiles(context, folder, chunking, {
+    cap: Number.POSITIVE_INFINITY,
+  });
+  const scored = scoreLexicalChunks(chunks, queryTerms);
+  const collapsed = collapseChunksToNotes(scored, queryTerms, maxSnippetChars).filter(
+    (result) => minScore === undefined || result.score >= minScore,
+  );
+  const offset = parseCursorOffset(cursor);
+  const results = collapsed.slice(offset, offset + limit);
+  const nextCursor =
+    offset + results.length < collapsed.length ? String(offset + results.length) : null;
+  return {
+    operation: "semantic_search_notes",
+    mode: "lexical_fallback",
+    indexUsed: false,
+    indexFresh: false,
+    model: getSemanticModel(context),
+    dim: getSemanticDim(context),
+    chunking,
+    fallbackUsed: true,
+    fallbackReason,
+    candidateLimit: chunks.length,
+    nextCursor,
+    resultCount: results.length,
+    results,
+    coverage: buildRetrievalCoverage({
+      mode: "fallback",
+      considered: chunks.length,
+      read: results.length,
+      skipped: Math.max(0, chunks.length - results.length),
+      truncated: nextCursor !== null,
+      fallbackUsed: true,
+      reasons: [fallbackReason, "bm25_full_vault_fallback"],
+    }),
   };
 }
 
@@ -590,13 +690,15 @@ async function buildSemanticChunkProfiles(
   context: ToolExecutionContext,
   folder: string | null,
   chunking: SemanticChunkingOptions,
+  options: { cap?: number } = {},
 ): Promise<SemanticChunkProfile[]> {
+  const cap = options.cap ?? MAX_LISTED_FILES;
   const files = context.app.vault
     .getFiles()
     .filter((file) => file.extension === "md")
     .filter((file) => !isVaultPathExcluded(file.path))
     .filter((file) => isFileInFolder(file.path, folder))
-    .slice(0, MAX_LISTED_FILES);
+    .slice(0, Number.isFinite(cap) ? cap : undefined);
   const chunks: SemanticChunkProfile[] = [];
 
   for (const file of files) {
@@ -665,20 +767,23 @@ function scoreSemanticChunks({
   documentVectors: number[][];
   queryTerms: Set<string>;
 }): ScoredChunk[] {
+  const terms = [...queryTerms];
+  const scored = scoreHybridCandidatesV1(
+    chunks.map((chunk, index) => ({
+      cosine: normalizeCosine(cosineSimilarity(queryVector, documentVectors[index])),
+      lexicalText: hybridLexicalText(chunk),
+    })),
+    terms,
+  );
   return chunks
     .map((chunk, index) => {
-      const semanticScore = normalizeCosine(cosineSimilarity(queryVector, documentVectors[index]));
-      const lexical = scoreLexicalChunk(chunk, queryTerms);
-      const score = semanticScore * 0.85 + lexical.score * 0.15;
-      const reasons = semanticScore > 0.55
-        ? ["semantic_similarity", ...lexical.reasons]
-        : lexical.reasons;
+      const hybrid = scored[index]!;
       return {
         chunk,
-        score,
-        semanticScore,
-        lexicalScore: lexical.score,
-        reasons: dedupeStrings(reasons),
+        score: hybrid.score,
+        semanticScore: hybrid.semanticScore,
+        lexicalScore: hybrid.lexicalScore,
+        reasons: dedupeStrings(hybrid.reasons),
       };
     })
     .filter((item) => item.semanticScore > 0.1 || item.lexicalScore > 0)
@@ -689,71 +794,33 @@ function scoreLexicalChunks(
   chunks: SemanticChunkProfile[],
   queryTerms: Set<string>,
 ): ScoredChunk[] {
+  const terms = [...queryTerms];
+  if (terms.length === 0 || chunks.length === 0) {
+    return [];
+  }
+  const documents = chunks.map((chunk) =>
+    buildLexicalDocumentTermStatsV1(hybridLexicalText(chunk).toLowerCase(), terms),
+  );
+  const corpus = buildLexicalCorpusStatsV1(documents);
   return chunks
-    .map((chunk) => {
-      const lexical = scoreLexicalChunk(chunk, queryTerms);
+    .map((chunk, index) => {
+      const lexicalScore = bm25ContentScoreV1(documents[index]!, corpus);
       return {
         chunk,
-        score: lexical.score,
+        score: lexicalScore,
         semanticScore: 0,
-        lexicalScore: lexical.score,
-        reasons: lexical.reasons,
+        lexicalScore,
+        reasons: lexicalScore > 0 ? ["bm25_content"] : [],
       };
     })
     .filter((item) => item.lexicalScore > 0)
     .sort(compareScoredChunks);
 }
 
-function scoreLexicalChunk(
-  chunk: SemanticChunkProfile,
-  queryTerms: Set<string>,
-): { score: number; reasons: string[] } {
-  if (queryTerms.size === 0) {
-    return { score: 0, reasons: [] };
-  }
-
-  const textTerms = tokenizeConceptText(chunk.text);
-  const titleTerms = tokenizeConceptText(chunk.title);
-  const headingTerms = tokenizeConceptText(chunk.heading ?? "");
-  const tagTerms = tokenizeConceptText(chunk.tags.join(" "));
-  const pathTerms = tokenizeConceptText(chunk.path.replace(/[\/_.-]+/g, " "));
-  const reasons: string[] = [];
-  let score = 0;
-
-  const contentOverlap = overlapRatio(queryTerms, textTerms);
-  if (contentOverlap > 0) {
-    score += contentOverlap * 0.55;
-    reasons.push("content_match");
-  }
-
-  const titleOverlap = overlapRatio(queryTerms, titleTerms);
-  if (titleOverlap > 0) {
-    score += titleOverlap * 0.25;
-    reasons.push("title_match");
-  }
-
-  const headingOverlap = overlapRatio(queryTerms, headingTerms);
-  if (headingOverlap > 0) {
-    score += headingOverlap * 0.2;
-    reasons.push("heading_match");
-  }
-
-  const tagOverlap = overlapRatio(queryTerms, tagTerms);
-  if (tagOverlap > 0) {
-    score += tagOverlap * 0.15;
-    reasons.push("tag_match");
-  }
-
-  const pathOverlap = overlapRatio(queryTerms, pathTerms);
-  if (pathOverlap > 0) {
-    score += pathOverlap * 0.1;
-    reasons.push("path_match");
-  }
-
-  return {
-    score: Math.min(score, 1),
-    reasons,
-  };
+function hybridLexicalText(chunk: SemanticChunkProfile): string {
+  return [chunk.title, chunk.heading ?? "", chunk.tags.join(" "), chunk.text]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function collapseChunksToNotes(
@@ -1079,25 +1146,14 @@ function countApproxTokens(text: string): number {
   return getApproxTokens(text).length;
 }
 
-function overlapRatio(left: Set<string>, right: Set<string>): number {
-  if (left.size === 0 || right.size === 0) {
-    return 0;
-  }
-  let overlap = 0;
-  for (const term of left) {
-    if (right.has(term)) {
-      overlap += 1;
-    }
-  }
-  return overlap / left.size;
-}
-
-
 function compareScoredChunks(left: ScoredChunk, right: ScoredChunk): number {
+  const rrf = right.score - left.score;
+  if (rrf !== 0) return rrf;
+  const cosineGap = right.semanticScore - left.semanticScore;
+  if (Math.abs(cosineGap) > COSINE_TIEBREAK_MARGIN_V1) return cosineGap;
   return (
-    right.score - left.score ||
-    right.semanticScore - left.semanticScore ||
     right.lexicalScore - left.lexicalScore ||
+    cosineGap ||
     left.chunk.path.localeCompare(right.chunk.path)
   );
 }

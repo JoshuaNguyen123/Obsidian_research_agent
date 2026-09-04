@@ -38,6 +38,7 @@ import {
   type SafetyCeilingPreset,
 } from "./agent/safetyCeiling";
 import {
+  NEW_INSTALL_SEMANTIC_PROFILE,
   SEMANTIC_PROFILE_PRESETS,
   applySemanticProfilePreset,
   type SemanticProfilePreset,
@@ -81,7 +82,11 @@ export type {
   SemanticProfileLimits,
   SemanticProfilePreset,
 } from "./agent/semanticProfile";
-export { SEMANTIC_PROFILE_PRESETS, applySemanticProfilePreset };
+export {
+  NEW_INSTALL_SEMANTIC_PROFILE,
+  SEMANTIC_PROFILE_PRESETS,
+  applySemanticProfilePreset,
+};
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
 export type BrowserMissionMode = "supervised" | "extract_only";
 export type AutonomyProfile = "automatic" | "conservative" | "custom";
@@ -431,11 +436,13 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   agenticReflexDiagnosticsEnabled: true,
   speechActSemanticRescueMode: "off",
   semanticSearchEnabled: true,
-  semanticProfile: "balanced",
-  // Derived, never duplicated: the shipped defaults ARE the Balanced preset, so
-  // the two can never silently drift apart. Capability and environment settings
-  // below stay literal — they are choices, not tuning.
-  ...SEMANTIC_PROFILE_PRESETS.balanced,
+  semanticProfile: NEW_INSTALL_SEMANTIC_PROFILE,
+  // New installs ship Fast (jina-v2-small, 256-token chunks). Existing vaults
+  // that stored semanticProfile: "balanced" (or the balanced field values)
+  // keep them — Object.assign(DEFAULT_SETTINGS, saved) lets stored keys win.
+  // Capability and environment settings below stay literal — they are choices,
+  // not tuning.
+  ...SEMANTIC_PROFILE_PRESETS[NEW_INSTALL_SEMANTIC_PROFILE],
   semanticPythonCommand: "",
   semanticModelCacheDir: "",
   semanticIndexEnabled: true,
