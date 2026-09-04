@@ -30,6 +30,7 @@ import type {
 import { ToolExecutionError } from "./types";
 import { getRequiredString, isRecord, normalizeVaultPath } from "./validation";
 
+/** Create ("add a mermaid flowchart") and revise share this mutation gate. */
 const MERMAID_MUTATION_INTENT =
   /\b(add|insert|upsert|update|revise|edit|change|modify|replace|create|write|fix|adjust)\b[\s\S]{0,120}\bmermaid\b|\bmermaid\b[\s\S]{0,120}\b(add|insert|upsert|update|revise|edit|change|modify|replace|create|write|fix|adjust)\b/i;
 

@@ -131,8 +131,16 @@ export function hasHtmlPreviewIntent(prompt: string): boolean {
   return HTML_PREVIEW_INTENT.test(stripNegatedHtmlPreviewClausesV1(prompt));
 }
 
+const MERMAID_CREATE_INTENT =
+  /\b(create|add|insert|draw|make|build)\b[\s\S]{0,80}\b(mermaid|flowchart)\b|\b(mermaid|flowchart)\b[\s\S]{0,80}\b(create|add|insert|draw|make|build)\b/i;
+
+/** Create/add/insert a Mermaid diagram — offered as upsert, not canvas revise. */
+export function hasMermaidCreateIntent(prompt: string): boolean {
+  return /\bmermaid\b/i.test(prompt) && MERMAID_CREATE_INTENT.test(prompt);
+}
+
 export function hasReviseDesignIntent(prompt: string): boolean {
-  return REVISE_DESIGN_INTENT.test(prompt);
+  return REVISE_DESIGN_INTENT.test(prompt) || hasMermaidCreateIntent(prompt);
 }
 
 /**

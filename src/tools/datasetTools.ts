@@ -21,6 +21,8 @@ import {
  * deliberately NOT involved — its prepared-action contract (repository
  * profile, staging manifest, boundary probe, exact approval) has no seam for
  * "summarize a CSV", and statistics this small are pure computation.
+ * Offer gating lives in `hasDatasetAnalysisIntent`: a `*.csv` / `*.tsv`
+ * path mention is enough; the prompt need not say "dataset".
  */
 
 const MAX_DATASET_BYTES = 5 * 1024 * 1024;

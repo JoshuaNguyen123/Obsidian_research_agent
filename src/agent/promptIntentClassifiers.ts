@@ -26,6 +26,7 @@ import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
 import {
   hasDesignIntent as hasSharedDesignIntent,
   hasExplicitCanvasDestinationIntent,
+  hasMermaidCreateIntent,
   hasReviseDesignIntent,
   isResearchTopicDesignProse,
 } from "./codeDesignIntent";
@@ -62,7 +63,11 @@ import { hasReplaceIntent } from "./replaceIntent";
  * Each of these had a private second definition until 2026-08-26; see the
  * defining module for the witness prompts that split them.
  */
-export { hasDesignIntent, hasHtmlPreviewIntent } from "./codeDesignIntent";
+export {
+  hasDesignIntent,
+  hasHtmlPreviewIntent,
+  hasMermaidCreateIntent,
+} from "./codeDesignIntent";
 export { hasDeepResearchIntent, hasLongResearchIntent } from "./researchDepthIntent";
 export {
   hasExplicitNoNoteWriteIntent,
@@ -195,10 +200,21 @@ export function hasVaultIndexIntent(prompt: string): boolean {
   );
 }
 
+/** A vault-relative or basename `*.csv` / `*.tsv` (or ndjson) path mention. */
+export function hasDatasetPathMentionIntent(prompt: string): boolean {
+  return (
+    /\*\.(?:csv|tsv|ndjson)\b/i.test(prompt) ||
+    /(?:^|[\s"'`/\\])[\w.-]+\.(?:csv|tsv|ndjson)\b/i.test(prompt)
+  );
+}
+
 /** Tabular-analysis prompts: dataset files or explicit data-analysis asks. */
 export function hasDatasetAnalysisIntent(prompt: string): boolean {
-  return /\b(dataset|\w+\.(?:csv|tsv|ndjson)\b|data\s+analysis|analy[sz]e\s+(?:the\s+|my\s+)?data|column\s+statistics|histogram|scatter\s*plot)\b/i.test(
-    prompt,
+  return (
+    hasDatasetPathMentionIntent(prompt) ||
+    /\b(dataset|data\s+analysis|analy[sz]e\s+(?:the\s+|my\s+)?data|column\s+statistics|histogram|scatter\s*plot)\b/i.test(
+      prompt,
+    )
   );
 }
 
@@ -211,6 +227,20 @@ export function hasDatasetAnalysisIntent(prompt: string): boolean {
 export function hasCitationWorkIntent(prompt: string): boolean {
   return /\b(doi\b|arxiv|bibtex|bibliograph\w*|reference\s+list|literature\s+(?:review|search)|(?:resolve|verify|check|look\s*up)\s+(?:the\s+|this\s+|these\s+)?citations?)\b|10\.\d{4,9}\//i.test(
     prompt,
+  );
+}
+
+/**
+ * Offer `verify_citation` / `resolve_citation` on bibliographic wording OR
+ * the shared cite-your-sources / fetched-web family. `export_bibtex` stays
+ * on the narrower bibliographic gate so ordinary sourced essays keep a
+ * compact schema.
+ */
+export function hasCitationVerifyResolveOfferIntent(prompt: string): boolean {
+  return (
+    hasCitationWorkIntent(prompt) ||
+    hasFetchedWebSourceIntent(prompt) ||
+    hasSharedDeepResearchIntent(prompt)
   );
 }
 
@@ -918,7 +948,17 @@ export function hasSpecificFileReadIntent(prompt: string): boolean {
   );
 }
 
+/** `.bib` / `.csv` / `.tsv` sidecar creates that must keep `create_file`. */
+export function hasSidecarCreateFileIntent(prompt: string): boolean {
+  return /\b(?:create|creating|make|new|write|export|save)\b[\s\S]{0,160}[\w./-]+\.(?:bib|csv|tsv)\b|[\w./-]+\.(?:bib|csv|tsv)\b[\s\S]{0,160}\b(?:create|creating|make|new|write|export|save)\b/i.test(
+    prompt,
+  );
+}
+
 export function hasCreateFileIntent(prompt: string): boolean {
+  if (hasSidecarCreateFileIntent(prompt)) {
+    return true;
+  }
   if (!/\b(create|creating|new|make)\b/i.test(prompt)) {
     return false;
   }
@@ -984,7 +1024,10 @@ export function hasMermaidCreateThenReviseIntent(prompt: string): boolean {
 }
 
 export function getExplicitMermaidWorkflowToolNames(prompt: string): string[] {
-  if (!hasReviseDesignIntent(prompt) || !hasMermaidDesignIntent(prompt)) {
+  if (
+    !hasMermaidDesignIntent(prompt) ||
+    (!hasReviseDesignIntent(prompt) && !hasMermaidCreateIntent(prompt))
+  ) {
     return [];
   }
   return hasMermaidCreateThenReviseIntent(prompt)
@@ -1503,4 +1546,51 @@ export function hasTitleOnlyIntent(prompt: string): boolean {
 
 export function hasMermaidDesignIntent(prompt: string): boolean {
   return /\bmermaid\b/i.test(prompt);
+}
+
+/** PDF / companion document-extract prompts. */
+export function hasDocumentExtractIntent(prompt: string): boolean {
+  return (
+    /\b(?:extract_document|document_extract)\b/i.test(prompt) ||
+    /\b(?:pdf|\.pdf)\b/i.test(prompt) ||
+    /\bextract(?:\s+text)?\s+from\s+(?:the\s+)?(?:pdf|document)\b/i.test(prompt) ||
+    /\b(?:read|parse|ingest|ocr)\b[\s\S]{0,80}\b(?:pdf|document)\b/i.test(prompt)
+  );
+}
+
+/**
+ * "PR #N" / "pull request #N" / "issue #N" without requiring the word GitHub
+ * or a catalog tool noun. Mutations stay on the explicit catalog path.
+ */
+export function hasGitHubPrOrIssueRefIntent(prompt: string): boolean {
+  if (
+    /\b(?:do\s+not|don't|never)\b[\s\S]{0,40}\b(?:pr|pull\s+request|issue)\b/i.test(
+      prompt,
+    )
+  ) {
+    return false;
+  }
+  return (
+    /\b(?:pull\s+requests?|prs?)\s*#?\s*\d+\b/i.test(prompt) ||
+    /\bissues?\s*#\s*\d+\b/i.test(prompt) ||
+    /\b(?:pr|issue)\s+#\s*\d+\b/i.test(prompt)
+  );
+}
+
+const LINEAR_DEEP_NOUNS = [
+  ["cycle", /cycles?/i],
+  ["comment", /comments?/i],
+  ["document", /documents?/i],
+  ["initiative", /initiatives?/i],
+  ["customer", /customers?/i],
+  ["label", /labels?/i],
+  ["relation", /relations?/i],
+  ["milestone", /milestones?/i],
+] as const;
+
+/** Deeper Linear nouns beyond issues / projects / progress. */
+export function getNamedLinearDeepNouns(prompt: string): string[] {
+  return LINEAR_DEEP_NOUNS.filter(([, pattern]) => pattern.test(prompt)).map(
+    ([noun]) => noun,
+  );
 }

@@ -26,13 +26,9 @@ import {
  * - export_bibtex: pure formatter over resolved records; the model writes the
  *   file through the existing create_file tool.
  *
- * PDF ingestion is deliberately out of scope: there is no dependency-free
- * parser in this codebase, so full text comes from open-access HTML through
- * the existing web_fetch cache, and metadata/abstracts come from the APIs.
- * `buildResearchFallbackCandidates` in `../orchestrator/researchProvider`
- * carries this further by rewriting known PDF URLs (arXiv, PubMed, DOI) to
- * their open HTML equivalents before any browser fallback is attempted, which
- * recovers most of the full text a parser would have given us.
+ * PDF / document bytes go through first-class `extract_document` (companion
+ * `/document/extract_text`). These bibliographic tools stay metadata- and
+ * quote-oriented: resolve/verify/export do not parse PDFs themselves.
  */
 
 const CROSSREF_API = "https://api.crossref.org/works";

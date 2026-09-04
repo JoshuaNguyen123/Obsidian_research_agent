@@ -7,7 +7,9 @@ import {
   installCompanionBootstrapSessionV1,
 } from "../packages/headless-runtime/src";
 import {
+  EXTRACT_DOCUMENT_TOOL_NAME,
   createDocumentExtractProvider,
+  createDocumentExtractTools,
   MAX_DOCUMENT_BYTES,
 } from "../src/tools/documentExtract";
 import { retrieveUsableResearchSource } from "../src/orchestrator/researchProvider";
@@ -423,4 +425,29 @@ test("an injected fetcher replaces the host-side download without touching the p
   } finally {
     disconnect();
   }
+});
+
+test("extract_document is a first-class tool that receipts a missing companion session", async () => {
+  clearCompanionBootstrapSessionV1(BASE_URL);
+  const [tool] = createDocumentExtractTools();
+  assert.equal(tool.name, EXTRACT_DOCUMENT_TOOL_NAME);
+  assert.ok(tool.descriptor);
+  const recorded: Recorded = { requests: [] };
+  const result = await tool.executeResult!(
+    { url: PDF_URL },
+    contextFor(companionJson({ status: "parsed", text: "unused" }), {
+      recorded,
+    }),
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.toolName, EXTRACT_DOCUMENT_TOOL_NAME);
+  assert.equal(result.error?.code, "companion_session_required");
+  assert.match(
+    String(result.error?.message),
+    /authenticated companion session/i,
+  );
+  assert.ok(result.receipt);
+  assert.equal(result.receipt?.toolName, EXTRACT_DOCUMENT_TOOL_NAME);
+  assert.match(result.receipt?.message ?? "", /companion session/i);
+  assert.deepEqual(recorded.requests, []);
 });

@@ -6,6 +6,7 @@ import { createDesignTools } from "./designTools";
 import { createMermaidTools } from "./mermaidTools";
 import { createDatasetTools } from "./datasetTools";
 import { createCitationTools } from "./citationTools";
+import { createDocumentExtractTools } from "./documentExtract";
 import { createCompanionTools } from "./companionTools";
 import { createVaultIndexTools } from "./vaultIndexTools";
 import { createRecallTools } from "./recallTools";
@@ -340,6 +341,7 @@ function createCoreOwnedTools(): AgentTool[] {
     ...createMermaidTools(),
     ...createDatasetTools(),
     ...createCitationTools(),
+    ...createDocumentExtractTools(),
     ...createClarificationTools(),
   ].map(withExplicitToolDescriptor);
 }

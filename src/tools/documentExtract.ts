@@ -7,9 +7,17 @@ import type {
   ResearchRetrievalOutput,
   ResearchRetrievalProvider,
 } from "../orchestrator/researchProvider";
+import type { ActionReceipt, ToolDescriptor } from "../agent/actions";
 import { requestWithRetry } from "./httpRetry";
-import { ToolExecutionError, type ToolExecutionContext } from "./types";
-import { isRecord } from "./validation";
+import {
+  ToolExecutionError,
+  type AgentTool,
+  type ToolExecutionContext,
+  type ToolExecutionResult,
+} from "./types";
+import { getRequiredString, isRecord } from "./validation";
+
+export const EXTRACT_DOCUMENT_TOOL_NAME = "extract_document";
 
 /** Pages read out of one document before the rest is reported as truncated. */
 export const DEFAULT_DOCUMENT_EXTRACT_PAGES = 100;
@@ -378,3 +386,176 @@ function getDocumentTimeoutMs(context: ToolExecutionContext): number {
   }
   return Math.max(1, Math.min(configured, context.deadlineAt - Date.now()));
 }
+
+function resolveDocumentExtractCompanion(
+  context: ToolExecutionContext,
+): { baseUrl: string; session: CompanionBootstrapSessionV1 } | { error: string } {
+  const baseUrl = context.settings.companionBaseUrl.trim().replace(/\/+$/u, "");
+  if (!baseUrl) {
+    return { error: "extract_document requires a configured companion base URL." };
+  }
+  let session: CompanionBootstrapSessionV1 | null = null;
+  try {
+    session = resolveCompanionBootstrapSessionV1(baseUrl);
+  } catch {
+    session = null;
+  }
+  if (!session?.credential) {
+    return { error: "extract_document requires an authenticated companion session." };
+  }
+  return { baseUrl, session };
+}
+
+function companionAbsentReceipt(
+  context: ToolExecutionContext,
+  url: string,
+  message: string,
+): ToolExecutionResult {
+  const now = new Date().toISOString();
+  const receipt: ActionReceipt = {
+    version: 1,
+    id: "extract-document-companion-session-required",
+    runId: context.runId?.trim() || "extract-document",
+    actionId: "not_applied",
+    toolName: EXTRACT_DOCUMENT_TOOL_NAME,
+    operation: "read",
+    resource: {
+      system: "web",
+      resourceType: "document",
+      id: url || "unresolved",
+      ...(url ? { url } : {}),
+    },
+    message,
+    payloadFingerprint: "companion_session_required",
+    grantId: "none",
+    startedAt: now,
+    committedAt: now,
+    commitKind: "no_op",
+    readback: { status: "not_required", checkedAt: now },
+  };
+  return {
+    ok: false,
+    toolName: EXTRACT_DOCUMENT_TOOL_NAME,
+    mutationState: "not_applied",
+    error: {
+      code: "companion_session_required",
+      message,
+    },
+    receipt,
+  };
+}
+
+const EXTRACT_DOCUMENT_DESCRIPTOR: ToolDescriptor = {
+  version: 1,
+  name: EXTRACT_DOCUMENT_TOOL_NAME,
+  capability: { system: "web", resourceType: "document", action: "read" },
+  effect: "read",
+  risk: "low",
+  approval: {
+    allowPromptGrant: true,
+    allowPersistentGrant: true,
+    fallback: "none",
+  },
+  execution: {
+    preparation: "none",
+    cacheable: true,
+    parallelSafe: true,
+  },
+  durability: {
+    journal: false,
+    receipt: true,
+    readback: "none",
+    reconciliation: "none",
+  },
+  allowedPrincipals: ["single_agent", "lead", "researcher"],
+};
+
+export function createDocumentExtractTools(): AgentTool[] {
+  return [extractDocumentTool];
+}
+
+const extractDocumentTool: AgentTool = {
+  name: EXTRACT_DOCUMENT_TOOL_NAME,
+  description:
+    "Extract page-marked text from a public PDF or document URL through the companion document_extract route. Requires an authenticated companion session; returns a receipt if the session is absent.",
+  descriptor: EXTRACT_DOCUMENT_DESCRIPTOR,
+  parameters: {
+    type: "object",
+    required: ["url"],
+    properties: {
+      url: {
+        type: "string",
+        description: "Public HTTP(S) URL of the PDF or document to extract.",
+      },
+      title: {
+        type: "string",
+        description: "Optional document title for the extract request.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const result = await extractDocumentTool.executeResult!(args, context);
+    if (!result.ok) {
+      throw new ToolExecutionError(
+        result.error?.code ?? "invalid_state",
+        result.error?.message ?? "extract_document failed.",
+        { mutationState: result.mutationState },
+      );
+    }
+    return result.output;
+  },
+  async executeResult(args, context) {
+    const url = getRequiredString(args, "url").trim();
+    const companion = resolveDocumentExtractCompanion(context);
+    if ("error" in companion) {
+      return companionAbsentReceipt(context, url, companion.error);
+    }
+    const title =
+      typeof args.title === "string" ? args.title.trim() : undefined;
+    const provider = createDocumentExtractProvider(context);
+    const retrieved = await provider.retrieve(
+      {
+        id: EXTRACT_DOCUMENT_TOOL_NAME,
+        url,
+        title,
+        strategy: "document_extract",
+      },
+      context.abortSignal,
+    );
+    const now = new Date().toISOString();
+    const output = retrieved ?? {
+      title: title || url,
+      url,
+      content: "",
+      parserStatus: "empty" as const,
+    };
+    return {
+      ok: true,
+      toolName: EXTRACT_DOCUMENT_TOOL_NAME,
+      output,
+      mutationState: "not_applied",
+      receipt: {
+        version: 1,
+        id: "extract-document-ok",
+        runId: context.runId?.trim() || "extract-document",
+        actionId: context.operationId?.trim() || "extract-document",
+        toolName: EXTRACT_DOCUMENT_TOOL_NAME,
+        operation: "read",
+        resource: {
+          system: "web",
+          resourceType: "document",
+          id: url,
+          url,
+        },
+        message: "extract_document completed through the companion session.",
+        payloadFingerprint: "extract_document",
+        grantId: "none",
+        startedAt: now,
+        committedAt: now,
+        commitKind: "committed",
+        readback: { status: "not_required", checkedAt: now },
+      },
+    };
+  },
+};

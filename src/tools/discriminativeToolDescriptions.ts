@@ -65,6 +65,8 @@ export const DISCRIMINATIVE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> 
     "Purpose: Check a claimed quote against a cached web_fetch source. Use when: verifying a quotation. Do not use when: the URL was not fetched yet. Required: quote plus url or path. Next: keep, drop, or re-fetch. Side effects: read.",
   export_bibtex:
     "Purpose: Format resolve_citation records as BibTeX. Use when: the user asked for BibTeX. Do not use when: writing the file yourself — pass records, then create_file. Required: records. Next: create_file. Side effects: none.",
+  extract_document:
+    "Purpose: Extract page-marked text from a PDF or document via the companion. Use when: the user names a PDF or asks to extract document text. Do not use when: HTML pages (use web_fetch) or no companion session. Required: url. Next: cite pages or verify_citation. Side effects: read.",
   semantic_search_notes:
     "Purpose: Conceptual vault search by idea or topic when filenames may differ. Use when: asking what notes say about a concept. Do not use when: an exact path/title/heading is known (use read_file) or mutating notes. Required: query. Next: read_file on ranked paths. Side effects: read.",
   inspect_semantic_index:
