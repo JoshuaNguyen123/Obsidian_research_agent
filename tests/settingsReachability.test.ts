@@ -52,6 +52,10 @@ const INTENTIONALLY_NOT_USER_FACING: ReadonlyMap<string, string> = new Map([
   ["githubEnabled", "derived from whether a GitHub credential exists"],
   ["linearCapabilityGate", "deprecated; pinned on load"],
   ["linearScanIntervalMinutes", "pinned to 15 on load"],
+  [
+    "orchestratorAutoMergeGreen",
+    "hidden: feeds dead runCodeTeamMission only; not rendered",
+  ],
 ]);
 
 function readSettingsSource(): string {

@@ -3,7 +3,7 @@
   "name": "Agentic Researcher",
   "version": "0.4.0",
   "minAppVersion": "1.11.4",
-  "description": "Single-install native Obsidian agent: research, approved code work, background companion, Linear/GitHub, note writeback, and receipts.",
+  "description": "Desktop-only research assistant. Default model is bring-your-own-key paid cloud. Vault research works without WSL. Companion is a fourth optional artifact, not in the community zip.",
   "author": "Josh",
   "authorUrl": "https://github.com/JoshuaNguyen123/Obsidian_research_agent",
   "isDesktopOnly": true

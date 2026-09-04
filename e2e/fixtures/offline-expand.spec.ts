@@ -111,7 +111,7 @@ async function runExpandScenario(input: {
       },
       {
         modelRouterEnabled: false,
-        modelRouterMode: "conservative",
+        modelRouterMode: "off",
         semanticIndexEnabled: false,
         enableStreaming: true,
         streamWritebackMode: "all_current_note_content_writes",
