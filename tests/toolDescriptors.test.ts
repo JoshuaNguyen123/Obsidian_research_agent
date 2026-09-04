@@ -32,3 +32,10 @@ test("unknown legacy tools fail closed during descriptor construction", () => {
   assert.throws(() => descriptorFor("linear_magic_graphql"), /Missing explicit/);
 });
 
+test("extract_document is an explicit web read, not a missing descriptor", () => {
+  const descriptor = descriptorFor("extract_document");
+  assert.equal(descriptor.effect, "read");
+  assert.equal(descriptor.risk, "low");
+  assert.equal(descriptor.capability.system, "web");
+});
+

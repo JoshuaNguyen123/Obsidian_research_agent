@@ -78,7 +78,9 @@ export function evidenceFromToolResult(
   }
 
   if (
-    (toolName === "web_fetch" || toolName === "read_source_section") &&
+    (toolName === "web_fetch" ||
+      toolName === "read_source_section" ||
+      toolName === "extract_document") &&
     isRecord(result.output)
   ) {
     const url =
@@ -437,6 +439,7 @@ export function claimPassagesFromToolResult(
   if (
     toolName === "web_fetch" ||
     toolName === "read_source_section" ||
+    toolName === "extract_document" ||
     toolName === "read_file" ||
     toolName === "browser_extract_markdown"
   ) {
@@ -454,6 +457,7 @@ export function claimPassagesFromToolResult(
     if (
       (toolName === "web_fetch" ||
         toolName === "read_source_section" ||
+        toolName === "extract_document" ||
         toolName === "browser_extract_markdown") &&
       !evaluateSourceUsability({
         content,
@@ -547,6 +551,7 @@ function evidenceIdForClaimPassages(
   if (
     toolName === "web_fetch" ||
     toolName === "read_source_section" ||
+    toolName === "extract_document" ||
     toolName === "browser_extract_markdown"
   ) {
     const sourceLocator =

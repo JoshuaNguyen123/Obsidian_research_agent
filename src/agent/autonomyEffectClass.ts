@@ -20,6 +20,7 @@ const SOFT_FORCE = new Set([
   "ask_user",
   "web_search",
   "web_fetch",
+  "extract_document",
   "read_current_file",
   "read_file",
   "read_source_section",

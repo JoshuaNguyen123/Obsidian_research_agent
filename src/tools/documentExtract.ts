@@ -9,13 +9,18 @@ import type {
 } from "../orchestrator/researchProvider";
 import type { ActionReceipt, ToolDescriptor } from "../agent/actions";
 import { requestWithRetry } from "./httpRetry";
+import { writeSourceCacheNote } from "./sourceCache";
 import {
   ToolExecutionError,
   type AgentTool,
   type ToolExecutionContext,
   type ToolExecutionResult,
 } from "./types";
-import { getRequiredString, isRecord } from "./validation";
+import {
+  getOptionalString,
+  isRecord,
+  normalizeVaultPath,
+} from "./validation";
 
 export const EXTRACT_DOCUMENT_TOOL_NAME = "extract_document";
 
@@ -26,13 +31,24 @@ export const DEFAULT_DOCUMENT_EXTRACT_PAGES = 100;
 export const DEFAULT_DOCUMENT_EXTRACT_CHARS = 60_000;
 
 /**
- * The largest document the companion route can be handed in one request.
- *
- * The binding constraint is the companion boundary's `max_body_bytes` (1 MiB by
- * default), and base64 inflates the payload by a third. Refusing early with a
- * named reason beats a bare 413 from the middleware.
+ * Companion `/document/extract_text` is gated by `max_body_bytes` (1 MiB by
+ * default in `companion/auth.py`). The JSON envelope plus base64 inflation
+ * (~4/3) is the binding constraint, not a second host-side guess.
  */
-export const MAX_DOCUMENT_BYTES = 720_000;
+export const COMPANION_DEFAULT_MAX_BODY_BYTES = 1_048_576;
+const DOCUMENT_EXTRACT_JSON_ENVELOPE_BYTES = 2_048;
+
+/** Largest raw document that still fits one companion POST after base64. */
+export function maxDocumentBytesForCompanionBody(
+  maxBodyBytes = COMPANION_DEFAULT_MAX_BODY_BYTES,
+): number {
+  return Math.max(
+    1,
+    Math.floor((maxBodyBytes - DOCUMENT_EXTRACT_JSON_ENVELOPE_BYTES) * 3 / 4),
+  );
+}
+
+export const MAX_DOCUMENT_BYTES = maxDocumentBytesForCompanionBody();
 
 export interface DocumentBytesV1 {
   bytes: ArrayBuffer;
@@ -95,20 +111,34 @@ export function createDocumentExtractProvider(
     ): Promise<ResearchRetrievalOutput | null> {
       const abortSignal = signal ?? context.abortSignal;
       assertDocumentOperationActive(context, abortSignal);
-      const url = normalizeDocumentUrl(candidate.url);
-      const document = await fetchDocument(url, abortSignal);
+      const locator = resolveDocumentLocator(candidate.url, Boolean(options.fetchDocument));
+      const document = await fetchDocument(
+        locator.fetchUrl ?? locator.cacheUrl,
+        abortSignal,
+      );
       assertDocumentOperationActive(context, abortSignal);
 
       const extracted = await requestDocumentExtract(context, {
-        url,
+        url: locator.fetchUrl,
         title: candidate.title,
         document,
         signal: abortSignal,
       });
       const content = extracted.status === "parsed" ? extracted.text : "";
+      if (content.trim()) {
+        await cacheExtractedSource(context, {
+          url: locator.cacheUrl,
+          title:
+            candidate.title?.trim() ||
+            documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
+          content,
+        });
+      }
       return {
-        title: candidate.title?.trim() || documentNameFromUrl(url),
-        url,
+        title:
+          candidate.title?.trim() ||
+          documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
+        url: locator.cacheUrl,
         content,
         // The empty/parsed split is the whole point: an unreadable PDF must not
         // look like a parsed source with nothing to say.
@@ -165,7 +195,7 @@ async function downloadDocument(
 async function requestDocumentExtract(
   context: ToolExecutionContext,
   input: {
-    url: string;
+    url: string | null;
     title?: string;
     document: DocumentBytesV1;
     signal: AbortSignal | undefined;
@@ -200,6 +230,12 @@ async function requestDocumentExtract(
     maxPages: DEFAULT_DOCUMENT_EXTRACT_PAGES,
     maxChars: DEFAULT_DOCUMENT_EXTRACT_CHARS,
   });
+  if (body.length > COMPANION_DEFAULT_MAX_BODY_BYTES) {
+    throw new ToolExecutionError(
+      "source_unusable",
+      `document_extract companion body is ${body.length} bytes; the limit is ${COMPANION_DEFAULT_MAX_BODY_BYTES} bytes.`,
+    );
+  }
   const response = await credential.withToken((token) =>
     requestWithRetry(context.httpTransport, {
       url: `${baseUrl}/document/extract_text`,
@@ -376,6 +412,122 @@ function assertDocumentOperationActive(
   }
 }
 
+function resolveDocumentLocator(
+  rawUrl: string,
+  allowVaultCacheKey: boolean,
+): { cacheUrl: string; fetchUrl: string | null } {
+  const trimmed = (rawUrl ?? "").trim();
+  if (isHttpDocumentLocator(trimmed)) {
+    const url = normalizeDocumentUrl(trimmed);
+    return { cacheUrl: url, fetchUrl: url };
+  }
+  if (allowVaultCacheKey && trimmed) {
+    return { cacheUrl: trimmed, fetchUrl: null };
+  }
+  return { cacheUrl: normalizeDocumentUrl(trimmed), fetchUrl: normalizeDocumentUrl(trimmed) };
+}
+
+function isHttpDocumentLocator(value: string): boolean {
+  return (
+    /^https?:\/\//iu.test(value) ||
+    /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?(?:[/?#]|$)/iu.test(value)
+  );
+}
+
+async function resolveExtractDocumentSource(
+  context: ToolExecutionContext,
+  input: { url?: string; path?: string },
+): Promise<{
+  cacheUrl: string;
+  title: string;
+  document: DocumentBytesV1;
+  vaultPath?: string;
+}> {
+  if (input.path) {
+    const vaultPath = normalizeVaultPdfPath(input.path);
+    const document = await readVaultPdf(context, vaultPath);
+    const cacheUrl = input.url?.trim()
+      ? normalizeDocumentUrl(input.url)
+      : vaultPath;
+    return {
+      cacheUrl,
+      title: documentNameFromUrl(cacheUrl),
+      document,
+      vaultPath,
+    };
+  }
+  const url = normalizeDocumentUrl(input.url ?? "");
+  return {
+    cacheUrl: url,
+    title: documentNameFromUrl(url),
+    document: await downloadDocument(context, url, context.abortSignal),
+  };
+}
+
+function normalizeVaultPdfPath(path: string): string {
+  const normalized = normalizeVaultPath(path);
+  if (!normalized.toLowerCase().endsWith(".pdf")) {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      "extract_document vault path must be a .pdf file.",
+    );
+  }
+  return normalized;
+}
+
+async function readVaultPdf(
+  context: ToolExecutionContext,
+  path: string,
+): Promise<DocumentBytesV1> {
+  const file = context.app?.vault?.getFileByPath(path);
+  if (!file) {
+    throw new ToolExecutionError(
+      "source_unusable",
+      `extract_document could not find vault PDF ${path}.`,
+    );
+  }
+  const readBinary = context.app.vault.readBinary?.bind(context.app.vault);
+  if (typeof readBinary !== "function") {
+    throw new ToolExecutionError(
+      "invalid_state",
+      "extract_document requires vault.readBinary for a local .pdf path.",
+    );
+  }
+  const bytes = await readBinary(file);
+  if (!bytes || bytes.byteLength === 0) {
+    throw new ToolExecutionError(
+      "source_unusable",
+      `extract_document received no document bytes from vault path ${path}.`,
+    );
+  }
+  if (bytes.byteLength > MAX_DOCUMENT_BYTES) {
+    throw new ToolExecutionError(
+      "source_unusable",
+      `document_extract will not send a ${bytes.byteLength}-byte document to the companion; the limit is ${MAX_DOCUMENT_BYTES} bytes.`,
+    );
+  }
+  return { bytes, contentType: "application/pdf" };
+}
+
+async function cacheExtractedSource(
+  context: ToolExecutionContext,
+  source: { url: string; title: string; content: string },
+): Promise<void> {
+  if (!context.app?.vault || !source.content.trim()) {
+    return;
+  }
+  try {
+    await writeSourceCacheNote(context, {
+      url: source.url,
+      title: source.title,
+      content: source.content,
+      parserStatus: "parsed",
+    });
+  } catch {
+    // Cache is an accelerator for verify_citation, not a precondition of extract.
+  }
+}
+
 function getDocumentTimeoutMs(context: ToolExecutionContext): number {
   const configured = Math.max(1, context.settings.requestTimeoutMs);
   if (
@@ -477,15 +629,20 @@ export function createDocumentExtractTools(): AgentTool[] {
 const extractDocumentTool: AgentTool = {
   name: EXTRACT_DOCUMENT_TOOL_NAME,
   description:
-    "Extract page-marked text from a public PDF or document URL through the companion document_extract route. Requires an authenticated companion session; returns a receipt if the session is absent.",
+    "Extract page-marked text from a public PDF URL or a vault-relative .pdf path through the companion document_extract route. Writes the extract into the Agent Sources cache so verify_citation can check quotes. Requires an authenticated companion session; returns a receipt if the session is absent.",
   descriptor: EXTRACT_DOCUMENT_DESCRIPTOR,
   parameters: {
     type: "object",
-    required: ["url"],
+    required: [],
     properties: {
       url: {
         type: "string",
         description: "Public HTTP(S) URL of the PDF or document to extract.",
+      },
+      path: {
+        type: "string",
+        description:
+          "Optional vault-relative .pdf path, validated with normalizeVaultPath.",
       },
       title: {
         type: "string",
@@ -506,34 +663,51 @@ const extractDocumentTool: AgentTool = {
     return result.output;
   },
   async executeResult(args, context) {
-    const url = getRequiredString(args, "url").trim();
+    const urlArg = getOptionalString(args, "url")?.trim();
+    const pathArg = getOptionalString(args, "path")?.trim();
+    if (!urlArg && !pathArg) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        "extract_document requires url or a vault-relative .pdf path.",
+      );
+    }
     const companion = resolveDocumentExtractCompanion(context);
+    const locator = urlArg || pathArg || "";
     if ("error" in companion) {
-      return companionAbsentReceipt(context, url, companion.error);
+      return companionAbsentReceipt(context, locator, companion.error);
     }
     const title =
       typeof args.title === "string" ? args.title.trim() : undefined;
-    const provider = createDocumentExtractProvider(context);
+    const source = await resolveExtractDocumentSource(context, {
+      url: urlArg,
+      path: pathArg,
+    });
+    const provider = createDocumentExtractProvider(context, {
+      fetchDocument: async () => source.document,
+    });
     const retrieved = await provider.retrieve(
       {
         id: EXTRACT_DOCUMENT_TOOL_NAME,
-        url,
-        title,
+        url: source.cacheUrl,
+        title: title || source.title,
         strategy: "document_extract",
       },
       context.abortSignal,
     );
     const now = new Date().toISOString();
     const output = retrieved ?? {
-      title: title || url,
-      url,
+      title: title || source.title,
+      url: source.cacheUrl,
       content: "",
       parserStatus: "empty" as const,
     };
     return {
       ok: true,
       toolName: EXTRACT_DOCUMENT_TOOL_NAME,
-      output,
+      output: {
+        ...output,
+        ...(source.vaultPath ? { path: source.vaultPath } : {}),
+      },
       mutationState: "not_applied",
       receipt: {
         version: 1,
@@ -543,10 +717,11 @@ const extractDocumentTool: AgentTool = {
         toolName: EXTRACT_DOCUMENT_TOOL_NAME,
         operation: "read",
         resource: {
-          system: "web",
+          system: source.vaultPath ? "vault" : "web",
           resourceType: "document",
-          id: url,
-          url,
+          id: source.cacheUrl,
+          ...(source.vaultPath ? { path: source.vaultPath } : {}),
+          ...(urlArg ? { url: urlArg } : {}),
         },
         message: "extract_document completed through the companion session.",
         payloadFingerprint: "extract_document",

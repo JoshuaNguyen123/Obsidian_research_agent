@@ -48,6 +48,10 @@ const ADDED_NAMES = [
   "find_related_notes",
   "suggest_note_links",
   "extract_document",
+  "analyze_dataset",
+  "create_svg_design",
+  "read_mermaid_block",
+  "upsert_mermaid_block",
 ] as const;
 
 test("covers confused pairs with Purpose / Do not use when", () => {
@@ -104,6 +108,17 @@ test("code delivery descriptions identify the real filesystem and standalone exp
       /code_workspace_export_directory|absolute verified export path/iu,
     );
   }
+});
+
+test("create_svg_design tells the model to pass chartShapes here", () => {
+  assert.match(
+    DISCRIMINATIVE_TOOL_DESCRIPTIONS.create_svg_design,
+    /pass chartShapes here/i,
+  );
+  assert.match(
+    DISCRIMINATIVE_TOOL_DESCRIPTIONS.analyze_dataset,
+    /chartShapes/,
+  );
 });
 
 test("prefixes base descriptions once", () => {

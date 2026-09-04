@@ -23,6 +23,7 @@ import {
 } from "../src/agent/toolOfferGates";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import type { MissionIntent } from "../src/tools/types";
+import { OFFLINE_RESEARCH_CATALOG_PROBES } from "../e2e/fixtures/offlineExpandScenarios";
 
 const PARAPHRASE_SOURCE_PROMPTS = [
   "Write a 1000 word essay on photosynthesis. Cite your sources.",
@@ -104,6 +105,13 @@ test("metric A: cite-your-sources and scholarly-cite prompts offer verify or res
     ),
     false,
   );
+  for (const prompt of SCHOLARLY_CITE_PROMPTS) {
+    assert.equal(
+      isAllowedForMission("export_bibtex", prompt, researchIntent()),
+      false,
+      `export_bibtex must stay off bare cite-N-sources: ${prompt}`,
+    );
+  }
 });
 
 test("metric B: add a mermaid flowchart offers upsert_mermaid_block", () => {
@@ -115,6 +123,54 @@ test("metric B: add a mermaid flowchart offers upsert_mermaid_block", () => {
   );
   assert.equal(
     isAllowedForMission("read_mermaid_block", prompt, researchIntent()),
+    true,
+  );
+});
+
+test("Add a flowchart offers mermaid; explicit canvas dest suppresses it", () => {
+  const flowchart = "Add a flowchart to this note";
+  assert.equal(shouldOfferMermaidBlock(flowchart), true);
+  assert.equal(
+    isAllowedForMission("upsert_mermaid_block", flowchart, researchIntent()),
+    true,
+  );
+  const canvas = "Move this flowchart onto an Obsidian canvas";
+  assert.equal(shouldOfferMermaidBlock(canvas), false);
+  assert.equal(
+    isAllowedForMission("upsert_mermaid_block", canvas, researchIntent()),
+    false,
+  );
+});
+
+test("create_design_* follows missionGrantsDesignCapability", () => {
+  const research = "Write a note on transformer architecture.";
+  assert.equal(
+    isAllowedForMission("create_design_canvas", research, researchIntent()),
+    false,
+  );
+  assert.equal(
+    isAllowedForMission("create_svg_design", research, researchIntent()),
+    false,
+  );
+  const design = "create a canvas diagram of the flow";
+  assert.equal(
+    isAllowedForMission("create_design_canvas", design, researchIntent()),
+    true,
+  );
+});
+
+test("Inspect the repo does not offer workspace create or artifact export", () => {
+  const prompt = "Inspect the repo";
+  assert.equal(
+    isAllowedForMission("code_workspace_create", prompt, researchIntent()),
+    false,
+  );
+  assert.equal(
+    isAllowedForMission("export_workspace_artifact", prompt, researchIntent()),
+    false,
+  );
+  assert.equal(
+    isAllowedForMission("code_workspace_read", prompt, researchIntent()),
     true,
   );
 });
@@ -180,6 +236,43 @@ test("Linear offer stays on issues/projects/progress unless a deeper noun is nam
     isLinearToolOfferedForMission("linear_create_comment", issues),
     false,
   );
+  assert.equal(
+    isLinearToolOfferedForMission("linear_create_issue", issues),
+    false,
+  );
+  assert.equal(
+    isLinearToolOfferedForMission("linear_update_issue", issues),
+    false,
+  );
+  assert.equal(
+    isLinearToolOfferedForMission("linear_archive_issue", issues),
+    false,
+  );
+  assert.equal(
+    isLinearToolOfferedForMission("linear_trash_issue", issues),
+    false,
+  );
+  assert.equal(
+    isLinearToolOfferedForMission(
+      "linear_create_issue",
+      "Create a Linear issue for this bug",
+    ),
+    true,
+  );
+  assert.equal(
+    isLinearToolOfferedForMission(
+      "linear_create_issue",
+      "Could you write me a 1000 word essay on china's government? Then turn the essay into linear issues?",
+    ),
+    true,
+  );
+  assert.equal(
+    isLinearToolOfferedForMission(
+      "linear_archive_issue",
+      "Archive this Linear issue",
+    ),
+    true,
+  );
 
   const cycles = "Show my Linear cycles";
   assert.ok(getNamedLinearDeepNouns(cycles).includes("cycle"));
@@ -206,4 +299,16 @@ test("GitHub catalog read tools are offered on PR / issue #N language", () => {
     ),
     true,
   );
+});
+
+test("offline research catalog probes offer extract, citation verify, dataset json, and flowchart mermaid", () => {
+  assert.equal(OFFLINE_RESEARCH_CATALOG_PROBES.length, 4);
+  for (const probe of OFFLINE_RESEARCH_CATALOG_PROBES) {
+    const prompt = probe.prompt.split("{marker}").join("OFFLINE_CATALOG_PROBE");
+    assert.equal(
+      isAllowedForMission(probe.expectedTool, prompt, researchIntent()),
+      true,
+      `${probe.id} must offer ${probe.expectedTool}`,
+    );
+  }
 });

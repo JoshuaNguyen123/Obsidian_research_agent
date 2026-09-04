@@ -33,13 +33,20 @@ import {
 
 const CROSSREF_API = "https://api.crossref.org/works";
 const ARXIV_API = "https://export.arxiv.org/api/query";
+const PUBMED_ESUMMARY =
+  "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
 const MAX_ABSTRACT_CHARS = 1_200;
 const MAX_AUTHORS = 24;
 const MAX_SECTIONS_TO_SCAN = 12;
 const MAX_BIBTEX_RECORDS = 50;
+const CROSSREF_SEARCH_ROWS = 5;
+/** Crossref relevance score is not 0–1; below this is a weak bibliographic hit. */
+export const CROSSREF_SCORE_FLOOR = 40;
+/** Jaccard token overlap required when the Crossref score is missing or low. */
+export const CROSSREF_TITLE_SIMILARITY_FLOOR = 0.5;
 
 export interface CitationRecordV1 {
-  kind: "doi" | "arxiv" | "search";
+  kind: "doi" | "arxiv" | "pubmed" | "search";
   sourceId: string;
   title: string;
   authors: string[];
@@ -66,7 +73,7 @@ const resolveCitationTool: AgentTool = {
       identifier: {
         type: "string",
         description:
-          "A DOI (10.xxxx/...), arXiv id (2401.12345) or URL, or a free-text title to search Crossref for.",
+          "A DOI (10.xxxx/...), arXiv id (2401.12345 or hep-th/9901001) or URL, PMID, or a free-text title to search Crossref for.",
       },
     },
     additionalProperties: false,
@@ -84,6 +91,11 @@ const resolveCitationTool: AgentTool = {
       const record = await resolveArxiv(context, arxivId);
       return { status: "resolved", via: "arxiv", record };
     }
+    const pubmedId = extractPubmedId(identifier);
+    if (pubmedId) {
+      const record = await resolvePubmed(context, pubmedId);
+      return { status: "resolved", via: "pubmed", record };
+    }
     const record = await searchCrossref(context, identifier);
     if (!record) {
       return {
@@ -100,7 +112,7 @@ const resolveCitationTool: AgentTool = {
 const verifyCitationTool: AgentTool = {
   name: "verify_citation",
   description:
-    "Verify a claimed quote against an already-cached web source (fetch it with web_fetch first). Returns supported when the quote appears verbatim (whitespace-normalized), unsupported when the cached full text does not contain it, unverifiable when no cached source exists.",
+    "Verify a claimed quote against an already-cached web source (fetch it with web_fetch or extract_document first). Returns supported when the quote appears verbatim (whitespace-normalized), unsupported when the cached full text does not contain it, unverifiable when no cached source exists.",
   parameters: {
     type: "object",
     required: ["quote"],
@@ -147,7 +159,7 @@ const verifyCitationTool: AgentTool = {
       return {
         status: "unverifiable",
         message:
-          "No cached source for this reference. Fetch it with web_fetch first, then verify.",
+          "No cached source for this reference. Fetch it with web_fetch or extract_document first, then verify.",
       };
     }
     const sections = Math.min(first.sectionCount, maxSections);
@@ -245,25 +257,80 @@ async function searchCrossref(
 ): Promise<CitationRecordV1 | null> {
   const payload = await getJson(
     context,
-    `${CROSSREF_API}?rows=1&query.bibliographic=${encodeURIComponent(title.slice(0, 256))}`,
+    `${CROSSREF_API}?rows=${CROSSREF_SEARCH_ROWS}&query.bibliographic=${encodeURIComponent(title.slice(0, 256))}`,
   );
   const items =
     isRecord(payload) &&
     isRecord(payload.message) &&
     Array.isArray(payload.message.items)
-      ? payload.message.items
+      ? payload.message.items.filter(isRecord)
       : [];
-  const first = items.find(isRecord);
-  return first ? crossrefRecord(first, "search") : null;
+  const match = pickCrossrefSearchMatch(items, title);
+  return match ? crossrefRecord(match, "search") : null;
+}
+
+export function pickCrossrefSearchMatch(
+  items: readonly Record<string, unknown>[],
+  query: string,
+): Record<string, unknown> | null {
+  const ranked = items.map((item) => {
+    const title = crossrefTitle(item);
+    const score = typeof item.score === "number" && Number.isFinite(item.score)
+      ? item.score
+      : 0;
+    return {
+      item,
+      score,
+      similarity: bibliographicTitleSimilarity(query, title),
+    };
+  });
+  const accepted = ranked.filter(
+    (row) =>
+      row.score >= CROSSREF_SCORE_FLOOR ||
+      row.similarity >= CROSSREF_TITLE_SIMILARITY_FLOOR,
+  );
+  accepted.sort(
+    (left, right) =>
+      right.similarity - left.similarity || right.score - left.score,
+  );
+  return accepted[0]?.item ?? null;
+}
+
+export function bibliographicTitleSimilarity(query: string, title: string): number {
+  const queryTokens = tokenizeBibliographicTitle(query);
+  const titleTokens = tokenizeBibliographicTitle(title);
+  if (queryTokens.size === 0 || titleTokens.size === 0) {
+    return 0;
+  }
+  let intersection = 0;
+  for (const token of queryTokens) {
+    if (titleTokens.has(token)) intersection += 1;
+  }
+  return intersection / (queryTokens.size + titleTokens.size - intersection);
+}
+
+function tokenizeBibliographicTitle(value: string): Set<string> {
+  return new Set(
+    value
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[^a-z0-9\s]/gu, " ")
+      .split(/\s+/u)
+      .filter((token) => token.length > 1),
+  );
+}
+
+function crossrefTitle(message: Record<string, unknown>): string {
+  return Array.isArray(message.title)
+    ? String(message.title[0] ?? "").trim()
+    : String(message.title ?? "").trim();
 }
 
 function crossrefRecord(
   message: Record<string, unknown>,
   kind: "doi" | "search",
 ): CitationRecordV1 {
-  const title = Array.isArray(message.title)
-    ? String(message.title[0] ?? "").trim()
-    : String(message.title ?? "").trim();
+  const title = crossrefTitle(message);
   if (!title) throw new Error("Crossref record has no title.");
   const authors = Array.isArray(message.author)
     ? message.author
@@ -347,12 +414,86 @@ export function extractDoi(identifier: string): string | null {
   return fromUrl?.[1] ?? null;
 }
 
+const LEGACY_ARXIV_ID =
+  "([a-z-]+(?:\\.[A-Za-z]{2})?\\/\\d{7})";
+
 export function extractArxivId(identifier: string): string | null {
   const cleaned = identifier.trim();
-  const direct = /^(?:arxiv:)?(\d{4}\.\d{4,5})(v\d+)?$/iu.exec(cleaned);
-  if (direct) return `${direct[1]}${direct[2] ?? ""}`;
-  const fromUrl = /arxiv\.org\/(?:abs|pdf)\/(\d{4}\.\d{4,5})(v\d+)?/iu.exec(cleaned);
-  return fromUrl ? `${fromUrl[1]}${fromUrl[2] ?? ""}` : null;
+  const modern = /^(?:arxiv:)?(\d{4}\.\d{4,5})(v\d+)?$/iu.exec(cleaned);
+  if (modern) return `${modern[1]}${modern[2] ?? ""}`;
+  const modernUrl = /arxiv\.org\/(?:abs|pdf)\/(\d{4}\.\d{4,5})(v\d+)?/iu.exec(
+    cleaned,
+  );
+  if (modernUrl) return `${modernUrl[1]}${modernUrl[2] ?? ""}`;
+  const legacy = new RegExp(`^(?:arxiv:)?${LEGACY_ARXIV_ID}(v\\d+)?$`, "iu").exec(
+    cleaned,
+  );
+  if (legacy) return `${legacy[1]}${legacy[2] ?? ""}`;
+  const legacyUrl = new RegExp(
+    `arxiv\\.org/(?:abs|pdf)/${LEGACY_ARXIV_ID}(v\\d+)?`,
+    "iu",
+  ).exec(cleaned);
+  return legacyUrl ? `${legacyUrl[1]}${legacyUrl[2] ?? ""}` : null;
+}
+
+export function extractPubmedId(identifier: string): string | null {
+  const cleaned = identifier.trim();
+  const labeled = /^(?:pmid:?\s*)(\d{5,8})$/iu.exec(cleaned);
+  if (labeled) return labeled[1];
+  const fromUrl = /pubmed\.ncbi\.nlm\.nih\.gov\/(\d{5,8})\b/iu.exec(cleaned);
+  if (fromUrl) return fromUrl[1];
+  const inline = /\bpmid:?\s*(\d{5,8})\b/iu.exec(cleaned);
+  return inline?.[1] ?? null;
+}
+
+async function resolvePubmed(
+  context: ToolExecutionContext,
+  pmid: string,
+): Promise<CitationRecordV1> {
+  const payload = await getJson(
+    context,
+    `${PUBMED_ESUMMARY}?db=pubmed&retmode=json&rettype=abstract&id=${encodeURIComponent(pmid)}&retmax=1&tool=agentic-researcher`,
+  );
+  const result = isRecord(payload) && isRecord(payload.result) ? payload.result : null;
+  const record = result && isRecord(result[pmid]) ? result[pmid] : null;
+  if (!record) {
+    throw new Error(`PubMed returned no record for PMID ${pmid}.`);
+  }
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  if (!title) throw new Error(`PubMed record for PMID ${pmid} has no title.`);
+  const authors = Array.isArray(record.authors)
+    ? record.authors
+        .filter(isRecord)
+        .map((author) =>
+          typeof author.name === "string" ? author.name.trim() : "",
+        )
+        .filter(Boolean)
+        .slice(0, MAX_AUTHORS)
+    : [];
+  const pubdate = typeof record.pubdate === "string" ? record.pubdate : "";
+  const yearMatch = /(\d{4})/u.exec(pubdate);
+  const year = yearMatch ? Number(yearMatch[1]) : null;
+  const venue =
+    (typeof record.fulljournalname === "string" && record.fulljournalname.trim()) ||
+    (typeof record.source === "string" && record.source.trim()) ||
+    null;
+  const elocation =
+    typeof record.elocationid === "string"
+      ? record.elocationid.replace(/^doi:\s*/iu, "")
+      : "";
+  const doi = extractDoi(elocation);
+  return {
+    kind: "pubmed",
+    sourceId: `citation:pmid:${pmid}`,
+    title,
+    authors,
+    year,
+    venue,
+    url: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
+    doi,
+    arxivId: null,
+    abstract: null,
+  };
 }
 
 export function formatBibtexEntry(

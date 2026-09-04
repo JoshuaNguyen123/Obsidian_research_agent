@@ -6,11 +6,17 @@ import {
   createSessionBootstrapTokenLeaseV1,
   installCompanionBootstrapSessionV1,
 } from "../packages/headless-runtime/src";
+import { descriptorFor } from "../src/tools/toolDescriptors";
+import { effectClassForTool } from "../src/agent/autonomyEffectClass";
+import { RESEARCHER_SOFT_TOOL_NAMES } from "../src/orchestrator/researcherSoftCatalog";
+import { createCitationTools } from "../src/tools/citationTools";
 import {
   EXTRACT_DOCUMENT_TOOL_NAME,
   createDocumentExtractProvider,
   createDocumentExtractTools,
+  COMPANION_DEFAULT_MAX_BODY_BYTES,
   MAX_DOCUMENT_BYTES,
+  maxDocumentBytesForCompanionBody,
 } from "../src/tools/documentExtract";
 import { retrieveUsableResearchSource } from "../src/orchestrator/researchProvider";
 import { ToolExecutionError, type ToolExecutionContext } from "../src/tools/types";
@@ -427,6 +433,24 @@ test("an injected fetcher replaces the host-side download without touching the p
   }
 });
 
+test("extract_document is Soft, not Bound, and descriptorFor does not throw", () => {
+  assert.doesNotThrow(() => descriptorFor(EXTRACT_DOCUMENT_TOOL_NAME));
+  assert.equal(descriptorFor(EXTRACT_DOCUMENT_TOOL_NAME).risk, "low");
+  assert.equal(descriptorFor(EXTRACT_DOCUMENT_TOOL_NAME).effect, "read");
+  assert.equal(effectClassForTool(EXTRACT_DOCUMENT_TOOL_NAME), "soft");
+  assert.notEqual(effectClassForTool(EXTRACT_DOCUMENT_TOOL_NAME), "bound");
+  assert.ok(RESEARCHER_SOFT_TOOL_NAMES.includes(EXTRACT_DOCUMENT_TOOL_NAME));
+  assert.ok(
+    MAX_DOCUMENT_BYTES > 720_000,
+    "companion-aligned document budget should be raised past the old 720k cap",
+  );
+  assert.equal(
+    MAX_DOCUMENT_BYTES,
+    maxDocumentBytesForCompanionBody(COMPANION_DEFAULT_MAX_BODY_BYTES),
+  );
+  assert.ok(MAX_DOCUMENT_BYTES * (4 / 3) + 2_048 <= COMPANION_DEFAULT_MAX_BODY_BYTES);
+});
+
 test("extract_document is a first-class tool that receipts a missing companion session", async () => {
   clearCompanionBootstrapSessionV1(BASE_URL);
   const [tool] = createDocumentExtractTools();
@@ -450,4 +474,143 @@ test("extract_document is a first-class tool that receipts a missing companion s
   assert.equal(result.receipt?.toolName, EXTRACT_DOCUMENT_TOOL_NAME);
   assert.match(result.receipt?.message ?? "", /companion session/i);
   assert.deepEqual(recorded.requests, []);
+});
+
+function createExtractVaultContext(
+  companionResponse: HttpResponse,
+  options: {
+    download?: HttpResponse;
+    vaultFiles?: Record<string, ArrayBuffer>;
+  } = {},
+): ToolExecutionContext {
+  const content = new Map<string, string>();
+  const folders = new Set<string>();
+  const binaries = new Map<string, ArrayBuffer>(
+    Object.entries(options.vaultFiles ?? {}),
+  );
+  const getFile = (path: string) =>
+    content.has(path) || binaries.has(path)
+      ? {
+          path,
+          basename: path.split("/").pop()?.replace(/\.[^.]+$/i, "") ?? path,
+          extension: path.split(".").pop()?.toLowerCase() ?? "",
+          stat: {
+            mtime: 1,
+            size:
+              content.get(path)?.length ??
+              binaries.get(path)?.byteLength ??
+              0,
+          },
+        }
+      : null;
+  const base = contextFor(companionResponse, { download: options.download });
+  return {
+    ...base,
+    now: () => new Date("2026-09-04T00:00:00.000Z"),
+    app: {
+      vault: {
+        getFileByPath: getFile,
+        getFolderByPath: (path: string) =>
+          folders.has(path) ? { path, name: path.split("/").pop() ?? path } : null,
+        createFolder: async (path: string) => {
+          folders.add(path);
+        },
+        create: async (path: string, data: string) => {
+          content.set(path, data);
+          return getFile(path);
+        },
+        modify: async (file: { path: string }, data: string) => {
+          content.set(file.path, data);
+        },
+        read: async (file: { path: string }) => {
+          const value = content.get(file.path);
+          if (value === undefined) throw new Error(`File not found: ${file.path}`);
+          return value;
+        },
+        readBinary: async (file: { path: string }) => {
+          const value = binaries.get(file.path);
+          if (!value) throw new Error(`Binary not found: ${file.path}`);
+          return value;
+        },
+        getFiles: () =>
+          [...new Set([...content.keys(), ...binaries.keys()])]
+            .map((path) => getFile(path))
+            .filter((file): file is NonNullable<typeof file> => Boolean(file)),
+      },
+    },
+  } as unknown as ToolExecutionContext;
+}
+
+test("extract_document caches page text so verify_citation can support a PDF quote", async () => {
+  const disconnect = connectCompanion();
+  const quote = "Opinion of the Court holds the statute valid.";
+  try {
+    const [extract] = createDocumentExtractTools();
+    const verify = createCitationTools().find((tool) => tool.name === "verify_citation")!;
+    const context = createExtractVaultContext(
+      companionJson({
+        ok: true,
+        status: "parsed",
+        reason: null,
+        text: `## Page 1\n\n${quote}\n`,
+        pageCount: 1,
+        pagesExtracted: 1,
+        pagesSkipped: 0,
+        truncated: false,
+      }),
+    );
+    const extracted = await extract.executeResult!({ url: PDF_URL }, context);
+    assert.equal(extracted.ok, true);
+    assert.match(String((extracted.output as { content?: string }).content), /Opinion of the Court/u);
+
+    const verified = (await verify.execute(
+      { quote, url: PDF_URL },
+      context,
+    )) as Record<string, unknown>;
+    assert.equal(verified.status, "supported");
+    assert.equal(verified.sourceUrl, PDF_URL);
+  } finally {
+    disconnect();
+  }
+});
+
+test("extract_document accepts a vault-relative .pdf path through normalizeVaultPath", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const [extract] = createDocumentExtractTools();
+    const context = createExtractVaultContext(
+      companionJson({
+        ok: true,
+        status: "parsed",
+        reason: null,
+        text: "## Page 1\n\nVault opinion text for citation checks.\n",
+        pageCount: 1,
+        pagesExtracted: 1,
+        pagesSkipped: 0,
+        truncated: false,
+      }),
+      { vaultFiles: { "Papers/opinion.pdf": pdfBytes() } },
+    );
+    const result = await extract.executeResult!(
+      { path: "Papers/opinion.pdf" },
+      context,
+    );
+    assert.equal(result.ok, true);
+    assert.equal((result.output as { path?: string }).path, "Papers/opinion.pdf");
+    assert.match(
+      String((result.output as { content?: string }).content),
+      /Vault opinion text/u,
+    );
+
+    await assert.rejects(
+      () => extract.executeResult!({ path: "Papers/notes.md" }, context),
+      /must be a \.pdf/u,
+    );
+    await assert.rejects(
+      () => extract.executeResult!({ path: "../secret.pdf" }, context),
+      /parent traversal/u,
+    );
+  } finally {
+    disconnect();
+  }
 });

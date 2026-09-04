@@ -62,11 +62,19 @@ export const DISCRIMINATIVE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> 
   resolve_citation:
     "Purpose: Resolve a DOI, arXiv id, or title into one bibliographic record. Use when: a stable citation record/sourceId is needed. Do not use when: fetching page text (use web_fetch) or verifying a quote (use verify_citation). Required: identifier. Next: cite or export_bibtex. Side effects: read.",
   verify_citation:
-    "Purpose: Check a claimed quote against a cached web_fetch source. Use when: verifying a quotation. Do not use when: the URL was not fetched yet. Required: quote plus url or path. Next: keep, drop, or re-fetch. Side effects: read.",
+    "Purpose: Check a claimed quote against a cached web_fetch or extract_document source. Use when: verifying a quotation. Do not use when: the URL was not fetched or extracted yet. Required: quote plus url or path. Next: keep, drop, or re-fetch. Side effects: read.",
   export_bibtex:
     "Purpose: Format resolve_citation records as BibTeX. Use when: the user asked for BibTeX. Do not use when: writing the file yourself — pass records, then create_file. Required: records. Next: create_file. Side effects: none.",
   extract_document:
-    "Purpose: Extract page-marked text from a PDF or document via the companion. Use when: the user names a PDF or asks to extract document text. Do not use when: HTML pages (use web_fetch) or no companion session. Required: url. Next: cite pages or verify_citation. Side effects: read.",
+    "Purpose: Extract page-marked text from a PDF via the companion and cache it for verify_citation. Use when: the user names a PDF URL or vault .pdf path. Do not use when: HTML pages (use web_fetch) or no companion session. Required: url or path. Next: cite pages or verify_citation. Side effects: read.",
+  analyze_dataset:
+    "Purpose: Analyze a vault CSV/TSV/JSON table and return column stats plus chartShapes. Use when: a dataset path is named. Do not use when: inventing figures or writing the chart yourself. Required: path. Next: pass chartShapes to create_svg_design. Side effects: read.",
+  create_svg_design:
+    "Purpose: Create a vault SVG from structured shapes. Use when: drawing a chart or wireframe; pass chartShapes here from analyze_dataset. Do not use when: Mermaid (upsert_mermaid_block) or an explicit canvas dest. Required: path + shapes. Next: none. Side effects: write.",
+  read_mermaid_block:
+    "Purpose: Read one Mermaid block and its note SHA. Use when: inspecting or preparing an edit. Do not use when: the dest is an Obsidian canvas. Required: path + selector. Next: upsert_mermaid_block. Side effects: read.",
+  upsert_mermaid_block:
+    "Purpose: Insert or update one Mermaid block after read. Use when: add/create a flowchart or mermaid in a note. Do not use when: explicit canvas dest (use create_design_canvas). Required: path, baseHash, selector, mermaid. Next: stop. Side effects: write.",
   semantic_search_notes:
     "Purpose: Conceptual vault search by idea or topic when filenames may differ. Use when: asking what notes say about a concept. Do not use when: an exact path/title/heading is known (use read_file) or mutating notes. Required: query. Next: read_file on ranked paths. Side effects: read.",
   inspect_semantic_index:

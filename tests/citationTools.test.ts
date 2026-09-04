@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CROSSREF_SCORE_FLOOR,
+  bibliographicTitleSimilarity,
   createCitationTools,
   extractArxivId,
   extractDoi,
+  extractPubmedId,
   formatBibtexEntry,
+  pickCrossrefSearchMatch,
 } from "../src/tools/citationTools";
 import type { HttpRequest, HttpResponse } from "../src/model/types";
 import type { ToolExecutionContext } from "../src/tools/types";
@@ -54,7 +58,20 @@ test("identifier extraction handles DOI and arXiv forms", () => {
   assert.equal(extractArxivId("arXiv:2401.12345v2"), "2401.12345v2");
   assert.equal(extractArxivId("https://arxiv.org/abs/2401.12345"), "2401.12345");
   assert.equal(extractArxivId("https://arxiv.org/pdf/2401.12345v3"), "2401.12345v3");
+  assert.equal(extractArxivId("hep-th/9901001"), "hep-th/9901001");
+  assert.equal(extractArxivId("arXiv:hep-th/9901001v2"), "hep-th/9901001v2");
+  assert.equal(
+    extractArxivId("https://arxiv.org/abs/hep-th/9901001"),
+    "hep-th/9901001",
+  );
+  assert.equal(extractArxivId("math.GT/0309136"), "math.GT/0309136");
   assert.equal(extractArxivId("not an id"), null);
+  assert.equal(extractPubmedId("PMID: 15761122"), "15761122");
+  assert.equal(
+    extractPubmedId("https://pubmed.ncbi.nlm.nih.gov/15761122/"),
+    "15761122",
+  );
+  assert.equal(extractPubmedId("Attention Is All You Need"), null);
 });
 
 test("resolve_citation resolves a DOI through Crossref and normalizes the record", async () => {
@@ -103,6 +120,88 @@ test("resolve_citation resolves arXiv ids from the Atom feed", async () => {
   assert.equal(result.record.year, 2024);
   assert.equal(result.record.arxivId, "2401.12345");
   assert.equal(result.record.url, "https://arxiv.org/abs/2401.12345");
+});
+
+test("resolve_citation resolves legacy arXiv ids from the Atom feed", async () => {
+  const atom = [
+    "<feed>",
+    "<entry>",
+    "<id>http://arxiv.org/abs/hep-th/9901001v1</id>",
+    "<published>1999-01-04T00:00:00Z</published>",
+    "<title>An old hep-th paper</title>",
+    "<summary>We study strings.</summary>",
+    "<author><name>A. Author</name></author>",
+    "</entry>",
+    "</feed>",
+  ].join("\n");
+  const context = contextWith({ status: 200, headers: {}, text: atom } as never);
+  const result = (await resolveCitation.execute(
+    { identifier: "hep-th/9901001" },
+    context,
+  )) as Record<string, any>;
+  assert.equal(result.via, "arxiv");
+  assert.equal(result.record.arxivId, "hep-th/9901001");
+  assert.equal(result.record.url, "https://arxiv.org/abs/hep-th/9901001");
+});
+
+test("resolve_citation resolves PMID through bounded local-HTTP PubMed esummary", async () => {
+  const requests: HttpRequest[] = [];
+  const context = contextWith((request) => {
+    requests.push(request);
+    return {
+      status: 200,
+      headers: {},
+      json: {
+        result: {
+          uids: ["15761122"],
+          "15761122": {
+            title: "A PubMed paper",
+            authors: [{ name: "Doe J" }],
+            pubdate: "2005 Apr",
+            fulljournalname: "Nature",
+            elocationid: "doi: 10.1038/nature03404",
+          },
+        },
+      },
+    };
+  });
+  const result = (await resolveCitation.execute(
+    { identifier: "PMID: 15761122" },
+    context,
+  )) as Record<string, any>;
+  assert.equal(result.via, "pubmed");
+  assert.equal(result.record.kind, "pubmed");
+  assert.equal(result.record.title, "A PubMed paper");
+  assert.equal(result.record.year, 2005);
+  assert.equal(result.record.doi, "10.1038/nature03404");
+  assert.match(requests[0]!.url, /eutils\.ncbi\.nlm\.nih\.gov/u);
+  assert.match(requests[0]!.url, /retmax=1/u);
+});
+
+test("Crossref search uses a similarity floor, not rows=1 with no floor", () => {
+  assert.ok(
+    bibliographicTitleSimilarity(
+      "Attention Is All You Need",
+      "Attention Is All You Need",
+    ) >= 0.99,
+  );
+  const distractor = {
+    title: ["Completely Unrelated Chemistry Paper"],
+    score: 1.2,
+    DOI: "10.0000/nope",
+  };
+  const hit = {
+    ...CROSSREF_WORK.message,
+    score: CROSSREF_SCORE_FLOOR - 1,
+  };
+  assert.equal(
+    pickCrossrefSearchMatch([distractor], "Attention Is All You Need"),
+    null,
+  );
+  assert.equal(
+    pickCrossrefSearchMatch([distractor, hit], "Attention Is All You Need"),
+    hit,
+  );
 });
 
 test("resolve_citation falls back to Crossref search for titles and reports misses", async () => {

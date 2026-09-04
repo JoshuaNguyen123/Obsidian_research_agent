@@ -12,6 +12,7 @@ import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
 import {
   hasExplicitCanvasDestinationIntent,
   hasReviseDesignIntent,
+  missionGrantsDesignCapability,
 } from "./codeDesignIntent";
 import { hasJupyterReflectionIntentV1 } from "./jupyterReflectionIntent";
 import {
@@ -220,7 +221,6 @@ const CODE_TOOL_NAMES = new Set([
 ]);
 
 const CODE_READ_ONLY_TOOL_NAMES = new Set([
-  "code_workspace_create",
   "code_workspace_status",
   "code_workspace_stat",
   "code_workspace_list",
@@ -231,7 +231,6 @@ const CODE_READ_ONLY_TOOL_NAMES = new Set([
   "read_workspace_file",
   "list_workspace_files",
   "preview_workspace_html",
-  "export_workspace_artifact",
   "render_html_preview",
   "code_repair_status",
 ]);
@@ -265,14 +264,19 @@ const LINEAR_DEFAULT_OFFER_NAMES = new Set([
   "linear_get_issue",
   "linear_list_issues",
   "linear_search_issues",
+  "linear_list_projects",
+  "linear_list_project_statuses",
+  "linear_get_project",
+  "linear_get_project_update",
+  "linear_list_project_updates",
+]);
+
+const LINEAR_CORE_MUTATION_NAMES = new Set([
   "linear_create_issue",
   "linear_update_issue",
   "linear_archive_issue",
   "linear_unarchive_issue",
   "linear_trash_issue",
-  "linear_list_projects",
-  "linear_list_project_statuses",
-  "linear_get_project",
   "linear_create_project",
   "linear_update_project",
   "linear_archive_project",
@@ -283,8 +287,6 @@ const LINEAR_DEFAULT_OFFER_NAMES = new Set([
   "linear_archive_project_update",
   "linear_unarchive_project_update",
   "linear_delete_project_update",
-  "linear_get_project_update",
-  "linear_list_project_updates",
 ]);
 
 const LINEAR_NOUN_TOOL_FRAGMENTS: Record<string, string[]> = {
@@ -319,10 +321,12 @@ export function hasSafeReflexLabel(
 }
 
 export function shouldOfferMermaidBlock(prompt: string): boolean {
+  if (hasExplicitCanvasDestinationIntent(prompt)) {
+    return false;
+  }
   return (
-    hasMermaidDesignIntent(prompt) &&
-    !hasExplicitCanvasDestinationIntent(prompt) &&
-    (hasReviseDesignIntent(prompt) || hasMermaidCreateIntent(prompt))
+    hasMermaidCreateIntent(prompt) ||
+    (hasMermaidDesignIntent(prompt) && hasReviseDesignIntent(prompt))
   );
 }
 
@@ -355,12 +359,61 @@ export function isLinearToolOfferedForMission(
   if (LINEAR_DEFAULT_OFFER_NAMES.has(name)) {
     return true;
   }
+  if (LINEAR_CORE_MUTATION_NAMES.has(name)) {
+    return hasExplicitLinearMutationVerb(name, prompt);
+  }
   const nouns = getNamedLinearDeepNouns(prompt);
-  return nouns.some((noun) =>
+  const nounMatch = nouns.some((noun) =>
     (LINEAR_NOUN_TOOL_FRAGMENTS[noun] ?? []).some((fragment) =>
       name.includes(fragment),
     ),
   );
+  if (!nounMatch) {
+    return false;
+  }
+  if (isLinearMutationToolName(name)) {
+    return hasExplicitLinearMutationVerb(name, prompt);
+  }
+  return true;
+}
+
+function isLinearMutationToolName(name: string): boolean {
+  return /_(?:create|update|archive|unarchive|trash|delete|retire|restore)(?:_|$)/u.test(
+    name,
+  );
+}
+
+function hasExplicitLinearMutationVerb(name: string, prompt: string): boolean {
+  if (/_create(?:_|$)/u.test(name)) {
+    return (
+      /\b(?:create|add|open|file|new)\b/iu.test(prompt) ||
+      /\bturn\b[\s\S]{0,100}\binto\b[\s\S]{0,80}\b(?:linear\s+)?issues?\b/iu.test(
+        prompt,
+      )
+    );
+  }
+  if (/_update(?:_|$)/u.test(name)) {
+    return /\b(?:update|edit|change|modify|rename)\b/iu.test(prompt);
+  }
+  if (/_unarchive(?:_|$)/u.test(name)) {
+    return /\b(?:unarchive|restore)\b/iu.test(prompt);
+  }
+  if (/_archive(?:_|$)/u.test(name)) {
+    return /\barchive\b/iu.test(prompt);
+  }
+  if (/_trash(?:_|$)/u.test(name)) {
+    return /\b(?:trash|delete|remove)\b/iu.test(prompt);
+  }
+  if (/_delete(?:_|$)/u.test(name)) {
+    return /\b(?:delete|remove)\b/iu.test(prompt);
+  }
+  if (/_retire(?:_|$)/u.test(name)) {
+    return /\bretire\b/iu.test(prompt);
+  }
+  if (/_restore(?:_|$)/u.test(name)) {
+    return /\brestore\b/iu.test(prompt);
+  }
+  return false;
 }
 
 export function getOfferedGitHubCatalogReadToolNames(
@@ -659,7 +712,7 @@ export function isAllowedForMission(
       name === "create_svg_design" ||
       name === "create_design_package"
     ) {
-      return hasDesignIntent(prompt);
+      return missionGrantsDesignCapability(prompt);
     }
 
     if (name === "update_design_canvas" || name === "update_svg_design") {

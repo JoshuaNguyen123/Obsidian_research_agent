@@ -42,7 +42,7 @@ export const readMermaidBlockTool: AgentTool = {
   name: "read_mermaid_block",
   descriptor: createMermaidReadDescriptor(),
   description:
-    "Read one exact Mermaid block from a Markdown note by heading or stable block id, returning the note SHA-256 required for safe edits.",
+    "Read one exact Mermaid block from a Markdown note by heading or stable block id, returning the note SHA-256 required for safe edits. Do not use when the mission asks for an Obsidian canvas.",
   parameters: {
     type: "object",
     required: ["path", "selector"],

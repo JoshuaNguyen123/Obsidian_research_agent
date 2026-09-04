@@ -28,6 +28,7 @@ function softDebt(): ProofDebt {
 
 test("effectClassForTool maps soft force and hard force", () => {
   assert.equal(effectClassForTool("web_search"), "soft");
+  assert.equal(effectClassForTool("extract_document"), "soft");
   assert.equal(effectClassForTool("append_to_current_file"), "soft");
   assert.equal(effectClassForTool("github_merge_pull_request"), "hard");
   assert.equal(effectClassForTool("linear_trash_issue"), "hard");

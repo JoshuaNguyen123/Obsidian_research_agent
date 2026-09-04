@@ -36,6 +36,7 @@ const VAULT_READS = new Set([
 ]);
 const WEB_READS = new Set([
   "export_bibtex",
+  "extract_document",
   "read_source_section",
   "resolve_citation",
   "verify_citation",

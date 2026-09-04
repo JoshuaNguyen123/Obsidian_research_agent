@@ -51,6 +51,11 @@ test("codeDesignIntent classifies code and design prompts", () => {
     hasMermaidCreateIntent("Add a mermaid flowchart to this note"),
     true,
   );
+  assert.equal(hasMermaidCreateIntent("Add a flowchart to this note"), true);
+  assert.equal(
+    hasMermaidCreateIntent("Move this flowchart onto an Obsidian canvas"),
+    false,
+  );
   assert.equal(
     hasReviseDesignIntent("Add a mermaid flowchart to this note"),
     true,

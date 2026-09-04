@@ -54,7 +54,7 @@ export function createDatasetTools(): AgentTool[] {
 const analyzeDatasetTool: AgentTool = {
   name: "analyze_dataset",
   description:
-    "Analyze a tabular dataset file (.csv, .tsv, .json array, .ndjson) from the vault: per-column types and statistics, plus ready-to-render chart shapes for create_svg_design. Read-only; use create_file/append_file to write findings into a note.",
+    "Analyze a tabular dataset file (.csv, .tsv, .json array, .ndjson) from the vault: per-column types and statistics, plus ready-to-render chartShapes for create_svg_design (pass chartShapes here). Read-only; use create_file/append_file to write findings into a note.",
   parameters: {
     type: "object",
     required: ["path"],

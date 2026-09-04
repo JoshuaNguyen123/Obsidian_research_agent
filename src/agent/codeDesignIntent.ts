@@ -136,7 +136,12 @@ const MERMAID_CREATE_INTENT =
 
 /** Create/add/insert a Mermaid diagram — offered as upsert, not canvas revise. */
 export function hasMermaidCreateIntent(prompt: string): boolean {
-  return /\bmermaid\b/i.test(prompt) && MERMAID_CREATE_INTENT.test(prompt);
+  if (hasExplicitCanvasDestinationIntent(prompt)) {
+    return false;
+  }
+  // MERMAID_CREATE_INTENT already includes flowchart; do not also require the
+  // word "mermaid" or "Add a flowchart to this note" never offers upsert.
+  return MERMAID_CREATE_INTENT.test(prompt);
 }
 
 export function hasReviseDesignIntent(prompt: string): boolean {

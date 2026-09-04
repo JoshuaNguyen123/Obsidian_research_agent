@@ -32,6 +32,7 @@ export const RESEARCHER_SOFT_TOOL_NAMES: readonly string[] = [
   "suggest_note_links",
   "web_search",
   "web_fetch",
+  "extract_document",
   "read_source_section",
   "browser_open_page",
   "browser_observe",
