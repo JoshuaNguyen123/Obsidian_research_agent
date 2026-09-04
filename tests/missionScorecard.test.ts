@@ -272,6 +272,128 @@ test("finishing early is not extra credit", () => {
   assert.equal(fast.total, 1);
 });
 
+test("a continued mission is not charged for the segments it inherited", () => {
+  // The BYOK shape: four continuations, 60 model calls and 20 minutes across
+  // the whole durable run, of which this last segment spent 12 calls against
+  // the 20 its effort decision granted. providerUsage is run-scoped and the
+  // execution budget is segment-scoped, so the two only divide cleanly once
+  // the inherited spend is declared.
+  const continued = scoreMissionV1({
+    ...CLEAN_PASS,
+    modelCalls: 60,
+    modelCallBudget: 20,
+    inheritedModelCalls: 48,
+    wallClockMs: 1_200_000,
+    wallClockBudgetMs: 600_000,
+    inheritedWallClockMs: 900_000,
+  });
+  const byId = new Map(continued.dimensions.map((item) => [item.id, item]));
+
+  assert.equal(byId.get("model_call_efficiency")?.score, 1);
+  assert.equal(byId.get("wall_clock_efficiency")?.score, 1);
+  // The detail keeps naming the run-scoped numerator the ledger attests, so a
+  // reader comparing Run Details against the scorecard sees one run, not two.
+  assert.equal(byId.get("model_call_efficiency")?.detail, "60/68 model calls");
+  assert.equal(byId.get("wall_clock_efficiency")?.detail, "1200s/1500s");
+  assert.equal(continued.total, 1);
+});
+
+test("undeclared inheritance is what made a resumed mission look wasteful", () => {
+  // The bug this pins, kept as an executable statement of it: the very same
+  // run scored against the last segment's allowance alone. Both efficiency
+  // dimensions carry weight 0.05, so the pair moved the weighted total by
+  // enough to matter to the capability ratchet's 0.8 promotion floor and its
+  // 0.6 regression floor.
+  const conflated = scoreMissionV1({
+    ...CLEAN_PASS,
+    modelCalls: 60,
+    modelCallBudget: 20,
+    wallClockMs: 1_200_000,
+    wallClockBudgetMs: 600_000,
+  });
+  const byId = new Map(conflated.dimensions.map((item) => [item.id, item]));
+
+  assert.equal(byId.get("model_call_efficiency")?.score, round4(20 / 60));
+  assert.equal(byId.get("wall_clock_efficiency")?.score, 0.5);
+  assert.ok(conflated.total < 1);
+});
+
+test("a genuine overrun still scores below 1 for a continued mission", () => {
+  // Raising the denominator must not make the dimension unable to fail. The
+  // inherited spend is added to the budget, not to a free pass: a segment that
+  // blows its own allowance still shows up.
+  const overrun = scoreMissionV1({
+    ...CLEAN_PASS,
+    modelCalls: 100,
+    modelCallBudget: 20,
+    inheritedModelCalls: 48,
+    wallClockMs: 1_800_000,
+    wallClockBudgetMs: 600_000,
+    inheritedWallClockMs: 900_000,
+  });
+  const byId = new Map(overrun.dimensions.map((item) => [item.id, item]));
+
+  assert.equal(byId.get("model_call_efficiency")?.score, round4(68 / 100));
+  assert.equal(byId.get("wall_clock_efficiency")?.score, round4(1_500_000 / 1_800_000));
+});
+
+test("a fresh mission scores exactly as it did before inheritance was declared", () => {
+  // Every baselined lane is a fresh mission. Declaring a zero baseline (or
+  // omitting it) must leave those records bit-identical, or the harvested
+  // mission-scorecard baseline would need regenerating.
+  const omitted = scoreMissionV1(CLEAN_PASS);
+  const declaredZero = scoreMissionV1({
+    ...CLEAN_PASS,
+    inheritedModelCalls: 0,
+    inheritedWallClockMs: 0,
+  });
+
+  assert.deepEqual(declaredZero, omitted);
+  assert.equal(
+    omitted.dimensions.find((item) => item.id === "model_call_efficiency")?.detail,
+    "20/40 model calls",
+  );
+});
+
+test("declaring an inherited baseline can never lower a score", () => {
+  // This is what keeps `e2e/baselines/mission-scorecards.v1.json` valid
+  // without regeneration: the regression gate fires only on a DROP, and
+  // widening the denominator's scope is monotone in the score. The degenerate
+  // rows matter most -- a zero or nonsensical segment budget already means "no
+  // budget declared" and must not be turned into a real denominator by the
+  // numerator's own history.
+  const budgets = [0, -5, 40, Number.NaN, Number.POSITIVE_INFINITY];
+  const useds = [0, 20, 200];
+  const inheriteds = [0, 48, -1, Number.NaN, undefined];
+
+  for (const modelCallBudget of budgets) {
+    for (const modelCalls of useds) {
+      for (const inheritedModelCalls of inheriteds) {
+        const segmentScoped = scoreMissionV1({
+          ...CLEAN_PASS,
+          modelCalls,
+          modelCallBudget,
+        });
+        const runScoped = scoreMissionV1({
+          ...CLEAN_PASS,
+          modelCalls,
+          modelCallBudget,
+          inheritedModelCalls,
+        });
+        const label = `used=${modelCalls} budget=${modelCallBudget} inherited=${inheritedModelCalls}`;
+        const before = segmentScoped.dimensions.find(
+          (item) => item.id === "model_call_efficiency",
+        )!;
+        const after = runScoped.dimensions.find(
+          (item) => item.id === "model_call_efficiency",
+        )!;
+        assert.ok(after.score >= before.score, `${label}: ${before.score} -> ${after.score}`);
+        assert.ok(after.score >= 0 && after.score <= 1, `${label}: ${after.score}`);
+      }
+    }
+  }
+});
+
 test("recovery attempts decay smoothly rather than stepping to zero", () => {
   const scores = [0, 1, 3, 10].map(
     (attempts) =>
@@ -332,3 +454,7 @@ test("the projection is scannable and reports acceptance alongside the score", (
   assert.match(formatted, /mission_score=1\.000 acceptance=needs_more_work/);
   assert.match(formatted, /- evidence_grounding: 1\.000 \(10\/10 claims cited\)/);
 });
+
+function round4(value: number): number {
+  return Math.round(value * 10_000) / 10_000;
+}

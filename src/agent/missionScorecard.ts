@@ -106,12 +106,33 @@ export interface MissionScorecardInput {
   mutationsWithReceipts: number;
   /** Recovery attempts planned by the recovery engine. */
   recoveryAttempts: number;
-  /** Model calls actually made (`providerUsage.modelCallCount`). */
+  /**
+   * Model calls actually made, read from `providerUsage.modelCallCount`. That
+   * aggregate spans the whole durable run: every continuation segment merges
+   * what it inherited from the ledger it resumed with its own totals, so a
+   * mission continued four times reports all four segments here.
+   */
   modelCalls: number;
-  /** Model calls the route budget expected. */
+  /**
+   * Model calls this segment's route budget granted. Segment-scoped: the
+   * runner rebuilds it from the effort decision at every start, so on its own
+   * it does not cover what earlier segments of the same run already spent.
+   * Supply {@link inheritedModelCalls} so the two sides share one scope.
+   */
   modelCallBudget: number;
+  /**
+   * The part of {@link modelCalls} that earlier segments of the same durable
+   * run spent — the aggregate this segment inherited before measuring a call
+   * of its own. Absent or 0 means a fresh mission, which is what every
+   * non-continued run supplies.
+   */
+  inheritedModelCalls?: number;
+  /** Wall clock spent, run-scoped exactly like {@link modelCalls}. */
   wallClockMs: number;
+  /** Wall clock this segment was allowed, segment-scoped like {@link modelCallBudget}. */
   wallClockBudgetMs: number;
+  /** The part of {@link wallClockMs} inherited, exactly like {@link inheritedModelCalls}. */
+  inheritedWallClockMs?: number;
   /**
    * Research depth inputs. Optional so a non-research mission keeps scoring
    * without supplying them: an absent block means "no web sources required",
@@ -163,6 +184,17 @@ export interface MissionScoreRegression {
 export function scoreMissionV1(
   input: MissionScorecardInput,
 ): MissionScorecardV1 {
+  // Both efficiency ratios take a run-scoped numerator, so both denominators
+  // are raised to the same scope before anything is divided. See
+  // {@link runScopedBudget}.
+  const modelCallBudget = runScopedBudget(
+    input.modelCallBudget,
+    input.inheritedModelCalls,
+  );
+  const wallClockBudgetMs = runScopedBudget(
+    input.wallClockBudgetMs,
+    input.inheritedWallClockMs,
+  );
   const dimensions: MissionScoreDimension[] = [
     dimension(
       "acceptance_coverage",
@@ -213,13 +245,13 @@ export function scoreMissionV1(
     ),
     dimension(
       "model_call_efficiency",
-      budgetEfficiency(input.modelCalls, input.modelCallBudget),
-      `${input.modelCalls}/${input.modelCallBudget} model calls`,
+      budgetEfficiency(input.modelCalls, modelCallBudget),
+      `${input.modelCalls}/${modelCallBudget} model calls`,
     ),
     dimension(
       "wall_clock_efficiency",
-      budgetEfficiency(input.wallClockMs, input.wallClockBudgetMs),
-      `${Math.round(input.wallClockMs / 1000)}s/${Math.round(input.wallClockBudgetMs / 1000)}s`,
+      budgetEfficiency(input.wallClockMs, wallClockBudgetMs),
+      `${Math.round(input.wallClockMs / 1000)}s/${Math.round(wallClockBudgetMs / 1000)}s`,
     ),
   ];
 
@@ -476,9 +508,53 @@ function ratioMet(total: number, missing: number): number {
 }
 
 /**
+ * Raise a per-segment execution budget to the scope of a run-scoped usage
+ * figure.
+ *
+ * `providerUsage` totals span the whole resume chain while the execution
+ * budget is granted afresh at every segment start, so dividing one by the
+ * other measures a continued mission against a denominator covering only its
+ * last segment. Four continuations in, that reported something like 60 calls
+ * against 20 and scored both efficiency dimensions down to a third — for no
+ * reason but having been resumed. The fix carries the baseline rather than
+ * shrinking the numerator, so the score and the ledger keep naming the same
+ * span of the same run.
+ *
+ * Adding the inherited *spend* (not an inherited budget, which is never
+ * persisted) is how the runner already builds every budget it grants:
+ * `applyExecutionBudgetForEffortDecision` sets `maxCalls` to the calls spent
+ * so far plus this segment's allowance. Extending that across the chain adds
+ * the spend the chain carried in, which is exactly the term the segment's own
+ * budget is missing.
+ */
+function runScopedBudget(
+  segmentBudget: number,
+  inheritedUsage: number | undefined,
+): number {
+  // A budget that is absent, zero, or nonsensical already means "no budget
+  // declared", which {@link budgetEfficiency} scores 1. Raising it would
+  // manufacture a denominator out of the numerator's own history and could
+  // score such a run *below* what it scored before. Widening the scope must
+  // never lower a score.
+  if (!Number.isFinite(segmentBudget) || segmentBudget <= 0) {
+    return segmentBudget;
+  }
+  const inherited =
+    typeof inheritedUsage === "number" &&
+    Number.isFinite(inheritedUsage) &&
+    inheritedUsage > 0
+      ? inheritedUsage
+      : 0;
+  return segmentBudget + inherited;
+}
+
+/**
  * Efficiency against a budget. At or under budget scores 1 — finishing early is
  * not extra credit, because rewarding it would pressure the agent to stop
  * short. Overruns decay smoothly so a 2x overrun is clearly worse than 1.1x.
+ *
+ * Both arguments must describe the same span of the run; see
+ * {@link runScopedBudget}.
  */
 function budgetEfficiency(used: number, budget: number): number {
   if (!Number.isFinite(used) || used < 0) return 0;

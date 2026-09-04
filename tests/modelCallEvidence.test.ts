@@ -17,6 +17,65 @@ test("categorizes endpoints without retaining raw URLs", () => {
   assert.equal(categorizeModelEndpoint("https://models.example.test/v1"), "custom");
 });
 
+test("normalizing an inherited aggregate before merging it changes nothing", () => {
+  // AgentRunner reads the run's inherited baseline through one accessor,
+  // `declaredInheritedProviderUsageV1()`, which is `merge(inheritedProviderUsage)`
+  // — so four seats fold `merge(merge(inh), own)` where they used to fold
+  // `merge(inh, own)`. That substitution is only safe while merge is a purely
+  // additive fold whose optional fields appear ONLY when a segment carried
+  // them. The load-bearing case is a silent provider: absent
+  // `cachedPromptTokens` means "no call ever reported caching", which is a
+  // different fact from a measured zero, and normalizing must not invent one.
+  const segment = {
+    schemaVersion: 1 as const,
+    modelCallCount: 7,
+    successfulCallCount: 6,
+    failedCallCount: 1,
+    reportedTokens: 900,
+    estimatedTokens: 0,
+    retries: 2,
+    wallClockMs: 5_000,
+  };
+  const ownShapes = [
+    segment,
+    { ...segment, cachedPromptTokens: 120 },
+    { ...segment, promptPrefixReuseSamples: 3, promptPrefixReuseRatioTotal: 1.8 },
+    {
+      ...segment,
+      cachedPromptTokens: 120,
+      promptPrefixReuseSamples: 3,
+      promptPrefixReuseRatioTotal: 1.8,
+    },
+  ];
+  const inheritedShapes = [null, undefined, segment, { ...segment, cachedPromptTokens: 5 }];
+
+  for (const inherited of inheritedShapes) {
+    for (const own of ownShapes) {
+      const direct = mergeModelUsageAggregatesV1(inherited, own);
+      const viaAccessor = mergeModelUsageAggregatesV1(
+        mergeModelUsageAggregatesV1(inherited),
+        own,
+      );
+      const label = JSON.stringify({ inherited, own });
+      assert.deepEqual(viaAccessor, direct, label);
+      // deepEqual alone would not catch an optional field appearing as 0,
+      // because the fold's other side supplies the same number.
+      assert.deepEqual(
+        Object.keys(viaAccessor).sort(),
+        Object.keys(direct).sort(),
+        `optional-field presence drifted for ${label}`,
+      );
+    }
+  }
+
+  const silent = mergeModelUsageAggregatesV1(
+    mergeModelUsageAggregatesV1(null),
+    segment,
+  );
+  assert.equal("cachedPromptTokens" in silent, false);
+  assert.equal("promptPrefixReuseSamples" in silent, false);
+});
+
 test("merges disjoint provider-usage segments for continuation scorecards", () => {
   assert.deepEqual(
     mergeModelUsageAggregatesV1(
