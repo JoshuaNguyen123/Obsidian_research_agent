@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 import {
   hostProvisionedSandboxAdoptionDecisionV1,
@@ -354,4 +357,28 @@ test("prompts without a sandbox ladder keep passing the preflight untouched", ()
   });
   assert.equal(result.ok, true);
   assert.deepEqual(result.checks, []);
+});
+
+test("community first-run chips never trip sandboxValidationRequired", () => {
+  const settingsSource = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "settings.ts"),
+    "utf8",
+  );
+  const viewSource = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "AgentView.ts"),
+    "utf8",
+  );
+  const block = settingsSource.match(
+    /export const FIRST_RUN_CHAT_SUGGESTIONS\s*=\s*\[([\s\S]*?)\]\s*as const/u,
+  );
+  assert.ok(block, "FIRST_RUN_CHAT_SUGGESTIONS missing");
+  const chips = [...block[1].matchAll(/"([^"]+)"/gu)].map((match) => match[1]);
+  assert.ok(chips.length >= 2);
+  assert.doesNotMatch(viewSource, /tested tool/u);
+  const requiring = chips.filter((chip) => missionRequiresSandboxValidationV1(chip));
+  assert.equal(
+    requiring.length,
+    0,
+    `first_run_chips_requiring_sandbox=${requiring.length} (${requiring.join(" | ")})`,
+  );
 });

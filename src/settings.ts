@@ -100,6 +100,17 @@ export type OutputProfile =
   | "chat_first";
 export type { ModelRouterMode };
 
+/** First-run Chat chips. Research-only; must not trip sandboxValidationRequired. */
+export const FIRST_RUN_CHAT_SUGGESTIONS = [
+  "Research this note and append a cited recommendation.",
+  "Find related vault notes and suggest wiki-links.",
+  "Summarize the active note and list the open questions.",
+] as const;
+
+/** Chat and settings one-liner: companion/overnight resume are not in the community zip. */
+export const COMMUNITY_INSTALL_HONESTY_LINE =
+  "Companion and overnight resume are optional and are not included in the community zip.";
+
 export interface AgentSettings {
   /** Settings schema version for profile migration. */
   settingsSchemaVersion?: number;
@@ -208,6 +219,10 @@ export interface AgentSettings {
   overnightRunsEnabled?: boolean;
   overnightRunHours?: number;
   overnightMaxSegments?: number;
+  /**
+   * Default off. Community installs do not include the companion, so overnight
+   * auto-resume stays off until the user opts in.
+   */
   autoResumeOvernightRuns?: boolean;
   /**
    * When true, Chat shows an unfinished-run banner on panel open.
@@ -235,9 +250,9 @@ export interface AgentSettings {
    */
   modelFallbackEnabled?: boolean;
   keepAwakeDuringOvernightRuns?: boolean;
-  /** Opt-in Lead + Worker orchestration and Orchestrator tab. */
+  /** Opt-in research orchestrator and Orchestrator tab. */
   orchestratorPreviewEnabled?: boolean;
-  /** Lead + Worker team runtime. Defaults on; migrate from orchestratorPreviewEnabled. */
+  /** Research orchestrator runtime. Defaults on; migrate from orchestratorPreviewEnabled. */
   orchestratorEnabled?: boolean;
   /** Permit guarded fast-forward promotion after isolated integration is green. */
   orchestratorAutoMergeGreen?: boolean;
@@ -390,7 +405,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   researchEffortCeiling: "extended",
   defaultMinFetchedSources: 3,
   overnightRunsEnabled: true,
-  autoResumeOvernightRuns: true,
+  autoResumeOvernightRuns: false,
   showUnfinishedRunBannerOnOpen: true,
   runRetentionDays: 30,
   runRetentionMaxRuns: 200,
@@ -471,6 +486,10 @@ export class AgentSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Agentic Researcher" });
     containerEl.createEl("p", {
       text: "Connect a model, pick how the agent should work, then check readiness. Advanced tuning stays collapsed until you need it.",
+      cls: "setting-item-description agentic-settings-intro",
+    });
+    containerEl.createEl("p", {
+      text: COMMUNITY_INSTALL_HONESTY_LINE,
       cls: "setting-item-description agentic-settings-intro",
     });
 
@@ -1742,7 +1761,7 @@ export class AgentSettingTab extends PluginSettingTab {
       parent,
       "agentic-settings-autonomy",
       "Autonomy & schedules",
-      "How far a run may go, overnight work, team workers, and recurring missions.",
+      "How far a run may go, overnight research, research workers, and recurring missions.",
       ["Background work"],
     );
 
@@ -1912,7 +1931,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Enable overnight research")
       .setDesc(
-        "Allow explicit overnight or 8-12 hour prompts to use durable multi-segment execution. Vault nodes wait for Obsidian; eligible pre-authorized non-vault nodes may use the optional secure Companion.",
+        "Allow explicit overnight or 8-12 hour prompts to use durable multi-segment execution. Vault nodes wait for Obsidian. The companion is optional and is not included in the community zip; research works without it.",
       )
       .addToggle((toggle) =>
         toggle
@@ -1980,11 +1999,11 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(overnightHost)
       .setName("Resume overnight runs after reload")
       .setDesc(
-        "Resume the newest safe overnight mission after a plugin reload or crash. Explicitly stopped missions never resume automatically.",
+        "Off by default. Opt in to resume the newest safe overnight mission after a reload or crash. Companion and overnight resume are optional and are not included in the community zip. Explicitly stopped missions never resume automatically.",
       )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.autoResumeOvernightRuns !== false)
+          .setValue(this.plugin.settings.autoResumeOvernightRuns === true)
           .onChange(async (value) => {
             this.plugin.settings.autoResumeOvernightRuns = value;
             await this.plugin.saveSettings();
@@ -2068,9 +2087,9 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(section)
-      .setName("Orchestrator team runtime")
+      .setName("Research orchestrator")
       .setDesc(
-        "On by default. Eligible deep research / sources / verify prompts and explicit code-team requests use Lead + Worker. Turn off to force single-agent.",
+        "On by default. Eligible deep research, sources, and verify prompts can use research workers. Turn off to force a single agent.",
       )
       .addToggle((toggle) =>
         toggle
@@ -2085,28 +2104,9 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    const orchestratorHost: HTMLElement =
-      this.plugin.settings.orchestratorEnabled !== false
-        ? section
-        : document.createElement("div");
-
-    new Setting(orchestratorHost)
-      .setName("Auto-merge green orchestrator worktrees")
-      .setDesc(
-        "After an approved coding mission, fast-forward only when the isolated integration worktree is green and the base checkout is still clean.",
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.orchestratorAutoMergeGreen === true)
-          .onChange(async (value) => {
-            this.plugin.settings.orchestratorAutoMergeGreen = value;
-            await this.plugin.saveSettings();
-          }),
-      );
-
     new Setting(limitsHost)
       .setName("Orchestrator worker max steps")
-      .setDesc("Per-worker step budget for Lead + Worker missions.")
+      .setDesc("Per-worker step budget for orchestrated research missions.")
       .addText((text) =>
         text
           .setPlaceholder(String(DEFAULT_SETTINGS.orchestratorWorkerMaxSteps))
@@ -2126,7 +2126,7 @@ export class AgentSettingTab extends PluginSettingTab {
 
     new Setting(limitsHost)
       .setName("Orchestrator worker max tool calls")
-      .setDesc("Per-worker tool-call budget for Lead + Worker missions.")
+      .setDesc("Per-worker tool-call budget for orchestrated research missions.")
       .addText((text) =>
         text
           .setPlaceholder(
@@ -2625,7 +2625,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Companion service URL")
       .setDesc(
-        "Local companion URL for desktop browser automation and explicit experience memory.",
+        "Optional local companion URL. The companion is a fourth install artifact and is not included in the community zip.",
       )
       .addText((text) =>
         text

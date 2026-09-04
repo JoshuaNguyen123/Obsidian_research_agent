@@ -45,9 +45,10 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 ## Requirements
 
-- Obsidian Desktop 1.11.4 or newer (`manifest.json` `minAppVersion`; the credential system is built on `app.secretStorage`, which shipped in 1.11.4). Version 0.4.0 is desktop-only because the unified Code and Companion modules require guarded Node/Electron capabilities.
-- Node.js and npm.
-- An Ollama Cloud API key for the default BYOK experience. Local Ollama and compatible Ollama endpoints are optional alternatives.
+- Obsidian **Desktop** 1.11.4 or newer (`manifest.json` `minAppVersion` and `isDesktopOnly`; the credential system is built on `app.secretStorage`, which shipped in 1.11.4). This plugin does not run on mobile.
+- Node.js and npm (development only).
+- An Ollama Cloud API key for the default **bring-your-own-key paid cloud** model. You pay the provider you configure. Local Ollama and compatible endpoints are optional alternatives.
+- Vault research, citations, and note writeback work **without WSL**, Docker, or the companion. Those extras are only for code execution and optional unattended background work.
 
 ## Model requirements and reliability status
 
@@ -106,6 +107,8 @@ A missing, stale, or hash-mismatched file is refused. The companion stays off. T
 
 ## Install For Development
 
+Desktop-only. The default model is bring-your-own-key paid cloud. Research works without WSL. The companion is a fourth optional artifact and is not in the community zip.
+
 ```bash
 npm install
 npm run build
@@ -117,7 +120,7 @@ Copy the plugin files into an Obsidian vault plugin folder:
 <vault>/.obsidian/plugins/agentic-researcher/
 ```
 
-Community-installer files:
+Community zip / community-installer files (exactly these three):
 
 ```text
 main.js
@@ -125,7 +128,7 @@ manifest.json
 styles.css
 ```
 
-Optional fourth file for the local companion service (see [What this plugin executes and writes](#what-this-plugin-executes-and-writes)):
+Optional fourth file for the local companion service. It is **not** in the community zip. Research and overnight vault work run without it (see [What this plugin executes and writes](#what-this-plugin-executes-and-writes)):
 
 ```text
 companion-assets.json

@@ -109,6 +109,10 @@ import {
   type ContinuationSuppressionDecision,
 } from "./ui/continuationSuppressionCopy";
 import {
+  COMMUNITY_INSTALL_HONESTY_LINE,
+  FIRST_RUN_CHAT_SUGGESTIONS,
+} from "./settings";
+import {
   blockedSummaryFromFactsV1,
   buildRunFailureEvidenceV1,
   isRunFailureDiagnosticTraceV1,
@@ -1276,15 +1280,15 @@ export class AgentView extends ItemView {
     emptyState.createEl("p", {
       text: "Start with an outcome. The agent will read relevant context, use approved tools, and return the result with receipts.",
     });
+    emptyState.createEl("p", {
+      text: COMMUNITY_INSTALL_HONESTY_LINE,
+      attr: { "data-testid": "community-install-honesty" },
+    });
     const suggestions = emptyState.createDiv({
       cls: "agentic-researcher-chat-suggestions",
       attr: { "aria-label": "Example missions" },
     });
-    for (const prompt of [
-      "Research this note and append a cited recommendation.",
-      "Turn the acceptance criteria in this note into a tested tool.",
-      "Summarize the active note and suggest related vault links.",
-    ]) {
+    for (const prompt of FIRST_RUN_CHAT_SUGGESTIONS) {
       const button = suggestions.createEl("button", {
         text: prompt,
         cls: "agentic-researcher-chat-suggestion",

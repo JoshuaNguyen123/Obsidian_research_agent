@@ -98,6 +98,10 @@ test("completed assistant messages use isolated host-only Markdown rendering", (
 test("empty state and primary mission action use the shared UI system", () => {
   assert.match(viewSource, /What should we work on\?/u);
   assert.match(viewSource, /data-testid": "chat-empty-state"/u);
+  assert.match(viewSource, /FIRST_RUN_CHAT_SUGGESTIONS/u);
+  assert.match(viewSource, /COMMUNITY_INSTALL_HONESTY_LINE/u);
+  assert.match(viewSource, /data-testid": "community-install-honesty"/u);
+  assert.doesNotMatch(viewSource, /tested tool/u);
   assert.match(styles, /\.agentic-researcher-chat-suggestions/u);
   assert.match(styles, /background: var\(--interactive-accent\)/u);
 });
