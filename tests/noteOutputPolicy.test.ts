@@ -79,7 +79,7 @@ describe("noteOutputPolicy decision table", () => {
     });
     assert.equal(result.destination, "new_note");
     assert.equal(result.mutation, "create");
-    assert.equal(result.delivery, "stream");
+    assert.equal(result.delivery, "atomic");
     assert.equal(result.title, "automatic");
     assert.equal(result.reason, "untargeted_content_create");
   });
@@ -111,12 +111,28 @@ describe("noteOutputPolicy decision table", () => {
       "Create a new note about release readiness.",
       "Make me a markdown file called Release Readiness.",
       "Write this in a new note.",
+      "Create a new note titled Photosynthesis Brief.",
     ]) {
       const result = plan({ prompt, hasActiveMarkdownNote: true });
       assert.equal(result.destination, "new_note", prompt);
       assert.equal(result.mutation, "create", prompt);
       assert.equal(result.reason, "explicit_new_note", prompt);
+      assert.equal(result.delivery, "atomic", prompt);
     }
+  });
+
+  it("Create a new note titled Photosynthesis Brief dests new_note even on specialized_route", () => {
+    const prompt = "Create a new note titled Photosynthesis Brief.";
+    const result = plan({
+      prompt,
+      hasActiveMarkdownNote: true,
+      specializedRoute: true,
+      contentProducing: true,
+    });
+    assert.equal(result.destination, "new_note");
+    assert.equal(result.mutation, "create");
+    assert.equal(result.reason, "explicit_new_note");
+    assert.equal(result.delivery, "atomic");
   });
 
   it("placeholder active note allows automatic title", () => {
@@ -137,7 +153,7 @@ describe("noteOutputPolicy decision table", () => {
     });
     assert.equal(result.destination, "new_note");
     assert.equal(result.mutation, "create");
-    assert.equal(result.delivery, "stream");
+    assert.equal(result.delivery, "atomic");
     assert.equal(result.title, "automatic");
     assert.equal(result.reason, "no_active_note_create");
   });

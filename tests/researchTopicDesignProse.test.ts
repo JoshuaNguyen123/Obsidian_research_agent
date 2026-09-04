@@ -8,11 +8,17 @@ import {
 } from "../src/agent/codeDesignIntent";
 import {
   hasCanvasDesignIntent,
+  hasDatasetPathMentionIntent,
   hasDesignPackageIntent,
+  hasDocumentExtractIntent,
   hasGraphConnectionIntent,
+  hasMermaidDesignIntent,
   hasResearchMemoryIntent,
+  hasResearchMemoryReadIntent,
+  hasSpecificFileReadIntent,
   hasVaultBrowseIntent,
   hasVaultContextQuestionIntent,
+  hasWebSearchIntent,
 } from "../src/agent/promptIntentClassifiers";
 import { analyzeGeneratedOutputPrompt } from "../src/agent/generatedOutputPolicy";
 import { planLoopBudget } from "../src/agent/loopPlanner";
@@ -119,6 +125,46 @@ test("working memory and References as subject matter do not plant vault or grap
     hasGraphConnectionIntent("What notes is this note connected to?"),
     true,
   );
+});
+
+test("ROI WS1 classifier pins: web not vault-browse, memory, arxiv, dest helpers", () => {
+  assert.equal(hasVaultBrowseIntent("include a list of sources"), false);
+  assert.equal(hasWebSearchIntent("include a list of sources"), true);
+  assert.equal(hasVaultBrowseIntent("career path"), false);
+  assert.equal(
+    hasVaultBrowseIntent("Write an essay about computer files."),
+    false,
+  );
+  assert.equal(hasVaultBrowseIntent("list files"), true);
+  assert.equal(hasVaultBrowseIntent("Inspect the vault structure with tools."), true);
+  assert.equal(hasVaultBrowseIntent("browse my notes"), true);
+
+  assert.equal(hasResearchMemoryReadIntent("human memory"), false);
+  assert.equal(hasResearchMemoryReadIntent("transformer memory"), false);
+  assert.equal(hasResearchMemoryReadIntent("memory hierarchy"), false);
+  assert.equal(hasResearchMemoryReadIntent("working memory"), false);
+  assert.equal(hasResearchMemoryReadIntent("read research memory"), true);
+  assert.equal(
+    hasResearchMemoryReadIntent("Recall the research on photosynthesis"),
+    true,
+  );
+
+  assert.equal(
+    hasSpecificFileReadIntent("https://arxiv.org/abs/1706.03762"),
+    false,
+  );
+  assert.equal(
+    hasWebSearchIntent("Research this paper: https://arxiv.org/abs/1706.03762"),
+    true,
+  );
+
+  assert.equal(hasDatasetPathMentionIntent("Results.json"), true);
+  assert.equal(hasMermaidDesignIntent("Add a flowchart to this note"), true);
+  assert.equal(
+    hasDocumentExtractIntent("https://www.nature.com/articles/s41586-023-example.pdf"),
+    true,
+  );
+  assert.equal(hasDocumentExtractIntent("open this Nature paper"), true);
 });
 
 test("a research-note continuation with a design-flavored handoff plans no create_design_* node", () => {

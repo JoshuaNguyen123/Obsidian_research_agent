@@ -80,15 +80,19 @@ test("allocateUniqueMarkdownPath suffixes collisions", () => {
   );
 });
 
-test("generate-with-title is visible title intent but not explicit rename", () => {
+test("generate-with-title is not a visible-title rename", () => {
   const prompt =
     "Create a 50 word piece of text with the title Purple Horizon on this page.";
-  assert.equal(isVisibleTitleRenameIntent(prompt), true);
+  assert.equal(isVisibleTitleRenameIntent(prompt), false);
   assert.equal(isExplicitVisibleFileRenameIntent(prompt), false);
   assert.equal(isTitleOnlyIntent(prompt), false);
   assert.equal(hasTitleIntent(prompt), false);
   assert.equal(
     isExplicitVisibleFileRenameIntent("Rename the current note to Purple Horizon."),
+    true,
+  );
+  assert.equal(
+    isVisibleTitleRenameIntent("The current note is still Untitled."),
     true,
   );
 });

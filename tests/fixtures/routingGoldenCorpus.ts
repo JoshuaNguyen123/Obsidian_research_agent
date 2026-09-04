@@ -109,16 +109,14 @@ export const FULL_DESKTOP_LADDER = [
  * 75/85 after WS-5 rebuilt observe() on the production writeback pipeline
  * and added the missing prompt families. 76/85 after WS-2 topic-noun
  * containment flipped guard-desk-notes (topical "game design") to pass.
- * 82/85 after WS-2 classifiers landed on the WS-5 production-shaped
- * corpus: title+stream STEM notes, page-clear wipe/start-over, transformer
- * architecture scholarly stream, and working-memory / References-section
- * topic-noun containment now match expected. guard-desk-notes is a
- * known_miss again (desired single_model_answer/chat; observe now
- * single_model_writeback + append stream kind). title-clause-stream-with-rename
- * dest/delivery now match but route is still single_model_writeback.
- * new-note-titled is still current-note writeback, not new_note create.
+ * 83/85 after new-note-titled matches production: dest/create is atomic
+ * create_file, so stream kinds are null. ROI WS1 had already flipped
+ * title-clause-stream-with-rename to tool_required. script-verb-downloads lost
+ * its accidental vault-browse (bare "folder") and is now a known_miss.
+ * guard-desk-notes is a known_miss (desired single_model_answer/chat; observe
+ * now single_model_writeback + append stream kind).
  */
-export const ROUTING_BASELINE_ACCURACY = 82 / 85;
+export const ROUTING_BASELINE_ACCURACY = 83 / 85;
 
 export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
   {
@@ -854,7 +852,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     expected: {
       speechAct: "execute",
       executionTier: "bounded_tool",
-      route: "grounded_workflow",
+      route: "tool_required",
       streamingWritebackKind: null,
       directCurrentNoteWritebackKind: null,
       noteOutputDestination: "chat",
@@ -1011,7 +1009,12 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "stream",
     },
-    status: "pass",
+    current: {
+      // Previously grounded only because bare "folder" matched vault-browse.
+      route: "direct_writeback",
+      directCurrentNoteWritebackKind: "append",
+    },
+    status: "known_miss",
   },
   {
     id: "program-typo-prgram",
@@ -1296,7 +1299,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     status: "pass",
   },
   {
-    // dest/delivery now match; route is still single_model_writeback, not tool_required.
+    // dest/delivery match; sidecar rename is tool_required so rename_current_file can run.
     id: "title-clause-stream-with-rename",
     prompt: "Write a 200 word brief on photosynthesis. Stream onto this page. Change the title as well.",
     expected: {
@@ -1309,10 +1312,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "append",
       noteOutputDelivery: "stream",
     },
-    current: {
-      route: "single_model_writeback",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
     // Stream onto this page without a title clause should stay on the active note.
@@ -1383,7 +1383,6 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
     status: "pass",
   },
   {
-    // known_miss WS-2: Create a new note titled X should dest new_note, not current-note writeback.
     id: "new-note-titled",
     prompt: "Create a new note titled Photosynthesis Brief.",
     expected: {
@@ -1396,15 +1395,7 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
       noteOutputMutation: "create",
       noteOutputDelivery: "atomic",
     },
-    current: {
-      route: "direct_writeback",
-      streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: "append",
-      noteOutputDestination: "chat",
-      noteOutputMutation: "append",
-      noteOutputDelivery: "atomic",
-    },
-    status: "known_miss",
+    status: "pass",
   },
   {
     // architecture is a design noun; this stays scholarly stream-to-page.
@@ -1442,14 +1433,16 @@ export const ROUTING_GOLDEN_CORPUS: readonly RoutingGoldenCaseV1[] = [
   },
   {
     // a References section is note structure, not graph-connection.
+    // static-gen + research now grants web (ROI WS1 P0).
     id: "references-section-steal",
     prompt: "Write a research note with a References section onto this page.",
     expected: {
       speechAct: "persist",
       executionTier: "bounded_tool",
-      route: "direct_writeback",
+      route: "grounded_workflow",
+      reasonsInclude: ["web_search_intent"],
       streamingWritebackKind: "append",
-      directCurrentNoteWritebackKind: "append",
+      directCurrentNoteWritebackKind: null,
       noteOutputDestination: "active_note",
       noteOutputMutation: "append",
       noteOutputDelivery: "stream",
@@ -1563,17 +1556,11 @@ export function observeProductionRouting(input: {
     input.prompt,
     missionIntent,
   );
-  const streamingWritebackKind = getStreamingWritebackKind(
+  const streamingWritebackKindRaw = getStreamingWritebackKind(
     input.prompt,
     toolContext,
     true,
   );
-  const directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
-    prompt: input.prompt,
-    missionIntent,
-    streamingWritebackKind,
-    toolContext,
-  });
   const noteOutput = buildMissionNoteOutputPlan({
     prompt: input.prompt,
     missionIntent,
@@ -1581,6 +1568,17 @@ export function observeProductionRouting(input: {
     enableStreaming: true,
     forceChatOnly,
   });
+  const streamingWritebackKind =
+    noteOutput.destination === "new_note" ? null : streamingWritebackKindRaw;
+  const directCurrentNoteWritebackKind =
+    noteOutput.destination === "new_note"
+      ? null
+      : getDirectCurrentNoteWritebackKind({
+          prompt: input.prompt,
+          missionIntent,
+          streamingWritebackKind,
+          toolContext,
+        });
   const plan = createRunPlan({
     prompt: input.prompt,
     missionIntent,

@@ -239,7 +239,7 @@ test("run planner exposes route decisions, allowed tool names, and trace reasons
   }
 });
 
-test("change the title as well keeps streamed writeback plus one rename step", () => {
+test("change the title as well stays tool_required so rename_current_file can run", () => {
   const prompt =
     "Write a 50 word piece of text on this page. Change the title as well.";
   const plan = createRunPlan({
@@ -255,11 +255,10 @@ test("change the title as well keeps streamed writeback plus one rename step", (
     streamingWritebackKind: "append",
     directCurrentNoteWritebackKind: null,
   });
-  assert.equal(plan.route, "single_model_writeback");
+  assert.equal(plan.route, "tool_required");
   assert.equal(plan.maxStepsForRun, 2);
   assert.ok(plan.traceReasons.includes("streaming_writeback:append"));
   assert.ok(plan.traceReasons.includes("sidecar_title_rename"));
-  assert.notEqual(plan.route, "tool_required");
 });
 
 test("authority router code proposal selects the code route only above direct chat", () => {
@@ -357,11 +356,10 @@ test("compound title and current-note content stays streamed with a sidecar rena
     directCurrentNoteWritebackKind: null,
   });
 
-  assert.equal(plan.route, "single_model_writeback");
+  assert.equal(plan.route, "tool_required");
   assert.equal(plan.maxStepsForRun, 2);
   assert.ok(plan.traceReasons.includes("streaming_writeback:append"));
   assert.ok(plan.traceReasons.includes("sidecar_title_rename"));
-  assert.notEqual(plan.route, "tool_required");
 });
 
 test("explicit code workspace tools receive a grounded multi-step budget", () => {

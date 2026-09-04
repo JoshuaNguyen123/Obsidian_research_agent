@@ -96,10 +96,31 @@ test("static generation without source language does not invent a web obligation
 
 test("literary book citations and source-code artifacts stay out of the fetched-web family", () => {
   assert.equal(hasFetchedWebSourceIntent(LITERARY), false);
+  assert.equal(hasWebSearchIntent(LITERARY), false);
   assert.equal(analyzeGeneratedOutputPrompt(LITERARY).requiresGrounding, false);
   assert.equal(hasFetchedWebSourceIntent(CODE_SOURCE_FILES), false);
   assert.equal(
     matchesSourcesOrWebLanguageV1("Read the source files in src/agent."),
     false,
   );
+});
+
+test("include a list of sources is fetched-web language, not a literary pin", () => {
+  const prompt = "include a list of sources";
+  assert.equal(matchesFetchedWebSourceLanguageV1(prompt), true);
+  assert.equal(hasFetchedWebSourceIntent(prompt), true);
+  assert.equal(hasWebSearchIntent(prompt), true);
+});
+
+test("Write a 1000 word research note on photosynthesis grants web", () => {
+  const prompt = "Write a 1000 word research note on photosynthesis";
+  assert.equal(hasStaticGenerationIntent(prompt), true);
+  assert.equal(hasWebSearchIntent(prompt), true);
+});
+
+test("a concise research paragraph without sources stays local drafting", () => {
+  const prompt =
+    "I want you to generate a concise research paragraph regarding the Vietnam War.";
+  assert.equal(hasStaticGenerationIntent(prompt), true);
+  assert.equal(hasWebSearchIntent(prompt), false);
 });

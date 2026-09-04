@@ -5,6 +5,7 @@
 
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
 import { detectExplicitReplaceIntent } from "./replaceIntent";
+import { isTitleOnlyIntent } from "./titleIntent";
 export { detectExplicitReplaceIntent };
 
 export type NoteOutputDestination = "active_note" | "new_note" | "chat";
@@ -92,6 +93,12 @@ const EXPLICIT_ACTIVE_NOTE_TARGET_PATTERN =
 const UNTARGETED_REPORT_ARTIFACT_PATTERN =
   /\b(?:guide|report)\b/iu;
 
+const EXPLICIT_VAULT_MARKDOWN_PATH =
+  /(?:^|[\s"'`/\\])[\w .@()-]+\/[\w .@()/-]+\.md\b/i;
+
+const DELETE_NAMED_NOTE_PATTERN =
+  /\b(?:delete|remove|trash)\b[\s\S]{0,80}\b(?:current|this|active|the)\s+(?:note|page|document|file)\b/i;
+
 const PRESERVE_TITLE_PATTERN =
   /\b(keep|preserve|do\s+not\s+(?:change|rename|retitle)|don'?t\s+(?:change|rename|retitle))\b[\s\S]{0,40}\b(title|name|filename)\b/i;
 
@@ -150,12 +157,6 @@ export function resolveNoteOutputPlan(
   if (detectChatOnlyIntent(prompt)) {
     return chatPlan("explicit_chat_only");
   }
-  if (specialized) {
-    return chatPlan("specialized_route");
-  }
-  if (!contentProducing) {
-    return chatPlan("trivial_chat");
-  }
 
   const title = resolveTitlePolicy({
     autoTitleOnWrite: input.autoTitleOnWrite,
@@ -164,14 +165,62 @@ export function resolveNoteOutputPlan(
     activeNoteIsPlaceholder: input.activeNoteIsPlaceholder === true,
   });
 
-  if (explicitNewNote) {
+  // Named note destinations outrank specialized_route chat. Code/design keep
+  // specialized tooling in the runner; dest follows the note the user named.
+  // Path-targeted create_file (Projects/Brief.md) and title-only / delete
+  // current-note work stay specialized_route chat.
+  if (explicitNewNote && !EXPLICIT_VAULT_MARKDOWN_PATH.test(prompt)) {
     return {
       destination: "new_note",
       mutation: "create",
-      delivery,
+      delivery: "atomic",
       title: preserveTitle ? "preserve" : input.autoTitleOnWrite ? "automatic" : "preserve",
       reason: "explicit_new_note",
     };
+  }
+
+  if (
+    input.hasActiveMarkdownNote &&
+    explicitActiveNoteTarget &&
+    !isTitleOnlyIntent(prompt) &&
+    !DELETE_NAMED_NOTE_PATTERN.test(prompt) &&
+    !EXPLICIT_VAULT_MARKDOWN_PATH.test(prompt)
+  ) {
+    if (input.sectionTarget && input.sectionTarget.headings.length > 0) {
+      return {
+        destination: "active_note",
+        mutation:
+          input.sectionTarget.mode === "replace"
+            ? "section_replace"
+            : "section_append",
+        delivery,
+        title: "preserve",
+        reason: "section_target_matched",
+      };
+    }
+    if (input.sectionTargetAmbiguous) {
+      return {
+        destination: "chat",
+        mutation: "append",
+        delivery: "atomic",
+        title: "preserve",
+        reason: "section_target_ambiguous",
+      };
+    }
+    return {
+      destination: "active_note",
+      mutation: explicitReplace ? "replace" : "append",
+      delivery,
+      title,
+      reason: explicitReplace ? "replace_explicit" : "active_note_available",
+    };
+  }
+
+  if (specialized) {
+    return chatPlan("specialized_route");
+  }
+  if (!contentProducing) {
+    return chatPlan("trivial_chat");
   }
 
   if (input.hasActiveMarkdownNote) {
@@ -225,7 +274,7 @@ export function resolveNoteOutputPlan(
       return {
         destination: "new_note",
         mutation: "create",
-        delivery,
+        delivery: "atomic",
         title: input.autoTitleOnWrite && !preserveTitle ? "automatic" : "preserve",
         reason: "untargeted_content_create",
       };
@@ -261,7 +310,7 @@ export function resolveNoteOutputPlan(
   return {
     destination: "new_note",
     mutation: "create",
-    delivery,
+    delivery: "atomic",
     title: input.autoTitleOnWrite && !preserveTitle ? "automatic" : "preserve",
     reason: "no_active_note_create",
   };

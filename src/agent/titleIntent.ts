@@ -59,19 +59,9 @@ export function isVisibleTitleRenameIntent(prompt: string): boolean {
     return true;
   }
 
-  const explicitlyTargetsVisibleNoteTitle =
-    /\b(?:page|file|tab|visible|note)\s+title\b|\bcall\s+(?:this|the)\s+note\b/i.test(
-      prompt,
-    );
-  const targetsArtifactTitle =
-    /\b(?:canvas|diagram|svg|mermaid|wireframe|mockup|design|graph|chart)\b[\s\S]{0,80}\btitle\b|\btitle\b[\s\S]{0,80}\b(?:canvas|diagram|svg|mermaid|wireframe|mockup|design|graph|chart)\b/i.test(
-      prompt,
-    );
-  if (targetsArtifactTitle && !explicitlyTargetsVisibleNoteTitle) {
-    return false;
-  }
-
-  return /\b(title|untitled)\b/i.test(prompt);
+  // Placeholder Untitled only. A bare "title" / "titled X" research note is
+  // streamed writeback, not a rename mission.
+  return /\buntitled\b/i.test(prompt);
 }
 
 /**
@@ -83,7 +73,7 @@ export function isVisibleTitleRenameIntent(prompt: string): boolean {
  * Purple Horizon" is not title-primary: streamed current-note writeback
  * stays, and an explicit rename is a sidecar tool step. Do not treat
  * `isVisibleTitleRenameIntent` alone as hasTitleIntent — that matcher is
- * true for any "title" word, including generate-with-title prompts.
+ * explicit rename or placeholder Untitled, not any "title" word.
  */
 export function hasTitleIntent(prompt: string): boolean {
   if (

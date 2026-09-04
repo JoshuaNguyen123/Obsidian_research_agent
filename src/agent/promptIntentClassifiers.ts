@@ -200,11 +200,11 @@ export function hasVaultIndexIntent(prompt: string): boolean {
   );
 }
 
-/** A vault-relative or basename `*.csv` / `*.tsv` (or ndjson) path mention. */
+/** A vault-relative or basename `*.csv` / `*.tsv` / `*.json` (or ndjson) path mention. */
 export function hasDatasetPathMentionIntent(prompt: string): boolean {
   return (
-    /\*\.(?:csv|tsv|ndjson)\b/i.test(prompt) ||
-    /(?:^|[\s"'`/\\])[\w.-]+\.(?:csv|tsv|ndjson)\b/i.test(prompt)
+    /\*\.(?:csv|tsv|ndjson|json)\b/i.test(prompt) ||
+    /(?:^|[\s"'`/\\])[\w.-]+\.(?:csv|tsv|ndjson|json)\b/i.test(prompt)
   );
 }
 
@@ -838,8 +838,22 @@ function withoutWorkingMemoryTopic(prompt: string): string {
 }
 
 export function hasResearchMemoryReadIntent(prompt: string): boolean {
-  return /\b(research\s+memory|topic\s+memory|memory|remember|recall|long[-\s]?term|continue\s+(?:this|the)\s+research|build\s+on\s+(?:this|the)\s+research)\b/i.test(
-    withoutWorkingMemoryTopic(prompt),
+  const scoped = withoutWorkingMemoryTopic(prompt);
+  if (
+    /\b(?:research\s+memory|topic\s+memory)\b/i.test(scoped) ||
+    /\b(?:continue\s+(?:this|the)\s+research|build\s+on\s+(?:this|the)\s+research)\b/i.test(
+      scoped,
+    )
+  ) {
+    return true;
+  }
+  return (
+    /\b(?:remember|recall)\b[\s\S]{0,80}\b(?:research(?:\s+memory)?|topic(?:\s+memory)?|mission|findings?|sources?)\b/i.test(
+      scoped,
+    ) ||
+    /\b(?:research(?:\s+memory)?|topic(?:\s+memory)?|mission|findings?|sources?)\b[\s\S]{0,80}\b(?:remember|recall)\b/i.test(
+      scoped,
+    )
   );
 }
 
@@ -922,8 +936,23 @@ export function hasVaultBrowseIntent(prompt: string): boolean {
   if (/\btemplates?\b/i.test(prompt)) {
     return false;
   }
-  return /\b(vault|files|file names|filenames|markdown files|md files|folders|folder|directory|directories|path|paths|list|browse|inspect|where\s+this\s+note\s+belongs|placement|organize\s+(?:the\s+)?vault|across\s+files)\b/i.test(
-    prompt,
+  // Do not steal the web route on "include a list of sources", "career path",
+  // or ordinary essay "files". Vault / browse-the-vault / list-files still match.
+  return (
+    /\bvault\b/i.test(prompt) ||
+    /\b(?:file\s+names|filenames|markdown\s+files|md\s+files)\b/i.test(prompt) ||
+    /\blist\s+(?:(?:the|all|my|our)\s+)*(?:markdown\s+)?(?:files?|notes?|folders?|director(?:y|ies)|filenames?|file\s+names)\b/i.test(
+      prompt,
+    ) ||
+    /\b(?:browse|inspect)\s+(?:(?:the|my|our|this|all)\s+)*(?:vault|markdown\s+files|md\s+files|files?|folders?|notes?|director(?:y|ies))\b/i.test(
+      prompt,
+    ) ||
+    /\b(?:vault|markdown\s+files|md\s+files|folders?|director(?:y|ies))\b[\s\S]{0,40}\b(?:browse|inspect)\b/i.test(
+      prompt,
+    ) ||
+    /\bwhere\s+this\s+note\s+belongs\b/i.test(prompt) ||
+    /\borganize\s+(?:the\s+)?vault\b/i.test(prompt) ||
+    /\bacross\s+files\b/i.test(prompt)
   );
 }
 
@@ -942,9 +971,13 @@ export function hasFolderContentQuestionIntent(prompt: string): boolean {
   );
 }
 
+const PUBLIC_NETWORK_SLASH_PATH =
+  /https?:\/\/\S+|\b(?:doi\.org|arxiv\.org)\/\S+/gi;
+
 export function hasSpecificFileReadIntent(prompt: string): boolean {
+  const local = prompt.replace(PUBLIC_NETWORK_SLASH_PATH, " ");
   return /(?:^|[\s"'`])[\w .@()-]+\/[\w .@()/-]+|\.md\b|\b(file named|note named|named file|named note|specific file|existing file|vault file)\b/i.test(
-    prompt,
+    local,
   );
 }
 
@@ -1436,12 +1469,21 @@ export function hasWebSearchIntent(prompt: string): boolean {
   }
 
   // Static generation is local drafting unless the shared source-intent
-  // family says the user asked for fetched/public sources. This gate must
-  // not be able to contradict the proof / generated / effort / catalog
-  // seats: they all read `hasFetchedWebSourceIntent` /
+  // family says the user asked for fetched/public sources, or the draft is
+  // itself a research|investigate note. Literary "citations from the book"
+  // stay local. This gate must not contradict the proof / generated / effort /
+  // catalog seats: they all read `hasFetchedWebSourceIntent` /
   // `matchesFetchedWebSourceLanguageV1`.
   if (hasStaticGenerationIntent(prompt) && !hasFetchedWebSourceIntent(prompt)) {
-    return false;
+    const longResearchNote =
+      /\b(?:research|investigate)\b/i.test(prompt) &&
+      !hasPrimaryTextCitationIntent(prompt) &&
+      (/\b\d{3,}\s*[- ]?words?\b/i.test(prompt) ||
+        /\bresearch\s+note\b/i.test(prompt) ||
+        /\blong\s+research\b/i.test(prompt));
+    if (!longResearchNote) {
+      return false;
+    }
   }
 
   if (hasFolderContentQuestionIntent(prompt)) {
@@ -1545,7 +1587,7 @@ export function hasTitleOnlyIntent(prompt: string): boolean {
 }
 
 export function hasMermaidDesignIntent(prompt: string): boolean {
-  return /\bmermaid\b/i.test(prompt);
+  return /\b(?:mermaid|flowchart)\b/i.test(prompt);
 }
 
 /** PDF / companion document-extract prompts. */
@@ -1553,8 +1595,10 @@ export function hasDocumentExtractIntent(prompt: string): boolean {
   return (
     /\b(?:extract_document|document_extract)\b/i.test(prompt) ||
     /\b(?:pdf|\.pdf)\b/i.test(prompt) ||
+    /https?:\/\/\S+\.pdf\b/i.test(prompt) ||
     /\bextract(?:\s+text)?\s+from\s+(?:the\s+)?(?:pdf|document)\b/i.test(prompt) ||
-    /\b(?:read|parse|ingest|ocr)\b[\s\S]{0,80}\b(?:pdf|document)\b/i.test(prompt)
+    /\b(?:read|parse|ingest|ocr)\b[\s\S]{0,80}\b(?:pdf|document)\b/i.test(prompt) ||
+    /\bopen\s+this\s+nature\s+paper\b/i.test(prompt)
   );
 }
 

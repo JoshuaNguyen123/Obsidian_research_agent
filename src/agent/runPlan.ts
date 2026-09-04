@@ -368,7 +368,7 @@ export function createRunPlan({
     });
   }
 
-  if (directCurrentNoteWritebackKind !== null) {
+  if (directCurrentNoteWritebackKind !== null && outputTarget !== "new_note") {
     return plan({
       route: "direct_writeback",
       maxStepsForRun: capSteps(1),
@@ -527,28 +527,39 @@ export function createRunPlan({
   }
 
   // Body write stays on streamed writeback. An explicit "change the title
-  // as well" is one extra rename tool step, not a flip to the tool loop
-  // and not a chat destination.
+  // as well" stays tool_required so rename_current_file can run; dest stays
+  // the named note, not chat. A new_note dest must not take the current-note
+  // stream shortcut.
   if (
     streamingWritebackKind !== null &&
+    outputTarget !== "new_note" &&
     !hasTitleIntent(prompt) &&
     !isTitleOnlyIntent(prompt)
   ) {
     const sidecarTitleRename = isExplicitVisibleFileRenameIntent(prompt);
+    if (sidecarTitleRename) {
+      return plan({
+        route: "tool_required",
+        maxStepsForRun: capSteps(2),
+        thinking: undefined,
+        allowedTools: tools,
+        slowPathReason: "none",
+        expectedTimeClass: "quick",
+        traceReasons: [
+          `streaming_writeback:${streamingWritebackKind}`,
+          "sidecar_title_rename",
+        ],
+      });
+    }
     return plan({
       route: "single_model_writeback",
-      maxStepsForRun: capSteps(
-        streamingWritebackKind === "edit" ? 3 : sidecarTitleRename ? 2 : 1,
-      ),
+      maxStepsForRun: capSteps(streamingWritebackKind === "edit" ? 3 : 1),
       thinking: undefined,
       allowedTools: tools,
       slowPathReason:
         streamingWritebackKind === "edit" ? "needs_edit_or_replace" : "none",
       expectedTimeClass: streamingWritebackKind === "edit" ? "normal" : "quick",
-      traceReasons: [
-        `streaming_writeback:${streamingWritebackKind}`,
-        ...(sidecarTitleRename ? ["sidecar_title_rename"] : []),
-      ],
+      traceReasons: [`streaming_writeback:${streamingWritebackKind}`],
     });
   }
 
