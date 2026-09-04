@@ -66,6 +66,7 @@ import {
   recordDailyUseAcceptance,
 } from "./fixtures/dailyUseAcceptance";
 import type { MissionScorecardV1 } from "../src/agent/missionScorecard";
+import { runScopedProviderUsageV1 } from "../src/agent/runCoordinator";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
 import {
   assertVerifiedCommitBoundCodeExamplesV1,
@@ -224,6 +225,8 @@ interface PhaseModelUsageProofV1 {
   }>;
   terminalUsageScopeId: string;
   terminalCoordinatorModelCalls: number;
+  terminalInheritedModelCalls: number;
+  terminalRunScopedModelCalls: number;
   finalSegmentModelCalls: number;
 }
 
@@ -2533,16 +2536,42 @@ function assertPhaseModelCallAccounting(
     Number.isSafeInteger(finalSegmentModelCalls) && finalSegmentModelCalls > 0,
     `${phase} final ledger segment did not attest a positive model-call count`,
   ).toBe(true);
+
+  // The ledger spans the whole resume chain; the coordinator scope above spans
+  // one start. Every Continue click opens a new scope, so the two only become
+  // comparable once the scope's declared inheritance is added back -- through
+  // the product's own predicate, not a number this lane re-derives.
+  const terminalInheritedModelCalls =
+    snapshot?.providerUsageInherited?.modelCallCount;
   expect(
-    terminalCoordinatorModelCalls,
+    Number.isSafeInteger(terminalInheritedModelCalls) &&
+      terminalInheritedModelCalls >= 0,
+    `${phase} coordinator did not attest what its scope inherited`,
+  ).toBe(true);
+  const terminalRunScopedModelCalls = runScopedProviderUsageV1({
+    providerUsage: snapshot.providerUsage,
+    providerUsageInherited: snapshot.providerUsageInherited,
+  }).modelCallCount;
+  expect(
+    terminalRunScopedModelCalls,
     `${phase} coordinator aggregate omitted calls attested by its final ledger segment`,
   ).toBeGreaterThanOrEqual(finalSegmentModelCalls);
+  // A scope that inherited nothing must have measured the ledger itself: an
+  // uncontinued phase keeps the original, stricter reading of the invariant.
+  if (terminalInheritedModelCalls === 0) {
+    expect(
+      terminalCoordinatorModelCalls,
+      `${phase} coordinator scope inherited nothing yet counted fewer calls than its ledger`,
+    ).toBeGreaterThanOrEqual(finalSegmentModelCalls);
+  }
   return {
     version: 1,
     modelCallCount: phaseDelta,
     usageScopes,
     terminalUsageScopeId,
     terminalCoordinatorModelCalls,
+    terminalInheritedModelCalls,
+    terminalRunScopedModelCalls,
     finalSegmentModelCalls,
   };
 }

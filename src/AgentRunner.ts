@@ -45,6 +45,7 @@ import {
   extractProviderTokenUsage,
   mergeModelUsageAggregatesV1,
   type ModelCallEvidenceV1,
+  type ProviderUsageInheritanceV1,
   type ModelExecutionBudgetV1,
   type ModelUsageAggregateV1,
 } from "./model/modelCallEvidence";
@@ -1612,6 +1613,17 @@ export interface AgentRunEvents {
   onMetric?: (event: AgentRunMetricEvent) => void;
   /** Redacted provider attestation. Never contains prompts, responses, URLs, or credentials. */
   onModelCallEvidence?: (event: ModelCallEvidenceV1) => void;
+  /**
+   * The provider usage this segment inherited from earlier segments of the
+   * same durable run, declared once before the segment measures its own.
+   *
+   * The mission ledger folds this same aggregate into `providerUsage`, so a
+   * live observer (RunCoordinator) that starts counting at zero each segment
+   * cannot be compared against the ledger without it. Emitted for every
+   * segment, including a fresh mission, so "inherited nothing" is an
+   * attestation rather than an absence.
+   */
+  onProviderUsageInherited?: (event: ProviderUsageInheritanceV1) => void;
   /** Redacted durable source attestation. Never contains source text, paths, or URLs. */
   onMissionEvidence?: (event: MissionEvidenceAttestationV1) => void;
   /** Graded run-quality projection; acceptance remains the independent gate. */
@@ -4095,6 +4107,15 @@ export async function runAgentMission({
   inheritedProviderUsage = resumeLedger?.providerUsage
     ? { ...resumeLedger.providerUsage }
     : null;
+  // One declaration, from the one place the inherited aggregate is computed.
+  // Every live observer of this run needs the same baseline the ledger is
+  // about to merge, or its own totals describe a shorter span of the run.
+  events.onProviderUsageInherited?.({
+    schemaVersion: 1,
+    runId,
+    resumedFromRunId: resumeLedger?.runId ?? null,
+    usage: mergeModelUsageAggregatesV1(inheritedProviderUsage),
+  });
   if (resumeLedger && isPrePlanningAnchorLedger(resumeLedger)) {
     // Anchor-only continuation: the interrupted run persisted its durable
     // anchor but planning never began, so there is nothing to preserve

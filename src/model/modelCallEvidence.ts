@@ -126,6 +126,74 @@ export function mergeModelUsageAggregatesV1(
 }
 
 /**
+ * Provider usage a run segment inherited from earlier segments of the same
+ * durable run, declared once by the runner before the segment measures any
+ * calls of its own.
+ *
+ * The mission ledger merges this exact aggregate with the segment's live
+ * totals, so its `providerUsage` spans the whole resume chain. RunCoordinator
+ * measures only the evidence its own scope observes. Without the declaration
+ * the two surfaces silently span different parts of the same run, and the
+ * coordinator's whole-team aggregate reads *smaller* than the ledger segment
+ * it publishes — an aggregate below one of its own parts.
+ */
+export interface ProviderUsageInheritanceV1 {
+  schemaVersion: 1;
+  /** The segment declaring what it inherited. */
+  runId: string;
+  /** The durable run whose ledger supplied it; null for a fresh mission. */
+  resumedFromRunId: string | null;
+  usage: ModelUsageAggregateV1;
+}
+
+/**
+ * Coerce a persisted or cross-process usage aggregate into the current shape.
+ * The mission ledger's readback and RunCoordinator's event intake share this
+ * one normalizer so a legacy record cannot mean two different things to the
+ * two subsystems that must agree about it.
+ */
+export function normalizeModelUsageAggregateV1(
+  value: unknown,
+): ModelUsageAggregateV1 {
+  const record = isRecord(value) ? value : {};
+  return {
+    schemaVersion: 1,
+    modelCallCount: wholeUsageCount(record.modelCallCount),
+    successfulCallCount: wholeUsageCount(record.successfulCallCount),
+    failedCallCount: wholeUsageCount(record.failedCallCount),
+    reportedTokens: wholeUsageCount(record.reportedTokens),
+    estimatedTokens: wholeUsageCount(record.estimatedTokens),
+    retries: wholeUsageCount(record.retries),
+    wallClockMs: wholeUsageCount(record.wallClockMs),
+    ...(usageNumber(record.cachedPromptTokens) !== undefined
+      ? { cachedPromptTokens: wholeUsageCount(record.cachedPromptTokens) }
+      : {}),
+    // Prefix-reuse totals travel as a pair; one without the other is
+    // unreadable and normalizes to absent (unknown), never to a zero average.
+    ...(usageNumber(record.promptPrefixReuseSamples) !== undefined &&
+    usageNumber(record.promptPrefixReuseRatioTotal) !== undefined
+      ? {
+          promptPrefixReuseSamples: wholeUsageCount(
+            record.promptPrefixReuseSamples,
+          ),
+          promptPrefixReuseRatioTotal: Math.max(
+            0,
+            usageNumber(record.promptPrefixReuseRatioTotal) ?? 0,
+          ),
+        }
+      : {}),
+  };
+}
+
+function usageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function wholeUsageCount(value: unknown): number {
+  return Math.max(0, Math.floor(usageNumber(value) ?? 0));
+}
+
+/**
  * Mean per-step prompt-prefix reuse ratio (0..1) carried by a usage
  * aggregate, or null when no step was measured. The runner measures a step
  * only against a previous step, so a single-call mission has no sample and

@@ -61,7 +61,10 @@ import {
   writeMissionRuntimeSnapshot,
   type MissionRuntimeSnapshotV2,
 } from "../src/agent/runStore";
-import { RunCoordinator } from "../src/agent/runCoordinator";
+import {
+  RunCoordinator,
+  runScopedProviderUsageV1,
+} from "../src/agent/runCoordinator";
 import type { AgentSettings } from "../src/settings";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import { ScopedToolRegistry } from "../src/tools/ScopedToolRegistry";
@@ -3879,6 +3882,68 @@ test("continue run of an anchor-only interrupted run restarts the mission from i
       ),
     ) >= 3,
     "the continuation ledger must add this segment's call to the two durable prior calls",
+  );
+});
+
+test("a coordinator-backed continuation aggregate is never short of the ledger it resumed", async () => {
+  // The BYOK journey's Phase A failure, reduced: a durable run with two prior
+  // provider calls is continued in a NEW coordinator scope. The ledger merges
+  // what it inherited, so it attests 3; the scope only ever saw 1. Comparing
+  // the two without the declared baseline reads an aggregate as smaller than
+  // one of its own parts.
+  const vault = createVaultHarness();
+  const coordinator = new RunCoordinator();
+  const interruptedRunId = "run-usage-inheritance-continuation";
+  const anchor = createPrePlanningAnchorLedger({
+    runId: interruptedRunId,
+    mission: "Append the inherited-usage proof to the current note.",
+    targetNotePath: "Current.md",
+    now: new Date("2026-07-10T12:10:00.000Z"),
+  });
+  anchor.providerUsage = {
+    schemaVersion: 1,
+    modelCallCount: 2,
+    successfulCallCount: 1,
+    failedCallCount: 1,
+    reportedTokens: 120,
+    estimatedTokens: 0,
+    retries: 1,
+    wallClockMs: 4_000,
+  };
+  await writeMissionLedger(vault.context, anchor);
+
+  await coordinator.start((abortSignal, events) =>
+    runAgentMission({
+      prompt: `continue run ${interruptedRunId}`,
+      modelClient: createModelClient([
+        responseWithToolCall("append_to_current_file", {
+          text: "inherited usage proof",
+        }),
+      ]),
+      toolRegistry: createDefaultToolRegistry(),
+      toolContext: vault.context,
+      enableStreaming: false,
+      abortSignal,
+      events,
+    }),
+  );
+
+  const snapshot = coordinator.getSnapshot();
+  const ledgerModelCalls =
+    snapshot.lastMissionLedger?.providerUsage.modelCallCount ?? 0;
+  assert.ok(
+    ledgerModelCalls >= 3,
+    `the resumed ledger must carry the durable prior calls: ${ledgerModelCalls}`,
+  );
+  // The scope still measures only itself, so per-scope counts stay disjoint.
+  assert.ok(
+    snapshot.providerUsage.modelCallCount < ledgerModelCalls,
+    "this scope is expected to have measured less than the whole resume chain",
+  );
+  assert.equal(snapshot.providerUsageInherited.modelCallCount, 2);
+  assert.ok(
+    runScopedProviderUsageV1(snapshot).modelCallCount >= ledgerModelCalls,
+    `run-scoped usage ${JSON.stringify(runScopedProviderUsageV1(snapshot))} is short of ledger ${ledgerModelCalls}`,
   );
 });
 

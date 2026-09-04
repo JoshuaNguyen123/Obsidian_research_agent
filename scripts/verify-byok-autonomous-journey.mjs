@@ -545,6 +545,10 @@ function validatePhaseProviderUsage(value, expectedPhase) {
       value.terminalUsageScopeId.trim().length > 0 &&
       Number.isSafeInteger(value.terminalCoordinatorModelCalls) &&
       value.terminalCoordinatorModelCalls > 0 &&
+      Number.isSafeInteger(value.terminalInheritedModelCalls) &&
+      value.terminalInheritedModelCalls >= 0 &&
+      Number.isSafeInteger(value.terminalRunScopedModelCalls) &&
+      value.terminalRunScopedModelCalls > 0 &&
       Number.isSafeInteger(value.finalSegmentModelCalls) &&
       value.finalSegmentModelCalls > 0,
     `Phase ${expectedPhase} provider-usage proof is invalid.`,
@@ -572,9 +576,22 @@ function validatePhaseProviderUsage(value, expectedPhase) {
     terminalScope?.modelCalls === value.terminalCoordinatorModelCalls,
     `Phase ${expectedPhase} terminal coordinator usage does not match its scope.`,
   );
+  // The terminal scope measured one coordinator start; the Lead ledger spans
+  // the whole resume chain, and every Continue opens a new scope. They compare
+  // only after the scope's declared inheritance is added back.
   requireCondition(
-    value.finalSegmentModelCalls <= value.terminalCoordinatorModelCalls,
+    value.terminalRunScopedModelCalls ===
+      value.terminalCoordinatorModelCalls + value.terminalInheritedModelCalls,
+    `Phase ${expectedPhase} run-scoped usage is not its scope plus what it inherited.`,
+  );
+  requireCondition(
+    value.finalSegmentModelCalls <= value.terminalRunScopedModelCalls,
     `Phase ${expectedPhase} final Lead segment exceeds its coordinator usage.`,
+  );
+  requireCondition(
+    value.terminalInheritedModelCalls > 0 ||
+      value.finalSegmentModelCalls <= value.terminalCoordinatorModelCalls,
+    `Phase ${expectedPhase} terminal scope inherited nothing yet trails its Lead ledger.`,
   );
 }
 

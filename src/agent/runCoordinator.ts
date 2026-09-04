@@ -9,6 +9,11 @@ import type {
   AgentRunReceipt,
   AgentRunStopReason,
 } from "../AgentRunner";
+import {
+  mergeModelUsageAggregatesV1,
+  normalizeModelUsageAggregateV1,
+  type ProviderUsageInheritanceV1,
+} from "../model/modelCallEvidence";
 import type { MissionGraphV3 } from "../../packages/headless-runtime/src/missionGraphV3";
 import type { MissionLedgerSummary } from "./missionLedger";
 import { PROMPT_PREFIX_REUSE_METRIC_NAME_V1 } from "./runContext";
@@ -57,7 +62,19 @@ export interface RunCoordinatorSnapshot {
   diagnosticAttestations: RunDiagnosticAttestationV1[];
   /** Stable identity for one coordinator start, including all delegated model workers. */
   providerUsageScopeId: string | null;
+  /**
+   * Model usage measured live inside this scope only, so per-scope counts stay
+   * disjoint and summable across the starts of one mission. Read the whole
+   * run's usage through `runScopedProviderUsageV1`, never this field alone.
+   */
   providerUsage: ModelUsageAggregateV1;
+  /**
+   * What this scope inherited from earlier segments of the same durable run,
+   * as declared by the runner from the same aggregate the mission ledger
+   * merges. Zero for a fresh mission, and zero until the accepted run declares
+   * it, which is the truth: this scope has measured nothing older.
+   */
+  providerUsageInherited: ModelUsageAggregateV1;
   lastMissionGraph: MissionGraphV3 | null;
   /**
    * Durable ledger projection restored from the latest integrity-checked
@@ -161,6 +178,8 @@ export class RunCoordinator {
   private readonly diagnosticAttestations: RunDiagnosticAttestationV1[] = [];
   private providerUsageScopeId: string | null = null;
   private providerUsage: ModelUsageAggregateV1 = emptyProviderUsage();
+  private providerUsageInherited: ModelUsageAggregateV1 = emptyProviderUsage();
+  private adoptedProviderUsageInheritance = false;
   private lastMissionGraph: MissionGraphV3 | null = null;
   private lastMissionLedger: MissionLedgerSummary | null = null;
   private persistedProjection: PersistedMissionRunProjectionMetadata | null = null;
@@ -207,6 +226,7 @@ export class RunCoordinator {
       })),
       providerUsageScopeId: this.providerUsageScopeId,
       providerUsage: { ...this.providerUsage },
+      providerUsageInherited: { ...this.providerUsageInherited },
       lastMissionGraph: this.lastMissionGraph
         ? structuredCloneValue(this.lastMissionGraph)
         : null,
@@ -313,6 +333,8 @@ export class RunCoordinator {
     this.providerUsageScopeId = createProviderUsageScopeId();
     this.activeProviderUsageScopeId = this.providerUsageScopeId;
     this.providerUsage = emptyProviderUsage();
+    this.providerUsageInherited = emptyProviderUsage();
+    this.adoptedProviderUsageInheritance = false;
     // Keep an integrity-checked restart projection visible until the accepted
     // executor publishes its own config or graph. A continuation can be
     // cancelled while its structured router is in flight; eagerly clearing
@@ -453,6 +475,8 @@ export class RunCoordinator {
     this.providerUsageScopeId = null;
     this.activeProviderUsageScopeId = null;
     this.providerUsage = emptyProviderUsage();
+    this.providerUsageInherited = emptyProviderUsage();
+    this.adoptedProviderUsageInheritance = false;
     this.lastComplete = null;
     this.state = "idle";
     this.startedAtMs = null;
@@ -588,6 +612,18 @@ export class RunCoordinator {
         // unknown coordinator but must never replace an established root run.
         this.runId = this.runId ?? graph.missionId ?? null;
         this.lastMissionGraph = structuredCloneValue(graph);
+      }
+    } else if (key === "onProviderUsageInherited") {
+      const declaration = args[0] as ProviderUsageInheritanceV1 | undefined;
+      // Only the FIRST segment of this scope can carry usage the scope did not
+      // see. Every later segment inherits its predecessor's ledger, which this
+      // same scope already counted call-by-call -- adopting that would double
+      // count the scope's own evidence.
+      if (declaration && !this.adoptedProviderUsageInheritance) {
+        this.adoptedProviderUsageInheritance = true;
+        this.providerUsageInherited = normalizeModelUsageAggregateV1(
+          declaration.usage,
+        );
       }
     } else if (key === "onModelCallEvidence") {
       const evidence = args[0] as ModelCallEvidenceV1 | undefined;
@@ -828,6 +864,28 @@ export class RunCoordinator {
     this.lastMissionLedger = null;
     this.persistedProjection = null;
   }
+}
+
+/**
+ * Provider usage for the whole durable run behind a coordinator snapshot: what
+ * the scope inherited from earlier segments plus what it measured itself.
+ *
+ * This is the only comparable against `lastMissionLedger.providerUsage`, which
+ * spans the same resume chain. `providerUsage` alone spans one start, so a
+ * mission continued even once makes it smaller than the ledger it publishes --
+ * an aggregate below one of its own parts. Both sides fold the same declared
+ * baseline with the same merge, so neither re-derives the other's numbers.
+ */
+export function runScopedProviderUsageV1(
+  snapshot: Pick<
+    RunCoordinatorSnapshot,
+    "providerUsage" | "providerUsageInherited"
+  >,
+): ModelUsageAggregateV1 {
+  return mergeModelUsageAggregatesV1(
+    snapshot.providerUsageInherited,
+    snapshot.providerUsage,
+  );
 }
 
 function createProviderUsageScopeId(): string {

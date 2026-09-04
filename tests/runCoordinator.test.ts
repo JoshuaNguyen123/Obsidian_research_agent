@@ -1,7 +1,14 @@
-import { promptPrefixReuseAverageV1 } from "../src/model/modelCallEvidence";
+import {
+  normalizeModelUsageAggregateV1,
+  promptPrefixReuseAverageV1,
+} from "../src/model/modelCallEvidence";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { RunAlreadyActiveError, RunCoordinator } from "../src/agent/runCoordinator";
+import {
+  RunAlreadyActiveError,
+  RunCoordinator,
+  runScopedProviderUsageV1,
+} from "../src/agent/runCoordinator";
 import { scoreMissionV1 } from "../src/agent/missionScorecard";
 
 test("run coordinator enforces single flight and returns the runner outcome", async () => {
@@ -1359,4 +1366,185 @@ test("run coordinator folds prompt-prefix reuse metrics into its usage projectio
   assert.equal(usage.promptPrefixReuseSamples, 2);
   assert.ok(Math.abs((usage.promptPrefixReuseRatioTotal ?? 0) - 1.4) < 1e-9);
   assert.ok(Math.abs((promptPrefixReuseAverageV1(usage) ?? 0) - 0.7) < 1e-9);
+});
+
+test("a continued run's coordinator aggregate covers the ledger segment it publishes", async () => {
+  // The BYOK journey's shape: one durable run, continued once. The Lead ledger
+  // merges every segment's usage, while each Continue click opens a fresh
+  // coordinator scope that starts counting at zero. Before the scope declared
+  // what it inherited, the whole-team aggregate read smaller than the ledger
+  // segment it published -- an aggregate below one of its own parts.
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onProviderUsageInherited?.({
+      schemaVersion: 1,
+      runId: "run-segment-1",
+      resumedFromRunId: null,
+      usage: emptyProviderUsageForTest(),
+    });
+    events.onModelCallEvidence?.(modelCallEvidenceForTest("segment-1-call-1"));
+    events.onModelCallEvidence?.(modelCallEvidenceForTest("segment-1-call-2"));
+    events.onRunConfig?.({
+      runId: "run-segment-1",
+      missionLedger: {
+        runId: "run-segment-1",
+        canResume: true,
+        providerUsage: { ...emptyProviderUsageForTest(), modelCallCount: 2 },
+      },
+    } as never);
+    events.onMissionGraphUpdate?.({
+      missionId: "run-segment-1",
+      objective: "continued mission",
+      revision: 1,
+      nodes: {},
+    } as never);
+    events.onRunComplete?.({ step: 2, maxSteps: 4, stopReason: "budget" });
+  });
+
+  await coordinator.start(
+    async (_signal, events) => {
+      events.onProviderUsageInherited?.({
+        schemaVersion: 1,
+        runId: "run-segment-2",
+        resumedFromRunId: "run-segment-1",
+        usage: { ...emptyProviderUsageForTest(), modelCallCount: 2 },
+      });
+      events.onModelCallEvidence?.(modelCallEvidenceForTest("segment-2-call-1"));
+      events.onModelCallEvidence?.(modelCallEvidenceForTest("segment-2-call-2"));
+      events.onModelCallEvidence?.(modelCallEvidenceForTest("segment-2-call-3"));
+      events.onRunConfig?.({
+        runId: "run-segment-2",
+        missionLedger: {
+          runId: "run-segment-2",
+          canResume: false,
+          providerUsage: { ...emptyProviderUsageForTest(), modelCallCount: 5 },
+        },
+      } as never);
+      events.onRunComplete?.({ step: 5, maxSteps: 8, stopReason: "final" });
+    },
+    { preserveExistingProjectionUntilLedger: true },
+  );
+
+  const snapshot = coordinator.getSnapshot();
+  // The scope keeps measuring only itself, so per-scope counts stay disjoint
+  // and still sum to the mission's real total across starts.
+  assert.equal(snapshot.providerUsage.modelCallCount, 3);
+  assert.equal(snapshot.providerUsageInherited.modelCallCount, 2);
+  assert.equal(
+    runScopedProviderUsageV1(snapshot).modelCallCount,
+    snapshot.lastMissionLedger?.providerUsage.modelCallCount,
+  );
+  assert.ok(
+    runScopedProviderUsageV1(snapshot).modelCallCount >=
+      (snapshot.lastMissionLedger?.providerUsage.modelCallCount ?? 0),
+  );
+});
+
+test("a coordinator scope adopts only the baseline older than itself", async () => {
+  // A long run auto-continues inside ONE start: segment 2 resumes segment 1's
+  // ledger, but this scope already counted those calls one evidence record at
+  // a time. Re-adopting the later declaration would double count the scope's
+  // own measurements.
+  const coordinator = new RunCoordinator();
+  await coordinator.start(
+    async (_signal, events) => {
+      events.onProviderUsageInherited?.({
+        schemaVersion: 1,
+        runId: "run-inner-1",
+        resumedFromRunId: "run-earlier",
+        usage: { ...emptyProviderUsageForTest(), modelCallCount: 4 },
+      });
+      events.onModelCallEvidence?.(modelCallEvidenceForTest("inner-1-call-1"));
+      events.onModelCallEvidence?.(modelCallEvidenceForTest("inner-1-call-2"));
+      // Segment 2 of the same start, resuming what this scope just measured.
+      events.onProviderUsageInherited?.({
+        schemaVersion: 1,
+        runId: "run-inner-2",
+        resumedFromRunId: "run-inner-1",
+        usage: { ...emptyProviderUsageForTest(), modelCallCount: 6 },
+      });
+      events.onModelCallEvidence?.(modelCallEvidenceForTest("inner-2-call-1"));
+      events.onRunConfig?.({
+        runId: "run-inner-2",
+        missionLedger: {
+          runId: "run-inner-2",
+          canResume: false,
+          providerUsage: { ...emptyProviderUsageForTest(), modelCallCount: 7 },
+        },
+      } as never);
+      events.onRunComplete?.({ step: 3, maxSteps: 6, stopReason: "final" });
+    },
+    { preserveExistingProjectionUntilLedger: true },
+  );
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.providerUsageInherited.modelCallCount, 4);
+  assert.equal(snapshot.providerUsage.modelCallCount, 3);
+  assert.equal(runScopedProviderUsageV1(snapshot).modelCallCount, 7);
+});
+
+test("a fresh mission's scope inherits nothing and starts a new baseline", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onProviderUsageInherited?.({
+      schemaVersion: 1,
+      runId: "run-continued",
+      resumedFromRunId: "run-earlier",
+      usage: { ...emptyProviderUsageForTest(), modelCallCount: 9 },
+    });
+    events.onModelCallEvidence?.(modelCallEvidenceForTest("continued-call"));
+    events.onRunComplete?.({ step: 1, maxSteps: 2, stopReason: "final" });
+  });
+  assert.equal(
+    coordinator.getSnapshot().providerUsageInherited.modelCallCount,
+    9,
+  );
+
+  await coordinator.start(async (_signal, events) => {
+    events.onProviderUsageInherited?.({
+      schemaVersion: 1,
+      runId: "run-fresh",
+      resumedFromRunId: null,
+      usage: emptyProviderUsageForTest(),
+    });
+    events.onModelCallEvidence?.(modelCallEvidenceForTest("fresh-call"));
+    events.onRunComplete?.({ step: 1, maxSteps: 2, stopReason: "final" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.providerUsageInherited.modelCallCount, 0);
+  assert.equal(runScopedProviderUsageV1(snapshot).modelCallCount, 1);
+});
+
+test("the coordinator and the mission ledger normalize one inherited aggregate identically", async () => {
+  // The disagreement this whole seam fixes is two subsystems reading the same
+  // number differently. They must also *coerce* it identically: a legacy or
+  // partial record has to mean one thing, not one thing per reader.
+  const legacy = {
+    schemaVersion: 1,
+    modelCallCount: 3.7,
+    successfulCallCount: -2,
+    reportedTokens: 11,
+    promptPrefixReuseSamples: 2,
+  };
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onProviderUsageInherited?.({
+      schemaVersion: 1,
+      runId: "run-legacy",
+      resumedFromRunId: "run-legacy-parent",
+      usage: legacy as never,
+    });
+    events.onRunComplete?.({ step: 0, maxSteps: 1, stopReason: "final" });
+  });
+
+  assert.deepEqual(
+    coordinator.getSnapshot().providerUsageInherited,
+    normalizeModelUsageAggregateV1(legacy),
+  );
+  // Half a prefix-reuse pair is unreadable and must stay absent on both sides.
+  assert.equal(
+    coordinator.getSnapshot().providerUsageInherited.promptPrefixReuseSamples,
+    undefined,
+  );
 });

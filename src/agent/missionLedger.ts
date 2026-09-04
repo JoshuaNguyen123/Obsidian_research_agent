@@ -41,7 +41,10 @@ import {
   type MissionRuntimeSnapshotWriteResult,
 } from "./runStore";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
-import type { ModelUsageAggregateV1 } from "../model/modelCallEvidence";
+import {
+  normalizeModelUsageAggregateV1,
+  type ModelUsageAggregateV1,
+} from "../model/modelCallEvidence";
 import { normalizeOrchestratorSnapshot } from "../orchestrator/orchestratorStore";
 import {
   parseContinuationHandoffV1,
@@ -342,7 +345,14 @@ export interface MissionLedgerSummary {
   };
   evidenceCount: number;
   receiptCount: number;
-  /** Redacted per-segment provider aggregate; never includes prompts or responses. */
+  /**
+   * Redacted provider aggregate for the whole durable run: every continuation
+   * segment merges what it inherited from the resumed ledger with its own
+   * totals, so this grows across the resume chain and is NOT a per-segment
+   * figure. A live measurement scope (e.g. one RunCoordinator start) can only
+   * be compared against it after adding back the usage that scope inherited --
+   * see `runScopedProviderUsageV1`.
+   */
   providerUsage: ModelUsageAggregateV1;
   expectedTools: string[];
   nextAction: string;
@@ -1025,7 +1035,7 @@ export function summarizeMissionLedger(
       : undefined,
     evidenceCount: ledger.evidence.length,
     receiptCount: ledger.receipts.length,
-    providerUsage: normalizeProviderUsage(ledger.providerUsage),
+    providerUsage: normalizeModelUsageAggregateV1(ledger.providerUsage),
     expectedTools: [...ledger.loopBudget.expectedTools],
     nextAction: ledger.nextActions[0] ?? "none",
     remainingActions: [...ledger.remainingActions],
@@ -1542,7 +1552,7 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
       finalizationReserve: getNumber(loopBudget.finalizationReserve) ?? 0,
       expectedTools: getStringArray(loopBudget.expectedTools),
     },
-    providerUsage: normalizeProviderUsage(value.providerUsage),
+    providerUsage: normalizeModelUsageAggregateV1(value.providerUsage),
     tasks: Array.isArray(value.tasks)
       ? value.tasks.map(normalizeMissionTask).filter(isMissionTask)
       : [],
@@ -1994,43 +2004,6 @@ function getBlockerCategory(value: unknown): MissionBlockerCategory | undefined 
     value === "unknown"
     ? value
     : undefined;
-}
-
-function normalizeProviderUsage(value: unknown): ModelUsageAggregateV1 {
-  const record = isRecord(value) ? value : {};
-  return {
-    schemaVersion: 1,
-    modelCallCount: Math.max(0, Math.floor(getNumber(record.modelCallCount) ?? 0)),
-    successfulCallCount: Math.max(0, Math.floor(getNumber(record.successfulCallCount) ?? 0)),
-    failedCallCount: Math.max(0, Math.floor(getNumber(record.failedCallCount) ?? 0)),
-    reportedTokens: Math.max(0, Math.floor(getNumber(record.reportedTokens) ?? 0)),
-    estimatedTokens: Math.max(0, Math.floor(getNumber(record.estimatedTokens) ?? 0)),
-    retries: Math.max(0, Math.floor(getNumber(record.retries) ?? 0)),
-    wallClockMs: Math.max(0, Math.floor(getNumber(record.wallClockMs) ?? 0)),
-    ...(getNumber(record.cachedPromptTokens) !== undefined
-      ? {
-          cachedPromptTokens: Math.max(
-            0,
-            Math.floor(getNumber(record.cachedPromptTokens) ?? 0),
-          ),
-        }
-      : {}),
-    // Prefix-reuse totals travel as a pair; one without the other is
-    // unreadable and normalizes to absent (unknown), never to a zero average.
-    ...(getNumber(record.promptPrefixReuseSamples) !== undefined &&
-    getNumber(record.promptPrefixReuseRatioTotal) !== undefined
-      ? {
-          promptPrefixReuseSamples: Math.max(
-            0,
-            Math.floor(getNumber(record.promptPrefixReuseSamples) ?? 0),
-          ),
-          promptPrefixReuseRatioTotal: Math.max(
-            0,
-            getNumber(record.promptPrefixReuseRatioTotal) ?? 0,
-          ),
-        }
-      : {}),
-  };
 }
 
 function getDependencyHealthStatus(
