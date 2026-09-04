@@ -208,6 +208,52 @@ test("a circular final-projection hold is a stable product alarm", () => {
   assert.deepEqual(classified.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
 });
 
+test("an empty sealed frontier with unpaid claim_grounding is a stable product alarm", () => {
+  const logText = [
+    "Error: Mission exceeded 4 explicit continuations; approved=1; state={",
+    '"stopReason":"budget","autoContinueReason":"segment_cap",',
+    '"acceptanceStatus":"needs_more_work",',
+    '"missing":["verifier:claim_grounding:ungrounded:claim:s-ab110bbfee"],',
+    '"diagnostics":[{"id":"mission-graph-tool-frontier-2","message":"MissionGraph frontier tools: none"}]',
+    "}",
+    "  1) [byok-autonomous-journey] › e2e/byok-autonomous-journey.spec.ts › BYOK-01",
+  ].join("\n");
+  const classified = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: { records: [{ status: "failed" }] },
+    summaryFresh: true,
+    logText,
+  });
+  assert.equal(
+    classified.failureClass,
+    "product:sealed_frontier_emptied_citation_gather",
+  );
+  assert.equal(classified.confidence, CLASSIFICATION_MECHANICAL);
+});
+
+test("an executable citation-gather menu killed by the no-tool breaker is a stable product alarm", () => {
+  const logText = [
+    "Error: Mission stopped before acceptance; approved=1; summary={",
+    '"recentDiagnostics":[{"id":"mission-graph-tool-frontier-9","message":"MissionGraph frontier tools: web_search, web_fetch, verify_citation, read_source_section"}]',
+    "}; state={",
+    '"stopDetail":"Blocked: the model twice returned no tool call against the same unchanged executable frontier.",',
+    '"missing":["verifier:claim_grounding:ungrounded:claim:s-84f3b5f31d"],',
+    "}",
+    "  1) [byok-autonomous-journey] › e2e/byok-autonomous-journey.spec.ts › BYOK-01",
+  ].join("\n");
+  const classified = classifyAttemptOutcome({
+    exitCode: 1,
+    summary: { records: [{ status: "failed" }] },
+    summaryFresh: true,
+    logText,
+  });
+  assert.equal(
+    classified.failureClass,
+    "product:citation_gather_no_tool_breaker",
+  );
+  assert.equal(classified.confidence, CLASSIFICATION_MECHANICAL);
+});
+
 test("proof-matrix cell projects are exclusive-runner allowlisted", () => {
   // 2026-08-25: interrupted-continuation-live existed in playwright.config.ts
   // and package.json but not PLAYWRIGHT_PROJECTS, so four proof-matrix

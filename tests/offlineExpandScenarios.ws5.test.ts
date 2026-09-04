@@ -12,6 +12,7 @@ import {
 import { PLAYWRIGHT_PROJECTS, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
 import {
   OFFLINE_EXPAND_SCENARIOS,
+  OFFLINE_RESEARCH_CATALOG_PROBES,
   assertOfflineExpandCatalogComplete,
   renderOfflineExpandPrompt,
 } from "../e2e/fixtures/offlineExpandScenarios";

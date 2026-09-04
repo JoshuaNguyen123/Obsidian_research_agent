@@ -226,57 +226,65 @@
             "id": "acceptance_coverage",
             "score": 1,
             "weight": 0.3,
-            "detail": "13/13 criteria met",
-            "applicable": true
+            "detail": "12/12 criteria met",
+            "applicable": true,
+            "vacuous": false
           },
           {
             "id": "evidence_grounding",
             "score": 1,
             "weight": 0.25,
-            "detail": "4/4 claims cited",
-            "applicable": true
+            "detail": "5/5 claims cited",
+            "applicable": true,
+            "vacuous": false
           },
           {
             "id": "receipt_coverage",
             "score": 1,
             "weight": 0.15,
             "detail": "1/1 mutations receipted",
-            "applicable": true
+            "applicable": true,
+            "vacuous": false
           },
           {
             "id": "source_independence",
             "score": 1,
             "weight": 0.05,
             "detail": "2/2 distinct domains",
-            "applicable": true
+            "applicable": true,
+            "vacuous": false
           },
           {
             "id": "research_depth",
             "score": 0.5625,
             "weight": 0.05,
             "detail": "2 cited passages, 2 domains, 0 quotes, 3 sections",
-            "applicable": true
+            "applicable": true,
+            "vacuous": false
           },
           {
             "id": "recovery_cleanliness",
             "score": 1,
             "weight": 0.1,
             "detail": "0 recovery attempts",
-            "applicable": true
+            "applicable": true,
+            "vacuous": false
           },
           {
             "id": "model_call_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "8/24 model calls",
-            "applicable": true
+            "detail": "5/24 model calls",
+            "applicable": true,
+            "vacuous": false
           },
           {
             "id": "wall_clock_efficiency",
             "score": 1,
             "weight": 0.05,
-            "detail": "190s/840s",
-            "applicable": true
+            "detail": "40s/840s",
+            "applicable": true,
+            "vacuous": false
           }
         ],
         "total": 0.9781

@@ -862,6 +862,14 @@ const PRODUCT_LOG_SIGNATURES = [
     /product:final_projection_candidate_rejected\b/u,
     "product:final_projection_candidate_rejected",
   ],
+  [
+    /MissionGraph frontier tools: none[\s\S]{0,12000}claim_grounding|claim_grounding[\s\S]{0,12000}MissionGraph frontier tools: none/u,
+    "product:sealed_frontier_emptied_citation_gather",
+  ],
+  [
+    /twice returned no tool call against the same unchanged executable frontier[\s\S]{0,20000}verify_citation|verify_citation[\s\S]{0,20000}twice returned no tool call against the same unchanged executable frontier/u,
+    "product:citation_gather_no_tool_breaker",
+  ],
 ];
 
 /**
@@ -1498,6 +1506,9 @@ function csvField(value) {
 }
 
 export function appendRunCsvRow(row) {
+  if (Array.isArray(row) && row.length > 2) {
+    row[2] = String(row[2] ?? "").trim();
+  }
   mkdirSync(EVAL_DIR, { recursive: true });
   if (!existsSync(RUN_CSV)) {
     writeFileSync(RUN_CSV, RUN_CSV_HEADER + "\n");

@@ -84,3 +84,44 @@ export function assertOfflineExpandCatalogComplete(): void {
     throw new Error("offline-expand catalog has extra or duplicate scenario ids");
   }
 }
+
+/**
+ * Installed-plugin catalog probes for extract / citation / dataset / mermaid.
+ * Chat-only; the scripted backend records the offered tool menu and does not
+ * call the tools (no live web, no PDF fetch, no vault dataset file).
+ */
+export const OFFLINE_RESEARCH_CATALOG_PROBES: readonly {
+  id: string;
+  markerPrefix: string;
+  expectedTool: string;
+  prompt: string;
+}[] = [
+  {
+    id: "extract_document_pdf",
+    markerPrefix: "OFFLINE_CATALOG_EXTRACT",
+    expectedTool: "extract_document",
+    prompt:
+      "Open this Nature paper https://example.org/paper.pdf and extract the abstract. Answer in chat only with exactly {marker}. Do not write or edit any note.",
+  },
+  {
+    id: "verify_citation",
+    markerPrefix: "OFFLINE_CATALOG_CITE",
+    expectedTool: "verify_citation",
+    prompt:
+      "Verify the citations in this note against their source passages. Answer in chat only with exactly {marker}. Do not write or edit any note.",
+  },
+  {
+    id: "analyze_dataset_json",
+    markerPrefix: "OFFLINE_CATALOG_DATASET",
+    expectedTool: "analyze_dataset",
+    prompt:
+      "Analyze Results.json and describe the columns. Answer in chat only with exactly {marker}. Do not write or edit any note.",
+  },
+  {
+    id: "mermaid_flowchart_without_word",
+    markerPrefix: "OFFLINE_CATALOG_FLOWCHART",
+    expectedTool: "upsert_mermaid_block",
+    prompt:
+      "Add a flowchart to this note. Then reply in chat with exactly {marker}.",
+  },
+];

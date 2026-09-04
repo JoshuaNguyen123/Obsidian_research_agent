@@ -9,6 +9,8 @@ export interface OfflineAgentBackendMetricsV1 {
   streamedRequestCount: number;
   toolFrontierObservations: number;
   emittedToolCalls: number;
+  /** Union of tool names the installed plugin offered across requests. */
+  offeredToolNames: string[];
 }
 
 export interface OfflineAgentBackendV1 extends AgentBackend {
@@ -26,6 +28,7 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
     streamedRequestCount: 0,
     toolFrontierObservations: 0,
     emittedToolCalls: 0,
+    offeredToolNames: [],
   };
 
   const complete = async (
@@ -41,6 +44,11 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
         return typeof entry.function.name === "string" ? [entry.function.name] : [];
       }),
     );
+    for (const name of toolNames) {
+      if (!metrics.offeredToolNames.includes(name)) {
+        metrics.offeredToolNames.push(name);
+      }
+    }
     const transcript = messages
       .flatMap((message) => isRecord(message) && typeof message.content === "string"
         ? [message.content]
@@ -59,6 +67,11 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
 
     if (request.response_format !== undefined) {
       return { content: "{}" };
+    }
+
+    const catalogMarker = transcript.match(/OFFLINE_CATALOG_[A-Z0-9_]+/u)?.[0];
+    if (catalogMarker) {
+      return { content: `Catalog probe complete ${catalogMarker}.` };
     }
 
     const appendMarker = transcript.match(/OFFLINE_APPEND_[A-Z0-9_]+/u)?.[0];

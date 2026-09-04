@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { createOfflineAgentBackendV1 } from "./offlineAgentBackend";
 import {
   OFFLINE_EXPAND_SCENARIOS,
+  OFFLINE_RESEARCH_CATALOG_PROBES,
   renderOfflineExpandPrompt,
   type OfflineExpandScenarioV1,
 } from "./offlineExpandScenarios";
@@ -20,7 +21,7 @@ const OFFLINE_BASE_URL = "http://127.0.0.1:7332/v1";
 const OFFLINE_TOKEN = "offline-e2e-ephemeral-token";
 const SUMMARY_PATH = path.join("test-results", "offline-application-attempts.json");
 
-test.describe("zero-cloud expand: replace, page-clear, word-count, title", () => {
+test.describe("zero-cloud expand: replace, page-clear, word-count, title, research catalog", () => {
   test.skip(
     process.env.E2E_PLAYWRIGHT_LANE !== "offline-expand" ||
       process.env.E2E_OFFLINE_AI !== "1",
@@ -81,6 +82,83 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title", () =>
     } finally {
       await close(bridge);
     }
+  });
+
+  test("OFFLINE-07/10 installed catalog offers extract, citation verify, dataset json, and flowchart mermaid", async () => {
+    const backend = createOfflineAgentBackendV1();
+    const { createAgentBridgeServer } = await importNativeEsm<{
+      createAgentBridgeServer(options: {
+        token: string;
+        backend: typeof backend;
+      }): Server;
+    }>(pathToFileURL(path.resolve("scripts", "agent-bridge.mjs")).href);
+    const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
+    const missing: string[] = [];
+    try {
+      await listen(bridge, 7332);
+      for (const probe of OFFLINE_RESEARCH_CATALOG_PROBES) {
+        const offeredBefore = new Set(backend.snapshot().offeredToolNames);
+        let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+        try {
+          harness = await startRealAiHarness(
+            `offline-catalog-${probe.id}`,
+            {
+              baseUrl: OFFLINE_BASE_URL,
+              model: "offline-scripted-v1",
+              missionTimeoutMs: 90_000,
+              firstChunkTimeoutMs: 30_000,
+              completionTimeoutMs: 90_000,
+            },
+            {
+              modelRouterEnabled: false,
+              modelRouterMode: "off",
+              semanticIndexEnabled: false,
+              enableStreaming: true,
+              streamWritebackMode: "all_current_note_content_writes",
+              workingMode: "automatic",
+              maxAgentSteps: 4,
+            },
+          );
+          const marker = `${probe.markerPrefix}_${harness.marker.replace(/[^A-Z0-9_]/giu, "_").toUpperCase()}`;
+          await harness.seedNote(
+            harness.notePath,
+            `# Catalog probe\n\n${marker}\n`,
+            true,
+          );
+          await harness.submitMission(
+            renderOfflineExpandPrompt(
+              {
+                id: "title_rename_plus_body",
+                markerPrefix: probe.markerPrefix,
+                title: probe.id,
+                prompt: probe.prompt,
+                expectedMutation: "append",
+                requiresBackup: false,
+                expectedTools: [probe.expectedTool],
+              },
+              marker,
+            ),
+            { timeoutMs: 90_000 },
+          );
+        } finally {
+          await harness?.close();
+        }
+        const offered = backend.snapshot().offeredToolNames.filter(
+          (name) => !offeredBefore.has(name),
+        );
+        const sawExpected =
+          offered.includes(probe.expectedTool) ||
+          backend.snapshot().offeredToolNames.includes(probe.expectedTool);
+        if (!sawExpected) {
+          missing.push(
+            `${probe.id}: expected ${probe.expectedTool}; offered=${JSON.stringify(offered)}`,
+          );
+        }
+      }
+    } finally {
+      await close(bridge);
+    }
+    expect(missing, missing.join("\n")).toEqual([]);
   });
 });
 
