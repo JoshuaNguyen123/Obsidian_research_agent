@@ -30,11 +30,23 @@ export interface CachedSource {
   truncated: boolean;
   parserStatus: SourceParserStatus;
   sectionCount: number;
+  /**
+   * Root mission that last transported this source. Absent on notes written
+   * before the field existed, which read as "belongs to no current mission"
+   * and so never satisfy a refresh.
+   */
+  fetchedForMission?: string;
 }
 
 export interface SourceCacheReadOptions {
   maxAgeMs?: number;
   refresh?: boolean;
+  /**
+   * Root mission asking. A refresh means "do not serve me a copy from an
+   * earlier mission", so a copy this mission transported itself still
+   * satisfies it; without an identity the refresh stays unconditional.
+   */
+  missionId?: string;
 }
 
 export interface CachedSourceSection extends CachedSource {
@@ -63,6 +75,23 @@ const sourceSectionReadCaches = new WeakMap<
   >
 >();
 const SOURCE_SECTION_READ_CACHE_ENTRIES = 32;
+
+/**
+ * The mission a tool call belongs to, for cache scoping.
+ *
+ * `rootMissionId` and not `runId`: a resumed segment gets a fresh runId, and
+ * the research worker suffixes runId per participant, so keying on it would
+ * re-transport every source at each segment boundary and once per worker.
+ * Evidence belongs to the mission that is gathering it, and this is the same
+ * span the mission ledger's provider usage telescopes over. (A prepared
+ * action deliberately keys the other way, on the segment that will execute
+ * it -- that is a different question with a different answer.)
+ */
+export function resolveSourceCacheMissionId(
+  ctx: ToolExecutionContext,
+): string | undefined {
+  return ctx.rootMissionId?.trim() || ctx.runId?.trim() || undefined;
+}
 
 export async function writeSourceCacheNote(
   ctx: ToolExecutionContext,
@@ -93,6 +122,7 @@ export async function writeSourceCacheNote(
     `${SOURCE_CACHE_FOLDER}/${safeDomain(normalizedUrl)}/${safeSlug(title)}-${urlHash}.md`,
     { requireMarkdown: true },
   );
+  const fetchedForMission = resolveSourceCacheMissionId(ctx);
   const note = [
     "---",
     `url: ${JSON.stringify(normalizedUrl)}`,
@@ -106,6 +136,9 @@ export async function writeSourceCacheNote(
     `truncated: ${truncated}`,
     `parserStatus: ${JSON.stringify(parserStatus)}`,
     `sectionCount: ${sectionCount}`,
+    ...(fetchedForMission
+      ? [`fetchedForMission: ${JSON.stringify(fetchedForMission)}`]
+      : []),
     "---",
     "",
     readableBody,
@@ -133,6 +166,7 @@ export async function writeSourceCacheNote(
     truncated,
     parserStatus,
     sectionCount,
+    ...(fetchedForMission ? { fetchedForMission } : {}),
   } satisfies CachedSource;
   await upsertSourceCacheManifest(ctx, cached, fetchedAt);
   return cached;
@@ -144,11 +178,28 @@ export async function findFreshCachedSource(
   options: SourceCacheReadOptions = {},
 ): Promise<CachedSource | null> {
   const maxAgeMs = normalizeMaxAgeMs(options.maxAgeMs);
-  if (options.refresh || maxAgeMs <= 0) {
+  if (maxAgeMs <= 0) {
+    return null;
+  }
+  // A refresh drops the cache to this mission's own transports rather than
+  // discarding it outright. The first fetch of a source still pays a wire
+  // trip, so the freshness the caller asked for is the freshness it gets; what
+  // it no longer gets is a second wire trip for bytes this same mission
+  // already pulled. `max_age_ms` above stays the unconditional bypass, and is
+  // also how a caller bounds how stale a same-mission copy may be.
+  const missionScope = options.refresh === true
+    ? options.missionId?.trim()
+    : undefined;
+  if (options.refresh === true && !missionScope) {
     return null;
   }
   const normalizedUrl = normalizeSourceUrl(url);
-  const manifestHit = await findFreshManifestEntry(ctx, normalizedUrl, maxAgeMs);
+  const manifestHit = await findFreshManifestEntry(
+    ctx,
+    normalizedUrl,
+    maxAgeMs,
+    missionScope,
+  );
   if (manifestHit) {
     return manifestHit;
   }
@@ -165,6 +216,9 @@ export async function findFreshCachedSource(
       continue;
     }
     if (!isStrongContentHash(parsed.contentHash)) {
+      continue;
+    }
+    if (missionScope && parsed.fetchedForMission !== missionScope) {
       continue;
     }
     const age = now - Date.parse(parsed.fetchedAt);
@@ -210,6 +264,29 @@ export async function readSourceSection(
       sourceStartChar + SOURCE_CACHE_SECTION_CHARS,
     ),
   };
+}
+
+/**
+ * Whole stored text of a cached source, for callers that need the source
+ * rather than one bounded section. Returns null when the note is gone or
+ * unparseable, so a retrieval provider can fall through to the wire instead of
+ * failing the attempt.
+ */
+export async function readCachedSourceContent(
+  ctx: ToolExecutionContext,
+  vaultPath: string,
+): Promise<string | null> {
+  let file: TFile | null = null;
+  try {
+    file = ctx.app.vault.getFileByPath(
+      normalizeVaultPath(vaultPath, { requireMarkdown: true }),
+    );
+  } catch {
+    return null;
+  }
+  if (!file) return null;
+  const payload = await readCachedSourcePayload(ctx, file).catch(() => null);
+  return payload?.sourceContent ?? null;
 }
 
 async function findCachedFileByUrl(ctx: ToolExecutionContext, url: string) {
@@ -406,6 +483,7 @@ async function findFreshManifestEntry(
   ctx: ToolExecutionContext,
   normalizedUrl: string,
   maxAgeMs: number,
+  missionScope?: string,
 ): Promise<CachedSource | null> {
   const manifest = await readSourceCacheManifest(ctx);
   const entry = manifest.entries.find(
@@ -415,6 +493,9 @@ async function findFreshManifestEntry(
     return null;
   }
   if (!isStrongContentHash(entry.contentHash)) {
+    return null;
+  }
+  if (missionScope && entry.fetchedForMission !== missionScope) {
     return null;
   }
   const age = (ctx.now?.().getTime() ?? Date.now()) - Date.parse(entry.fetchedAt);
@@ -447,6 +528,7 @@ function parseCachedSourceNote(path: string, markdown: string): CachedSource | n
   }
   const normalizedUrl = fields.get("normalizedUrl") ?? normalizeSourceUrl(url);
   const urlHash = fields.get("urlHash") ?? hashSourceText(normalizedUrl);
+  const fetchedForMission = fields.get("fetchedForMission")?.trim();
   const parsedSourceChars = Number.isFinite(sourceChars) ? sourceChars : totalChars;
   return {
     vaultPath: path,
@@ -462,6 +544,7 @@ function parseCachedSourceNote(path: string, markdown: string): CachedSource | n
       parseBoolean(fields.get("truncated")) ?? parsedSourceChars > totalChars,
     parserStatus: parseParserStatus(fields.get("parserStatus")),
     sectionCount: Number.isFinite(sectionCount) ? Math.max(1, sectionCount) : 1,
+    ...(fetchedForMission ? { fetchedForMission } : {}),
   };
 }
 
@@ -517,6 +600,10 @@ function normalizeCachedSourceRecord(value: unknown): CachedSource | null {
       : sourceChars > value.totalChars,
     parserStatus: parseParserStatus(value.parserStatus),
     sectionCount: Math.max(1, value.sectionCount),
+    ...(typeof value.fetchedForMission === "string" &&
+    value.fetchedForMission.trim()
+      ? { fetchedForMission: value.fetchedForMission }
+      : {}),
   };
 }
 
