@@ -151,7 +151,6 @@ import {
 import {
   detectLinearIntent,
   extractExplicitLinearIssueReadIdentity,
-  hasExplicitPermanentLinearDeleteIntent,
 } from "./agent/linearIntent";
 import {
   canonicalSeedExactAcceptedResearchPackageV1,
@@ -202,9 +201,16 @@ import {
   GITHUB_CATALOG_READ_TOOL_NAMES,
   getExplicitGitHubCatalogMutationToolNames,
   getGitHubCatalogReadToolNames,
-  hasExplicitGitHubCatalogIntent,
   isGitHubCatalogToolName,
 } from "./tools/githubCatalogTools";
+import {
+  hasSafeReflexLabel,
+  isAllowedForMission,
+  isGitHubCatalogToolOfferedForMission,
+  isLinearToolOfferedForMission,
+  shouldOfferCreateFile,
+  shouldOfferMermaidBlock,
+} from "./agent/toolOfferGates";
 import {
   attachAutoContinuationSuppressionReason,
   decideAutoContinuation,
@@ -29543,19 +29549,7 @@ function getAllowedToolDefinitions(
   const allowCanvasDesign =
     hasCanvasDesignIntent(prompt) && !/\bsvg\b/i.test(prompt);
   const allowSvgDesign = hasSvgDesignIntent(prompt);
-  const allowMermaidDesign =
-    hasMermaidDesignIntent(prompt) &&
-    !hasExplicitCanvasDestinationIntent(prompt);
   const linearIntent = detectLinearIntent(prompt);
-  const githubCatalogIntent = hasExplicitGitHubCatalogIntent(prompt);
-  const githubCatalogMutationNames = new Set(
-    getExplicitGitHubCatalogMutationToolNames(prompt),
-  );
-  const githubCatalogReadNames = new Set(getGitHubCatalogReadToolNames(prompt));
-  const selectedGitHubCatalogNames =
-    githubCatalogMutationNames.size > 0
-      ? githubCatalogMutationNames
-      : githubCatalogReadNames;
   const preparedBackgroundGitHubNames = new Set(
     getRequestedPreparedBackgroundGitHubTools(prompt),
   );
@@ -29568,7 +29562,6 @@ function getAllowedToolDefinitions(
     allowVaultIndex ||
     hasReflexReadLabel(["vault_search", "semantic_vault_search"]);
   const allowSpecificFileRead = hasSpecificFileReadIntent(prompt);
-  const allowCreateFile = hasCreateFileIntent(prompt);
   const allowCreateFolder = hasCreateFolderIntent(prompt);
   const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
   const hasCurrentMutationTarget =
@@ -29679,18 +29672,14 @@ function getAllowedToolDefinitions(
     if (isGitHubCatalogToolName(name)) {
       return (
         settings?.githubEnabled === true &&
-        githubCatalogIntent &&
-        selectedGitHubCatalogNames.has(name)
+        isGitHubCatalogToolOfferedForMission(name, prompt)
       );
     }
 
     if (name.startsWith("linear_")) {
-      if (settings?.linearEnabled !== true || !linearIntent.explicit) {
-        return false;
-      }
       return (
-        name !== "linear_delete_issue_permanently" ||
-        hasExplicitPermanentLinearDeleteIntent(prompt)
+        settings?.linearEnabled === true &&
+        isLinearToolOfferedForMission(name, prompt)
       );
     }
 
@@ -29767,11 +29756,11 @@ function getAllowedToolDefinitions(
     }
 
     if (name === "read_mermaid_block") {
-      return hasReviseDesignIntent(prompt) && allowMermaidDesign;
+      return shouldOfferMermaidBlock(prompt);
     }
 
     if (name === "upsert_mermaid_block") {
-      return hasReviseDesignIntent(prompt) && allowMermaidDesign;
+      return shouldOfferMermaidBlock(prompt);
     }
 
     if (name === "create_design_package") {
@@ -29888,7 +29877,7 @@ function getAllowedToolDefinitions(
     }
 
     if (name === "create_file") {
-      return allowCreateFile && !allowTemplateTools;
+      return shouldOfferCreateFile(prompt);
     }
 
     if (name === "append_file") {
@@ -30022,167 +30011,6 @@ function getAllowedToolDefinitions(
   return filtered;
 }
 
-function isAllowedForMission(
-  name: string,
-  prompt: string,
-  intent: MissionIntent,
-  reflex: ReflexDecision | null = null,
-  routedCodeToolNames: ReadonlySet<string> = new Set(),
-): boolean {
-  if (!isToolWithinAutonomyScope(name, prompt, intent, reflex)) {
-    return false;
-  }
-
-  // Asking the user is never blanket-offered: it is added deliberately by the
-  // runner only when the host can actually answer (see the interactive
-  // clarification block), so a headless run never offers a tool that would
-  // expire, and ordinary missions keep a compact tool schema.
-  if (name === ASK_USER_TOOL_NAME) {
-    return false;
-  }
-
-  // Specialist reads stay out of generic missions so ordinary requests keep a
-  // compact tool schema; a matching prompt (or the Researcher catalog, which
-  // bypasses this gate) brings them in.
-  if (name === "analyze_dataset") {
-    return hasDatasetAnalysisIntent(prompt);
-  }
-  if (name === "verify_citation") {
-    // Deep research is exactly the case where checking a quote against the
-    // cached source matters, but `hasCitationWorkIntent` demands bibliographic
-    // vocabulary (doi/arxiv/bibtex/…), so "research X and cite your sources"
-    // never saw the tool at all. Only this one tool widens — resolve_citation
-    // and export_bibtex keep the narrow gate so the schema stays compact.
-    return hasCitationWorkIntent(prompt) || hasDeepResearchIntent(prompt);
-  }
-  if (name === "resolve_citation" || name === "export_bibtex") {
-    return hasCitationWorkIntent(prompt);
-  }
-
-  if (READ_NAV_TOOL_NAMES.has(name)) {
-    return (
-      intent.vaultContext ||
-      hasVaultBrowseIntent(prompt) ||
-      hasParallelVaultReadIntent(prompt) ||
-      hasSpecificFileReadIntent(prompt) ||
-      hasCurrentNoteReadIntent(prompt) ||
-      hasWordCountIntent(prompt) ||
-      hasGraphConnectionIntent(prompt) ||
-      hasConceptualVaultSearchIntent(prompt) ||
-      hasTemplateIntent(prompt) ||
-      hasResearchMemoryIntent(prompt) ||
-      hasExperienceMemoryIntent(prompt) ||
-      hasVaultIndexIntent(prompt) ||
-      hasDesignIntent(prompt) ||
-      hasBrowserAutomationIntent(prompt) ||
-      hasCheckpointResumeIntent(prompt) ||
-      hasMissionResumeIntent(prompt) ||
-      hasSafeReflexLabel(reflex, [
-        "vault_search",
-        "semantic_vault_search",
-        "graph_context",
-        "word_count",
-      ]) ||
-      intent.noteOutput ||
-      intent.explicitMutation
-    );
-  }
-
-  if (DELETE_TOOL_NAMES.has(name)) {
-    return intent.explicitDelete;
-  }
-
-  if (WRITE_TOOL_NAMES.has(name)) {
-    if (name === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
-      return hasJupyterReflectionIntentV1(prompt);
-    }
-
-    if (name === "rebuild_semantic_index") {
-      return hasSemanticIndexMaintenanceIntent(prompt);
-    }
-
-    if (name === "open_web_source") {
-      return hasOpenWebSourceIntent(prompt);
-    }
-
-    if (
-      name === "create_design_canvas" ||
-      name === "create_svg_design" ||
-      name === "create_design_package"
-    ) {
-      return hasDesignIntent(prompt);
-    }
-
-    if (
-      name === "update_design_canvas" ||
-      name === "update_svg_design" ||
-      name === "upsert_mermaid_block"
-    ) {
-      return hasReviseDesignIntent(prompt);
-    }
-
-    if (name === "export_workspace_artifact") {
-      return hasCodeExecutionIntent(prompt) || hasHtmlPreviewIntent(prompt);
-    }
-
-    if (MEMORY_TOOL_NAMES.has(name)) {
-      return hasExperienceMemoryIntent(prompt) || hasResearchMemoryWriteIntent(prompt);
-    }
-
-    if (name === "compact_research_memory") {
-      return hasResearchMemoryCompactIntent(prompt);
-    }
-
-    return intent.noteOutput || intent.explicitMutation || hasResearchMemoryWriteIntent(prompt);
-  }
-
-  if (
-    name === "web_search" ||
-    name === "web_fetch" ||
-    name === "read_source_section"
-  ) {
-    return (
-      hasWebSearchIntent(prompt) ||
-      hasCheckpointResumeIntent(prompt) ||
-      hasMissionResumeIntent(prompt) ||
-      hasSafeReflexLabel(reflex, ["web_research"])
-    );
-  }
-
-  if (BROWSER_TOOL_NAMES.has(name)) {
-    return hasBrowserAutomationIntent(prompt);
-  }
-
-  if (CODE_TOOL_NAMES.has(name)) {
-    if (name === "code_validate_commit_prepared") {
-      return hasPreparedBackgroundCodeValidationCommitIntent(prompt);
-    }
-    return (
-      (hasCodeExecutionIntent(prompt) ||
-        detectProjectLifecycleStagesV1(prompt).includes("code_execution") ||
-        hasCodeWorkspaceReadIntent(prompt) ||
-        getExplicitCodeToolNames(prompt).length > 0 ||
-        routedCodeToolNames.size > 0 ||
-        hasHtmlPreviewIntent(prompt)) &&
-      isCodeToolAllowedForPrompt(name, prompt, routedCodeToolNames)
-    );
-  }
-
-  return true;
-}
-
-function hasSafeReflexLabel(
-  reflex: ReflexDecision | null,
-  labels: ReflexDecision["label"][],
-): boolean {
-  return Boolean(
-    reflex &&
-      reflex.confidence >= 0.72 &&
-      labels.includes(reflex.label) &&
-      !reflex.safetyNotes.includes("unsafe"),
-  );
-}
-
 function isSemanticSearchEnabled(
   settings: ToolExecutionContext["settings"] | undefined,
 ): boolean {
@@ -30196,107 +30024,6 @@ function isSemanticIndexEnabled(
     settings?.semanticSearchEnabled !== false &&
     settings?.semanticIndexEnabled !== false
   );
-}
-
-function isToolWithinAutonomyScope(
-  name: string,
-  prompt: string,
-  intent: MissionIntent,
-  reflex: ReflexDecision | null = null,
-): boolean {
-  const scope = intent.autonomyScope;
-  if (intent.explicitMutation && isBroadUnscopedVaultMutation(scope)) {
-    return !WRITE_TOOL_NAMES.has(name) && !DELETE_TOOL_NAMES.has(name);
-  }
-
-  if (
-    name === "web_search" ||
-    name === "web_fetch" ||
-    name === "read_source_section"
-  ) {
-    return (
-      scope.read.web ||
-      hasCheckpointResumeIntent(prompt) ||
-      hasMissionResumeIntent(prompt) ||
-      hasSafeReflexLabel(reflex, ["web_research"])
-    );
-  }
-
-  if (name === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
-    return hasJupyterReflectionIntentV1(prompt);
-  }
-
-  if (name === WRITE_PROJECT_RESULTS_TOOL_NAME) {
-    return (
-      detectProjectLifecycleStagesV1(prompt).includes("reflection") &&
-      !hasJupyterReflectionIntentV1(prompt)
-    );
-  }
-
-  if (name === "append_research_memory" || name === "compact_research_memory") {
-    return scope.write.researchMemory;
-  }
-
-  if (name === "delete_research_memory_entry") {
-    return scope.write.researchMemory && intent.explicitDelete;
-  }
-
-  if (
-    name === "open_web_source" ||
-    name === "create_design_canvas" ||
-    name === "update_design_canvas" ||
-    name === "create_svg_design" ||
-    name === "update_svg_design" ||
-    name === "upsert_mermaid_block" ||
-    name === "create_design_package"
-  ) {
-    return scope.write.artifacts;
-  }
-
-  if (name === "export_workspace_artifact") {
-    return scope.write.artifacts || hasCodeExecutionIntent(prompt);
-  }
-
-  if (BROWSER_TOOL_NAMES.has(name)) {
-    return scope.read.web;
-  }
-
-  if (MEMORY_TOOL_NAMES.has(name)) {
-    return name === "memory_search"
-      ? true
-      : scope.write.researchMemory &&
-          (!DELETE_TOOL_NAMES.has(name) || intent.explicitDelete);
-  }
-
-  if (name === "replace_current_file") {
-    // Shared catalog predicate — both AgentRunner sites must agree, or a
-    // blocked append can point at a replace that was never offered.
-    return currentNoteReplaceCatalogEligible(scope);
-  }
-
-  if (name === "delete_current_file") {
-    return scope.destructive.deleteCurrentNote;
-  }
-
-  if (name === "delete_path") {
-    return scope.destructive.deletePaths;
-  }
-
-  if (
-    name === "append_to_current_file" ||
-    name === "append_to_current_section" ||
-    name === "highlight_current_file_phrase" ||
-    name === "restore_current_file_from_backup" ||
-    name === "prepare_edit_current_section" ||
-    name === "edit_current_section" ||
-    name === "rename_current_file" ||
-    name === "retitle_current_file" ||
-    name === "link_related_notes_in_current_file"
-  ) {
-    return currentNoteAppendCatalogEligible(scope);
-  }
-
-  return true;
 }
 
 export function suppressCompositeOwnedCurrentNoteWriteback(input: {

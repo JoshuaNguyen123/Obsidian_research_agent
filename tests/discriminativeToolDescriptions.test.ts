@@ -47,6 +47,7 @@ const ADDED_NAMES = [
   "get_note_graph_context",
   "find_related_notes",
   "suggest_note_links",
+  "extract_document",
 ] as const;
 
 test("covers confused pairs with Purpose / Do not use when", () => {

@@ -9,6 +9,7 @@ import {
   hasExplicitCanvasDestinationIntent,
   hasExplicitCodeTeamMagicPhrase,
   hasHtmlPreviewIntent,
+  hasMermaidCreateIntent,
   hasReviseDesignIntent,
 } from "../src/agent/codeDesignIntent";
 
@@ -44,6 +45,14 @@ test("codeDesignIntent classifies code and design prompts", () => {
   assert.equal(hasReviseDesignIntent("revise the canvas layout"), true);
   assert.equal(
     hasReviseDesignIntent("read the Mermaid block, then revise the same block"),
+    true,
+  );
+  assert.equal(
+    hasMermaidCreateIntent("Add a mermaid flowchart to this note"),
+    true,
+  );
+  assert.equal(
+    hasReviseDesignIntent("Add a mermaid flowchart to this note"),
     true,
   );
   assert.equal(hasHtmlPreviewIntent("preview the html page"), true);
