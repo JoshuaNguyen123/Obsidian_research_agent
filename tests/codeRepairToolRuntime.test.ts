@@ -206,6 +206,46 @@ test("read-only reconciliation completes a crash-after-commit without duplicate 
   assert.equal(status.terminalStatus, "complete");
 });
 
+test("repair status carries the parsed diagnostics of the red validation", async (t) => {
+  // The whole point of the digest: what the agent reads to decide what to fix
+  // must name the broken file and line, not just the receipt that holds them.
+  const harness = await createHarness(t, "src/index.ts");
+  const red = await validation(
+    "fast", "fast-sandbox", true, "fast-digest", 0, false, FAILURE_HASH,
+    harness.validationBinding,
+    {
+      stdout: [
+        "src/index.ts(12,5): error TS2304: Cannot find name 'Cell'.",
+        "src/index.ts(31,9): error TS2551: Property 'lenght' does not exist on type 'Board'.",
+      ].join("\n"),
+      stderr: "",
+    },
+  );
+  harness.validations.set(red.id, red);
+  const action = await prepareCycle(harness, red, 1, 0);
+  await harness.handlers.executePreparedCycleRecord(action, authorizedContext(action));
+
+  const status = await harness.handlers.readStatus(SCOPE, context());
+  const digest = status.failureDigest;
+  assert.ok(digest, "a red validation must produce a digest");
+  assert.equal(digest.diagnostics.length, 2);
+  assert.equal(digest.diagnostics[0]?.file, "src/index.ts");
+  assert.equal(digest.diagnostics[0]?.line, 12);
+  assert.equal(digest.diagnostics[0]?.code, "TS2304");
+  assert.deepEqual(digest.failedChecks, ["fast validation"]);
+  assert.match(digest.summary, /2 errors in 1 file/u);
+  // Nothing to diff against on the first red cycle.
+  assert.deepEqual(digest.unresolved, []);
+  assert.equal(digest.introduced.length, 2);
+});
+
+test("a green repair status carries no digest", async (t) => {
+  const harness = await createHarness(t, "src/index.ts");
+  await recordPassingFast(harness);
+  const status = await harness.handlers.readStatus(SCOPE, context());
+  assert.equal(status.failureDigest, null);
+});
+
 test("optional caller diff fingerprint rejects a stale supplied value", async (t) => {
   const harness = await createHarness(t, "src/index.ts");
   await recordPassingFast(harness);
@@ -933,14 +973,15 @@ async function validation(
   passed = true,
   failureFingerprint: string | null = passed ? null : FAILURE_HASH,
   binding: CodeValidationReceiptV1["binding"] = null,
+  checkOutput: { stdout: string; stderr: string } | null = null,
 ): Promise<CodeValidationReceiptV1> {
   const startedAt = new Date(NOW.getTime() + offsetMs).toISOString();
   const completedAt = new Date(NOW.getTime() + offsetMs + 1_000).toISOString();
   const checks = [{
     label: `${kind} validation`,
     exitCode: passed ? 0 : 1,
-    stdout: passed ? "ok" : "",
-    stderr: passed ? "" : "failure",
+    stdout: checkOutput?.stdout ?? (passed ? "ok" : ""),
+    stderr: checkOutput?.stderr ?? (passed ? "" : "failure"),
     durationMs: 1_000,
   }];
   const evidence = {

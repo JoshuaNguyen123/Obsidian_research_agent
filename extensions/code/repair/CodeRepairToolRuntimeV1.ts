@@ -38,6 +38,11 @@ import {
 } from "./productionAdapters";
 import { assertSafeRepositoryRelativePath } from "./protectedControls";
 import {
+  buildValidationFailureDigestV1,
+  parseCheckDiagnosticsV1,
+  type ValidationFailureDigestV1,
+} from "./validationFailureDigestV1";
+import {
   CODE_REPAIR_CHECKPOINT_VERSION,
   CODE_REPAIR_RECEIPT_VERSION,
   type ArtifactHashReadbackV1,
@@ -2347,7 +2352,28 @@ function statusFromCheckpoint(
     terminalStatus: checkpoint.terminal?.status ?? null,
     publicationEligible: checkpoint.terminal?.publicationEligible ?? false,
     blockerCode: checkpoint.blocker?.code ?? null,
+    failureDigest: failureDigestFromCheckpoint(checkpoint),
   };
+}
+
+/**
+ * The parsed form of the newest red validation, diffed against the red one
+ * before it. Reading `validationHistory` rather than storing anything keeps
+ * the checkpoint format and every receipt fingerprint out of this.
+ */
+function failureDigestFromCheckpoint(
+  checkpoint: CodeRepairCheckpointV1,
+): ValidationFailureDigestV1 | null {
+  const failures = checkpoint.validationHistory.filter(
+    (validation) => validation.status === "failed",
+  );
+  const latest = failures.at(-1);
+  if (!latest) return null;
+  const earlier = failures.at(-2);
+  const previous = earlier
+    ? earlier.checks.flatMap((check) => parseCheckDiagnosticsV1(check))
+    : [];
+  return buildValidationFailureDigestV1(latest.checks, previous);
 }
 
 function assertCheckpointScope(
