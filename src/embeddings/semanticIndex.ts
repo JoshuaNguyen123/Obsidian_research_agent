@@ -498,7 +498,11 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     // Absent seedPaths this is an empty map, and scoring stays byte-identical.
     const graphPrior = buildSemanticGraphPrior(index.notes, request.seedPaths ?? []);
 
-    const rerankSettings = resolveSemanticRerankSettingsV1(settings);
+    const rerankSettings = resolveSemanticRerankSettingsV1(settings, {
+      // `research` spends the cross-encoder only on the deep searches, which
+      // is where a shortlist is read for evidence rather than for a reflex.
+      deepSearch: request.mode === "deep",
+    });
     const rerankWanted = request.rerank ?? rerankSettings.enabled;
     const searchResult = index.version === 2
       ? await searchIndexShards({

@@ -2,6 +2,7 @@ import type { AgentSettings } from "../settings";
 import {
   DEFAULT_SEMANTIC_RERANK_MODEL,
   DEFAULT_SEMANTIC_RERANK_TOP_K,
+  type SemanticRerankModeV1,
 } from "../embeddings/semanticRerank";
 
 /**
@@ -52,7 +53,7 @@ export interface SemanticProfileLimits {
    * leave it off: switching presets must land on a known configuration rather
    * than inheriting half of the previous one.
    */
-  semanticRerankMode: "off" | "cross_encoder";
+  semanticRerankMode: SemanticRerankModeV1;
   semanticRerankModel: string;
   semanticRerankTopK: number;
 }
@@ -98,7 +99,12 @@ export const SEMANTIC_PROFILE_PRESETS: Readonly<
     semanticIndexDebounceMs: 3000,
     semanticIndexMaxFiles: 10000,
     semanticIndexPersistVectors: true,
-    semanticRerankMode: "off",
+    // Deep searches -- the ones a research mission runs when it is deciding
+    // what to cite -- pay about a second for the cross-encoder; every other
+    // search stays first-stage only. Choosing this preset on an existing
+    // vault does not rebuild anything: reranking reads the index it already
+    // has. The first deep search after choosing it downloads a 130 MB model.
+    semanticRerankMode: "research",
     semanticRerankModel: DEFAULT_SEMANTIC_RERANK_MODEL,
     semanticRerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
   }),

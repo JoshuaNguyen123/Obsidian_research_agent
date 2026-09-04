@@ -137,17 +137,36 @@ export interface ResolvedSemanticRerankV1 {
 }
 
 /**
+ * When the cross-encoder runs.
+ *
+ * The stage costs about a second of local CPU per search, which is worth
+ * paying when a research mission is deciding what to cite and is not worth
+ * paying when a reflex classifier is checking an intent. `research` splits
+ * those two cases on the `deep` search mode the caller already declares --
+ * that is where the shortlist is being read for evidence -- so the accuracy is
+ * spent where it changes an answer. `off` and `cross_encoder` remain the
+ * unconditional ends of the range.
+ */
+export type SemanticRerankModeV1 = "off" | "research" | "cross_encoder";
+
+/**
  * Read the three settings as one decision. Anything unreadable resolves to
  * "off": the accuracy stage costs CPU on every search, so it is never inferred.
  */
-export function resolveSemanticRerankSettingsV1(settings: {
-  semanticRerankMode?: "off" | "cross_encoder";
-  semanticRerankModel?: string;
-  semanticRerankTopK?: number;
-}): ResolvedSemanticRerankV1 {
+export function resolveSemanticRerankSettingsV1(
+  settings: {
+    semanticRerankMode?: SemanticRerankModeV1;
+    semanticRerankModel?: string;
+    semanticRerankTopK?: number;
+  },
+  options: { deepSearch?: boolean } = {},
+): ResolvedSemanticRerankV1 {
   const model = settings.semanticRerankModel?.trim() || DEFAULT_SEMANTIC_RERANK_MODEL;
+  const mode = settings.semanticRerankMode;
   return {
-    enabled: settings.semanticRerankMode === "cross_encoder",
+    enabled:
+      mode === "cross_encoder" ||
+      (mode === "research" && options.deepSearch === true),
     model,
     topK: normalizeSemanticRerankTopKV1(settings.semanticRerankTopK),
   };

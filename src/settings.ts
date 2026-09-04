@@ -14,6 +14,7 @@ import {
   normalizeSemanticRerankTopKV1,
   resolveSemanticRerankSettingsV1,
   SEMANTIC_RERANK_MODEL_CATALOG_V1,
+  type SemanticRerankModeV1,
 } from "./embeddings/semanticRerank";
 
 /** Dropdown value meaning "type a model id the catalogue does not know". */
@@ -333,7 +334,7 @@ export interface AgentSettings {
    * because a silently-ignored accelerator setting is worse than none.
    */
   semanticOnnxProviders?: string;
-  semanticRerankMode?: "off" | "cross_encoder";
+  semanticRerankMode?: SemanticRerankModeV1;
   semanticRerankModel?: string;
   semanticRerankTopK?: number;
   temperature: number | null;
@@ -2358,7 +2359,15 @@ export class AgentSettingTab extends PluginSettingTab {
     // The second retrieval stage. Its cost is per search and its benefit is
     // ordering, so the row states both in the units the user feels: how long a
     // search will take and how many chunks get re-read.
-    const rerank = resolveSemanticRerankSettingsV1(this.plugin.settings);
+    // The row reads the stored MODE, not the resolved `enabled` flag: under
+    // "research" the stage is enabled per search rather than globally, and
+    // asking the resolver without a search to resolve for would report it as
+    // off and hide the model row this preset depends on.
+    const rerankMode: SemanticRerankModeV1 =
+      this.plugin.settings.semanticRerankMode ?? "off";
+    const rerank = resolveSemanticRerankSettingsV1(this.plugin.settings, {
+      deepSearch: true,
+    });
     const rerankSpec = findSemanticRerankModelSpecV1(rerank.model);
     const rerankSeconds = rerankSpec
       ? Math.max(1, Math.round(rerank.topK / rerankSpec.pairsPerSecond))
@@ -2366,26 +2375,33 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(semanticHost)
       .setName("Rerank search results")
       .setDesc(
-        rerank.enabled && rerankSeconds
-          ? `A local cross-encoder re-reads the top ${rerank.topK} chunks against the question itself, which is markedly more accurate than embedding similarity alone. Costs roughly ${rerankSeconds}s per search on this machine and nothing at indexing time.`
-          : "Off: results are ordered by embedding similarity and word overlap alone. Turning this on adds a local cross-encoder pass over the top results — more accurate ordering, about a second per search, no extra indexing cost.",
+        rerankMode === "off" || !rerankSeconds
+          ? "Off: results are ordered by embedding similarity and word overlap alone. Turning this on adds a local cross-encoder pass over the top results — more accurate ordering, about a second per search, no extra indexing cost."
+          : rerankMode === "research"
+            ? `A local cross-encoder re-reads the top ${rerank.topK} chunks against the question itself on research searches only, where the result is being read for evidence. Costs roughly ${rerankSeconds}s on those searches, nothing on the rest, and nothing at indexing time.`
+            : `A local cross-encoder re-reads the top ${rerank.topK} chunks against the question itself, which is markedly more accurate than embedding similarity alone. Costs roughly ${rerankSeconds}s per search on this machine and nothing at indexing time.`,
       )
       .addDropdown((dropdown) =>
         dropdown
           .addOptions({
             off: "Off",
-            cross_encoder: "Cross-encoder (accurate)",
+            research: "Research searches only (recommended)",
+            cross_encoder: "Every search (most accurate)",
           })
-          .setValue(rerank.enabled ? "cross_encoder" : "off")
+          .setValue(rerankMode)
           .onChange(async (value) => {
             this.plugin.settings.semanticRerankMode =
-              value === "cross_encoder" ? "cross_encoder" : "off";
+              value === "cross_encoder"
+                ? "cross_encoder"
+                : value === "research"
+                  ? "research"
+                  : "off";
             await this.plugin.saveSettings();
             this.redisplayWithAdvancedSectionOpen("agentic-settings-research-sources");
           }),
       );
 
-    if (rerank.enabled) {
+    if (rerankMode !== "off") {
       new Setting(semanticHost)
         .setName("Reranking model")
         .setDesc(

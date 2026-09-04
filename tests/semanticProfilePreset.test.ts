@@ -93,20 +93,35 @@ test("fast trades the model and chunk size for indexing speed, on the benchmark'
   assert.equal(fast.semanticIndexMaxFiles, SEMANTIC_PROFILE_PRESETS.balanced.semanticIndexMaxFiles);
 });
 
-test("accurate is the fast index plus the cross-encoder stage, and every other preset states the stage off", () => {
+test("every preset states the rerank stage, and the shipped default spends it on research only", () => {
   // "Fast and extremely accurate" is two stages, not one bigger model: index
   // with the small embedder (measured 31 chunks/s) and pay ~1s per search to
   // have a cross-encoder re-read the shortlist. Presets must state the stage
-  // explicitly so switching away from accurate actually turns it off.
+  // explicitly so switching between them actually changes it.
   const accurate = SEMANTIC_PROFILE_PRESETS.accurate;
   assert.equal(accurate.semanticEmbeddingModel, SEMANTIC_PROFILE_PRESETS.fast.semanticEmbeddingModel);
   assert.equal(
     accurate.semanticChunkTargetTokens,
     SEMANTIC_PROFILE_PRESETS.fast.semanticChunkTargetTokens,
   );
-  assert.equal(accurate.semanticRerankMode, "cross_encoder");
+  assert.equal(accurate.semanticRerankMode, "cross_encoder", "accurate pays on every search");
   assert.ok(accurate.semanticRerankTopK >= 1);
-  for (const name of ["balanced", "fast", "thorough"] as const) {
+  // The shipped default: the accuracy is spent where a shortlist is read for
+  // evidence, and nowhere else. Accurate remains the always-on option, and the
+  // legacy presets stay exactly as vaults on them stored them.
+  assert.equal(
+    SEMANTIC_PROFILE_PRESETS[NEW_INSTALL_SEMANTIC_PROFILE].semanticRerankMode,
+    "research",
+  );
+  for (const name of ["balanced", "thorough"] as const) {
     assert.equal(SEMANTIC_PROFILE_PRESETS[name].semanticRerankMode, "off", name);
+  }
+  // A preset never leaves the mode unstated, or switching would inherit half
+  // of the previous one.
+  for (const preset of Object.values(SEMANTIC_PROFILE_PRESETS)) {
+    assert.ok(
+      ["off", "research", "cross_encoder"].includes(preset.semanticRerankMode),
+      preset.semanticRerankMode,
+    );
   }
 });

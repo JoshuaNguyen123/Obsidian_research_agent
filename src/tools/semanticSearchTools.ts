@@ -112,6 +112,28 @@ interface ScoredChunk {
   reasons: string[];
 }
 
+/**
+ * Is this search going to be read as evidence?
+ *
+ * Deep mode costs a wider first-stage shortlist and, under the shipped rerank
+ * default, about a second of local cross-encoder time. That is the right trade
+ * when the mission will write a note, edit a file, or answer a question from
+ * the vault -- the result is about to become part of an answer someone relies
+ * on. It is the wrong trade for a chat turn, where a first-stage ordering is
+ * already good enough and latency is what the user feels.
+ *
+ * Keyed on the mission the host already classified, so no new signal has to be
+ * threaded through the runner, and an explicit `mode` argument still wins.
+ */
+export function isEvidenceShapedMissionV1(context: ToolExecutionContext): boolean {
+  const mode = context.missionIntent?.mode;
+  return (
+    mode === "note_output" ||
+    mode === "vault_context_answer" ||
+    mode === "explicit_file_mutation"
+  );
+}
+
 export function createSemanticSearchTools(): AgentTool[] {
   return [
     semanticSearchNotesTool,
@@ -198,7 +220,7 @@ export const semanticSearchNotesTool: AgentTool = {
     const mode =
       modeArg === "deep" || modeArg === "standard"
         ? modeArg
-        : caps.preferDeepMode
+        : caps.preferDeepMode || isEvidenceShapedMissionV1(context)
           ? "deep"
           : "standard";
     const candidateLimit = clampInteger(
