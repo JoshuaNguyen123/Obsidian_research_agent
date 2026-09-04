@@ -870,6 +870,15 @@ const PRODUCT_LOG_SIGNATURES = [
     /twice returned no tool call against the same unchanged executable frontier[\s\S]{0,20000}verify_citation|verify_citation[\s\S]{0,20000}twice returned no tool call against the same unchanged executable frontier/u,
     "product:citation_gather_no_tool_breaker",
   ],
+  [
+    // RunCoordinator's whole-team aggregate came in BELOW the model-call count
+    // its own final ledger segment attested. An aggregate is never smaller than
+    // one of its parts, so the two accounting subsystems disagree about the
+    // same calls. Reached for the first time on 2026-09-04 once claim grounding
+    // stopped ending Phase A early; it classified as process:matrix_unclassified.
+    /coordinator aggregate omitted calls attested by its final ledger segment/u,
+    "product:coordinator_usage_aggregate_short",
+  ],
 ];
 
 /**

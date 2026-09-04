@@ -17,7 +17,11 @@ import {
 import { startRealAiHarness } from "./realAiHarness";
 
 const execFileAsync = promisify(execFile);
-const OFFLINE_BASE_URL = "http://127.0.0.1:7332/v1";
+// Must match E2E_OPENAI_COMPATIBLE_BASE_URL, which run-e2e-exclusive.mjs
+// pins to 127.0.0.1:7331 for every --offline-ai lane (offline-core uses the
+// same port). Standing the bridge up on 7332 left the plugin dialling 7331
+// and every mission died on ERR_CONNECTION_REFUSED.
+const OFFLINE_BASE_URL = "http://127.0.0.1:7331/v1";
 const OFFLINE_TOKEN = "offline-e2e-ephemeral-token";
 const SUMMARY_PATH = path.join("test-results", "offline-application-attempts.json");
 
@@ -36,14 +40,14 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
         backend: typeof backend;
       }): Server;
     }>(pathToFileURL(path.resolve("scripts", "agent-bridge.mjs")).href);
-    const { validateOfflineApplicationAttempt } = await importNativeEsm<{
+    const { validateOfflineApplicationAttempt } = await importIsolatedEsm<{
       validateOfflineApplicationAttempt(value: unknown): Record<string, unknown>;
-    }>(pathToFileURL(path.resolve("scripts", "offline-application-attempt.mjs")).href);
+    }>(path.resolve("scripts", "offline-application-attempt.mjs"));
     const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
     const cloudModelRequests: string[] = [];
     const attempts: Record<string, unknown>[] = [];
     try {
-      await listen(bridge, 7332);
+      await listen(bridge, 7331);
       const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"]);
       const { stdout: porcelain } = await execFileAsync(
         "git",
@@ -95,7 +99,7 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
     const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
     const missing: string[] = [];
     try {
-      await listen(bridge, 7332);
+      await listen(bridge, 7331);
       for (const probe of OFFLINE_RESEARCH_CATALOG_PROBES) {
         const offeredBefore = new Set(backend.snapshot().offeredToolNames);
         let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
@@ -375,4 +379,25 @@ function importNativeEsm<T>(specifier: string): Promise<T> {
     value: string,
   ) => Promise<T>;
   return importer(specifier);
+}
+
+/**
+ * Import a self-contained ESM module without Playwright's loader rewriting it.
+ *
+ * Playwright transforms every project file whose extension it owns, `.mjs`
+ * included, and hands Node CommonJS output. Node still treats a `.mjs` URL as
+ * ESM, so the transformed body throws `exports is not defined in ES module
+ * scope` before a single export is read -- which is why this lane could never
+ * start. A `data:` URL carries no file path for the loader to match, so the
+ * original source is evaluated as written.
+ *
+ * Only safe for modules with no imports and no `import.meta`: a data: URL has
+ * no base to resolve either against. `offline-application-attempt.mjs`
+ * qualifies; `agent-bridge.mjs` does not, and keeps importNativeEsm.
+ */
+async function importIsolatedEsm<T>(filePath: string): Promise<T> {
+  const source = await readFile(filePath, "utf8");
+  return importNativeEsm<T>(
+    `data:text/javascript;base64,${Buffer.from(source, "utf8").toString("base64")}`,
+  );
 }
