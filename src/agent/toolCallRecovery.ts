@@ -6,18 +6,131 @@ import { getString, isRecord } from "./recordUtils";
 
 const MAX_RECOVERED_TEXT_TOOL_CALLS = 4;
 
+export interface RecoverToolCallsOptions {
+  /** Ready-frontier names. Structured calls off this set are recovered from text. */
+  frontierToolNames?: ReadonlySet<string>;
+}
+
+/**
+ * Prefer structured provider toolCalls when they are known, on-frontier, and
+ * have usable arguments. Recover from assistant text when structured calls
+ * are missing, unknown, empty-args (and text has better args), or off-frontier.
+ */
 export function recoverToolCallsFromAssistantMessage(
   response: Pick<ModelChatResponse, "message" | "toolCalls">,
   knownToolNames: ReadonlySet<string>,
+  options?: RecoverToolCallsOptions,
 ): ModelToolCall[] {
-  if (response.toolCalls.length > 0) {
-    return response.toolCalls;
-  }
-
-  return extractToolCallsFromAssistantText(
+  const structured = response.toolCalls ?? [];
+  const textCalls = extractToolCallsFromAssistantText(
     response.message.content,
     knownToolNames,
   );
+  const frontier = options?.frontierToolNames;
+
+  if (structured.length === 0) {
+    return filterRecoveredCallsToFrontier(textCalls, frontier);
+  }
+
+  if (shouldRecoverStructuredFromText(structured, textCalls, knownToolNames, frontier)) {
+    const recovered = filterRecoveredCallsToFrontier(textCalls, frontier);
+    if (recovered.length > 0) {
+      return recovered;
+    }
+    return structured.filter((call) => isUsableStructuredCall(call, knownToolNames, frontier));
+  }
+
+  return structured;
+}
+
+export const MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE = {
+  content:
+    '<tool_call>{"name":"web_search","arguments":{"query":"obsidian"}}</tool_call>',
+  structured: [
+    {
+      name: "not_a_real_tool",
+      arguments: {},
+      index: 0,
+      raw: { source: "junk-structured" },
+    },
+  ] satisfies ModelToolCall[],
+  knownToolNames: ["web_search"],
+  expectedName: "web_search",
+} as const;
+
+/** Metric B: share of expected text calls recovered from mixed junk structured. */
+export function measureMixedStructuredTextRecoveryRate(): number {
+  const recovered = recoverToolCallsFromAssistantMessage(
+    {
+      message: {
+        role: "assistant",
+        content: MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE.content,
+      },
+      toolCalls: [...MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE.structured],
+    },
+    new Set(MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE.knownToolNames),
+  );
+  const expected = MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE.expectedName;
+  const hits = recovered.filter(
+    (call) => call.name === expected && !isEmptyArgsToolCall(call),
+  );
+  return hits.length > 0 ? 1 : 0;
+}
+
+function shouldRecoverStructuredFromText(
+  structured: readonly ModelToolCall[],
+  textCalls: readonly ModelToolCall[],
+  knownToolNames: ReadonlySet<string>,
+  frontier: ReadonlySet<string> | undefined,
+): boolean {
+  if (textCalls.length === 0) {
+    return false;
+  }
+  if (
+    structured.some(
+      (call) =>
+        !knownToolNames.has(call.name) || isOffFrontierToolCall(call, frontier),
+    )
+  ) {
+    return true;
+  }
+  return structured.some(
+    (call) =>
+      isEmptyArgsToolCall(call) &&
+      textCalls.some(
+        (textCall) =>
+          textCall.name === call.name && !isEmptyArgsToolCall(textCall),
+      ),
+  );
+}
+
+function isUsableStructuredCall(
+  call: ModelToolCall,
+  knownToolNames: ReadonlySet<string>,
+  frontier: ReadonlySet<string> | undefined,
+): boolean {
+  return knownToolNames.has(call.name) && !isOffFrontierToolCall(call, frontier);
+}
+
+function isEmptyArgsToolCall(call: ModelToolCall): boolean {
+  return Object.keys(call.arguments ?? {}).length === 0;
+}
+
+function isOffFrontierToolCall(
+  call: ModelToolCall,
+  frontier: ReadonlySet<string> | undefined,
+): boolean {
+  return Boolean(frontier && frontier.size > 0 && !frontier.has(call.name));
+}
+
+function filterRecoveredCallsToFrontier(
+  calls: ModelToolCall[],
+  frontier: ReadonlySet<string> | undefined,
+): ModelToolCall[] {
+  if (!frontier || frontier.size === 0) {
+    return calls;
+  }
+  return calls.filter((call) => frontier.has(call.name));
 }
 
 export function extractToolCallsFromAssistantText(

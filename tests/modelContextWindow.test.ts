@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveVerifiedModelContextLength } from "../src/agent/modelContextWindow";
+import {
+  dropUncallableToolSchemas,
+  EARLY_COMPACTION_THRESHOLD_RATIO,
+  resolveConversationCompactionThreshold,
+  resolveVerifiedModelContextLength,
+  shouldCompactConversationEarly,
+} from "../src/agent/modelContextWindow";
 
 const verified = {
   modelProvider: "ollama",
@@ -39,6 +45,32 @@ test("verified context length resolves only for the matching ollama model", () =
       modelConnectionVerifiedProvider: undefined,
     }),
     null,
+  );
+});
+
+test("conversation compaction trips at 40-50% of the prompt budget, not 85%", () => {
+  const threshold = resolveConversationCompactionThreshold();
+  assert.ok(threshold >= 0.4);
+  assert.ok(threshold <= 0.5);
+  assert.equal(threshold, EARLY_COMPACTION_THRESHOLD_RATIO);
+  assert.equal(shouldCompactConversationEarly(44, 100), false);
+  assert.equal(shouldCompactConversationEarly(46, 100), true);
+  assert.equal(shouldCompactConversationEarly(84, 100), true);
+});
+
+test("uncallable frontier tool schemas are dropped from the context window", () => {
+  const schemas = [
+    { function: { name: "web_search" } },
+    { function: { name: "append_to_current_file" } },
+    { function: { name: "linear_create_issue" } },
+  ];
+  const kept = dropUncallableToolSchemas(
+    schemas,
+    new Set(["append_to_current_file"]),
+  );
+  assert.deepEqual(
+    kept.map((schema) => schema.function.name),
+    ["append_to_current_file"],
   );
 });
 

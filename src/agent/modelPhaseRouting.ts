@@ -43,6 +43,16 @@
  */
 
 import type { ModelCallPhase } from "../model/types";
+import {
+  measurePreloopModelCalls,
+  resolvePreloopSkip,
+  type PreloopSkipDecision,
+  type PreloopSkipInput,
+} from "./preloopSkip";
+
+/** Same-provider fast tags for new-install specialist / utility defaults. */
+export const DEFAULT_OLLAMA_UTILITY_MODEL = "qwen3.5:cloud";
+export const DEFAULT_OPENAI_UTILITY_MODEL = "gpt-4o-mini";
 
 export const MODEL_CALL_PHASES: readonly ModelCallPhase[] = [
   "router",
@@ -174,6 +184,44 @@ export function buildStructuredDecisionRouting(
   }
   return createModelPhaseRouting(overrides);
 }
+
+/**
+ * Empty configured utility is a no-op (router/planner stay on the lead).
+ * A same-provider fast tag routes structured-decision phases off the lead.
+ */
+export function resolveSameProviderUtilityModel(input: {
+  provider: "ollama" | "openai_compatible";
+  leadModel: string;
+  configuredUtility?: string;
+}): string {
+  const configured = input.configuredUtility?.trim() ?? "";
+  if (configured) {
+    return configured;
+  }
+  const lead = input.leadModel.trim();
+  const fallback =
+    input.provider === "openai_compatible"
+      ? DEFAULT_OPENAI_UTILITY_MODEL
+      : DEFAULT_OLLAMA_UTILITY_MODEL;
+  return lead === fallback ? "" : fallback;
+}
+
+/**
+ * Decision source for skipping authority classify + graph planner.
+ * Prompt-on-page extracts the note prompt first, then classifies once
+ * and embeds once — no wrapper-router tax.
+ */
+export function resolveStructuredPreloopDecision(
+  input: PreloopSkipInput,
+): PreloopSkipDecision {
+  return resolvePreloopSkip(input);
+}
+
+export function shouldSkipStructuredPreloop(input: PreloopSkipInput): boolean {
+  return resolvePreloopSkip(input).skipClassifyAndPlan;
+}
+
+export { measurePreloopModelCalls };
 
 /**
  * Per-phase call counts, so the saving from a routing table can be stated from

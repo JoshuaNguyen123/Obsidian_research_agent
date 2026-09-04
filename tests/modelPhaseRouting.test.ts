@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DEFAULT_OLLAMA_UTILITY_MODEL,
   MODEL_CALL_PHASES,
   STRUCTURED_DECISION_PHASES,
   buildStructuredDecisionRouting,
   createModelPhaseRouting,
   resolveModelForPhase,
+  resolveSameProviderUtilityModel,
+  shouldSkipStructuredPreloop,
   summarizePhaseDistribution,
 } from "../src/agent/modelPhaseRouting";
 
@@ -142,4 +145,31 @@ test("phase distribution quantifies the routable share of a run", () => {
 
 test("an empty distribution does not divide by zero", () => {
   assert.deepEqual(summarizePhaseDistribution([]), []);
+});
+
+test("same-provider utility defaults off the lead cloud model", () => {
+  assert.equal(
+    resolveSameProviderUtilityModel({
+      provider: "ollama",
+      leadModel: DEFAULT_MODEL,
+    }),
+    DEFAULT_OLLAMA_UTILITY_MODEL,
+  );
+  const routed = buildStructuredDecisionRouting(DEFAULT_OLLAMA_UTILITY_MODEL);
+  assert.equal(
+    resolveModelForPhase("router", routed, DEFAULT_MODEL, [
+      DEFAULT_MODEL,
+      DEFAULT_OLLAMA_UTILITY_MODEL,
+    ]).model,
+    DEFAULT_OLLAMA_UTILITY_MODEL,
+  );
+});
+
+test("preloop skip is the routing decision source for host-obvious writes", () => {
+  assert.equal(
+    shouldSkipStructuredPreloop({
+      prompt: "Write a 300-word essay into this note",
+    }),
+    true,
+  );
 });

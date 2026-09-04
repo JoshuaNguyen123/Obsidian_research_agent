@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   extractToolCallsFromAssistantText,
+  measureMixedStructuredTextRecoveryRate,
+  MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE,
   recoverToolCallsFromAssistantMessage,
 } from "../src/agent/toolCallRecovery";
 import type { ModelChatResponse } from "../src/model/types";
@@ -116,7 +118,7 @@ test("one textual call parseable by two stages recovers exactly once", () => {
   assert.deepEqual(calls[0].arguments, { query: "solo" });
 });
 
-test("provider tool calls bypass text recovery", () => {
+test("usable structured tool calls still bypass text recovery", () => {
   const response: Pick<ModelChatResponse, "message" | "toolCalls"> = {
     message: {
       role: "assistant",
@@ -125,7 +127,7 @@ test("provider tool calls bypass text recovery", () => {
     toolCalls: [
       {
         name: "read_current_file",
-        arguments: {},
+        arguments: { detail: "full" },
         index: 0,
         raw: { source: "provider" },
       },
@@ -133,7 +135,74 @@ test("provider tool calls bypass text recovery", () => {
   };
 
   assert.deepEqual(
-    recoverToolCallsFromAssistantMessage(response, new Set(["list_folder"])),
+    recoverToolCallsFromAssistantMessage(
+      response,
+      new Set(["read_current_file", "list_folder"]),
+    ),
     response.toolCalls,
   );
+});
+
+test("unknown, empty-args, or off-frontier structured calls recover from text", () => {
+  const known = new Set(["web_search", "append_to_current_file"]);
+  const unknown = recoverToolCallsFromAssistantMessage(
+    {
+      message: {
+        role: "assistant",
+        content: MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE.content,
+      },
+      toolCalls: [...MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE.structured],
+    },
+    new Set(MIXED_STRUCTURED_TEXT_RECOVERY_FIXTURE.knownToolNames),
+  );
+  assert.equal(unknown.length, 1);
+  assert.equal(unknown[0].name, "web_search");
+  assert.deepEqual(unknown[0].arguments, { query: "obsidian" });
+
+  const emptyArgs = recoverToolCallsFromAssistantMessage(
+    {
+      message: {
+        role: "assistant",
+        content:
+          '<tool_call>{"name":"web_search","arguments":{"query":"obsidian"}}</tool_call>',
+      },
+      toolCalls: [
+        {
+          name: "web_search",
+          arguments: {},
+          index: 0,
+          raw: { source: "empty-args" },
+        },
+      ],
+    },
+    known,
+  );
+  assert.equal(emptyArgs.length, 1);
+  assert.deepEqual(emptyArgs[0].arguments, { query: "obsidian" });
+
+  const offFrontier = recoverToolCallsFromAssistantMessage(
+    {
+      message: {
+        role: "assistant",
+        content:
+          '<tool_call>{"name":"append_to_current_file","arguments":{"text":"hi"}}</tool_call>',
+      },
+      toolCalls: [
+        {
+          name: "web_search",
+          arguments: { query: "nope" },
+          index: 0,
+          raw: { source: "off-frontier" },
+        },
+      ],
+    },
+    known,
+    { frontierToolNames: new Set(["append_to_current_file"]) },
+  );
+  assert.equal(offFrontier.length, 1);
+  assert.equal(offFrontier[0].name, "append_to_current_file");
+});
+
+test("Metric B: mixed junk-structured + valid-text recovery is 100%", () => {
+  assert.equal(measureMixedStructuredTextRecoveryRate(), 1);
 });

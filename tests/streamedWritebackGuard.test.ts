@@ -4,6 +4,10 @@ import { test } from "node:test";
 import {
   detectExternalStreamEdit,
   formatExternalStreamEditMessage,
+  JSON_PREFIX_WRITEBACK_HOLD_CHARS,
+  jsonPrefixWritebackHoldChars,
+  shouldKeepPostReleaseBuffer,
+  shouldKeepWritebackSafetyBuffer,
   stripWritebackDialoguePreamble,
 } from "../src/agent/streamedWritebackGuard";
 
@@ -110,6 +114,20 @@ test("a CRLF candidate keeps its original bytes after the strip", () => {
     "Sure, here is the revised note:\r\n\r\n" + note,
   );
   assert.equal(result.content, note);
+});
+
+test("Metric C: JSON-prefix writeback hold is finite and at most 400 chars", () => {
+  const hold = jsonPrefixWritebackHoldChars();
+  assert.ok(Number.isFinite(hold));
+  assert.ok(hold <= 400);
+  assert.equal(hold, JSON_PREFIX_WRITEBACK_HOLD_CHARS);
+
+  const shortJson = "{".repeat(hold);
+  const overHold = "{".repeat(hold + 1);
+  assert.equal(shouldKeepPostReleaseBuffer(shortJson), true);
+  assert.equal(shouldKeepPostReleaseBuffer(overHold), false);
+  assert.equal(shouldKeepWritebackSafetyBuffer(shortJson), true);
+  assert.equal(shouldKeepWritebackSafetyBuffer(overHold), false);
 });
 
 test("an over-long prefix is kept even when it opens conversationally", () => {

@@ -48,3 +48,49 @@ export function resolveVerifiedModelContextLength(
   }
   return contextLength;
 }
+
+/**
+ * Compact conversation earlier than the historical 85% trip so long tool
+ * transcripts shrink before the provider truncates. 40–50% of the prompt
+ * budget is the host default; AgentRunner still reads `runContext`'s 0.85
+ * until the campaign owner swaps the one-line import.
+ */
+export const EARLY_COMPACTION_THRESHOLD_RATIO = 0.45;
+
+export function resolveConversationCompactionThreshold(): number {
+  return EARLY_COMPACTION_THRESHOLD_RATIO;
+}
+
+export function shouldCompactConversationEarly(
+  estimatedChars: number,
+  maxPromptChars: number,
+): boolean {
+  if (
+    !Number.isFinite(estimatedChars) ||
+    !Number.isFinite(maxPromptChars) ||
+    maxPromptChars <= 0
+  ) {
+    return false;
+  }
+  return estimatedChars > maxPromptChars * EARLY_COMPACTION_THRESHOLD_RATIO;
+}
+
+export interface FrontierToolSchemaLike {
+  function: {
+    name: string;
+  };
+}
+
+/**
+ * Drop tool schemas the ready frontier cannot call so they do not occupy
+ * context. Route-base extras stay out unless the frontier lists them.
+ */
+export function dropUncallableToolSchemas<T extends FrontierToolSchemaLike>(
+  schemas: readonly T[],
+  callableNames: ReadonlySet<string>,
+): T[] {
+  if (callableNames.size === 0) {
+    return [];
+  }
+  return schemas.filter((schema) => callableNames.has(schema.function.name));
+}

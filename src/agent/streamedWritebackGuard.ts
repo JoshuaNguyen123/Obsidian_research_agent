@@ -60,15 +60,65 @@ export function shouldAbortReleasedChunk(
   return false;
 }
 
+/**
+ * Finite hold while a chunk looks like JSON / tool markup. Today the live
+ * runner kept buffering for the entire `{` / `[` prefix (unbounded). Release
+ * after this many characters so prose that happens to open with a brace
+ * still reaches the note.
+ */
+export const JSON_PREFIX_WRITEBACK_HOLD_CHARS = 400;
+
+export function jsonPrefixWritebackHoldChars(): number {
+  return JSON_PREFIX_WRITEBACK_HOLD_CHARS;
+}
+
 export function shouldKeepPostReleaseBuffer(content: string): boolean {
+  return shouldHoldWritebackSafetyPrefix(content, { allowPartialFence: false });
+}
+
+/**
+ * Initial (pre-release) safety window. Same finite JSON hold as post-release.
+ * AgentRunner still has a local copy that holds `{` unbounded — swap it to
+ * this export in one line so the initial buffer picks up the cap.
+ */
+export function shouldKeepWritebackSafetyBuffer(content: string): boolean {
+  return shouldHoldWritebackSafetyPrefix(content, { allowPartialFence: true });
+}
+
+function shouldHoldWritebackSafetyPrefix(
+  content: string,
+  options: { allowPartialFence: boolean },
+): boolean {
   const trimmed = content.trimStart();
+  if (!trimmed) {
+    return true;
+  }
+
   const lower = trimmed.toLowerCase();
-  return (
-    lower.startsWith("<requested_tool_call") ||
-    trimmed.startsWith("{") ||
-    trimmed.startsWith("[") ||
-    /^\\?`\\?`?\\?`?\s*(json|tool|tool_call|function)\b/i.test(trimmed)
-  );
+  if (
+    "<requested_tool_call".startsWith(lower) ||
+    lower.startsWith("<requested_tool_call")
+  ) {
+    return true;
+  }
+
+  if (/^\\?`\\?`?\\?`?\s*(json|tool|tool_call|function)\b/i.test(trimmed)) {
+    return true;
+  }
+
+  if (
+    options.allowPartialFence &&
+    (trimmed.startsWith("`") || trimmed.startsWith("\\`")) &&
+    !/\n/.test(trimmed)
+  ) {
+    return true;
+  }
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return trimmed.length <= JSON_PREFIX_WRITEBACK_HOLD_CHARS;
+  }
+
+  return false;
 }
 
 export interface StreamRetryPolicy {
