@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { App } from "obsidian";
 import {
@@ -205,21 +206,40 @@ test("a deleted note is excluded and named, and the other notes still rank", asy
   assert.ok(result.results.length > 0);
 });
 
-test("stale notes beyond the live-merge cap are excluded rather than embedded", async () => {
+test("a working-session stale set is live-merged instead of searching a partial sample", async () => {
   const { vault, service, requests } = await buildFixture();
   for (const topic of ["orchard", "harbour", "glacier", "library"]) {
     vault.put(`Notes/${topic}.md`, noteBody(topic, "edited"));
   }
-  assert.ok(4 > MAX_LIVE_STALE_NOTES_PER_SEARCH);
+  assert.ok(4 <= MAX_LIVE_STALE_NOTES_PER_SEARCH);
   const before = requests.length;
   const result = await service.search({ query: "orchard apples", limit: 4 });
   assert.equal(result.ok, true, result.message);
   assert.equal(result.indexFresh, false);
   assert.equal(result.stale?.changedPaths.length, 4);
-  assert.deepEqual(result.stale?.liveMergedPaths, []);
-  assert.equal(result.results.length, 0);
-  // Only the query was embedded; no document batch was sent.
-  assert.equal(requests.slice(before).filter((request) => request.documents.length > 0).length, 0);
+  assert.equal(result.stale?.liveMergedPaths.length, 4);
+  assert.ok(result.results.some((hit) => hit.path === "Notes/orchard.md"));
+  assert.ok(
+    requests.slice(before).some((request) => request.documents.length > 0),
+    "changed notes are embedded live when under the session cap",
+  );
+});
+
+test("stale notes beyond the live-merge cap fail explicit instead of searching a partial sample", async () => {
+  const { vault, service, requests } = await buildFixture();
+  for (const topic of ["orchard", "harbour", "glacier", "library"]) {
+    vault.put(`Notes/${topic}.md`, noteBody(topic, "edited"));
+  }
+  const before = requests.length;
+  const result = await service.search({
+    query: "orchard apples",
+    limit: 4,
+    maxLiveStaleNotes: 2,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "stale_index_live_cap");
+  assert.equal(result.message, "index stale, rebuilding");
+  assert.equal(requests.slice(before).length, 0);
 });
 
 test("a majority-stale index still fails closed so the tool can fall back to BM25", async () => {
@@ -276,4 +296,12 @@ test("a stale report names a bounded number of paths but counts every one", asyn
   assert.equal(result.stale?.changedCount, 0);
   // Indexed notes still rank; the unindexed ones simply are not there yet.
   assert.equal(result.results[0]?.path, "Notes/orchard.md");
+});
+
+test("the unused DEFAULT_INDEX_MAX_FILES constant is gone and the live-stale cap is a session bound", () => {
+  const source = readFileSync(new URL("../src/embeddings/semanticIndex.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /DEFAULT_INDEX_MAX_FILES/u);
+  assert.match(source, /MAX_LIVE_STALE_NOTES_PER_SEARCH = 16/u);
+  assert.match(source, /index stale, rebuilding/u);
+  assert.equal(MAX_LIVE_STALE_NOTES_PER_SEARCH, 16);
 });

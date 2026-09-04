@@ -106,6 +106,28 @@ test("empty state and primary mission action use the shared UI system", () => {
   assert.match(styles, /background: var\(--interactive-accent\)/u);
 });
 
+test("capturePrompt does not await the sandbox probe on the composer hot path", () => {
+  const capture = viewSource.slice(
+    viewSource.indexOf("private async capturePrompt("),
+    viewSource.indexOf("private createRunEventHandlers("),
+  );
+  assert.match(capture, /proving sandbox…/u);
+  assert.match(
+    capture,
+    /this\.plugin\.ensureCodeSandboxReadinessForMission\(\)/u,
+  );
+  assert.doesNotMatch(
+    capture,
+    /await this\.plugin\.ensureCodeSandboxReadinessForMission\(\)/u,
+  );
+  assert.match(capture, /sandboxValidationRequired: false/u);
+  assert.match(
+    viewSource,
+    /import \{ isSafeVaultResultPath \} from "\.\/tools\/validation"/u,
+  );
+  assert.doesNotMatch(viewSource, /function isSafeVaultResultPath\(/u);
+});
+
 test("Stop is reachable from the composer, not only from the live-run card", () => {
   // The live-run card is a different region of the tab and can be dismissed;
   // when it was the only Stop, a running mission left the composer showing a

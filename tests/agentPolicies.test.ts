@@ -14,7 +14,9 @@ import { planLoopBudget } from "../src/agent/loopPlanner";
 import { decideNextLoopAction } from "../src/agent/loopDecision";
 import {
   canApplyProjectMemoryLoad,
+  conversationPersistTargetsV1,
   getProjectMemoryLocation,
+  isFolderScopedProjectMemoryV1,
   resolveProjectMemoryAnchorPath,
 } from "../src/agent/projectMemory";
 import {
@@ -904,6 +906,23 @@ test("project memory paths live under the active note folder", () => {
     researchNotesFolder: "Agent Memory/Research",
     vaultMemoryFolder: "Agent Memory",
     vaultToolOutcomePath: "Agent Memory/tool-outcome-memory.json",
+  });
+
+  assert.equal(
+    isFolderScopedProjectMemoryV1(getProjectMemoryLocation("Projects/Grapes.md")),
+    true,
+  );
+  assert.equal(
+    isFolderScopedProjectMemoryV1(getProjectMemoryLocation("Root.md")),
+    false,
+  );
+  assert.deepEqual(conversationPersistTargetsV1(true), {
+    pluginData: false,
+    folderJson: true,
+  });
+  assert.deepEqual(conversationPersistTargetsV1(false), {
+    pluginData: true,
+    folderJson: false,
   });
 });
 

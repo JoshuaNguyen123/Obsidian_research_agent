@@ -95,7 +95,7 @@ export function buildExclusiveRunMetricRow(input) {
   return [
     new Date(startedAtMs).toISOString(),
     input.projects.join("+"),
-    input.model,
+    String(input.model ?? "").trim(),
     input.head,
     durationSeconds,
     acceptance.missionOutcome,

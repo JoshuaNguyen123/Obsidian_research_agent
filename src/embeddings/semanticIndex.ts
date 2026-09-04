@@ -46,7 +46,6 @@ import type {
 } from "./semanticIndexTypes";
 
 const DEFAULT_INDEX_FOLDER = "Agent Memory";
-const DEFAULT_INDEX_MAX_FILES = 1000;
 const INDEX_MARKDOWN_NAME = "Semantic Vault Index.md";
 const INDEX_JSON_NAME = "semantic-vault-index.json";
 const INDEX_VERSION = 2;
@@ -55,11 +54,13 @@ const INDEX_SHARD_ROW_LIMIT = 2048;
 const INDEX_SHARD_NAME_PREFIX = "semantic-vault-index-shard-";
 const MAX_INDEX_SNIPPET_CHARS = 360;
 /**
- * How many changed notes one search embeds live so the note being edited is
- * still searchable before the debounced reindex lands. Bounded because each is
- * a full chunk-and-embed of that note on the helper's serial queue.
+ * How many changed notes one search embeds live so a working session of
+ * edits stays searchable before the debounced reindex lands. Bounded because
+ * each note is a full chunk-and-embed on the helper's serial queue. Beyond
+ * this cap search fails with "index stale, rebuilding" instead of ranking a
+ * partial stale sample.
  */
-export const MAX_LIVE_STALE_NOTES_PER_SEARCH = 3;
+export const MAX_LIVE_STALE_NOTES_PER_SEARCH = 16;
 /**
  * Beyond this share of the index (or this many notes) the stale set is no
  * longer a few edits but a different vault. Search fails closed with
@@ -445,6 +446,16 @@ class DefaultSemanticIndexService implements SemanticIndexService {
         dim,
         "stale_index_majority",
         `Semantic index is stale: ${staleNoteCount} of ${index.notes.length} indexed notes changed or vanished since it was built.`,
+        index.indexedAt,
+      );
+    }
+    const liveStaleCap = request.maxLiveStaleNotes ?? MAX_LIVE_STALE_NOTES_PER_SEARCH;
+    if (liveStaleCap > 0 && staleness.changedPaths.length > liveStaleCap) {
+      return makeSearchFailure(
+        model,
+        dim,
+        "stale_index_live_cap",
+        "index stale, rebuilding",
         index.indexedAt,
       );
     }

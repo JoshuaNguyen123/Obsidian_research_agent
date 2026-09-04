@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  appendIdempotencySnapshotVaultPath,
   appendToCurrentFileTool,
+  applyAppendIdempotencySnapshotV1,
   noteTailHasExactAppendedBlock,
   resetAppendIdempotencyStateForTests,
   resolveAppendOperationIdentity,
+  snapshotAppendIdempotencyV1,
 } from "../src/tools/vaultTools";
 import type { ToolExecutionContext } from "../src/tools/types";
 
@@ -230,16 +233,18 @@ function createAppendVaultContext(options: {
 }): {
   context: ToolExecutionContext;
   content: Map<string, string>;
+  folders: Set<string>;
   modifies: number;
 } {
   const content = new Map<string, string>([["Current.md", options.initial]]);
+  const folders = new Set<string>();
   let modifies = 0;
   const getFile = (path: string) =>
     content.has(path)
       ? {
           path,
-          basename: "Current",
-          extension: "md",
+          basename: path.split("/").pop()?.replace(/\.[^.]+$/u, "") ?? path,
+          extension: path.split(".").pop() ?? "",
         }
       : null;
   const context: ToolExecutionContext = {
@@ -250,11 +255,21 @@ function createAppendVaultContext(options: {
       vault: {
         read: async (file: { path: string }) => content.get(file.path) ?? "",
         modify: async (file: { path: string }, data: string) => {
-          modifies += 1;
+          if (file.path === "Current.md") {
+            modifies += 1;
+          }
           content.set(file.path, data);
         },
+        create: async (path: string, data: string) => {
+          content.set(path, data);
+          return getFile(path);
+        },
+        createFolder: async (path: string) => {
+          folders.add(path);
+        },
         getFileByPath: getFile,
-        getFolderByPath: () => null,
+        getFolderByPath: (path: string) =>
+          folders.has(path) ? { path } : null,
         getAbstractFileByPath: (path: string) => getFile(path),
         getAllLoadedFiles: () => [getFile("Current.md")!],
       },
@@ -274,6 +289,7 @@ function createAppendVaultContext(options: {
   return {
     context,
     content,
+    folders,
     get modifies() {
       return modifies;
     },
@@ -334,4 +350,68 @@ test("a retried append after segment turnover is skipped exactly once under its 
   );
   assert.equal(nextNode.reason, undefined);
   assert.equal(mock.modifies, 2);
+});
+
+test("reload hydrates append idempotency from the run snapshot and does not double-append", async () => {
+  resetAppendIdempotencyStateForTests();
+  const mock = createAppendVaultContext({
+    prompt: "Append one proof line to the current note.",
+    initial: "Initial note",
+  });
+  const identity = {
+    runId: "run-reload-1",
+    operationId: "run-reload-1:1:0:append_to_current_file",
+  };
+  await appendToCurrentFileTool.execute(
+    { text: "Durable mutation proof" },
+    { ...mock.context, ...identity },
+  );
+  assert.equal(mock.modifies, 1);
+  const snapshot = snapshotAppendIdempotencyV1();
+  assert.ok(snapshot.keys.length > 0);
+
+  resetAppendIdempotencyStateForTests();
+  applyAppendIdempotencySnapshotV1(snapshot);
+  const retry = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      { ...mock.context, ...identity },
+    ),
+  );
+  assert.equal(retry.duplicateSkip, true);
+  assert.equal(retry.bytesWritten, 0);
+  assert.equal(mock.modifies, 1);
+  assert.equal(mock.content.get("Current.md"), "Initial note\nDurable mutation proof");
+});
+
+test("Continue after process restart hydrates keys from the vault run snapshot", async () => {
+  resetAppendIdempotencyStateForTests();
+  const mock = createAppendVaultContext({
+    prompt: "Append one proof line to the current note.",
+    initial: "Initial note",
+  });
+  const identity = {
+    runId: "segment-reload",
+    rootMissionId: "root-reload",
+    nodeId: "tool-03-append_to_current_file",
+    operationId: "segment-reload:2:0:append_to_current_file",
+  };
+  await appendToCurrentFileTool.execute(
+    { text: "Durable mutation proof" },
+    { ...mock.context, ...identity },
+  );
+  const sidecarPath = appendIdempotencySnapshotVaultPath(identity);
+  assert.equal(sidecarPath, "Agent Runs/root-reload.append-idempotency.json");
+  assert.ok(mock.content.has(sidecarPath!));
+
+  resetAppendIdempotencyStateForTests();
+  const resumed = asAppendReceipt(
+    await appendToCurrentFileTool.execute(
+      { text: "Durable mutation proof" },
+      { ...mock.context, ...identity },
+    ),
+  );
+  assert.equal(resumed.duplicateSkip, true);
+  assert.equal(resumed.bytesWritten, 0);
+  assert.equal(mock.modifies, 1);
 });

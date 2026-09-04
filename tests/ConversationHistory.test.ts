@@ -4,6 +4,7 @@ import {
   appendConversationMessage,
   getConversationCharCount,
   normalizeConversationHistory,
+  resolveConversationHistoryOnProjectLoadV1,
   toConversationModelMessages,
   trimConversationHistory,
   type AgentConversationMessage,
@@ -81,6 +82,35 @@ test("appendConversationMessage preserves bounded history and clear-to-empty beh
 
   assert.deepEqual(history, [{ role: "assistant", content: "reply" }]);
   assert.deepEqual(normalizeConversationHistory([]), []);
+});
+
+test("loading a folder with no history file does not keep the previous folder transcript", () => {
+  const previousFolderChat: AgentConversationMessage[] = [
+    { role: "user", content: "secret from folder A" },
+    { role: "assistant", content: "reply in folder A" },
+  ];
+  assert.deepEqual(
+    resolveConversationHistoryOnProjectLoadV1({
+      folderScoped: true,
+      folderHistory: null,
+      pluginDataHistory: previousFolderChat,
+    }),
+    [],
+  );
+});
+
+test("vault-root sessions keep data.json when no project folder is active", () => {
+  const pluginData: AgentConversationMessage[] = [
+    { role: "user", content: "root chat" },
+  ];
+  assert.deepEqual(
+    resolveConversationHistoryOnProjectLoadV1({
+      folderScoped: false,
+      folderHistory: null,
+      pluginDataHistory: pluginData,
+    }),
+    pluginData,
+  );
 });
 
 test("toConversationModelMessages emits only user and assistant model messages", () => {

@@ -2367,6 +2367,7 @@ export const appendToCurrentFileTool: AgentTool = {
     const idempotencyKey = operationIdentity
       ? `${operationIdentity}::${contentFingerprint}`
       : null;
+    await hydrateAppendIdempotencyFromRunSnapshot(context);
     // Duplicate-skip is identity + payload, never content alone. A second
     // mission appending the same line has a different run/operation identity
     // and must write. A Continue/retry of THIS identity may skip only after
@@ -2396,6 +2397,7 @@ export const appendToCurrentFileTool: AgentTool = {
     }
     if (idempotencyKey) {
       recordAppliedAppendIdempotencyKey(idempotencyKey);
+      await persistAppendIdempotencyToRunSnapshot(context);
     }
 
     const nextContent = `${current}${appendedText}`;
@@ -5065,6 +5067,123 @@ export function noteTailHasExactAppendedBlock(
 const MAX_APPLIED_APPEND_IDEMPOTENCY_KEYS = 512;
 const appliedAppendIdempotencyKeys: string[] = [];
 const appliedAppendIdempotencyKeySet = new Set<string>();
+
+export interface AppendIdempotencySnapshotV1 {
+  version: 1;
+  keys: string[];
+}
+
+export function createAppendIdempotencySnapshotV1(
+  keys: readonly string[] = [],
+): AppendIdempotencySnapshotV1 {
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(key);
+  }
+  return {
+    version: 1,
+    keys: unique.slice(-MAX_APPLIED_APPEND_IDEMPOTENCY_KEYS),
+  };
+}
+
+export function parseAppendIdempotencySnapshotV1(
+  value: unknown,
+): AppendIdempotencySnapshotV1 {
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.keys)) {
+    return createAppendIdempotencySnapshotV1();
+  }
+  return createAppendIdempotencySnapshotV1(
+    value.keys.filter((key): key is string => typeof key === "string" && key.length > 0),
+  );
+}
+
+export function snapshotAppendIdempotencyV1(): AppendIdempotencySnapshotV1 {
+  return createAppendIdempotencySnapshotV1(appliedAppendIdempotencyKeys);
+}
+
+export function applyAppendIdempotencySnapshotV1(
+  snapshot: AppendIdempotencySnapshotV1 | null | undefined,
+): void {
+  appliedAppendIdempotencyKeys.length = 0;
+  appliedAppendIdempotencyKeySet.clear();
+  for (const key of snapshot?.keys ?? []) {
+    recordAppliedAppendIdempotencyKey(key);
+  }
+}
+
+export function appendIdempotencySnapshotVaultPath(
+  context: Pick<ToolExecutionContext, "runId" | "rootMissionId">,
+): string | null {
+  const durableId = context.rootMissionId?.trim() || context.runId?.trim() || "";
+  if (!durableId) {
+    return null;
+  }
+  const safe = durableId.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 120);
+  if (!safe) {
+    return null;
+  }
+  try {
+    return normalizeVaultPath(`Agent Runs/${safe}.append-idempotency.json`);
+  } catch {
+    return null;
+  }
+}
+
+export async function hydrateAppendIdempotencyFromRunSnapshot(
+  context: Pick<ToolExecutionContext, "app" | "runId" | "rootMissionId">,
+): Promise<void> {
+  const path = appendIdempotencySnapshotVaultPath(context);
+  if (!path) {
+    return;
+  }
+  const file = context.app.vault.getFileByPath(path);
+  if (!file) {
+    return;
+  }
+  try {
+    const parsed = parseAppendIdempotencySnapshotV1(
+      JSON.parse(await context.app.vault.read(file)),
+    );
+    for (const key of parsed.keys) {
+      recordAppliedAppendIdempotencyKey(key);
+    }
+  } catch {
+    // A corrupt sidecar must not block the append; in-memory keys still apply.
+  }
+}
+
+export async function persistAppendIdempotencyToRunSnapshot(
+  context: Pick<ToolExecutionContext, "app" | "runId" | "rootMissionId">,
+): Promise<void> {
+  const path = appendIdempotencySnapshotVaultPath(context);
+  if (!path) {
+    return;
+  }
+  const body = JSON.stringify(snapshotAppendIdempotencyV1());
+  const existing = context.app.vault.getFileByPath(path);
+  try {
+    if (existing) {
+      await context.app.vault.modify(existing, body);
+      return;
+    }
+    const folder = "Agent Runs";
+    if (
+      typeof context.app.vault.getFolderByPath === "function" &&
+      !context.app.vault.getFolderByPath(folder) &&
+      typeof context.app.vault.createFolder === "function"
+    ) {
+      await context.app.vault.createFolder(folder);
+    }
+    await context.app.vault.create(path, body);
+  } catch {
+    // Persistence failure must not undo a successful note append.
+  }
+}
 
 function hasAppliedAppendIdempotencyKey(key: string): boolean {
   return appliedAppendIdempotencyKeySet.has(key);

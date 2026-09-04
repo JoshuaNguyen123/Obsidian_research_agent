@@ -82,6 +82,22 @@ test("direct metrics require a non-skipped selected project execution", () => {
   assert.equal(selectedProjectExecuted(report, ["real-ai-soak"]), false);
 });
 
+test("direct metrics trim model-id whitespace", () => {
+  const row = buildExclusiveRunMetricRow({
+    startedAt: Date.parse("2026-09-01T17:00:00.000Z"),
+    endedAt: Date.parse("2026-09-01T17:01:14.000Z"),
+    projects: ["desktop-code-delivery-real-live"],
+    model: "  glm-5.3-flash:cloud  ",
+    head: "a".repeat(40),
+    dirty: false,
+    exitCode: 0,
+    summaryFresh: false,
+    summary: null,
+  });
+  const columns = RUN_CSV_HEADER.split(",");
+  assert.equal(row[columns.indexOf("model")], "glm-5.3-flash:cloud");
+});
+
 test("direct failed-run metrics classify the Playwright error contract", () => {
   const row = buildExclusiveRunMetricRow({
     startedAt: Date.parse("2026-09-01T17:10:00.000Z"),

@@ -1,7 +1,7 @@
 import { MAX_TOOL_RESULT_CHARS } from "./constants";
 import { ToolExecutionError, ToolExecutionResult } from "./types";
 
-const BLOCKED_VAULT_ROOTS = new Set([
+export const BLOCKED_VAULT_ROOTS = new Set([
   ".agent-backups",
   ".obsidian",
   ".trash",
@@ -276,6 +276,24 @@ export function normalizeVaultPath(
   }
 
   return normalized;
+}
+
+/**
+ * Receipt/completion UI path check. Same vault-relative rules as writes:
+ * `normalizeVaultPath` plus {@link BLOCKED_VAULT_ROOTS}, so `.obsidian/*.md`
+ * cannot become a completion path. Notebooks are allowed beside markdown
+ * because Results/Jupyter receipts use `.ipynb`.
+ */
+export function isSafeVaultResultPath(path: string): boolean {
+  if (!path.trim()) {
+    return false;
+  }
+  try {
+    const normalized = normalizeVaultPath(path);
+    return /\.(?:md|ipynb)$/iu.test(normalized);
+  } catch {
+    return false;
+  }
 }
 
 export function truncateText(text: string, maxChars: number): string {

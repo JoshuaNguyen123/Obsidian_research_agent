@@ -112,6 +112,7 @@ import {
   COMMUNITY_INSTALL_HONESTY_LINE,
   FIRST_RUN_CHAT_SUGGESTIONS,
 } from "./settings";
+import { isSafeVaultResultPath } from "./tools/validation";
 import {
   blockedSummaryFromFactsV1,
   buildRunFailureEvidenceV1,
@@ -1935,16 +1936,16 @@ export class AgentView extends ItemView {
     }
 
     const activeFile = this.app.workspace.getActiveFile();
-    // Adopt and re-prove a host-provisioned sandbox before gating, so a
-    // provisioned machine starts the mission instead of reporting a blocker
-    // the host had already resolved.
+    // Adopt and re-prove a host-provisioned sandbox without blocking the
+    // composer. The ~105s WSL probe used to `await` here, so a code prompt
+    // froze Run Mission even when the cached binding was already valid.
+    // Non-code prompts never start the probe. Code prompts start the mission
+    // immediately, show "proving sandbox…", and capability readiness gates
+    // code tools when the probe finishes.
     const sandboxValidationRequired = missionRequiresSandboxValidationV1(prompt);
-    if (sandboxValidationRequired) {
-      // Usually a cached read: plugin load already adopted and proved the
-      // binding, so this only starts a probe process when that proof is
-      // missing or has gone stale.
-      await this.plugin.ensureCodeSandboxReadinessForMission();
-    }
+    const sandboxProbe = sandboxValidationRequired
+      ? this.plugin.ensureCodeSandboxReadinessForMission()
+      : null;
     const missionReadiness = evaluateMissionReadinessPreflightV1({
       prompt,
       readiness: this.plugin.getCapabilityReadiness(),
@@ -1956,7 +1957,10 @@ export class AgentView extends ItemView {
         deleteRepoAuthorized: this.readGitHubCleanupAuthority(),
         credentialKind: this.readGitHubCredentialKind(),
       },
-      sandboxValidationRequired,
+      // Composer never waits on the probe. Compound preflight still gates
+      // sandbox from lifecycle stages; single-stage code delivery starts and
+      // the in-flight prove updates capability readiness for code tools.
+      sandboxValidationRequired: false,
     });
     if (!missionReadiness.ok) {
       const card = buildMissionReadinessCardModelV1(missionReadiness);
@@ -2008,9 +2012,18 @@ export class AgentView extends ItemView {
     });
     this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
     // Quiet start: user bubble + subtle agent working indicator (no "Starting
-    // mission..." status box or CRT LOAD chrome).
-    this.setRunning(true, "working...");
-    this.updateChatLoader("working...");
+    // mission..." status box or CRT LOAD chrome). Code prompts show the
+    // in-flight prove; the loader returns to working once the probe settles.
+    const provingSandbox = Boolean(sandboxProbe);
+    this.setRunning(true, provingSandbox ? "proving sandbox…" : "working...");
+    this.updateChatLoader(provingSandbox ? "proving sandbox…" : "working...");
+    if (sandboxProbe) {
+      void sandboxProbe.then(() => {
+        if (this.isRunning) {
+          this.updateChatLoader("working...");
+        }
+      });
+    }
 
     let outcome: RunOutcome | null = null;
     try {
@@ -6078,18 +6091,6 @@ function firstStringValue(
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return null;
-}
-
-function isSafeVaultResultPath(path: string): boolean {
-  return Boolean(
-    path &&
-      !path.startsWith("/") &&
-      !path.includes("\\") &&
-      !/[\u0000-\u001f\u007f]/u.test(path) &&
-      !/(^|\/)\.\.(\/|$)/u.test(path) &&
-      !/^[a-z]:/iu.test(path) &&
-      /\.(?:md|ipynb)$/iu.test(path),
-  );
 }
 
 function formatEffortProfile(profile: string): string {

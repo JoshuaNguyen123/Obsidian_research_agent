@@ -86,6 +86,26 @@ export function resolveProjectMemoryAnchorPath(
   return null;
 }
 
+/** True when conversation/research JSON lives under the active note's folder. */
+export function isFolderScopedProjectMemoryV1(
+  location: ProjectMemoryLocation,
+): boolean {
+  return location.memoryFolder !== location.vaultMemoryFolder;
+}
+
+/**
+ * Single conversation store. Folder JSON when a project folder is active;
+ * otherwise plugin `data.json`. Never both.
+ */
+export function conversationPersistTargetsV1(folderScoped: boolean): {
+  pluginData: boolean;
+  folderJson: boolean;
+} {
+  return folderScoped
+    ? { pluginData: false, folderJson: true }
+    : { pluginData: true, folderJson: false };
+}
+
 /**
  * Latest-request-wins guard for asynchronous project-memory hydration.
  *

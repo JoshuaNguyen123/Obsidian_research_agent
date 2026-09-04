@@ -49,6 +49,22 @@ export function appendConversationMessage(
   return trimConversationHistory([...history, message], limits);
 }
 
+/**
+ * Folder-scoped JSON is source of truth when a project folder is active.
+ * A missing history file must load empty — never the previous folder's
+ * transcript. Vault-root / no-folder sessions keep `data.json`.
+ */
+export function resolveConversationHistoryOnProjectLoadV1(input: {
+  folderScoped: boolean;
+  folderHistory: unknown | null;
+  pluginDataHistory: AgentConversationMessage[];
+}): AgentConversationMessage[] {
+  if (!input.folderScoped) {
+    return normalizeConversationHistory(input.pluginDataHistory);
+  }
+  return normalizeConversationHistory(input.folderHistory ?? []);
+}
+
 export function trimConversationHistory(
   history: AgentConversationMessage[],
   limits: ConversationHistoryLimits = DEFAULT_LIMITS,

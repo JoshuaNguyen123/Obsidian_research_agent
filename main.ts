@@ -37,6 +37,7 @@ import {
 import {
   appendConversationMessage,
   normalizeConversationHistory,
+  resolveConversationHistoryOnProjectLoadV1,
   type AgentConversationMessage,
 } from "./src/conversationHistory";
 import {
@@ -157,7 +158,9 @@ import {
 } from "./src/agent/researchMemoryV2";
 import {
   canApplyProjectMemoryLoad,
+  conversationPersistTargetsV1,
   getProjectMemoryLocation,
+  isFolderScopedProjectMemoryV1,
   resolveProjectMemoryAnchorPath,
 } from "./src/agent/projectMemory";
 import {
@@ -819,6 +822,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   readonly agenticResearcherApi = this.coreApiHost.getApi();
   settings: AgentSettings = { ...DEFAULT_SETTINGS };
   conversationHistory: AgentConversationMessage[] = [];
+  /** Last `data.json` transcript; used when no project folder is active. */
+  private pluginDataConversationHistory: AgentConversationMessage[] = [];
+  private codeSandboxReadinessInFlight: Promise<void> | null = null;
   researchMemoryIndex: ResearchMemoryIndexEntry[] = [];
   toolOutcomeMemory: ToolOutcomeMemoryV1 = createToolOutcomeMemory();
   private projectMemoryLoadGeneration = 0;
@@ -2983,6 +2989,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
     this.semanticIndexService = this.createSemanticIndexService();
     this.conversationHistory = normalizeConversationHistory(rawHistory);
+    this.pluginDataConversationHistory = this.conversationHistory;
     this.researchMemoryIndex = migrateResearchMemoryIndexV2(
       normalizeResearchMemoryIndex(rawResearchMemoryIndex),
       this.settings.vaultScopeId!,
@@ -7714,10 +7721,25 @@ export default class AgenticResearcherPlugin extends Plugin {
    * before a code-execution mission is gated. Provisioning records the runtime
    * identity in the host environment; without this the durable state kept zero
    * providers and the mission died at code_validate_fast. Failures are
-   * swallowed: the readiness gate reports the resulting blocker.
+   * swallowed: the readiness gate reports the resulting blocker. Callers must
+   * not await this on the composer hot path.
    */
   async ensureCodeSandboxReadinessForMission(
     timeoutMs = HOST_PROVISIONED_SANDBOX_READINESS_TIMEOUT_MS_V1,
+  ): Promise<void> {
+    if (this.codeSandboxReadinessInFlight) {
+      return this.codeSandboxReadinessInFlight;
+    }
+    this.codeSandboxReadinessInFlight = this.runCodeSandboxReadinessForMission(
+      timeoutMs,
+    ).finally(() => {
+      this.codeSandboxReadinessInFlight = null;
+    });
+    return this.codeSandboxReadinessInFlight;
+  }
+
+  private async runCodeSandboxReadinessForMission(
+    timeoutMs: number,
   ): Promise<void> {
     const code = this.getCapabilityRuntime<{
       ensureHostProvisionedSandboxReadinessV1?(
@@ -8326,16 +8348,29 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.conversationHistory,
       message,
     );
-    await this.savePluginData();
-    await this.saveProjectMemoryData();
+    await this.persistConversationStore();
     this.activeAgentView?.refreshConversationLog();
   }
 
   async clearConversationHistory() {
     this.invalidateProjectMemoryLoads();
     this.conversationHistory = [];
-    await this.savePluginData();
-    await this.saveProjectMemoryData();
+    await this.persistConversationStore();
+  }
+
+  private async persistConversationStore(): Promise<void> {
+    const location = getProjectMemoryLocation(this.getProjectMemoryAnchorPath());
+    const folderScoped = isFolderScopedProjectMemoryV1(location);
+    const targets = conversationPersistTargetsV1(folderScoped);
+    if (!folderScoped) {
+      this.pluginDataConversationHistory = this.conversationHistory;
+    }
+    if (targets.pluginData) {
+      await this.savePluginData();
+    }
+    if (targets.folderJson) {
+      await this.saveProjectMemoryData();
+    }
   }
 
   async setToolOutcomeMemory(memory: ToolOutcomeMemoryV1) {
@@ -8758,9 +8793,11 @@ export default class AgenticResearcherPlugin extends Plugin {
       return;
     }
 
-    if (conversationHistory !== null) {
-      this.conversationHistory = normalizeConversationHistory(conversationHistory);
-    }
+    this.conversationHistory = resolveConversationHistoryOnProjectLoadV1({
+      folderScoped: isFolderScopedProjectMemoryV1(currentLocation),
+      folderHistory: conversationHistory,
+      pluginDataHistory: this.pluginDataConversationHistory,
+    });
 
     if (researchMemoryIndex !== null) {
       this.researchMemoryIndex = migrateResearchMemoryIndexV2(

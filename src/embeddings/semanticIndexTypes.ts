@@ -160,8 +160,9 @@ export interface SemanticIndexSearchRequest {
   /**
    * Cap on how many changed-but-not-yet-reindexed notes a search will embed
    * live and merge into the indexed hits. Defaults to
-   * `MAX_LIVE_STALE_NOTES_PER_SEARCH`; 0 disables the merge and simply
-   * excludes stale notes.
+   * `MAX_LIVE_STALE_NOTES_PER_SEARCH` (16). 0 disables the merge and simply
+   * excludes stale notes. Over the cap, search fails with
+   * "index stale, rebuilding" instead of ranking a partial sample.
    */
   maxLiveStaleNotes?: number;
   /**
