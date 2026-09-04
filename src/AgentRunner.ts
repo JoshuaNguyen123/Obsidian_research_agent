@@ -204,6 +204,7 @@ import {
   isGitHubCatalogToolName,
 } from "./tools/githubCatalogTools";
 import {
+  EXTRACT_DOCUMENT_TOOL_NAME,
   hasSafeReflexLabel,
   isAllowedForMission,
   isGitHubCatalogToolOfferedForMission,
@@ -257,8 +258,10 @@ import {
 import {
   allowsDestructiveShortCurrentNoteReplace,
   analyzeCurrentNoteResetPrompt,
+  hasPageContentClearIntent,
   isCurrentNoteReplaceResetPrompt,
 } from "./agent/currentNoteResetPolicy";
+import { hasAuthorizedCurrentNoteReplaceIntent } from "./agent/replaceIntent";
 import {
   planLoopBudget,
   type LoopBudgetPlan,
@@ -266,6 +269,8 @@ import {
 import {
   applyResearchPhaseToLoopDecision,
   decideNextLoopAction,
+  proseAnswerCannotFinishMissionV1,
+  shouldKeepLoopOpenForCitationGatherStallV1,
   unresolvedFailedTools,
   type LoopLedger,
 } from "./agent/loopDecision";
@@ -321,6 +326,7 @@ import {
 } from "./agent/linearReconcileRecover";
 import {
   buildMissionGraphFrontierTurnContext,
+  CITATION_GROUNDING_GATHER_TOOL_NAMES,
   constrainToolsToMissionGraphFrontier,
   narrowAdaptiveCodeMutationsToPlannedWritesV1,
   filterSetLooseToolNamesByMissionGraphAuthority,
@@ -333,6 +339,9 @@ import {
   missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
   missionGraphTerminalProjectionSealsToolFrontierV1,
+  sealedFrontierShouldKeepCitationGatherV1,
+  unpaidProofRequiresCitationGatherV1,
+  citationGatherUnpaidMissingV1,
 } from "./agent/missionGraphFrontier";
 import { enforcePhaseToolMenuCeilingV1 } from "./agent/toolSchemaPolicy";
 import { proofDebtSeedsFromOrchestratorHandoff } from "./agent/leadHandoffProof";
@@ -438,6 +447,7 @@ import {
   rememberVerifiedMermaidReadResult,
   rememberVerifiedWorkspaceReadResult,
   resolveSingleNamedTrustedRepositoryProfileKey,
+  heldFinalProjectionHasUnpaidProofDebtV1,
   shouldAcceptHeldFinalProjectionCandidateV1,
   shouldFinalizeVerifiedHostExportAfterToolUse,
   shouldRequestStreamingFinalProjection,
@@ -508,7 +518,6 @@ import {
   getExplicitVaultCrudWorkflowToolNames,
   getModelLinearIssueTemplateStructureProblem,
   getUnsafeModelLinearIssueCreateOutputMessage,
-  hasAffirmativeCodePathAction,
   hasAffirmativeJoinedDeveloperLifecycleIntent,
   hasAmbiguousDatePrompt,
   hasAppendIntent,
@@ -1166,15 +1175,20 @@ export { MAX_AGENT_STEPS } from "./tools/constants";
 export { resolveThinkingMode } from "./agent/runPlan";
 export {
   buildMissionGraphFrontierTurnContext,
+  CITATION_GROUNDING_GATHER_TOOL_NAMES,
   constrainToolsToMissionGraphFrontier,
   filterSetLooseToolNamesByMissionGraphAuthority,
   getActiveValidationRecoveryFrontierV1,
   getPendingMissionGraphWriteToolNames,
+  injectCitationGroundingGatherToolsV1,
   isAdaptiveCodeWorkspaceMutationToolNameV1,
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
   injectProofGateForcedGatherToolsV1,
   missionGraphFinalOnlyStubOwesRequiredWorkV1,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
+  sealedFrontierShouldKeepCitationGatherV1,
+  unpaidProofRequiresCitationGatherV1,
+  citationGatherUnpaidMissingV1,
 } from "./agent/missionGraphFrontier";
 export {
   insertExplicitLinearReadbacksIntoLifecycleToolNames,
@@ -1214,6 +1228,7 @@ export {
   receiptProvesWorkspaceContentChangeV1,
   rememberVerifiedWorkspaceReadResult,
   resolveSingleNamedTrustedRepositoryProfileKey,
+  heldFinalProjectionHasUnpaidProofDebtV1,
   shouldAcceptHeldFinalProjectionCandidateV1,
   shouldFinalizeVerifiedHostExportAfterToolUse,
   shouldRequestStreamingFinalProjection,
@@ -3744,6 +3759,7 @@ export async function runAgentMission({
   let explanatoryToolRouteReclassified = false;
   let lastStep = 0;
   let lastFinalOutput = "";
+  let lastHeldCitationGatherMissing: string[] = [];
   /**
    * One reserved retry for a forced final answer that came back empty.
    *
@@ -3755,6 +3771,7 @@ export async function runAgentMission({
    * grants exactly one extra step, once, only for this case.
    */
   let awaitingForcedFinalAnswer = false;
+  let sealFrontierAfterForcedFinal = false;
   let emptyForcedFinalRetryUsed = false;
   let finalRetryExtraSteps = 0;
   let committedProofGatedWrite: {
@@ -4522,6 +4539,11 @@ export async function runAgentMission({
         resumeRoute: resumeLedger?.route,
         expectedTools: resumeLedger?.loopBudget.expectedTools,
       });
+    if (refuseInheritedCodeWorkflow) {
+      // Classifiers no longer grant code: drop the inherited host stream so
+      // current-note write tools become the offered (and healable) authority.
+      streamingWritebackKind = null;
+    }
     if (
       streamingWritebackKind === "append" &&
       resumeSnapshot?.missionGraphRef &&
@@ -5499,7 +5521,13 @@ export async function runAgentMission({
       // same (proof-matrix interrupted-continuation, 2026-08-25 22:41Z).
       const writebackHealMissionRequiresAppend =
         resumeContinuesStreamedCurrentNoteAppend ||
-        requiredWriteTools.includes("append_to_current_file");
+        requiredWriteTools.some(
+          (name) =>
+            name === "append_to_current_file" ||
+            name === "replace_current_file" ||
+            name === "edit_current_section" ||
+            name === "append_to_current_section",
+        );
       const resumedGraphForWritebackHealCandidate =
         missionGraphSession && exactResumeRunId
           ? missionGraphSession.graph
@@ -9099,6 +9127,49 @@ export async function runAgentMission({
     );
     return gateAcceptanceByResearchPhase(acceptance, phase);
   };
+  const citationGatherCompanionToolNames = (): string[] => {
+    const liveMissing = evaluateCurrentAcceptance(
+      lastFinalOutput.trim() || undefined,
+    ).missing;
+    if (lastFinalOutput.trim()) {
+      lastHeldCitationGatherMissing = unpaidProofRequiresCitationGatherV1(
+        liveMissing,
+      )
+        ? [...liveMissing]
+        : [];
+    }
+    if (
+      !sealedFrontierShouldKeepCitationGatherV1({
+        graph: missionGraphSession?.graph ?? missionGraph,
+        sealForForcedFinal:
+          sealFrontierAfterForcedFinal &&
+          !(
+            setLooseCompoundEnabled &&
+            setLooseDeliveryComplete({
+              stages: compoundLifecycleStages,
+              proofs: setLooseDeliveryProofs,
+            }).unpaid.length > 0
+          ),
+        unpaidAcceptanceMissing: citationGatherUnpaidMissingV1({
+          liveMissing,
+          lastFinalOutput,
+          persistedMissing: resumeLedger?.acceptance?.missing,
+          heldCandidateMissing: lastHeldCitationGatherMissing,
+        }),
+        inFinalizationReserve:
+          loopBudgetPlan.finalizationReserve > 0 &&
+          loopBudgetPlan.toolStepBudget > 0 &&
+          currentSegmentSuccessfulToolNames.length >=
+            loopBudgetPlan.toolStepBudget,
+        explicitSingleWebFetchOnly:
+          hasExplicitSingleWebFetchOnlyIntent(activeIntentPrompt),
+        explicitNoWeb: hasExplicitNoWebIntent(activeIntentPrompt),
+      })
+    ) {
+      return [];
+    }
+    return [...CITATION_GROUNDING_GATHER_TOOL_NAMES];
+  };
   const reconcileCommittedProofGatedWriteAcceptance = (
     acceptance: MissionAcceptanceResult,
     step: number,
@@ -11803,6 +11874,11 @@ export async function runAgentMission({
           // went unmet or the scorecard reads a caveat as a clean pass.
           lastProofGatedHoldToolName = null;
         } else {
+          if (
+            unpaidProofRequiresCitationGatherV1(candidateAcceptance.missing)
+          ) {
+            lastHeldCitationGatherMissing = [...candidateAcceptance.missing];
+          }
           lastFinalOutput = "";
           // Chat gets the What/Why/Next dispatch WITHOUT the raw token list --
           // the tokens stay in Run Details (acceptance panel + traces), which
@@ -14149,13 +14225,20 @@ export async function runAgentMission({
         const setLooseUnpaidToolAllowlist = setLooseDeliveryStillUnpaid
           ? new Set(setLoosePipelineOffered)
           : null;
+        const citationGatherAllowlist = citationGatherCompanionToolNames();
         const mayBypassGraphStart =
-          setLooseUnpaidToolAllowlist !== null &&
-          mayBypassMissionGraphStartForSetLooseSoftCompanion(
-            toolCall.name,
-            setLooseUnpaidToolAllowlist,
-            currentMissionGraphForSetLooseAuthority,
-          );
+          (setLooseUnpaidToolAllowlist !== null &&
+            mayBypassMissionGraphStartForSetLooseSoftCompanion(
+              toolCall.name,
+              setLooseUnpaidToolAllowlist,
+              currentMissionGraphForSetLooseAuthority,
+            )) ||
+          (citationGatherAllowlist.length > 0 &&
+            mayBypassMissionGraphStartForSetLooseSoftCompanion(
+              toolCall.name,
+              citationGatherAllowlist,
+              currentMissionGraphForSetLooseAuthority,
+            ));
         // Genuinely unplanned Soft companions, plus bounded adaptive workspace
         // edits after durable workspace creation, may run when graph-start
         // bookkeeping has no exact action. Planned gates still begin and
@@ -14190,6 +14273,7 @@ export async function runAgentMission({
       const authorityReadyFrontier = authoritativeRefusalFrontierToolNamesV1({
         graph: missionGraphSession?.graph ?? missionGraph,
         excludeToolNames: [toolCall.name],
+        admittedCompanionToolNames: citationGatherCompanionToolNames(),
       });
       const message = [
         `Rejected ${toolCall.name}: ${getUnknownErrorMessage(error)}`,
@@ -17197,6 +17281,7 @@ export async function runAgentMission({
                 ),
                 excludeToolNames: [toolCall.name],
                 allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+                admittedCompanionToolNames: citationGatherCompanionToolNames(),
               }),
             }),
           });
@@ -17227,6 +17312,7 @@ export async function runAgentMission({
               ),
               excludeToolNames: [toolCall.name],
               allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+              admittedCompanionToolNames: citationGatherCompanionToolNames(),
             });
           messages.push({
             role: "system" as const,
@@ -19410,17 +19496,40 @@ export async function runAgentMission({
           .flatMap(getMissionGraphNodeFrontierToolNames),
       );
     }
+    const liveBlockingPreWriteProofs = hasSatisfiedDurablePreWriteProof()
+      ? []
+      : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
+    const preWriteProofGateApplies = preWriteProofGateAppliesV1({
+      durablePreWriteProofSatisfied: hasSatisfiedDurablePreWriteProof(),
+      blockingPreWriteMissing: liveBlockingPreWriteProofs,
+    });
+    const setLooseDeliveryUnpaidThisTurn =
+      setLooseCompoundEnabled &&
+      setLooseDeliveryComplete({
+        stages: compoundLifecycleStages,
+        proofs: setLooseDeliveryProofs,
+      }).unpaid.length > 0;
+    const catalogAlreadyOffersWebGather = tools.some(
+      (item) =>
+        item.function.name === "web_search" ||
+        item.function.name === "web_fetch",
+    );
     const proofGateForcedGather =
-      proofGateWriteRejectionCountsByTool.size > 0 &&
+      preWriteProofGateApplies &&
       !hasSatisfiedDurablePreWriteProof() &&
-      blockingProofsAreWebFetchOnlyV1(
-        evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof),
-      )
+      blockingProofsAreWebFetchOnlyV1(liveBlockingPreWriteProofs) &&
+      !hasExplicitSingleWebFetchOnlyIntent(activeIntentPrompt) &&
+      !hasExplicitNoWebIntent(activeIntentPrompt) &&
+      (proofGateWriteRejectionCountsByTool.size > 0 ||
+        !catalogAlreadyOffersWebGather)
         ? {
             injectWebTools: true,
             heldWriteToolName:
               lastProofGatedHoldToolName ??
               [...proofGateWriteRejectionCountsByTool.keys()][0] ??
+              requiredWriteTools.find((name) =>
+                isContentWriteToolThatNeedsEvidence(name),
+              ) ??
               null,
           }
         : undefined;
@@ -19430,6 +19539,17 @@ export async function runAgentMission({
         "web_fetch",
       ]);
       allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    }
+    const citationGatherCompanions = citationGatherCompanionToolNames();
+    if (citationGatherCompanions.length > 0) {
+      tools = addToolDefinitions(
+        tools,
+        toolRegistry,
+        citationGatherCompanions,
+      );
+      for (const name of citationGatherCompanions) {
+        allowedToolNames.add(name);
+      }
     }
     let stepTools = bindVerifiedWorkspaceIdentityToolSchemas(
       constrainValidationRecoveryWorkspaceToolsV1({
@@ -19459,6 +19579,11 @@ export async function runAgentMission({
                 maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
                 setLooseOfferedToolNames,
                 proofGateForcedGather,
+                sealForForcedFinal:
+                  sealFrontierAfterForcedFinal &&
+                  !setLooseDeliveryUnpaidThisTurn,
+                keepCitationGatherOnSealedFrontier:
+                  citationGatherCompanions.length > 0,
               },
             ),
             // The authoritative graph, even when the menu above was built
@@ -19485,15 +19610,17 @@ export async function runAgentMission({
       stepTools,
       compoundResearchClosureTurn,
     );
-    if (proofGateWriteRejectionCountsByTool.size > 0) {
+    if (proofGateForcedGather || proofGateWriteRejectionCountsByTool.size > 0) {
       const beforeContainment = stepTools;
-      const liveBlockingProofs = hasSatisfiedDurablePreWriteProof()
-        ? []
-        : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
+      const liveBlockingProofs = liveBlockingPreWriteProofs;
       stepTools = containProofGateRejectedWriteToolsV1(stepTools, {
         rejectionCounts: proofGateWriteRejectionCountsByTool,
         blockingProofsOutstanding: !hasSatisfiedDurablePreWriteProof(),
         blockingProofs: liveBlockingProofs,
+        holdWritesUntilProofs:
+          Boolean(proofGateForcedGather) &&
+          proofGateWriteRejectionCountsByTool.size === 0 &&
+          !blockingProofsAreWebFetchOnlyV1(liveBlockingProofs),
       });
       if (stepTools.length !== beforeContainment.length) {
         const withheld = beforeContainment
@@ -19934,6 +20061,7 @@ export async function runAgentMission({
           graph: missionGraphSession?.graph ?? missionGraph,
           candidateToolNames: readyToolNames,
           allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+          admittedCompanionToolNames: citationGatherCompanionToolNames(),
         });
       const offeredToolsAreAuthoritative =
         authoritativeOfferedToolNames.length > 0;
@@ -20947,14 +21075,19 @@ export async function runAgentMission({
           runPlan,
           allowedToolNames,
         );
-      const proseCannotFinishMission =
-        ((runPlan.route === "tool_required" ||
-          runPlan.route === "grounded_workflow") &&
-          successfulToolNames.length === 0) ||
-        (codeWorkflowMission && missionGraphUsesExactPlannedFrontier) ||
-        pendingRequiredWritesBeforeToolUse.length > 0 ||
-        missingRequiredWebToolsBeforeToolUse.length > 0 ||
-        requiredVaultTraversalStillMissing;
+      const citationGatherStillOffered =
+        citationGatherCompanionToolNames().length > 0;
+      const proseCannotFinishMission = proseAnswerCannotFinishMissionV1({
+        route: runPlan.route,
+        successfulToolCount: successfulToolNames.length,
+        codeExactFrontier:
+          Boolean(codeWorkflowMission && missionGraphUsesExactPlannedFrontier),
+        pendingRequiredWriteCount: pendingRequiredWritesBeforeToolUse.length,
+        missingRequiredWebToolCount:
+          missingRequiredWebToolsBeforeToolUse.length,
+        requiredVaultTraversalStillMissing,
+        citationGatherStillUnpaid: citationGatherStillOffered,
+      });
       if (
         proseCannotFinishMission &&
         stepTools.length > 0 &&
@@ -21227,6 +21360,37 @@ export async function runAgentMission({
             role: "system" as const,
             content: buildProseSteeringEscalation(readySteeringToolNames),
           });
+          noToolEscalationActive = true;
+          continue;
+        }
+        if (
+          shouldKeepLoopOpenForCitationGatherStallV1({
+            citationGatherStillUnpaid: citationGatherStillOffered,
+            executableFrontier: stepTools.length > 0,
+            stepBelowLimit: step < stepLimit,
+          })
+        ) {
+          const readyGatherToolNames = stepTools.map(
+            (tool) => tool.function.name,
+          );
+          events.onStatus?.(
+            `Model stalled without tools while citation gather is unpaid; keeping the tool loop open (${readyGatherToolNames.join(", ")}).`,
+          );
+          events.onTrace?.({
+            id: `citation-gather-stall-${step}`,
+            kind: "status",
+            step,
+            message: [
+              `citation_gather_still_unpaid=true`,
+              `frontier=${readyGatherToolNames.join(",") || "none"}`,
+              `attempts=${unchangedNoToolResponseCount}`,
+            ].join("; "),
+          });
+          messages.push({
+            role: "system" as const,
+            content: buildCitationGatherStallCorrection(readyGatherToolNames),
+          });
+          unchangedNoToolResponseCount = 0;
           noToolEscalationActive = true;
           continue;
         }
@@ -22483,6 +22647,11 @@ export async function runAgentMission({
           !candidateOnlyFinalProjectionDebt
         ) {
           const rejectedCandidate = lastFinalOutput;
+          if (
+            unpaidProofRequiresCitationGatherV1(candidateAcceptance.missing)
+          ) {
+            lastHeldCitationGatherMissing = [...candidateAcceptance.missing];
+          }
           lastFinalOutput = "";
           if (
             step < stepLimit &&
@@ -22689,6 +22858,14 @@ export async function runAgentMission({
             )
             .flatMap(getMissionGraphNodeFrontierToolNames),
         );
+        const midResponseCitationGather = citationGatherCompanionToolNames();
+        if (midResponseCitationGather.length > 0) {
+          tools = addToolDefinitions(
+            tools,
+            toolRegistry,
+            midResponseCitationGather,
+          );
+        }
         const refreshedStepTools = bindVerifiedWorkspaceIdentityToolSchemas(
           constrainValidationRecoveryWorkspaceToolsV1({
             tools: bindExactWorkspaceDestinationToolSchemas(
@@ -22708,6 +22885,17 @@ export async function runAgentMission({
                   route: runPlan.route,
                   maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
                   setLooseOfferedToolNames: refreshedSetLooseOffered,
+                  sealForForcedFinal:
+                    sealFrontierAfterForcedFinal &&
+                    !(
+                      setLooseCompoundEnabled &&
+                      setLooseDeliveryComplete({
+                        stages: compoundLifecycleStages,
+                        proofs: setLooseDeliveryProofs,
+                      }).unpaid.length > 0
+                    ),
+                  keepCitationGatherOnSealedFrontier:
+                    midResponseCitationGather.length > 0,
                 },
               ),
               missionGraphUsesExactPlannedFrontier && !setLooseCompoundEnabled
@@ -23203,6 +23391,7 @@ export async function runAgentMission({
             candidateToolNames: [...stepAllowedToolNames],
             excludeToolNames: [toolCall.name],
             allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+            admittedCompanionToolNames: citationGatherCompanionToolNames(),
           });
         // Authority is unchanged: this only stops host-side menu drift from
         // being counted in the bucket that means "the model named a tool it
@@ -23567,6 +23756,7 @@ export async function runAgentMission({
                 ),
                 excludeToolNames: [toolCall.name],
                 allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
+                admittedCompanionToolNames: citationGatherCompanionToolNames(),
               }),
             }),
           });
@@ -24588,6 +24778,8 @@ export async function runAgentMission({
         researchPhaseDescriptor.writeToolsAllowed !== true,
       secondAgentAvailable: specialistClientForRecovery !== null,
       secondAgentConsulted: specialistRecoveryConsulted,
+      citationGatherStillUnpaid:
+        citationGatherCompanionToolNames().length > 0,
     };
     const loopDecision = applyResearchPhaseToLoopDecision(
       decideNextLoopAction(loopLedger, loopBudgetPlan),
@@ -24971,6 +25163,7 @@ export async function runAgentMission({
             "The mission plan is complete. Do not request more tools. Provide the final answer now using the gathered evidence and receipts.",
         });
         awaitingForcedFinalAnswer = true;
+        sealFrontierAfterForcedFinal = true;
         continue;
       }
     }
@@ -25005,9 +25198,9 @@ export async function runAgentMission({
       }
       const heldFinalNode =
         (missionGraphSession?.graph ?? missionGraph)?.nodes.final;
-      const heldFinalAcceptance = lastFinalOutput.trim()
-        ? evaluateCurrentAcceptance(lastFinalOutput)
-        : null;
+      const heldFinalAcceptance = evaluateCurrentAcceptance(
+        lastFinalOutput.trim() || undefined,
+      );
       const hasReadyToollessFinalNode = Boolean(
         heldFinalNode &&
           (heldFinalNode.status === "ready" ||
@@ -25015,18 +25208,17 @@ export async function runAgentMission({
             heldFinalNode.status === "running") &&
           heldFinalNode.allowedTools.length === 0,
       );
-      if (
-        shouldAcceptHeldFinalProjectionCandidateV1({
-          loopAction: loopDecision.action,
-          graphFinalOnly: missionGraphFinalSynthesisOnly,
-          heldCandidate: lastFinalOutput,
-          acceptanceMissing: heldFinalAcceptance?.missing ?? [],
-          hasReadyToollessFinalNode,
-          setLooseDeliveryStillUnpaid,
-          pendingRequiredWriteCount:
-            pendingRequiredWriteToolsAfterToolUse.length,
-        })
-      ) {
+      const heldFinalAcceptInput = {
+        loopAction: loopDecision.action,
+        graphFinalOnly: missionGraphFinalSynthesisOnly,
+        heldCandidate: lastFinalOutput,
+        acceptanceMissing: heldFinalAcceptance.missing,
+        hasReadyToollessFinalNode,
+        setLooseDeliveryStillUnpaid,
+        pendingRequiredWriteCount:
+          pendingRequiredWriteToolsAfterToolUse.length,
+      };
+      if (shouldAcceptHeldFinalProjectionCandidateV1(heldFinalAcceptInput)) {
         events.onStatus?.(
           "Held final draft pays remaining projection debt; closing the run.",
         );
@@ -25037,7 +25229,7 @@ export async function runAgentMission({
           message:
             "Accepted the held final-projection candidate instead of reopening a set-loose tool frontier.",
           outputPreview: {
-            missing: heldFinalAcceptance?.missing ?? [],
+            missing: heldFinalAcceptance.missing,
             graph_final_only: missionGraphFinalSynthesisOnly,
             payloadFingerprint: hashOperationInput(lastFinalOutput),
           },
@@ -25049,6 +25241,21 @@ export async function runAgentMission({
         );
         await finishRun("final", lastStep, stepLimit);
         return;
+      }
+      const onlyTerminalFinalizationDebt =
+        !heldFinalProjectionHasUnpaidProofDebtV1(heldFinalAcceptance.missing) &&
+        (heldFinalAcceptance.missing.length === 0 ||
+          missionAcceptanceHasOnlyTerminalFinalizationDebt(
+            heldFinalAcceptance,
+            hasReadyToollessFinalNode,
+          ));
+      if (
+        missionGraphFinalSynthesisOnly &&
+        !setLooseDeliveryStillUnpaid &&
+        pendingRequiredWriteToolsAfterToolUse.length === 0 &&
+        onlyTerminalFinalizationDebt
+      ) {
+        sealFrontierAfterForcedFinal = true;
       }
       events.onStatus?.(
         `Tool context is sufficient; drafting final output (${loopDecision.reason})...`,
@@ -26569,9 +26776,20 @@ export function containProofGateRejectedWriteToolsV1<
     rejectionCounts: ReadonlyMap<string, number>;
     blockingProofsOutstanding: boolean;
     blockingProofs?: readonly string[];
+    /**
+     * First gather turn: hide writes until web/fetch proofs exist so the
+     * model cannot retry a write before search. After a proof-gated
+     * rejection, web-only debt keeps the write visible (inject gather).
+     */
+    holdWritesUntilProofs?: boolean;
   },
 ): T[] {
   if (!input.blockingProofsOutstanding) return [...tools];
+  if (input.holdWritesUntilProofs === true) {
+    return tools.filter(
+      (tool) => !isContentWriteToolThatNeedsEvidence(tool.function.name),
+    );
+  }
   // Web/fetch debt is paid by gathering, not by hiding the write. Keep the
   // held write visible and let the frontier inject search/fetch instead.
   if (blockingProofsAreWebFetchOnlyV1(input.blockingProofs ?? [])) {
@@ -29509,10 +29727,14 @@ function getAllowedToolDefinitions(
     hasSectionAppendIntent(prompt) || namesActiveNoteSection;
   const allowDelete = hasDeleteIntent(prompt);
   const allowDeletePath = hasDeletePathIntent(prompt);
-  const allowWholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
+  const allowWholeNoteReplace =
+    hasWholeNoteReplaceIntent(prompt) ||
+    hasPageContentClearIntent(prompt) ||
+    isCurrentNoteReplaceResetPrompt(prompt);
   const preferHostOwnedReplace =
     prefersStreamedReplaceForEditOrganize(prompt) ||
     allowWholeNoteReplace ||
+    hasPageContentClearIntent(prompt) ||
     streamingWritebackKind === "replace";
   const allowEdit =
     (hasEditIntent(prompt) || namesActiveNoteSection) &&
@@ -29593,14 +29815,14 @@ function getAllowedToolDefinitions(
     hasHtmlPreviewIntent(prompt) ||
     allowCodeExecution ||
     explicitCodeToolNames.includes("render_html_preview");
-  const allowDesignTools = hasDesignIntent(prompt);
+  const allowDesignTools = missionGrantsDesignCapability(prompt);
   const allowDesignPackage = hasDesignPackageIntent(prompt);
   const allowBrowserTools = hasBrowserAutomationIntent(prompt);
   const allowExperienceMemory =
     settings?.experienceMemoryEnabled === true &&
     (hasExperienceMemoryIntent(prompt) ||
       hasWebSearchIntent(prompt) ||
-      hasDesignIntent(prompt) ||
+      missionGrantsDesignCapability(prompt) ||
       hasBrowserAutomationIntent(prompt) ||
       hasLongResearchIntent(prompt) ||
       hasResearchMemoryIntent(prompt));
@@ -29781,11 +30003,12 @@ function getAllowedToolDefinitions(
       if (name === "code_validate_commit_prepared") {
         return hasPreparedBackgroundCodeValidationCommitIntent(prompt);
       }
+      // isAllowedForMission already applied the WS2 isCodeToolAllowedForPrompt
+      // gate. Do not keep a drifting AgentRunner copy.
       return (
-        (allowCodeExecution ||
-          allowCodeWorkspaceRead ||
-          explicitCodeToolNames.length > 0) &&
-        isCodeToolAllowedForPrompt(name, prompt, routedCodeToolNameSet)
+        allowCodeExecution ||
+        allowCodeWorkspaceRead ||
+        explicitCodeToolNames.length > 0
       );
     }
 
@@ -29847,7 +30070,7 @@ function getAllowedToolDefinitions(
     }
 
     if (name === "search_markdown_files" || name === "read_markdown_files") {
-      return allowVaultBrowse || allowSpecificFileRead;
+      return allowVaultBrowse || allowSpecificFileRead || allowSemanticSearch;
     }
 
     if (name === "inspect_semantic_index") {
@@ -29996,7 +30219,7 @@ function getAllowedToolDefinitions(
 
     if (name === "rename_current_file") {
       return (
-        !hasDesignIntent(prompt) &&
+        !missionGrantsDesignCapability(prompt) &&
         allowVisibleRename &&
         (!preferPathTarget || allowExplicitCurrentNoteRename) &&
         !allowEdit &&
@@ -30006,7 +30229,7 @@ function getAllowedToolDefinitions(
 
     if (name === "edit_current_section") {
       return (
-        !hasDesignIntent(prompt) &&
+        !missionGrantsDesignCapability(prompt) &&
         allowEdit &&
         streamingWritebackKind !== "edit"
       );
@@ -30015,7 +30238,12 @@ function getAllowedToolDefinitions(
     if (name === "replace_current_file") {
       return (
         allowReplace &&
-        !preferPathTarget
+        !preferPathTarget &&
+        (hasAuthorizedCurrentNoteReplaceIntent(prompt) ||
+          allowWholeNoteReplace ||
+          hasPageContentClearIntent(prompt) ||
+          isCurrentNoteReplaceResetPrompt(prompt) ||
+          streamingWritebackKind === "replace")
       );
     }
 
@@ -30027,7 +30255,21 @@ function getAllowedToolDefinitions(
       return allowGraphLinkWrite && !preferPathTarget;
     }
 
-    return true;
+    if (
+      name === EXTRACT_DOCUMENT_TOOL_NAME ||
+      name === "analyze_dataset" ||
+      name === "verify_citation" ||
+      name === "resolve_citation" ||
+      name === "export_bibtex"
+    ) {
+      // WS2 already gated these in isAllowedForMission. Name them here so
+      // the catalog is deny-by-default for anything else unregistered.
+      return true;
+    }
+
+    // Extension/legacy tools carry a descriptor. Schema-only names that
+    // nobody listed above stay off the menu (deny-by-default).
+    return toolRegistry.getDescriptor?.(name) != null;
   });
 
   // The user named one exact read and explicitly prohibited discovery. Keep
@@ -30887,6 +31129,24 @@ function getRequiredWriteToolNames(
   );
 }
 
+export function getAllowedToolNamesForTests(
+  toolRegistry: ToolRegistry,
+  prompt: string,
+  missionIntent: MissionIntent,
+  streamingWritebackKind: StreamingWritebackKind | null = null,
+): string[] {
+  return getAllowedToolDefinitions(
+    toolRegistry,
+    prompt,
+    missionIntent,
+    undefined,
+    streamingWritebackKind,
+    null,
+    [],
+    true,
+  ).map((definition) => definition.function.name);
+}
+
 export function getRequiredWriteToolNamesForTests(
   prompt: string,
   allowedToolNames: readonly string[],
@@ -31169,12 +31429,6 @@ export function shouldRefuseInheritedCodeWorkflowOnResumeV1(input: {
     getRequiredCodeWorkflowToolNames(input.prompt).length > 0
   ) {
     return false;
-  }
-  if (
-    input.resumeRoute === "grounded_workflow" ||
-    input.resumeRoute === "tool_required"
-  ) {
-    return true;
   }
   return (input.expectedTools ?? []).some((name) =>
     (CODE_EXECUTION_TOOL_ALLOW as readonly string[]).includes(name),
@@ -31665,6 +31919,18 @@ function buildProseSteeringEscalation(
     "Prose without a tool call cannot advance this mission; required tool work is still owed.",
     `The ready frontier tool(s): ${readyToolNames.join(", ")}.`,
     exactInstruction,
+  ].join(" ");
+}
+
+function buildCitationGatherStallCorrection(
+  readyToolNames: readonly string[],
+): string {
+  return [
+    FRONTIER_CORRECTION_SENTINEL,
+    "Prose without a tool call cannot pay claim-grounding. Do not draft another final-only page.",
+    `The ready citation-gather tool(s): ${readyToolNames.join(", ")}.`,
+    "Call verify_citation or read_source_section on a fetched passage, or web_fetch a cited URL, using the offered schema.",
+    "Return the tool call only.",
   ].join(" ");
 }
 
@@ -32467,6 +32733,14 @@ function getStreamingWritebackKind(
     return "replace";
   }
 
+  if (
+    hasPageContentClearIntent(prompt) ||
+    isCurrentNoteReplaceResetPrompt(prompt) ||
+    hasWholeNoteReplaceIntent(prompt)
+  ) {
+    return "replace";
+  }
+
   if (hasExplicitStreamToCurrentNoteIntent(prompt)) {
     return hasReplaceIntent(prompt) || isCurrentNoteReplaceResetPrompt(prompt)
       ? "replace"
@@ -32911,6 +33185,11 @@ function shouldDefaultToActiveNoteWriteback({
   if (
     forceChatOnly ||
     hasChatOnlyResponseIntent(prompt) ||
+    hasExplicitNoNoteWriteIntent(prompt) ||
+    missionForbidsNoteMutationV1({ userPrompt: prompt }) ||
+    classifyMissionSpeechAct(prompt).reasons.includes(
+      "conversation_revision",
+    ) ||
     !enableStreaming ||
     toolContext.settings?.streamWritebackMode !==
       "all_current_note_content_writes" ||
@@ -33244,44 +33523,6 @@ function hasActiveCurrentMarkdownFile(
 
 
 
-function isCodeToolAllowedForPrompt(
-  toolName: string,
-  prompt: string,
-  routedCodeToolNames: ReadonlySet<string> = new Set(),
-): boolean {
-  if (/\b(install(?:ing|ed)?|dependency|dependencies|lockfile|bootstrap|restore)\b/i.test(prompt) === false &&
-      (toolName === "install_code_dependency")) {
-    return false;
-  }
-  if (toolName === "code_workspace_move") {
-    return hasAffirmativeCodePathAction(prompt, /\b(?:rename|move)\b/iu);
-  }
-  if (toolName === "code_workspace_copy") {
-    return hasAffirmativeCodePathAction(prompt, /\b(?:copy|duplicate)\b/iu);
-  }
-  if (toolName === "code_workspace_trash") {
-    return hasAffirmativeCodePathAction(prompt, /\b(?:remove|delete|trash)\b/iu);
-  }
-  if (toolName === "code_workspace_restore") {
-    return hasAffirmativeCodePathAction(prompt, /\brestore\b/iu);
-  }
-  if (routedCodeToolNames.has(toolName)) {
-    return true;
-  }
-  if (
-    hasRepositoryCodeMutationIntent(prompt) ||
-    hasStandaloneCodeExecutionIntent(prompt) ||
-    hasCodeDeliverableIntent(prompt) ||
-    detectProjectLifecycleStagesV1(prompt).includes("code_execution")
-  ) {
-    return true;
-  }
-  const explicit = getExplicitCodeToolNames(prompt);
-  if (explicit.length > 0) {
-    return explicit.includes(toolName);
-  }
-  return CODE_READ_ONLY_TOOL_NAMES.has(toolName);
-}
 
 
 export function getCompoundLifecycleResearchGraphToolNames(

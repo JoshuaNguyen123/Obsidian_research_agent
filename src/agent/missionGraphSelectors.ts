@@ -289,6 +289,13 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
    * above. Default false: a seat that does not know fails closed.
    */
   allowDynamicReadContinuation?: boolean;
+  /**
+   * Extra names the caller has already decided the authority will admit
+   * (citation-gather Soft tools on a sealed terminal frontier). Fail closed:
+   * omit this unless the same unpaid-proof predicate that offers those tools
+   * is true. Never use this to reopen leftover Soft-union companions.
+   */
+  admittedCompanionToolNames?: readonly string[] | null;
 }): string[] {
   const clean = (names: readonly string[] | null | undefined): string[] => [
     ...new Set((names ?? []).map((name) => name.trim()).filter(Boolean)),
@@ -296,6 +303,7 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
   const excluded = new Set(clean(input.excludeToolNames));
   const candidates =
     input.candidateToolNames == null ? null : clean(input.candidateToolNames);
+  const companionSet = new Set(clean(input.admittedCompanionToolNames));
   const graph = input.graph;
   if (!graph) {
     // No graph means no MissionGraphSession, so `beginMissionGraphTool` returns
@@ -308,7 +316,8 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
     graph.capabilityEnvelope.tools[name]?.effect === "read";
   const readySet = new Set(readyMissionGraphFrontierToolNamesV1(graph));
   const admits = (name: string): boolean =>
-    !excluded.has(name) && (readySet.has(name) || admitsDynamicRead(name));
+    !excluded.has(name) &&
+    (readySet.has(name) || admitsDynamicRead(name) || companionSet.has(name));
   if (candidates === null) {
     return [
       ...new Set([
@@ -318,6 +327,7 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
               .filter(([, grant]) => grant.effect === "read")
               .map(([name]) => name)
           : []),
+        ...companionSet,
       ]),
     ].filter((name) => !excluded.has(name));
   }

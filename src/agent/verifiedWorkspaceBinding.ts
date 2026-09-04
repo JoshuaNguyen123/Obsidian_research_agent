@@ -794,6 +794,22 @@ export function missionAcceptanceHasOnlyTerminalFinalizationDebt(
  * (optionally plus `mission_plan_incomplete` on a tool-less final node),
  * finish the run instead of asking the model again.
  */
+const HELD_FINAL_UNPAID_PROOF_RED_PATTERN =
+  /write_receipt|citation_coverage|claim_grounding|web_evidence|fetched_sources|source_coverage|source_domains|distinct_domains|vault_evidence|note_reflection|linear_hierarchy|code_execution|private_github|accepted_research|create_project_idea_brief/i;
+
+/**
+ * Citations, receipts, and set-loose delivery stay real reds even when a
+ * held draft exists. Terminal `final_output` / `final_relevance` debt does
+ * not belong in this set.
+ */
+export function heldFinalProjectionHasUnpaidProofDebtV1(
+  acceptanceMissing: readonly string[],
+): boolean {
+  return acceptanceMissing.some((item) =>
+    HELD_FINAL_UNPAID_PROOF_RED_PATTERN.test(item),
+  );
+}
+
 export function shouldAcceptHeldFinalProjectionCandidateV1(input: {
   loopAction: string;
   graphFinalOnly: boolean;
@@ -808,6 +824,10 @@ export function shouldAcceptHeldFinalProjectionCandidateV1(input: {
   if (input.setLooseDeliveryStillUnpaid) return false;
   if (input.pendingRequiredWriteCount > 0) return false;
   if (!input.heldCandidate.trim()) return false;
+  if (heldFinalProjectionHasUnpaidProofDebtV1(input.acceptanceMissing)) {
+    return false;
+  }
+  if (input.acceptanceMissing.length === 0) return true;
   return missionAcceptanceHasOnlyTerminalFinalizationDebt(
     { missing: [...input.acceptanceMissing] },
     input.hasReadyToollessFinalNode,

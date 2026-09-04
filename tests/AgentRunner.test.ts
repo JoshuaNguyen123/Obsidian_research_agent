@@ -56,7 +56,10 @@ import {
   rejectDuplicateResearchSourceFetchV1,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
+  getAllowedToolNamesForTests,
   getRequiredWriteToolNamesForTests,
+  applyDefaultActiveNoteWriteback,
+  classifyMissionIntent,
   missionRequiresSandboxValidationV1,
   getDurablyProvenCompletedGraphToolNames,
   getRestorableCompletedGraphToolNames,
@@ -175,6 +178,7 @@ import {
   hasCodeDeliverableIntent,
   hasExplicitCodeExecutionProhibition,
 } from "../src/agent/codeDeliverableIntent";
+import { missionGrantsDesignCapability } from "../src/agent/codeDesignIntent";
 import { ModelClientError } from "../src/model/types";
 import type {
   ModelChatRequest,
@@ -903,6 +907,141 @@ test("a topic brief about algorithms in python is not a code deliverable", () =>
       resumeRoute: "grounded_workflow",
     }),
     false,
+  );
+  assert.equal(
+    shouldRefuseInheritedCodeWorkflowOnResumeV1({
+      prompt: "continue the sourced brief",
+      resumeRoute: "grounded_workflow",
+      expectedTools: ["web_search", "append_to_current_file"],
+    }),
+    false,
+  );
+});
+
+function catalogNames(prompt: string, extraTools: string[] = []): string[] {
+  const registry = new DefaultToolRegistry([
+    ...["web_search", "web_fetch", "append_to_current_file", "replace_current_file", "create_design_canvas", "create_svg_design", "invented_unregistered_tool", ...extraTools].map(
+      (name) => ({
+        name,
+        description: name,
+        parameters: { type: "object" as const, properties: {} },
+        execute: async () => ({ ok: true }),
+      }),
+    ),
+  ]);
+  const missionIntent = applyDefaultActiveNoteWriteback({
+    prompt,
+    missionIntent: classifyMissionIntent(prompt, {
+      hasActiveMarkdownNote: true,
+    }),
+    toolContext: {
+      settings: {
+        streamWritebackMode: "all_current_note_content_writes",
+      },
+      getCurrentMarkdownFile: () =>
+        ({ path: "Current.md", extension: "md" }) as never,
+    } as never,
+    enableStreaming: true,
+    forceChatOnly: false,
+  });
+  return getAllowedToolNamesForTests(registry, prompt, missionIntent);
+}
+
+test("research-topic design prose does not offer create_design tools", () => {
+  const prompt =
+    "Write a 400 word note on graphic design history and why visual design matters.";
+  assert.equal(missionGrantsDesignCapability(prompt), false);
+  const names = catalogNames(prompt);
+  assert.equal(names.includes("create_design_canvas"), false);
+  assert.equal(names.includes("create_svg_design"), false);
+});
+
+test("catalog denies unnamed tools by default", () => {
+  const names = catalogNames("Append a short greeting to this note.");
+  assert.equal(
+    names.includes("invented_unregistered_tool"),
+    false,
+    `deny-by-default must drop unnamed tools; got ${names.join(",")}`,
+  );
+  assert.equal(names.includes("append_to_current_file"), true);
+});
+
+test("page-clear default writeback does not append", () => {
+  const prompt =
+    "Delete all the notes on the page and then write a 300 word essay on the renaissance.";
+  const intent = applyDefaultActiveNoteWriteback({
+    prompt,
+    missionIntent: classifyMissionIntent(prompt, {
+      hasActiveMarkdownNote: true,
+    }),
+    toolContext: {
+      settings: {
+        streamWritebackMode: "all_current_note_content_writes",
+      },
+      getCurrentMarkdownFile: () =>
+        ({ path: "Current.md", extension: "md" }) as never,
+    } as never,
+    enableStreaming: true,
+    forceChatOnly: false,
+  });
+  const names = getAllowedToolNamesForTests(
+    new DefaultToolRegistry([
+      {
+        name: "append_to_current_file",
+        description: "append",
+        parameters: { type: "object", properties: {} },
+        execute: async () => ({ ok: true }),
+      },
+      {
+        name: "replace_current_file",
+        description: "replace",
+        parameters: { type: "object", properties: {} },
+        execute: async () => ({ ok: true }),
+      },
+    ]),
+    prompt,
+    intent,
+    "replace",
+  );
+  assert.equal(names.includes("append_to_current_file"), false);
+  assert.equal(names.includes("replace_current_file"), true);
+});
+
+test("no-write follow-up does not replace the current note", () => {
+  const prompt =
+    "Rewrite the answer you just gave me — do not write or edit any note.";
+  const intent = applyDefaultActiveNoteWriteback({
+    prompt,
+    missionIntent: classifyMissionIntent(prompt, {
+      hasActiveMarkdownNote: true,
+    }),
+    toolContext: {
+      settings: {
+        streamWritebackMode: "all_current_note_content_writes",
+      },
+      getCurrentMarkdownFile: () =>
+        ({ path: "Current.md", extension: "md" }) as never,
+    } as never,
+    enableStreaming: true,
+    forceChatOnly: false,
+  });
+  assert.equal(intent.noteOutput, false);
+  const names = getAllowedToolNamesForTests(
+    new DefaultToolRegistry([
+      {
+        name: "replace_current_file",
+        description: "replace",
+        parameters: { type: "object", properties: {} },
+        execute: async () => ({ ok: true }),
+      },
+    ]),
+    prompt,
+    intent,
+  );
+  assert.equal(
+    names.includes("replace_current_file"),
+    false,
+    "product:no_write_followup_replaced_note",
   );
 });
 
@@ -18700,6 +18839,66 @@ test("compound research checks every counted tool and closure exposes only publi
       (tool) => tool.function.name,
     ),
     ["publish_research_to_linear"],
+  );
+});
+
+test("transformer-architecture-with-cite gathers web tools on the first turn", async () => {
+  const prompt =
+    "Write a brief explaining the transformer architecture and cite at least 5 scholarly sources on this page.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Transformer\n\n",
+  });
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "Attention Is All You Need",
+              url: "https://arxiv.org/abs/1706.03762",
+              snippet: "The transformer architecture.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "Attention Is All You Need",
+          url: "https://arxiv.org/abs/1706.03762",
+          content: "The transformer uses multi-head self-attention.",
+          excerpt: "The transformer uses multi-head self-attention.",
+        },
+      };
+    }
+    return { status: 404, headers: {}, json: {} };
+  };
+  const client = createClient({
+    chatRequests,
+    chatResponders: [() => responseWithContent("Gathering sources first.")],
+  });
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+  });
+  const firstAgent = chatRequests.find(
+    (request) => request.evidencePhase === "agent_step",
+  );
+  const firstTools = firstAgent?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(
+    firstTools.includes("web_search") && firstTools.includes("web_fetch"),
+    `first gather must offer web_search/web_fetch; got ${firstTools.join(",")}`,
   );
 });
 

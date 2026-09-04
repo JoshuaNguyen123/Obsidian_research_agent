@@ -3777,7 +3777,10 @@ test("durable run anchor exists before the first model call and evolves into the
   );
   assert.ok(finalLedger.revision > anchor.revision);
   const runArtifacts = [...vault.files.keys()].filter(
-    (path) => path.startsWith("Agent Runs/") && path.includes(identityRunId!),
+    (path) =>
+      path.startsWith("Agent Runs/") &&
+      path.includes(identityRunId!) &&
+      !path.endsWith(".append-idempotency.json"),
   );
   assert.equal(
     runArtifacts.length,

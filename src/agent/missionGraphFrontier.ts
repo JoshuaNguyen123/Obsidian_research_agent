@@ -459,6 +459,105 @@ export const PROOF_GATE_FORCED_GATHER_TOOL_NAMES = [
 ] as const;
 
 /**
+ * After a tool-less terminal `final` is ready, leftover Soft-union companions
+ * such as `create_project_idea_brief` must stay sealed. Unpaid claim-grounding
+ * / citation coverage is different: the model still needs search, fetch, and
+ * citation verify to pay quote spans. Emptying the menu here is what turned
+ * BYOK continuations into `tool_not_allowed` + `segment_cap`.
+ */
+export const CITATION_GROUNDING_GATHER_TOOL_NAMES = [
+  "web_search",
+  "web_fetch",
+  "verify_citation",
+  "read_source_section",
+] as const;
+
+const CITATION_GATHER_UNPAID_PROOF_PATTERN =
+  /citation_coverage|claim_grounding|web_evidence|fetched_sources|source_coverage|source_domains|distinct_domains|quote_mismatch/i;
+
+export function unpaidProofRequiresCitationGatherV1(
+  acceptanceMissing: readonly string[] | null | undefined,
+): boolean {
+  return (acceptanceMissing ?? []).some((item) =>
+    CITATION_GATHER_UNPAID_PROOF_PATTERN.test(item),
+  );
+}
+
+/**
+ * Claim grounding is only scored against a draft (`finalOutput`). Continue
+ * starts `lastFinalOutput` empty, so live acceptance will not name
+ * `claim_grounding` until the model writes another ungrounded page — and a
+ * sealed terminal then returns `[]` for that first step. Union persisted
+ * ledger missing and the last held rejected-draft missing only while this
+ * segment has no candidate; a live draft's missing set is authoritative.
+ */
+export function citationGatherUnpaidMissingV1(input: {
+  liveMissing: readonly string[] | null | undefined;
+  lastFinalOutput?: string | null;
+  persistedMissing?: readonly string[] | null;
+  heldCandidateMissing?: readonly string[] | null;
+}): string[] {
+  const live = [...(input.liveMissing ?? [])];
+  if (input.lastFinalOutput?.trim()) return live;
+  return [
+    ...live,
+    ...(input.persistedMissing ?? []),
+    ...(input.heldCandidateMissing ?? []),
+  ];
+}
+
+export function isCitationGroundingGatherToolNameV1(toolName: string): boolean {
+  return (CITATION_GROUNDING_GATHER_TOOL_NAMES as readonly string[]).includes(
+    toolName.trim(),
+  );
+}
+
+export function injectCitationGroundingGatherToolsV1<
+  T extends { function: { name: string } },
+>(offered: readonly T[], catalog: readonly T[]): T[] {
+  const names = new Set(offered.map((tool) => tool.function.name));
+  const extra: T[] = [];
+  for (const name of CITATION_GROUNDING_GATHER_TOOL_NAMES) {
+    if (names.has(name)) continue;
+    const schema = catalog.find((tool) => tool.function.name === name);
+    if (schema) extra.push(schema);
+  }
+  return extra.length > 0 ? [...offered, ...extra] : [...offered];
+}
+
+/**
+ * Offer/authority/refusal must share this: citation gather is restored only
+ * when a terminal seal would otherwise return `[]`, claims are unpaid, the
+ * segment is not in its finalization reserve, and the prompt did not forbid
+ * search. Fetch-only and in-run tool-budget caps stay empty.
+ */
+export function sealedFrontierShouldKeepCitationGatherV1(input: {
+  graph: MissionGraphV3 | null | undefined;
+  sealForForcedFinal?: boolean;
+  unpaidAcceptanceMissing?: readonly string[] | null;
+  inFinalizationReserve?: boolean;
+  explicitSingleWebFetchOnly?: boolean;
+  explicitNoWeb?: boolean;
+}): boolean {
+  if (input.inFinalizationReserve === true) return false;
+  if (input.explicitSingleWebFetchOnly === true) return false;
+  if (input.explicitNoWeb === true) return false;
+  if (!unpaidProofRequiresCitationGatherV1(input.unpaidAcceptanceMissing)) {
+    return false;
+  }
+  if (missionGraphTerminalProjectionSealsToolFrontierV1(input.graph)) {
+    return true;
+  }
+  if (input.sealForForcedFinal !== true || !input.graph) {
+    return false;
+  }
+  return (
+    missionGraphOnlyFinalSynthesisRemainsV1(input.graph) &&
+    graphHasCompletedRequiredMutation(input.graph)
+  );
+}
+
+/**
  * After a web/fetch-only proof-gated write hold, keep the held write visible
  * and add search/fetch from the catalog. Used by both the fresh frontier and
  * the Continue empty-frontier fallback so they cannot disagree.
@@ -850,6 +949,21 @@ export function constrainToolsToMissionGraphFrontier(
       injectWebTools?: boolean;
       heldWriteToolName?: string | null;
     };
+    /**
+     * `force_final_no_tools` + a paid graph whose only remaining node is the
+     * tool-less final. Seal even when that final is still `queued` so a
+     * set-loose Soft-union cannot reopen `create_project_idea_brief` (or
+     * other companions) after the loop has already decided to finish.
+     * Unpaid set-loose delivery stays a caller-side red: do not pass this
+     * flag while those proofs are unpaid.
+     */
+    sealForForcedFinal?: boolean;
+    /**
+     * When a terminal projection would otherwise return `[]`, keep citation
+     * gather tools from the catalog. Do not pass this for unpaid receipts or
+     * leftover Soft-union companions — those stay sealed.
+     */
+    keepCitationGatherOnSealedFrontier?: boolean;
   } = {},
 ): ModelToolDefinition[] {
   const applyEffectClass = (
@@ -889,8 +1003,26 @@ export function constrainToolsToMissionGraphFrontier(
   // after the loop has already decided `force_final_no_tools`; each completed
   // read then materializes another dynamic retry node and the verified final
   // draft is never allowed to terminate the run.
+  //
+  // Unpaid claim-grounding is the exception: returning [] made BYOK
+  // continuations refuse web_fetch while quote-span debt stayed red.
+  const sealedTerminalFrontier = (): ModelToolDefinition[] => {
+    if (!options.keepCitationGatherOnSealedFrontier) return [];
+    return applyEffectClass(
+      injectCitationGroundingGatherToolsV1([], tools),
+      { respectMaxEffectClass: false },
+    );
+  };
   if (missionGraphTerminalProjectionSealsToolFrontierV1(graph)) {
-    return [];
+    return sealedTerminalFrontier();
+  }
+  if (
+    options.sealForForcedFinal === true &&
+    graph &&
+    missionGraphOnlyFinalSynthesisRemainsV1(graph) &&
+    graphHasCompletedRequiredMutation(graph)
+  ) {
+    return sealedTerminalFrontier();
   }
   if (graph && suppressOptionalFrontier && setLooseNames.length > 0) {
     const optionalOnlyNames =

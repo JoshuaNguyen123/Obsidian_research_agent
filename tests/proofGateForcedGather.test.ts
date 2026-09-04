@@ -165,3 +165,103 @@ test("proof-gated web/fetch debt keeps the write, injects gather tools, and spli
   assert.equal(recovery.status, "recover");
   assert.equal(recovery.updatedAction?.toolName, "web_search");
 });
+
+test("first gather turn injects web tools and holds writes until proofs exist", () => {
+  const transformerWithCite =
+    "Write a brief explaining the transformer architecture and cite at least 5 scholarly sources on this page.";
+  const thousandWordResearch =
+    "Write a 1000 word research note on photosynthesis. Cite at least 5-10 scholarly and academic sources.";
+
+  assert.equal(
+    blockingProofsAreWebFetchOnlyV1([
+      "web_evidence",
+      "citation_coverage",
+      "fetched_sources",
+    ]),
+    true,
+    transformerWithCite,
+  );
+  assert.equal(
+    blockingProofsAreWebFetchOnlyV1(["web_evidence", "source_coverage"]),
+    true,
+    thousandWordResearch,
+  );
+
+  const firstGatherMenu = [
+    "append_to_current_file",
+    "replace_current_file",
+    "read_current_file",
+  ].map(tool);
+  assert.deepEqual(
+    containProofGateRejectedWriteToolsV1(firstGatherMenu, {
+      rejectionCounts: new Map(),
+      blockingProofsOutstanding: true,
+      blockingProofs: ["web_evidence", "citation_coverage"],
+    }).map((item) => item.function.name),
+    ["append_to_current_file", "replace_current_file", "read_current_file"],
+    "web/fetch-only first gather keeps the write visible; execution still holds it",
+  );
+  assert.deepEqual(
+    containProofGateRejectedWriteToolsV1(firstGatherMenu, {
+      rejectionCounts: new Map(),
+      blockingProofsOutstanding: true,
+      blockingProofs: ["vault_evidence"],
+      holdWritesUntilProofs: true,
+    }).map((item) => item.function.name),
+    ["read_current_file"],
+    "non-web first-gather holds writes until proofs exist",
+  );
+
+  const catalog = [
+    "append_to_current_file",
+    "read_current_file",
+    "web_search",
+    "web_fetch",
+  ].map(tool);
+  assert.deepEqual(
+    injectProofGateForcedGatherToolsV1(
+      [tool("read_current_file")],
+      catalog,
+      { injectWebTools: true, heldWriteToolName: "append_to_current_file" },
+    ).map((item) => item.function.name),
+    ["read_current_file", "web_search", "web_fetch", "append_to_current_file"],
+    "first gather injects web_search/web_fetch without a prior write rejection",
+  );
+
+  const streamingStub = {
+    nodes: {
+      dispatch: {
+        id: "dispatch",
+        status: "complete",
+        allowedTools: [],
+        inputs: {},
+        outputs: {},
+      },
+      final: {
+        id: "final",
+        status: "ready",
+        allowedTools: [],
+        inputs: {},
+        outputs: {},
+        completionContract: { requiredEvidenceKinds: ["final-output"] },
+      },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as never;
+  const firstTurnFrontier = constrainToolsToMissionGraphFrontier(
+    catalog,
+    streamingStub,
+    {
+      route: "single_model_writeback",
+      proofGateForcedGather: {
+        injectWebTools: true,
+        heldWriteToolName: "append_to_current_file",
+      },
+    },
+  ).map((item) => item.function.name);
+  assert.ok(
+    firstTurnFrontier.includes("web_search") &&
+      firstTurnFrontier.includes("web_fetch"),
+    `transformer-architecture-with-cite and 1000-word research note must gather first; got ${firstTurnFrontier.join(",")}`,
+  );
+});
