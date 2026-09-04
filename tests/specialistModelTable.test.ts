@@ -40,11 +40,17 @@ const ALL_SPECIALIST_MODES = {
 const CLOUD: ModelClientDescriptor = {
   provider: "ollama",
   endpointCategory: "ollama_cloud",
-} as ModelClientDescriptor;
+  model: "glm-5.3-flash:cloud",
+  transportKind: "production",
+};
+// The provider is still named "ollama" here: what distinguishes the transport
+// that has these models is the endpoint category, not the provider name.
 const LOCAL: ModelClientDescriptor = {
   provider: "ollama",
-  endpointCategory: "ollama_local",
-} as ModelClientDescriptor;
+  endpointCategory: "local",
+  model: "glm-5.3-flash",
+  transportKind: "production",
+};
 
 test("every specialist mode has exactly one row, with a stated reason", () => {
   const modes = Object.keys(ALL_SPECIALIST_MODES) as SpecialistMode[];
