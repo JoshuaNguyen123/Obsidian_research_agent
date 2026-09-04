@@ -828,6 +828,7 @@ import {
   shouldRequireClaimGrounding,
   shouldVerifyQuoteSpansV1,
 } from "./agent/claimLedger";
+import { renderCitedNoteBodyV1 } from "./agent/citationBibliography";
 import {
   createQuotedSpanPattern,
   quoteAppearsVerbatim,
@@ -13861,6 +13862,47 @@ export async function runAgentMission({
           });
         }
         return blockedResult;
+      }
+      // Render the proved citations for a reader before anything else reads
+      // this payload. After the scope narrowing above, so a citation the
+      // mission never accepted cannot earn a footnote; before the acceptance
+      // check below, because the note write has to equal the answer that was
+      // verified -- transforming it afterwards breaks that identity, the write
+      // is held, and the mission burns its budget retrying (measured: it did).
+      // Every token survives inside its own footnote definition, so a
+      // payload-level citation check still finds every one of them.
+      if (textKey && finalPayload.trim()) {
+        const rendered = renderCitedNoteBodyV1({
+          content: finalPayload,
+          evidence: missionEvidenceRecords,
+        });
+        if (rendered.changed) {
+          finalPayload = rendered.content;
+          toolCall = {
+            ...toolCall,
+            arguments: {
+              ...toolCall.arguments,
+              [textKey]: finalPayload,
+            },
+          };
+          events.onTrace?.({
+            id: `${step}:${String(toolIndex)}:${toolCall.name}:citations-rendered`,
+            kind: "verification",
+            step,
+            toolName: toolCall.name,
+            message: `Rendered ${rendered.entries.length} cited source(s) as footnotes with a Sources section.`,
+            outputPreview: {
+              sources: rendered.entries.map((entry) => ({
+                marker: entry.marker,
+                title: entry.title,
+                url: entry.url ?? entry.vaultPath ?? null,
+                citedRanges: entry.ranges,
+              })),
+              unresolvedTokens: rendered.unresolvedTokens,
+              payloadFingerprint: hashOperationInput(finalPayload),
+            },
+          });
+        }
       }
     }
     if (observedToolCallCount >= maxToolCalls) {

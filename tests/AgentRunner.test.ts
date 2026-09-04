@@ -264,6 +264,42 @@ import { PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME } from "../src/tools/githubPu
 import { isCompletedAcceptedResearchPublicationReceipt } from "../src/agent/setLooseCompoundAutonomy";
 import { completedResearchPublicationReceiptFixture } from "./fixtures/completedResearchPublicationReceipt";
 
+/**
+ * A cited writeback no longer lands the raw verification tokens in the note.
+ * `source:1f3a9c:passage:1200-1900` becomes `[^1]`, and a Sources section is
+ * appended with one definition per source that keeps the token verbatim. These
+ * assertions used to pin the draft byte-for-byte; they now pin the stronger
+ * property: the prose is the draft, unchanged apart from how each citation is
+ * written, and every cited source is listed.
+ */
+function assertCitedNoteMatchesDraft(
+  actual: string | undefined,
+  expectedDraft: string,
+): void {
+  const text = actual ?? "";
+  const marker = "\n\n## Sources\n";
+  const cut = text.indexOf(marker);
+  const prose = cut >= 0 ? text.slice(0, cut) : text;
+  const sources = cut >= 0 ? text.slice(cut) : "";
+  const normalize = (value: string) =>
+    value
+      .replace(/\[?\bsource:[a-z0-9]+:passage:\d+-\d+\b\]?/giu, "<cite>")
+      .replace(/\[\^\d+\]/gu, "<cite>");
+  assert.equal(normalize(prose), normalize(expectedDraft));
+  const citedTokens = expectedDraft.match(/\bsource:[a-z0-9]+:passage:\d+-\d+\b/giu) ?? [];
+  if (citedTokens.length === 0) {
+    assert.equal(cut, -1, "an uncited draft must not grow a Sources section");
+    return;
+  }
+  assert.ok(cut >= 0, `expected a Sources section, got: ${text.slice(-160)}`);
+  for (const token of new Set(citedTokens)) {
+    assert.ok(
+      sources.includes(token),
+      `Sources section must keep ${token} for the proof contract: ${sources}`,
+    );
+  }
+}
+
 test("resumed atomic publication graph keeps current-note ownership only without a standalone writer", () => {
   const graph = (allowedTools: string[][]) => ({
     nodes: Object.fromEntries(
@@ -5966,7 +6002,7 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
       "Sources or vault tools are required; asking model to use tools before writing...",
     ),
   );
-  assert.equal(
+  assertCitedNoteMatchesDraft(
     vault.content.get("Current.md"),
     `${notePrompt}\n${finalDraft}`,
   );
@@ -12542,7 +12578,7 @@ test("premature current-note append is rejected until required web fetch complet
   assert.equal(receipts.length, 1);
   assert.equal(receipts[0].toolName, "append_to_current_file");
   assert.equal(receipts[0].path, "Current.md");
-  assert.equal(
+  assertCitedNoteMatchesDraft(
     vault.content.get("Current.md"),
     `Initial note\n${verifiedAppend}`,
   );
@@ -16958,7 +16994,7 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
   assert.ok(!statuses.includes("Stopped at safety limit. Review partial results."));
   assert.ok(finalDeltas.length >= 1);
   assert.ok(finalDeltas.every((delta) => !/<tool_call>|<\/tool_call>/.test(delta)));
-  assert.equal(
+  assertCitedNoteMatchesDraft(
     vault.content.get("Current.md"),
     `Essay prompt\n${verifiedEssayDraft}`,
   );
@@ -18034,7 +18070,7 @@ test("proof-gated cited writeback stages progressive corrections before one note
     vault.operations.filter((item) => item === "modify:Current.md").length,
     1,
   );
-  assert.equal(
+  assertCitedNoteMatchesDraft(
     vault.content.get("Current.md"),
     `${originalNote}\n${correctedDraft}`,
   );
@@ -19442,7 +19478,10 @@ test("proof-sensitive direct write tools settle the verified receipt before a ra
     vault.operations.filter((item) => item === "modify:Current.md").length,
     1,
   );
-  assert.equal(vault.content.get("Current.md"), `${originalNote}\n${correctedDraft}`);
+  assertCitedNoteMatchesDraft(
+    vault.content.get("Current.md"),
+    `${originalNote}\n${correctedDraft}`,
+  );
   assert.doesNotMatch(vault.content.get("Current.md") ?? "", /DIRECT UNVERIFIED/);
 });
 

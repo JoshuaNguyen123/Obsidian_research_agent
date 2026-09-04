@@ -133,8 +133,14 @@ export interface BuildClaimLedgerInput {
   maxClaims?: number;
 }
 
-const PASSAGE_ID_PATTERN =
+/**
+ * Source-scoped passage tokens. Exported because the bibliography renderer has
+ * to recognise exactly what the claim ledger recognises: two patterns for one
+ * token shape is how a citation gets verified here and missed there.
+ */
+export const SOURCE_SCOPED_PASSAGE_ID_PATTERN =
   /\bsource:[a-z0-9]+:passage:\d+-\d+\b/gi;
+const PASSAGE_ID_PATTERN = SOURCE_SCOPED_PASSAGE_ID_PATTERN;
 /** Legacy/simple passage markers that are not nested inside source-scoped ids. */
 const SIMPLE_PASSAGE_ID_PATTERN =
   /(?<!source:[a-z0-9]+:)\bpassage:[a-z0-9][a-z0-9:_-]*\b/gi;
@@ -918,6 +924,15 @@ function splitClaimSentences(draft: string): ClaimSentenceChunk[] {
       continue;
     }
     const cleaned = draft.slice(cleanedStart, cleanedEnd);
+    // A footnote definition is bibliography, not an assertion. The writeback
+    // path renders proved citations as `[^n]` markers with a definition per
+    // source, and reading "[^1]: Title - https://... (cited chars 0-67 ...)"
+    // as a claim asks the grounder to find evidence for a URL: it cannot, the
+    // completion is held as ungrounded, and the mission burns its budget
+    // rewriting a line that was never a claim.
+    if (/^\[\^[^\]]+\]:/u.test(cleaned)) {
+      continue;
+    }
     const heading = /^#{1,6}\s+(.+)$/u.exec(cleaned);
     if (heading?.[1]) {
       epistemicSection =
