@@ -57,9 +57,10 @@ describe("settings search", () => {
 
   it("keeps preset-owned rows in the document so they can be found", () => {
     // The old idiom rendered them into a detached div, which is indistinguishable
-    // from not existing. Two hosts moved to the searchable form; the two that
-    // remain detached are children of a capability the user switched off, where
-    // the rows genuinely do not apply.
+    // from not existing. Two hosts moved to the searchable form. The remaining
+    // detached host is the overnight-resume toggle when overnight runs are off
+    // (the row genuinely does not apply). The orchestrator auto-merge toggle
+    // is no longer rendered.
     assert.match(SETTINGS, /private createPresetHiddenHost\(/);
     assert.ok(
       SETTINGS.includes('this.createPresetHiddenHost(section, "Custom limits")'),
@@ -72,8 +73,8 @@ describe("settings search", () => {
     const detached = SETTINGS.match(/: document\.createElement\("div"\)/gu) ?? [];
     assert.equal(
       detached.length,
-      2,
-      `only the two switched-off-capability hosts may stay detached; found ${detached.length}`,
+      1,
+      `only the overnight-resume host may stay detached when overnight runs are off; found ${detached.length}`,
     );
   });
 

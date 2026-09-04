@@ -3911,7 +3911,11 @@ test("router cancellation persists its invoked provider call into the durable an
   };
 
   const mission = runAgentMission({
-    prompt: "Append a durable provider-accounting line to the current note.",
+    // Must not be a host-obvious target-only append: that path skips
+    // authority classify+plan, so the first model call is the loop, not
+    // the router this test accounts.
+    prompt:
+      "Search the web and append a cited durable provider-accounting line to the current note.",
     modelClient: client,
     toolRegistry: createDefaultToolRegistry(),
     toolContext: vault.context,
