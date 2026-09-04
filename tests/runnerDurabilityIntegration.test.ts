@@ -3316,6 +3316,129 @@ test("continue run restores receipt-backed completed title work", async () => {
   assert.ok(goalState.completedTools?.includes("retitle_current_file"));
 });
 
+test("a continued mission's efficiency score is measured against the budget its inherited spend covers", async () => {
+  // Regression: the scorecard divided a run-scoped numerator by a
+  // segment-scoped denominator. `missionLedger.providerUsage` merges what the
+  // resumed ledger already spent with this segment's own totals, while
+  // `modelExecutionBudget` is rebuilt from this segment's effort decision at
+  // every start. A mission continued a few times therefore reported its whole
+  // run's calls against one segment's allowance and lost both efficiency
+  // dimensions -- 0.10 of the weighted total -- purely for having been
+  // resumed. At the capability ratchet's thresholds (green >= 0.8, regression
+  // < 0.6) that is enough to break a promotion streak or drop the tier.
+  const vault = createVaultHarness();
+  const seedRunId = "run-resume-heavy-provider-usage";
+  const originalMission =
+    "Retitle the current note to Durable Title, then list the markdown files.";
+  const ledger = createMissionLedger({
+    runId: seedRunId,
+    mission: originalMission,
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 8,
+      toolStepBudget: 4,
+      finalizationReserve: 4,
+      expectedTools: ["retitle_current_file", "list_markdown_files"],
+      stopWhenSatisfied: true,
+    },
+  });
+  ledger.status = "budget";
+  // Four interrupted segments' worth of spend, far beyond anything one
+  // segment's effort decision grants. This is the whole point of the fixture:
+  // an inherited total that no per-segment budget can cover.
+  ledger.providerUsage = {
+    schemaVersion: 1,
+    modelCallCount: 48,
+    successfulCallCount: 46,
+    failedCallCount: 2,
+    reportedTokens: 240_000,
+    estimatedTokens: 0,
+    retries: 2,
+    wallClockMs: 900_000,
+  };
+  await writeMissionLedger(vault.context, ledger);
+  await writeMissionRuntimeSnapshot(
+    vault.context,
+    createMissionRuntimeSnapshot({
+      runId: seedRunId,
+      originalMission,
+      currentNotePath: "Current.md",
+      status: "paused",
+      operationGoals: { current_note_title: "done" },
+      receipts: [
+        {
+          id: "receipt-completed-title",
+          toolName: "retitle_current_file",
+          operation: "retitle",
+          message: "Visible note title updated.",
+          path: "Current.md",
+          createdAt: "2026-07-10T12:00:00.000Z",
+        },
+      ],
+    }),
+  );
+
+  const scorecards: MissionScorecardV1[] = [];
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: createModelClient([
+      responseWithToolCall("list_markdown_files", {}),
+      responseWithContent("The completed title was preserved and the files were listed."),
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onMissionScorecard: (scorecard) => scorecards.push(scorecard),
+    },
+  });
+
+  const scorecard = scorecards.at(-1);
+  assert.ok(scorecard, "a continued mission must still emit a scorecard");
+  const modelEfficiency = scorecard.dimensions.find(
+    (dimension) => dimension.id === "model_call_efficiency",
+  );
+  const wallClockEfficiency = scorecard.dimensions.find(
+    (dimension) => dimension.id === "wall_clock_efficiency",
+  );
+  assert.ok(modelEfficiency && wallClockEfficiency);
+
+  // The numerator stays run-scoped, matching the ledger and Run Details. A
+  // future fix that shrank it to the segment instead would fail here.
+  assert.ok(
+    modelEfficiency.detail.endsWith(" model calls"),
+    `unexpected model-call detail: ${modelEfficiency.detail}`,
+  );
+  const [usedCalls, budgetedCalls] = modelEfficiency.detail
+    .replace(" model calls", "")
+    .split("/")
+    .map(Number);
+  assert.ok(
+    usedCalls > 48,
+    `the run-scoped count must include the 48 inherited calls plus this segment's: ${modelEfficiency.detail}`,
+  );
+  assert.ok(
+    budgetedCalls >= usedCalls,
+    `the budget must cover the spend it inherited: ${modelEfficiency.detail}`,
+  );
+
+  assert.equal(
+    modelEfficiency.score,
+    1,
+    `a resumed segment inside its own allowance must not be scored down: ${modelEfficiency.detail}`,
+  );
+  assert.equal(
+    wallClockEfficiency.score,
+    1,
+    `the same holds for wall clock: ${wallClockEfficiency.detail}`,
+  );
+  // 0.10 of the weighted total rides on the pair; the ratchet reads the total.
+  assert.ok(
+    scorecard.total >= 0.8,
+    `a clean continued mission must stay above the ratchet's promotion floor: ${JSON.stringify(scorecard)}`,
+  );
+});
+
 test("continue run refuses an already accepted terminal mutation mission", async () => {
   const vault = createVaultHarness();
   const seedRunId = "run-terminal-write";

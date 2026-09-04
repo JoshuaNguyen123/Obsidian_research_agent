@@ -233,6 +233,72 @@ test("ratchet tightens fast: one regression drops straight back to tier 0", () =
   assert.equal(rebuilt.tier, 0);
 });
 
+test("a resumed mission does not lose the tier it earned to a scope mismatch", () => {
+  // The ratchet reads only `scorecard.total`, and the two efficiency
+  // dimensions carry 0.05 each. While the scorecard divided a run-scoped
+  // `providerUsage` numerator by a segment-scoped execution budget, a mission
+  // that had been continued a few times paid that weight for nothing but
+  // being resumed -- enough, at these thresholds, to turn the same work from
+  // a streak-breaking neutral into a tier-clearing regression.
+  const continued = {
+    acceptanceCriteriaTotal: 5,
+    acceptanceCriteriaMissing: 2,
+    acceptancePassed: true,
+    claimsRequiringEvidence: 8,
+    claimsWithEvidence: 5,
+    mutationsPerformed: 2,
+    mutationsWithReceipts: 1,
+    recoveryAttempts: 2,
+    // 60 calls and 20 minutes across the whole resume chain, of which this
+    // segment spent 12 calls and 5 minutes against the 20 and 10 it was
+    // granted. Every figure below is one mission; only the declaration of
+    // what it inherited differs.
+    modelCalls: 60,
+    modelCallBudget: 20,
+    wallClockMs: 1_200_000,
+    wallClockBudgetMs: 600_000,
+  } satisfies MissionScorecardInput;
+  const inherited = { inheritedModelCalls: 48, inheritedWallClockMs: 900_000 };
+
+  const conflated = scoreMissionV1(continued);
+  const scoped = scoreMissionV1({ ...continued, ...inherited });
+
+  assert.equal(classifyCapabilityRatchetEvidence(conflated), "regression");
+  assert.equal(classifyCapabilityRatchetEvidence(scoped), "neutral");
+  assert.ok(
+    conflated.total < 0.6 && scoped.total >= 0.6,
+    `totals=${conflated.total}/${scoped.total}`,
+  );
+
+  // The product consequence: an earned tier survives the continuation.
+  const earned = observeGreens(createCapabilityRatchetState(T0), [
+    "r1",
+    "r2",
+    "r3",
+    "r4",
+    "r5",
+  ]);
+  assert.equal(earned.tier, 1);
+  assert.equal(
+    observeCapabilityRatchetScorecard(earned, {
+      runId: "r6",
+      at: at(5),
+      scorecard: conflated,
+    }).state.tier,
+    0,
+    "the scope mismatch cleared a tier the mission had not actually lost",
+  );
+  assert.equal(
+    observeCapabilityRatchetScorecard(earned, {
+      runId: "r6",
+      at: at(5),
+      scorecard: scoped,
+    }).state.tier,
+    1,
+    "a mediocre-but-not-regressed continuation only breaks the streak",
+  );
+});
+
 test("persisted record round-trips exactly and malformed records fail closed", () => {
   const state = observeGreens(
     createCapabilityRatchetState(T0),

@@ -2197,6 +2197,20 @@ export async function runAgentMission({
   // Keep the last durable segment separate so repeated syncs never double-add
   // it and the final scorecard reflects the whole root mission.
   let inheritedProviderUsage: ModelUsageAggregateV1 | null = null;
+  /**
+   * The one reader of {@link inheritedProviderUsage}, normalized so "inherited
+   * nothing" is a zeroed aggregate rather than an absence.
+   *
+   * Three seats need this baseline and must never disagree about it: the
+   * ledger merges it into `providerUsage`, `onProviderUsageInherited` declares
+   * it to live observers that start counting at zero each segment, and the
+   * mission scorecard raises its efficiency budgets by it so a run-scoped
+   * numerator meets a run-scoped denominator. They read it here rather than
+   * each folding the variable themselves, because a second reading of the
+   * baseline is exactly how the surfaces drifted apart the first time.
+   */
+  const declaredInheritedProviderUsageV1 = (): ModelUsageAggregateV1 =>
+    mergeModelUsageAggregatesV1(inheritedProviderUsage);
   // Once a runtime-snapshot write has an ambiguous outcome, no later ledger or
   // snapshot write may touch the same Agent Runs artifact in this process. A
   // retry could race the original unresolved vault operation and overwrite a
@@ -2342,7 +2356,7 @@ export async function runAgentMission({
   });
   const syncMissionLedgerProviderUsage = () => {
     const providerUsage = mergeModelUsageAggregatesV1(
-      inheritedProviderUsage,
+      declaredInheritedProviderUsageV1(),
       observableModel.getUsage(),
     );
     // The observable client never sees the prompt geometry; the inherited
@@ -2606,7 +2620,7 @@ export async function runAgentMission({
       now: anchorContext.now?.() ?? new Date(),
     });
     anchorLedger.providerUsage = mergeModelUsageAggregatesV1(
-      inheritedProviderUsage,
+      declaredInheritedProviderUsageV1(),
       observableModel.getUsage(),
     );
     prePlanningAnchorLedger = anchorLedger;
@@ -2652,7 +2666,7 @@ export async function runAgentMission({
       return;
     }
     prePlanningAnchorLedger.providerUsage = mergeModelUsageAggregatesV1(
-      inheritedProviderUsage,
+      declaredInheritedProviderUsageV1(),
       observableModel.getUsage(),
     );
     prePlanningAnchorLedger.updatedAt = (
@@ -4114,7 +4128,7 @@ export async function runAgentMission({
     schemaVersion: 1,
     runId,
     resumedFromRunId: resumeLedger?.runId ?? null,
-    usage: mergeModelUsageAggregatesV1(inheritedProviderUsage),
+    usage: declaredInheritedProviderUsageV1(),
   });
   if (resumeLedger && isPrePlanningAnchorLedger(resumeLedger)) {
     // Anchor-only continuation: the interrupted run persisted its durable
@@ -9404,6 +9418,11 @@ export async function runAgentMission({
       claimLedger: lastClaimLedger,
       finalOutput: lastFinalOutput,
     });
+    // The same baseline `syncMissionLedgerProviderUsage` just merged into the
+    // ledger and `onProviderUsageInherited` declared to live observers, read
+    // through the one accessor so the scorecard cannot describe a different
+    // span of the run than they do.
+    const inheritedProviderUsageForScore = declaredInheritedProviderUsageV1();
     const missionScorecard = scoreMissionV1({
       acceptanceCriteriaTotal: lastVerificationChecks.length,
       acceptanceCriteriaMissing: lastVerificationChecks.filter(
@@ -9424,10 +9443,18 @@ export async function runAgentMission({
       // must be based on the direct mutation proof rather than a lossy index.
       mutationsWithReceipts: writeReceipts.length,
       recoveryAttempts: recoveryAttemptSignatures.length,
+      // The ledger's providerUsage spans the whole resume chain, while the
+      // execution budget is granted afresh at every start. Carrying the
+      // declared baseline is what keeps the two ratios on one scope; without
+      // it a four-times-continued mission divided its whole run's calls by the
+      // last segment's allowance and lost both efficiency dimensions for
+      // having been resumed.
       modelCalls: missionLedger?.providerUsage?.modelCallCount ?? 0,
       modelCallBudget: modelExecutionBudget.maxCalls,
+      inheritedModelCalls: inheritedProviderUsageForScore.modelCallCount,
       wallClockMs: missionLedger?.providerUsage?.wallClockMs ?? 0,
       wallClockBudgetMs: modelExecutionBudget.maxWallClockMs,
+      inheritedWallClockMs: inheritedProviderUsageForScore.wallClockMs,
       // Without this block the two research dimensions score a vacuous 1.0
       // for every mission — thin summaries stay invisible. The builder
       // returns undefined for non-research missions, which keeps their
