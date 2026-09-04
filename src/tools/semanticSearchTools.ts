@@ -481,10 +481,10 @@ async function searchSemanticIndexFirst({
       reasons: search.stale
         ? [
             "persisted_semantic_index_with_stale_notes",
-            `changed_notes_excluded:${search.stale.changedPaths.length - search.stale.liveMergedPaths.length}`,
+            `changed_notes_excluded:${search.stale.changedCount - search.stale.liveMergedPaths.length}`,
             `changed_notes_live_merged:${search.stale.liveMergedPaths.length}`,
-            `missing_notes_excluded:${search.stale.missingPaths.length}`,
-            `unindexed_notes:${search.stale.unindexedPaths.length}`,
+            `missing_notes_excluded:${search.stale.missingCount}`,
+            `unindexed_notes:${search.stale.unindexedCount}`,
           ]
         : ["fresh_persisted_semantic_index"],
     }),

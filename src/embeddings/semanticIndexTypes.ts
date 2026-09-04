@@ -166,8 +166,16 @@ export interface SemanticIndexStaleReportV1 {
   changedPaths: string[];
   /** Indexed notes that no longer exist; excluded. */
   missingPaths: string[];
-  /** Indexable notes the index has never seen; not searchable until reindexed. */
+  /**
+   * Indexable notes the index has never seen; not searchable until reindexed.
+   * Path lists are capped at `MAX_STALE_REPORT_PATHS` entries (a vault past the
+   * index's file ceiling would otherwise put thousands of paths into every
+   * search result); the counts are always exact.
+   */
   unindexedPaths: string[];
+  changedCount: number;
+  missingCount: number;
+  unindexedCount: number;
   /** Subset of `changedPaths` that was embedded live and merged into the hits. */
   liveMergedPaths: string[];
 }
