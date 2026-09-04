@@ -12,6 +12,11 @@ import { DEFAULT_STREAM_REQUEST_TIMEOUT_MS } from "../model/requestTimeoutDefaul
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import { normalizeEmbeddingDimSettingV1 } from "../embeddings/embeddingModelCatalogV1";
+import {
+  DEFAULT_SEMANTIC_RERANK_MODEL,
+  DEFAULT_SEMANTIC_RERANK_TOP_K,
+  normalizeSemanticRerankTopKV1,
+} from "../embeddings/semanticRerank";
 
 export const SETTINGS_SCHEMA_VERSION = 5;
 
@@ -141,6 +146,29 @@ export interface NormalizableAgentSettings {
   semanticIndexDebounceMs: number;
   semanticIndexMaxFiles: number;
   semanticIndexPersistVectors: boolean;
+  /**
+   * Second retrieval stage. "cross_encoder" rescores the top
+   * {@link semanticRerankTopK} results of a semantic search with a local
+   * cross-encoder, which reads the query and the chunk together and is much
+   * better at telling a chunk that answers the question from one that merely
+   * shares its words. It costs about a second per search on a laptop CPU and
+   * nothing at all at indexing time, so it is the accuracy lever that does not
+   * slow down the vault scan. "off" is the shipped default.
+   */
+  /**
+   * ONNX Runtime execution providers to try before the CPU one, comma
+   * separated (for example `DmlExecutionProvider` after installing
+   * `onnxruntime-directml`, or `OpenVINOExecutionProvider`). Empty means
+   * whatever onnxruntime chose for itself, which on a stock install is the CPU
+   * provider. A provider the local runtime does not have is not an error: the
+   * helper falls back to the default and the probe reports what actually ran,
+   * because a silently-ignored accelerator setting is worse than none.
+   */
+  semanticOnnxProviders?: string;
+  semanticRerankMode?: "off" | "cross_encoder";
+  semanticRerankModel?: string;
+  semanticRerankTopK?: number;
+
   temperature: number | null;
   topK: number | null;
   topP: number | null;
@@ -231,6 +259,10 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   semanticIndexDebounceMs: 3000,
   semanticIndexMaxFiles: 10000,
   semanticIndexPersistVectors: true,
+  semanticOnnxProviders: "",
+  semanticRerankMode: "off",
+  semanticRerankModel: DEFAULT_SEMANTIC_RERANK_MODEL,
+  semanticRerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
   temperature: null,
   topK: null,
   topP: null,
@@ -287,6 +319,19 @@ export function normalizeAgentSettings(
   merged.enableStreaming = coerceBoolean(merged.enableStreaming, true);
   merged.semanticEmbeddingDim = normalizeEmbeddingDimSettingV1(
     merged.semanticEmbeddingDim,
+  );
+  // An unreadable rerank setting must land on "off": the accuracy stage is
+  // opt-in, and a typo in stored data cannot be allowed to spend a second of
+  // CPU on every search.
+  merged.semanticRerankMode =
+    merged.semanticRerankMode === "cross_encoder" ? "cross_encoder" : "off";
+  merged.semanticRerankModel =
+    typeof merged.semanticRerankModel === "string" &&
+    merged.semanticRerankModel.trim()
+      ? merged.semanticRerankModel.trim()
+      : DEFAULT_SEMANTIC_RERANK_MODEL;
+  merged.semanticRerankTopK = normalizeSemanticRerankTopKV1(
+    merged.semanticRerankTopK,
   );
   merged.streamWritebackMode = coerceStreamWritebackMode(
     merged.streamWritebackMode,

@@ -44,6 +44,12 @@ export interface EmbeddingProbeResultV1 {
    * measured here rather than copied from a table.
    */
   throughput: { documents: number; ms: number; perSecond: number } | null;
+  /**
+   * Execution providers the runtime actually loaded the model with. A user who
+   * configured an accelerator needs to see whether it took; an empty list just
+   * means the runtime did not say.
+   */
+  providersUsed: string[];
 }
 
 /**
@@ -82,6 +88,7 @@ export async function probeEmbeddingProviderV1({
     requestedDim,
     prefixes,
     throughput: null,
+    providersUsed: [],
   };
 
   if (!provider) {
@@ -200,6 +207,7 @@ export async function probeEmbeddingProviderV1({
   return {
     ...base,
     ok: true,
+    providersUsed: response.providersUsed ?? [],
     dim: queryVector.length,
     latencyMs,
     cause: "healthy",

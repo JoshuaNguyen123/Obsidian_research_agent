@@ -37,6 +37,11 @@ import {
   resolveEffectiveEmbeddingDimV1,
 } from "../src/embeddings/embeddingModelCatalogV1";
 import {
+  DEFAULT_SEMANTIC_RERANK_MODEL,
+  DEFAULT_SEMANTIC_RERANK_TOP_K,
+  normalizeSemanticRerankTopKV1,
+} from "../src/embeddings/semanticRerank";
+import {
   buildRetrievalFixture,
   scoreRetrieval,
   type RetrievalFixtureQuery,
@@ -68,6 +73,12 @@ interface BenchmarkRow {
   queryLatencyMs: { p50: number; max: number };
   lexical: ReturnType<typeof scoreRetrieval>;
   semantic: ReturnType<typeof scoreRetrieval>;
+  /** The near-miss set: only a second stage separates these. */
+  hard: ReturnType<typeof scoreRetrieval>;
+  /** Same hard set with the cross-encoder stage on, when --rerank was given. */
+  hardReranked: ReturnType<typeof scoreRetrieval> | null;
+  rerankModel: string | null;
+  rerankLatencyMs: { p50: number; max: number } | null;
   error?: string;
 }
 
@@ -96,6 +107,8 @@ function parseArgs(argv: string[]) {
     skipLarge: false,
     pythonCommand: "",
     listOnly: false,
+    rerankModel: "",
+    rerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -119,6 +132,12 @@ function parseArgs(argv: string[]) {
       options.pythonCommand = next();
     } else if (arg === "--list") {
       options.listOnly = true;
+    } else if (arg === "--rerank") {
+      // Runs the hard query set a second time with the cross-encoder stage on,
+      // so the report carries the delta the stage is meant to buy.
+      options.rerankModel = next() || DEFAULT_SEMANTIC_RERANK_MODEL;
+    } else if (arg === "--rerank-topk") {
+      options.rerankTopK = normalizeSemanticRerankTopKV1(next());
     }
   }
   return options;
@@ -185,8 +204,9 @@ async function benchmarkOne(
   candidate: Candidate,
   profile: ChunkProfile,
   pythonCommand: string,
+  rerank: { model: string; topK: number } | null,
 ): Promise<BenchmarkRow> {
-  const { notes, queries, semanticQueries } = buildRetrievalFixture();
+  const { notes, queries, semanticQueries, hardQueries } = buildRetrievalFixture();
   const effective = resolveEffectiveEmbeddingDimV1(candidate.model, candidate.dim);
   const settings = {
     semanticSearchEnabled: true,
@@ -203,6 +223,11 @@ async function benchmarkOne(
     semanticIndexDebounceMs: 3000,
     semanticIndexMaxFiles: 10000,
     semanticIndexPersistVectors: true,
+    // The stage is driven per search below, so the stored setting stays off and
+    // the first pass over the hard set measures the first stage alone.
+    semanticRerankMode: "off",
+    semanticRerankModel: rerank?.model ?? DEFAULT_SEMANTIC_RERANK_MODEL,
+    semanticRerankTopK: rerank?.topK ?? DEFAULT_SEMANTIC_RERANK_TOP_K,
   } as unknown as AgentSettings;
 
   clearSemanticManifestReadCache();
@@ -232,6 +257,10 @@ async function benchmarkOne(
     queryLatencyMs: { p50: 0, max: 0 },
     lexical: scoreRetrieval([]),
     semantic: scoreRetrieval([]),
+    hard: scoreRetrieval([]),
+    hardReranked: null,
+    rerankModel: rerank?.model ?? null,
+    rerankLatencyMs: null,
   };
 
   try {
@@ -254,14 +283,25 @@ async function benchmarkOne(
       return { ...base, error: `${built.code}: ${built.message}` };
     }
 
-    const rankSet = async (set: RetrievalFixtureQuery[], latencies: number[]) => {
+    const rankSet = async (
+      set: RetrievalFixtureQuery[],
+      latencies: number[],
+      withRerank = false,
+    ) => {
       const ranked: Array<{ query: RetrievalFixtureQuery; paths: string[] }> = [];
       for (const query of set) {
         const queryStartedAt = performance.now();
-        const result = await service.search({ query: query.text, limit: 10 });
+        const result = await service.search({
+          query: query.text,
+          limit: 10,
+          ...(withRerank ? { rerank: true } : {}),
+        });
         latencies.push(performance.now() - queryStartedAt);
         if (!result.ok) {
           throw new Error(`search failed: ${result.code}: ${result.message}`);
+        }
+        if (withRerank && !result.reranked) {
+          throw new Error(`rerank did not run: ${result.rerankReason ?? "unknown"}`);
         }
         ranked.push({ query, paths: result.results.map((hit) => hit.path) });
       }
@@ -270,6 +310,13 @@ async function benchmarkOne(
     const latencies: number[] = [];
     const lexical = await rankSet(queries, latencies);
     const semantic = await rankSet(semanticQueries, latencies);
+    const hard = await rankSet(hardQueries, latencies);
+    let hardReranked: ReturnType<typeof scoreRetrieval> | null = null;
+    let rerankLatencies: number[] | null = null;
+    if (rerank) {
+      rerankLatencies = [];
+      hardReranked = await rankSet(hardQueries, rerankLatencies, true);
+    }
 
     return {
       ...base,
@@ -283,6 +330,14 @@ async function benchmarkOne(
       },
       lexical,
       semantic,
+      hard,
+      hardReranked,
+      rerankLatencyMs: rerankLatencies
+        ? {
+            p50: Math.round(percentile(rerankLatencies, 0.5)),
+            max: Math.round(Math.max(...rerankLatencies)),
+          }
+        : null,
     };
   } catch (error) {
     return { ...base, error: error instanceof Error ? error.message : String(error) };
@@ -301,13 +356,13 @@ function renderReport(rows: BenchmarkRow[], meta: Record<string, string>): strin
   lines.push("");
   for (const [key, value] of Object.entries(meta)) lines.push(`- ${key}: ${value}`);
   lines.push("");
-  lines.push("Fixture: `src/tools/retrievalFixture.ts` — lexical set = exact-vocabulary queries, semantic set = paraphrases sharing no words with the answer. Scores are recall@1 / recall@3 / MRR.");
+  lines.push("Fixture: `src/tools/retrievalFixture.ts` — lexical set = exact-vocabulary queries, semantic set = paraphrases sharing no words with the answer, hard set = question-shaped queries whose every word also appears in two notes that do not answer them (an open-question note and a same-topic note about another aspect). Scores are recall@1 / recall@3 / MRR.");
   lines.push("");
-  lines.push("| model | dim | chunk target | chunks | build s | chunks/s | index MB | query p50 ms | lexical R@1/R@3/MRR | semantic R@1/R@3/MRR | note |");
-  lines.push("|---|---|---|---|---|---|---|---|---|---|---|");
+  lines.push("| model | dim | chunk target | chunks | build s | chunks/s | index MB | query p50 ms | lexical R@1/R@3/MRR | semantic R@1/R@3/MRR | hard R@1/R@3/MRR | hard + rerank | rerank p50 ms | note |");
+  lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const row of rows) {
     lines.push(
-      `| ${row.model} | ${row.effectiveDim}${row.effectiveDim !== row.dim ? ` (asked ${row.dim})` : ""} | ${row.chunkTarget} | ${row.chunks} | ${row.buildSeconds} | ${row.chunksPerSecond} | ${(row.indexBytes / 1_000_000).toFixed(2)} | ${row.queryLatencyMs.p50} | ${formatScore(row.lexical)} | ${formatScore(row.semantic)} | ${row.error ? `FAILED: ${row.error}` : ""} |`,
+      `| ${row.model} | ${row.effectiveDim}${row.effectiveDim !== row.dim ? ` (asked ${row.dim})` : ""} | ${row.chunkTarget} | ${row.chunks} | ${row.buildSeconds} | ${row.chunksPerSecond} | ${(row.indexBytes / 1_000_000).toFixed(2)} | ${row.queryLatencyMs.p50} | ${formatScore(row.lexical)} | ${formatScore(row.semantic)} | ${formatScore(row.hard)} | ${row.hardReranked ? formatScore(row.hardReranked) : "-"} | ${row.rerankLatencyMs ? row.rerankLatencyMs.p50 : "-"} | ${row.error ? `FAILED: ${row.error}` : ""} |`,
     );
   }
   lines.push("");
@@ -342,12 +397,19 @@ async function main() {
         continue;
       }
       process.stdout.write(`  ${candidate.model}@${candidate.dim} chunk ${profile.label} ... `);
-      const row = await benchmarkOne(candidate, profile, options.pythonCommand);
+      const row = await benchmarkOne(
+        candidate,
+        profile,
+        options.pythonCommand,
+        options.rerankModel
+          ? { model: options.rerankModel, topK: options.rerankTopK }
+          : null,
+      );
       rows.push(row);
       console.log(
         row.error
           ? `FAILED ${row.error}`
-          : `${row.chunksPerSecond} chunks/s, semantic ${formatScore(row.semantic)}, lexical ${formatScore(row.lexical)}`,
+          : `${row.chunksPerSecond} chunks/s, semantic ${formatScore(row.semantic)}, hard ${formatScore(row.hard)}${row.hardReranked ? ` -> reranked ${formatScore(row.hardReranked)}` : ""}, lexical ${formatScore(row.lexical)}`,
       );
       // Write after every row so a long run that dies still leaves a report.
       const report = renderReport(rows, {

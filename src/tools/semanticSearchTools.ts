@@ -478,15 +478,21 @@ async function searchSemanticIndexFirst({
       // Editing a note used to fail the whole indexed search and route the
       // tool to the 300-note live path; now drifted notes are excluded (or
       // re-embedded live) and the coverage record says exactly which.
-      reasons: search.stale
-        ? [
-            "persisted_semantic_index_with_stale_notes",
-            `changed_notes_excluded:${search.stale.changedCount - search.stale.liveMergedPaths.length}`,
-            `changed_notes_live_merged:${search.stale.liveMergedPaths.length}`,
-            `missing_notes_excluded:${search.stale.missingCount}`,
-            `unindexed_notes:${search.stale.unindexedCount}`,
-          ]
-        : ["fresh_persisted_semantic_index"],
+      reasons: [
+        ...(search.stale
+          ? [
+              "persisted_semantic_index_with_stale_notes",
+              `changed_notes_excluded:${search.stale.changedCount - search.stale.liveMergedPaths.length}`,
+              `changed_notes_live_merged:${search.stale.liveMergedPaths.length}`,
+              `missing_notes_excluded:${search.stale.missingCount}`,
+              `unindexed_notes:${search.stale.unindexedCount}`,
+            ]
+          : ["fresh_persisted_semantic_index"]),
+        // A ranking that was asked for a cross-encoder pass and did not get
+        // one looks exactly like a first-stage ranking. Saying so here is what
+        // keeps a reader from trusting an accuracy stage that never ran.
+        ...(search.rerankReason ? [search.rerankReason] : []),
+      ],
     }),
     // Where this search's wall clock actually went. The tool metric records a
     // single duration; only this split says whether it was shard decode or

@@ -42,6 +42,12 @@ export interface RetrievalFixtureQuery {
 const TOPICS = [
   {
     slug: "photosynthesis",
+    // The hard case: a question whose words are all in two notes that do
+    // not answer it. Only a model that reads the query and the passage
+    // together can put the answer note first.
+    question: 'which pigment inside a leaf captures sunlight for photosynthesis',
+    adjacentTitle: 'why do leaves change colour in autumn',
+    adjacentBody: 'In autumn the pigment breaks down and carotenoids show through, which is why leaves turn yellow and red. This note is about leaf colour, not about how light is captured.',
     term: "chlorophyll",
     field: "biology",
     // A second sentence in the answer note that says the same thing without
@@ -56,6 +62,12 @@ const TOPICS = [
   },
   {
     slug: "monetary-policy",
+    // The hard case: a question whose words are all in two notes that do
+    // not answer it. Only a model that reads the query and the passage
+    // together can put the answer note first.
+    question: 'what does a central bank buy when it wants to lower long-term interest rates',
+    adjacentTitle: 'how does a central bank unwind its balance sheet',
+    adjacentBody: 'Selling the accumulated portfolio back into the market, or letting it mature without reinvestment, gradually shrinks the balance sheet. This note is about the unwind, not about the purchases.',
     term: "quantitative easing",
     field: "economics",
     gloss: "A central bank buys long-dated bonds to push down interest rates when cutting the policy rate is no longer possible.",
@@ -68,6 +80,12 @@ const TOPICS = [
   },
   {
     slug: "byzantine-fault",
+    // The hard case: a question whose words are all in two notes that do
+    // not answer it. Only a model that reads the query and the passage
+    // together can put the answer note first.
+    question: 'how many replicas must agree before a value is safely committed',
+    adjacentTitle: 'how a replicated log is compacted with snapshots',
+    adjacentBody: 'Old entries are replaced by a snapshot of the state machine so the log does not grow without bound. This note is about compaction, not about agreement.',
     term: "consensus quorum",
     field: "distributed systems",
     gloss: "Enough honest nodes must agree before a value is committed, so a minority of lying replicas cannot fork the log.",
@@ -80,6 +98,12 @@ const TOPICS = [
   },
   {
     slug: "baroque-counterpoint",
+    // The hard case: a question whose words are all in two notes that do
+    // not answer it. Only a model that reads the query and the passage
+    // together can put the answer note first.
+    question: 'what is the short opening melody of a fugue called',
+    adjacentTitle: 'how equal temperament changed keyboard tuning',
+    adjacentBody: 'Dividing the octave into twelve equal steps let a keyboard play in every key at the cost of pure intervals. This note is about tuning, not about melodic structure.',
     term: "fugue subject",
     field: "music theory",
     gloss: "The short opening melody that each voice imitates in turn as the piece unfolds.",
@@ -92,6 +116,12 @@ const TOPICS = [
   },
   {
     slug: "protein-folding",
+    // The hard case: a question whose words are all in two notes that do
+    // not answer it. Only a model that reads the query and the passage
+    // together can put the answer note first.
+    question: 'what is the overall three dimensional shape of a folded polypeptide called',
+    adjacentTitle: 'how proteins are separated by mass in the laboratory',
+    adjacentBody: 'Gel electrophoresis pulls denatured chains through a matrix so they separate by size. This note is about separation, not about folded shape.',
     term: "tertiary structure",
     field: "biochemistry",
     gloss: "The overall three-dimensional shape a single polypeptide chain settles into.",
@@ -132,6 +162,16 @@ export function buildRetrievalFixture(): {
    * `scripts/benchmark-embedders.ts`.
    */
   semanticQueries: RetrievalFixtureQuery[];
+  /**
+   * Question-shaped queries whose vocabulary is fully present in two notes
+   * that do not answer them: one that states the question and leaves it open,
+   * one about a neighbouring aspect of the same topic. A bi-encoder ranks
+   * those near the top because it never sees query and passage together; a
+   * cross-encoder rerank is what separates them. This set exists because the
+   * paraphrase set saturates at MRR 1.00 on the shipped embedders and so can
+   * no longer discriminate between ranking strategies.
+   */
+  hardQueries: RetrievalFixtureQuery[];
 } {
   const notes: RetrievalFixtureNote[] = [];
 
@@ -160,6 +200,32 @@ export function buildRetrievalFixture(): {
         `The appendix records that ${topic.term} was measured again in the follow-up study.`,
       ].join("\n"),
       mtime: 4_000,
+    });
+
+    // Near-miss 1: the question itself, stated and left open. Its embedding
+    // sits closer to a question-shaped query than the answer note does, which
+    // is exactly the failure a single-vector ranking cannot see.
+    notes.push({
+      path: `Distractors/${topic.slug}-open-question.md`,
+      content: [
+        `# ${topic.question}?`,
+        "",
+        `Someone asked: ${topic.question}? The answer is not recorded in this note; it is filed here as an open question for later.`,
+        filler(`${topic.slug}-open`, 4),
+      ].join("\n"),
+      mtime: 3_500,
+    });
+
+    // Near-miss 2: same topic, same vocabulary, a different aspect of it.
+    notes.push({
+      path: `Research/${topic.slug}-adjacent.md`,
+      content: [
+        `# ${topic.adjacentTitle}`,
+        "",
+        `This note explains ${topic.field}: ${topic.adjacentBody}`,
+        filler(`${topic.slug}-adjacent`, 5),
+      ].join("\n"),
+      mtime: 3_800,
     });
 
     // The distractor: heavy query vocabulary, answers nothing.
@@ -210,7 +276,22 @@ export function buildRetrievalFixture(): {
     })),
   );
 
-  return { notes, queries, semanticQueries };
+  const hardQueries: RetrievalFixtureQuery[] = TOPICS.flatMap((topic) => [
+    {
+      text: `${topic.question}?`,
+      relevantPaths: [`Research/${topic.slug}.md`],
+      probes:
+        "a note that states this exact question without answering it, and a same-topic note about a different aspect, both outrank the answer on embedding similarity alone",
+    },
+    {
+      text: topic.question,
+      relevantPaths: [`Research/${topic.slug}.md`],
+      probes:
+        "same question without the question mark: the open-question note still matches it almost word for word",
+    },
+  ]);
+
+  return { notes, queries, semanticQueries, hardQueries };
 }
 
 /** Minimal execution context over a fixture corpus. Read paths only. */

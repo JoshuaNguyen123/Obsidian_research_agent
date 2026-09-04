@@ -7,6 +7,15 @@ import {
   resolveEffectiveEmbeddingDimV1,
 } from "./embeddings/embeddingModelCatalogV1";
 
+import {
+  DEFAULT_SEMANTIC_RERANK_TOP_K,
+  findSemanticRerankModelSpecV1,
+  MAX_SEMANTIC_RERANK_TOP_K,
+  normalizeSemanticRerankTopKV1,
+  resolveSemanticRerankSettingsV1,
+  SEMANTIC_RERANK_MODEL_CATALOG_V1,
+} from "./embeddings/semanticRerank";
+
 /** Dropdown value meaning "type a model id the catalogue does not know". */
 const CUSTOM_EMBEDDING_MODEL_OPTION = "__custom__";
 import type AgenticResearcherPlugin from "../main";
@@ -285,6 +294,28 @@ export interface AgentSettings {
   semanticIndexDebounceMs: number;
   semanticIndexMaxFiles: number;
   semanticIndexPersistVectors: boolean;
+  /**
+   * Second retrieval stage. "cross_encoder" rescores the top
+   * {@link semanticRerankTopK} results of a semantic search with a local
+   * cross-encoder, which reads the query and the chunk together and is much
+   * better at telling a chunk that answers the question from one that merely
+   * shares its words. It costs about a second per search on a laptop CPU and
+   * nothing at all at indexing time, so it is the accuracy lever that does not
+   * slow down the vault scan. "off" is the shipped default.
+   */
+  /**
+   * ONNX Runtime execution providers to try before the CPU one, comma
+   * separated (for example `DmlExecutionProvider` after installing
+   * `onnxruntime-directml`, or `OpenVINOExecutionProvider`). Empty means
+   * whatever onnxruntime chose for itself, which on a stock install is the CPU
+   * provider. A provider the local runtime does not have is not an error: the
+   * helper falls back to the default and the probe reports what actually ran,
+   * because a silently-ignored accelerator setting is worse than none.
+   */
+  semanticOnnxProviders?: string;
+  semanticRerankMode?: "off" | "cross_encoder";
+  semanticRerankModel?: string;
+  semanticRerankTopK?: number;
   temperature: number | null;
   topK: number | null;
   topP: number | null;
@@ -2066,13 +2097,14 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Semantic tuning")
       .setDesc(
-        "Balanced suits most vaults. Fast indexes about three times quicker with a smaller model and shorter chunks (rebuilds the index once when chosen). Thorough uses larger chunks and a much bigger index ceiling for large vaults. Custom values exposes every individual setting.",
+        "Balanced suits most vaults. Fast indexes about three times quicker with a smaller model and shorter chunks (rebuilds the index once when chosen). Accurate builds that same fast index and adds a local cross-encoder pass over each search's top results — the most accurate ordering, about a second per search. Thorough uses larger chunks and a much bigger index ceiling for large vaults. Custom values exposes every individual setting.",
       )
       .addDropdown((dropdown) =>
         dropdown
           .addOptions({
             balanced: "Balanced",
             fast: "Fast",
+            accurate: "Accurate",
             thorough: "Thorough",
             custom: "Custom values",
           })
@@ -2211,6 +2243,80 @@ export class AgentSettingTab extends PluginSettingTab {
         );
     }
 
+    // The second retrieval stage. Its cost is per search and its benefit is
+    // ordering, so the row states both in the units the user feels: how long a
+    // search will take and how many chunks get re-read.
+    const rerank = resolveSemanticRerankSettingsV1(this.plugin.settings);
+    const rerankSpec = findSemanticRerankModelSpecV1(rerank.model);
+    const rerankSeconds = rerankSpec
+      ? Math.max(1, Math.round(rerank.topK / rerankSpec.pairsPerSecond))
+      : null;
+    new Setting(semanticHost)
+      .setName("Rerank search results")
+      .setDesc(
+        rerank.enabled && rerankSeconds
+          ? `A local cross-encoder re-reads the top ${rerank.topK} chunks against the question itself, which is markedly more accurate than embedding similarity alone. Costs roughly ${rerankSeconds}s per search on this machine and nothing at indexing time.`
+          : "Off: results are ordered by embedding similarity and word overlap alone. Turning this on adds a local cross-encoder pass over the top results — more accurate ordering, about a second per search, no extra indexing cost.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            off: "Off",
+            cross_encoder: "Cross-encoder (accurate)",
+          })
+          .setValue(rerank.enabled ? "cross_encoder" : "off")
+          .onChange(async (value) => {
+            this.plugin.settings.semanticRerankMode =
+              value === "cross_encoder" ? "cross_encoder" : "off";
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen("agentic-settings-research-sources");
+          }),
+      );
+
+    if (rerank.enabled) {
+      new Setting(semanticHost)
+        .setName("Reranking model")
+        .setDesc(
+          rerankSpec
+            ? `${rerankSpec.summary} Measured on this project's retrieval fixture: MRR ${rerankSpec.measured.paraphraseMrr.toFixed(2)} against 0.61 with no reranking, about ${(rerankSpec.measured.searchMs / 1000).toFixed(1)}s per search. ${rerankSpec.sizeMb} MB, downloaded on first use.`
+            : "Model id not in the catalogue; it is used as given and must be a FastEmbed cross-encoder.",
+        )
+        .addDropdown((dropdown) => {
+          for (const spec of SEMANTIC_RERANK_MODEL_CATALOG_V1) {
+            dropdown.addOption(
+              spec.id,
+              `${spec.id} · MRR ${spec.measured.paraphraseMrr.toFixed(2)} · ${(spec.measured.searchMs / 1000).toFixed(1)}s`,
+            );
+          }
+          if (!rerankSpec) {
+            dropdown.addOption(rerank.model, rerank.model);
+          }
+          dropdown.setValue(rerank.model).onChange(async (value) => {
+            this.plugin.settings.semanticRerankModel = value;
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen(
+              "agentic-settings-research-sources",
+            );
+          });
+        });
+
+      new Setting(semanticHost)
+        .setName("Chunks reranked")
+        .setDesc(
+          `How deep the shortlist goes. More candidates means a better chance the right chunk is in the pool to be promoted, and a proportionally longer search (1-${MAX_SEMANTIC_RERANK_TOP_K}).`,
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder(String(DEFAULT_SEMANTIC_RERANK_TOP_K))
+            .setValue(String(rerank.topK))
+            .onChange(async (value) => {
+              this.plugin.settings.semanticRerankTopK =
+                normalizeSemanticRerankTopKV1(value);
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
+
     const semanticChunkSetting = new Setting(semanticHost)
       .setName("Semantic chunk tokens")
       .setDesc(
@@ -2282,6 +2388,27 @@ export class AgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.semanticPythonCommand)
           .onChange(async (value) => {
             this.plugin.settings.semanticPythonCommand = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    // Opt-in accelerator. Nothing here installs anything: onnxruntime ships
+    // CPU-only, and a user who has installed onnxruntime-directml or
+    // onnxruntime-openvino needs a way to ask for it. A name the local runtime
+    // does not have falls back to the default rather than failing an index
+    // build, and "Test embedder" reports which provider actually ran, so the
+    // setting can never quietly claim an acceleration that is not happening.
+    new Setting(semanticHost)
+      .setName("ONNX execution providers")
+      .setDesc(
+        "Advanced: comma-separated execution providers to try before the default, for example DmlExecutionProvider (needs onnxruntime-directml) or OpenVINOExecutionProvider. Leave blank for the CPU runtime. Test embedder reports what actually ran.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("CPU runtime default")
+          .setValue(this.plugin.settings.semanticOnnxProviders ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.semanticOnnxProviders = value.trim();
             await this.plugin.saveSettings();
           }),
       );
@@ -3926,10 +4053,13 @@ function describeEmbeddingProbe(
   if (!probe) {
     return "FastEmbed model used for semantic_search_notes. Not yet tested — press Test embedder to check the runtime actually works.";
   }
+  const runtime = probe.providersUsed?.length
+    ? ` Runtime: ${probe.providersUsed.join(", ")}.`
+    : "";
   return probe.ok
     ? probe.throughput
-      ? `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms for one document, about ${probe.throughput.perSecond} documents/s on this machine.`
-      : `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms.`
+      ? `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms for one document, about ${probe.throughput.perSecond} documents/s on this machine.${runtime}`
+      : `Working: ${probe.model} at ${probe.dim} dimensions, ${probe.latencyMs}ms.${runtime}`
     : probe.setupAction
       ? `Not working: ${probe.message} ${probe.setupAction}`
       : `Not working: ${probe.message}`;

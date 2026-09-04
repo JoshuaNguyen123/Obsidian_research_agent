@@ -573,3 +573,114 @@ test("a queued interactive request runs before queued background batches", async
     provider.dispose?.();
   }
 });
+
+test("the rerank op rides the same helper session and returns one score per document", async () => {
+  // Reranking is a second FastEmbed model, not a second process: the helper
+  // holds both caches, so an accurate search costs one more round trip on the
+  // session that is already open, not another Python interpreter.
+  const { runtime, spawned } = createFakeRuntime((child) => {
+    child.onWrite = (line) => {
+      const request = JSON.parse(line) as {
+        id: string;
+        op?: string;
+        model: string;
+        query?: string;
+        documents: string[];
+      };
+      child.emitStdout(
+        JSON.stringify(
+          request.op === "rerank"
+            ? {
+                id: request.id,
+                ok: true,
+                model: request.model,
+                dim: 0,
+                scores: request.documents.map((document) =>
+                  document.includes("answer") ? 3.5 : -2.5,
+                ),
+              }
+            : {
+                id: request.id,
+                ok: true,
+                model: request.model,
+                dim: 2,
+                documents: [[1, 0]],
+                queries: [[0, 1]],
+              },
+        ) + "\n",
+      );
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  try {
+    await provider.embed(REQUEST);
+    const result = await provider.rerank!({
+      model: "jinaai/jina-reranker-v1-tiny-en",
+      query: "which one answers",
+      documents: ["a distractor", "the answer"],
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.scores, [-2.5, 3.5]);
+    assert.equal(spawned.length, 1, "rerank must reuse the open helper session");
+    const wire = JSON.parse(spawned[0].writes[1]) as Record<string, unknown>;
+    assert.equal(wire.op, "rerank");
+    assert.equal(wire.query, "which one answers");
+    assert.equal(wire.cacheDir, "cache-dir");
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("an empty rerank shortlist never reaches the helper", async () => {
+  const { runtime, spawned } = createFakeRuntime();
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  try {
+    const result = await provider.rerank!({
+      model: "jinaai/jina-reranker-v1-tiny-en",
+      query: "anything",
+      documents: [],
+    });
+    assert.deepEqual(result, { ok: true, model: "jinaai/jina-reranker-v1-tiny-en", scores: [] });
+    assert.equal(spawned.length, 0);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("a helper that cannot rerank reports the code instead of vectors", async () => {
+  const { runtime } = createFakeRuntime((child) => {
+    child.onWrite = (line) => {
+      const request = JSON.parse(line) as { id: string; model: string };
+      child.emitStdout(
+        JSON.stringify({
+          id: request.id,
+          ok: false,
+          model: request.model,
+          dim: 0,
+          code: "missing_reranker",
+          message: "This FastEmbed build has no cross-encoder reranker",
+        }) + "\n",
+      );
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+  });
+  try {
+    const result = await provider.rerank!({
+      model: "jinaai/jina-reranker-v1-tiny-en",
+      query: "q",
+      documents: ["one"],
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "missing_reranker");
+    assert.equal(result.scores, undefined);
+  } finally {
+    provider.dispose?.();
+  }
+});

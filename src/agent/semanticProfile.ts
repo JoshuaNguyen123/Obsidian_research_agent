@@ -1,4 +1,8 @@
 import type { AgentSettings } from "../settings";
+import {
+  DEFAULT_SEMANTIC_RERANK_MODEL,
+  DEFAULT_SEMANTIC_RERANK_TOP_K,
+} from "../embeddings/semanticRerank";
 
 /**
  * Semantic tuning, expressed as one choice instead of eight.
@@ -13,7 +17,12 @@ import type { AgentSettings } from "../settings";
  *
  * Deliberately free of any Obsidian import so it stays unit-testable.
  */
-export type SemanticProfilePreset = "fast" | "balanced" | "thorough" | "custom";
+export type SemanticProfilePreset =
+  | "fast"
+  | "balanced"
+  | "accurate"
+  | "thorough"
+  | "custom";
 
 export interface SemanticProfileLimits {
   semanticEmbeddingModel: string;
@@ -25,6 +34,14 @@ export interface SemanticProfileLimits {
   semanticIndexDebounceMs: number;
   semanticIndexMaxFiles: number;
   semanticIndexPersistVectors: boolean;
+  /**
+   * Every preset states the rerank stage explicitly, including the ones that
+   * leave it off: switching presets must land on a known configuration rather
+   * than inheriting half of the previous one.
+   */
+  semanticRerankMode: "off" | "cross_encoder";
+  semanticRerankModel: string;
+  semanticRerankTopK: number;
 }
 
 /**
@@ -48,6 +65,9 @@ export const SEMANTIC_PROFILE_PRESETS: Readonly<
     semanticIndexDebounceMs: 3000,
     semanticIndexMaxFiles: 10000,
     semanticIndexPersistVectors: true,
+    semanticRerankMode: "off",
+    semanticRerankModel: DEFAULT_SEMANTIC_RERANK_MODEL,
+    semanticRerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
   }),
   // Measured on 2026-09-03 (scripts/benchmark-embedders.ts, i7-1165G7, CPU
   // only): jina-embeddings-v2-small-en indexed 31 chunks/s against nomic's
@@ -66,6 +86,31 @@ export const SEMANTIC_PROFILE_PRESETS: Readonly<
     semanticIndexDebounceMs: 3000,
     semanticIndexMaxFiles: 10000,
     semanticIndexPersistVectors: true,
+    semanticRerankMode: "off",
+    semanticRerankModel: DEFAULT_SEMANTIC_RERANK_MODEL,
+    semanticRerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
+  }),
+  // Fast to index and accurate to read: the same small embedding model builds
+  // the index at ~31 chunks/s, and every search then pays about a second to
+  // have a local cross-encoder re-read its top 20 chunks against the actual
+  // question. The two stages fix different errors -- the bi-encoder decides
+  // which twenty chunks are in the neighbourhood, the cross-encoder decides
+  // which of those actually answers -- so this is the preset for someone who
+  // wants speed where the vault-sized work is and accuracy where it counts.
+  // First search after choosing it downloads a 130 MB reranker.
+  accurate: Object.freeze({
+    semanticEmbeddingModel: "jinaai/jina-embeddings-v2-small-en",
+    semanticEmbeddingDim: 512,
+    semanticChunkMinTokens: 150,
+    semanticChunkTargetTokens: 256,
+    semanticChunkMaxTokens: 360,
+    semanticChunkOverlapTokens: 40,
+    semanticIndexDebounceMs: 3000,
+    semanticIndexMaxFiles: 10000,
+    semanticIndexPersistVectors: true,
+    semanticRerankMode: "cross_encoder",
+    semanticRerankModel: DEFAULT_SEMANTIC_RERANK_MODEL,
+    semanticRerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
   }),
   // Larger chunks carry more surrounding context per embedding, and a bigger
   // file ceiling covers large vaults. The embedding model is unchanged: this
@@ -80,6 +125,9 @@ export const SEMANTIC_PROFILE_PRESETS: Readonly<
     semanticIndexDebounceMs: 3000,
     semanticIndexMaxFiles: 40000,
     semanticIndexPersistVectors: true,
+    semanticRerankMode: "off",
+    semanticRerankModel: DEFAULT_SEMANTIC_RERANK_MODEL,
+    semanticRerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
   }),
 });
 

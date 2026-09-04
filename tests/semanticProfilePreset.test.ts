@@ -78,3 +78,21 @@ test("fast trades the model and chunk size for indexing speed, on the benchmark'
   );
   assert.equal(fast.semanticIndexMaxFiles, SEMANTIC_PROFILE_PRESETS.balanced.semanticIndexMaxFiles);
 });
+
+test("accurate is the fast index plus the cross-encoder stage, and every other preset states the stage off", () => {
+  // "Fast and extremely accurate" is two stages, not one bigger model: index
+  // with the small embedder (measured 31 chunks/s) and pay ~1s per search to
+  // have a cross-encoder re-read the shortlist. Presets must state the stage
+  // explicitly so switching away from accurate actually turns it off.
+  const accurate = SEMANTIC_PROFILE_PRESETS.accurate;
+  assert.equal(accurate.semanticEmbeddingModel, SEMANTIC_PROFILE_PRESETS.fast.semanticEmbeddingModel);
+  assert.equal(
+    accurate.semanticChunkTargetTokens,
+    SEMANTIC_PROFILE_PRESETS.fast.semanticChunkTargetTokens,
+  );
+  assert.equal(accurate.semanticRerankMode, "cross_encoder");
+  assert.ok(accurate.semanticRerankTopK >= 1);
+  for (const name of ["balanced", "fast", "thorough"] as const) {
+    assert.equal(SEMANTIC_PROFILE_PRESETS[name].semanticRerankMode, "off", name);
+  }
+});

@@ -3,6 +3,7 @@ import {
   request as requestHttp,
   type IncomingMessage,
 } from "node:http";
+import { request as requestHttps } from "node:https";
 import { once } from "node:events";
 
 export interface AuthenticatedOllamaProxySnapshotV1 {
@@ -34,12 +35,31 @@ export interface AuthenticatedOllamaProxyV1 {
 export async function startAuthenticatedOllamaProxyV1(options: {
   expectedBearerToken: string;
   upstreamBaseUrl?: string;
+  /**
+   * Credential the proxy presents upstream, replacing the disposable token the
+   * plugin sent. This is what lets the separate-credential path be proven with
+   * a single real account: Lead and Specialist still hold two different
+   * credentials for two different endpoints (which is the product behaviour
+   * under test), and the boundary swaps each for the one real key on the way
+   * out. Required for a non-loopback upstream; never logged or returned by
+   * snapshot().
+   */
+  upstreamAuthorization?: string;
 }): Promise<AuthenticatedOllamaProxyV1> {
   const expected = options.expectedBearerToken.trim();
   if (!expected) throw new Error("Authenticated Ollama proxy requires a token.");
   const upstream = new URL(options.upstreamBaseUrl ?? "http://127.0.0.1:11434");
-  if (!isLoopback(upstream.hostname)) {
-    throw new Error("Authenticated Ollama proxy upstream must be loopback.");
+  const upstreamAuthorization = options.upstreamAuthorization?.trim() ?? "";
+  // A loopback upstream (a local daemon) needs no credential. Anything else is
+  // a real remote endpoint, and forwarding a test's disposable token to it
+  // would only produce a 401: it must carry a real key, supplied here.
+  if (!isLoopback(upstream.hostname) && !upstreamAuthorization) {
+    throw new Error(
+      "Authenticated Ollama proxy upstream must be loopback unless an upstream credential is supplied.",
+    );
+  }
+  if (!isLoopback(upstream.hostname) && upstream.protocol !== "https:") {
+    throw new Error("Authenticated Ollama proxy refuses a plaintext remote upstream.");
   }
 
   let authorizedRequests = 0;
@@ -71,7 +91,8 @@ export async function startAuthenticatedOllamaProxyV1(options: {
       }
       const target = new URL(requestPath, upstream);
       await new Promise<void>((resolve, reject) => {
-        const upstreamRequest = requestHttp(
+        const send = target.protocol === "https:" ? requestHttps : requestHttp;
+        const upstreamRequest = send(
           {
             protocol: target.protocol,
             hostname: target.hostname,
@@ -83,6 +104,9 @@ export async function startAuthenticatedOllamaProxyV1(options: {
                 request.headers["content-type"] ?? "application/json",
               ...(body.length > 0
                 ? { "content-length": String(body.length) }
+                : {}),
+              ...(upstreamAuthorization
+                ? { authorization: `Bearer ${upstreamAuthorization}` }
                 : {}),
             },
           },

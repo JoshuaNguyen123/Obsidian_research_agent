@@ -144,6 +144,13 @@ export interface SemanticIndexSearchRequest {
    * default) leaves scoring byte-identical to the pure semantic+lexical blend.
    */
   seedPaths?: string[];
+  /**
+   * Override the `semanticRerankMode` setting for this one search: `false`
+   * skips the cross-encoder stage even when it is configured (a background
+   * caller that only needs a rough ranking), `true` demands it. Omitted
+   * follows the setting.
+   */
+  rerank?: boolean;
 }
 
 export interface SemanticIndexSearchTimingsV1 {
@@ -153,6 +160,11 @@ export interface SemanticIndexSearchTimingsV1 {
   scoreMs: number;
   /** Rows actually scored, so a duration can be read per row. */
   rowsScored: number;
+  /**
+   * The optional cross-encoder stage, including reading the shortlist's notes
+   * and the model's first load. Absent when reranking was off.
+   */
+  rerankMs?: number;
 }
 
 /**
@@ -202,6 +214,15 @@ export interface SemanticIndexSearchResult {
    * whether optimising the scan is worth doing.
    */
   timings?: SemanticIndexSearchTimingsV1;
+  /** Whether the cross-encoder stage actually rescored the head of the ranking. */
+  reranked?: boolean;
+  /**
+   * Why: `cross_encoder_reranked`, or a `rerank_skipped:*` /
+   * `rerank_unavailable:*` reason. Present whenever the stage was asked for,
+   * including when it declined, because a silently absent accuracy stage is
+   * how a user ends up trusting a ranking that was never reranked.
+   */
+  rerankReason?: string;
   code?: string;
   message?: string;
 }
@@ -215,6 +236,12 @@ export interface SemanticIndexSearchHit {
   reasons: string[];
   heading: string | null;
   snippet: string;
+  /**
+   * Present only on hits a cross-encoder actually read: its relevance for this
+   * exact query, squashed to 0..1. `score` already carries it, blended; this is
+   * here so a caller can see the two stages disagree.
+   */
+  rerankScore?: number;
 }
 
 export interface SemanticIndexService {

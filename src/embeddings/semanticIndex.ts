@@ -7,6 +7,10 @@ import {
   resolveEmbeddingPrefixesV1,
 } from "./embeddingPrefixes";
 import { resolveEffectiveEmbeddingDimV1 } from "./embeddingModelCatalogV1";
+import {
+  rerankSemanticHitsV1,
+  resolveSemanticRerankSettingsV1,
+} from "./semanticRerank";
 import { PYTHON_FASTEMBED_PROVIDER_ID } from "./pythonFastEmbedProvider";
 import {
   chunkMarkdownForSemanticSearch,
@@ -490,6 +494,8 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     // Absent seedPaths this is an empty map, and scoring stays byte-identical.
     const graphPrior = buildSemanticGraphPrior(index.notes, request.seedPaths ?? []);
 
+    const rerankSettings = resolveSemanticRerankSettingsV1(settings);
+    const rerankWanted = request.rerank ?? rerankSettings.enabled;
     const searchResult = index.version === 2
       ? await searchIndexShards({
           app: this.app,
@@ -516,6 +522,17 @@ class DefaultSemanticIndexService implements SemanticIndexService {
             maxNotes: request.maxLiveStaleNotes ?? MAX_LIVE_STALE_NOTES_PER_SEARCH,
             signal: request.signal,
           }),
+          rerankHead: rerankWanted
+            ? (hits) =>
+                this.rerankWithChunkText({
+                  hits,
+                  query,
+                  settings,
+                  chunking: index.chunking,
+                  rerank: rerankSettings,
+                  signal: request.signal,
+                })
+            : undefined,
         })
       : {
           hits: searchIndexChunks({
@@ -562,11 +579,79 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       nextCursor: searchResult.nextCursor,
       resultCount: searchResult.hits.length,
       results: searchResult.hits,
+      ...("reranked" in searchResult
+        ? {
+            reranked: searchResult.reranked,
+            ...(searchResult.rerankReason
+              ? { rerankReason: searchResult.rerankReason }
+              : {}),
+          }
+        : {}),
       // Absent on the v1 path, which scores in memory and has no decode step.
       ...("timings" in searchResult && searchResult.timings
         ? { timings: searchResult.timings }
         : {}),
     };
+  }
+
+  /**
+   * Rescore the head of a ranking with the cross-encoder.
+   *
+   * The shards store a 360-character snippet, which is not what the model
+   * should read: a cross-encoder is only as good as the passage it is given.
+   * The full chunk is recovered by re-chunking the note with the index's own
+   * chunking parameters and matching on the row's text hash -- so no offsets
+   * enter the shard format, and a note that changed since it was indexed
+   * simply fails to match and keeps its first-stage place.
+   */
+  private async rerankWithChunkText({
+    hits,
+    query,
+    settings,
+    chunking,
+    rerank,
+    signal,
+  }: {
+    hits: ScoredIndexHitV1[];
+    query: string;
+    settings: AgentSettings;
+    chunking: SemanticChunkingOptions;
+    rerank: { model: string; topK: number };
+    signal?: AbortSignal;
+  }): Promise<{
+    hits: ScoredIndexHitV1[];
+    applied: boolean;
+    reason: string;
+    ms: number;
+    candidateCount: number;
+  }> {
+    const shortlist = hits.slice(0, rerank.topK);
+    const wantedPaths = new Set(
+      shortlist.filter((hit) => hit.rowTextHash).map((hit) => hit.path),
+    );
+    const textByHash = new Map<string, string>();
+    for (const path of wantedPaths) {
+      if (signal?.aborted) break;
+      const file = this.app.vault.getFileByPath(path);
+      if (!file) continue;
+      const built = await buildPendingNote(this.app, file, chunking);
+      if (!built) continue;
+      for (const chunk of built.chunkInputs) {
+        textByHash.set(chunk.textHash, chunk.embeddingText);
+      }
+    }
+    return rerankSemanticHitsV1({
+      hits,
+      query,
+      textFor: (hit) =>
+        (hit.rowTextHash ? textByHash.get(hit.rowTextHash) : null) ?? hit.snippet,
+      provider: this.getEmbeddingProvider(),
+      model: rerank.model,
+      cacheDir: settings.semanticModelCacheDir || undefined,
+      topK: rerank.topK,
+      priority: "interactive",
+      signal,
+    });
   }
 
   /**
@@ -597,7 +682,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     candidatePaths: string[];
     maxNotes: number;
     signal?: AbortSignal;
-  }): Promise<{ hits: Array<SemanticIndexSearchHit & { sortPath: string }>; paths: string[] }> {
+  }): Promise<{ hits: Array<ScoredIndexHitV1>; paths: string[] }> {
     const empty = { hits: [], paths: [] };
     const scoped = candidatePaths.filter(
       (path) => !folder || path.startsWith(`${folder}/`),
@@ -654,7 +739,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     if (!embedded.ok || embedded.vectors.length !== pending.length) {
       return empty;
     }
-    const hits: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
+    const hits: Array<ScoredIndexHitV1> = [];
     const paths = new Set<string>();
     pending.forEach((item, position) => {
       const vector = embedded.vectors[position];
@@ -684,6 +769,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
         heading: item.row.heading,
         snippet: boundedSnippet(item.row.snippet, maxSnippetChars),
         sortPath: item.row.notePath,
+        rowTextHash: item.row.textHash,
       });
     });
     return { hits, paths: [...paths] };
@@ -1186,6 +1272,17 @@ export async function embedIndexDocuments({
 }
 
 /**
+ * A hit while it is still inside the ranker: the public fields plus the note
+ * path it sorts by and, when the row came from a shard, the hash of the chunk
+ * text. The hash is what lets the rerank stage find the chunk again in the note
+ * without storing offsets in the shard format.
+ */
+type ScoredIndexHitV1 = SemanticIndexSearchHit & {
+  sortPath: string;
+  rowTextHash?: string;
+};
+
+/**
  * Blend the three retrieval signals.
  *
  * With no graph prior the weights are 0.85/0.15 — byte-identical to the
@@ -1235,7 +1332,7 @@ function searchIndexChunks({
   excludePaths?: Set<string>;
   cursor?: string | null;
 }): SemanticIndexSearchHit[] {
-  const scored: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
+  const scored: Array<ScoredIndexHitV1> = [];
 
   for (const note of index.notes) {
     if (folder && !note.path.startsWith(`${folder}/`)) {
@@ -1272,7 +1369,7 @@ function searchIndexChunks({
     }
   }
 
-  const byPath = new Map<string, SemanticIndexSearchHit & { sortPath: string }>();
+  const byPath = new Map<string, ScoredIndexHitV1>();
   for (const hit of scored.sort(compareHits)) {
     if (!byPath.has(hit.path)) {
       byPath.set(hit.path, hit);
@@ -1283,7 +1380,7 @@ function searchIndexChunks({
   return [...byPath.values()]
     .sort(compareHits)
     .slice(offset, offset + limit)
-    .map(({ sortPath, ...hit }) => hit);
+    .map(({ sortPath, rowTextHash, ...hit }) => hit);
 }
 
 async function searchIndexShards({
@@ -1300,6 +1397,7 @@ async function searchIndexShards({
   graphPrior,
   excludePaths,
   liveHits,
+  rerankHead,
 }: {
   graphPrior?: SemanticGraphPrior | null;
   app: App;
@@ -1315,15 +1413,30 @@ async function searchIndexShards({
   /** Notes the index no longer describes; their rows are skipped. */
   excludePaths?: Set<string>;
   /** Freshly embedded rows for a few excluded notes, merged into the ranking. */
-  liveHits?: { hits: Array<SemanticIndexSearchHit & { sortPath: string }>; paths: string[] };
+  liveHits?: { hits: Array<ScoredIndexHitV1>; paths: string[] };
+  /**
+   * Optional second stage: rescore the head of the ranking with a
+   * cross-encoder. It runs on the full ranking before paging, so page two
+   * reflects the same order, and it may only reorder -- a hit it dislikes
+   * sinks, it never disappears.
+   */
+  rerankHead?: (hits: Array<ScoredIndexHitV1>) => Promise<{
+    hits: Array<ScoredIndexHitV1>;
+    applied: boolean;
+    reason: string;
+    ms: number;
+    candidateCount: number;
+  }>;
 }): Promise<{
   hits: SemanticIndexSearchHit[];
   candidateCount: number;
   nextCursor: string | null;
   timings: SemanticIndexSearchTimingsV1;
   liveMergedPaths: string[];
+  reranked: boolean;
+  rerankReason: string | null;
 }> {
-  const scored: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
+  const scored: Array<ScoredIndexHitV1> = [];
   let candidateCount = 0;
   let decodeMs = 0;
   let scoreMs = 0;
@@ -1378,6 +1491,7 @@ async function searchIndexShards({
         heading: row.heading,
         snippet: boundedSnippet(row.snippet, maxSnippetChars),
         sortPath: row.notePath,
+        rowTextHash: row.textHash,
       };
       if (minScore !== undefined && hit.score < minScore) {
         continue;
@@ -1394,22 +1508,31 @@ async function searchIndexShards({
     pushBoundedHit(scored, hit, candidateLimit);
   }
 
-  const byPath = new Map<string, SemanticIndexSearchHit & { sortPath: string }>();
+  const byPath = new Map<string, ScoredIndexHitV1>();
   for (const hit of scored.sort(compareHits)) {
     if (!byPath.has(hit.path)) {
       byPath.set(hit.path, hit);
     }
   }
-  const allHits = [...byPath.values()].sort(compareHits);
+  const ranked = [...byPath.values()].sort(compareHits);
+  const reranked = rerankHead ? await rerankHead(ranked) : null;
+  const allHits = reranked?.hits ?? ranked;
   const offset = parseCursorOffset(cursor);
   const page = allHits.slice(offset, offset + limit);
   const nextOffset = offset + page.length;
   return {
-    hits: page.map(({ sortPath, ...hit }) => hit),
+    hits: page.map(({ sortPath, rowTextHash, ...hit }) => hit),
     candidateCount,
     nextCursor: nextOffset < allHits.length ? String(nextOffset) : null,
-    timings: { decodeMs, scoreMs, rowsScored: candidateCount },
+    timings: {
+      decodeMs,
+      scoreMs,
+      rowsScored: candidateCount,
+      ...(reranked ? { rerankMs: reranked.ms } : {}),
+    },
     liveMergedPaths: liveHits?.paths ?? [],
+    reranked: reranked?.applied ?? false,
+    rerankReason: reranked?.reason ?? null,
   };
 }
 
@@ -1576,7 +1699,7 @@ function lexicalScoreForRow(
   return { score: Math.min(1, score), reasons };
 }
 
-function pushBoundedHit<T extends SemanticIndexSearchHit & { sortPath: string }>(
+function pushBoundedHit<T extends ScoredIndexHitV1>(
   hits: T[],
   hit: T,
   limit: number,
@@ -2105,8 +2228,8 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
 
 
 function compareHits(
-  left: SemanticIndexSearchHit & { sortPath: string },
-  right: SemanticIndexSearchHit & { sortPath: string },
+  left: ScoredIndexHitV1,
+  right: ScoredIndexHitV1,
 ): number {
   return (
     right.score - left.score ||

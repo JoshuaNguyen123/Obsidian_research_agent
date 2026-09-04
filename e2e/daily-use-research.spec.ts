@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import { getE2EAiCredential } from "./aiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
 import { assertApprovalSurfaceUsableV1 } from "./fixtures/uiSurfaceAssertions";
@@ -183,18 +184,36 @@ test.describe("Daily-use live research contract", () => {
     const previousLeadCredential = process.env.E2E_OLLAMA_API_KEY;
     const leadToken = `lead-${randomUUID()}`;
     const specialistToken = `specialist-${randomUUID()}`;
+    // What is under test is that Lead and Specialist hold *different*
+    // credentials and reach *different* endpoints -- that is the product
+    // behaviour of specialistConnectionMode "separate". It is not that the
+    // operator owns two accounts: on this machine (and on most people's) there
+    // is one Ollama-cloud key, and the two agents differ by model. So each
+    // agent gets its own disposable token and its own loopback boundary, and
+    // each boundary swaps that token for the single real key on the way
+    // upstream. Pointing both at 127.0.0.1:11434 instead would require a local
+    // daemon this project deliberately does not run.
+    const upstreamCredential = getE2EAiCredential("ollama");
+    const upstreamBaseUrl = process.env.E2E_OLLAMA_BASE_URL?.trim() || "https://ollama.com/api";
+    const leadModel = process.env.E2E_AI_MODEL?.trim() || "glm-5.3-flash:cloud";
+    const specialistModel =
+      process.env.E2E_SPECIALIST_MODEL?.trim() || "qwen3.5:cloud";
     try {
       leadProxy = await startAuthenticatedOllamaProxyV1({
         expectedBearerToken: leadToken,
+        upstreamBaseUrl,
+        upstreamAuthorization: upstreamCredential,
       });
       specialistProxy = await startAuthenticatedOllamaProxyV1({
         expectedBearerToken: specialistToken,
+        upstreamBaseUrl,
+        upstreamAuthorization: upstreamCredential,
       });
       process.env.E2E_OLLAMA_API_KEY = leadToken;
       harness = await startRealAiHarness(
         "dual-agent-separate-live",
         {
-          model: "minimax-m3:cloud",
+          model: leadModel,
           baseUrl: leadProxy.baseUrl,
           missionTimeoutMs: 8 * 60_000,
           completionTimeoutMs: 8 * 60_000,
@@ -208,7 +227,7 @@ test.describe("Daily-use live research contract", () => {
           },
           orchestratorEnabled: true,
           specialistEnabled: true,
-          specialistModel: "gpt-oss:120b-cloud",
+          specialistModel,
           specialistConnectionMode: "separate",
           specialistProvider: "ollama",
           specialistBaseUrl: specialistProxy.baseUrl,
@@ -260,7 +279,7 @@ test.describe("Daily-use live research contract", () => {
       expect(credentialProof.leadConnection, JSON.stringify(safeState)).toMatchObject({
         status: "ready",
         provider: "ollama",
-        model: "minimax-m3:cloud",
+        model: leadModel,
       });
       expect(
         credentialProof.specialistConnection,
@@ -268,18 +287,21 @@ test.describe("Daily-use live research contract", () => {
       ).toMatchObject({
         status: "ready",
         provider: "ollama",
-        model: "gpt-oss:120b-cloud",
+        model: specialistModel,
       });
       expect(leadProof.authorizedRequests, JSON.stringify(safeState)).toBeGreaterThan(0);
       expect(specialistProof.authorizedRequests, JSON.stringify(safeState)).toBeGreaterThan(0);
       expect(leadProof.rejectedRequests, JSON.stringify(safeState)).toBe(0);
       expect(specialistProof.rejectedRequests, JSON.stringify(safeState)).toBe(0);
-      expect(leadProof.models, JSON.stringify(safeState)).toEqual([
-        "minimax-m3:cloud",
-      ]);
+      // The two boundaries saw two different models, which is what "two real
+      // models" means when both accounts are the same account.
+      expect(leadProof.models, JSON.stringify(safeState)).toEqual([leadModel]);
       expect(specialistProof.models, JSON.stringify(safeState)).toEqual([
-        "gpt-oss:120b-cloud",
+        specialistModel,
       ]);
+      expect(leadModel, "lead and specialist must differ by model").not.toBe(
+        specialistModel,
+      );
       expect(credentialProof.mode, JSON.stringify(safeState)).toBe("separate");
       expect(credentialProof.leadReferenceId, JSON.stringify(safeState)).toBeTruthy();
       expect(credentialProof.specialistReferenceId, JSON.stringify(safeState)).toBeTruthy();

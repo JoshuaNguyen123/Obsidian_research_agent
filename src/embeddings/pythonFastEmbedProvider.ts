@@ -1,5 +1,7 @@
 import type { AgentSettings } from "../settings";
 import type {
+  SemanticRerankRequest,
+  SemanticRerankResponse,
   SemanticEmbeddingPriority,
   SemanticEmbeddingProvider,
   SemanticEmbeddingRequest,
@@ -10,7 +12,27 @@ import { getNodeRequireForObsidian } from "../platform/nodeRequire";
 /** Recorded in every index this provider builds; see `SemanticEmbeddingProvider.id`. */
 export const PYTHON_FASTEMBED_PROVIDER_ID = "python-fastembed";
 
+/**
+ * Read the execution-provider setting. Comma separated, order preserved,
+ * blanks dropped: the helper tries them in order and falls back to the
+ * runtime's own default if the list does not load.
+ */
+export function parseOnnxProviderListV1(value: unknown): string[] {
+  if (typeof value !== "string" || !value.trim()) return [];
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, 4);
+}
+
 const REQUEST_TIMEOUT_MS = 180000;
+/**
+ * Reranking produces no vectors, but the wire request carries the embedding
+ * request's shape so both ops share one transport. The width is never read on
+ * the rerank path; it only has to pass the helper's positive-integer guard.
+ */
+const RERANK_WIRE_DIM = 1;
 const IDLE_SHUTDOWN_MS = 120000;
 const MAX_OUTPUT_CHARS = 10_000_000;
 const MAX_STDERR_CHARS = 20_000;
@@ -281,6 +303,9 @@ export function createPythonFastEmbedProvider(
           id,
           ...request,
           cacheDir: request.cacheDir ?? activeSettings.semanticModelCacheDir,
+          providers:
+            request.providers ??
+            parseOnnxProviderListV1(activeSettings.semanticOnnxProviders),
         }) + "\n";
       try {
         target.child.stdin.write(body, "utf8");
@@ -442,6 +467,38 @@ export function createPythonFastEmbedProvider(
 
   return {
     id: PYTHON_FASTEMBED_PROVIDER_ID,
+    rerank: (request: SemanticRerankRequest): Promise<SemanticRerankResponse> => {
+      if (request.documents.length === 0) {
+        return Promise.resolve({ ok: true, model: request.model, scores: [] });
+      }
+      // The rerank op rides the same helper session, the same serial queue and
+      // the same recovery budget as embedding: one Python process holds both
+      // model caches, so a search that reranks costs one extra round trip, not
+      // a second interpreter.
+      const wire: SemanticEmbeddingRequest = {
+        op: "rerank",
+        model: request.model,
+        dim: RERANK_WIRE_DIM,
+        cacheDir: request.cacheDir,
+        query: request.query,
+        documents: request.documents,
+        queries: [],
+        priority: request.priority ?? "interactive",
+        signal: request.signal,
+      };
+      return enqueue(
+        () =>
+          request.signal?.aborted
+            ? Promise.resolve({
+                ok: false,
+                model: request.model,
+                code: "aborted",
+                message: "The run was stopped before the rerank request started.",
+              } satisfies SemanticRerankResponse)
+            : embedNow(wire).then((result) => toRerankResponse(request, result)),
+        request.priority ?? "interactive",
+      );
+    },
     embed: (request) =>
       enqueue(
         () =>
@@ -458,6 +515,36 @@ export function createPythonFastEmbedProvider(
       }
     },
   };
+}
+
+/**
+ * Map the shared wire response onto the rerank contract. A helper that is too
+ * old to know the op, or a Python without the reranking extra, comes back as
+ * `ok: false` with a code the caller can show; the caller's contract is that
+ * this leaves the ranking alone rather than failing the search.
+ */
+function toRerankResponse(
+  request: SemanticRerankRequest,
+  response: SemanticEmbeddingResponse,
+): SemanticRerankResponse {
+  if (!response.ok) {
+    return {
+      ok: false,
+      model: request.model,
+      code: response.code ?? "rerank_failed",
+      message: response.message,
+    };
+  }
+  const scores = response.scores;
+  if (!Array.isArray(scores) || scores.length !== request.documents.length) {
+    return {
+      ok: false,
+      model: request.model,
+      code: "rerank_length_mismatch",
+      message: `Reranker returned ${Array.isArray(scores) ? scores.length : 0} scores for ${request.documents.length} documents.`,
+    };
+  }
+  return { ok: true, model: request.model, scores };
 }
 
 /**
@@ -581,6 +668,30 @@ except Exception:
     np = None
 
 MODELS = {}
+RERANKERS = {}
+PROVIDERS_USED = {}
+
+def load_with_providers(factory, model_name, cache_dir, providers):
+    # An execution-provider list the local onnxruntime cannot satisfy must not
+    # break embedding: try the requested providers, then fall back to whatever
+    # the runtime picks for itself, and report which of the two happened.
+    if providers:
+        try:
+            instance = factory(model_name=model_name, cache_dir=cache_dir or None, providers=providers)
+            return instance, list(providers)
+        except Exception:
+            pass
+    try:
+        instance = factory(model_name=model_name, cache_dir=cache_dir or None)
+    except TypeError:
+        instance = factory(model_name=model_name)
+    used = []
+    try:
+        import onnxruntime
+        used = list(onnxruntime.get_available_providers())[:1]
+    except Exception:
+        used = []
+    return instance, used
 
 def emit(payload):
     sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
@@ -657,8 +768,8 @@ def iter_vectors(values):
         for vector in raw:
             yield vector
 
-def get_model(model_name, cache_dir):
-    key = (model_name, cache_dir)
+def get_model(model_name, cache_dir, providers=None):
+    key = (model_name, cache_dir, tuple(providers or ()))
     cached = MODELS.get(key)
     if cached is not None:
         return cached
@@ -666,15 +777,63 @@ def get_model(model_name, cache_dir):
         os.makedirs(cache_dir, exist_ok=True)
         os.environ["FASTEMBED_CACHE_PATH"] = cache_dir
     from fastembed import TextEmbedding
-    try:
-        instance = TextEmbedding(model_name=model_name, cache_dir=cache_dir or None)
-    except TypeError:
-        instance = TextEmbedding(model_name=model_name)
+    instance, used = load_with_providers(TextEmbedding, model_name, cache_dir, providers)
     list(instance.embed(["warmup"], batch_size=1))
     MODELS[key] = instance
+    PROVIDERS_USED[key] = used
     return instance
 
+def get_reranker(model_name, cache_dir):
+    key = (model_name, cache_dir)
+    cached = RERANKERS.get(key)
+    if cached is not None:
+        return cached
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ["FASTEMBED_CACHE_PATH"] = cache_dir
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+    try:
+        instance = TextCrossEncoder(model_name=model_name, cache_dir=cache_dir or None)
+    except TypeError:
+        instance = TextCrossEncoder(model_name=model_name)
+    list(instance.rerank("warmup", ["warmup"]))
+    RERANKERS[key] = instance
+    return instance
+
+def handle_rerank(request):
+    rid = str(request.get("id") or "")
+    model = str(request.get("model") or "")
+    cache_dir = str(request.get("cacheDir") or "").strip()
+    query = str(request.get("query") or "")
+    documents = [str(item) for item in (request.get("documents") or [])]
+    if not model:
+        fail(rid, "invalid_rerank_model", "rerank requires a model name")
+        return
+    if not query or not documents:
+        emit({"id": rid, "ok": True, "model": model, "dim": 0, "scores": []})
+        return
+    try:
+        reranker = get_reranker(model, cache_dir)
+    except ImportError as error:
+        fail(rid, "missing_reranker", "This FastEmbed build has no cross-encoder reranker: " + str(error), model)
+        return
+    except Exception as error:
+        fail(rid, "rerank_failed", str(error), model)
+        return
+    try:
+        scores = [float(score) for score in reranker.rerank(query, documents)]
+    except Exception as error:
+        fail(rid, "rerank_failed", str(error), model)
+        return
+    if len(scores) != len(documents):
+        fail(rid, "rerank_length_mismatch", "reranker returned " + str(len(scores)) + " scores for " + str(len(documents)) + " documents", model)
+        return
+    emit({"id": rid, "ok": True, "model": model, "dim": 0, "scores": scores})
+
 def handle(request):
+    if str(request.get("op") or "embed") == "rerank":
+        handle_rerank(request)
+        return
     rid = str(request.get("id") or "")
     model = str(request.get("model") or "nomic-ai/nomic-embed-text-v1.5-Q")
     # Supplied per request from the caller's model table. Absent means no
@@ -686,6 +845,7 @@ def handle(request):
     # Absent means the pre-flag behaviour (truncate), which only nomic ever saw.
     use_matryoshka = bool(request.get("matryoshka", True))
     cache_dir = str(request.get("cacheDir") or "").strip()
+    providers = [str(item) for item in (request.get("providers") or []) if str(item).strip()]
     documents = request.get("documents") or []
     queries = request.get("queries") or []
 
@@ -696,7 +856,7 @@ def handle(request):
         return
 
     try:
-        embedding_model = get_model(model, cache_dir)
+        embedding_model = get_model(model, cache_dir, providers)
     except ImportError:
         fail(rid, "missing_fastembed", "Install FastEmbed with: python -m pip install fastembed", model, dim)
         return
@@ -728,6 +888,7 @@ def handle(request):
         "queries": query_vectors,
         "downloadedOrVerified": True,
         "cacheDir": cache_dir,
+        "providersUsed": PROVIDERS_USED.get((model, cache_dir, tuple(providers)), []),
     })
 
 def main():
