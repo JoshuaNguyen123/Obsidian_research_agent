@@ -1,3 +1,10 @@
+import {
+  bm25ContentScoreV1,
+  buildLexicalCorpusStatsV1,
+  buildLexicalDocumentTermStatsV1,
+  type LexicalDocumentTermStatsV1,
+} from "../tools/lexicalRanking";
+
 // Keep each source compact enough that multi-source research can fit alongside
 // the mission plan, tool schemas, and a correction pass in an 8k context.
 // The complete source remains in the durable cache; these are the best
@@ -222,49 +229,111 @@ function hashLocator(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
+/** Windows built per query term, and in total, before ranking. */
+const MAX_WINDOWS_PER_TERM = 8;
+const MAX_QUERY_WINDOWS = 48;
+/** How many occurrences of one term are worth locating before sampling. */
+const MAX_SCANNED_OCCURRENCES = 512;
+
+/**
+ * Up to `MAX_WINDOWS_PER_TERM` occurrences of a term, spread across the whole
+ * document rather than taken from its beginning.
+ *
+ * Taking the first eight is a prefix bias with teeth: a page whose navigation
+ * or tag blocks repeat the query terms consumes every slot before the reader
+ * ever reaches the paragraph that answers, and a window that was never built
+ * cannot be ranked, selected, cited or quoted, however good the scoring is.
+ * Sampling evenly across the occurrence list keeps the same budget and always
+ * includes the first and the last.
+ */
+function spreadOccurrencesV1(lowerContent: string, term: string): number[] {
+  const occurrences: number[] = [];
+  let cursor = 0;
+  while (occurrences.length < MAX_SCANNED_OCCURRENCES) {
+    const index = lowerContent.indexOf(term, cursor);
+    if (index < 0) break;
+    occurrences.push(index);
+    cursor = index + Math.max(1, term.length);
+  }
+  if (occurrences.length <= MAX_WINDOWS_PER_TERM) return occurrences;
+  const picked: number[] = [];
+  for (let slot = 0; slot < MAX_WINDOWS_PER_TERM; slot += 1) {
+    const position = Math.round(
+      (slot * (occurrences.length - 1)) / (MAX_WINDOWS_PER_TERM - 1),
+    );
+    const occurrence = occurrences[position];
+    if (picked.at(-1) !== occurrence) picked.push(occurrence);
+  }
+  return picked;
+}
+
+/**
+ * Windows around each query-term occurrence, ranked by how much of the query
+ * they answer and then by BM25 within the page.
+ *
+ * Ranking used to be term coverage plus a raw occurrence count, which is the
+ * scoring a keyword list wins: a navigation block or tag dump repeating the
+ * query's words beat the paragraph that states the fact. The tiebreak is now
+ * `bm25ContentScoreV1` over the page's own windows, so a term is weighed by how
+ * rare it is *on this page*, repeats saturate instead of accumulating, longer
+ * windows are normalised, and `informativeOccurrenceCountV1` discounts adjacent
+ * repeats and keyword-dense lines outright. Coverage stays the primary key: a
+ * window answering three of three terms should still precede one answering one.
+ */
 function buildQueryCandidates(
   content: string,
   terms: string[],
   maxPassageChars: number,
 ): PassageCandidate[] {
   const lowerContent = content.toLocaleLowerCase();
-  const candidates: PassageCandidate[] = [];
+  const windows: Array<{
+    start: number;
+    end: number;
+    matchedTerms: string[];
+    stats: LexicalDocumentTermStatsV1;
+  }> = [];
   const seenStarts = new Set<number>();
 
   for (const term of terms) {
-    let cursor = 0;
-    let matchesForTerm = 0;
-    while (cursor < lowerContent.length && matchesForTerm < 8 && candidates.length < 48) {
-      const index = lowerContent.indexOf(term, cursor);
-      if (index < 0) {
-        break;
-      }
+    for (const index of spreadOccurrencesV1(lowerContent, term)) {
+      if (windows.length >= MAX_QUERY_WINDOWS) break;
       const start = clampInteger(
         index - Math.floor(maxPassageChars * 0.35),
         0,
         Math.max(0, content.length - Math.min(maxPassageChars, content.length)),
       );
-      if (!seenStarts.has(start)) {
-        const end = Math.min(content.length, start + maxPassageChars);
-        const lowerWindow = lowerContent.slice(start, end);
-        const matchedTerms = terms.filter((candidate) => lowerWindow.includes(candidate));
-        const occurrenceScore = matchedTerms.reduce(
-          (score, candidate) => score + countOccurrences(lowerWindow, candidate),
-          0,
-        );
-        candidates.push({
-          start,
-          end,
-          score: matchedTerms.length * 100 + occurrenceScore,
-          selection: "query_match",
-          matchedTerms,
-        });
-        seenStarts.add(start);
-      }
-      matchesForTerm += 1;
-      cursor = index + Math.max(1, term.length);
+      if (seenStarts.has(start)) continue;
+      const end = Math.min(content.length, start + maxPassageChars);
+      const lowerWindow = lowerContent.slice(start, end);
+      windows.push({
+        start,
+        end,
+        matchedTerms: terms.filter((candidate) => lowerWindow.includes(candidate)),
+        stats: buildLexicalDocumentTermStatsV1(lowerWindow, terms),
+      });
+      seenStarts.add(start);
     }
   }
+
+  // The corpus is the page's paragraphs, not the candidate windows. Windows are
+  // built *around* query terms, so scoring them against each other makes every
+  // term appear everywhere, IDF collapse to zero, and the ranking fall back to
+  // document order -- which hands first place to whatever block sits nearest
+  // the top. Paragraphs are what the terms are actually rare or common in.
+  const corpus = buildLexicalCorpusStatsV1(
+    lowerContent
+      .split(/\n\s*\n/u)
+      .filter((block) => block.trim().length > 0)
+      .map((block) => buildLexicalDocumentTermStatsV1(block, terms)),
+  );
+  const candidates: PassageCandidate[] = windows.map((window) => ({
+    start: window.start,
+    end: window.end,
+    score:
+      window.matchedTerms.length * 100 + bm25ContentScoreV1(window.stats, corpus),
+    selection: "query_match",
+    matchedTerms: window.matchedTerms,
+  }));
 
   return candidates.sort(
     (left, right) => right.score - left.score || left.start - right.start,

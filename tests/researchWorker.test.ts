@@ -9,7 +9,9 @@ import type {
 import type { ModelCallEvidenceV1 } from "../src/model/modelCallEvidence";
 import {
   createReadOnlyWorkerRegistry,
+  canJoinResearchWorkerBatchV1,
   isResearchWorkerParallelSafe,
+  researchWorkerCallHostV1,
   OLLAMA_CLOUD_DEEP_RESEARCH_MODEL,
   runResearchWorker,
 } from "../src/orchestrator/researchWorker";
@@ -962,11 +964,44 @@ test("researcher falls back to chat when streaming is disabled", async () => {
   assert.equal(streamCalls, 0);
 });
 
-test("research worker parallel-safe classifier keeps web_fetch serial", () => {
+test("research worker parallel-safe classifier keeps the browser session serial", () => {
   assert.equal(isResearchWorkerParallelSafe("read_file"), true);
   assert.equal(isResearchWorkerParallelSafe("web_search"), true);
-  assert.equal(isResearchWorkerParallelSafe("web_fetch"), false);
+  // The browser tools share one window and its lease; two at once is two
+  // commands to the same session.
   assert.equal(isResearchWorkerParallelSafe("browser_open_page"), false);
+  assert.equal(isResearchWorkerParallelSafe("browser_extract_markdown"), false);
+  // web_fetch is parallel-safe by tool, and constrained by host below.
+  assert.equal(isResearchWorkerParallelSafe("web_fetch"), true);
+});
+
+test("fetches batch across hosts but never twice against one host", () => {
+  // Four pages at once is fine when they are four servers. Two concurrent
+  // requests to the same host is how a research agent gets rate-limited, so a
+  // second call to a host already in the batch waits for the next one.
+  const fetchCall = (url: string) => ({ name: "web_fetch", arguments: { url } });
+  assert.equal(researchWorkerCallHostV1(fetchCall("https://a.test/x")), "a.test");
+  assert.equal(researchWorkerCallHostV1(fetchCall("HTTPS://A.TEST/y")), "a.test");
+  assert.equal(researchWorkerCallHostV1({ name: "read_file", arguments: {} }), null);
+  // An unreadable URL is treated as one shared host rather than as "no host",
+  // which is the cautious reading.
+  assert.equal(researchWorkerCallHostV1(fetchCall("not a url")), "unparsed");
+  assert.equal(researchWorkerCallHostV1({ name: "web_fetch", arguments: {} }), "unparsed");
+
+  const batch = new Set<string>();
+  assert.equal(canJoinResearchWorkerBatchV1(fetchCall("https://a.test/1"), batch), true);
+  batch.add("a.test");
+  assert.equal(canJoinResearchWorkerBatchV1(fetchCall("https://b.test/1"), batch), true);
+  assert.equal(canJoinResearchWorkerBatchV1(fetchCall("https://a.test/2"), batch), false);
+  // A tool with no host is unaffected by what the batch already holds.
+  assert.equal(
+    canJoinResearchWorkerBatchV1({ name: "read_file", arguments: { path: "a.md" } }, batch),
+    true,
+  );
+  assert.equal(
+    canJoinResearchWorkerBatchV1({ name: "browser_open_page", arguments: {} }, batch),
+    false,
+  );
 });
 
 test("research worker runs parallel-safe reads concurrently", async () => {

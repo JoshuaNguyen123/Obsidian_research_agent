@@ -39,6 +39,26 @@ export interface SemanticVaultIndexV1 {
   notes: SemanticIndexNote[];
 }
 
+/**
+ * How common each term is across the index's own rows, so the lexical half of
+ * the blend can tell a word that means something here from one that appears in
+ * every note. Computed at build time over exactly the text the lexical scorer
+ * reads (title, heading, tags, snippet); absent on an index built before this
+ * existed, which scores the way it always did.
+ */
+export interface SemanticIndexLexicalStatsV1 {
+  /** Rows the frequencies were counted over. */
+  documentCount: number;
+  /** Mean lexical-text length in characters. */
+  averageLength: number;
+  /**
+   * Rows containing each term, for the most common terms only -- a full vault
+   * vocabulary would dominate the manifest, and a term too rare to make the cut
+   * is treated as maximally informative, which is what it is.
+   */
+  documentFrequencies: Record<string, number>;
+}
+
 export interface SemanticIndexRowMeta {
   id: string;
   notePath: string;
@@ -101,6 +121,8 @@ export interface SemanticVaultIndexV2 {
   notes: SemanticIndexNoteMeta[];
   shards: SemanticIndexShardRef[];
   totalRows: number;
+  /** Term rarity over this index's rows; absent on indexes built before it. */
+  lexicalStats?: SemanticIndexLexicalStatsV1;
 }
 
 export type SemanticVaultIndex = SemanticVaultIndexV1 | SemanticVaultIndexV2;

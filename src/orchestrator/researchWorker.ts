@@ -74,13 +74,24 @@ export const RESEARCH_WORKER_ALLOWED_TOOLS: ReadonlySet<string> = new Set(
   RESEARCHER_SOFT_TOOL_NAMES,
 );
 
-/** Tools that must stay sequential (leases, browser session, or mutations). */
+/**
+ * Tools that must stay sequential. The browser tools share one session and its
+ * lease, so two of them at once is two commands to the same window.
+ */
 const RESEARCH_WORKER_SERIAL_ONLY = new Set([
-  "web_fetch",
   "browser_open_page",
   "browser_observe",
   "browser_extract_markdown",
 ]);
+
+/**
+ * `web_fetch` is not one of them, but it is not unconditionally parallel
+ * either: reading four pages at once is only fine when they are four different
+ * servers. Two concurrent requests to the same host is the behaviour that gets
+ * a research agent rate-limited or blocked, and the source cache it writes
+ * through is already serialised by its own queue.
+ */
+const HOST_SERIAL_TOOL = "web_fetch";
 
 const MAX_RESEARCH_WORKER_PARALLEL_READS = 4;
 
@@ -89,6 +100,39 @@ export function isResearchWorkerParallelSafe(toolName: string): boolean {
     RESEARCH_WORKER_ALLOWED_TOOLS.has(toolName) &&
     !RESEARCH_WORKER_SERIAL_ONLY.has(toolName)
   );
+}
+
+/**
+ * The host a call would hit, when that constrains batching. Anything
+ * unparseable returns a stable placeholder rather than null, so an unreadable
+ * URL is treated as "same host as every other unreadable URL" -- the cautious
+ * reading.
+ */
+export function researchWorkerCallHostV1(call: {
+  name: string;
+  arguments: Record<string, unknown>;
+}): string | null {
+  if (call.name !== HOST_SERIAL_TOOL) return null;
+  const raw = call.arguments?.url;
+  if (typeof raw !== "string" || !raw.trim()) return "unparsed";
+  try {
+    return new URL(raw.trim()).host.toLowerCase() || "unparsed";
+  } catch {
+    return "unparsed";
+  }
+}
+
+/**
+ * Whether one more call may join the batch already assembled. Keeps the
+ * per-tool rule and adds the one-request-per-host rule for fetches.
+ */
+export function canJoinResearchWorkerBatchV1(
+  call: { name: string; arguments: Record<string, unknown> },
+  hostsInBatch: ReadonlySet<string>,
+): boolean {
+  if (!isResearchWorkerParallelSafe(call.name)) return false;
+  const host = researchWorkerCallHostV1(call);
+  return host === null || !hostsInBatch.has(host);
 }
 
 export interface ResearchWorkerResult {
@@ -411,12 +455,15 @@ export async function runResearchWorker(input: {
       }
 
       let batchEnd = callCursor;
+      const batchHosts = new Set<string>();
       while (
         batchEnd < response.toolCalls.length &&
         toolCalls + (batchEnd - callCursor) < modelCeiling &&
         batchEnd - callCursor < MAX_RESEARCH_WORKER_PARALLEL_READS &&
-        isResearchWorkerParallelSafe(response.toolCalls[batchEnd]!.name)
+        canJoinResearchWorkerBatchV1(response.toolCalls[batchEnd]!, batchHosts)
       ) {
+        const host = researchWorkerCallHostV1(response.toolCalls[batchEnd]!);
+        if (host !== null) batchHosts.add(host);
         batchEnd += 1;
       }
       const parallelCount = batchEnd - callCursor;

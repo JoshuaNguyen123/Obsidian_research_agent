@@ -26,6 +26,7 @@ import {
 } from "./semanticGraphPrior";
 import type {
   SemanticIndexBuildResult,
+  SemanticIndexLexicalStatsV1,
   SemanticIndexChunk,
   SemanticIndexNote,
   SemanticIndexNoteMeta,
@@ -747,7 +748,12 @@ class DefaultSemanticIndexService implements SemanticIndexService {
         return;
       }
       const semanticScore = normalizeCosine(cosineSimilarity(queryVector, vector));
-      const lexicalScore = lexicalScoreForRow(item.note, item.row, queryTerms);
+      const lexicalScore = lexicalScoreForRow(
+        item.note,
+        item.row,
+        queryTerms,
+        index.lexicalStats,
+      );
       const graphScore = graphScoreFor(graphPrior, item.row.notePath);
       if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
         return;
@@ -879,6 +885,12 @@ class DefaultSemanticIndexService implements SemanticIndexService {
         vectorEncoding: "float32-base64",
       })),
       totalRows: combined.length,
+      // Recomputed over every row the update assembled, not patched: a
+      // frequency table that describes the previous vault is worse than none.
+      lexicalStats: buildLexicalStatsForRowsV1(
+        combined.map(({ row }) => row),
+        nextNotes,
+      ),
     };
 
     await this.writeIndex(nextIndex, nextShards);
@@ -1022,6 +1034,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
           vectorEncoding: "float32-base64" as const,
         })),
         totalRows: rows.length,
+        lexicalStats: buildLexicalStatsForRowsV1(rows, notes),
       },
         shards,
       },
@@ -1470,7 +1483,7 @@ async function searchIndexShards({
       const semanticScore = normalizeCosine(
         cosineSimilarityAt(vectors, rowIndex * index.dim, index.dim, queryTyped, queryNorm),
       );
-      const lexicalScore = lexicalScoreForRow(note, row, queryTerms);
+      const lexicalScore = lexicalScoreForRow(note, row, queryTerms, index.lexicalStats);
       const graphScore = graphScoreFor(graphPrior ?? null, row.notePath);
       const score = blendSemanticScore(semanticScore, lexicalScore.score, graphScore);
       if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
@@ -1669,29 +1682,38 @@ function lexicalScoreForRow(
   note: SemanticIndexNoteMeta,
   row: SemanticIndexRowMeta,
   queryTerms: Set<string>,
+  stats?: SemanticIndexLexicalStatsV1 | null,
 ): { score: number; reasons: string[] } {
   if (queryTerms.size === 0) {
     return { score: 0, reasons: [] };
   }
 
+  // With corpus statistics the four components weigh matched *information*;
+  // without them (an index built before they were recorded) they weigh matched
+  // words, exactly as before.
+  const share = (text: string): number =>
+    stats
+      ? idfWeightedOverlapV1(queryTerms, tokenize(text), stats)
+      : overlapRatio(queryTerms, tokenize(text));
+
   const reasons: string[] = [];
   let score = 0;
-  const title = overlapRatio(queryTerms, tokenize(note.title));
+  const title = share(note.title);
   if (title > 0) {
     score += title * 0.25;
     reasons.push("title_match");
   }
-  const heading = overlapRatio(queryTerms, tokenize(row.heading ?? ""));
+  const heading = share(row.heading ?? "");
   if (heading > 0) {
     score += heading * 0.2;
     reasons.push("heading_match");
   }
-  const tags = overlapRatio(queryTerms, tokenize(note.tags.join(" ")));
+  const tags = share(note.tags.join(" "));
   if (tags > 0) {
     score += tags * 0.15;
     reasons.push("tag_match");
   }
-  const snippet = overlapRatio(queryTerms, tokenize(row.snippet));
+  const snippet = share(row.snippet);
   if (snippet > 0) {
     score += snippet * 0.55;
     reasons.push("snippet_match");
@@ -2211,6 +2233,95 @@ function tokenize(text: string): Set<string> {
       .map((term) => term.replace(/^['-]+|['-]+$/g, ""))
       .filter((term) => term.length > 2 && !STOP_TERMS.has(term)),
   );
+}
+
+/**
+ * The text the lexical half of the blend actually reads for one row. Kept in
+ * one function so the statistics are counted over exactly what is later scored;
+ * counting one text and scoring another is how a corpus statistic silently
+ * stops describing its corpus.
+ */
+function rowLexicalTextV1(
+  note: { title: string; tags: string[] },
+  row: { heading: string | null; snippet: string },
+): string {
+  return [note.title, row.heading ?? "", note.tags.join(" "), row.snippet].join(" ");
+}
+
+/** Terms kept in the manifest's frequency table; the rest count as rare. */
+export const MAX_LEXICAL_STAT_TERMS = 2000;
+
+/**
+ * Statistics for a whole index. Indexed by path rather than searched per row:
+ * a vault of two thousand notes and twenty thousand rows would otherwise turn
+ * the build's last step into forty million string comparisons.
+ */
+function buildLexicalStatsForRowsV1(
+  rows: readonly SemanticIndexRowMeta[],
+  notes: readonly SemanticIndexNoteMeta[],
+): SemanticIndexLexicalStatsV1 {
+  const notesByPath = new Map(notes.map((note) => [note.path, note]));
+  return buildSemanticLexicalStatsV1(
+    rows.map((row) => ({
+      note: notesByPath.get(row.notePath) ?? { title: row.title, tags: [] },
+      row,
+    })),
+  );
+}
+
+export function buildSemanticLexicalStatsV1(
+  entries: ReadonlyArray<{
+    note: { title: string; tags: string[] };
+    row: { heading: string | null; snippet: string };
+  }>,
+): SemanticIndexLexicalStatsV1 {
+  const frequencies = new Map<string, number>();
+  let totalLength = 0;
+  for (const entry of entries) {
+    const text = rowLexicalTextV1(entry.note, entry.row);
+    totalLength += text.length;
+    for (const term of tokenize(text)) {
+      frequencies.set(term, (frequencies.get(term) ?? 0) + 1);
+    }
+  }
+  const kept = [...frequencies.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, MAX_LEXICAL_STAT_TERMS);
+  return {
+    documentCount: entries.length,
+    averageLength: entries.length > 0 ? totalLength / entries.length : 0,
+    documentFrequencies: Object.fromEntries(kept),
+  };
+}
+
+/**
+ * Share of the query's *information* that a piece of text carries, rather than
+ * share of its words. With a query like "semantic index rebuild", "index" may
+ * sit in half the vault while "rebuild" sits in three notes; counting them
+ * equally is what let a keyword-dense note outrank the note that answers.
+ * Terms absent from the capped table are treated as maximally rare.
+ */
+function idfWeightedOverlapV1(
+  queryTerms: Set<string>,
+  text: Set<string>,
+  stats: SemanticIndexLexicalStatsV1,
+): number {
+  if (queryTerms.size === 0 || text.size === 0) return 0;
+  const documentCount = Math.max(1, stats.documentCount);
+  const weightOf = (term: string): number => {
+    const documentFrequency = stats.documentFrequencies[term] ?? 0;
+    return Math.log(
+      1 + (documentCount - documentFrequency + 0.5) / (documentFrequency + 0.5),
+    );
+  };
+  let matched = 0;
+  let total = 0;
+  for (const term of queryTerms) {
+    const weight = weightOf(term);
+    total += weight;
+    if (text.has(term)) matched += weight;
+  }
+  return total > 0 ? matched / total : 0;
 }
 
 function overlapRatio(left: Set<string>, right: Set<string>): number {
