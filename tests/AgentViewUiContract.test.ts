@@ -101,3 +101,47 @@ test("empty state and primary mission action use the shared UI system", () => {
   assert.match(styles, /\.agentic-researcher-chat-suggestions/u);
   assert.match(styles, /background: var\(--interactive-accent\)/u);
 });
+
+test("Stop is reachable from the composer, not only from the live-run card", () => {
+  // The live-run card is a different region of the tab and can be dismissed;
+  // when it was the only Stop, a running mission left the composer showing a
+  // disabled Run Mission button and no way to stop what it started.
+  assert.match(viewSource, /data-testid": "composer-stop"/u);
+  assert.match(viewSource, /data-testid": "live-run-stop"/u);
+  // Both call the same path: two stop buttons must never mean two stop
+  // semantics.
+  assert.equal([...viewSource.matchAll(/this\.requestStop\(\);/gu)].length >= 2, true);
+  assert.match(
+    viewSource,
+    /composerStopButtonEl\.hidden = !this\.isRunning/u,
+    "the composer Stop must be visible exactly while a run is stoppable",
+  );
+  assert.doesNotMatch(
+    viewSource,
+    /use Stop in the live-run card/u,
+    "the aria-label must not send the user to the card any more",
+  );
+});
+
+test("Run Details can be navigated and filtered without losing a section", () => {
+  // Eight tiles, seven sections, and thirteen more behind Diagnostics: the tab
+  // holds everything it always did, but finding one row no longer means
+  // scrolling past the other twenty.
+  assert.match(viewSource, /data-testid": "run-details-nav"/u);
+  assert.match(viewSource, /data-testid": "run-details-filter"/u);
+  assert.match(viewSource, /RUN_DETAILS_JUMP_TARGETS_V1/u);
+  // Jumping into Diagnostics has to open it, or the chip scrolls to a closed
+  // expander and appears to do nothing.
+  assert.match(viewSource, /diagnostics\.open = true/u);
+  // Rows are hidden, never removed: pinned selectors keep resolving.
+  assert.match(viewSource, /classList\.toggle\("is-filtered-out", !hit\)/u);
+  assert.match(
+    styles,
+    /\.agentic-researcher-dashboard \.is-filtered-out[\s\S]{0,80}display: none;/u,
+  );
+  // The filter deliberately leaves prose sections alone.
+  assert.match(
+    viewSource,
+    /RUN_DETAILS_FILTERABLE_ROW_SELECTOR_V1 =\s*\n?\s*"\.agentic-researcher-config-line/u,
+  );
+});

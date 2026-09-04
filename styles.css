@@ -147,6 +147,51 @@
   max-width: 76ch;
 }
 
+/* The settings search. A hundred rows across six collapsed accordions is a
+   haystack; this is the needle finder. Rows never leave the DOM — they are
+   hidden with a class — so nothing a test selector or a screen reader can
+   reach vanishes from the document. */
+.agentic-researcher-settings .agentic-settings-search {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-3);
+  margin-bottom: var(--agent-space-5);
+}
+
+.agentic-researcher-settings .agentic-settings-search-input {
+  flex: 1 1 22ch;
+  max-width: 46ch;
+}
+
+.agentic-researcher-settings .agentic-settings-search-count {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
+}
+
+.agentic-researcher-settings .setting-item.is-filtered-out,
+.agentic-researcher-settings .agentic-settings-advanced-section.is-filtered-out {
+  display: none;
+}
+
+/* Rows a preset currently owns: present in the document so the search can find
+   them, out of the layout until it does. Revealed rows are not editable from
+   here — the preset would overwrite them — so they read as inert and the
+   accompanying copy says which option unlocks them. */
+.agentic-researcher-settings .agentic-settings-preset-hidden {
+  display: none;
+}
+
+.agentic-researcher-settings .agentic-settings-preset-hidden.is-search-revealed {
+  display: block;
+  opacity: 0.72;
+  pointer-events: none;
+}
+
+.agentic-researcher-settings .agentic-settings-preset-hidden-note {
+  margin-bottom: var(--agent-space-3);
+}
+
 /* Fill or outline, not both — the surface step already separates the panel
    from the settings background. */
 .agentic-researcher-settings .agentic-settings-panel {
@@ -620,6 +665,67 @@
     width: 100%;
   }
 
+}
+
+/* Run Details navigation: a jump strip and one row filter. Both only hide or
+   scroll — every row stays in the document. */
+.agentic-researcher-run-details-nav {
+  border-bottom: 1px solid var(--agent-rule);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-3);
+  justify-content: space-between;
+  margin-bottom: var(--agent-space-4);
+  padding-bottom: var(--agent-space-3);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--agent-surface);
+}
+
+.agentic-researcher-run-details-jump {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-2);
+}
+
+.agentic-researcher-run-details-jump-chip {
+  background: var(--agent-surface-raised);
+  border: 1px solid var(--agent-rule);
+  border-radius: var(--agent-radius-full);
+  color: var(--agent-text-muted);
+  cursor: pointer;
+  font-size: var(--agent-type-label);
+  padding: var(--agent-space-1) var(--agent-space-3);
+}
+
+.agentic-researcher-run-details-jump-chip:hover {
+  color: var(--agent-text);
+}
+
+.agentic-researcher-run-details-filter {
+  align-items: center;
+  display: flex;
+  gap: var(--agent-space-2);
+}
+
+.agentic-researcher-run-details-filter-input {
+  min-width: 18ch;
+}
+
+.agentic-researcher-run-details-filter-count {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
+  white-space: nowrap;
+}
+
+.agentic-researcher-dashboard .is-filtered-out {
+  display: none;
+}
+
+/* Stop sits beside Run Mission for as long as there is a run to stop. */
+.agentic-researcher-composer-stop[hidden] {
+  display: none;
 }
 
 /* @style-tokens:settings-region-end — everything below is the mission console,

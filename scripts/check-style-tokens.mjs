@@ -110,6 +110,29 @@ async function main() {
     }
   });
 
+  // A var(--agent-*) that was never defined is invisible: CSS drops the whole
+  // declaration and the rule silently loses its colour, spacing or radius. That
+  // happened eight times in one change, so the definitions are now checked
+  // against the uses.
+  const definedTokens = new Set(
+    [...lines.join("\n").matchAll(/^\s*(--agent-[a-z0-9-]+)\s*:/gmu)].map(
+      (match) => match[1],
+    ),
+  );
+  lines.forEach((line, index) => {
+    for (const match of line.matchAll(/var\((--agent-[a-z0-9-]+)/gu)) {
+      const token = match[1];
+      if (!definedTokens.has(token)) {
+        violations.push({
+          lineNumber: index + 1,
+          rule: "undefined-token",
+          message: `${token} is used but never defined; the declaration is dropped at runtime.`,
+          line: line.trim(),
+        });
+      }
+    }
+  });
+
   if (violations.length > 0) {
     console.error(
       `styles.css style-token check failed with ${violations.length} violation(s):`,

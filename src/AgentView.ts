@@ -205,11 +205,45 @@ interface MissionAcceptanceChecklist {
   checkedAt?: string;
 }
 
+/**
+ * The sections a jump chip can reach, in the order the tab renders them. Keys
+ * match `createDashboardSection`'s key, which is also the class suffix.
+ */
+const RUN_DETAILS_JUMP_TARGETS_V1: ReadonlyArray<readonly [string, string]> =
+  Object.freeze([
+    ["final-answer", "Result"],
+    ["tool-timeline", "Plan and steps"],
+    ["receipts", "Receipts"],
+    ["acceptance", "Acceptance"],
+    ["evidence", "Evidence"],
+    ["preview", "Preview"],
+    ["status", "Status timeline"],
+    ["model-config", "Model config"],
+    ["mission-graph", "Mission"],
+  ]);
+
+/**
+ * The line-shaped rows the filter box hides. Prose sections (Result, Preview)
+ * are deliberately not filterable: hiding half a paragraph is not a view of it.
+ */
+const RUN_DETAILS_FILTERABLE_ROW_SELECTOR_V1 =
+  ".agentic-researcher-config-line, .agentic-researcher-log-item, .agentic-researcher-trace-row";
+
 export class AgentView extends ItemView {
   private readonly plugin: AgenticResearcherPlugin;
   private logEl: HTMLElement | null = null;
   private promptEl: HTMLTextAreaElement | null = null;
   private runButtonEl: HTMLButtonElement | null = null;
+  /** Run Details jump strip and row filter; see renderRunDetailsNav. */
+  private runDetailsNavEl: HTMLElement | null = null;
+  private runDetailsFilterQuery = "";
+  /**
+   * Stop, in the place the user started from. Stop used to live only on the
+   * live-run card, which is a different region of the tab (and gone entirely
+   * once the card is dismissed), so the composer showed a disabled Run Mission
+   * button and no way to stop what it had started.
+   */
+  private composerStopButtonEl: HTMLButtonElement | null = null;
   private steeringEl: HTMLElement | null = null;
   private steeringKindEl: HTMLSelectElement | null = null;
   private steeringTextEl: HTMLInputElement | null = null;
@@ -958,6 +992,18 @@ export class AgentView extends ItemView {
       },
     });
 
+    this.composerStopButtonEl = actionsEl.createEl("button", {
+      text: "Stop",
+      cls: "agentic-researcher-secondary-action agentic-researcher-composer-stop",
+      attr: { type: "button", "data-testid": "composer-stop" },
+    });
+    this.composerStopButtonEl.hidden = true;
+    this.composerStopButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.requestStop();
+    });
+
     this.steeringEl = actionsEl.createDiv({
       cls: "agentic-researcher-steering",
       attr: {
@@ -1442,6 +1488,8 @@ export class AgentView extends ItemView {
       dashboardEl.appendChild(this.steeringEl);
     }
 
+    this.renderRunDetailsNav(dashboardEl);
+
     // Primary surface: what the mission produced and what proves it. Process
     // detail lives behind one Diagnostics expander below so the default view
     // stays quiet.
@@ -1688,6 +1736,103 @@ export class AgentView extends ItemView {
       text: value,
       cls: "agentic-researcher-metric-value",
     });
+  }
+
+  /**
+   * Navigation for a tab that is eight metric tiles, seven sections and a
+   * Diagnostics expander holding thirteen more.
+   *
+   * Two controls, both of which only ever hide or scroll: a jump strip that
+   * scrolls a named section into view (opening Diagnostics when the target
+   * lives inside it), and one filter box over the line-shaped rows -- status
+   * timeline entries, run log lines, trace rows, model config lines. Rows stay
+   * in the DOM and are hidden with a class, because every pinned e2e selector
+   * and every screen reader walks this same document; a filter is a view, not
+   * a deletion.
+   */
+  private renderRunDetailsNav(dashboardEl: HTMLElement): void {
+    const navEl = dashboardEl.createDiv({
+      cls: "agentic-researcher-run-details-nav",
+      attr: { "data-testid": "run-details-nav" },
+    });
+    this.runDetailsNavEl = navEl;
+
+    const jumpEl = navEl.createDiv({
+      cls: "agentic-researcher-run-details-jump",
+      attr: { role: "group", "aria-label": "Jump to a Run Details section" },
+    });
+    for (const [key, label] of RUN_DETAILS_JUMP_TARGETS_V1) {
+      const chip = jumpEl.createEl("button", {
+        text: label,
+        cls: "agentic-researcher-run-details-jump-chip",
+        attr: { type: "button", "data-jump-key": key },
+      });
+      chip.addEventListener("click", (event) => {
+        event.preventDefault();
+        this.jumpToDashboardSection(key);
+      });
+    }
+
+    const filterEl = navEl.createDiv({
+      cls: "agentic-researcher-run-details-filter",
+    });
+    const input = filterEl.createEl("input", {
+      cls: "agentic-researcher-run-details-filter-input",
+      attr: {
+        type: "search",
+        placeholder: "Filter rows (tool, path, setting)",
+        "aria-label": "Filter Run Details rows",
+        "data-testid": "run-details-filter",
+      },
+    });
+    input.value = this.runDetailsFilterQuery;
+    const countEl = filterEl.createSpan({
+      cls: "agentic-researcher-run-details-filter-count",
+    });
+    input.addEventListener("input", () => {
+      this.runDetailsFilterQuery = input.value;
+      this.applyRunDetailsFilter(countEl);
+    });
+    this.applyRunDetailsFilter(countEl);
+  }
+
+  private jumpToDashboardSection(key: string): void {
+    const target = this.containerEl.querySelector<HTMLElement>(
+      `.agentic-researcher-dashboard-section-${key}`,
+    );
+    if (!target) return;
+    // A section inside Diagnostics is unreachable while the expander is shut,
+    // so jumping to it opens the expander first.
+    const diagnostics = target.closest("details");
+    if (diagnostics instanceof HTMLDetailsElement) diagnostics.open = true;
+    target.removeAttribute("hidden");
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  private applyRunDetailsFilter(countEl: HTMLElement | null): void {
+    const query = this.runDetailsFilterQuery.trim().toLowerCase();
+    const root = this.containerEl.querySelector<HTMLElement>(
+      ".agentic-researcher-dashboard",
+    );
+    if (!root) return;
+    const rows = Array.from(
+      root.querySelectorAll<HTMLElement>(RUN_DETAILS_FILTERABLE_ROW_SELECTOR_V1),
+    );
+    let matches = 0;
+    for (const row of rows) {
+      const hit = !query || (row.textContent ?? "").toLowerCase().includes(query);
+      row.classList.toggle("is-filtered-out", !hit);
+      if (query && hit) matches += 1;
+    }
+    if (countEl) {
+      countEl.setText(
+        query
+          ? matches === 0
+            ? `No rows match (${rows.length} scanned)`
+            : `${matches} of ${rows.length} rows`
+          : "",
+      );
+    }
   }
 
   private createDashboardSection(
@@ -4448,11 +4593,17 @@ export class AgentView extends ItemView {
     this.runButtonEl.setAttribute(
       "aria-label",
       this.isRunning
-        ? "Mission is running; use Stop in the live-run card"
+        ? "Mission is running; Stop is beside this button"
         : idleBlocked
           ? "Connect and test a model before Run Mission"
           : "Run Mission",
     );
+    if (this.composerStopButtonEl) {
+      // Visible exactly while there is something to stop, next to the control
+      // that started it. The live-run card keeps its own Stop; both call the
+      // same requestStop().
+      this.composerStopButtonEl.hidden = !this.isRunning;
+    }
     this.runButtonEl.setText(
       this.isRunning
         ? "Run Mission"

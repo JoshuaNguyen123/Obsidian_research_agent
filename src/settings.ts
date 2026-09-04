@@ -474,10 +474,12 @@ export class AgentSettingTab extends PluginSettingTab {
     });
 
     this.renderPendingMissionSetup(containerEl);
+    this.renderSettingsSearch(containerEl);
 
     this.renderBasicSection(containerEl);
     this.renderCapabilityStatus(containerEl);
     this.renderAdvancedSections(containerEl);
+    this.applySettingsFilter();
     this.applyPendingFocus();
     this.startReadinessRefresh();
   }
@@ -520,6 +522,103 @@ export class AgentSettingTab extends PluginSettingTab {
       this.plugin.clearPendingCapabilityResume();
       this.display();
     });
+  }
+
+  /**
+   * A container for rows a preset currently owns: out of the layout, still in
+   * the document. The settings search reveals it (and says why the rows cannot
+   * be edited from there) instead of pretending the settings do not exist.
+   */
+  private createPresetHiddenHost(
+    section: HTMLElement,
+    customOptionLabel: string,
+  ): HTMLElement {
+    const host = section.createDiv({ cls: "agentic-settings-preset-hidden" });
+    host.dataset.presetCustomLabel = customOptionLabel;
+    host.createDiv({
+      cls: "setting-item-description agentic-settings-preset-hidden-note",
+      text: `Shown by search. The preset above sets these; choose "${customOptionLabel}" to edit them.`,
+    });
+    return host;
+  }
+
+  /**
+   * Filter every row by name and description.
+   *
+   * A hundred-odd settings across six collapsed sections is a haystack: the
+   * fastest path to one of them was scrolling and guessing which accordion it
+   * lived in. Rows stay in the DOM and are hidden with a class, so nothing an
+   * e2e selector or a screen reader can reach disappears from the document;
+   * sections with a match open themselves, sections without one fold away, and
+   * rows a preset owns are revealed with a note saying which preset option
+   * unlocks them.
+   */
+  private applySettingsFilter(): void {
+    const query = this.settingsFilterQuery.trim().toLowerCase();
+    const root = this.containerEl;
+    const rows = Array.from(root.querySelectorAll<HTMLElement>(".setting-item"));
+    let matches = 0;
+    for (const row of rows) {
+      const haystack = (row.textContent ?? "").toLowerCase();
+      const hit = !query || haystack.includes(query);
+      row.classList.toggle("is-filtered-out", !hit);
+      if (query && hit) matches += 1;
+    }
+
+    for (const host of Array.from(
+      root.querySelectorAll<HTMLElement>(".agentic-settings-preset-hidden"),
+    )) {
+      const revealed =
+        query.length > 0 &&
+        Array.from(host.querySelectorAll<HTMLElement>(".setting-item")).some(
+          (row) => !row.classList.contains("is-filtered-out"),
+        );
+      host.classList.toggle("is-search-revealed", revealed);
+    }
+
+    for (const section of Array.from(
+      root.querySelectorAll<HTMLDetailsElement>(".agentic-settings-advanced-section"),
+    )) {
+      const hasMatch = Array.from(
+        section.querySelectorAll<HTMLElement>(".setting-item"),
+      ).some((row) => !row.classList.contains("is-filtered-out"));
+      section.classList.toggle("is-filtered-out", Boolean(query) && !hasMatch);
+      if (query && hasMatch) section.open = true;
+    }
+
+    const summary = root.querySelector<HTMLElement>(".agentic-settings-search-count");
+    if (summary) {
+      summary.setText(
+        query
+          ? matches === 0
+            ? "No settings match."
+            : `${matches} setting${matches === 1 ? "" : "s"} match.`
+          : "",
+      );
+    }
+  }
+
+  private renderSettingsSearch(containerEl: HTMLElement): void {
+    const row = containerEl.createDiv({ cls: "agentic-settings-search" });
+    const input = row.createEl("input", {
+      cls: "agentic-settings-search-input",
+      attr: {
+        type: "search",
+        placeholder: "Search settings by name or description",
+        "aria-label": "Search settings",
+      },
+    });
+    input.value = this.settingsFilterQuery;
+    row.createSpan({ cls: "agentic-settings-search-count" });
+    input.addEventListener("input", () => {
+      this.settingsFilterQuery = input.value;
+      this.applySettingsFilter();
+    });
+    // A re-render (a preset toggle, a connection test) must not silently drop
+    // the filter the user is reading through.
+    if (this.settingsFilterQuery) {
+      window.setTimeout(() => input.focus(), 0);
+    }
   }
 
   private applyPendingFocus(): void {
@@ -1193,6 +1292,9 @@ export class AgentSettingTab extends PluginSettingTab {
     this.readinessRefreshTimer = null;
   }
 
+  /** Live settings filter; survives the re-renders a preset toggle triggers. */
+  private settingsFilterQuery = "";
+
   private redisplayWithAdvancedSectionOpen(sectionId: string): void {
     this.display();
     const section = this.containerEl.querySelector<HTMLDetailsElement>(
@@ -1668,12 +1770,14 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    // Individual limits stay available but only surface under "Custom limits";
-    // a detached host means they simply are not rendered otherwise.
+    // Individual limits stay available but only surface under "Custom limits".
+    // They are rendered into a hidden host rather than left out of the DOM, so
+    // the settings search can still find them: a setting you cannot search for
+    // is a setting you cannot find at all.
     const limitsHost: HTMLElement =
       (this.plugin.settings.safetyCeiling ?? "balanced") === "custom"
         ? section
-        : document.createElement("div");
+        : this.createPresetHiddenHost(section, "Custom limits");
 
     new Setting(limitsHost)
       .setName("Maximum agent steps")
@@ -2129,7 +2233,7 @@ export class AgentSettingTab extends PluginSettingTab {
     const semanticHost: HTMLElement =
       (this.plugin.settings.semanticProfile ?? "balanced") === "custom"
         ? section
-        : document.createElement("div");
+        : this.createPresetHiddenHost(section, "Custom values");
 
     // The catalogue names what each model costs and produces; a free-text id
     // stays possible for a model the catalogue does not know, and the probe
