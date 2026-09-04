@@ -12,6 +12,7 @@ import type {
   VerifiedLocalCommitReceiptV1,
 } from "./types";
 import { bindForegroundRepairScopeV1 } from "./ForegroundRepairScopeV1";
+import type { ValidationFailureDigestV1 } from "./validationFailureDigestV1";
 
 export const CODE_REPAIR_STATUS_TOOL = "code_repair_status" as const;
 export const CODE_REPAIR_RECORD_CYCLE_TOOL = "code_repair_record_cycle" as const;
@@ -39,6 +40,13 @@ export interface CodeRepairStatusV1 extends CodeRepairScopeArgsV1 {
   terminalStatus: "complete" | "blocked" | null;
   publicationEligible: boolean;
   blockerCode: string | null;
+  /**
+   * What the most recent red validation actually reported, parsed from its
+   * output and diffed against the previous cycle. Null while nothing has
+   * failed. Derived at read time from the stored receipts, so no checkpoint or
+   * receipt fingerprint depends on it.
+   */
+  failureDigest: ValidationFailureDigestV1 | null;
 }
 
 export interface CodeRepairToolHandlersV1 {
@@ -88,7 +96,7 @@ export function createCodeRepairToolContributionsV1(
       tool: {
         name: CODE_REPAIR_STATUS_TOOL,
         description:
-          "Read a durable code-repair checkpoint and its validation, blocker, and receipt status.",
+          "Read a durable code-repair checkpoint and its validation, blocker, and receipt status. When the last validation was red, failureDigest carries the parsed diagnostics — file, line, code, message per problem — plus which of them survived the previous repair cycle, which were fixed, and which are new. Read it before editing: repairing what it lists is what ends the cycle, and the unresolved list is the reason a cycle can otherwise repeat.",
         parameters: scopeSchema(),
         descriptor: {
           version: 1,

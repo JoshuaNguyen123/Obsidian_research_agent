@@ -93,6 +93,30 @@ test("the stage is off unless it was explicitly chosen", () => {
   );
 });
 
+test("research mode spends the cross-encoder on deep searches and nothing else", () => {
+  // The shipped default. A reflex intent check and a background index probe
+  // must not each pay a second of CPU; the search a mission runs to decide
+  // what to cite must.
+  const settings = { semanticRerankMode: "research" } as const;
+  assert.equal(resolveSemanticRerankSettingsV1(settings, { deepSearch: true }).enabled, true);
+  assert.equal(resolveSemanticRerankSettingsV1(settings, { deepSearch: false }).enabled, false);
+  // No opinion supplied is not a deep search: the caller has to say so.
+  assert.equal(resolveSemanticRerankSettingsV1(settings).enabled, false);
+
+  // The unconditional ends of the range ignore the search entirely.
+  for (const deepSearch of [true, false]) {
+    assert.equal(
+      resolveSemanticRerankSettingsV1({ semanticRerankMode: "cross_encoder" }, { deepSearch })
+        .enabled,
+      true,
+    );
+    assert.equal(
+      resolveSemanticRerankSettingsV1({ semanticRerankMode: "off" }, { deepSearch }).enabled,
+      false,
+    );
+  }
+});
+
 test("every catalogued reranker carries the numbers a user needs to choose", () => {
   assert.ok(SEMANTIC_RERANK_MODEL_CATALOG_V1.length >= 5);
   for (const spec of SEMANTIC_RERANK_MODEL_CATALOG_V1) {

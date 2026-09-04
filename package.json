@@ -28,6 +28,7 @@
     "sync:test-vault": "node scripts/sync-test-vault.mjs",
     "measure:startup-timing": "node scripts/measure-startup-timing.mjs",
     "bench:embedders": "tsx scripts/benchmark-embedders.ts",
+    "mcp:retrieval": "tsx scripts/mcp-retrieval-server.ts",
     "cleanup:e2e-github-residue": "node scripts/cleanup-e2e-github-residue.mjs",
     "cleanup:e2e-runtime-residue": "node scripts/cleanup-owned-e2e-runtime-residue.mjs",
     "cleanup:e2e-runtime-residue:apply": "node scripts/cleanup-owned-e2e-runtime-residue.mjs --apply",

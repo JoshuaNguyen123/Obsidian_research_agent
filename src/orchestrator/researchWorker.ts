@@ -32,6 +32,11 @@ import {
   type ResearchEffortTier,
 } from "../agent/researchEffortPolicy";
 import {
+  isDirectCloudTransportV1,
+  OLLAMA_CLOUD_DEEP_RESEARCH_MODEL_V1,
+  resolveSpecialistModelV1,
+} from "./specialistModelTableV1";
+import {
   createResearchProgressController,
   type ResearchProgressController,
 } from "../agent/researchProgressController";
@@ -53,7 +58,7 @@ const RESEARCH_WORKER_MAX_STEPS = MAX_AGENT_STEPS;
 /** Match orchestrator worker tool-call normalize / code worker ceiling. */
 const RESEARCH_WORKER_MAX_TOOL_CALLS = 80;
 /** Canonical model name for direct requests to https://ollama.com/api. */
-export const OLLAMA_CLOUD_DEEP_RESEARCH_MODEL = "nemotron-3-ultra";
+export const OLLAMA_CLOUD_DEEP_RESEARCH_MODEL = OLLAMA_CLOUD_DEEP_RESEARCH_MODEL_V1;
 import {
   addSourceCandidate,
   claimNextSourceCandidate,
@@ -968,22 +973,28 @@ export function resolveResearchWorkerModelRequestProfile(input: {
   researchEffortTier: ResearchEffortTier;
 }): Pick<ModelChatRequest, "model" | "think"> {
   const descriptor = input.modelClient.descriptor;
-  const directOllamaCloud =
-    descriptor?.provider === "ollama" &&
-    descriptor.endpointCategory === "ollama_cloud";
-  if (!directOllamaCloud) {
+  if (!isDirectCloudTransportV1(descriptor)) {
     return { think: resolveResearcherThink(input) };
   }
 
-  const deepResearch =
-    input.researchEffortTier === "deep" ||
-    input.researchEffortTier === "extended";
-  if (deepResearch) {
+  // The effort gate is the table's, not this worker's: quick and standard
+  // passes resolve to no override and fall through to the configured model.
+  const choice = resolveSpecialistModelV1({
+    mode: "researcher",
+    descriptor,
+    researchEffortTier: input.researchEffortTier,
+  });
+  if (choice) {
     return {
-      model: OLLAMA_CLOUD_DEEP_RESEARCH_MODEL,
+      model: choice.model,
       // Nemotron's direct Ollama thinking contract is safely enabled as a
       // boolean. Preserve an explicit user opt-out when one is configured.
-      think: input.toolContext.settings?.thinkingMode === "off" ? false : true,
+      think:
+        choice.think === "inherit"
+          ? input.toolContext.settings?.thinkingMode === "off"
+            ? false
+            : true
+          : choice.think,
     };
   }
 

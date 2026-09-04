@@ -11,6 +11,10 @@ import type {
 } from "../model/types";
 import type { ToolExecutionResult } from "../tools/types";
 import type { WorkerHandoff } from "./types";
+import {
+  OLLAMA_CLOUD_CODE_WORKER_MODEL_V1,
+  resolveSpecialistModelV1,
+} from "./specialistModelTableV1";
 import { buildJupyterNotebookV1 } from "../../extensions/code/JupyterNotebookV1";
 
 const MAX_CODE_FILE_BYTES = 1_000_000;
@@ -74,8 +78,12 @@ const BLOCKED_MUTATION_EXTENSIONS = new Set([
   ".sh",
 ]);
 
-/** Canonical model name for direct requests to https://ollama.com/api. */
-export const OLLAMA_CLOUD_CODE_WORKER_MODEL = "kimi-k2.7-code";
+/**
+ * Canonical model name for direct requests to https://ollama.com/api.
+ * The choice itself lives in {@link SPECIALIST_MODEL_TABLE_V1}; this is the
+ * name re-exported for the callers and tests that already referenced it.
+ */
+export const OLLAMA_CLOUD_CODE_WORKER_MODEL = OLLAMA_CLOUD_CODE_WORKER_MODEL_V1;
 
 export interface CodeWorkerResult {
   handoff: WorkerHandoff;
@@ -239,14 +247,16 @@ export async function runCodeWorker(input: {
 export function resolveCodeWorkerModelRequestProfile(
   modelClient: ModelClient,
 ): Pick<ModelChatRequest, "model" | "think"> {
-  const descriptor = modelClient.descriptor;
-  if (
-    descriptor?.provider === "ollama" &&
-    descriptor.endpointCategory === "ollama_cloud"
-  ) {
+  const choice = resolveSpecialistModelV1({
+    mode: "code_builder",
+    descriptor: modelClient.descriptor,
+  });
+  if (choice) {
     return {
-      model: OLLAMA_CLOUD_CODE_WORKER_MODEL,
-      think: true,
+      model: choice.model,
+      // The code_builder row pins thinking on; "inherit" would mean the table
+      // has stopped having an opinion, and this caller's fallback is off.
+      think: choice.think === "inherit" ? false : choice.think,
     };
   }
   return { think: false };

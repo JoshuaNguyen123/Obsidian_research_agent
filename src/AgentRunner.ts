@@ -597,6 +597,10 @@ import {
   shouldRequireLinearIssueTemplateRead,
 } from "./agent/promptIntentClassifiers";
 import {
+  buildSemanticVaultPrefetchArgsV1,
+  semanticVaultPrefetchIsUsableV1,
+} from "./agent/vaultPrefetchRetrieval";
+import {
   LIVENESS_CAVEAT_HEADING,
   decideSingleAgentLivenessRecheck,
   formatLivenessCaveat,
@@ -17849,22 +17853,49 @@ export async function runAgentMission({
     }
 
     try {
-      events.onStatus?.("Inspecting vault context locally...");
-      const vaultContext = await runObservedTool({
-        name: "inspect_vault_context",
-        arguments: buildVaultPrefetchArgs(activeIntentPrompt),
-        toolRegistry,
-        toolContext: runToolContext,
-        events,
-        step: 0,
-      });
-      successfulToolNames.push("inspect_vault_context");
-      currentSegmentSuccessfulToolNames.push("inspect_vault_context");
+      // Retrieve before reading. The folder scan reads twelve files chosen by
+      // scope, not by the question; the index ranks chunks against it. Ask the
+      // index first and keep the scan for vaults that have no usable one.
+      let prefetchToolName = "inspect_vault_context";
+      let vaultContext: unknown = null;
+      if (
+        runToolContext.settings?.semanticIndexEnabled === true &&
+        toolRegistry
+          .getDefinitions()
+          .some((definition) => definition.function.name === "semantic_search_notes")
+      ) {
+        events.onStatus?.("Retrieving the notes that match the question...");
+        const retrieved = await runObservedTool({
+          name: "semantic_search_notes",
+          arguments: buildSemanticVaultPrefetchArgsV1(activeIntentPrompt),
+          toolRegistry,
+          toolContext: runToolContext,
+          events,
+          step: 0,
+        }).catch(() => null);
+        if (semanticVaultPrefetchIsUsableV1(retrieved)) {
+          prefetchToolName = "semantic_search_notes";
+          vaultContext = retrieved;
+        }
+      }
+      if (vaultContext === null) {
+        events.onStatus?.("Inspecting vault context locally...");
+        vaultContext = await runObservedTool({
+          name: "inspect_vault_context",
+          arguments: buildVaultPrefetchArgs(activeIntentPrompt),
+          toolRegistry,
+          toolContext: runToolContext,
+          events,
+          step: 0,
+        });
+      }
+      successfulToolNames.push(prefetchToolName);
+      currentSegmentSuccessfulToolNames.push(prefetchToolName);
       await recordLedgerToolResult(
-        "inspect_vault_context",
+        prefetchToolName,
         {
           ok: true,
-          toolName: "inspect_vault_context",
+          toolName: prefetchToolName,
           output: vaultContext,
         },
         0,

@@ -79,7 +79,11 @@ test("the ladder floor never exceeds the largest sanctioned profile", () => {
   assert.ok(huge);
   assert.equal(huge.maxToolCalls, 200);
   assert.equal(huge.maxModelCalls, MAX_AGENT_STEPS);
-  assert.equal(huge.maxWallClockMs, 20 * 60_000);
+  // Wall clock has its own ladder ceiling, above the profile's flat 20
+  // minutes: the profile grants 200 tool calls in that 20 minutes, which is
+  // six seconds each, and a sandbox validation is not six seconds. Bounded all
+  // the same -- naming ten thousand stages buys 45 minutes, not more.
+  assert.equal(huge.maxWallClockMs, 45 * 60_000);
   assert.equal(huge.maxSegments, 3);
 
   const extendedTeam = resolveMissionEffortDecisionV1({
@@ -135,4 +139,43 @@ test("committed work sums the stages a compound mission actually plans", () => {
     "a compound pipeline commits strictly more work than one code stage",
   );
   assert.equal(missionRequiresExtendedEffortBudgetV1(compound), true);
+});
+
+test("wall clock scales with the ladder instead of flattening at one profile value", () => {
+  // The measured defect: every dimension but this one grew with the ladder, so
+  // a 14-step build-validate-commit-publish mission drew twice the tool calls
+  // of a 7-step single-file build and exactly the same 20 minutes to spend
+  // them in.
+  const short = missionEffortFloorForCommittedToolCallsV1(7)!;
+  const long = missionEffortFloorForCommittedToolCallsV1(14)!;
+  assert.ok(
+    long.maxToolCalls > short.maxToolCalls,
+    "precondition: the longer ladder gets more tool calls",
+  );
+  assert.ok(
+    long.maxWallClockMs > short.maxWallClockMs,
+    `a ${long.maxToolCalls}-call ladder must not get the same ${Math.round(short.maxWallClockMs / 60_000)} minutes as a ${short.maxToolCalls}-call one`,
+  );
+
+  // Time per granted tool call must not shrink as the ladder grows: that ratio
+  // collapsing is exactly what the flat ceiling did.
+  const perCall = (floor: { maxWallClockMs: number; maxToolCalls: number }) =>
+    floor.maxWallClockMs / floor.maxToolCalls;
+  assert.ok(
+    perCall(long) >= perCall(short) * 0.9,
+    `${Math.round(perCall(long) / 1000)}s per call at 14 steps vs ${Math.round(perCall(short) / 1000)}s at 7`,
+  );
+
+  // Still monotonic and still bounded.
+  let previous = 0;
+  for (const steps of [1, 5, 10, 15, 20, 100]) {
+    const floor = missionEffortFloorForCommittedToolCallsV1(steps)!;
+    assert.ok(floor.maxWallClockMs >= previous, `${steps} steps regressed`);
+    assert.ok(floor.maxWallClockMs <= 45 * 60_000, `${steps} steps exceeded the bound`);
+    previous = floor.maxWallClockMs;
+  }
+
+  // A mission with no detected ladder is untouched by any of this.
+  assert.equal(missionEffortFloorForCommittedToolCallsV1(0), null);
+  assert.equal(missionEffortFloorForCommittedToolCallsV1(null), null);
 });

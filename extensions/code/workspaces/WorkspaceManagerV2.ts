@@ -15,6 +15,13 @@ import {
   type WorkspaceManifestV2,
   type WorkspaceSandboxPolicyV2,
 } from "./WorkspaceManifestV2";
+import {
+  MAX_SEARCH_CANDIDATES_V1,
+  rankWorkspaceSearchCandidatesV1,
+  workspaceQueryTermsV1,
+  type WorkspaceSearchCandidateV1,
+  type WorkspaceSearchMatchKindV1,
+} from "./workspaceSearchRankingV1";
 
 const MANIFEST_FILE = "manifest.v2.json";
 const ROOT_FOLDER = "root";
@@ -75,6 +82,13 @@ export interface WorkspaceSearchResultV2 {
   line: number;
   column: number;
   preview: string;
+  /**
+   * Relevance, best first. Surfaced rather than kept internal so a reader can
+   * see that the top hit won by a margin instead of by tree order.
+   */
+  score: number;
+  /** Whether this line declares the match, refers to it, or merely mentions it. */
+  matchKind: WorkspaceSearchMatchKindV1;
 }
 
 export interface WorkspaceManagerOptionsV2 {
@@ -830,21 +844,62 @@ export class WorkspaceManagerV2 {
     const start = options.path ? assertWorkspaceRelativePathV2(options.path) : "";
     const tree = await this.scanTree(manifest, start);
     const limit = clamp(options.limit ?? WORKSPACE_MAX_SEARCH_RESULTS_V2, 1, WORKSPACE_MAX_SEARCH_RESULTS_V2);
-    const expected = options.caseSensitive ? needle : needle.toLocaleLowerCase();
-    const output: WorkspaceSearchResultV2[] = [];
+    const caseSensitive = options.caseSensitive === true;
+    const expected = caseSensitive ? needle : needle.toLocaleLowerCase();
+    const queryTerms = workspaceQueryTermsV1(needle, caseSensitive);
+    // A single term identical to the query would make the fallback a copy of
+    // the phrase pass, so it is only built when it could differ.
+    const wantsTermFallback =
+      queryTerms.length > 1 || (queryTerms.length === 1 && queryTerms[0] !== expected);
+
+    const phraseMatches: WorkspaceSearchCandidateV1[] = [];
+    const termMatches: WorkspaceSearchCandidateV1[] = [];
+    const documentFrequencies = new Map<string, number>();
+    let documentCount = 0;
+
     for (const file of tree.files) {
       const read = await this.read(workspaceId, file.path);
+      documentCount += 1;
+      const haystack = caseSensitive ? read.content : read.content.toLocaleLowerCase();
+      for (const term of queryTerms) {
+        if (haystack.includes(term)) {
+          documentFrequencies.set(term, (documentFrequencies.get(term) ?? 0) + 1);
+        }
+      }
       for (const [index, line] of read.content.split(/\r?\n/u).entries()) {
-        const candidate = options.caseSensitive ? line : line.toLocaleLowerCase();
+        const candidate = caseSensitive ? line : line.toLocaleLowerCase();
+        const matchedTerms = queryTerms.filter((term) => candidate.includes(term));
         let offset = candidate.indexOf(expected);
-        while (offset >= 0) {
-          output.push({ path: file.path, line: index + 1, column: offset + 1, preview: line.slice(0, 500) });
-          if (output.length >= limit) return output;
+        while (offset >= 0 && phraseMatches.length < MAX_SEARCH_CANDIDATES_V1) {
+          phraseMatches.push({ path: file.path, line: index + 1, column: offset + 1, text: line, needle: expected, matchedTerms, phrase: true });
           offset = candidate.indexOf(expected, offset + Math.max(1, expected.length));
+        }
+        if (wantsTermFallback && matchedTerms.length > 0 && termMatches.length < MAX_SEARCH_CANDIDATES_V1) {
+          // The longest matched term stands for the line: it is the most
+          // specific one present, and unlike rarity it is known before the
+          // corpus statistics finish.
+          const anchor = [...matchedTerms].sort((left, right) => right.length - left.length || (left < right ? -1 : 1))[0]!;
+          termMatches.push({ path: file.path, line: index + 1, column: candidate.indexOf(anchor) + 1, text: line, needle: anchor, matchedTerms, phrase: false });
         }
       }
     }
-    return output;
+
+    // Term matching widens a query that found nothing; it never dilutes one
+    // that found something.
+    const chosen = phraseMatches.length > 0 ? phraseMatches : termMatches;
+    const ranked = rankWorkspaceSearchCandidatesV1(
+      chosen,
+      { documentCount, documentFrequencies, queryTerms },
+      { caseSensitive },
+    );
+    return ranked.slice(0, limit).map((match) => ({
+      path: match.path,
+      line: match.line,
+      column: match.column,
+      preview: match.text.slice(0, 500),
+      score: match.score,
+      matchKind: match.matchKind,
+    }));
   }
 
   async mkdir(workspaceId: string, leaseId: string, relativePath: string): Promise<WorkspaceMutationReceiptV2> {
