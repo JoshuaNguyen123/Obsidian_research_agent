@@ -876,8 +876,20 @@ const PRODUCT_LOG_SIGNATURES = [
     // one of its parts, so the two accounting subsystems disagree about the
     // same calls. Reached for the first time on 2026-09-04 once claim grounding
     // stopped ending Phase A early; it classified as process:matrix_unclassified.
+    // FIXED 2026-09-04 (c5755ad): the coordinator now declares the usage its
+    // scope inherited, and the lane compares runScopedProviderUsageV1. Kept so
+    // historical rows still classify; a fresh hit means the baseline regressed.
     /coordinator aggregate omitted calls attested by its final ledger segment/u,
     "product:coordinator_usage_aggregate_short",
+  ],
+  [
+    // Phase A pulled the same four owned sources over the wire 33 times. The
+    // fixture backend counts transport hits, so this is refetching, not the
+    // model calling web_fetch again against a warm cache. Reached for the
+    // first time on 2026-09-04 once the usage aggregate above stopped ending
+    // Phase A one assertion earlier; the run itself passed acceptance 15/15.
+    /refetched owned sources over the wire instead of reusing them/u,
+    "product:owned_source_refetch_amplification",
   ],
 ];
 

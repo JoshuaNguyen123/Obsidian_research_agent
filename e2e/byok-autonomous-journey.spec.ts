@@ -788,7 +788,13 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     const researchMetrics = await readResearchBackendMetrics(harness.page);
     expect(researchMetrics.searchCalls).toBeGreaterThanOrEqual(1);
     expect(new Set(researchMetrics.fetchedUrls)).toEqual(new Set(sources));
-    expect(researchMetrics.fetchCalls).toBe(sources.length);
+    // Counts transport hits, not tool calls: the owned backend records one
+    // per /web_fetch request, so a cache that does not survive a segment
+    // boundary or a section read shows up here and nowhere else.
+    expect(
+      researchMetrics.fetchCalls,
+      "Phase A refetched owned sources over the wire instead of reusing them",
+    ).toBe(sources.length);
     expect(
       researchMetrics.fetchedUrls.length,
       "Phase A must not transport the same owned source twice while distinct-source debt remains",
