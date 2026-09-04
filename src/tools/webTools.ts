@@ -27,7 +27,9 @@ import {
   SOURCE_CACHE_FRESH_MS,
   SOURCE_CACHE_MAX_AGE_MS,
   findFreshCachedSource,
+  readCachedSourceContent,
   readSourceSection,
+  resolveSourceCacheMissionId,
   writeSourceCacheNote,
 } from "./sourceCache";
 import type { SourceParserStatus } from "./sourceCache";
@@ -386,9 +388,11 @@ export const webFetchTool: AgentTool = {
       isFreshnessSensitivePrompt(context.originalPrompt)
     );
     const query = getEvidenceQuery(args, context.originalPrompt);
+    const missionId = resolveSourceCacheMissionId(context);
     const cached = await findFreshCachedSource(context, url, {
       maxAgeMs,
       refresh,
+      ...(missionId ? { missionId } : {}),
     });
     if (cached) {
       const section = await readSourceSection(
@@ -726,6 +730,30 @@ function createRuntimeResearchProviders(
     async retrieve(candidate) {
       assertOperationActive(context);
       const normalizedUrl = normalizeWebFetchUrl(candidate.url);
+      // The ladder is a last resort, and it used to reach it over the wire even
+      // for a URL this run had already stored: this provider is a second
+      // transport site that never consulted the source cache, so a primary
+      // failure re-pulled bytes the vault already held and the owned-source
+      // backend counted the hit twice. A stored copy answers the same
+      // candidate; only a cache miss now costs a request.
+      const substitute = await findFreshCachedSource(context, normalizedUrl, {
+        maxAgeMs: SOURCE_CACHE_FRESH_MS,
+      });
+      if (substitute) {
+        const storedContent = await readCachedSourceContent(
+          context,
+          substitute.vaultPath,
+        );
+        if (storedContent?.trim()) {
+          return {
+            title: substitute.title,
+            url: normalizedUrl,
+            content: storedContent,
+            parserStatus: substitute.parserStatus,
+            providerMetadata: { links: [] },
+          };
+        }
+      }
       const baseUrl = normalizeOllamaBaseUrl(context.settings.ollamaBaseUrl);
       const response = await requestWithRetry(context.httpTransport, {
         url: `${baseUrl}/web_fetch`,

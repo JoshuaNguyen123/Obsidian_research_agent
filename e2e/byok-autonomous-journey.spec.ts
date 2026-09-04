@@ -738,12 +738,26 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       waitForCompletion: false,
       timeoutMs: 70 * 60_000,
     });
-    approvalCount += await harness.approveUntilMissionComplete(70 * 60_000, {
-      maxContinuations: 4,
-      allowedApprovalToolNames: BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS,
-      requirePrivateRepositoryApproval: true,
-      requireExactPreparedActionApproval: true,
-    });
+    try {
+      approvalCount += await harness.approveUntilMissionComplete(70 * 60_000, {
+        maxContinuations: 4,
+        allowedApprovalToolNames: BYOK_ALLOWED_PREPARED_APPROVAL_TOOLS,
+        requirePrivateRepositoryApproval: true,
+        requireExactPreparedActionApproval: true,
+      });
+    } finally {
+      // Phase A can die here rather than at the transport assertions below --
+      // a required-tool failure suppresses auto-continue and the run exhausts
+      // its continuation ceiling. That death is exactly when the fetch
+      // attribution is most wanted, and teardown removes the vault run notes,
+      // so capture it on the way out instead of after the asserts.
+      await attachPhaseWebFetchAttribution(
+        test.info(),
+        "A",
+        harness.page,
+        observedToolJournal,
+      );
+    }
     const phaseAProgressCounters = harness.readProgressCounters();
     expect(phaseAProgressCounters.approvals).toBe(approvalCount);
     continuationCount = phaseAProgressCounters.continuations;
@@ -3628,6 +3642,24 @@ interface ObservedToolExecution {
   linearIssueId?: string;
   workspaceId?: string;
   workspacePaths?: string[];
+  webFetch?: ObservedWebFetchDecision;
+}
+
+/**
+ * Why a web_fetch call did or did not reuse the source cache. The owned
+ * backend counts transport hits below the cache, so a refetch red says only
+ * that the cache was missed -- never which of the three ways missed it: the
+ * model asking to refresh, the mission's cache policy, or the prompt the
+ * context carried when the freshness default was evaluated.
+ */
+interface ObservedWebFetchDecision {
+  url: string;
+  refreshArg?: boolean;
+  maxAgeArg?: number;
+  fromCache?: boolean;
+  cacheMaxAgeMs?: number;
+  fallbackUsed?: boolean;
+  promptSample: string;
 }
 
 const MAX_OBSERVED_TOOL_JOURNAL_EVENTS = 2_048;
@@ -3979,6 +4011,29 @@ async function installToolExecutionObserver(
                 call?.arguments?.toPath,
               );
             }
+            if (event.name === "web_fetch") {
+              const output = result?.output ?? result;
+              event.webFetch = {
+                url: boundedString(call?.arguments?.url, 300) ?? "",
+                ...(typeof call?.arguments?.refresh === "boolean"
+                  ? { refreshArg: call.arguments.refresh }
+                  : {}),
+                ...(typeof call?.arguments?.max_age_ms === "number"
+                  ? { maxAgeArg: call.arguments.max_age_ms }
+                  : {}),
+                ...(typeof output?.fromCache === "boolean"
+                  ? { fromCache: output.fromCache }
+                  : {}),
+                ...(typeof output?.cacheMaxAgeMs === "number"
+                  ? { cacheMaxAgeMs: output.cacheMaxAgeMs }
+                  : {}),
+                ...(output?.fallbackUsed === true
+                  ? { fallbackUsed: true }
+                  : {}),
+                promptSample:
+                  boundedString(context?.originalPrompt, 220) ?? "",
+              };
+            }
             return result;
           } finally {
             event.completedAt = new Date().toISOString();
@@ -4082,6 +4137,81 @@ async function installToolExecutionObserver(
     pluginId: NATIVE_CORE_PLUGIN_ID,
     repositoryFileMutationTools: [...REPOSITORY_FILE_MUTATION_TOOLS],
   });
+}
+
+/**
+ * Pair the owned backend's transport counters with the web_fetch tool calls
+ * that produced them.
+ *
+ * The counters sit below the source cache, so "33 transport hits for 4 owned
+ * URLs" is compatible with two different products: a model that called
+ * web_fetch 33 times and missed the cache every time, and a model that called
+ * it 8 times while something inside the tool fetched repeatedly. Only the
+ * per-call decision record separates them, and only a cache-bypass reason
+ * says which lever to move.
+ */
+async function attachPhaseWebFetchAttribution(
+  info: ReturnType<typeof test.info>,
+  phase: string,
+  page: Page,
+  journal: readonly ObservedToolExecution[],
+): Promise<void> {
+  // Runs from a `finally`, so it must never throw: a diagnostic that masks the
+  // failure it was meant to explain is worse than no diagnostic.
+  let metrics: { searchCalls: number; fetchCalls: number; fetchedUrls: string[] };
+  let observed: readonly ObservedToolExecution[];
+  try {
+    metrics = await readResearchBackendMetrics(page);
+    observed = await readToolExecutionObserver(page, journal);
+  } catch {
+    observed = journal;
+    metrics = { searchCalls: -1, fetchCalls: -1, fetchedUrls: [] };
+  }
+  const calls = observed.filter((event) => event.name === "web_fetch");
+  const decisions = calls.map((event) => ({
+    sequence: event.sequence,
+    ok: event.ok,
+    ...(event.webFetch ?? { url: "", promptSample: "" }),
+  }));
+  const served = decisions.filter((entry) => entry.fromCache === true).length;
+  const payload = {
+    version: 1,
+    phase,
+    transportHits: metrics.fetchCalls,
+    distinctTransportUrls: [...new Set(metrics.fetchedUrls)].length,
+    webFetchToolCalls: calls.length,
+    okWebFetchToolCalls: calls.filter((event) => event.ok).length,
+    servedFromCache: served,
+    modelRequestedRefresh: decisions.filter(
+      (entry) => entry.refreshArg === true,
+    ).length,
+    modelRequestedMaxAge: decisions.filter(
+      (entry) => typeof entry.maxAgeArg === "number",
+    ).length,
+    // A fallback call is the ladder's alternate_result provider, the second
+    // transport site: it bills a request even when the substitute is already
+    // stored, so it separates "the model asked again" from "the tool pulled
+    // again" in the transport count.
+    viaFallbackLadder: decisions.filter(
+      (entry) => entry.fallbackUsed === true,
+    ).length,
+    distinctPromptSamples: [
+      ...new Set(decisions.map((entry) => entry.promptSample)),
+    ],
+    decisions,
+  };
+  // eslint-disable-next-line no-console
+  console.log(
+    `[phase ${phase}] web_fetch attribution: transportHits=${payload.transportHits} toolCalls=${payload.webFetchToolCalls} servedFromCache=${payload.servedFromCache} modelRefresh=${payload.modelRequestedRefresh} viaFallback=${payload.viaFallbackLadder}`,
+  );
+  try {
+    await info.attach(`phase-${phase}-web-fetch-attribution.json`, {
+      contentType: "application/json",
+      body: Buffer.from(JSON.stringify(payload, null, 2), "utf8"),
+    });
+  } catch {
+    // An attachment that cannot be written must not replace the real failure.
+  }
 }
 
 async function readToolExecutionObserver(
