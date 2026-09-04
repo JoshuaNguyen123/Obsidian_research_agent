@@ -8,6 +8,7 @@ import {
   createSemanticIndexService,
   getSemanticIndexFreshness,
   MAX_LIVE_STALE_NOTES_PER_SEARCH,
+  MAX_STALE_REPORT_PATHS,
 } from "../src/embeddings/semanticIndex";
 import type { AgentSettings } from "../src/settings";
 import type {
@@ -258,4 +259,21 @@ test("the manifest is parsed once per file version, not once per search", async 
   await service.search({ query: "orchard", limit: 2 });
   await service.search({ query: "glacier", limit: 2 });
   assert.equal(reads, 1, "one parse for the first search; the next two reuse it");
+});
+
+test("a stale report names a bounded number of paths but counts every one", async () => {
+  // A vault past the index's file ceiling, or a big import before the next
+  // reindex, must not push thousands of paths into every search result.
+  const { vault, service } = await buildFixture();
+  for (let index = 0; index < MAX_STALE_REPORT_PATHS + 30; index += 1) {
+    vault.put(`Imported/new-${index}.md`, noteBody("orchard", `import ${index}`));
+  }
+  const result = await service.search({ query: "orchard apples", limit: 3 });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.indexFresh, false);
+  assert.equal(result.stale?.unindexedCount, MAX_STALE_REPORT_PATHS + 30);
+  assert.equal(result.stale?.unindexedPaths.length, MAX_STALE_REPORT_PATHS);
+  assert.equal(result.stale?.changedCount, 0);
+  // Indexed notes still rank; the unindexed ones simply are not there yet.
+  assert.equal(result.results[0]?.path, "Notes/orchard.md");
 });

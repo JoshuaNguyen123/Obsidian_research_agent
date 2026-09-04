@@ -60,6 +60,8 @@ export const MAX_LIVE_STALE_NOTES_PER_SEARCH = 3;
  */
 const STALE_MAJORITY_NOTE_FLOOR = 50;
 const STALE_MAJORITY_RATIO = 0.2;
+/** Paths named per category in a stale report; counts stay exact beyond it. */
+export const MAX_STALE_REPORT_PATHS = 25;
 export const SEMANTIC_INDEX_READ_CONCURRENCY = 8;
 const STOP_TERMS = new Set([
   "the",
@@ -544,9 +546,12 @@ class DefaultSemanticIndexService implements SemanticIndexService {
         ? {}
         : {
             stale: {
-              changedPaths: staleness.changedPaths,
-              missingPaths: staleness.missingPaths,
-              unindexedPaths: staleness.unindexedPaths,
+              changedPaths: staleness.changedPaths.slice(0, MAX_STALE_REPORT_PATHS),
+              missingPaths: staleness.missingPaths.slice(0, MAX_STALE_REPORT_PATHS),
+              unindexedPaths: staleness.unindexedPaths.slice(0, MAX_STALE_REPORT_PATHS),
+              changedCount: staleness.changedPaths.length,
+              missingCount: staleness.missingPaths.length,
+              unindexedCount: staleness.unindexedPaths.length,
               liveMergedPaths,
             } satisfies SemanticIndexStaleReportV1,
           }),
