@@ -63,7 +63,7 @@ export function evaluateTransformerBriefMarkdown(
     ),
     criterion(
       "importance_explained",
-      /\b(?:importance|impact|significance|advantages?|breakthrough|transformative|transformed|foundational|foundation|consequential|decisive|took over|why\b[\s\S]{0,100}\b(?:matter|changed|important|powerful|useful))\b/iu.test(markdown) &&
+      /\b(?:importance|impact|significance|advantages?|breakthrough|transformative|transformed|foundational|foundation|consequential|decisive|took over|why\b[\s\S]{0,100}\b(?:matters?|changed|important|powerful|useful))\b/iu.test(markdown) &&
         /\b(?:language models?|translation|vision|multimodal|parallel|scal(?:e|ing)|transfer learning)\b/iu.test(markdown),
       "importance claim and at least one concrete consequence must both be present",
     ),

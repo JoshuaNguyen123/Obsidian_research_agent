@@ -112,6 +112,31 @@ test("transformer relevance rejects a long structured brief on the wrong subject
   assert.equal(evaluateTransformerBriefMarkdown(markdown).passed, false);
 });
 
+test("transformer importance recognizes matters with a concrete consequence", () => {
+  const markdown = [
+    "## 4. Why the Transformer Matters",
+    "Every position is processed simultaneously, converting sequence modeling into dense matrix multiplications.",
+    "The same block stack supports transfer learning; vision and multimodal models use attention over token sequences.",
+  ].join("\n\n");
+  const importance = evaluateTransformerBriefMarkdown(markdown).criteria.find(
+    (item) => item.id === "importance_explained",
+  );
+
+  assert.equal(importance?.passed, true);
+});
+
+test("transformer importance still requires both an importance claim and a consequence", () => {
+  for (const markdown of [
+    "## Why the Transformer Matters\n\nThis architecture is remarkable and interesting.",
+    "## Architecture\n\nTokens pass through attention layers in parallel before translation output.",
+  ]) {
+    const importance = evaluateTransformerBriefMarkdown(markdown).criteria.find(
+      (item) => item.id === "importance_explained",
+    );
+    assert.equal(importance?.passed, false);
+  }
+});
+
 function transformerCanvas(): JsonCanvas {
   const labels = [
     "Input tokens",
