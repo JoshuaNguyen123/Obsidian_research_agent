@@ -8680,6 +8680,58 @@ test("note writes pay requested word-count proof before completing", async () =>
   assert.equal(vault.content.get("Current.md")?.trim().split(/\s+/u).length, 40);
 });
 
+test("completed ordered appends finalize without requesting a third streamed write", async () => {
+  const markerA = "E2E_MARKER_1788571939_ORDERED_A1";
+  const markerB = "E2E_MARKER_1788571939_ORDERED_B2";
+  const prompt = "Perform exactly two ordered durable appends to the current note, then finish. " +
+    `First append exactly one line containing ${markerA} and verify that write. ` +
+    `Then append exactly one separate line containing ${markerB} and verify that write. ` +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+  const vault = createRunnerVaultContext({ prompt, content: "Initial note\n" });
+  vault.context.settings = createRunnerSettings({ maxAgentSteps: 8 });
+  const calls: ModelToolCall[] = [];
+  const requests: ModelChatRequest[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const completions: any[] = [];
+  const { createMissionLedger, writeMissionLedger } = await import("../src/agent/missionLedger");
+  const runId = "run-interrupted-ordered-finalization";
+  const ledger = createMissionLedger({
+    runId, mission: prompt, route: "grounded_workflow",
+    loopBudget: { hardCap: 8, toolStepBudget: 6, finalizationReserve: 2,
+      expectedTools: ["append_to_current_file"], stopWhenSatisfied: true },
+  });
+  ledger.status = "blocked";
+  ledger.continuationCommand = `continue run ${runId}`;
+  ledger.nextActions = ["Complete the two remaining ordered appends."];
+  await writeMissionLedger(vault.context, ledger);
+  await runAgentMission({
+    prompt: `continue run ${runId}`,
+    modelClient: createClient({
+      chatRequests: requests,
+      chatResponders: [
+        () => responseWithToolCall("append_to_current_file", { text: markerA }),
+        () => responseWithToolCall("append_to_current_file", { text: markerB }),
+        () => responseWithContent(`Completed exactly two ordered appends: ${markerA}, then ${markerB}.`),
+      ],
+      streamResponders: [
+        () => responseWithContent(`Completed exactly two ordered appends: ${markerA}, then ${markerB}.`),
+      ],
+    }),
+    toolRegistry: createCollectingRegistry(calls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => { completions.push(event); },
+    },
+  });
+  assert.deepEqual(calls.map((call) => call.name), ["append_to_current_file", "append_to_current_file"]);
+  assert.equal((vault.content.get("Current.md")?.match(new RegExp(markerA, "gu")) ?? []).length, 1);
+  assert.equal((vault.content.get("Current.md")?.match(new RegExp(markerB, "gu")) ?? []).length, 1);
+  assert.deepEqual(traces.filter((event) => event.kind === "tool_rejected"), [], "host must not invent a third write after the two committed appends");
+  assert.equal(completions.at(-1)?.stopReason, "write_completed", JSON.stringify(completions));
+});
+
 test("installed catalog prompts survive real routing and scope resolution", async () => {
   const { OFFLINE_RESEARCH_CATALOG_PROBES } = await import("../e2e/fixtures/offlineExpandScenarios");
   for (const probe of OFFLINE_RESEARCH_CATALOG_PROBES) {

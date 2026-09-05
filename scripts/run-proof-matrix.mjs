@@ -851,6 +851,12 @@ const HARNESS_LOG_SIGNATURES = [
 /** Stable lane-owned product assertions that are precise enough to alarm. */
 const PRODUCT_LOG_SIGNATURES = [
   [
+    // This id is emitted only by the host's streamed finalizer, never by a
+    // model-authored tool call. Reproduced after two accepted ordered writes.
+    /proof-gated-writeback-\d+:plan-dependency-rejected/u,
+    "product:host_writeback_without_ready_task",
+  ],
+  [
     /product:resume_attempt_projection_lost\b/u,
     "product:resume_attempt_projection_lost",
   ],

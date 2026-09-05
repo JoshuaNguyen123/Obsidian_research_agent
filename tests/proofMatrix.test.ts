@@ -102,6 +102,20 @@ test("proof matrix model pin is explicit and rejects ambiguous tags", () => {
   assert.throws(() => resolveProofMatrixModel(["--model="]), /bounded exact model tag/u);
 });
 
+test("a host finalizer without a ready mutation task is a repeatable product alarm", () => {
+  const result = classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false,
+    logText: 'Error: {"id":"proof-gated-writeback-3:plan-dependency-rejected","toolName":"append_to_current_file","errorCode":"plan_dependency_violation"}\nExpected: 0\nReceived: 1',
+  });
+  assert.equal(result.failureClass, "product:host_writeback_without_ready_task");
+  const manifest = manifestWith([]);
+  assert.equal(registerProductFailure(manifest, result.failureClass), false);
+  assert.equal(registerProductFailure(manifest, result.failureClass), true);
+  const modelCall = classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false,
+    logText: 'Error: {"id":"run-1:2:0:append_to_current_file:plan-dependency-rejected","errorCode":"plan_dependency_violation"}',
+  });
+  assert.notEqual(modelCall.failureClass, result.failureClass, "model calls cannot inherit host attribution");
+});
+
 test("scorecard baseline detection reads records[].project, not array indices", () => {
   const baseline = {
     version: 1,

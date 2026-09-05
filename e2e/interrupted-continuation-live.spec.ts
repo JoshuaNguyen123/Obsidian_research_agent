@@ -257,6 +257,11 @@ test.describe("interrupted continuation", () => {
       });
       expect(toolOutcomes.coverage, toolOutcomeEvidence).toBe("complete");
       expect(toolOutcomes.succeededWithWork, toolOutcomeEvidence).toBe(2);
+      expect(
+        collectorDiagnostics.filter((event) =>
+          /^proof-gated-writeback-\d+:plan-dependency-rejected$/u.test(event.id ?? "")),
+        `product:host_writeback_without_ready_task — ${toolOutcomeEvidence}`,
+      ).toEqual([]);
       expect(toolOutcomes.failed, toolOutcomeEvidence).toBe(0);
       expect(toolOutcomes.vacuous, toolOutcomeEvidence).toBe(0);
       await recordDailyUseAcceptance(

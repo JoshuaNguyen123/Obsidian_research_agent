@@ -21859,6 +21859,7 @@ export async function runAgentMission({
       }
       if (
         streamingWritebackKind &&
+        hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind) &&
         pendingToolsBeforeStream.length > 0 &&
         step < stepLimit
       ) {
@@ -21873,6 +21874,9 @@ export async function runAgentMission({
       }
       if (
         streamingWritebackKind &&
+        // A completed write may still owe a final answer or verification.
+        // Keep those proofs payable without starting another note mutation.
+        hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind) &&
         (streamingWritebackKind !== "edit" || preparedStreamingSectionEdit)
       ) {
         const webFallbackSatisfiedForWriteback =
