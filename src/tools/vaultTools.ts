@@ -6,6 +6,7 @@ import {
   verifyPreparedActionFingerprint,
   withPreparedActionFingerprint,
   type ActionReceipt,
+  type ActionReconciliationResult,
   type JsonValue,
   type PreparedAction,
   type PreparedActionResult,
@@ -1103,7 +1104,7 @@ export const readResearchMemoryTool: AgentTool = {
 export const appendResearchMemoryTool: AgentTool = {
   name: "append_research_memory",
   description:
-    "Append durable topic memory to a markdown note under the configured research memory folder and update the plugin memory index.",
+    "Prepare and atomically append durable topic memory under the configured research memory folder, update its index, and return an authorized receipt with verified readback. Existing matching content is reported as a no-op.",
   parameters: {
     type: "object",
     required: ["topic", "text"],
@@ -1134,90 +1135,12 @@ export const appendResearchMemoryTool: AgentTool = {
     },
     additionalProperties: false,
   },
-  async execute(args, context) {
-    assertResearchMemoryEnabled(context);
-    const topic = getRequiredString(args, "topic").trim();
-    const text = getRequiredString(args, "text").trim();
-    if (!topic) {
-      throw new Error("append_research_memory requires a non-empty topic.");
-    }
-    if (!text) {
-      throw new Error("append_research_memory requires non-empty text.");
-    }
-
-    const keywords = getOptionalStringArray(args, "keywords");
-    const sourcePaths = getOptionalStringArray(args, "sourcePaths");
-    const sourceUrls = getOptionalStringArray(args, "sourceUrls");
-    const path = buildResearchMemoryPath(context, topic);
-    const contentHash = hashResearchMemoryText(text);
-    const existingIndexEntry = (context.getResearchMemoryIndex?.() ?? []).find(
-      (entry) => entry.path === path,
-    );
-    if (existingIndexEntry?.contentHash === contentHash) {
-      return {
-        path,
-        operation: "duplicate",
-        topic,
-        keywords: existingIndexEntry.keywords,
-        lastUpdated: existingIndexEntry.lastUpdated,
-        contentHash,
-        duplicate: true,
-        bytesWritten: 0,
-      };
-    }
-    await ensureParentFolder(context, path, true);
-    const now = context.now?.() ?? new Date();
-    const nowIso = now.toISOString();
-    const entryText = formatResearchMemoryAppend({
-      topic,
-      text,
-      keywords,
-      sourcePaths,
-      sourceUrls,
-      nowIso,
-    });
-    const file = context.app.vault.getFileByPath(path);
-    let operation: "create" | "append";
-
-    if (file) {
-      const current = await context.app.vault.read(file);
-      const prefix = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
-      await context.app.vault.modify(file, `${current}${prefix}${entryText}`);
-      operation = "append";
-    } else {
-      await context.app.vault.create(path, `# ${topic}\n\n${entryText}`);
-      operation = "create";
-    }
-
-    const nextIndex = upsertResearchMemoryIndexEntry(
-      context.getResearchMemoryIndex?.() ?? [],
-      {
-        topic,
-        path,
-        keywords,
-        lastUpdated: nowIso,
-        confidence: "high",
-        sourcePaths,
-        sourceUrls,
-        contentHash,
-        updateCount: (existingIndexEntry?.updateCount ?? 0) + 1,
-        targetId: existingIndexEntry?.targetId ?? topic,
-        verificationState: "unverified",
-      },
-    );
-    await context.setResearchMemoryIndex?.(nextIndex);
-
-    return {
-      path,
-      operation,
-      topic,
-      keywords,
-      lastUpdated: nowIso,
-      contentHash,
-      duplicate: false,
-      bytesWritten: getByteLength(entryText),
-    };
+  async execute() {
+    refuseUnpreparedVaultExecution("append_research_memory");
   },
+  prepare: prepareAppendResearchMemory,
+  executePrepared: executePreparedAppendResearchMemory,
+  reconcile: reconcileAppendResearchMemory,
 };
 
 export const reviewResearchMemoryTool: AgentTool = {
@@ -5317,11 +5240,14 @@ async function createVaultActionReceipt(input: {
   effects?: ActionReceipt["effects"];
   observedRevision?: string;
   readbackStatus?: ActionReceipt["readback"]["status"];
+  commitKind?: ActionReceipt["commitKind"];
+  reconciliationGrantId?: string;
 }): Promise<ActionReceipt> {
-  const grantId = input.context.authorizedAction!.grantId;
+  const grantId = input.context.authorizedAction?.grantId ?? input.reconciliationGrantId!;
+  const commitKind = input.commitKind ?? "committed";
   const receiptHash = await sha256Fingerprint({
     actionId: input.action.id,
-    commitKind: "committed",
+    commitKind,
     observedRevision: input.observedRevision ?? null,
   });
   return {
@@ -5339,7 +5265,7 @@ async function createVaultActionReceipt(input: {
     idempotencyKey: input.action.idempotencyKey,
     startedAt: input.startedAt,
     committedAt: input.committedAt,
-    commitKind: "committed",
+    commitKind,
     readback: {
       status: input.readbackStatus ?? "verified",
       checkedAt: input.committedAt,
@@ -5901,6 +5827,154 @@ async function executePreparedDeletePath(
       observedRevision,
     }),
   };
+}
+
+async function prepareAppendResearchMemory(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    assertResearchMemoryEnabled(context);
+    const topic = getRequiredString(args, "topic").trim();
+    const text = getRequiredString(args, "text").trim();
+    if (!topic || !text) throw new Error("append_research_memory requires non-empty topic and text.");
+    const path = buildResearchMemoryPath(context, topic);
+    const keywords = getOptionalStringArray(args, "keywords");
+    const sourcePaths = getOptionalStringArray(args, "sourcePaths");
+    sourcePaths.forEach((sourcePath) => assertSafeMarkdownPath(sourcePath));
+    const sourceUrls = getOptionalStringArray(args, "sourceUrls");
+    const nowIso = vaultNow(context).toISOString();
+    const entryText = formatResearchMemoryAppend({ topic, text, keywords, sourcePaths, sourceUrls, nowIso });
+    const file = context.app.vault.getFileByPath(path);
+    const current = file ? await context.app.vault.read(file) : null;
+    return { ok: true, action: await buildPreparedVaultAction({
+      context, toolName: "append_research_memory", targetPath: path,
+      normalizedArgs: { path, topic, text, keywords, sourcePaths, sourceUrls, nowIso, entryText,
+        contentHash: hashResearchMemoryText(text),
+        priorRevision: current === null ? null : await sha256Fingerprint(current),
+        alreadyPresent: current !== null && researchMemoryContentPresent(current, text),
+      },
+      preview: { summary: `Append durable research memory to ${path}.`, destination: path,
+        after: { topic, text }, warnings: [], outboundBytes: 0 },
+    }) };
+  } catch (error) {
+    return prepareVaultFailure(error);
+  }
+}
+
+/** Memory is content-deduplicated; a stale index alone never proves a no-op. */
+function researchMemoryContentPresent(current: string, text: string): boolean {
+  return `${current}\n`.includes(`\n\n${text}\n`);
+}
+
+function preparedResearchMemoryFields(action: PreparedAction) {
+  const args = action.normalizedArgs;
+  const path = requirePreparedString(args, "path");
+  assertSafeMarkdownPath(path);
+  if (path !== action.target.path || path !== action.target.id) {
+    throw new ToolExecutionError("invalid_prepared_action", "Research memory target differs from its sealed path.", { mutationState: "not_applied" });
+  }
+  return {
+    path, topic: requirePreparedString(args, "topic"), text: requirePreparedString(args, "text"),
+    entryText: requirePreparedString(args, "entryText"), nowIso: requirePreparedString(args, "nowIso"),
+    contentHash: requirePreparedString(args, "contentHash"), keywords: getOptionalStringArray(args, "keywords"),
+    sourcePaths: getOptionalStringArray(args, "sourcePaths"), sourceUrls: getOptionalStringArray(args, "sourceUrls"),
+  };
+}
+
+async function indexVerifiedResearchMemory(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<void> {
+  const entry = preparedResearchMemoryFields(action);
+  const index = context.getResearchMemoryIndex?.() ?? [];
+  const previous = index.find((row) => row.path === entry.path);
+  // The note is the source of truth. Repair only the derived index after
+  // readback; replay must not increment it twice or replace newer topic data.
+  if (previous?.contentHash === entry.contentHash ||
+      (previous && Date.parse(previous.lastUpdated) > Date.parse(entry.nowIso))) return;
+  await context.setResearchMemoryIndex?.(upsertResearchMemoryIndexEntry(index, {
+    topic: entry.topic, path: entry.path, keywords: entry.keywords, lastUpdated: entry.nowIso,
+    confidence: "high", sourcePaths: entry.sourcePaths, sourceUrls: entry.sourceUrls,
+    contentHash: entry.contentHash, updateCount: (previous?.updateCount ?? 0) + 1,
+    targetId: previous?.targetId ?? entry.topic, verificationState: "unverified",
+  }));
+}
+
+async function executePreparedAppendResearchMemory(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertVaultPreparedBinding("append_research_memory", action, context);
+  assertResearchMemoryEnabled(context);
+  const entry = preparedResearchMemoryFields(action);
+  const startedAt = vaultNow(context).toISOString();
+  await ensureParentFolder(context, entry.path, true);
+  let file = context.app.vault.getFileByPath(entry.path);
+  let bytesWritten = 0;
+  let operation = "append";
+  if (!file) {
+    const initial = `# ${entry.topic}\n\n${entry.entryText}`;
+    // Obsidian create is no-overwrite. A racing creator is left intact; a
+    // retry prepares the now-existing note and uses its atomic transform.
+    file = await context.app.vault.create(entry.path, initial);
+    bytesWritten = getByteLength(initial);
+    operation = "create";
+  } else {
+    await transformVaultFile(context, file, (current) => {
+      if (researchMemoryContentPresent(current, entry.text)) return current;
+      const append = `${current.length && !current.endsWith("\n") ? "\n" : ""}${entry.entryText}`;
+      bytesWritten = getByteLength(append);
+      return `${current}${append}`;
+    });
+  }
+  const observed = await context.app.vault.read(file);
+  if (!researchMemoryContentPresent(observed, entry.text)) {
+    throw new ToolExecutionError("vault_readback_failed", "Research memory content changed before readback; preserve the edit and reconcile before replay.", { mutationState: "may_have_applied" });
+  }
+  await indexVerifiedResearchMemory(action, context);
+  const duplicate = bytesWritten === 0;
+  const committedAt = vaultNow(context).toISOString();
+  const indexed = context.getResearchMemoryIndex?.().find((row) => row.path === entry.path);
+  return {
+    mutationState: "applied",
+    output: { path: entry.path, operation: duplicate ? "duplicate" : operation,
+      topic: entry.topic, keywords: indexed?.keywords ?? entry.keywords,
+      lastUpdated: indexed?.lastUpdated ?? entry.nowIso, contentHash: entry.contentHash, duplicate, bytesWritten },
+    receipt: await createVaultActionReceipt({ action, context, operation: "append",
+      message: duplicate ? `Verified existing research memory in ${entry.path}.` : `Saved research memory in ${entry.path}.`,
+      startedAt, committedAt, commitKind: duplicate ? "no_op" : "committed",
+      observedRevision: await sha256Fingerprint(observed), effects: { bytesWritten, affectedCount: duplicate ? 0 : 1, changed: !duplicate },
+    }),
+  };
+}
+
+async function reconcileAppendResearchMemory(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<ActionReconciliationResult> {
+  assertResearchMemoryEnabled(context);
+  const entry = preparedResearchMemoryFields(action);
+  const file = context.app.vault.getFileByPath(entry.path);
+  const current = file ? await context.app.vault.read(file) : null;
+  const observedRevision = current === null ? null : await sha256Fingerprint(current);
+  // A new append needs the exact sealed entry. An already-satisfied request
+  // instead retains its explicit no-op proof; an index hash never substitutes.
+  if (current !== null && (current.includes(entry.entryText) ||
+      (action.normalizedArgs.alreadyPresent === true && researchMemoryContentPresent(current, entry.text)))) {
+    await indexVerifiedResearchMemory(action, context);
+    const checkedAt = vaultNow(context).toISOString();
+    return { outcome: "committed", message: "Exact research memory readback reconciled; the note was not mutated.",
+      receipt: await createVaultActionReceipt({ action, context, operation: "append",
+        message: `Reconciled research memory in ${entry.path} from exact readback.`,
+        startedAt: checkedAt, committedAt: checkedAt, commitKind: "reconciled",
+        reconciliationGrantId: "reconciled-exact-readback", observedRevision: observedRevision!,
+      }),
+    };
+  }
+  return observedRevision === action.normalizedArgs.priorRevision
+    ? { outcome: "not_applied", message: "Memory note still matches the sealed pre-write state; no replay was performed." }
+    : { outcome: "still_uncertain", message: "Memory note changed and the exact sealed content is absent; preserve user edits and review before replay." };
 }
 
 async function prepareDeleteResearchMemoryEntry(

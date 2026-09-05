@@ -308,10 +308,70 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
       }, { notePath: harness.notePath, marker: harness.marker.replace(/[^a-z0-9]/giu, "") });
       expect(scheduleProof).toEqual({ launches: 1, isolatedHistory: true, persistedBeforeLaunch: true,
         firstFailure: "offline_dispatch_fault", sameOccurrence: true, retryFailure: "scheduled_preflight_blocked", retryPersisted: true });
+      const memoryProof = await harness.page.evaluate(async ({ marker }) => {
+        const app = (window as any).app;
+        const plugin = app.plugins.plugins["agentic-researcher"];
+        const registry = plugin.createToolRegistry();
+        const context = plugin.createToolExecutionContext("Save this to research memory.");
+        context.settings = { ...context.settings, researchMemoryEnabled: true };
+        context.runId = `offline-memory-${marker}`;
+        context.operationId = "memory-append";
+        const call = { name: "append_research_memory", arguments: { topic: `Owned memory ${marker}`, text: `MEMORY_${marker}` } };
+        const denied = await registry.execute(call, context);
+        const prepared = await registry.prepare(call, context);
+        if (!prepared.ok) throw new Error(JSON.stringify(prepared));
+        const action = prepared.action;
+        const path = action.target.path;
+        const parent = path.slice(0, path.lastIndexOf("/"));
+        if (!app.vault.getFolderByPath(parent)) await app.vault.createFolder(parent);
+        await app.vault.create(path, "Original user content\n");
+        const process = app.vault.process.bind(app.vault);
+        app.vault.process = async (file: any, transform: (text: string) => string) => {
+          if (file.path === path) {
+            app.vault.process = process;
+            await process(file, (current: string) => `${current}Intervening user edit\n`);
+          }
+          return process(file, transform);
+        };
+        const authority = { preparedActionId: action.id, payloadFingerprint: action.payloadFingerprint, grantId: "offline-owned-memory-approval" };
+        context.setResearchMemoryIndex = async () => { throw new Error("Injected crash after note mutation, before index persistence"); };
+        try {
+          const failed = await registry.executePrepared(action, context, authority);
+          const written = await app.vault.read(app.vault.getFileByPath(path));
+          return { action, authority, written, failed: !failed.ok,
+            unpreparedRejected: denied.error?.code === "prepared_action_required",
+            preservedEdit: written.startsWith("Original user content\nIntervening user edit\n") };
+        } finally { app.vault.process = process; }
+      }, { marker: harness.marker.replace(/[^a-z0-9]/giu, "") });
+      expect(memoryProof.unpreparedRejected).toBe(true);
+      expect(memoryProof.failed).toBe(true);
+      expect(memoryProof.preservedEdit).toBe(true);
+      // Recreate the installed runtime, losing all process-local dedupe state.
+      await harness.relaunch();
+      const memoryRecovery = await harness.page.evaluate(async ({ action, authority, written }) => {
+        const app = (window as any).app;
+        const plugin = app.plugins.plugins["agentic-researcher"];
+        const registry = plugin.createToolRegistry();
+        const context = plugin.createToolExecutionContext("Save this to research memory.");
+        context.settings = { ...context.settings, researchMemoryEnabled: true };
+        context.runId = action.runId;
+        context.authorizedAction = authority;
+        const reconciled = await registry.reconcile(action, context);
+        const replay = await registry.executePrepared(action, context, authority);
+        const current = await app.vault.read(app.vault.getFileByPath(action.target.path));
+        const index = context.getResearchMemoryIndex?.() ?? [];
+        return { outcome: reconciled.outcome, commitKind: reconciled.receipt?.commitKind,
+          readback: reconciled.receipt?.readback?.status, replayKind: replay.receipt?.commitKind,
+          bytesWritten: replay.receipt?.effects?.bytesWritten,
+          unchanged: current === written, indexed: index.some((entry: any) => entry.path === action.target.path) };
+      }, memoryProof);
+      expect(memoryRecovery).toEqual({ outcome: "committed", commitKind: "reconciled", readback: "verified",
+        replayKind: "no_op", bytesWritten: 0, unchanged: true, indexed: true });
       probeAttempt.status = "passed";
       probeAttempt.failureClass = "none";
       probeAttempt.observations = { sourceHits: result.sourceHits, searchExtraHits: result.searchExtraHits,
-        citationStatus: result.citationStatus, conflictCode: result.conflictCode, unboundRejected: result.unboundRejected, scheduleProof };
+        citationStatus: result.citationStatus, conflictCode: result.conflictCode, unboundRejected: result.unboundRejected, scheduleProof,
+        memory: { unpreparedRejected: memoryProof.unpreparedRejected, preservedEdit: memoryProof.preservedEdit, ...memoryRecovery } };
     } catch (error) {
       probeAttempt.failureDetail = error instanceof Error ? error.message : String(error);
       throw error;

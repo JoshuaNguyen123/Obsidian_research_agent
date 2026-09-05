@@ -2878,7 +2878,7 @@ test("research memory tools write markdown source and update index", async () =>
     memoryIndex = entries;
   };
 
-  const append = await registry.execute(
+  const append = await executeAuthorizedPrepared(registry,
     {
       name: "append_research_memory",
       arguments: {
@@ -2933,7 +2933,7 @@ test("research memory tools write markdown source and update index", async () =>
   assert.equal(matches[0].path, "Agent Memory/Research/renaissance-research.md");
   assert.equal(matches[0].found, true);
 
-  const duplicate = await registry.execute(
+  const duplicate = await executeAuthorizedPrepared(registry,
     {
       name: "append_research_memory",
       arguments: {
@@ -3074,7 +3074,7 @@ test("research memory write tolerates an already existing memory folder", async 
     }
   };
 
-  const result = await registry.execute(
+  const result = await executeAuthorizedPrepared(registry,
     {
       name: "append_research_memory",
       arguments: {

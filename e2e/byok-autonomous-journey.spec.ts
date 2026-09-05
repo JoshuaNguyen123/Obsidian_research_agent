@@ -1869,6 +1869,24 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       }).then(() => test.info().attach("byok-failure-evidence", {
         contentType: "application/json", path: evidencePath,
       })).catch((error) => cleanupErrors.push(`Failure evidence: ${safeExternalCleanupError(error)}`));
+      // This Node journal survives renderer restarts. Preserve it before
+      // cleanup even when product acceptance passed but an authority proof
+      // failed. Completed registry events are partial coverage, not a claim
+      // to include runner policy refusals or calls still in flight.
+      const journalPath = test.info().outputPath("byok-tool-observer-evidence.json");
+      await preserveFailureEvidence({
+        file: journalPath,
+        metadata: { scenarioId: "BYOK-01", model: harness.config.model,
+          coverage: "completed_registry_events_only",
+          capped: observedToolJournal.length >= MAX_OBSERVED_TOOL_JOURNAL_EVENTS,
+          observedCompleted: observedToolJournal.length,
+          observedFailed: observedToolJournal.filter((event) => !event.ok).length,
+          events: observedToolJournal.map((event) => ({ ...event })),
+        },
+        read: () => preCleanupPage ? readToolExecutionObserver(preCleanupPage, observedToolJournal) : Promise.resolve(null),
+      }).then(() => test.info().attach("byok-tool-observer-evidence", {
+        contentType: "application/json", path: journalPath,
+      })).catch((error) => cleanupErrors.push(`Tool journal evidence: ${safeExternalCleanupError(error)}`));
       // Owned-process relaunch destroys the renderer's collector. Preserve its
       // current fold before that boundary; afterEach merges it with later arms.
       if (preCleanupPage) await harvestToolCallCollector(preCleanupPage);
@@ -1937,8 +1955,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       if (
         phaseBSubmitted &&
         primaryError !== null &&
-        !phaseBDiagnosticAnnotated &&
-        !isPassingMissionScorecardLike(snapshot?.lastMissionScorecard)
+        !phaseBDiagnosticAnnotated
       ) {
         annotatePhaseBProductionDiagnostic(
           test.info(),

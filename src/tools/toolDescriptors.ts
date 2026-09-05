@@ -164,7 +164,13 @@ export function descriptorFor(toolName: string): ToolDescriptor {
     return legacyMutationDescriptor(toolName, "create");
   }
   if (APPEND_TOOLS.has(toolName)) {
-    return legacyMutationDescriptor(toolName, "append");
+    const descriptor = legacyMutationDescriptor(toolName, "append");
+    if (toolName === "append_research_memory") {
+      descriptor.execution.preparation = "required";
+      descriptor.durability.readback = "required";
+      descriptor.durability.reconciliation = "required";
+    }
+    return descriptor;
   }
   if (UPDATE_TOOLS.has(toolName)) {
     return legacyMutationDescriptor(

@@ -245,7 +245,10 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
   if (
     descriptor.effect !== "read" &&
     ctx.researchPhase?.researchBearing &&
-    !ctx.researchPhase.writeToolsAllowed
+    !ctx.researchPhase.writeToolsAllowed &&
+    // Keep the existing memory-only gather exception when this tool enters
+    // prepared execution. Scope, exact grants and expiry are still checked.
+    descriptor.name !== "append_research_memory"
   ) {
     return block(
       `Mutations are blocked during research ${ctx.researchPhase.phase} phase.`,
