@@ -1046,6 +1046,24 @@ test("run coordinator retains one receipt when a continuation re-emits durable p
   });
 
   assert.equal(coordinator.getSnapshot().lastReceipts.length, 1);
+  assert.equal(coordinator.getSnapshot().lastReceipts[0].id, "receipt-1");
+});
+
+test("run coordinator retains distinct legacy appends with identical display text", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    for (const fingerprint of ["a", "b"]) {
+      events.onReceipt?.({
+        toolName: "append_to_current_file", operation: "append", path: "Notes/Result.md",
+        message: "append Notes/Result.md", bytesWritten: 24,
+        readback: { status: "verified", checkedAt: "2026-09-04T22:00:00.000Z",
+          observedFingerprint: `sha256:${fingerprint.repeat(64)}` },
+      });
+    }
+    events.onRunComplete?.({ step: 2, maxSteps: 3, stopReason: "final" });
+  });
+  assert.equal(coordinator.getSnapshot().lastReceipts.length, 2,
+    "different read-back states are different effects even when paths, sizes and messages match");
 });
 
 test("a rejected concurrent start cannot tap or persist the active run's events", async () => {

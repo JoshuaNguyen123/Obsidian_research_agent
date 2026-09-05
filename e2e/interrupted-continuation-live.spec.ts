@@ -73,6 +73,19 @@ test.describe("interrupted continuation", () => {
           };
         }, NATIVE_CORE_PLUGIN_ID);
 
+      const readRunDiagnostics = () => harness!.page.evaluate((pluginId) => {
+        const snapshot = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId]?.getMissionRunSnapshot?.();
+        return (snapshot?.diagnosticAttestations ?? [])
+          .filter((item: any) =>
+            /^(?:agent-step-response-|mission-graph-tool-frontier-|ordered-current-note-append-frontier-projection-)/u.test(item?.id ?? "") ||
+            /:(?:graph-)?rejected$/u.test(item?.id ?? ""))
+          .map((item: any) => ({
+            id: item.id, kind: item.kind, step: item.step,
+            toolName: item.toolName, message: item.message, errorCode: item.errorCode,
+          }));
+      }, NATIVE_CORE_PLUGIN_ID);
+
       // Capture the live run identity before interrupting anything.
       let runId: string | null = null;
       await expect
@@ -127,6 +140,7 @@ test.describe("interrupted continuation", () => {
       }
 
       // Kill the plugin mid-flight and resume the same run.
+      const interruptedDiagnostics = await readRunDiagnostics();
       await harness.restartCorePlugin();
       const postRestartNote = await readFile(harness.noteFilePath, "utf8");
       const postRestartHasA = postRestartNote.includes(markerA);
@@ -151,6 +165,11 @@ test.describe("interrupted continuation", () => {
         allowVerifiedNoModelResume: true,
       });
       const progress = harness.readProgressCounters();
+      // Capture before receipt/acceptance assertions so failures retain both
+      // coordinator scopes. These projections never contain tool arguments.
+      const toolOutcomes = await peekToolCallCollector(harness.page);
+      const collectorDiagnostics = await peekToolCallCollectorDiagnosticsV1(harness.page);
+      const resumedDiagnostics = await readRunDiagnostics();
       const safeState = JSON.stringify({
         interruptWindow,
         requestedRootRunId: runId,
@@ -159,12 +178,17 @@ test.describe("interrupted continuation", () => {
         complete: snapshot.lastComplete,
         acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
         receipts: snapshot.lastReceipts.map((receipt: any) => ({
+          id: receipt.id,
           operation: receipt.operation,
           toolName: receipt.toolName,
           hasReadback: Boolean(receipt.readback),
         })),
         providerUsage: snapshot.providerUsage,
         totalModelCalls: progress.modelCalls,
+        toolOutcomes,
+        collectorDiagnostics,
+        interruptedDiagnostics,
+        resumedDiagnostics,
       });
 
       // The ordered append graph is authority-complete. Resume must expose
@@ -186,7 +210,12 @@ test.describe("interrupted continuation", () => {
       const appendReceipts = snapshot.lastReceipts.filter(
         (receipt: any) => receipt.operation === "append",
       );
-      expect(appendReceipts.length, safeState).toBe(2);
+      expect(appendReceipts.length,
+        `${toolOutcomes.succeededWithWork === 2 ? "product:completed_append_receipt_missing — " : ""}${safeState}`,
+      ).toBe(2);
+      expect(new Set(appendReceipts.map((receipt: any) => receipt.id)).size, safeState).toBe(2);
+      expect(appendReceipts.every((receipt: any) => typeof receipt.id === "string" && receipt.id.length > 0), safeState).toBe(true);
+      await expect(harness.page.locator(".agentic-researcher-receipt[data-operation-id]"), safeState).toHaveCount(2);
       expect(
         appendReceipts.every(
           (receipt: any) =>
@@ -211,9 +240,6 @@ test.describe("interrupted continuation", () => {
       // A green end state is not enough: the pre-fix run reached both markers
       // through one successful append after four rejected calls. Require two
       // real write successes and zero failures across both restart segments.
-      const toolOutcomes = await peekToolCallCollector(harness.page);
-      const collectorDiagnostics =
-        await peekToolCallCollectorDiagnosticsV1(harness.page);
       const toolOutcomeEvidence = JSON.stringify({
         interruptWindow,
         toolOutcomes,

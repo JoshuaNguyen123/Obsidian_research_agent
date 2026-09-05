@@ -9,6 +9,7 @@ import type {
   AgentRunReceipt,
   AgentRunStopReason,
 } from "../AgentRunner";
+import { sameReceiptIdentity } from "./receiptIdentity";
 import {
   mergeModelUsageAggregatesV1,
   normalizeModelUsageAggregateV1,
@@ -747,12 +748,13 @@ export class RunCoordinator {
       this.runId = this.runId ?? snapshot?.runId ?? null;
     } else if (key === "onReceipt") {
       const receipt = args[0] as AgentRunReceipt | undefined;
-      if (
-        receipt &&
-        !this.lastReceipts.some((existing) =>
-          sameRetainedReceiptIdentity(existing, receipt),
-        )
-      ) {
+      const retained = receipt && this.lastReceipts.find((existing) =>
+        sameReceiptIdentity(existing, receipt),
+      );
+      if (retained && receipt) {
+        // A replay can enrich a legacy receipt with its durable id.
+        Object.assign(retained, receipt);
+      } else if (receipt) {
         this.lastReceipts.push({ ...receipt });
         if (this.lastReceipts.length > MAX_RETAINED_RUN_RECEIPTS) {
           this.lastReceipts.splice(
@@ -1021,24 +1023,6 @@ function sanitizeTerminalDiagnostic(value: string, maxChars: number): string {
     .replace(/[\r\n\t]+/gu, " ")
     .trim()
     .slice(0, maxChars);
-}
-
-function sameRetainedReceiptIdentity(
-  left: AgentRunReceipt,
-  right: AgentRunReceipt,
-): boolean {
-  if (left.id && right.id) {
-    return left.id === right.id;
-  }
-  return (
-    left.toolName === right.toolName &&
-    left.operation === right.operation &&
-    left.path === right.path &&
-    left.toPath === right.toPath &&
-    left.resource?.system === right.resource?.system &&
-    left.resource?.id === right.resource?.id &&
-    left.message === right.message
-  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

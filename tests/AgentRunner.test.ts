@@ -8692,6 +8692,7 @@ test("completed ordered appends finalize without requesting a third streamed wri
   const calls: ModelToolCall[] = [];
   const requests: ModelChatRequest[] = [];
   const traces: AgentTraceEvent[] = [];
+  const receipts: AgentRunReceipt[] = [];
   const completions: any[] = [];
   const { createMissionLedger, writeMissionLedger } = await import("../src/agent/missionLedger");
   const runId = "run-interrupted-ordered-finalization";
@@ -8722,10 +8723,14 @@ test("completed ordered appends finalize without requesting a third streamed wri
     enableStreaming: true,
     events: {
       onTrace: (event) => traces.push(event),
+      onReceipt: (receipt) => { receipts.push(receipt); },
       onRunComplete: (event) => { completions.push(event); },
     },
   });
   assert.deepEqual(calls.map((call) => call.name), ["append_to_current_file", "append_to_current_file"]);
+  assert.equal(receipts.length, 2);
+  assert.equal(new Set(receipts.map((receipt) => receipt.id)).size, 2);
+  assert.ok(receipts.every((receipt) => receipt.id?.startsWith(`${receipt.runId}:`) && receipt.id.endsWith(":append_to_current_file")));
   assert.equal((vault.content.get("Current.md")?.match(new RegExp(markerA, "gu")) ?? []).length, 1);
   assert.equal((vault.content.get("Current.md")?.match(new RegExp(markerB, "gu")) ?? []).length, 1);
   assert.deepEqual(traces.filter((event) => event.kind === "tool_rejected"), [], "host must not invent a third write after the two committed appends");

@@ -5,6 +5,7 @@ import {
   setIcon,
 } from "obsidian";
 import { renderSafeAssistantMarkdownV1 } from "./ui/safeAssistantMarkdown";
+import { sameReceiptIdentity } from "./agent/receiptIdentity";
 import { projectConversationMessageForDisplayV1 } from "./ui/conversationDisplay";
 import type { AgentConversationMessage } from "./conversationHistory";
 import type AgenticResearcherPlugin from "../main";
@@ -339,7 +340,7 @@ export class AgentView extends ItemView {
   private readonly assistantRenderGate = new LatestRenderGate<HTMLElement>();
   private readonly traceRowEls = new Map<string, HTMLElement>();
   private readonly approvalCardEls = new Map<string, HTMLElement>();
-  private readonly receiptKeys = new Set<string>();
+  private readonly displayedReceipts: AgentRunReceipt[] = [];
   private readonly dismissedResumeRunIds = new Set<string>();
   private readonly runArtifactLinks: MissionReceiptArtifactLinkV1[] = [];
   private readonly runLinearIssueIds: string[] = [];
@@ -555,7 +556,7 @@ export class AgentView extends ItemView {
       // config or receipt DOM.
       this.runConfig = null;
       this.missionSubmittedSinceOpen = false;
-      this.receiptKeys.clear();
+      this.displayedReceipts.length = 0;
       this.setSectionPlaceholder(this.receiptsEl, "No receipts yet.");
     }
     this.missionGraphProjection = snapshot.lastMissionGraph
@@ -717,7 +718,7 @@ export class AgentView extends ItemView {
     this.chatMessageEls.clear();
     this.traceRowEls.clear();
     this.approvalCardEls.clear();
-    this.receiptKeys.clear();
+    this.displayedReceipts.length = 0;
     this.chatLoaderEl = null;
     this.chatLoaderTextEl = null;
     this.lifecycleStageStripEl = null;
@@ -2368,7 +2369,7 @@ export class AgentView extends ItemView {
     this.toolTimelineOrdinal = 0;
     this.traceRowEls.clear();
     this.approvalCardEls.clear();
-    this.receiptKeys.clear();
+    this.displayedReceipts.length = 0;
     this.runArtifactLinks.length = 0;
     this.runLinearIssueIds.length = 0;
     this.runValidationShas.length = 0;
@@ -3351,17 +3352,19 @@ export class AgentView extends ItemView {
       return;
     }
 
-    const receiptKey = this.getReceiptKey(receipt);
-    if (this.receiptKeys.has(receiptKey)) {
+    const displayed = this.displayedReceipts.find((existing) =>
+      sameReceiptIdentity(existing, receipt),
+    );
+    if (displayed) {
+      Object.assign(displayed, receipt);
       return;
     }
-    this.receiptKeys.add(receiptKey);
-    while (this.receiptKeys.size > MAX_RECEIPT_ROWS) {
-      const oldest = this.receiptKeys.values().next().value as string | undefined;
-      if (!oldest) {
-        break;
-      }
-      this.receiptKeys.delete(oldest);
+    this.displayedReceipts.push({ ...receipt });
+    if (this.displayedReceipts.length > MAX_RECEIPT_ROWS) {
+      this.displayedReceipts.splice(
+        0,
+        this.displayedReceipts.length - MAX_RECEIPT_ROWS,
+      );
     }
     this.clearPlaceholder(this.receiptsEl);
 
@@ -3387,6 +3390,7 @@ export class AgentView extends ItemView {
       },
     });
     receiptEl.dataset.receiptId = stableReceiptId;
+    if (receipt.id) receiptEl.dataset.operationId = receipt.id;
     const receiptRunId = receipt.runId?.trim() || this.runConfig?.runId?.trim() || "";
     if (receiptRunId) {
       receiptEl.dataset.runId = receiptRunId;
@@ -3572,21 +3576,6 @@ export class AgentView extends ItemView {
     ) {
       this.runValidationShas.push(validationFingerprint);
     }
-  }
-
-  private getReceiptKey(receipt: AgentRunReceipt): string {
-    return [
-      receipt.runId ?? this.runConfig?.runId ?? "",
-      receipt.toolName,
-      receipt.operation,
-      receipt.path ?? "",
-      receipt.toPath ?? "",
-      receipt.backupPath ?? "",
-      receipt.resource
-        ? `${receipt.resource.system}:${receipt.resource.resourceType}:${receipt.resource.id}`
-        : "",
-      receipt.message,
-    ].join("|");
   }
 
   private appendMetric(event: AgentRunMetricEvent) {

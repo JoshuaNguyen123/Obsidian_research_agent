@@ -116,6 +116,16 @@ test("a host finalizer without a ready mutation task is a repeatable product ala
   assert.notEqual(modelCall.failureClass, result.failureClass, "model calls cannot inherit host attribution");
 });
 
+test("two completed writes with a missing receipt raise a product alarm", () => {
+  const result = classifyAttemptOutcome({ exitCode: 1, summary: null, summaryFresh: false,
+    logText: "Error: product:completed_append_receipt_missing — two successful appends; expected 2 receipts, received 1",
+  });
+  assert.equal(result.failureClass, "product:completed_append_receipt_missing");
+  const manifest = manifestWith([]);
+  assert.equal(registerProductFailure(manifest, result.failureClass), false);
+  assert.equal(registerProductFailure(manifest, result.failureClass), true);
+});
+
 test("scorecard baseline detection reads records[].project, not array indices", () => {
   const baseline = {
     version: 1,

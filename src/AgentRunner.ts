@@ -1,4 +1,5 @@
 import { isRateLimitModelError } from "./model/retry";
+import { sameReceiptIdentity } from "./agent/receiptIdentity";
 import type {
   ModelChatRequest,
   ModelChatResponse,
@@ -7493,7 +7494,7 @@ export async function runAgentMission({
         continue;
       }
       const alreadyRestored = writeReceipts.some(
-        (existing) => sameAgentRunReceiptIdentity(existing, restoredReceipt),
+        (existing) => sameReceiptIdentity(existing, restoredReceipt),
       );
       if (!alreadyRestored) {
         writeReceipts.push(restoredReceipt);
@@ -8176,6 +8177,8 @@ export async function runAgentMission({
           },
         });
       }
+      receipt.id ??= operationId;
+      receipt.runId ??= runId;
       if (activeRecord) {
         const appliedRecord = transitionOperationJournalRecord(
           activeRecord,
@@ -16309,6 +16312,10 @@ export async function runAgentMission({
         toolDescriptor,
       );
       if (receipt) {
+        // Reuse the journal's operation identity; equal labels/byte counts do
+        // not make distinct writes the same receipt. Canonical ids stay intact.
+        receipt.id ??= operationId;
+        receipt.runId ??= runId;
         updatePinnedCurrentNotePathFromReceipt(receipt, toolEventBase.id);
         writeReceipts.push(receipt);
         events.onReceipt?.(receipt);
@@ -34693,24 +34700,6 @@ export function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
 function hasExplicitCodeWebResearchIntent(prompt: string): boolean {
   return /\b(web|internet|online|search\s+the\s+web|look\s+up|browse|sources?|citations?|cited|cite|urls?|news|up[-\s]?to[-\s]?date|fact[-\s]?check)\b/i.test(
     prompt,
-  );
-}
-
-function sameAgentRunReceiptIdentity(
-  left: AgentRunReceipt,
-  right: AgentRunReceipt,
-): boolean {
-  if (left.id && right.id) {
-    return left.id === right.id;
-  }
-  return (
-    left.toolName === right.toolName &&
-    left.operation === right.operation &&
-    left.path === right.path &&
-    left.toPath === right.toPath &&
-    left.resource?.system === right.resource?.system &&
-    left.resource?.id === right.resource?.id &&
-    left.message === right.message
   );
 }
 
