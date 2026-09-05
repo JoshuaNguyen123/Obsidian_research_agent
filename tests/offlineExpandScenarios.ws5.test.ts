@@ -11,6 +11,7 @@ import {
 // @ts-ignore The exclusive runner is an intentionally unbundled Node ESM script.
 import { PLAYWRIGHT_PROJECTS, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
 import {
+  OFFLINE_CITATION_REPAIR_SCENARIO,
   OFFLINE_EXPAND_SCENARIOS,
   OFFLINE_RESEARCH_CATALOG_PROBES,
   assertOfflineExpandCatalogComplete,
@@ -50,7 +51,7 @@ function green(scenarioId: string) {
   };
 }
 
-test("offline-expand catalog covers the four new scenario ids and no others", () => {
+test("offline-expand catalog covers four write scenarios and citation repair without omissions", () => {
   assertOfflineExpandCatalogComplete();
   assert.deepEqual(
     [...OFFLINE_EXPAND_SCENARIO_IDS],
@@ -59,9 +60,12 @@ test("offline-expand catalog covers the four new scenario ids and no others", ()
       "page_clear_then_write",
       "word_count_correction",
       "title_rename_plus_body",
+      "citation_finalization_repair",
     ],
   );
   assert.equal(OFFLINE_EXPAND_SCENARIOS.length, 4);
+  assert.equal(OFFLINE_CITATION_REPAIR_SCENARIO.id, "citation_finalization_repair");
+  assert.match(OFFLINE_CITATION_REPAIR_SCENARIO.prompt, /passage citations.*\{marker\}/u);
   for (const scenario of OFFLINE_EXPAND_SCENARIOS) {
     assert.ok(OFFLINE_REQUIRED_SCENARIOS.includes(scenario.id), scenario.id);
     assert.match(
@@ -71,7 +75,7 @@ test("offline-expand catalog covers the four new scenario ids and no others", ()
   }
 });
 
-test("the attempt validator accepts the four expand ids and rejects unknown ones", () => {
+test("the attempt validator accepts every expand id and rejects unknown ones", () => {
   for (const id of OFFLINE_EXPAND_SCENARIO_IDS) {
     assert.equal(validateOfflineApplicationAttempt(green(id)).scenarioId, id);
   }
@@ -96,7 +100,7 @@ test("exclusive runner gates expand scenarios only when that project ran", () =>
     requiredRepetitions: 1,
   });
   assert.equal(release.passed, true);
-  assert.equal(release.expectedAttempts, 4);
+  assert.equal(release.expectedAttempts, 5);
 });
 
 test("offline-expand is registered in the three-way lane contract", () => {

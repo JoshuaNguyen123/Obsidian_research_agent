@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 
 import { createOfflineAgentBackendV1 } from "./offlineAgentBackend";
 import {
+  OFFLINE_CITATION_REPAIR_SCENARIO,
   OFFLINE_EXPAND_SCENARIOS,
   OFFLINE_RESEARCH_CATALOG_PROBES,
   renderOfflineExpandPrompt,
@@ -320,6 +321,118 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
       await close(bridge);
     }
   });
+});
+
+test("OFFLINE-11 verifies a corrected citation draft before requesting more tools", async () => {
+  test.skip(process.env.E2E_PLAYWRIGHT_LANE !== "offline-expand" || process.env.E2E_OFFLINE_AI !== "1", "Requires the offline-expand lane.");
+  test.setTimeout(240_000);
+  const backend = createOfflineAgentBackendV1();
+  const { createAgentBridgeServer } = await importNativeEsm<{
+    createAgentBridgeServer(options: { token: string; backend: typeof backend }): Server;
+  }>(pathToFileURL(path.resolve("scripts", "agent-bridge.mjs")).href);
+  const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
+  let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+  const startedAt = Date.now();
+  const cloudModelRequests: string[] = [];
+  const identity = await readOfflineBuildIdentity();
+  const scenario = OFFLINE_CITATION_REPAIR_SCENARIO;
+  const attempt = beginOfflineAttempt(identity, scenario.id);
+  await saveOfflineAttempt(attempt);
+  try {
+    await listen(bridge, 7331);
+    harness = await startRealAiHarness("offline-citation-repair", {
+      baseUrl: OFFLINE_BASE_URL, model: "offline-scripted-v1",
+      missionTimeoutMs: 120_000, firstChunkTimeoutMs: 30_000, completionTimeoutMs: 120_000,
+    }, {
+      modelRouterEnabled: false, modelRouterMode: "off", semanticIndexEnabled: false,
+      // Leave tool budget outside the finalization reserve so the corrected
+      // candidate actually exercises admission past citation-gather steering.
+      researchMemoryEnabled: false, enableStreaming: false, maxAgentSteps: 8,
+    });
+    harness.page.on("request", (request) => {
+      if (isKnownCloudModelUrl(request.url())) cloudModelRequests.push(request.url());
+    });
+    await observeOfflineTools(harness.page);
+    await harness.seedNote(harness.notePath, "Preserve this note during cited chat.", true);
+    await harness.page.evaluate(({ fixtureId }) => {
+      const plugin = (window as any).app.plugins.plugins["agentic-researcher"];
+      const original = plugin.createToolExecutionContext;
+      const urls = [`https://one.example/mcp/${fixtureId}`, `https://two.example/mcp/${fixtureId}`];
+      const content = "MCP servers expose tools and resources through a standard protocol. Clients discover the approved server capabilities.";
+      const alternateContent = "Clients discover the approved server capabilities. MCP servers expose tools and resources through a standard protocol. Discovery lets clients inspect available capabilities before invoking them.";
+      plugin.createToolExecutionContext = function (...args: any[]) {
+        const context = original.apply(this, args);
+        const transport = context.httpTransport;
+        context.httpTransport = async (request: any) => {
+          if (request.url.endsWith("/web_search")) return {
+            status: 200, headers: {}, json: { results: urls.map((url) => ({ url, title: "MCP capabilities", snippet: content })) },
+          };
+          if (request.url.endsWith("/web_fetch")) {
+            const url = JSON.parse(String(request.body)).url;
+            if (!urls.includes(url)) throw new Error("Unowned citation fixture URL.");
+            return { status: 200, headers: {}, json: { url, title: "MCP capabilities", content: url === urls[0] ? content : alternateContent, links: [] } };
+          }
+          return transport(request);
+        };
+        return context;
+      };
+    }, { fixtureId: attempt.attemptId });
+    const marker = `${scenario.markerPrefix}_${attempt.attemptId.replace(/-/gu, "")}`;
+    await harness.submitMission(scenario.prompt.replace("{marker}", marker), { timeoutMs: 120_000 });
+    const snapshot = await harness.attestProductionRun();
+    const traceProof = await harness.page.evaluate(() => {
+      const plugin = (window as any).app.plugins.plugins["agentic-researcher"];
+      const traces: any[] = [];
+      const unsubscribe = plugin.subscribeMissionEvents({ onTrace: (event: any) => traces.push(event) }, { replay: true });
+      unsubscribe();
+      return {
+        rejected: traces.find((event) => /^final-output-rejected-/u.test(event.id))?.outputPreview,
+        admitted: traces.some((event) => /^citation-repair-candidate-admitted-/u.test(event.id)),
+        decisions: traces.filter((event) => /^(?:final-output-rejected-|citation-repair-candidate-|agent-step-response-|loop-decision-)/u.test(event.id))
+          .map((event) => ({ id: event.id, step: event.step, message: event.message, outputPreview: event.outputPreview })).slice(-20),
+      };
+    });
+    // Keep observed product acceptance and the draft sequence even when a
+    // later harness assertion fails; the attempt itself still remains failed.
+    Object.assign(attempt, {
+      acceptanceStatus: snapshot.lastMissionLedger?.acceptance?.status ?? null,
+      scorecardAcceptancePassed: snapshot.lastMissionScorecard?.acceptancePassed ?? null,
+      traceProof, backend: backend.snapshot(),
+      ...await readOfflineToolCounts(harness.page),
+    });
+    await saveOfflineAttempt(attempt);
+    expect(snapshot.lastComplete?.stopReason).toBe("final");
+    expect(snapshot.lastMissionLedger?.acceptance?.status).toBe("pass");
+    expect(snapshot.lastMissionScorecard?.acceptancePassed).toBe(true);
+    expect(snapshot.lastReceipts).toEqual([]);
+    expect(cloudModelRequests).toEqual([]);
+    expect(backend.snapshot().citationRepair).toEqual({ unverifiedDrafts: 1, correctedDrafts: 1 });
+    expect(backend.snapshot().citationCriticReviews).toBe(1);
+    expect(await harness.readNote()).toBe("Preserve this note during cited chat.");
+    expect(traceProof.rejected?.candidateExcerpt).toContain("MCP servers expose tools");
+    expect(traceProof.rejected?.missing.length).toBeGreaterThan(0);
+    expect(traceProof.admitted).toBe(true);
+    Object.assign(attempt, {
+      status: "passed", acceptanceStatus: "pass", scorecardAcceptancePassed: true,
+      failureClass: "none", failureDetail: "", model: "offline-scripted-v1",
+      ...await readOfflineToolCounts(harness.page), traceProof,
+      backend: backend.snapshot(), cloudRequestCount: cloudModelRequests.length,
+      scorecardTotal: snapshot.lastMissionScorecard.total,
+      scorecardDimensions: snapshot.lastMissionScorecard.dimensions.map((dimension: any) => ({ id: dimension.id, score: dimension.score })),
+      artifactReadbacks: ["note_unchanged", "rejected_draft_retained", "corrected_draft_verified"],
+      safetyViolationCount: 0, duplicateMutationCount: 0,
+      mutationsPerformed: 0, mutationsWithReceipts: 0, mutationEventsObserved: 0,
+      modelCalls: backend.snapshot().requestCount, providerWaitMs: 0,
+    });
+  } catch (error) {
+    attempt.failureDetail = error instanceof Error ? error.message : String(error);
+    throw error;
+  } finally {
+    attempt.durationMs = Date.now() - startedAt;
+    if (harness) Object.assign(attempt, await readOfflineToolCounts(harness.page));
+    await saveOfflineAttempt(attempt);
+    try { await harness?.close(); } finally { await close(bridge); }
+  }
 });
 
 async function runExpandScenario(input: {

@@ -21132,6 +21132,30 @@ export async function runAgentMission({
         );
       const citationGatherStillOffered =
         citationGatherCompanionToolNames().length > 0;
+      // Gather may be offered for the previous rejected draft. A replacement
+      // that already pays that proof must reach normal final verification,
+      // rather than being discarded by tool-only steering for stale debt.
+      const citationRepairAcceptance =
+        citationGatherStillOffered &&
+        hasRenderableAssistantContent(sanitizedStepResponseContent)
+          ? requireAcceptedPassageCitationCoverage(
+              evaluateCurrentAcceptance(sanitizedStepResponseContent),
+              sanitizedStepResponseContent,
+              getAcceptedMissionPassageIds(missionEvidenceRecords, researchPlan),
+              researchPlan,
+              activeIntentPrompt,
+            )
+          : null;
+      const citationRepairFinalNode =
+        (missionGraphSession?.graph ?? missionGraph)?.nodes.final;
+      const citationRepairReady = citationRepairAcceptance !== null && (
+        citationRepairAcceptance.status === "pass" ||
+        missionAcceptanceHasOnlyTerminalFinalizationDebt(
+          citationRepairAcceptance,
+          citationRepairFinalNode?.status === "ready" &&
+            citationRepairFinalNode.allowedTools.length === 0,
+        )
+      );
       const proseCannotFinishMission = proseAnswerCannotFinishMissionV1({
         route: runPlan.route,
         successfulToolCount: successfulToolNames.length,
@@ -21141,8 +21165,24 @@ export async function runAgentMission({
         missingRequiredWebToolCount:
           missingRequiredWebToolsBeforeToolUse.length,
         requiredVaultTraversalStillMissing,
-        citationGatherStillUnpaid: citationGatherStillOffered,
+        citationGatherStillUnpaid:
+          citationGatherStillOffered && !citationRepairReady,
       });
+      if (citationRepairReady && !proseCannotFinishMission) {
+        unchangedNoToolResponseCount = 0;
+        lastNoToolFrontierFingerprint = "";
+        consecutiveNoProgressSteps = 0;
+        events.onTrace?.({
+          id: `citation-repair-candidate-admitted-${step}`,
+          kind: "verification",
+          step,
+          message: "The replacement draft pays citation debt; continuing final verification.",
+          outputPreview: {
+            missing: citationRepairAcceptance!.missing,
+            payloadFingerprint: hashOperationInput(sanitizedStepResponseContent),
+          },
+        });
+      }
       if (
         proseCannotFinishMission &&
         stepTools.length > 0 &&
@@ -22706,6 +22746,19 @@ export async function runAgentMission({
           !candidateOnlyFinalProjectionDebt
         ) {
           const rejectedCandidate = lastFinalOutput;
+          events.onTrace?.({
+            id: `final-output-rejected-${step}`,
+            kind: "verification",
+            step,
+            message: "Final draft rejected by verification; retained for diagnosis only.",
+            outputPreview: {
+              missing: candidateAcceptance.missing,
+              candidateExcerpt: rejectedCandidate.slice(0, 24_000),
+              candidateCharacters: rejectedCandidate.length,
+              truncated: rejectedCandidate.length > 24_000,
+              payloadFingerprint: hashOperationInput(rejectedCandidate),
+            },
+          });
           if (
             unpaidProofRequiresCitationGatherV1(candidateAcceptance.missing)
           ) {

@@ -8,6 +8,7 @@ export const OFFLINE_EXPAND_SCENARIO_IDS = Object.freeze([
   "page_clear_then_write",
   "word_count_correction",
   "title_rename_plus_body",
+  "citation_finalization_repair",
 ]);
 
 export const OFFLINE_REQUIRED_SCENARIOS = Object.freeze([

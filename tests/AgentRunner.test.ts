@@ -12987,6 +12987,71 @@ test("broad vault mutation without a target removes write tools and records no w
   assert.equal(vault.content.get("Current.md"), "Do not overwrite this note.");
 });
 
+for (const validCitation of [true, false]) {
+test(validCitation
+  ? "a corrected cited final draft is verified before stale citation debt requests more tools"
+  : "a final draft with fabricated citations still owes proof after an earlier rejection", async () => {
+  const prompt =
+    "Search the web for MCP servers and fetch exactly two independent sources. Answer in chat with passage citations.";
+  const vault = createRunnerVaultContext({ prompt, content: "Leave this note unchanged." });
+  vault.context.settings.modelRouterMode = "off";
+  vault.context.settings.researchMemoryEnabled = false;
+  const urls = ["https://one.example/mcp", "https://two.example/mcp"];
+  const sourceText = "MCP servers expose tools and resources through a standard protocol. Clients discover the approved server capabilities.";
+  vault.context.httpTransport = async (request) => ({
+    status: 200,
+    headers: {},
+    json: request.url.endsWith("/web_search")
+      ? { results: urls.map((url) => ({ url, title: "MCP capabilities", snippet: sourceText })) }
+      : { url: JSON.parse(String(request.body)).url, title: "MCP capabilities", content: sourceText, links: [] },
+  });
+  const requests: ModelChatRequest[] = [];
+  const calls: ModelToolCall[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const statuses: string[] = [];
+  const traces: AgentTraceEvent[] = [];
+  let correctedDraft = "";
+  let correctedDrafts = 0;
+  const correct = (request: ModelChatRequest) => {
+    const ids = getPassageCitationIds(request);
+    assert.ok(ids.length >= 2, "the corrected candidate must use both persisted sources");
+    correctedDraft = `MCP servers expose tools and resources through a standard protocol [${validCitation ? ids[0] : "source:fabricated:passage:0-118"}]. Clients discover the approved server capabilities [${ids[1]}].`;
+    correctedDrafts += 1;
+    return responseWithContent(correctedDraft);
+  };
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests: requests,
+      chatResponders: [
+        () => responseWithToolCall("web_search", { query: "MCP servers" }),
+        () => responseWithContent(sourceText),
+        correct, correct, correct,
+      ],
+    }),
+    toolRegistry: createCollectingRegistry(calls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 5,
+    events: {
+      onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+  if (validCitation) {
+    assert.equal(completions.at(-1)?.stopReason, "final", JSON.stringify({ completions, statuses }));
+    assert.equal(correctedDrafts, 1, "a grounded replacement must not be discarded by the old draft's tool-only steering");
+  } else {
+    assert.notEqual(completions.at(-1)?.stopReason, "final");
+    assert.ok(correctedDrafts > 0);
+  }
+  assert.equal(traces.some((event) => event.id.startsWith("citation-repair-candidate-admitted-")), validCitation);
+  assert.deepEqual(calls.map((call) => call.name), ["web_search", "web_fetch", "web_fetch"]);
+  assert.equal(vault.content.get("Current.md"), "Leave this note unchanged.");
+});
+}
+
 test("BYOK research keeps ambient note authority host-bound while pathless publication can create its deterministic note", async () => {
   const prompt = [
     "Deeply research a small dependency-free Python CRDT library for marker E2E_BYOK_SCOPE_UNIT.",

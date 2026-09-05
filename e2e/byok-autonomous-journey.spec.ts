@@ -65,6 +65,8 @@ import {
 import {
   recordDailyUseAcceptance,
 } from "./fixtures/dailyUseAcceptance";
+import { harvestToolCallCollector, recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+import { preserveFailureEvidence } from "./fixtures/preserveFailureEvidence";
 import type { MissionScorecardV1 } from "../src/agent/missionScorecard";
 import { runScopedProviderUsageV1 } from "../src/agent/runCoordinator";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
@@ -104,6 +106,7 @@ const MAX_PHASE_B_DIAGNOSTIC_GRAPH_NONTERMINAL = 32;
 const MAX_PHASE_B_DIAGNOSTIC_TOOLS = 32;
 const MAX_PHASE_B_DIAGNOSTIC_RECEIPTS = 32;
 const execFileAsync = promisify(execFile);
+recordToolCallOutcomesAfterEach();
 
 const CODE_MUTATION_TOOLS = new Set([
   "code_workspace_create",
@@ -1842,6 +1845,25 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       } catch {
         preCleanupPage = undefined;
       }
+    }
+    if (primaryError !== null && harness) {
+      const progress = harness.readProgressCounters();
+      await recordDailyUseAcceptance(test.info(), "BYOK-01", observations.snapshot(), {
+        modelCalls: progress.modelCalls,
+        continuations: progress.continuations,
+        approvals: progress.approvals,
+      }).catch(() => undefined);
+      const evidencePath = test.info().outputPath("byok-failure-evidence.json");
+      await preserveFailureEvidence({
+        file: evidencePath,
+        metadata: { scenarioId: "BYOK-01", outcome: "failed", model: harness.config.model, progress },
+        read: () => preCleanupPage ? readByokFailureEvidence(preCleanupPage) : Promise.resolve(null),
+      }).then(() => test.info().attach("byok-failure-evidence", {
+        contentType: "application/json", path: evidencePath,
+      })).catch((error) => cleanupErrors.push(`Failure evidence: ${safeExternalCleanupError(error)}`));
+      // Owned-process relaunch destroys the renderer's collector. Preserve its
+      // current fold before that boundary; afterEach merges it with later arms.
+      if (preCleanupPage) await harvestToolCallCollector(preCleanupPage);
     }
     // Any failed live assertion may leave the coordinator active. Relaunching
     // the same owned process first aborts that execution boundary, then hydrates
@@ -4956,6 +4978,51 @@ function requireNestedApproval(
   expect(approval.approvalId).toBeTruthy();
   expect(approval.approvalFingerprint).toBe(approval.payloadFingerprint);
   return approval;
+}
+
+async function readByokFailureEvidence(page: Page): Promise<unknown> {
+  return page.evaluate(async ({ pluginId }) => {
+    const app = (window as typeof window & { app?: any }).app;
+    const plugin = app?.plugins?.plugins?.[pluginId];
+    const snapshot = plugin?.getMissionRunSnapshot?.();
+    if (!snapshot) return null;
+    const traces: any[] = [];
+    const unsubscribe = plugin.subscribeMissionEvents?.({
+      onTrace: (event: any) => {
+        if (/^(?:final-output-rejected-|citation-repair-candidate-|agent-step-response-|mission-acceptance-|loop-decision-)/u.test(event.id ?? "")) {
+          traces.push({ id: event.id, kind: event.kind, step: event.step, message: event.message, outputPreview: event.outputPreview });
+        }
+      },
+    }, { replay: true });
+    unsubscribe?.();
+    let runtime: any = null;
+    let runtimeReadStatus = "unavailable";
+    const runId = String(snapshot.runId ?? "");
+    if (/^run-[a-zA-Z0-9.-]{1,180}$/u.test(runId)) {
+      const file = app.vault.getFileByPath(`Agent Runs/${runId}.md`);
+      if (file && file.stat.size <= 1_000_000) {
+        const text = await app.vault.read(file);
+        const json = /## Runtime Snapshot\r?\n```json\r?\n([\s\S]*?)\r?\n```/u.exec(text)?.[1];
+        const parsed = json ? JSON.parse(json) : null;
+        if (parsed?.runId === runId) {
+          runtime = { runId, lineage: parsed.lineage, acceptance: parsed.acceptance, claimLedger: parsed.claimLedger, claimPassages: parsed.claimPassages };
+          runtimeReadStatus = "captured";
+        }
+      } else if (file) runtimeReadStatus = "oversized";
+    }
+    return {
+      runId, isRunning: snapshot.isRunning,
+      droppedEventCount: snapshot.droppedEventCount,
+      providerUsageScopeId: snapshot.providerUsageScopeId,
+      providerUsage: snapshot.providerUsage,
+      providerUsageInherited: snapshot.providerUsageInherited,
+      acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
+      lastComplete: snapshot.lastComplete,
+      receipts: snapshot.lastReceipts,
+      graph: snapshot.lastMissionGraph,
+      traces: traces.slice(-40), runtimeReadStatus, runtime,
+    };
+  }, { pluginId: NATIVE_CORE_PLUGIN_ID });
 }
 
 async function readRawRunSnapshot(page: Page): Promise<any> {

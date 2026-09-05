@@ -12,6 +12,12 @@ export interface OfflineAgentBackendMetricsV1 {
   /** Union of tool names the installed plugin offered across requests. */
   offeredToolNames: string[];
   offeredToolsByRequest: string[][];
+  citationRepair?: { unverifiedDrafts: number; correctedDrafts: number };
+  citationCriticReviews?: number;
+  citationRepairRequests?: {
+    offeredTools: string[];
+    lastMessages: { role: unknown; name: unknown; content: string }[];
+  }[];
 }
 
 export interface OfflineAgentBackendV1 extends AgentBackend {
@@ -72,6 +78,46 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
 
     if (request.response_format !== undefined) {
       return { content: "{}" };
+    }
+
+    if (transcript.includes("OFFLINE_CITATION_REPAIR")) {
+      const instructions = messages.filter(isRecord)
+        .filter((message) => message.role === "system")
+        .map((message) => typeof message.content === "string" ? message.content : "").join("\n");
+      if (instructions.includes("This request already contains explicit evidence intent.")) {
+        return { content: JSON.stringify({ mode: "deep_web", sourceFloor: 2, rationale: "The fixture explicitly requests two public sources." }) };
+      }
+      if (instructions.includes("Judge how much research effort a mission truly deserves.")) {
+        return { content: JSON.stringify({ tier: "standard", risk: "low", freshness: "none", rationale: "Two bounded source passages and a short cited answer." }) };
+      }
+      if (instructions.includes("You are an independent critic reviewing a completed research mission.")) {
+        metrics.citationCriticReviews = (metrics.citationCriticReviews ?? 0) + 1;
+        return { content: JSON.stringify({ verdict: "pass", missing: [], summary: "The corrected fixture text matches the two fixed source passages." }) };
+      }
+      metrics.citationRepairRequests ??= [];
+      metrics.citationRepairRequests.push({
+        offeredTools: [...toolNames],
+        lastMessages: messages.filter(isRecord).slice(-2).map((message) => ({
+          role: message.role, name: message.name,
+          content: typeof message.content === "string" ? message.content.slice(-1_200) : "",
+        })),
+      });
+      metrics.citationRepairRequests = metrics.citationRepairRequests.slice(-12);
+      if (!toolNameObserved(messages, "web_search")) {
+        metrics.emittedToolCalls += 1;
+        const marker = transcript.match(/OFFLINE_CITATION_REPAIR_[a-f0-9]{32}/u)?.[0];
+        return { toolCalls: [{ name: "web_search", arguments: { query: `MCP servers ${marker ?? "OFFLINE_CITATION_REPAIR"}` } }], finishReason: "tool_calls" };
+      }
+      const ids = [...new Set(transcript.match(/source:[a-z0-9]+:passage:\d+-\d+/giu) ?? [])];
+      if (ids.length < 2) throw new Error("Citation repair fixture requires both persisted source passages.");
+      metrics.citationRepair ??= { unverifiedDrafts: 0, correctedDrafts: 0 };
+      const reportScope = "\n\n## Limitations\nThis brief is limited to the cited source passages.\n\n## Confidence\nHigh confidence in these passage-supported statements.";
+      if (metrics.citationRepair.unverifiedDrafts === 0) {
+        metrics.citationRepair.unverifiedDrafts += 1;
+        return { content: `MCP servers expose tools and resources through a standard protocol. Clients discover the approved server capabilities.${reportScope}` };
+      }
+      metrics.citationRepair.correctedDrafts += 1;
+      return { content: `MCP servers expose tools and resources through a standard protocol [${ids[0]}]. Clients discover the approved server capabilities [${ids[1]}].${reportScope}` };
     }
 
     const catalogMarker = transcript.match(/OFFLINE_CATALOG_[A-Z0-9_]+/u)?.[0];

@@ -66,6 +66,14 @@ export const OFFLINE_EXPAND_SCENARIOS: readonly OfflineExpandScenarioV1[] = [
   },
 ];
 
+// This read-only mission has its own transport fixture and assertions; the
+// four write scenarios above continue through their shared mutation driver.
+export const OFFLINE_CITATION_REPAIR_SCENARIO = {
+  id: "citation_finalization_repair",
+  markerPrefix: "OFFLINE_CITATION_REPAIR",
+  prompt: "Search the web for MCP servers and fetch exactly two independent sources. Answer in chat with passage citations. Mission marker {marker}.",
+} as const;
+
 export function renderOfflineExpandPrompt(
   scenario: OfflineExpandScenarioV1,
   marker: string,
@@ -74,13 +82,17 @@ export function renderOfflineExpandPrompt(
 }
 
 export function assertOfflineExpandCatalogComplete(): void {
-  const defined = new Set(OFFLINE_EXPAND_SCENARIOS.map((item) => item.id));
+  const ids = [
+    ...OFFLINE_EXPAND_SCENARIOS.map((item) => item.id),
+    OFFLINE_CITATION_REPAIR_SCENARIO.id,
+  ];
+  const defined = new Set(ids);
   for (const id of OFFLINE_EXPAND_SCENARIO_IDS) {
     if (!defined.has(id)) {
       throw new Error(`offline-expand catalog is missing scenario ${id}`);
     }
   }
-  if (defined.size !== OFFLINE_EXPAND_SCENARIO_IDS.length) {
+  if (defined.size !== ids.length || defined.size !== OFFLINE_EXPAND_SCENARIO_IDS.length) {
     throw new Error("offline-expand catalog has extra or duplicate scenario ids");
   }
 }
