@@ -12987,15 +12987,20 @@ test("broad vault mutation without a target removes write tools and records no w
   assert.equal(vault.content.get("Current.md"), "Do not overwrite this note.");
 });
 
-for (const validCitation of [true, false]) {
-test(validCitation
+for (const memoryEnabled of [false, true]) for (const validCitation of [true, false]) {
+test((validCitation
   ? "a corrected cited final draft is verified before stale citation debt requests more tools"
-  : "a final draft with fabricated citations still owes proof after an earlier rejection", async () => {
+  : "a final draft with fabricated citations still owes proof after an earlier rejection") +
+  (memoryEnabled ? " with host research memory enabled" : ""), async () => {
   const prompt =
-    "Search the web for MCP servers and fetch exactly two independent sources. Answer in chat with passage citations.";
+    `Search the web for MCP servers and fetch exactly two independent sources. ${memoryEnabled ? "Summarize the sources" : "Answer in chat"} with passage citations.`;
   const vault = createRunnerVaultContext({ prompt, content: "Leave this note unchanged." });
   vault.context.settings.modelRouterMode = "off";
-  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.settings.researchMemoryEnabled = memoryEnabled;
+  if (memoryEnabled) {
+    vault.context.settings.workingMode = "custom";
+    vault.context.settings.outputProfile = "chat_first";
+  }
   const urls = ["https://one.example/mcp", "https://two.example/mcp"];
   const sourceText = "MCP servers expose tools and resources through a standard protocol. Clients discover the approved server capabilities.";
   vault.context.httpTransport = async (request) => ({
@@ -13040,14 +13045,16 @@ test(validCitation
     },
   });
   if (validCitation) {
-    assert.equal(completions.at(-1)?.stopReason, "final", JSON.stringify({ completions, statuses }));
+    assert.equal(completions.at(-1)?.stopReason, "final", JSON.stringify({ completions, statuses,
+      held: traces.filter((event) => event.id.startsWith("citation-repair-candidate-held-")) }));
     assert.equal(correctedDrafts, 1, "a grounded replacement must not be discarded by the old draft's tool-only steering");
   } else {
     assert.notEqual(completions.at(-1)?.stopReason, "final");
     assert.ok(correctedDrafts > 0);
   }
   assert.equal(traces.some((event) => event.id.startsWith("citation-repair-candidate-admitted-")), validCitation);
-  assert.deepEqual(calls.map((call) => call.name), ["web_search", "web_fetch", "web_fetch"]);
+  assert.deepEqual(calls.filter((call) => call.name !== "append_research_memory").map((call) => call.name), ["web_search", "web_fetch", "web_fetch"]);
+  assert.equal(calls.filter((call) => call.name === "append_research_memory").length, memoryEnabled && validCitation ? 1 : 0);
   assert.equal(vault.content.get("Current.md"), "Leave this note unchanged.");
 });
 }
@@ -24757,18 +24764,34 @@ function createCodeV2RoutingRegistry(): ToolRegistry {
   };
 }
 
-test("accepted web research runs auto-save durable research memory", async () => {
+for (const memoryCase of [
+  { name: "auto-save durable research memory", enabled: true, suffix: "", expectedSave: true },
+  { name: "respect disabled research memory", enabled: false, suffix: "", expectedSave: false },
+  { name: "respect an explicit no-note-write instruction", enabled: true, suffix: " Do not write or edit any note.", expectedSave: false },
+]) test(`accepted web research runs ${memoryCase.name}`, async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const executedCalls: ModelToolCall[] = [];
   const prompt =
-    "Search the web for the Ollama structured outputs documentation and summarize it.";
+    `Search the web for the Ollama structured outputs documentation and summarize it.${memoryCase.suffix}`;
   const vault = createRunnerVaultContext({
     prompt,
     now: new Date("2026-07-07T12:00:00.000Z"),
   });
+  const memoryRegistry = createDefaultToolRegistry();
+  vault.context.settings.researchMemoryEnabled = memoryCase.enabled;
+  const accepted: string[] = [];
+  let memoryResult: ToolExecutionResult | undefined;
 
   const registry: ToolRegistry = {
+    getDescriptor: (name) => memoryRegistry.getDescriptor!(name),
+    prepare: (call, context) => memoryRegistry.prepare!(call, context),
+    executePrepared: async (action, context, authority) => {
+      assert.equal(action.toolName, "append_research_memory");
+      executedCalls.push({ name: action.toolName, arguments: action.normalizedArgs });
+      memoryResult = await memoryRegistry.executePrepared!(action, context, authority);
+      return memoryResult;
+    },
     getDefinitions: () =>
       ["read_current_file", "web_search", "web_fetch", "append_research_memory"].map(
         (name) => ({
@@ -24808,18 +24831,7 @@ test("accepted web research runs auto-save durable research memory", async () =>
           },
         };
       }
-      if (call.name === "append_research_memory") {
-        return {
-          ok: true,
-          toolName: call.name,
-          output: {
-            path: "Agent Research Memory/latest-local-llm-routers.md",
-            operation: "create",
-            topic: call.arguments.topic,
-            bytesWritten: 256,
-          },
-        };
-      }
+      assert.notEqual(call.name, "append_research_memory", "memory must use the installed prepared contract");
       return {
         ok: true,
         toolName: call.name,
@@ -24857,13 +24869,28 @@ test("accepted web research runs auto-save durable research memory", async () =>
     enableStreaming: false,
     events: {
       onStatus: (message) => statuses.push(message),
+      onTrace: (trace) => {
+        if (trace.kind === "acceptance") accepted.push(String((trace.outputPreview as { status?: string })?.status));
+      },
     },
   });
 
   const memoryCall = executedCalls.find(
     (call) => call.name === "append_research_memory",
   );
-  assert.ok(memoryCall, "accepted research run must auto-save research memory");
+  assert.ok(accepted.includes("pass"), `research must actually pass: ${JSON.stringify(statuses)}`);
+  assert.ok(executedCalls.some((call) => call.name === "web_fetch"));
+  if (!memoryCase.expectedSave) {
+    assert.equal(memoryCall, undefined);
+    assert.equal(memoryResult, undefined);
+    assert.equal([...vault.content.keys()].some((path) => /\/Research\//u.test(path)), false);
+    return;
+  }
+  assert.ok(memoryCall, `accepted research run must auto-save research memory: ${JSON.stringify(statuses)}`);
+  assert.equal(memoryResult?.ok, true, JSON.stringify(memoryResult));
+  assert.equal(memoryResult?.receipt?.readback.status, "verified");
+  assert.match(memoryResult?.receipt?.grantId ?? "", /^grant:write-autonomy:/u);
+  assert.ok(vault.content.get(memoryResult!.receipt!.resource.path!)?.includes("Mission:"));
   assert.ok(String(memoryCall.arguments.topic).length > 0);
   assert.match(String(memoryCall.arguments.text), /Mission:/);
   assert.match(String(memoryCall.arguments.text), /https:\/\/example\.com\/routers/);

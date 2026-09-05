@@ -112,6 +112,14 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
       const ids = [...new Set(transcript.match(/source:[a-z0-9]+:passage:\d+-\d+/giu) ?? [])];
       if (ids.length < 2) throw new Error("Citation repair fixture requires both persisted source passages.");
       metrics.citationRepair ??= { unverifiedDrafts: 0, correctedDrafts: 0 };
+      if (transcript.includes("OFFLINE_MEMORY_SAVE") && metrics.citationRepair.correctedDrafts > 0 &&
+          toolNames.has("append_research_memory") && !toolNameObserved(messages, "append_research_memory")) {
+        metrics.emittedToolCalls += 1;
+        const marker = transcript.match(/OFFLINE_CITATION_REPAIR_[a-f0-9]{32}/u)?.[0];
+        return { toolCalls: [{ name: "append_research_memory", arguments: {
+          topic: `Offline MCP memory ${marker}`, text: "MCP servers expose tools and resources through a standard protocol.",
+        } }], finishReason: "tool_calls" };
+      }
       const reportScope = "\n\n## Limitations\nThis brief is limited to the cited source passages.\n\n## Confidence\nHigh confidence in these passage-supported statements.";
       if (metrics.citationRepair.unverifiedDrafts === 0) {
         metrics.citationRepair.unverifiedDrafts += 1;

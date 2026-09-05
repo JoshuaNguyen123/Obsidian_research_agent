@@ -1123,6 +1123,7 @@ import { planMissionGraphV3 } from "./agent/missionGraphPlanner";
 import {
   MissionGraphSession,
   createFileCollisionRepairRefusalCodeV1,
+  isCanonicalHostPostAcceptanceNode,
   resolveMissionGraphEvidenceKind,
   type MissionGraphToolExecution,
 } from "./agent/missionGraphSession";
@@ -3630,6 +3631,18 @@ export async function runAgentMission({
         streamingWritebackKind,
         getActiveRoutedCodeToolNames(),
       );
+  // The host's opt-in memory save must have the same eligibility at planning,
+  // prepared authorization and final extraction. This grants no general vault
+  // write scope: execution below additionally requires its canonical graph node.
+  const canPlanResearchMemorySave = () =>
+    runToolContext.settings?.researchMemoryEnabled === true &&
+    !researchMemoryAutoSaveRefused() &&
+    !isProofBoundProviderLifecycleWithoutPublicWeb({
+      prompt: activeIntentPrompt, missionIntent, requiredToolNames: requiredWriteTools,
+    }) &&
+    hasWebSearchIntent(activeIntentPrompt) &&
+    !missionIntent.requireWriteCompletion &&
+    knownToolNames.has("append_research_memory");
   ({
     streamingWritebackKind,
     directCurrentNoteWritebackKind,
@@ -4968,12 +4981,7 @@ export async function runAgentMission({
             requiredToolNames: requiredWriteTools,
           });
         const postAcceptanceToolNames =
-          runToolContext.settings?.researchMemoryEnabled === true &&
-          !researchMemoryAutoSaveRefused() &&
-          !proofBoundProviderLifecycle &&
-          hasWebSearchIntent(activeIntentPrompt) &&
-          !missionIntent.requireWriteCompletion &&
-          installedToolNames.has("append_research_memory")
+          canPlanResearchMemorySave()
             ? ["append_research_memory"]
             : [];
         const runnerOwnedToolNames = [
@@ -9603,10 +9611,9 @@ export async function runAgentMission({
       // DU-02's read-only cache check went red because this auto-save
       // produced the one receipt the user had ruled out; the planner seat
       // above reads the same predicate.
-      researchMemoryAutoSaveRefused() ||
+      !canPlanResearchMemorySave() ||
       acceptance.status !== "pass" ||
       stopReason !== "final" ||
-      runToolContext.settings?.researchMemoryEnabled !== true ||
       !runtimeSnapshotPersistenceAvailable ||
       !missionLedger ||
       successfulToolNames.includes("append_research_memory")
@@ -12878,6 +12885,12 @@ export async function runAgentMission({
           (hostGraphNode.status === "running" ||
             hostGraphNode.status === "waiting_approval"),
       );
+      const hostAuthorizedMemorySave =
+        toolCall.name === "append_research_memory" &&
+        canPlanResearchMemorySave() &&
+        hostGraphScopeAuthorized &&
+        hostGraphNode !== null && hostGraphNode !== undefined &&
+        isCanonicalHostPostAcceptanceNode(hostGraphNode);
       const runnerScopeAuthorized = isPreparedActionWithinRunnerScope({
         toolName: toolCall.name,
         descriptor,
@@ -12893,7 +12906,7 @@ export async function runAgentMission({
         intent: policyRouted.intent,
         approvalGranted: false,
         isDesktop: isCodeToolsDesktopRuntime(),
-        writeAutonomy,
+        writeAutonomy: writeAutonomy || hostAuthorizedMemorySave,
         codeRunCount: executedCodeRunCount,
         maxCodeRunsPerMission: runToolContext.settings?.maxCodeRunsPerMission,
         researchPhase: researchPhaseDescriptor,
@@ -12905,7 +12918,7 @@ export async function runAgentMission({
         // both the graph destination and the prompt-derived runner scope.
         scopeAllowed: exactVaultPathGraphTool || exactWorkspacePathGraphTool
           ? hostGraphScopeAuthorized && runnerScopeAuthorized
-          : (hostScopeAuthorized && hostGraphScopeAuthorized) ||
+          : hostAuthorizedMemorySave || (hostScopeAuthorized && hostGraphScopeAuthorized) ||
             runnerScopeAuthorized,
         now: runToolContext.now?.() ?? new Date(),
       };
@@ -21132,11 +21145,12 @@ export async function runAgentMission({
         );
       const citationGatherStillOffered =
         citationGatherCompanionToolNames().length > 0;
-      // Gather may be offered for the previous rejected draft. A replacement
-      // that already pays that proof must reach normal final verification,
-      // rather than being discarded by tool-only steering for stale debt.
+      // A rejected draft retains citation debt even when a host memory node
+      // keeps the graph unsealed and no companion gather menu is needed.
+      // Evaluate its replacement against that debt before tool-only steering.
       const citationRepairAcceptance =
-        citationGatherStillOffered &&
+        (citationGatherStillOffered ||
+          unpaidProofRequiresCitationGatherV1(lastHeldCitationGatherMissing)) &&
         hasRenderableAssistantContent(sanitizedStepResponseContent)
           ? requireAcceptedPassageCitationCoverage(
               evaluateCurrentAcceptance(sanitizedStepResponseContent),
@@ -21156,6 +21170,15 @@ export async function runAgentMission({
             citationRepairFinalNode.allowedTools.length === 0,
         )
       );
+      if (citationRepairAcceptance && !citationRepairReady) {
+        events.onTrace?.({
+          id: `citation-repair-candidate-held-${step}`,
+          kind: "verification", step,
+          message: "The replacement draft still owes verified completion evidence.",
+          outputPreview: { missing: citationRepairAcceptance.missing,
+            finalNodeStatus: citationRepairFinalNode?.status ?? null },
+        });
+      }
       const proseCannotFinishMission = proseAnswerCannotFinishMissionV1({
         route: runPlan.route,
         successfulToolCount: successfulToolNames.length,

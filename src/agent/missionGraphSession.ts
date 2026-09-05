@@ -3798,7 +3798,7 @@ function lifecycleOutputsOperationV1(
   };
 }
 
-function isCanonicalHostPostAcceptanceNode(node: MissionNodeV3): boolean {
+export function isCanonicalHostPostAcceptanceNode(node: MissionNodeV3): boolean {
   if (node.effect === "read" || node.allowedTools.length !== 1) return false;
   const toolName = node.allowedTools[0]!;
   const ordinal = /^post-acceptance-tool-(\d{2})-/u.exec(node.id)?.[1];

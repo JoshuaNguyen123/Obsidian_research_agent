@@ -383,7 +383,9 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
   });
 });
 
-test("OFFLINE-11 verifies a corrected citation draft before requesting more tools", async () => {
+for (const memoryEnabled of [false, true]) test(memoryEnabled
+  ? "installed host-planned research memory obtains exact authority after cited research"
+  : "OFFLINE-11 verifies a corrected citation draft before requesting more tools", async () => {
   test.skip(process.env.E2E_PLAYWRIGHT_LANE !== "offline-expand" || process.env.E2E_OFFLINE_AI !== "1", "Requires the offline-expand lane.");
   test.setTimeout(240_000);
   const backend = createOfflineAgentBackendV1();
@@ -396,8 +398,9 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
   const cloudModelRequests: string[] = [];
   const identity = await readOfflineBuildIdentity();
   const scenario = OFFLINE_CITATION_REPAIR_SCENARIO;
-  const attempt = beginOfflineAttempt(identity, scenario.id);
-  await saveOfflineAttempt(attempt);
+  const attempt = beginOfflineAttempt(identity, memoryEnabled ? "research-memory-host-scope" : scenario.id);
+  const saveAttempt = memoryEnabled ? saveOfflineProbe : saveOfflineAttempt;
+  await saveAttempt(attempt);
   try {
     await listen(bridge, 7331);
     harness = await startRealAiHarness("offline-citation-repair", {
@@ -407,16 +410,47 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
       modelRouterEnabled: false, modelRouterMode: "off", semanticIndexEnabled: false,
       // Leave tool budget outside the finalization reserve so the corrected
       // candidate actually exercises admission past citation-gather steering.
-      researchMemoryEnabled: false, enableStreaming: false, maxAgentSteps: 8,
+      researchMemoryEnabled: memoryEnabled, enableStreaming: false, maxAgentSteps: 8,
+      // Exercise the configured host memory save without routing the research
+      // answer into this fixture's active note or forbidding memory writes.
+      ...(memoryEnabled ? { workingMode: "custom", outputProfile: "chat_first" } : {}),
     });
     harness.page.on("request", (request) => {
       if (isKnownCloudModelUrl(request.url())) cloudModelRequests.push(request.url());
     });
     await observeOfflineTools(harness.page);
     await harness.seedNote(harness.notePath, "Preserve this note during cited chat.", true);
+    if (memoryEnabled) {
+      const effectiveSettings = await harness.page.evaluate(() => {
+        const settings = (window as any).app.plugins.plugins["agentic-researcher"].settings;
+        return { workingMode: settings.workingMode, outputProfile: settings.outputProfile,
+          researchMemoryEnabled: settings.researchMemoryEnabled, enableStreaming: settings.enableStreaming };
+      });
+      attempt.effectiveSettings = effectiveSettings;
+      await saveAttempt(attempt);
+      expect(effectiveSettings).toEqual({ workingMode: "custom", outputProfile: "chat_first",
+        researchMemoryEnabled: true, enableStreaming: false });
+    }
     await harness.page.evaluate(({ fixtureId }) => {
       const plugin = (window as any).app.plugins.plugins["agentic-researcher"];
       const original = plugin.createToolExecutionContext;
+      const createRegistry = plugin.createToolRegistry;
+      (window as any).__offlineMemoryAuthority = [];
+      plugin.createToolRegistry = function (...args: any[]) {
+        const registry = createRegistry.apply(this, args);
+        const executePrepared = registry.executePrepared.bind(registry);
+        registry.executePrepared = async (action: any, context: any, authority: any) => {
+          const result = await executePrepared(action, context, authority);
+          if (action.toolName === "append_research_memory") (window as any).__offlineMemoryAuthority.push({
+            ok: result.ok, mutationState: result.mutationState, nodeId: context.nodeId,
+            actionId: action.id, actionFingerprint: action.payloadFingerprint,
+            authorityFingerprint: authority?.payloadFingerprint, grantId: authority?.grantId,
+            receipt: result.receipt,
+          });
+          return result;
+        };
+        return registry;
+      };
       const urls = [`https://one.example/mcp/${fixtureId}`, `https://two.example/mcp/${fixtureId}`];
       const content = "MCP servers expose tools and resources through a standard protocol. Clients discover the approved server capabilities.";
       const alternateContent = "Clients discover the approved server capabilities. MCP servers expose tools and resources through a standard protocol. Discovery lets clients inspect available capabilities before invoking them.";
@@ -438,7 +472,10 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
       };
     }, { fixtureId: attempt.attemptId });
     const marker = `${scenario.markerPrefix}_${attempt.attemptId.replace(/-/gu, "")}`;
-    await harness.submitMission(scenario.prompt.replace("{marker}", marker), { timeoutMs: 120_000 });
+    const prompt = scenario.prompt.replace("{marker}", marker);
+    await harness.submitMission(memoryEnabled
+      ? `${prompt.replace("Answer in chat", "Summarize the sources")} OFFLINE_MEMORY_SAVE`
+      : prompt, { timeoutMs: 120_000 });
     const snapshot = await harness.attestProductionRun();
     const traceProof = await harness.page.evaluate(() => {
       const plugin = (window as any).app.plugins.plugins["agentic-researcher"];
@@ -446,6 +483,8 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
       const unsubscribe = plugin.subscribeMissionEvents({ onTrace: (event: any) => traces.push(event) }, { replay: true });
       unsubscribe();
       return {
+        errors: Array.from(document.querySelectorAll(".agentic-researcher-log-error .agentic-researcher-log-message"))
+          .map((element) => element.textContent ?? "").slice(-8),
         rejected: traces.find((event) => /^final-output-rejected-/u.test(event.id))?.outputPreview,
         admitted: traces.some((event) => /^citation-repair-candidate-admitted-/u.test(event.id)),
         decisions: traces.filter((event) => /^(?:final-output-rejected-|citation-repair-candidate-|agent-step-response-|loop-decision-)/u.test(event.id))
@@ -457,23 +496,48 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
     Object.assign(attempt, {
       acceptanceStatus: snapshot.lastMissionLedger?.acceptance?.status ?? null,
       scorecardAcceptancePassed: snapshot.lastMissionScorecard?.acceptancePassed ?? null,
+      lastComplete: snapshot.lastComplete, acceptance: snapshot.lastMissionLedger?.acceptance,
+      memoryProof: await harness.page.evaluate(() => (window as any).__offlineMemoryAuthority ?? []),
       traceProof, backend: backend.snapshot(),
       ...await readOfflineToolCounts(harness.page),
     });
-    await saveOfflineAttempt(attempt);
-    expect(snapshot.lastComplete?.stopReason).toBe("final");
+    await saveAttempt(attempt);
+    if (memoryEnabled) expect(["final", "write_completed"]).toContain(snapshot.lastComplete?.stopReason);
+    else expect(snapshot.lastComplete?.stopReason).toBe("final");
     expect(snapshot.lastMissionLedger?.acceptance?.status).toBe("pass");
     expect(snapshot.lastMissionScorecard?.acceptancePassed).toBe(true);
-    expect(snapshot.lastReceipts).toEqual([]);
+    const memoryProof = await harness.page.evaluate(() => (window as any).__offlineMemoryAuthority ?? []);
+    attempt.memoryProof = memoryProof;
+    await saveAttempt(attempt);
+    if (memoryEnabled) {
+      expect(memoryProof).toHaveLength(1);
+      expect(memoryProof[0].ok).toBe(true);
+      expect(memoryProof[0].mutationState).toBe("applied");
+      expect(memoryProof[0].nodeId).toMatch(/^post-acceptance-tool-\d+-append_research_memory$/u);
+      expect(memoryProof[0].grantId).toMatch(/^grant:write-autonomy:/u);
+      expect(memoryProof[0].receipt.actionId).toBe(memoryProof[0].actionId);
+      expect(memoryProof[0].receipt.payloadFingerprint).toBe(memoryProof[0].actionFingerprint);
+      expect(memoryProof[0].authorityFingerprint).toBe(memoryProof[0].actionFingerprint);
+      expect(memoryProof[0].receipt.readback.status).toBe("verified");
+      expect(snapshot.lastReceipts.filter((receipt: any) => receipt.toolName === "append_research_memory")).toHaveLength(1);
+      expect(harness.readProgressCounters().approvals).toBe(0);
+      const memoryContent = await harness.page.evaluate(async (path) => {
+        const app = (window as any).app;
+        return app.vault.read(app.vault.getFileByPath(path));
+      }, memoryProof[0].receipt.resource.path);
+      expect(memoryContent).toContain("MCP servers");
+    } else expect(snapshot.lastReceipts).toEqual([]);
     expect(cloudModelRequests).toEqual([]);
-    expect(backend.snapshot().citationRepair).toEqual({ unverifiedDrafts: 1, correctedDrafts: 1 });
-    expect(backend.snapshot().citationCriticReviews).toBe(1);
+    if (!memoryEnabled) {
+      expect(backend.snapshot().citationRepair).toEqual({ unverifiedDrafts: 1, correctedDrafts: 1 });
+      expect(backend.snapshot().citationCriticReviews).toBe(1);
+    }
     expect(await harness.readNote()).toBe("Preserve this note during cited chat.");
     expect(traceProof.rejected?.candidateExcerpt).toContain("MCP servers expose tools");
     expect(traceProof.rejected?.missing.length).toBeGreaterThan(0);
     expect(traceProof.rejected?.candidateExcerpt).toContain("[unverified — no cited source passage confirms this]");
     expect(traceProof.rejected?.missing.some((key: string) => key.includes("claim:s-15fb002f52"))).toBe(false);
-    expect(traceProof.admitted).toBe(true);
+    if (!memoryEnabled) expect(traceProof.admitted).toBe(true);
     Object.assign(attempt, {
       status: "passed", acceptanceStatus: "pass", scorecardAcceptancePassed: true,
       failureClass: "none", failureDetail: "", model: "offline-scripted-v1",
@@ -483,7 +547,7 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
       scorecardDimensions: snapshot.lastMissionScorecard.dimensions.map((dimension: any) => ({ id: dimension.id, score: dimension.score })),
       artifactReadbacks: ["note_unchanged", "rejected_draft_retained", "corrected_draft_verified"],
       safetyViolationCount: 0, duplicateMutationCount: 0,
-      mutationsPerformed: 0, mutationsWithReceipts: 0, mutationEventsObserved: 0,
+      mutationsPerformed: memoryProof.length, mutationsWithReceipts: memoryProof.length, mutationEventsObserved: memoryProof.length,
       modelCalls: backend.snapshot().requestCount, providerWaitMs: 0,
     });
   } catch (error) {
@@ -492,7 +556,7 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
   } finally {
     attempt.durationMs = Date.now() - startedAt;
     if (harness) Object.assign(attempt, await readOfflineToolCounts(harness.page));
-    await saveOfflineAttempt(attempt);
+    await saveAttempt(attempt);
     try { await harness?.close(); } finally { await close(bridge); }
   }
 });

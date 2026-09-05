@@ -1254,8 +1254,15 @@ export const CLASSIFICATION_UNCLASSIFIED = "unclassified";
  * log also carries an assertion diff); the primary classifier picks one, and
  * the others become secondary classes instead of being silently dropped.
  */
+function runtimeFailureLogText(logText) {
+  // Playwright prints nearby source, including branches that never executed.
+  // A failure-class literal in that code is not observed product evidence.
+  return (typeof logText === "string" ? logText : "")
+    .replace(/^[\t ]*(?:>[\t ]*)?\d+[\t ]*\|[^\r\n]*(?:\r?\n|$)/gm, "");
+}
+
 export function collectMechanicalFailureClasses(logText) {
-  const text = typeof logText === "string" ? logText : "";
+  const text = runtimeFailureLogText(logText);
   const classes = [];
   for (const [pattern, failureClass] of PRODUCT_LOG_SIGNATURES) {
     if (pattern.test(text) && !classes.includes(failureClass)) {
@@ -1285,7 +1292,7 @@ export function classifyAttemptOutcome({ exitCode, summary, summaryFresh, logTex
       secondaryClasses: [],
     };
   }
-  const text = typeof logText === "string" ? logText : "";
+  const text = runtimeFailureLogText(logText);
   const mechanical = collectMechanicalFailureClasses(text);
   const secondaryFor = (primary) => mechanical.filter((cls) => cls !== primary);
   const missingEnvironment = detectMissingRequiredEnvironment(text);

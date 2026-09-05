@@ -212,6 +212,21 @@ test("an exhausted semantic-index helper timeout is a stable product alarm", () 
   assert.deepEqual(classified.secondaryClasses, [LANE_ASSERTION_FAILURE_CLASS]);
 });
 
+test("a displayed Playwright source frame is not a runtime product failure", () => {
+  const classified = classifyAttemptOutcome({
+    exitCode: 1, summary: { records: [{ status: "failed" }] }, summaryFresh: true,
+    logText: [
+      "Error: Mission stopped before acceptance; memory policy blocked its target.",
+      "  1) [byok-autonomous-journey] › e2e/byok-autonomous-journey.spec.ts › BYOK-01",
+      '  1782 | ? "product:final_projection_candidate_rejected — "',
+      '  1783 | : "";',
+      '> 1784 | throw new Error(message);',
+    ].join("\n"),
+  });
+  assert.equal(classified.failureClass, LANE_ASSERTION_FAILURE_CLASS);
+  assert.ok(!classified.secondaryClasses.includes("product:final_projection_candidate_rejected"));
+});
+
 test("a circular final-projection hold is a stable product alarm", () => {
   const logText = [
     "Error: product:final_projection_candidate_rejected — Mission stopped before acceptance",
