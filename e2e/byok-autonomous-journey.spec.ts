@@ -1053,6 +1053,12 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       ...beforePhaseBObservedTools.map((event) => event.sequence),
     );
     const phaseBStartCounters = harness.readProgressCounters();
+    const assertExactFirstPhaseBRead = (events: readonly ObservedToolExecution[]) => {
+      const firstRead = events.find((event) => event.sequence > (phaseBSequenceStart ?? -1) && event.name === "linear_get_issue");
+      if (firstRead) expect(firstRead.linearIssueId,
+        "product:linear_issue_identity_changed — the first independent provider read must preserve the complete issue identity named in the mission",
+      ).toBe(issueId);
+    };
 
     const phaseBPrompt = [
       `Review and implement Linear issue ${issueId}. Begin with an independent linear_get_issue read of that exact identity and treat its signed accepted-research contract as the sole product specification.`,
@@ -1110,7 +1116,14 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
         requireExactPreparedActionApproval: true,
       });
     } catch (error) {
-      if (!isOwnedObsidianPageClosure(error)) throw error;
+      if (!isOwnedObsidianPageClosure(error)) {
+        // Include failed reads: waiting for a later successful read hid host
+        // UUID truncation behind a generic mission-stopped assertion.
+        const failedPhaseBTools = await readToolExecutionObserver(harness.page, observedToolJournal)
+          .catch(() => observedToolJournal);
+        assertExactFirstPhaseBRead(failedPhaseBTools);
+        throw error;
+      }
       const usedContinuations = Math.max(
         0,
         harness.readProgressCounters().continuations -
@@ -1208,6 +1221,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     const phaseBObservedTools = observedTools.filter(
       (event) => event.sequence > (phaseBSequenceStart ?? -1),
     );
+    assertExactFirstPhaseBRead(phaseBObservedTools);
     const linearRead = phaseBObservedTools.find(
       (event) =>
         event.name === "linear_get_issue" &&
@@ -1858,6 +1872,10 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       const progress = harness.readProgressCounters();
       await recordDailyUseAcceptance(test.info(), "BYOK-01", observations.snapshot(), {
         modelCalls: progress.modelCalls,
+        // This journal counts completed registry calls only. Preserve that
+        // observed count on failure instead of the unassigned success-path
+        // counter; failed/attempted totals still require the complete collector.
+        toolCalls: observedToolJournal.length,
         continuations: progress.continuations,
         approvals: progress.approvals,
       }).catch(() => undefined);

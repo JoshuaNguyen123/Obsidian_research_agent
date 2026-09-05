@@ -13,7 +13,9 @@ export interface LinearIntentDetection {
 
 const LINEAR_URL_PATTERN =
   /https:\/\/linear\.app\/[a-z0-9][a-z0-9/_-]*(?:\?[a-z0-9%&=._-]*)?/i;
-const ISSUE_IDENTIFIER_PATTERN = /\b([A-Z][A-Z0-9]{1,15}-[1-9][0-9]*)\b/;
+// A UUID segment can look like a human issue identifier. Require the whole
+// hyphenated token so opaque identities never become accidental Linear intent.
+const ISSUE_IDENTIFIER_PATTERN = /\b(?<!-)([A-Z][A-Z0-9]{1,15}-[1-9][0-9]*)\b(?!-)/;
 const ISSUE_UUID_PATTERN =
   /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i;
 const LINEAR_RESOURCE_PATTERN =
@@ -84,8 +86,12 @@ export function extractExplicitLinearIssueReadIdentity(
   const normalized = prompt.replace(/\r\n?/g, "\n");
   if (!detectLinearIntent(normalized).explicit) return null;
 
+  // UUIDs must win before the identifier alternative: ee86961f-8176 is a
+  // syntactically valid identifier prefix but not the issue the user named.
+  // The final token boundary also prevents malformed UUIDs from falling back
+  // to a shorter human identifier and redirecting the host's exact read.
   const resourcePattern =
-    /\blinear\s+issue(?:\s+(?:id|identity))?\s*(?:[:#]\s*)?([A-Z][A-Z0-9]{1,15}-[1-9][0-9]*|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/giu;
+    /\blinear\s+issue(?:\s+(?:id|identity))?\s*(?:[:#]\s*)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[A-Z][A-Z0-9]{1,15}-[1-9][0-9]*)\b(?!-)/giu;
   for (const match of normalized.matchAll(resourcePattern)) {
     const identity = match[1];
     if (!identity || match.index === undefined) continue;

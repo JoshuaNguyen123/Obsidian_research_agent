@@ -18,6 +18,7 @@ import {
 import {
   bindTrustedRepositoryWorkspaceCreate,
 } from "../src/agent/verifiedWorkspaceBinding";
+import { extractExplicitLinearIssueReadIdentity } from "../src/agent/linearIntent";
 
 const ISSUE_ID = "71aa708b-70a1-4b26-9e6f-fb8a9c31a4d2";
 const PHASE_B_PROMPT = [
@@ -26,6 +27,17 @@ const PHASE_B_PROMPT = [
   "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it.",
   "Implement the requested Python library in its bound trusted repository and create one verified local commit.",
 ].join(" ");
+
+test("the exact-read host preserves a valid letter-leading UUID and repairs a shortened echo", () => {
+  const uuid = "ee86961f-8176-4781-9351-e4cdaad81a69";
+  const exactIssueIdentity = extractExplicitLinearIssueReadIdentity(
+    `Review and implement Linear issue ${uuid}. Begin with an independent linear_get_issue read.`,
+  );
+  const input = { toolName: "linear_get_issue", required: true, verified: false, exactIssueIdentity };
+  assert.equal(canonicalExactLinearIssueReadIdV1({ ...input, echoedIssueId: uuid }), null,
+    "the host must not overwrite the model's correct UUID with a truncated identifier");
+  assert.equal(canonicalExactLinearIssueReadIdV1({ ...input, echoedIssueId: "EE86961F-8176" }), uuid);
+});
 
 test("isolated Phase B withholds every code and GitHub consumer until verified readback", () => {
   assert.equal(

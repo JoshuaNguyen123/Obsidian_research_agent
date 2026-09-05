@@ -116,3 +116,22 @@ test("permanent Linear deletion requires explicit irreversible wording", () => {
     false,
   );
 });
+
+test("exact Linear reads preserve letter-leading UUIDs instead of truncating them to issue identifiers", () => {
+  for (const first of "abcdef0123456789") {
+    const uuid = `${first}e86961f-8176-4781-9351-e4cdaad81a69`;
+    for (const input of [uuid, uuid.toUpperCase()]) {
+      assert.equal(extractExplicitLinearIssueReadIdentity(
+        `Review and implement Linear issue ${input}. Begin with an independent linear_get_issue read of that exact identity.`,
+      ), uuid);
+      assert.equal(detectLinearIntent(`Read ${input}.`).explicit, false,
+        "an opaque UUID alone must not be mistaken for an acted-on human Linear identifier");
+    }
+  }
+  for (const suffix of ["-extra", "-4781-9351-e4cdaad81a6", "_suffix"]) {
+    assert.equal(extractExplicitLinearIssueReadIdentity(`Read Linear issue EE86961F-8176${suffix}.`), null,
+      "a longer or malformed identity must not authorize a truncated prefix");
+  }
+  assert.equal(extractExplicitLinearIssueReadIdentity("Read Linear issue APP-520."), "APP-520");
+  assert.equal(extractExplicitLinearIssueReadIdentity("Do not read Linear issue ee86961f-8176-4781-9351-e4cdaad81a69."), null);
+});
