@@ -34,11 +34,27 @@ async function main() {
   const dataJson = new Map();
   const legacyDataJson = new Map();
   try {
+    const freshVaultRoot = path.join(fixtureRoot, "fresh-vault");
+    await runSync(freshVaultRoot);
+    for (const plugin of PLUGIN_CATALOG) {
+      const freshRoot = path.join(freshVaultRoot, ".obsidian", "plugins", plugin.id);
+      const names = (await readdir(freshRoot)).sort();
+      if (names.join("\0") !== [...PLUGIN_ARTIFACTS].sort().join("\0")) {
+        throw new Error(`Fresh installation created unexpected files for ${plugin.id}.`);
+      }
+      for (const artifact of PLUGIN_ARTIFACTS) {
+        const source = await readFile(path.resolve(repoRoot, plugin.sourceDir, artifact));
+        const installed = await readFile(path.join(freshRoot, artifact));
+        if (sha256(source) !== sha256(installed)) throw new Error(`Fresh installation changed ${artifact}.`);
+      }
+    }
     for (const [index, plugin] of PLUGIN_CATALOG.entries()) {
       const pluginRoot = path.join(pluginsRoot, plugin.id);
       await mkdir(pluginRoot, { recursive: true });
       const content = Buffer.from(
-        JSON.stringify({ fixture: plugin.id, ordinal: index, preserve: true }, null, 2),
+        JSON.stringify({ fixture: plugin.id, ordinal: index, preserve: true,
+          settings: { model: "fixture-model", maxAgentSteps: 12 },
+          conversationHistory: [{ role: "user", content: "Preserve fixture history." }] }, null, 2),
         "utf8",
       );
       await writeFile(path.join(pluginRoot, "data.json"), content, { flag: "wx" });
@@ -122,7 +138,7 @@ async function main() {
       }
     }
     console.log(
-      `Installed-artifact freshness passed for one unified plugin; ${LEGACY_PLUGIN_IDS.length} legacy data stores were retired byte-identically.`,
+      `Fresh install and upgrade artifact checks passed; settings/history and ${LEGACY_PLUGIN_IDS.length} legacy data stores were preserved byte-identically.`,
     );
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });

@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { sha256DiagramContent } from "../src/design/diagramArtifactStore";
@@ -58,7 +59,7 @@ test("read_mermaid_block returns exact note hash and selected block metadata", a
   assert.equal(output.metadata.heading?.text, "Architecture");
 });
 
-test("missing block read returns the note hash needed for an approved insert", async () => {
+for (const prompt of ["Add a Mermaid diagram for the primary flow.", "Add a flowchart to this note."]) test(`missing block read supplies the hash for an approved insert: ${prompt}`, async () => {
   const mock = createMockVault();
   const path = "Designs/new-flow.md";
   const before = "# Design\n\nUnrelated sentinel.\n";
@@ -74,7 +75,7 @@ test("missing block read returns the note hash needed for an approved insert", a
 
   const context = {
     ...mock.context,
-    originalPrompt: "Add a Mermaid diagram for the primary flow.",
+    originalPrompt: prompt,
     runId: "run-mermaid-insert",
     operationId: "call-mermaid-insert",
   };
@@ -263,7 +264,7 @@ test("prepared Mermaid upsert requires its exact authorization binding", async (
   assert.deepEqual(mock.operations, []);
 });
 
-test("failed Mermaid readback rolls the note back to its original bytes", async () => {
+test("ambiguous Mermaid write retains its backup without overwriting unexpected bytes", async () => {
   const mock = createMockVault();
   const path = "Designs/rollback.md";
   const before = "# Flow\n\n```mermaid\nflowchart LR\n A --> B\n```\n";
@@ -301,9 +302,12 @@ test("failed Mermaid readback rolls the note back to its original bytes", async 
     (error: unknown) =>
       error instanceof Error &&
       "code" in error &&
-      error.code === "mermaid_upsert_rolled_back",
+      error.code === "mermaid_upsert_rollback_failed",
   );
-  assert.equal(mock.get(path), before);
+  assert.notEqual(mock.get(path), before);
+  const backup = mock.operations.find((operation) => operation.startsWith("create:.agent-backups/"));
+  assert.ok(backup, JSON.stringify(mock.operations));
+  assert.equal(mock.get(backup.slice("create:".length)), before);
 });
 
 function createMockVault(now = new Date("2026-07-12T19:00:00.000Z")) {
@@ -327,6 +331,9 @@ function createMockVault(now = new Date("2026-07-12T19:00:00.000Z")) {
       operations.push(`create:${path}`);
       content.set(path, value);
       return { path };
+    },
+    process: function (file: any, transform: (content: string) => string): Promise<string> {
+      return processTestVaultFile(this, file, transform);
     },
     modify: async (entry: { path: string }, value: string) => {
       operations.push(`modify:${entry.path}`);

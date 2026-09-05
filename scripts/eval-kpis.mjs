@@ -19,6 +19,9 @@ import {
   partitionRunRows,
   runRowIsGreen,
   toRunRow,
+  optionalCount,
+  summarizeToolCounts,
+  EVIDENCE_SEMANTICS_VERSION,
 } from "./product-evidence.mjs";
 
 const CSV_PATH = new URL("../docs/eval/playwright-run-metrics.csv", import.meta.url);
@@ -36,8 +39,8 @@ const records = csvRecords(readFileSync(CSV_PATH, "utf8")).map((cells) => ({
   at: cells.run_started_at ?? "",
   lane: cells.lane ?? "",
   model: (cells.model ?? "").trim() || "(unset)",
-  toolEvents: Number(cells.tool_events_observed) || 0,
-  toolFailed: Number(cells.tool_events_failed) || 0,
+  toolEvents: optionalCount(cells.tool_events_observed),
+  toolFailed: optionalCount(cells.tool_events_failed),
   pctFailed: cells.pct_tool_calls_failed ?? "",
 })).filter((r) => r.at)
   .filter((r) => !since || r.at.slice(0, 10) >= since)
@@ -45,7 +48,7 @@ const records = csvRecords(readFileSync(CSV_PATH, "utf8")).map((cells) => ({
 
 // The whole point: `scored` is what a pass rate may see, `infrastructure` is
 // reported beside it and never inside it.
-const { scored, infrastructure } = partitionRunRows(records);
+const { scored, infrastructure, unresolved } = partitionRunRows(records);
 const isGreen = runRowIsGreen;
 
 const byKey = (list, keyFn) => {
@@ -67,6 +70,7 @@ const countBy = (list, keyFn) => {
 };
 
 const pct = formatRate;
+console.log(`Evidence semantics v${EVIDENCE_SEMANTICS_VERSION}; ${unresolved.length} unresolved rows (excluded pending classification). Historical CSV rows are unchanged.`);
 
 console.log(`Eval KPIs — ${scored.length} product run rows${since ? ` since ${since}` : ""}${onlyModel ? ` model=${onlyModel}` : ""}\n`);
 const exclusionNote = describeExcludedInfrastructure(infrastructure.length, records.length);
@@ -79,8 +83,8 @@ console.log("== By model ==");
 const scoredByModel = byKey(scored, (r) => r.model);
 for (const [model, list] of [...scoredByModel].sort((a, b) => b[1].length - a[1].length)) {
   const green = list.filter(isGreen).length;
-  const toolTotals = list.reduce((acc, r) => ({ e: acc.e + r.toolEvents, f: acc.f + r.toolFailed }), { e: 0, f: 0 });
-  const toolNote = toolTotals.e > 0 ? `, tool-call failure ${pct(toolTotals.f, toolTotals.e)} (${toolTotals.f}/${toolTotals.e})` : "";
+  const toolTotals = summarizeToolCounts(list);
+  const toolNote = `, tool-call failure ${pct(toolTotals.failed, toolTotals.observed)} (${toolTotals.failed}/${toolTotals.observed}), count coverage ${toolTotals.coveredRows}/${toolTotals.totalRows} rows`;
   const infra = infraByModel.get(model) ?? 0;
   const infraNote = infra > 0 ? `, +${infra} infrastructure (excluded)` : "";
   console.log(`  ${model}: ${list.length} runs, green ${green} (${pct(green, list.length)})${toolNote}${infraNote}`);

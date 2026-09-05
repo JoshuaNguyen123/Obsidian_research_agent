@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import { promptPrefixReuseAverageV1 } from "../src/model/modelCallEvidence";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -4689,6 +4690,9 @@ function createVaultHarness(options: {
         mtimes.set(path, clock);
         return createFile(path);
       },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
+      },
       modify: async (file: { path: string }, content: string) => {
         options.beforeModify?.(file.path, files, content);
         clock += 1;
@@ -5084,7 +5088,10 @@ test("a two-marker write contract is not discharged by one receipt", async () =>
   );
 });
 
-test("run-note rewrites per tool call stay within the write budget", async () => {
+test("run-note rewrites per tool call stay within the write budget", async (t) => {
+  // Measure coalescing independently of host speed. The production idle flush
+  // still runs after 1s; a loaded host must not change this test's write shape.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   // Every rewrite of the run note (Agent Runs/<runId>.md, not the mission
   // graph store) is attributed to the phase the run is in when it happens.
   // The budget is a ratchet on the measured shape after the combined

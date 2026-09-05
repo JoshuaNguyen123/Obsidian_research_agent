@@ -4,6 +4,7 @@
  * execution of that pipeline.
  */
 import { hasExplicitNoNoteWriteIntent } from "./noNoteWriteIntent";
+import { getRequestedResearchCatalogReadTools } from "./promptIntentClassifiers";
 import {
   canonicalizeKeywordTypos,
   fuzzyCorrectionReason,
@@ -98,6 +99,12 @@ function classifyTrimmedPrompt(
     /\b(?:note|document|page|file|vault|memory|reflection|canvas|diagram|artifact|essay|report|brief)\b/iu.test(
       value,
     );
+  // Chat is an output destination, not a prohibition on the requested reads.
+  // Keep broad platform assessments conversational; require an action clause
+  // and the same catalog-specific subject predicate used by the tool offer.
+  if (getRequestedResearchCatalogReadTools(value).length > 0) {
+    return result("execute", "bounded_tool", ["catalog_read_request"], explicitChatOnly);
+  }
   const actionVerb =
     "(?:call|run|execute|search|research|look up|fetch|make|generate|draw|implement|build|fix|repair|patch|refactor|create|seed|publish|commit|push|validate|test|deploy|open|submit|send|clean up|delete|update|modify|revise|close|reopen|count|inspect|read|list|trash|move|copy|install)";
   const explicitExecution =

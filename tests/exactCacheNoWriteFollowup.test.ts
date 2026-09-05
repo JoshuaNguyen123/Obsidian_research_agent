@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
@@ -524,6 +525,9 @@ function createVaultHarness(seed: Record<string, string>) {
         files.set(path, content);
         mtimes.set(path, clock);
         return createFile(path);
+      },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
       },
       modify: async (file: { path: string }, content: string) => {
         clock += 1;

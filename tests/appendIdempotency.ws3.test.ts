@@ -254,6 +254,11 @@ function createAppendVaultContext(options: {
       },
       vault: {
         read: async (file: { path: string }) => content.get(file.path) ?? "",
+        process: async (file: { path: string }, transform: (current: string) => string) => {
+          const next = transform(content.get(file.path) ?? "");
+          await context.app.vault.modify(file as never, next);
+          return next;
+        },
         modify: async (file: { path: string }, data: string) => {
           if (file.path === "Current.md") {
             modifies += 1;

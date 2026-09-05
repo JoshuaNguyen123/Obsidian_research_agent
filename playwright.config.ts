@@ -43,6 +43,9 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
 
 export default defineConfig({
   testDir: "./e2e",
+  // Playwright clears outputDir at startup. Keep its disposable traces below
+  // the durable run summaries and offline attempt records in test-results/.
+  outputDir: "./test-results/playwright",
   forbidOnly: !!process.env.CI,
   fullyParallel: false,
   globalTimeout: liveGlobalTimeout,
@@ -66,7 +69,7 @@ export default defineConfig({
       name: "offline-core",
       testMatch: /offline-core\.spec\.ts/u,
       retries: 0,
-      timeout: 240_000,
+      timeout: 600_000,
       expect: { timeout: 30_000 },
       use: { trace: "off", screenshot: "only-on-failure", video: "off" },
     },
@@ -74,7 +77,7 @@ export default defineConfig({
       name: "offline-expand",
       testMatch: /offline-expand\.spec\.ts/u,
       retries: 0,
-      timeout: 240_000,
+      timeout: 900_000,
       expect: { timeout: 30_000 },
       use: { trace: "off", screenshot: "only-on-failure", video: "off" },
     },

@@ -91,17 +91,18 @@ export function validateOfflineApplicationAttempt(value) {
     "providerWaitMs",
     "durationMs",
   ]) {
+    if (value.status !== "passed" && (value[field] === null || value[field] === undefined)) continue;
     if (!Number.isSafeInteger(value[field]) || value[field] < 0) {
       throw new Error(`Offline attempt ${field} must be a non-negative integer.`);
     }
   }
-  if (value.mutationsWithReceipts > value.mutationsPerformed) {
+  if (knownCount(value.mutationsWithReceipts) && knownCount(value.mutationsPerformed) && value.mutationsWithReceipts > value.mutationsPerformed) {
     throw new Error("Offline attempt cannot receipt more mutations than it performed.");
   }
-  if (value.mutationEventsObserved > value.mutationsPerformed) {
+  if (knownCount(value.mutationEventsObserved) && knownCount(value.mutationsPerformed) && value.mutationEventsObserved > value.mutationsPerformed) {
     throw new Error("Offline attempt cannot observe more mutation events than mutations performed.");
   }
-  if (value.toolEventsFailed > value.toolEventsObserved) {
+  if (knownCount(value.toolEventsFailed) && knownCount(value.toolEventsObserved) && value.toolEventsFailed > value.toolEventsObserved) {
     throw new Error("Offline attempt cannot fail more tool events than it observed.");
   }
   if (typeof value.scorecardAcceptancePassed !== "boolean") {
@@ -199,16 +200,16 @@ export function evaluateOfflineApplicationRelease({
   const proofComplete = selected.filter(offlineAttemptIsProofComplete).length;
   const totals = selected.reduce(
     (sum, attempt) => ({
-      cloudRequests: sum.cloudRequests + attempt.cloudRequestCount,
-      safetyViolations: sum.safetyViolations + attempt.safetyViolationCount,
-      duplicateMutations: sum.duplicateMutations + attempt.duplicateMutationCount,
-      mutations: sum.mutations + attempt.mutationsPerformed,
-      receiptedMutations: sum.receiptedMutations + attempt.mutationsWithReceipts,
-      mutationEvents: sum.mutationEvents + attempt.mutationEventsObserved,
-      toolEvents: sum.toolEvents + attempt.toolEventsObserved,
-      failedToolEvents: sum.failedToolEvents + attempt.toolEventsFailed,
-      modelCalls: sum.modelCalls + attempt.modelCalls,
-      durationMs: sum.durationMs + attempt.durationMs,
+      cloudRequests: sumKnownCounts(sum.cloudRequests, attempt.cloudRequestCount),
+      safetyViolations: sumKnownCounts(sum.safetyViolations, attempt.safetyViolationCount),
+      duplicateMutations: sumKnownCounts(sum.duplicateMutations, attempt.duplicateMutationCount),
+      mutations: sumKnownCounts(sum.mutations, attempt.mutationsPerformed),
+      receiptedMutations: sumKnownCounts(sum.receiptedMutations, attempt.mutationsWithReceipts),
+      mutationEvents: sumKnownCounts(sum.mutationEvents, attempt.mutationEventsObserved),
+      toolEvents: sumKnownCounts(sum.toolEvents, attempt.toolEventsObserved),
+      failedToolEvents: sumKnownCounts(sum.failedToolEvents, attempt.toolEventsFailed),
+      modelCalls: sumKnownCounts(sum.modelCalls, attempt.modelCalls),
+      durationMs: sumKnownCounts(sum.durationMs, attempt.durationMs),
     }),
     {
       cloudRequests: 0,
@@ -225,14 +226,16 @@ export function evaluateOfflineApplicationRelease({
   );
   return {
     version: 1,
+    semanticsVersion: 2,
     passed: failures.length === 0,
     failures,
     expectedAttempts: expectedKeys.size,
     observedAttempts: selected.length,
     proofCompleteAttempts: proofComplete,
     applicationSuccessRate: selected.length === 0 ? null : proofComplete / selected.length,
-    receiptCoverage: totals.mutations === 0 ? 1 : totals.receiptedMutations / totals.mutations,
-    toolContractFriction: totals.toolEvents === 0 ? 0 : totals.failedToolEvents / totals.toolEvents,
+    receiptCoverage: totals.mutations === null || totals.receiptedMutations === null ? null : totals.mutations === 0 ? 1 : totals.receiptedMutations / totals.mutations,
+    toolContractFriction: totals.toolEvents === null || totals.failedToolEvents === null ? null : totals.toolEvents === 0 ? 0 : totals.failedToolEvents / totals.toolEvents,
+    toolCountCoverage: selected.length ? selected.filter((attempt) => knownCount(attempt.toolEventsObserved) && knownCount(attempt.toolEventsFailed)).length / selected.length : null,
     releaseEligibleSource: selected.every((attempt) => attempt.sourceState === "clean_head"),
     ...totals,
   };
@@ -272,3 +275,6 @@ export async function assertOfflineApplicationAttemptSummaryFile({
 function isUnitInterval(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 }
+
+function knownCount(value) { return Number.isSafeInteger(value) && value >= 0; }
+function sumKnownCounts(left, right) { return knownCount(left) && knownCount(right) ? left + right : null; }

@@ -11,10 +11,12 @@ export interface OfflineAgentBackendMetricsV1 {
   emittedToolCalls: number;
   /** Union of tool names the installed plugin offered across requests. */
   offeredToolNames: string[];
+  offeredToolsByRequest: string[][];
 }
 
 export interface OfflineAgentBackendV1 extends AgentBackend {
   snapshot(): OfflineAgentBackendMetricsV1;
+  setCatalogNotePath(path: string): void;
 }
 
 /**
@@ -22,6 +24,7 @@ export interface OfflineAgentBackendV1 extends AgentBackend {
  * never installs a ModelClient or sandbox binding in the plugin process.
  */
 export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
+  let catalogNotePath: string | null = null;
   const metrics: OfflineAgentBackendMetricsV1 = {
     version: 1,
     requestCount: 0,
@@ -29,6 +32,7 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
     toolFrontierObservations: 0,
     emittedToolCalls: 0,
     offeredToolNames: [],
+    offeredToolsByRequest: [],
   };
 
   const complete = async (
@@ -49,6 +53,7 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
         metrics.offeredToolNames.push(name);
       }
     }
+    metrics.offeredToolsByRequest.push([...toolNames]);
     const transcript = messages
       .flatMap((message) => isRecord(message) && typeof message.content === "string"
         ? [message.content]
@@ -71,6 +76,26 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
 
     const catalogMarker = transcript.match(/OFFLINE_CATALOG_[A-Z0-9_]+/u)?.[0];
     if (catalogMarker) {
+      // Follow the native read-before-mutation graph; a later frontier cannot
+      // be observed by returning prose while its prerequisite is still owed.
+      for (const name of ["read_current_file", "read_mermaid_block"]) {
+        if (toolNames.has(name) && !toolNameObserved(messages, name)) {
+          if (name === "read_mermaid_block" && !catalogNotePath) throw new Error("Catalog note fixture is not bound.");
+          metrics.emittedToolCalls += 1;
+          return { toolCalls: [{ name, arguments: name === "read_mermaid_block"
+            ? { path: catalogNotePath, selector: { kind: "heading", heading: "Catalog probe" } } : {} }], finishReason: "tool_calls" };
+        }
+      }
+      if (toolNames.has("upsert_mermaid_block") && !toolNameObserved(messages, "upsert_mermaid_block")) {
+        const readback = messages.filter((message) => isRecord(message) && message.role === "tool" &&
+          typeof message.content === "string" && (message.name === "read_mermaid_block" ||
+            message.toolName === "read_mermaid_block" || message.content.includes("read_mermaid_block"))).at(-1);
+        const baseHash = isRecord(readback) ? readback.content.match(/"sha256"\s*:\s*"((?:sha256:)?[a-f0-9]{64})"/u)?.[1] : null;
+        if (!catalogNotePath || !baseHash) throw new Error("Flowchart execution requires the actual native note readback hash.");
+        metrics.emittedToolCalls += 1;
+        return { toolCalls: [{ name: "upsert_mermaid_block", arguments: { path: catalogNotePath, baseHash,
+          selector: { kind: "heading", heading: "Catalog probe" }, mermaid: "flowchart TD\n  Research --> Verify\n  Verify --> Reflect" } }], finishReason: "tool_calls" };
+      }
       return { content: `Catalog probe complete ${catalogMarker}.` };
     }
 
@@ -220,6 +245,7 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
 
   return {
     complete,
+    setCatalogNotePath: (path) => { catalogNotePath = path; },
     async *stream(request) {
       metrics.streamedRequestCount += 1;
       const result = await complete(request);

@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -162,6 +163,9 @@ function createVaultHarness() {
         files.delete(file.path);
         files.set(newPath, value);
         file.path = newPath;
+      },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
       },
       modify: async (file: { path: string }, content: string) => {
         clock += 1;

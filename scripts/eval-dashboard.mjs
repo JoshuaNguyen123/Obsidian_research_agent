@@ -91,7 +91,7 @@ try {
   // reported beside it, never inside it. Sections that measure something
   // other than the product (tool-call coverage, the uncertainty ledger) keep
   // counting every row, and say so.
-  const { scored, infrastructure } = partitionRunRows(records);
+  const { scored, infrastructure, unresolved } = partitionRunRows(records);
 
   const group = (list, keyFn) => {
     const m = new Map();
@@ -139,6 +139,7 @@ try {
 
   const md = [
     "# Eval KPI dashboard",
+    `Evidence semantics v2: ${unresolved.length} unresolved rows excluded pending classification. Historical rows are unchanged; reporting corrections are not product improvements.`,
     "",
     `Generated ${new Date().toISOString()} from ${scored.length} product run rows of ${records.length} recorded. Regenerated automatically after every \`npm test\` (posttest hook) and on demand via \`node scripts/eval-dashboard.mjs\`.`,
     "",

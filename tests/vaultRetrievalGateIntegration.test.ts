@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -418,6 +419,9 @@ function createVaultHarness(seed: Record<string, string>) {
         files.set(path, content);
         return createFile(path);
       },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
+      },
       modify: async (file: { path: string }, content: string) => {
         clock += 1;
         files.set(file.path, content);
@@ -585,4 +589,3 @@ test("an empty forced final earns one reserved retry instead of forfeiting the r
     "the retried final answer must be delivered",
   );
 });
-

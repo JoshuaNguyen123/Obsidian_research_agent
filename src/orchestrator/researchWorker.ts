@@ -26,6 +26,7 @@ import type {
   ToolRegistry,
 } from "../tools/types";
 import type { WorkerHandoff } from "./types";
+import { retrievalCacheDefaultsForMission } from "../tools/retrievalCachePolicy";
 import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
 import {
   selectInitialResearchEffort,
@@ -354,6 +355,7 @@ export async function runResearchWorker(input: {
       ...input.toolContext,
       runId: `${input.runId}-${input.participantId}`,
       originalPrompt: input.assignment,
+      retrievalCacheDefaults: input.toolContext.retrievalCacheDefaults ?? retrievalCacheDefaultsForMission(input.toolContext.originalPrompt),
       abortSignal: input.abortSignal,
       writeAutonomy: false,
       userApprovalGranted: false,
@@ -499,6 +501,7 @@ export async function runResearchWorker(input: {
               ...input.toolContext,
               runId: `${input.runId}-${input.participantId}`,
               originalPrompt: input.assignment,
+              retrievalCacheDefaults: input.toolContext.retrievalCacheDefaults ?? retrievalCacheDefaultsForMission(input.toolContext.originalPrompt),
               abortSignal: input.abortSignal,
               writeAutonomy: false,
               userApprovalGranted: false,
@@ -603,6 +606,7 @@ export async function runResearchWorker(input: {
               ...input.toolContext,
               runId: `${input.runId}-${input.participantId}`,
               originalPrompt: input.assignment,
+              retrievalCacheDefaults: input.toolContext.retrievalCacheDefaults ?? retrievalCacheDefaultsForMission(input.toolContext.originalPrompt),
               abortSignal: input.abortSignal,
               writeAutonomy: false,
               userApprovalGranted: false,

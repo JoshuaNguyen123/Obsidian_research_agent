@@ -18,17 +18,17 @@ export interface OfflineApplicationAttemptV1 {
   scorecardDimensions: OfflineScorecardDimensionV1[];
   artifactReadbacks: string[];
   failureClass: string;
-  cloudRequestCount: number;
-  safetyViolationCount: number;
-  duplicateMutationCount: number;
-  mutationsPerformed: number;
-  mutationsWithReceipts: number;
-  mutationEventsObserved: number;
-  toolEventsObserved: number;
-  toolEventsFailed: number;
-  modelCalls: number;
-  providerWaitMs: number;
-  durationMs: number;
+  cloudRequestCount: number | null;
+  safetyViolationCount: number | null;
+  duplicateMutationCount: number | null;
+  mutationsPerformed: number | null;
+  mutationsWithReceipts: number | null;
+  mutationEventsObserved: number | null;
+  toolEventsObserved: number | null;
+  toolEventsFailed: number | null;
+  modelCalls: number | null;
+  providerWaitMs: number | null;
+  durationMs: number | null;
 }
 
 export const OFFLINE_CORE_SCENARIO_IDS: readonly string[];
@@ -48,25 +48,27 @@ export function evaluateOfflineApplicationRelease(input: {
   requireCleanHead?: boolean;
 }): {
   version: 1;
+  semanticsVersion: 2;
   passed: boolean;
   failures: string[];
   expectedAttempts: number;
   observedAttempts: number;
   proofCompleteAttempts: number;
   applicationSuccessRate: number | null;
-  receiptCoverage: number;
-  toolContractFriction: number;
+  receiptCoverage: number | null;
+  toolContractFriction: number | null;
+  toolCountCoverage: number | null;
   releaseEligibleSource: boolean;
-  cloudRequests: number;
-  safetyViolations: number;
-  duplicateMutations: number;
-  mutations: number;
-  receiptedMutations: number;
-  mutationEvents: number;
-  toolEvents: number;
-  failedToolEvents: number;
-  modelCalls: number;
-  durationMs: number;
+  cloudRequests: number | null;
+  safetyViolations: number | null;
+  duplicateMutations: number | null;
+  mutations: number | null;
+  receiptedMutations: number | null;
+  mutationEvents: number | null;
+  toolEvents: number | null;
+  failedToolEvents: number | null;
+  modelCalls: number | null;
+  durationMs: number | null;
 };
 export function assertOfflineApplicationAttemptSummaryFile(input: {
   filePath: string;

@@ -346,6 +346,18 @@ export function createRunPlan({
     });
   }
 
+  if (speechAct.reasons.includes("catalog_read_request")) {
+    return plan({
+      route: "tool_required",
+      maxStepsForRun: capSteps(4),
+      thinking: undefined,
+      allowedTools: tools,
+      slowPathReason: "needs_model_planning",
+      expectedTimeClass: "normal",
+      traceReasons: ["catalog_read_request"],
+    });
+  }
+
   // Named Linear/GitHub Bound tools must not collapse into single-step note
   // writeback (maxSteps=1 / softOnly) — create + get + append need a tool loop.
   // Compound Linear→code→GitHub (or any code-shaped mission) must NOT take the

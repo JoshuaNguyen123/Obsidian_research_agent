@@ -120,10 +120,11 @@ export const NO_RUN_SUMMARY_SKIP_MESSAGE =
   "mission-scorecards: NO RUN SUMMARY — regression comparison skipped (baseline structure validated only)";
 
 export function parseMissionScorecardCliArgs(argv = process.argv.slice(2)) {
-  return { requireSummary: argv.includes("--require-summary") };
+  return { requireSummary: argv.includes("--require-summary"), baselineOnly: argv.includes("--baseline-only") };
 }
 
 export function formatMissionScorecardCliResult(result) {
+  if (result?.reason === "baseline_only") return "Mission scorecard baseline structure validated; no runtime comparison requested.";
   if (result?.reason === "no_run_summary") {
     return NO_RUN_SUMMARY_SKIP_MESSAGE;
   }
@@ -149,6 +150,11 @@ export async function assertMissionScorecardSummaryFile(options = {}) {
     options.baselinePath ?? DEFAULT_MISSION_SCORECARD_BASELINE_PATH,
   );
   const baseline = JSON.parse(await readFile(baselinePath, "utf8"));
+  if (options.baselineOnly) {
+    if (options.requireSummary || options.selectedProjects?.length) throw new Error("Baseline-only validation cannot substitute for a requested runtime comparison.");
+    validateBaseline(baseline);
+    return { checkedRecords: baseline.records.length, skipped: false, reason: "baseline_only" };
+  }
   const selectedProjects = new Set(
     (options.selectedProjects ?? [])
       .filter((value) => typeof value === "string" && value.trim())
@@ -570,8 +576,8 @@ if (
   process.argv[1] &&
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 ) {
-  const { requireSummary } = parseMissionScorecardCliArgs();
-  void assertMissionScorecardSummaryFile({ requireSummary })
+  const options = parseMissionScorecardCliArgs();
+  void assertMissionScorecardSummaryFile(options)
     .then((result) => {
       console.log(formatMissionScorecardCliResult(result));
     })

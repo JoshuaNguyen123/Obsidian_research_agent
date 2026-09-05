@@ -3,6 +3,16 @@ import { evaluateContinuousResearchRun } from "../orchestrator/continuousResearc
 
 export type MissionCadence = "hourly" | "daily" | "weekly";
 
+export interface ScheduleOccurrence {
+  id: string;
+  scheduledAt: string;
+  missionId: string;
+  status: "pending" | "settled";
+  retryAt?: string;
+  failures: number;
+  failureCode?: string;
+}
+
 export interface ScheduledMission {
   id: string;
   /** Human-readable label used by the settings schedule builder. */
@@ -21,6 +31,7 @@ export interface ScheduledMission {
   quietHours?: { startMinute: number; endMinute: number };
   consecutiveFailures?: number;
   lastSourceHashes?: Record<string, string>;
+  occurrence?: ScheduleOccurrence;
 }
 
 export function getDueMissions(
@@ -31,6 +42,7 @@ export function getDueMissions(
 }
 
 export class MissionScheduler {
+  private ticking = false;
   private intervalId: number | null = null;
   private readonly checkIntervalMs: number;
   private readonly onDue: (mission: ScheduledMission) => Promise<void>;
@@ -63,9 +75,11 @@ export class MissionScheduler {
   }
 
   async tick(now: Date): Promise<void> {
-    for (const mission of getDueMissions(this.getSchedules(), now)) {
-      await this.onDue(mission);
-    }
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      for (const mission of getDueMissions(this.getSchedules(), now)) await this.onDue(mission);
+    } finally { this.ticking = false; }
   }
 }
 
@@ -82,6 +96,9 @@ export function normalizeScheduledMissions(value: unknown): ScheduledMission[] {
 function isDue(mission: ScheduledMission, now: Date): boolean {
   if (!mission.enabled || !mission.prompt.trim()) {
     return false;
+  }
+  if (mission.occurrence?.status === "pending") {
+    return !mission.occurrence.retryAt || Date.parse(mission.occurrence.retryAt) <= now.getTime();
   }
 
   if (mission.mode === "continuous_research") {
@@ -114,25 +131,27 @@ function isDue(mission: ScheduledMission, now: Date): boolean {
     ).shouldRun;
   }
 
-  const lastRunAt = mission.lastRunAt ? Date.parse(mission.lastRunAt) : NaN;
-  const lastRun = Number.isFinite(lastRunAt) ? new Date(lastRunAt) : null;
-  const periodMs = getCadenceMs(mission.cadence);
-  if (lastRun && now.getTime() - lastRun.getTime() < periodMs) {
-    return false;
-  }
+  const due = latestScheduleOccurrenceAt(mission, now);
+  return due !== null && due.getTime() > Date.parse(mission.occurrence?.scheduledAt ?? mission.lastRunAt ?? "1970-01-01");
+}
 
-  if (mission.cadence === "hourly") {
-    return true;
-  }
+/** Local calendar arithmetic preserves the configured hour over DST and sleep. */
+export function latestScheduleOccurrenceAt(mission: ScheduledMission, now: Date): Date | null {
+  const due = new Date(now);
+  if (mission.cadence === "hourly") { due.setMinutes(0, 0, 0); return due; }
+  due.setHours(clampHour(mission.hourLocal), 0, 0, 0);
+  if (mission.cadence === "weekly") due.setDate(due.getDate() - (due.getDay() - clampWeekday(mission.weekday) + 7) % 7);
+  if (due > now) due.setDate(due.getDate() - (mission.cadence === "weekly" ? 7 : 1));
+  // A newly configured schedule starts at its next local slot; existing
+  // schedules coalesce missed slots into the latest one.
+  if (!mission.lastRunAt && !mission.occurrence && due.toDateString() !== now.toDateString()) return null;
+  return due;
+}
 
-  if (mission.cadence === "daily") {
-    return now.getHours() >= clampHour(mission.hourLocal);
-  }
-
-  return (
-    now.getDay() === clampWeekday(mission.weekday) &&
-    now.getHours() >= clampHour(mission.hourLocal)
-  );
+export function createScheduleOccurrence(mission: ScheduledMission, now: Date): ScheduleOccurrence {
+  const scheduledAt = (latestScheduleOccurrenceAt(mission, now) ?? now).toISOString();
+  const id = `${mission.id}:${scheduledAt}`;
+  return { id, scheduledAt, missionId: `scheduled-${encodeURIComponent(mission.id).replace(/%/g, "_")}-${Date.parse(scheduledAt)}`, status: "pending", failures: 0 };
 }
 
 function getCadenceMs(cadence: MissionCadence): number {
@@ -172,7 +191,18 @@ function normalizeScheduledMission(value: unknown): ScheduledMission | null {
     quietHours: normalizeQuietHours(value.quietHours),
     consecutiveFailures: Math.max(0, Math.trunc(getNumber(value.consecutiveFailures) ?? 0)),
     lastSourceHashes: getStringRecord(value.lastSourceHashes),
+    occurrence: normalizeScheduleOccurrence(value.occurrence),
   };
+}
+
+function normalizeScheduleOccurrence(value: unknown): ScheduleOccurrence | undefined {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.missionId !== "string" ||
+      !/^[A-Za-z0-9._-]{1,180}$/.test(value.missionId) || typeof value.scheduledAt !== "string" ||
+      !Number.isFinite(Date.parse(value.scheduledAt)) || (value.status !== "pending" && value.status !== "settled")) return undefined;
+  return { id: value.id, missionId: value.missionId, scheduledAt: value.scheduledAt, status: value.status,
+    failures: Math.max(0, Math.trunc(getNumber(value.failures) ?? 0)),
+    retryAt: typeof value.retryAt === "string" && Number.isFinite(Date.parse(value.retryAt)) ? value.retryAt : undefined,
+    failureCode: getString(value.failureCode) };
 }
 
 function getCadence(value: unknown): MissionCadence | null {

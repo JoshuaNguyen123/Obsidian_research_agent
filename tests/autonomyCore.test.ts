@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -252,6 +253,9 @@ function createCheckpointContext() {
           fileMtimes.set(path, ++mtime);
         },
         read: async (file: { path: string }) => files.get(file.path) ?? "",
+        process: function (file: any, transform: (content: string) => string): Promise<string> {
+          return processTestVaultFile(this, file, transform);
+        },
         modify: async (file: { path: string }, content: string) => {
           files.set(file.path, content);
           fileMtimes.set(file.path, ++mtime);

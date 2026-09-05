@@ -2,18 +2,18 @@ import { expect, test } from "@playwright/test";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { Server } from "node:http";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { createOfflineAgentBackendV1 } from "./fixtures/offlineAgentBackend";
 import { startRealAiHarness } from "./fixtures/realAiHarness";
+import { beginOfflineAttempt, saveOfflineAttempt, observeOfflineTools, readOfflineToolCounts, boundedOfflineRead } from "./fixtures/offlineEvidence";
 
 const execFileAsync = promisify(execFile);
 const OFFLINE_BASE_URL = "http://127.0.0.1:7331/v1";
 const OFFLINE_TOKEN = "offline-e2e-ephemeral-token";
-const SUMMARY_PATH = path.join("test-results", "offline-application-attempts.json");
 
 test.describe("zero-cloud installed production client", () => {
   test.skip(
@@ -37,6 +37,10 @@ test.describe("zero-cloud installed production client", () => {
     let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
     const cloudModelRequests: string[] = [];
     const startedAt = Date.now();
+    const identity = await currentBuildIdentity();
+    let modelCallsBefore = backend.snapshot().requestCount;
+    let attempt = beginOfflineAttempt(identity, "chat_only");
+    await saveOfflineAttempt(attempt);
     try {
       await listen(bridge, 7331);
       harness = await startRealAiHarness(
@@ -61,6 +65,7 @@ test.describe("zero-cloud installed production client", () => {
       harness.page.on("request", (request) => {
         if (isKnownCloudModelUrl(request.url())) cloudModelRequests.push(request.url());
       });
+      await observeOfflineTools(harness.page);
       const marker = `OFFLINE_CHAT_${harness.marker.replace(/[^A-Z0-9_]/giu, "_").toUpperCase()}`;
       await harness.submitMission(
         `Answer in chat only with exactly ${marker}. Do not read or write notes and do not use tools.`,
@@ -98,7 +103,21 @@ test.describe("zero-cloud installed production client", () => {
 
       const chatCompletedAt = Date.now();
       const chatModelCalls = backend.snapshot().requestCount;
+      const chatCounts = await readOfflineToolCounts(harness.page);
+      expect(chatCounts).toEqual({ toolEventsObserved: 0, toolEventsFailed: 0 });
+      attempt = validateOfflineApplicationAttempt({
+        ...attempt, status: "passed", acceptanceStatus: "not_applicable", failureClass: "none", failureDetail: "",
+        artifactReadbacks: [`chat:${marker}`], cloudRequestCount: cloudModelRequests.length,
+        safetyViolationCount: 0, duplicateMutationCount: 0, mutationsPerformed: 0,
+        mutationsWithReceipts: 0, mutationEventsObserved: 0, ...chatCounts,
+        modelCalls: chatModelCalls, providerWaitMs: 0, durationMs: chatCompletedAt - startedAt,
+      });
+      await saveOfflineAttempt(attempt);
       await harness.close();
+      harness = null;
+      attempt = beginOfflineAttempt(identity, "current_note_append");
+      modelCallsBefore = backend.snapshot().requestCount;
+      await saveOfflineAttempt(attempt);
       harness = await startRealAiHarness(
         "offline-core-append",
         {
@@ -121,6 +140,7 @@ test.describe("zero-cloud installed production client", () => {
       harness.page.on("request", (request) => {
         if (isKnownCloudModelUrl(request.url())) cloudModelRequests.push(request.url());
       });
+      await observeOfflineTools(harness.page);
       const beforeAppend = await harness.readNote();
       const appendStartedAt = Date.now();
       const appendMarker = `OFFLINE_APPEND_${harness.marker.replace(/[^A-Z0-9_]/giu, "_").toUpperCase()}`;
@@ -175,90 +195,66 @@ test.describe("zero-cloud installed production client", () => {
       expect(bridgeMetrics.requestCount).toBeGreaterThanOrEqual(3);
       expect(bridgeMetrics.emittedToolCalls).toBeGreaterThanOrEqual(1);
 
-      const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"]);
-      const { stdout: porcelain } = await execFileAsync(
-        "git",
-        ["status", "--porcelain=v1", "--untracked-files=all"],
-      );
-      const bundleSha256 = await sha256File(path.resolve("main.js"));
-      const installedBundleSha256 = await sha256File(resolveInstalledMainPath());
-      const identity = {
-        exactHead: stdout.trim(),
-        sourceState: porcelain.trim() ? "dirty_worktree" : "clean_head",
-        bundleSha256,
-        installedBundleSha256,
-      } as const;
-      expect(installedBundleSha256).toBe(bundleSha256);
-      const chatAttempt = validateOfflineApplicationAttempt({
-        version: 1,
-        scenarioId: "chat_only",
-        repetition: 1,
-        ...identity,
-        status: "passed",
-        acceptanceStatus: "not_applicable",
-        scorecardAcceptancePassed: false,
-        scorecardTotal: null,
-        scorecardDimensions: [],
-        artifactReadbacks: [`chat:${marker}`],
-        failureClass: "none",
-        cloudRequestCount: cloudModelRequests.length,
-        safetyViolationCount: 0,
-        duplicateMutationCount: 0,
-        mutationsPerformed: 0,
-        mutationsWithReceipts: 0,
-        mutationEventsObserved: 0,
-        toolEventsObserved: 0,
-        toolEventsFailed: 0,
-        modelCalls: bridgeMetrics.requestCount,
-        providerWaitMs: 0,
-        durationMs: chatCompletedAt - startedAt,
-      });
-      const appendAttempt = validateOfflineApplicationAttempt({
+      const scorecard = appendSnapshot.lastMissionScorecard;
+      attempt = validateOfflineApplicationAttempt({
+        ...attempt,
         version: 1,
         scenarioId: "current_note_append",
         repetition: 1,
         ...identity,
         status: "passed",
         acceptanceStatus: "pass",
-        scorecardAcceptancePassed: true,
-        scorecardTotal: 1,
-        scorecardDimensions: [
-          { id: "artifact_correctness", score: 1 },
-          { id: "receipt_coverage", score: 1 },
-          { id: "mutation_uniqueness", score: 1 },
-        ],
+        scorecardAcceptancePassed: scorecard?.acceptancePassed === true,
+        scorecardTotal: typeof scorecard?.total === "number" ? scorecard.total : null,
+        scorecardDimensions: (scorecard?.dimensions ?? []).map((dimension: any) => ({ id: dimension.id, score: dimension.score })),
         artifactReadbacks: [
           `note:${harness.notePath}:${appendMarker}`,
           `receipt:${appendReceipts[0].toolName}:${appendReceipts[0].operation}`,
         ],
         failureClass: "none",
+        failureDetail: "",
         cloudRequestCount: cloudModelRequests.length,
         safetyViolationCount: 0,
         duplicateMutationCount: 0,
         mutationsPerformed: 1,
         mutationsWithReceipts: appendReceipts.length,
         mutationEventsObserved: 1,
-        toolEventsObserved: appendLedger.expectedTools.length,
-        toolEventsFailed: 0,
+        ...await readOfflineToolCounts(harness.page),
         modelCalls: Math.max(0, bridgeMetrics.requestCount - chatModelCalls),
         providerWaitMs: 0,
         durationMs: Date.now() - appendStartedAt,
       });
       expect(cloudModelRequests).toEqual([]);
-      await writeFile(
-        SUMMARY_PATH,
-        `${JSON.stringify({
-          version: 1,
-          attempts: [chatAttempt, appendAttempt],
-        }, null, 2)}\n`,
-        "utf8",
-      );
+      await saveOfflineAttempt(attempt);
+    } catch (error) {
+      attempt.failureDetail = error instanceof Error ? error.message : String(error);
+      if (attempt.status === "passed") attempt.failureClass = "harness:scenario_after_acceptance";
+      attempt.status = "failed";
+      await saveOfflineAttempt(attempt);
+      throw error;
     } finally {
+      attempt.durationMs = Date.now() - Date.parse(attempt.startedAt);
+      attempt.cloudRequestCount = cloudModelRequests.length;
+      attempt.modelCalls = Math.max(0, backend.snapshot().requestCount - modelCallsBefore);
+      if (harness) {
+        Object.assign(attempt, await readOfflineToolCounts(harness.page));
+        await boundedOfflineRead(harness.page.evaluate(() => { (window as any).__offlineUnsubscribe?.(); }));
+      }
+      await saveOfflineAttempt(attempt);
       await harness?.close();
       await close(bridge);
     }
   });
 });
+
+async function currentBuildIdentity() {
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"]);
+  const { stdout: porcelain } = await execFileAsync("git", ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const bundleSha256 = await sha256File(path.resolve("main.js"));
+  const installedBundleSha256 = await sha256File(resolveInstalledMainPath());
+  expect(installedBundleSha256).toBe(bundleSha256);
+  return { exactHead: stdout.trim(), sourceState: porcelain.trim() ? "dirty_worktree" : "clean_head", bundleSha256, installedBundleSha256 };
+}
 
 function isKnownCloudModelUrl(value: string): boolean {
   try {

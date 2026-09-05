@@ -115,6 +115,8 @@ export interface DurableMissionManifestV1 {
   missionId: string;
   rootMissionId: string;
   prompt: string;
+  /** Host schedule identity for scoped grants; independent of segment/action ids. */
+  scheduleId?: string;
   status: DurableMissionStatus;
   policy: DurableMissionPolicy;
   createdAt: string;
@@ -358,6 +360,7 @@ export function normalizeDurableMissionManifest(
     revision,
     missionId,
     rootMissionId,
+    ...(typeof value.scheduleId === "string" && value.scheduleId.trim() ? { scheduleId: value.scheduleId.trim() } : {}),
     prompt,
     status,
     policy,
@@ -665,6 +668,7 @@ export function getDurableMissionBudgetExhaustionReason(
 export function getDurableMissionRecoverability(
   manifest: DurableMissionManifestV1,
   now: Date = new Date(),
+  leaseOwnerId?: string,
 ): DurableMissionRecoverability {
   if (hasDurableMissionDeadlineElapsed(manifest, now)) {
     return { recoverable: false, reason: "deadline_elapsed" };
@@ -689,7 +693,7 @@ export function getDurableMissionRecoverability(
   if (manifest.reconciliation.status !== "clean") {
     return { recoverable: false, reason: "unsafe_reconciliation" };
   }
-  if (isDurableMissionLeaseLive(manifest.lease, now)) {
+  if (isDurableMissionLeaseLive(manifest.lease, now) && manifest.lease?.ownerId !== leaseOwnerId) {
     return { recoverable: false, reason: "live_lease" };
   }
   if (isDurableMissionRetryExhausted(manifest.retry, manifest.policy)) {

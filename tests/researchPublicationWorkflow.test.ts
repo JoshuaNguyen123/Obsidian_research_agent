@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 
 import type { ActionReceipt, PreparedAction } from "../src/agent/actions";
 import { sha256DiagramContent } from "../src/design/diagramArtifactStore";
@@ -819,6 +820,9 @@ function assertOrdered(
 }
 
 class ResearchVault {
+  process(file: { path: string }, transform: (content: string) => string): Promise<string> {
+    return processTestVaultFile(this, file, transform);
+  }
   readonly files = new Map<string, string>();
   readonly folders = new Set(["Research", ".agent-backups"]);
   readonly adapterFiles = new Map<string, string>();

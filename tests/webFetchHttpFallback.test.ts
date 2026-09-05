@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { HttpRequest, HttpResponse } from "../src/model/types";
@@ -41,6 +42,9 @@ function createWebContext(
       create: async (path: string, data: string) => {
         content.set(path, data);
         return getFile(path);
+      },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
       },
       modify: async (file: { path: string }, data: string) => {
         content.set(file.path, data);

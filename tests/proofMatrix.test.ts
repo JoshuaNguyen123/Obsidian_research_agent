@@ -375,7 +375,7 @@ test("attempt log excerpt keeps the lines around the failure and stays bounded",
 test("harness and process deaths are infrastructure; real reds are not", () => {
   assert.equal(isInfrastructureFailureClass("harness:build_failed"), true);
   assert.equal(isInfrastructureFailureClass("harness:e2e_lock_timeout"), true);
-  assert.equal(isInfrastructureFailureClass("process:matrix_unclassified"), true);
+  assert.equal(isInfrastructureFailureClass("process:matrix_unclassified"), false);
   assert.equal(isInfrastructureFailureClass("product:writeback_unproven"), false);
   assert.equal(isInfrastructureFailureClass("model:refusal"), false);
   assert.equal(isInfrastructureFailureClass("external:linear_api_down"), false);

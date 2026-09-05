@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -693,6 +694,9 @@ function createMockContext(options: {
       },
       read: async (file: { path: string }) => content.get(file.path) ?? "",
       cachedRead: async (file: { path: string }) => content.get(file.path) ?? "",
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
+      },
       modify: async (file: { path: string }, data: string) => {
         operations.push(`modify:${file.path}`);
         content.set(file.path, data);

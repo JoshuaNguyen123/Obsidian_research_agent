@@ -5,6 +5,7 @@ import {
   SOURCE_CACHE_MAX_AGE_MS,
   readSourceCacheJsonFile,
   updateSourceCacheJsonFile,
+  resolveSourceCacheMissionId,
 } from "./sourceCache";
 
 /**
@@ -17,8 +18,8 @@ import {
  * query, the index the search addressed, and the result count, and is
  * bounded: the newest {@link SEARCH_CACHE_MAX_ENTRIES} searches survive, an
  * entry is fresh for the same 24 hours a fetched source is, and freshness-
- * sensitive prompts or an explicit `refresh` bypass it exactly as `web_fetch`
- * does.
+ * sensitive missions or an explicit `refresh` require current mission ownership
+ * while allowing reuse within the age limit. `max_age_ms: 0` always bypasses.
  *
  * Writes go through the source cache's serialized write path, so a search
  * cache write is cache maintenance under the same folder — never a note
@@ -51,6 +52,7 @@ export interface CachedWebSearch {
   index: string;
   maxResults: number;
   searchedAt: string;
+  searchedForMission?: string;
   results: CachedWebSearchResult[];
 }
 
@@ -69,6 +71,7 @@ export interface SearchCacheLookup {
 export interface SearchCacheReadOptions {
   maxAgeMs?: number;
   refresh?: boolean;
+  missionId?: string;
 }
 
 /**
@@ -95,7 +98,7 @@ export async function findFreshCachedSearch(
   options: SearchCacheReadOptions = {},
 ): Promise<CachedWebSearch | null> {
   const maxAgeMs = normalizeMaxAgeMs(options.maxAgeMs);
-  if (options.refresh || maxAgeMs <= 0 || !hasSearchCacheVault(ctx)) {
+  if (maxAgeMs <= 0 || !hasSearchCacheVault(ctx) || (options.refresh && !options.missionId?.trim())) {
     return null;
   }
   if (!normalizeSearchQuery(input.query)) {
@@ -108,6 +111,7 @@ export async function findFreshCachedSearch(
     if (!entry || entry.results.length === 0) {
       return null;
     }
+    if (options.refresh && entry.searchedForMission !== options.missionId?.trim()) return null;
     const age = nowMs(ctx) - Date.parse(entry.searchedAt);
     if (!Number.isFinite(age) || age < 0 || age > maxAgeMs) {
       return null;
@@ -145,6 +149,7 @@ export async function writeSearchCacheEntry(
     index: normalizeIndex(input.index),
     maxResults: normalizeMaxResults(input.maxResults),
     searchedAt,
+    searchedForMission: resolveSourceCacheMissionId(ctx),
     results,
   };
   try {
@@ -259,6 +264,8 @@ function normalizeCachedSearch(value: unknown): CachedWebSearch | null {
     index,
     maxResults,
     searchedAt: value.searchedAt,
+    ...(typeof value.searchedForMission === "string" && value.searchedForMission.trim()
+      ? { searchedForMission: value.searchedForMission.trim() } : {}),
     results,
   };
 }

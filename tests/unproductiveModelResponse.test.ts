@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
@@ -535,6 +536,9 @@ function createRunHarness() {
       create: async (path: string, content: string) => {
         files.set(path, content);
         return createFile(path);
+      },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
       },
       modify: async (file: { path: string }, content: string) => {
         files.set(file.path, content);

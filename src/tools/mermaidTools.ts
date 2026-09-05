@@ -29,6 +29,7 @@ import type {
 } from "./types";
 import { ToolExecutionError } from "./types";
 import { getRequiredString, isRecord, normalizeVaultPath } from "./validation";
+import { hasMermaidCreateIntent } from "../agent/codeDesignIntent";
 
 /** Create ("add a mermaid flowchart") and revise share this mutation gate. */
 const MERMAID_MUTATION_INTENT =
@@ -196,7 +197,7 @@ async function prepareMermaidUpsert(
   context: ToolExecutionContext,
 ): Promise<PreparedActionResult> {
   try {
-    if (!MERMAID_MUTATION_INTENT.test(context.originalPrompt)) {
+    if (!MERMAID_MUTATION_INTENT.test(context.originalPrompt) && !hasMermaidCreateIntent(context.originalPrompt)) {
       throw new ToolExecutionError(
         "intent_required",
         "upsert_mermaid_block requires explicit Mermaid diagram insertion or edit intent.",

@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -324,6 +325,9 @@ function createLedgerWriteContext(stamp: {
           files.set(path, content);
         },
         read: async (file: { path: string }) => files.get(file.path) ?? "",
+        process: function (file: any, transform: (content: string) => string): Promise<string> {
+          return processTestVaultFile(this, file, transform);
+        },
         modify: async (file: { path: string }, content: string) => {
           files.set(file.path, content);
         },

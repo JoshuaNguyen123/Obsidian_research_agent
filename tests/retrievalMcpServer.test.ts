@@ -61,6 +61,23 @@ function dependencies(
   };
 }
 
+test("refresh exposes newly created notes and changed metadata between requests", async () => {
+  const fixture = await vaultFixture("refresh");
+  try {
+    const adapter = new ReadOnlyVaultAdapterV1(fixture.root);
+    const app = adapter.asApp();
+    assert.equal(app.vault.getFileByPath("Notes/new.md"), null);
+    await writeFile(path.join(fixture.root, "Notes", "new.md"), "A new searchable note.");
+    adapter.refresh();
+    const file = app.vault.getFileByPath("Notes/new.md");
+    assert.ok(file);
+    assert.equal(await app.vault.read(file), "A new searchable note.");
+    await writeFile(path.join(fixture.root, "Notes", "new.md"), "Changed bytes and metadata.");
+    adapter.refresh();
+    assert.notEqual(app.vault.getFileByPath("Notes/new.md")?.stat.size, file.stat.size);
+  } finally { await fixture.cleanup(); }
+});
+
 test("the vault listing never exposes dotfolders", async () => {
   const fixture = await vaultFixture("dotfolders");
   try {

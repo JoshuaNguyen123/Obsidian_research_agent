@@ -244,6 +244,19 @@ export function hasCitationVerifyResolveOfferIntent(prompt: string): boolean {
   );
 }
 
+/** Explicit catalog reads shared by routing and deterministic graph seeding. */
+export function getRequestedResearchCatalogReadTools(prompt: string): string[] {
+  const actionClause = "(?:^|[.!?]\\s*|\\bplease\\s+)";
+  if (hasDatasetAnalysisIntent(prompt) && new RegExp(`${actionClause}analy[sz]e\\b`, "iu").test(prompt)) {
+    return ["analyze_dataset"];
+  }
+  if (hasCitationWorkIntent(prompt) && new RegExp(`${actionClause}(?:verify|check|resolve|look up)\\b`, "iu").test(prompt)) {
+    const tool = /\b(?:resolve|look up)\b/iu.test(prompt) ? "resolve_citation" : "verify_citation";
+    return /\b(?:this|current|active) note\b/iu.test(prompt) ? ["read_current_file", tool] : [tool];
+  }
+  return [];
+}
+
 export function hasOpenWebSourceIntent(prompt: string): boolean {
   return /\b(open|view|show|launch)\b[\s\S]{0,120}\b(source|sources|link|url|web|browser|reference|citation|page)\b|\b(source|sources|link|url|web\s+page|reference|citation|page)\b[\s\S]{0,120}\b(open|view|show|launch)\b/i.test(
     prompt,

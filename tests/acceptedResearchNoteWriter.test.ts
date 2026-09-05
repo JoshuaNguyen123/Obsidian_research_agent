@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 
 import {
   AcceptedResearchNoteWriter,
@@ -690,6 +691,9 @@ function packageFixture(): AcceptedResearchNotePackageV1 {
 }
 
 class ResearchVault {
+  process(file: { path: string }, transform: (content: string) => string): Promise<string> {
+    return processTestVaultFile(this, file, transform);
+  }
   readonly files = new Map<string, string>();
   readonly folders = new Set(["Research", ".agent-backups"]);
   readonly adapterFiles = new Map<string, string>();

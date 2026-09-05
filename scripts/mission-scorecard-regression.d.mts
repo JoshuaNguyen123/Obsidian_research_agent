@@ -35,6 +35,7 @@ export const NO_RUN_SUMMARY_SKIP_MESSAGE: string;
 
 export function parseMissionScorecardCliArgs(argv?: string[]): {
   requireSummary: boolean;
+  baselineOnly: boolean;
 };
 
 export function formatMissionScorecardCliResult(
@@ -47,6 +48,7 @@ export function assertMissionScorecardSummaryFile(options?: {
   selectedProjects?: string[];
   executedTests?: Array<{ project: string; file: string; title: string }>;
   requireSummary?: boolean;
+  baselineOnly?: boolean;
 }): Promise<MissionScorecardRegressionResult>;
 
 export function baselineRecordIsCurrent(record: unknown): boolean;

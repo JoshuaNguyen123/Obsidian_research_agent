@@ -3442,8 +3442,8 @@ export class AgentSettingTab extends PluginSettingTab {
       }
 
       new Setting(card)
-        .setName("Output note (optional)")
-        .setDesc("Vault-relative Markdown path. Leave blank to let the mission choose its normal output.")
+        .setName("Output note")
+        .setDesc("Vault-relative Markdown path. Required for current-note writes and delivery workflows; a schedule never inherits the focused note.")
         .addText((text) =>
           text
             .setPlaceholder("Research/Daily review.md")

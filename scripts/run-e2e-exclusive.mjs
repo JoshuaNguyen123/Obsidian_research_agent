@@ -4,6 +4,7 @@ import {
   mkdir,
   open,
   readFile,
+  writeFile,
   stat,
   unlink,
 } from "node:fs/promises";
@@ -295,15 +296,24 @@ async function main() {
   let completedPipelineExitCode = null;
   let finalRunExitCode = null;
   try {
-    if (aiMode === "offline") {
-      await unlink(OFFLINE_ATTEMPT_SUMMARY_PATH).catch((error) => {
-        if (error?.code !== "ENOENT") throw error;
-      });
-    }
     activeLock = await acquireE2eLock({
       playwrightArgs,
       isCancelled: () => Boolean(interruptedSignal),
     });
+    if (aiMode === "offline") {
+      // Reset only after owning the host, and retain the previous lane's
+      // evidence outside Playwright's disposable output directory.
+      const previous = await readFile(OFFLINE_ATTEMPT_SUMMARY_PATH).catch((error) => {
+        if (error?.code !== "ENOENT") throw error;
+        return null;
+      });
+      if (previous) {
+        const historyRoot = path.join(repoRoot, "docs", "eval", "offline-attempt-history");
+        await mkdir(historyRoot, { recursive: true });
+        await writeFile(path.join(historyRoot, `lane-${runStartedAt}-${randomUUID()}.json`), previous, { flag: "wx" });
+        await unlink(OFFLINE_ATTEMPT_SUMMARY_PATH);
+      }
+    }
     console.log(
       process.env.CI
         ? "Acquired exclusive Obsidian e2e lock."

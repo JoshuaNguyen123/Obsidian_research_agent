@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildHostMissionGraphPlanV1 } from "../src/agent/missionGraphHost";
@@ -4227,6 +4228,9 @@ function createVaultHarness(): {
       return getFile(path);
     },
     read: async (file: { path: string }) => files.get(file.path) ?? "",
+    process: function (file: any, transform: (content: string) => string): Promise<string> {
+      return processTestVaultFile(this, file, transform);
+    },
     modify: async (file: { path: string }, content: string) => {
       if (!files.has(file.path)) throw new Error(`Missing file: ${file.path}`);
       files.set(file.path, content);

@@ -334,6 +334,7 @@ export interface MissionRuntimeSnapshotV2 {
   revision: number;
   runId: string;
   originalMission: string;
+  retrievalCacheDefaults?: import("../tools/retrievalCachePolicy").RetrievalCacheDefaults;
   currentNotePath?: string;
   /** Host-allocated destination for automatic new-note output. */
   outputTargetPath?: string;
@@ -648,6 +649,7 @@ export interface LatestIncompleteMissionRuntimeSnapshot
 export interface CreateMissionRuntimeSnapshotInput {
   runId: string;
   originalMission: string;
+  retrievalCacheDefaults?: import("../tools/retrievalCachePolicy").RetrievalCacheDefaults;
   currentNotePath?: string | null;
   outputTargetPath?: string | null;
   rootRunId?: string;
@@ -682,6 +684,7 @@ export interface CreateMissionRuntimeSnapshotInput {
 export function createMissionRuntimeSnapshot({
   runId,
   originalMission,
+  retrievalCacheDefaults,
   currentNotePath,
   outputTargetPath,
   rootRunId = runId,
@@ -728,6 +731,7 @@ export function createMissionRuntimeSnapshot({
     revision: normalizeNonNegativeInteger(revision),
     runId,
     originalMission,
+    ...(retrievalCacheDefaults ? { retrievalCacheDefaults: { ...retrievalCacheDefaults } } : {}),
     currentNotePath: normalizeCurrentNotePath(currentNotePath),
     outputTargetPath: normalizeCurrentNotePath(outputTargetPath),
     lineage: {
@@ -836,6 +840,8 @@ export function normalizeMissionRuntimeSnapshot(
     revision: normalizeNonNegativeInteger(value.revision),
     runId,
     originalMission,
+    ...(isRecord(value.retrievalCacheDefaults) && typeof value.retrievalCacheDefaults.refresh === "boolean"
+      ? { retrievalCacheDefaults: { refresh: value.retrievalCacheDefaults.refresh } } : {}),
     currentNotePath: normalizeCurrentNotePath(value.currentNotePath),
     outputTargetPath: normalizeCurrentNotePath(value.outputTargetPath),
     lineage,

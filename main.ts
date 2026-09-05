@@ -244,6 +244,7 @@ import {
 } from "./src/agent/durableMission";
 import {
   listDurableMissionManifests,
+  readDurableMissionManifestById,
   writeDurableMissionManifest,
 } from "./src/agent/durableMissionStore";
 import { reduceDurableMissionTransition } from "./src/agent/durableMissionSupervisor";
@@ -268,6 +269,7 @@ import {
 import { buildDurableOutcomeFromAgentRunner } from "./src/agent/agentRunnerDurableAdapter";
 import { seedDurableChildRun } from "./src/agent/durableChildSeed";
 import { planDurableResumeScan } from "./src/agent/durableResumeSelection";
+import { prepareScheduledDispatch, scheduledPreparedAuthority, evaluateScheduledPreflight, bindScheduledNoteContext } from "./src/agent/scheduledDispatch";
 import {
   buildOperationReconciliationInputs,
   isBackgroundCodeCommitProofVerifiedV1,
@@ -11809,13 +11811,14 @@ export default class AgenticResearcherPlugin extends Plugin {
   private createDurableMission(
     prompt: string,
     durationHours: number,
+    missionId?: string,
   ): DurableMissionManifestV1 {
     const maxSegments = Math.min(
       24,
       Math.max(1, Math.floor(this.settings.overnightMaxSegments ?? 24)),
     );
     return createDurableMissionManifest({
-      missionId: `overnight-${createAgentRunId()}`,
+      missionId: missionId ?? `overnight-${createAgentRunId()}`,
       prompt,
       durationHours,
       currentNotePath: this.getCurrentMarkdownFile()?.path ?? null,
@@ -11864,8 +11867,10 @@ export default class AgenticResearcherPlugin extends Plugin {
             ? `continue run ${continuationRunId}`
             : current.prompt;
           const segmentRunId = createAgentRunId();
-          const baseToolContext =
-            this.createToolExecutionContext(segmentPrompt);
+          const unboundToolContext = this.createToolExecutionContext(segmentPrompt);
+          const baseToolContext = current.scheduleId
+            ? bindScheduledNoteContext(unboundToolContext, current)
+            : unboundToolContext;
           await seedDurableChildRun(baseToolContext, {
             childRunId: segmentRunId,
             rootMissionId: current.rootMissionId,
@@ -12009,6 +12014,10 @@ export default class AgenticResearcherPlugin extends Plugin {
               approvalBroker: this.approvalBroker,
               backgroundContinuation: this.createBackgroundMissionDispatchPort(),
               maxToolCalls: runtimeOptions.remaining.toolCalls,
+              ...(current.scheduleId ? {
+                interactiveApprovals: false,
+                ...(this.authorityGrantStore ? { preparedActionAuthority: scheduledPreparedAuthority(current.scheduleId, this.authorityGrantStore) } : {}),
+              } : {}),
               forceChatOnly,
               events: segmentEvents,
             });
@@ -12187,7 +12196,36 @@ export default class AgenticResearcherPlugin extends Plugin {
       const previousContinuousSourceHashes = {
         ...(mission.lastSourceHashes ?? {}),
       };
-      const conversationHistory = [...this.conversationHistory];
+      const context = this.createToolExecutionContext(prompt);
+      const durableManifest = await prepareScheduledDispatch(mission, {
+        now: new Date(), saveSchedule: () => this.saveSettings(),
+        readMission: async (id) => (await readDurableMissionManifestById(context, id))?.manifest ?? null,
+        createMission: (id) => {
+          const manifest = this.createDurableMission(prompt, this.settings.overnightRunHours ?? 10, id);
+          manifest.scheduleId = mission.id;
+          manifest.currentNotePath = mission.targetNotePath?.trim() || undefined;
+          return manifest;
+        },
+        saveMission: async (manifest) => {
+          const result = await writeDurableMissionManifest(context, manifest);
+          if (!result) throw new Error("Scheduled mission could not be persisted before launch.");
+          manifest.revision = result.revision;
+        },
+      });
+      if (["complete", "cancelled", "expired", "blocked"].includes(durableManifest.status)) {
+        if (mission.occurrence) mission.occurrence.status = "settled";
+        mission.lastRunAt = durableManifest.updatedAt;
+        mission.lastRunId = durableManifest.lineage.currentSegmentId ?? null;
+        await this.saveSettings();
+        return;
+      }
+      // Recheck current bindings and expiring authority on every dispatch,
+      // including an occurrence whose manifest survived a restart.
+      const preflight = evaluateScheduledPreflight({ manifest: durableManifest, readiness: this.getCapabilityReadiness(),
+        noteExists: Boolean(durableManifest.currentNotePath && this.app.vault.getFileByPath(durableManifest.currentNotePath)?.extension === "md"),
+        repositoryProfiles: Object.keys(this.repositoryProfileRegistry.profiles), store: this.authorityGrantStore });
+      if (!preflight.ok) throw Object.assign(new Error(preflight.blockers.join(" ")), { code: "scheduled_preflight_blocked" });
+      new Notice(`Scheduled mission authorized within existing limits. ${preflight.authorization.map((grant) => `${grant.remainingActions} actions until ${grant.expiresAt}`).join("; ")}`);
       try {
         await this.appendConversationMessage({ role: "user", content: prompt });
       } catch (error) {
@@ -12196,11 +12234,15 @@ export default class AgenticResearcherPlugin extends Plugin {
           error,
         );
       }
-      const outcome = await this.runMission(prompt, conversationHistory);
+      const outcome = await this.runMission(durableManifest.prompt, [], { durableManifest });
       const completedAt = new Date().toISOString();
       mission.lastRunAt = completedAt;
       mission.lastRunId = outcome.runId;
       mission.lastOutcome = outcome.stopReason;
+      const persisted = await readDurableMissionManifestById(context, durableManifest.missionId);
+      if (mission.occurrence && persisted && ["complete", "cancelled", "expired", "blocked", "paused_for_approval"].includes(persisted.manifest.status)) {
+        mission.occurrence.status = "settled";
+      }
       if (mission.mode === "continuous_research") {
         const terminalSucceeded =
           outcome.stopReason === "final" ||
@@ -12272,12 +12314,19 @@ export default class AgenticResearcherPlugin extends Plugin {
       }
       await this.saveSettings();
     } catch (error) {
+      if (mission.occurrence) {
+        mission.occurrence.failures += 1;
+        mission.occurrence.failureCode = error instanceof Error && "code" in error ? String(error.code) : "scheduled_launch_failed";
+        mission.occurrence.retryAt = new Date(Date.now() + Math.min(15 * 60_000, 30_000 * 2 ** Math.min(5, mission.occurrence.failures - 1))).toISOString();
+        await this.saveSettings().catch(() => undefined);
+      }
       if (mission.mode === "continuous_research") {
         mission.lastRunAt = new Date().toISOString();
         mission.consecutiveFailures = (mission.consecutiveFailures ?? 0) + 1;
         await this.saveSettings().catch(() => undefined);
       }
       console.warn(`Scheduled mission ${mission.id} failed to run.`, error);
+      if (mission.occurrence?.failures === 1) new Notice(`Scheduled mission paused: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.scheduledRunActive = false;
     }

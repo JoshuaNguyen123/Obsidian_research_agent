@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 /**
  * How wide is the offered frontier on a real compound mission, and is that
  * width a defect?
@@ -599,6 +600,9 @@ function createVaultHarness(): {
       return getFile(path);
     },
     read: async (file: { path: string }) => files.get(file.path) ?? "",
+    process: function (file: any, transform: (content: string) => string): Promise<string> {
+      return processTestVaultFile(this, file, transform);
+    },
     modify: async (file: { path: string }, content: string) => {
       files.set(file.path, content);
     },

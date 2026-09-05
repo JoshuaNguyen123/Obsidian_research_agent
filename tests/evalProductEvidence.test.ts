@@ -15,8 +15,11 @@ import {
   pythonProductEvidenceSource,
   runRowIsGreen,
   runRowIsInfrastructure,
+  runRowMeasuresProduct,
   summarizeRunRows,
   toRunRow,
+  optionalCount,
+  summarizeToolCounts,
 } from "../scripts/product-evidence.mjs";
 import {
   RUN_CSV_HEADER,
@@ -64,6 +67,18 @@ const HARNESS_ROW = {
 
 const rowsOf = (csv: string) => csvRecords(csv).map(toRunRow);
 
+test("partial failures cannot become green and unknown counts cannot become zero", () => {
+  assert.equal(runRowIsGreen(toRunRow({ mission_outcome: "stages_1-2-7_passed_stage4_failed", primary_failure_class: "product:describer_crash_on_id_only_mutation" })), false);
+  for (const fields of [{ acceptance_status: "needs_more_work" }, { scorecard_acceptance_passed: "false" }, { artifact_proof_count: "0" }]) {
+    assert.equal(runRowIsGreen(toRunRow({ ...GREEN_ROW, ...fields })), false);
+  }
+  assert.equal(partitionRunRows([toRunRow({ primary_failure_class: "process:matrix_unclassified" })]).unresolved.length, 1);
+  assert.equal(runRowIsGreen(toRunRow({ mission_outcome: "passed" })), false);
+  assert.deepEqual(summarizeToolCounts([
+    { toolEvents: 100, toolFailed: 4 }, { toolEvents: 80, toolFailed: optionalCount("") },
+  ]), { observed: 100, failed: 4, coveredRows: 1, totalRows: 2 });
+});
+
 test("a harness row in the CSV does not lower the reported pass rate", () => {
   // The whole misattribution in one comparison: the same two product runs,
   // once alone and once with a harness death recorded beside them. A build
@@ -95,7 +110,6 @@ test("every infrastructure class leaves the denominator; every real one stays in
     "harness:cleanup_failed",
     "harness:provider_quota_exhausted",
     "harness:renderer_death",
-    "process:matrix_unclassified",
     "process:unverified_build",
     ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS,
   ];
@@ -166,7 +180,7 @@ test("the exclusion can never hide a product red, only a harness death", () => {
   assert.equal(measuresProduct({ green: false, failureClass: "harness:build_failed" }), false);
   assert.equal(measuresProduct({ green: false, failureClass: "product:writeback_unproven" }), true);
   assert.equal(measuresProduct({ green: false, failureClass: "none" }), true);
-  assert.equal(measuresProduct(undefined), true, "an unclassified row is product evidence");
+  assert.equal(measuresProduct(undefined), false, "an unclassified row stays unresolved");
 
   const green = rowsOf(metricsCsv([GREEN_ROW]))[0];
   assert.ok(runRowIsGreen(green));
@@ -291,7 +305,7 @@ test("the generated Python agrees with the JS on every row", (t) => {
   const fromPython = JSON.parse(stdout) as Array<[boolean, boolean]>;
   const fromJs = rowsOf(metricsCsv(fixtures)).map((row) => [
     runRowIsGreen(row),
-    !runRowIsInfrastructure(row),
+    runRowMeasuresProduct(row),
   ]);
   assert.deepEqual(fromPython, fromJs, "the notebook and the dashboard must score identically");
 });

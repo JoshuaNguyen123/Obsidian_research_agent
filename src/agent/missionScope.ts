@@ -1,4 +1,4 @@
-import { hasDesignIntent } from "./codeDesignIntent";
+import { hasDesignIntent, hasMermaidCreateIntent } from "./codeDesignIntent";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import { hasPageContentClearIntent } from "./currentNoteResetPolicy";
 import {
@@ -136,6 +136,7 @@ export function deriveAutonomyScope(
     /\bresearch memory\b/i.test(prompt);
   scope.write.artifacts =
     hasDesignIntent(prompt) ||
+    hasMermaidCreateIntent(prompt) ||
     /\b(canvas|svg|diagram|wireframe|preview|artifact|source note|templates?|design package|service blueprint|logistics system|project ideation|mind map|ui flow)\b/i.test(
       prompt,
     );

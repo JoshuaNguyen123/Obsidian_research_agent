@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "../helpers/atomicTestVault";
 import type { MissionSpeechAct, ExecutionTier } from "../../src/agent/missionSpeechAct";
 import type {
   NoteOutputDelivery,
@@ -1494,6 +1495,9 @@ export function createRepresentativeRoutingContext(
       },
       vault: {
         read: async () => "",
+        process: function (file: any, transform: (content: string) => string): Promise<string> {
+          return processTestVaultFile(this, file, transform);
+        },
         modify: async () => {},
       },
       metadataCache: {

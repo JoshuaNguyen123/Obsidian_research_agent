@@ -1,3 +1,6 @@
+import { compareAndReplaceVaultFile } from "../tools/atomicVaultWrite";
+import { ToolExecutionError } from "../tools/types";
+
 export const DIAGRAM_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024;
 export const DIAGRAM_ARTIFACT_TRANSACTION_MAX_FILES = 16;
 
@@ -16,6 +19,7 @@ export interface DiagramArtifactVaultLike {
   read(file: DiagramArtifactFileLike): Promise<string>;
   create(path: string, content: string): Promise<DiagramArtifactFileLike>;
   modify(file: DiagramArtifactFileLike, content: string): Promise<void>;
+  process?(file: DiagramArtifactFileLike, transform: (content: string) => string): Promise<string>;
   trash?(file: DiagramArtifactFileLike, system: boolean): Promise<void>;
   delete?(file: DiagramArtifactFileLike, force?: boolean): Promise<void>;
   adapter?: {
@@ -184,8 +188,8 @@ export class DiagramArtifactStore {
 
     let beforeWrite: DiagramArtifactRead;
     try {
-      // This is intentionally the final asynchronous read immediately before
-      // modify. The write never relies on the earlier pre-backup observation.
+      // An early conflict can discard the unused backup. The atomic transform
+      // below also closes the remaining read-to-write race.
       this.onStage("checking_precondition");
       beforeWrite = await this.describe(path, await this.vault.read(targetFile));
       if (beforeWrite.sha256 !== expectedSha256) {
@@ -207,7 +211,7 @@ export class DiagramArtifactStore {
     let failure: { code: string; message: string } | null = null;
     try {
       this.onStage("writing_candidate");
-      await this.vault.modify(targetFile, candidate.content);
+      await compareAndReplaceVaultFile(this.vault, targetFile, original.content, candidate.content);
       this.onStage("verifying_readback");
       after = await this.describe(path, await this.vault.read(targetFile));
       if (after.sha256 !== candidate.sha256) {
@@ -238,12 +242,16 @@ export class DiagramArtifactStore {
         error: null,
       };
     } catch (error) {
+      if (error instanceof Error && "code" in error && ["vault_write_conflict", "vault_atomic_write_unavailable"].includes(String(error.code))) {
+        // Nothing was applied; rolling back here would overwrite the user edit.
+        throw error;
+      }
       validationStatus = isValidationError(error) ? "failed" : validationStatus;
       failure = errorDetails(error, "diagram_update_failed");
     }
 
     this.onStage("rolling_back");
-    const rollback = await this.rollbackUpdate(targetFile, path, original);
+    const rollback = await this.rollbackUpdate(targetFile, path, original, candidate.content);
     return {
       version: 1,
       operation: "update",
@@ -474,13 +482,16 @@ export class DiagramArtifactStore {
     file: DiagramArtifactFileLike,
     path: string,
     original: DiagramArtifactRead,
+    expectedCurrent: string,
   ): Promise<{
     status: "verified" | "failed";
     sha256: string | null;
     error: { code: string; message: string } | null;
   }> {
     try {
-      await this.vault.modify(file, original.content);
+      // Validation can yield while the user edits. Rollback owns only our
+      // candidate bytes, never a newer revision or an ambiguous partial write.
+      await compareAndReplaceVaultFile(this.vault, file, expectedCurrent, original.content);
       const readback = await this.describe(path, await this.vault.read(file));
       if (readback.sha256 !== original.sha256) {
         throw new DiagramArtifactStoreError(
@@ -802,7 +813,7 @@ function errorDetails(
   fallbackCode: string,
 ): { code: string; message: string } {
   return {
-    code: error instanceof DiagramArtifactStoreError
+    code: error instanceof DiagramArtifactStoreError || error instanceof ToolExecutionError
       ? error.code
       : fallbackCode,
     message: safeMessage(error),

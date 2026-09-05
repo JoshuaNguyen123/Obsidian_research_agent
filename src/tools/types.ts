@@ -121,6 +121,8 @@ export interface ToolExecutionContext {
   app: App;
   settings: AgentSettings;
   originalPrompt: string;
+  /** Resolved from the user's mission, never a specialist's assignment. */
+  retrievalCacheDefaults?: import("./retrievalCachePolicy").RetrievalCacheDefaults;
   /**
    * Set by the runner when a research plan is active and its fetched-source
    * floor has been met, certifying that `create_research_pack` may run without

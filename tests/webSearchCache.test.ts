@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { HttpResponse, HttpTransport } from "../src/model/types";
@@ -24,6 +25,19 @@ import { webSearchTool } from "../src/tools/webTools";
  */
 
 const ok = (json: unknown): HttpResponse => ({ status: 200, headers: {}, json });
+
+test("search refresh reuses root-mission results but zero age and new missions transport", async () => {
+  const harness = createVaultHarness({ now: () => new Date("2026-09-04T12:00:00Z") });
+  const ctx = harness.context;
+  ctx.rootMissionId = "root-a";
+  const search = (args: Record<string, unknown> = {}) => webSearchTool.execute({ query: "CRDT", refresh: true, ...args }, ctx) as Promise<Record<string, unknown>>;
+  assert.equal((await search()).fromCache, false);
+  ctx.runId = "continuation-b";
+  assert.equal((await search()).fromCache, true);
+  assert.equal((await search({ max_age_ms: 0 })).fromCache, false);
+  ctx.rootMissionId = "root-b";
+  assert.equal((await search()).fromCache, false);
+});
 
 function createVaultHarness(input: { now: () => Date; prompt?: string; results?: unknown[] }) {
   const content = new Map<string, string>();
@@ -53,6 +67,9 @@ function createVaultHarness(input: { now: () => Date; prompt?: string; results?:
         content.set(path, data);
         revisions.set(path, (revisions.get(path) ?? 0) + 1);
         return getFile(path);
+      },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
       },
       modify: async (file: { path: string }, data: string) => {
         content.set(file.path, data);

@@ -3,6 +3,7 @@ import { BACKUP_FOLDER, MAX_LISTED_FILES } from "./constants";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import { isVaultPathExcluded } from "./vaultExclusions";
 import type { AgentTool, ToolExecutionContext } from "./types";
+import { resolveCurrentNoteFile } from "./currentNote";
 import {
   getOptionalInteger,
   getOptionalString,
@@ -690,8 +691,7 @@ function resolveMarkdownFile(
 }
 
 function getActiveMarkdownFile(context: ToolExecutionContext): TFile {
-  const file =
-    context.getCurrentMarkdownFile?.() ?? context.app.workspace.getActiveFile();
+  const file = resolveCurrentNoteFile(context);
   if (!file || file.extension !== "md") {
     throw new Error(
       "An active markdown file is required. Open or focus a markdown note before using graph tools.",

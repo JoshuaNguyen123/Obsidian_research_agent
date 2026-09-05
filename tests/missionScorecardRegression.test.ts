@@ -529,8 +529,20 @@ test("missing run summary is a loud skip unless --require-summary is set", async
 });
 
 test("scorecard CLI treats --require-summary as a fail-closed flag", () => {
-  assert.deepEqual(parseMissionScorecardCliArgs([]), { requireSummary: false });
+  assert.deepEqual(parseMissionScorecardCliArgs([]), { requireSummary: false, baselineOnly: false });
   assert.deepEqual(parseMissionScorecardCliArgs(["--require-summary"]), {
     requireSummary: true,
+    baselineOnly: false,
   });
+});
+
+test("baseline-only CLI validates structure and rejects conflicting runtime flags", async () => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const exec = promisify(execFile);
+  const script = "scripts/mission-scorecard-regression.mjs";
+  const { stdout } = await exec(process.execPath, [script, "--baseline-only"], { windowsHide: true });
+  assert.match(stdout, /baseline structure validated; no runtime comparison requested/u);
+  await assert.rejects(exec(process.execPath, [script, "--baseline-only", "--require-summary"], { windowsHide: true }),
+    /Baseline-only validation cannot substitute/u);
 });

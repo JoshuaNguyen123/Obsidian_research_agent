@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { appendAgentRunCheckpoint } from "../src/agent/checkpoints";
@@ -84,6 +85,9 @@ function createAdapterVault() {
     read: async (file: { path: string }) => {
       counts.vaultRead += 1;
       return files.get(file.path) ?? "";
+    },
+    process: function (file: any, transform: (content: string) => string): Promise<string> {
+      return processTestVaultFile(this, file, transform);
     },
     modify: async (file: { path: string }, content: string) => {
       touch(file.path, content);

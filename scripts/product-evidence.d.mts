@@ -10,10 +10,17 @@ export interface RunRowSummary {
   green: number;
   red: number;
   infrastructure: number;
+  unresolved: number;
+  semanticsVersion: number;
   /** null — never 0 — when no row carried product evidence. */
   passRate: number | null;
 }
 export const NO_FAILURE_CLASS: "none";
+export const EVIDENCE_SEMANTICS_VERSION: number;
+export const UNRESOLVED_FAILURE_CLASS: string;
+export function isUnresolvedFailureClass(value: unknown): boolean;
+export function optionalCount(value: unknown): number | null;
+export function summarizeToolCounts(rows: Array<{ toolEvents: number | null; toolFailed: number | null }>): { observed: number; failed: number; coveredRows: number; totalRows: number };
 export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS: "environment_not_configured";
 export const INFRASTRUCTURE_FAILURE_CLASS_PREFIXES: readonly string[];
 export const INFRASTRUCTURE_FAILURE_CLASS_PATTERN: RegExp;
@@ -34,7 +41,7 @@ export function runRowMeasuresProduct(row: ProductEvidenceRow | null | undefined
 export function runRowIsInfrastructure(row: ProductEvidenceRow | null | undefined): boolean;
 export function partitionRunRows<T extends ProductEvidenceRow>(
   rows: readonly T[] | null | undefined,
-): { scored: T[]; infrastructure: T[] };
+): { scored: T[]; infrastructure: T[]; unresolved: T[] };
 export function summarizeRunRows(
   rows: readonly ProductEvidenceRow[] | null | undefined,
 ): RunRowSummary;

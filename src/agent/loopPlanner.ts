@@ -9,7 +9,7 @@ import {
   matchesFetchedWebSourceLanguageV1,
   matchesSourcesOrWebLanguageV1,
 } from "./sourceIntent";
-import { hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
+import { getRequestedResearchCatalogReadTools, hasOwnPriorThinkingRecallIntent } from "./promptIntentClassifiers";
 // The MissionGraph node this planner plants and the tool the route offers must
 // come from ONE predicate. Both of these were private copies here until
 // 2026-08-26: the word-count copy answered FALSE to "how many words is this
@@ -72,6 +72,9 @@ function getExpectedTools(
   prompt: string,
   generated: GeneratedOutputPolicy,
 ): string[] {
+  const catalogReads = getRequestedResearchCatalogReadTools(prompt);
+  if (catalogReads.length > 0) return catalogReads;
+
   if (generated.kind === "diagram") {
     if (
       /\b(design\s*package|service\s*blueprint|logistics\s*system|project\s*ideation|ui\s*flow|canvas\s+plus\s+(brief|markdown)|brief\s+plus\s+canvas)\b/i.test(

@@ -127,6 +127,8 @@ async function main(): Promise<void> {
         return;
       }
       try {
+        // Current metadata lets the index loader invalidate changed manifest/shard stamps.
+        adapter.refresh();
         const response = await handleRetrievalMcpRequestV1(request, dependencies);
         if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
       } catch (error) {

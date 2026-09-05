@@ -495,6 +495,9 @@ async function seedCorePluginData(
   preserveConfiguredGitHubCredential = false,
 ): Promise<void> {
   const parsed = parseObject(existingContent) ?? {};
+  const spendingBoundedOverrides = process.env.E2E_RESPECT_CONFIGURED_SPENDING_LIMITS === "1"
+    ? (await import("./qualificationSpendingLimits")).constrainQualificationSpendingLimits(parsed, overrides)
+    : overrides;
   const preservedLinearCredentialReference =
     preserveConfiguredLinearCredential &&
     isRecord(parsed.linearCredentialReference)
@@ -566,7 +569,7 @@ async function seedCorePluginData(
         githubApiToken: "",
         githubCredential: preservedGitHubCredential,
         conversationHistory: [],
-        ...overrides,
+        ...spendingBoundedOverrides,
       },
       null,
       2,

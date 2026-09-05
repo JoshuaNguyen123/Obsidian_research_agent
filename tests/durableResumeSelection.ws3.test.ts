@@ -63,21 +63,24 @@ test("durable resume classifier decision table covers every handled reason", () 
     {
       reason: "segment_budget_exhausted",
       manifest: withUsage(unfinished(), { segments: DURABLE_MISSION_MAX_SEGMENTS }),
-      expectedType: "resume",
+      expectedType: "terminalize",
+      expectedCode: "segment_budget_exhausted",
     },
     {
       reason: "model_step_budget_exhausted",
       manifest: withUsage(unfinished(), {
         modelSteps: DURABLE_MISSION_MAX_MODEL_STEPS,
       }),
-      expectedType: "resume",
+      expectedType: "terminalize",
+      expectedCode: "model_step_budget_exhausted",
     },
     {
       reason: "tool_call_budget_exhausted",
       manifest: withUsage(unfinished(), {
         toolCalls: DURABLE_MISSION_MAX_TOOL_CALLS,
       }),
-      expectedType: "resume",
+      expectedType: "terminalize",
+      expectedCode: "tool_call_budget_exhausted",
     },
     {
       reason: "terminal_status",
@@ -154,7 +157,7 @@ test("durable resume classifier decision table covers every handled reason", () 
   }
 });
 
-test("budget-exhausted unfinished missions stay resumable", () => {
+test("aggregate-exhausted missions cannot mint fresh budgets on resume", () => {
   for (const usage of [
     { segments: DURABLE_MISSION_MAX_SEGMENTS },
     { modelSteps: DURABLE_MISSION_MAX_MODEL_STEPS },
@@ -164,8 +167,10 @@ test("budget-exhausted unfinished missions stay resumable", () => {
       withUsage(unfinished(), usage),
       NOW,
     );
-    assert.equal(decision.type, "resume", JSON.stringify(usage));
+    assert.equal(decision.type, "terminalize", JSON.stringify(usage));
   }
+  const segmentStopped = withUsage(unfinished(), { segments: 1, modelSteps: 10, toolCalls: 20 });
+  assert.equal(classifyDurableResumeScanCandidate(segmentStopped, NOW).type, "resume");
 });
 
 function unfinished(): DurableMissionManifestV1 {

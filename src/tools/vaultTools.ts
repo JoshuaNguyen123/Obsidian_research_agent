@@ -1,4 +1,6 @@
 import type { TFile } from "obsidian";
+import { transformVaultFile, replaceVaultFileIfUnchanged } from "./atomicVaultWrite";
+import { resolveCurrentNoteFile } from "./currentNote";
 import {
   sha256Fingerprint,
   verifyPreparedActionFingerprint,
@@ -2170,12 +2172,11 @@ export const appendFileTool: AgentTool = {
     });
     const text = getRequiredString(args, "text");
     const file = getMarkdownFileByPath(context, path);
-    const current = await context.app.vault.read(file);
-    const prefix = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
-    const appendedText = `${prefix}${text}`;
-
-    const nextContent = `${current}${appendedText}`;
-    await context.app.vault.modify(file, nextContent);
+    let appendedText = "";
+    const nextContent = await transformVaultFile(context, file, (current) => {
+      appendedText = `${current.length > 0 && !current.endsWith("\n") ? "\n" : ""}${text}`;
+      return `${current}${appendedText}`;
+    });
     const observed = await context.app.vault.read(file);
     if (observed !== nextContent) {
       throw new ToolExecutionError(
@@ -2400,8 +2401,9 @@ export const appendToCurrentFileTool: AgentTool = {
       await persistAppendIdempotencyToRunSnapshot(context);
     }
 
-    const nextContent = `${current}${appendedText}`;
-    await context.app.vault.modify(file, nextContent);
+    // The validated payload may depend on the original prefix. Refuse a
+    // changed source inside the atomic callback rather than replacing user edits.
+    const nextContent = await replaceVaultFileIfUnchanged(context, file, current, `${current}${appendedText}`);
     const observed = await context.app.vault.read(file);
     if (observed !== nextContent) {
       throw new ToolExecutionError(
@@ -3395,9 +3397,7 @@ function getTemplateOutputFolder(context: ToolExecutionContext): string {
 
 function getActiveProjectBaseFolder(context: ToolExecutionContext): string {
   const activePath =
-    context.getCurrentMarkdownFile?.()?.path ??
-    context.app.workspace.getActiveFile()?.path ??
-    "";
+    resolveCurrentNoteFile(context)?.path ?? "";
   if (!activePath.trim()) {
     return "";
   }
@@ -4504,8 +4504,7 @@ function getParentFolderPath(path: string): string {
 }
 
 function getActiveMarkdownFile(context: ToolExecutionContext): TFile {
-  const file =
-    context.getCurrentMarkdownFile?.() ?? context.app.workspace.getActiveFile();
+  const file = resolveCurrentNoteFile(context);
   if (!file || file.extension !== "md") {
     throw new Error(
       "An active markdown file is required. Open or focus a markdown note before asking the agent to read the current note.",
@@ -5508,7 +5507,7 @@ async function executePreparedReplaceCurrentFile(
   });
   const startedAt = vaultNow(context).toISOString();
   const backupPath = await backupCurrentFile(context, file, current);
-  await context.app.vault.modify(file, text);
+  await replaceVaultFileIfUnchanged(context, file, current, text);
   const observed = await context.app.vault.read(file);
   if (observed !== text) {
     throw new ToolExecutionError(
@@ -5621,7 +5620,7 @@ async function executePreparedReplaceFile(
   });
   const startedAt = vaultNow(context).toISOString();
   const backupPath = await backupCurrentFile(context, file, current);
-  await context.app.vault.modify(file, text);
+  await replaceVaultFileIfUnchanged(context, file, current, text);
   const observed = await context.app.vault.read(file);
   if (observed !== text) {
     throw new ToolExecutionError(
@@ -6005,4 +6004,3 @@ async function executePreparedDeleteResearchMemoryEntry(
     }),
   };
 }
-

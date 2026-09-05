@@ -1050,6 +1050,10 @@ import {
   readAgentRunCheckpointByRunId,
   readLatestAgentRunCheckpoint,
 } from "./agent/checkpoints";
+import { retrievalCacheDefaultsForMission } from "./tools/retrievalCachePolicy";
+import { replaceVaultFileIfUnchanged } from "./tools/atomicVaultWrite";
+import { resolveCurrentNoteFile } from "./tools/currentNote";
+import { ToolExecutionError } from "./tools/types";
 import {
   createMissionRuntimeSnapshot,
   buildOperationReconciliationInputs,
@@ -2601,9 +2605,7 @@ export async function runAgentMission({
     }
     let anchorTargetNotePath: string | null = null;
     try {
-      const anchorNoteFile =
-        anchorContext.getCurrentMarkdownFile?.() ??
-        anchorContext.app.workspace.getActiveFile();
+      const anchorNoteFile = resolveCurrentNoteFile(anchorContext);
       anchorTargetNotePath =
         anchorNoteFile && typeof anchorNoteFile.path === "string"
           ? anchorNoteFile.path
@@ -2921,6 +2923,7 @@ export async function runAgentMission({
   let runToolContext: ToolExecutionContext = {
     ...toolContext,
     originalPrompt: activeIntentPrompt,
+    retrievalCacheDefaults: toolContext.retrievalCacheDefaults ?? retrievalCacheDefaultsForMission(intentPrompt),
     runtimeCache,
     // Durable writers and the compactor report their time here; the wall-clock
     // line at the end of the run splits it out (see summarizeRunWallClockV1).
@@ -4411,14 +4414,14 @@ export async function runAgentMission({
   );
   if (resumedOriginalMission) {
     activeIntentPrompt = resumedOriginalMission;
+    runToolContext.retrievalCacheDefaults = resumeSnapshot?.retrievalCacheDefaults ??
+      retrievalCacheDefaultsForMission(resumedOriginalMission);
     speechActClassification = classifyMissionSpeechAct(activeIntentPrompt);
     // Mid-stream provider failures keep a partial note and refuse a blind
     // re-stream. Continue must expand that draft to the word floor instead of
     // appending a second essay from the original write prompt.
     try {
-      const resumeNoteFile =
-        runToolContext.getCurrentMarkdownFile?.() ??
-        runToolContext.app.workspace.getActiveFile();
+      const resumeNoteFile = resolveCurrentNoteFile(runToolContext);
       if (
         resumeNoteFile &&
         "extension" in resumeNoteFile &&
@@ -5640,9 +5643,7 @@ export async function runAgentMission({
         if (owedLiteralAnchors.length > 0) {
           let owedNoteText: unknown = null;
           try {
-            const owedNoteFile =
-              runToolContext.getCurrentMarkdownFile?.() ??
-              runToolContext.app.workspace.getActiveFile();
+            const owedNoteFile = resolveCurrentNoteFile(runToolContext);
             if (owedNoteFile) {
               owedNoteText =
                 runToolContext.getCurrentMarkdownContent?.(
@@ -6050,12 +6051,12 @@ export async function runAgentMission({
     });
     const node = missionGraphSession.graph.nodes[execution.nodeId];
     if (
-      node?.status === "blocked" &&
+      (node?.status === "blocked" || node?.status === "ready") &&
       result.error?.code.startsWith("approval_") === true
     ) {
       // Approval denial/expiry is already a durable graph transition. Do not
-      // reinterpret it as a tool failure or attempt to transition the blocked
-      // node from the stale pre-approval running state.
+      // reinterpret it as a tool attempt. Denial is blocked; an undecided
+      // expired/aborted approval is ready for a fresh prepared action.
       return;
     }
     const canonicalEvidence = result.ok
@@ -6308,6 +6309,7 @@ export async function runAgentMission({
   );
   if (promptOnPageRoutingPrompt !== null) {
     activeIntentPrompt = promptOnPageRoutingPrompt;
+    runToolContext.retrievalCacheDefaults = retrievalCacheDefaultsForMission(promptOnPageRoutingPrompt);
     // The structured router classified the outer "prompt on page" request, not
     // the newly extracted note prompt. Do not carry that proposal across the
     // authority boundary; deterministic prompt-on-page routing owns this turn.
@@ -7732,6 +7734,7 @@ export async function runAgentMission({
       ? null
       : createMissionRuntimeSnapshot({
           runId,
+          retrievalCacheDefaults: runToolContext.retrievalCacheDefaults,
           originalMission:
             resumeSnapshot?.originalMission ??
             resumeLedger?.mission ??
@@ -7848,6 +7851,7 @@ export async function runAgentMission({
     const now = runToolContext.now?.() ?? new Date();
     runtimeSnapshot = createMissionRuntimeSnapshot({
       runId,
+      retrievalCacheDefaults: runToolContext.retrievalCacheDefaults,
       originalMission: runtimeSnapshot.originalMission,
       currentNotePath: runtimeSnapshot.currentNotePath,
       outputTargetPath: runtimeSnapshot.outputTargetPath,
@@ -8267,7 +8271,8 @@ export async function runAgentMission({
             ok: false,
             toolName,
             error: {
-              code: "streamed_writeback_failed",
+              code: error instanceof Error && "code" in error && typeof error.code === "string"
+                ? error.code : "streamed_writeback_failed",
               message: getUnknownErrorMessage(error),
             },
           },
@@ -8373,8 +8378,7 @@ export async function runAgentMission({
       return null;
     }
     try {
-      const file = runToolContext.getCurrentMarkdownFile?.() ??
-        runToolContext.app.workspace.getActiveFile();
+      const file = resolveCurrentNoteFile(runToolContext);
       const noteMarkdown =
         writtenMarkdown ??
         (file
@@ -8946,9 +8950,7 @@ export async function runAgentMission({
     string | null
   > => {
     try {
-      const file =
-        runToolContext.getCurrentMarkdownFile?.() ??
-        runToolContext.app.workspace.getActiveFile();
+      const file = resolveCurrentNoteFile(runToolContext);
       if (!file) return currentNoteLiteralDebtTextCache;
       const live = runToolContext.getCurrentMarkdownContent?.(file) ?? null;
       if (typeof live === "string") {
@@ -11680,9 +11682,7 @@ export async function runAgentMission({
           {
             missionPrompt: input.missionPrompt ?? activeIntentPrompt,
             activeBasename:
-              runToolContext.getCurrentMarkdownFile?.()?.basename ??
-              runToolContext.app.workspace.getActiveFile()?.basename ??
-              undefined,
+              resolveCurrentNoteFile(runToolContext)?.basename,
             expandExistingDraft: hasWordCountShortfallFollowUp(
               input.missionPrompt ?? activeIntentPrompt,
             ),
@@ -24662,7 +24662,7 @@ export async function runAgentMission({
       pendingResumeOwedWriteNodesAfterToolUse.length === 0 &&
       missingRequiredWebToolsAfterToolUse.length === 0 &&
       !pendingStreamingWriteback;
-    const requiresPostWriteAcceptance = researchPlan !== null;
+    const requiresPostWriteAcceptance = missionPlan !== null || researchPlan !== null;
     const postToolAcceptance =
       operationWriteComplete && requiresPostWriteAcceptance
       // A successful direct current-note tool call already supplies the
@@ -36029,9 +36029,7 @@ async function streamCurrentNoteWriteback({
 }): Promise<AgentRunReceipt> {
   let originalNoteContentForSafety = "";
   try {
-    const safetyFile =
-      toolContext.getCurrentMarkdownFile?.() ??
-      toolContext.app.workspace.getActiveFile();
+    const safetyFile = resolveCurrentNoteFile(toolContext);
     if (safetyFile && "extension" in safetyFile && safetyFile.extension === "md") {
       originalNoteContentForSafety =
         toolContext.getCurrentMarkdownContent?.(safetyFile as never) ??
@@ -36049,8 +36047,7 @@ async function streamCurrentNoteWriteback({
     researchFrontmatter,
   });
   const activeBasename =
-    toolContext.getCurrentMarkdownFile?.()?.basename ??
-    toolContext.app.workspace.getActiveFile()?.basename ??
+    resolveCurrentNoteFile(toolContext)?.basename ??
     (lazyCreatePath
       ? lazyCreatePath.replace(/^.*\//, "").replace(/\.md$/i, "")
       : undefined);
@@ -36067,9 +36064,7 @@ async function streamCurrentNoteWriteback({
   let expandDraftContext: string | null = null;
   if (includeCurrentDraftContext) {
     try {
-      const file =
-        toolContext.getCurrentMarkdownFile?.() ??
-        toolContext.app.workspace.getActiveFile();
+      const file = resolveCurrentNoteFile(toolContext);
       if (file && "extension" in file && file.extension === "md") {
         const draft =
           originalNoteContentForSafety ||
@@ -37152,8 +37147,10 @@ async function createStreamingNoteWriter({
   }
   const makeAppendBase = (content: string) =>
     `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}`;
+  let expectedAppendSource = current;
   const getLatestAppendBaseSource = () => {
     const source = readLiveEditorSource() ?? current;
+    if (expectedLiveContent === null) expectedAppendSource = source;
     // Live flushes write base+streamed. Callers that refresh the append base
     // (title metadata, replaceContent) must not treat the in-flight draft as
     // permanent note content or word-count corrections will double-append.
@@ -37277,11 +37274,26 @@ async function createStreamingNoteWriter({
         return;
       }
     }
+    const expectedDisk = expectedLiveContent ?? (kind === "append" ? expectedAppendSource : current);
+    try {
+      await replaceVaultFileIfUnchanged(toolContext, target, expectedDisk, content);
+    } catch (error) {
+      if (error instanceof ToolExecutionError && error.code === "vault_write_conflict") {
+        externalEditStop = { message: error.message, appliedChars: streamedContent.length };
+        return;
+      }
+      throw error;
+    }
+    const editorAfter = readLiveEditorSource();
+    if (editorAfter !== null && editorAfter !== observed && editorAfter !== content) {
+      externalEditStop = { message: formatExternalStreamEditMessage(target.path, getByteLength(streamedContent)), appliedChars: streamedContent.length };
+      expectedLiveContent = content;
+      return;
+    }
     toolContext.setCurrentMarkdownContent?.(target, content, {
       followStreamingEnd: true,
       streamKey: streamFollowKey,
     });
-    await toolContext.app.vault.modify(target, content);
     // Deliberately the bytes we wrote, not a re-read: re-reading here would
     // adopt anything the reader typed during the awaited modify as ours and
     // the next flush would overwrite exactly the keystrokes we are protecting.
@@ -37616,9 +37628,7 @@ function requirePreparedSectionEdit(
 }
 
 function getActiveMarkdownFile(toolContext: ToolExecutionContext) {
-  const file =
-    toolContext.getCurrentMarkdownFile?.() ??
-    toolContext.app.workspace.getActiveFile();
+  const file = resolveCurrentNoteFile(toolContext);
   if (!file || file.extension !== "md") {
     throw new Error(
       "An active markdown file is required. Open or focus a markdown note before running the mission.",
@@ -39309,7 +39319,8 @@ const CACHEABLE_TOOL_NAMES = new Set([
   "read_markdown_files",
   "read_file",
   "count_words",
-  "web_fetch",
+  // Web fetch owns its age/mission-aware durable cache. A result-cache hit
+  // here would skip max_age_ms=0 and report yesterday's transport as fresh.
   "get_note_graph_context",
   "find_related_notes",
   "suggest_note_links",

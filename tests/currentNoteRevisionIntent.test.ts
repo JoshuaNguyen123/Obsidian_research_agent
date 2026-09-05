@@ -1,3 +1,4 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -129,6 +130,9 @@ function createAppendContext(options: {
       workspace: { getActiveFile: () => getFile("Current.md") },
       vault: {
         read: async (file: { path: string }) => content.get(file.path) ?? "",
+        process: function (file: any, transform: (content: string) => string): Promise<string> {
+          return processTestVaultFile(this, file, transform);
+        },
         modify: async (file: { path: string }, data: string) => {
           content.set(file.path, data);
         },

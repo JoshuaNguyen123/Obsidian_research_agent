@@ -140,7 +140,7 @@ export class ReadOnlyVaultAdapterV1 {
     if (!absolute) {
       throw new ReadOnlyVaultError(`Path escapes the vault: ${file.path}`);
     }
-    if (file.stat.size > MAX_ADAPTED_FILE_BYTES_V1) {
+    if (fs.statSync(absolute).size > MAX_ADAPTED_FILE_BYTES_V1) {
       throw new ReadOnlyVaultError(
         `File exceeds the ${MAX_ADAPTED_FILE_BYTES_V1}-byte read limit: ${file.path}`,
       );

@@ -214,21 +214,28 @@ test("production OpenAI-compatible client recovers from one loopback 504 in 3 of
   });
 });
 
-test("client cancellation reaches the backend AbortSignal", async () => {
+test("client cancellation reaches the backend AbortSignal", { timeout: 10_000 }, async () => {
   let aborted = false;
+  let backendStarted!: () => void;
+  let backendAborted!: () => void;
+  const started = new Promise<void>((resolve) => { backendStarted = resolve; });
+  const observedAbort = new Promise<void>((resolve) => { backendAborted = resolve; });
   await withBridge({
     complete: async (_body, { signal }) => new Promise((_resolve, reject) => {
       signal.addEventListener("abort", () => {
         aborted = true;
+        backendAborted();
         reject(new Error("cancelled"));
       }, { once: true });
+      backendStarted();
     }),
   }, async (baseUrl) => {
     const controller = new AbortController();
     const pending = request(baseUrl, { messages: [] }, { signal: controller.signal });
-    setTimeout(() => controller.abort(), 20);
+    await started;
+    controller.abort();
     await assert.rejects(pending, /abort/iu);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await observedAbort;
     assert.equal(aborted, true);
   });
 });

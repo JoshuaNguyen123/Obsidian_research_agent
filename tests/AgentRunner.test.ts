@@ -7969,6 +7969,9 @@ test("Mermaid create then revise plans read, upsert, read, upsert, read frontier
     [
       ["read_mermaid_block"],
       ["upsert_mermaid_block"],
+      ["read_mermaid_block"],
+      ["upsert_mermaid_block"],
+      ["read_mermaid_block"],
     ],
   );
   assert.deepEqual(
@@ -7981,6 +7984,9 @@ test("Mermaid create then revise plans read, upsert, read, upsert, read frontier
     [
       "read_mermaid_block",
       "upsert_mermaid_block",
+      "read_mermaid_block",
+      "upsert_mermaid_block",
+      "read_mermaid_block",
     ],
   );
   for (const call of executedCalls.filter(
@@ -8644,6 +8650,59 @@ test("connect-note prompts expose inline graph link writing", async () => {
   assert.ok(toolNames.includes("find_related_notes"));
   assert.ok(toolNames.includes("suggest_note_links"));
   assert.ok(toolNames.includes("link_related_notes_in_current_file"));
+});
+
+test("note writes pay requested word-count proof before completing", async () => {
+  const prompt = "Write a 40 word note onto this page, then use count_words to verify.";
+  const vault = createRunnerVaultContext({ prompt, content: "" });
+  vault.context.settings = createRunnerSettings({ maxAgentSteps: 8 });
+  const calls: ModelToolCall[] = [];
+  const requests: ModelChatRequest[] = [];
+  const completions: any[] = [];
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests: requests,
+      chatResponders: [
+        () => responseWithToolCall("append_to_current_file", { text: Array(40).fill("word").join(" ") }),
+        () => responseWithToolCall("count_words", {}),
+        () => responseWithContent("Verified 40 words in the current note."),
+      ],
+    }),
+    toolRegistry: createCollectingRegistry(calls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: { onRunComplete: (event) => { completions.push(event); } },
+  });
+  assert.deepEqual(calls.map((call) => call.name), ["append_to_current_file", "count_words"]);
+  assert.equal(completions.length, 1);
+  assert.notEqual(completions.at(-1)?.stopReason, "budget", JSON.stringify(completions));
+  assert.equal(vault.content.get("Current.md")?.trim().split(/\s+/u).length, 40);
+});
+
+test("installed catalog prompts survive real routing and scope resolution", async () => {
+  const { OFFLINE_RESEARCH_CATALOG_PROBES } = await import("../e2e/fixtures/offlineExpandScenarios");
+  for (const probe of OFFLINE_RESEARCH_CATALOG_PROBES) {
+    const prompt = probe.prompt.replace("{marker}", "OFFLINE_CATALOG_PROBE");
+    const vault = createRunnerVaultContext({ prompt, content: "# Catalog probe" });
+    const requests: ModelChatRequest[] = [];
+    const sentinel = new Error("catalog offer captured");
+    const client: ModelClient = {
+      chat: async (request) => {
+        requests.push(request);
+        const offered = request.tools?.map((tool) => tool.function.name) ?? [];
+        if (!offered.includes(probe.expectedTool) && requests.length < 4) {
+          const prerequisite = ["read_current_file", "read_mermaid_block"].find((name) => offered.includes(name));
+          if (prerequisite) return responseWithToolCall(prerequisite, prerequisite === "read_mermaid_block"
+            ? { path: "Current.md", selector: { kind: "heading", heading: "Catalog probe" } } : {});
+        }
+        throw sentinel;
+      },
+    } as ModelClient;
+    await runAgentMission({ prompt, modelClient: client, toolRegistry: createDefaultToolRegistry(), toolContext: vault.context, enableStreaming: false }).catch((error) => { assert.equal(error, sentinel); });
+    assert.ok(requests.some((request) => request.tools?.some((tool) => tool.function.name === probe.expectedTool)),
+      `${probe.id}: ${JSON.stringify(requests.map((request) => request.tools?.map((tool) => tool.function.name)))}`);
+  }
 });
 
 test("word count prompts expose count_words without write tools", async () => {
@@ -17119,7 +17178,9 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search", "web_fetch", "append_to_current_file"],
+    // The citation read reaches the tool cache policy; registry calls are
+    // not network transports. Source-cache tests verify same-root reuse.
+    ["web_search", "web_fetch", "web_fetch", "append_to_current_file"],
   );
   assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 0);
@@ -21011,7 +21072,7 @@ test("simple generated current-note writeback skips read and planner loops", asy
   );
 });
 
-test("current-note writeback prefers live editor updates when available", async () => {
+test("current-note writeback updates the live editor after atomic disk acceptance", async () => {
   const prompt = "In this note, write a short project update.";
   const vault = createRunnerVaultContext({
     prompt,
@@ -21037,7 +21098,7 @@ test("current-note writeback prefers live editor updates when available", async 
   assert.ok(vault.operations.includes("setEditor:Current.md"));
   assert.ok(vault.operations.includes("modify:Current.md"));
   assert.ok(
-    vault.operations.indexOf("setEditor:Current.md") <
+    vault.operations.indexOf("setEditor:Current.md") >
       vault.operations.indexOf("modify:Current.md"),
   );
 });
@@ -21926,13 +21987,19 @@ test("revision approval follow-up inherits prior assistant edit intent", async (
   assert.equal(receipts[0].backupPath, ".agent-backups/322-Current.md");
 });
 
-test("denied streamed replacement approval preserves exact note bytes and creates no backup", async () => {
+for (const approvalDecision of ["denied", "expired"] as const) {
+test(`${approvalDecision} streamed replacement approval preserves exact note bytes and creates no backup`, async () => {
   const prompt = "Replace this note with a clean project brief.";
   const original = "# Original\n\nDo not change before exact approval.\n";
   const executedCalls: ModelToolCall[] = [];
   const approvals: ApprovalRequest[] = [];
   const receipts: AgentRunReceipt[] = [];
   const broker = new ApprovalBroker();
+  if (approvalDecision === "expired") {
+    const request = broker.request.bind(broker);
+    broker.request = (details, options) => request(details, { ...options, timeoutMs: 1 });
+  }
+  const completions: AgentRunCompleteEvent[] = [];
   const vault = createRunnerVaultContext({
     prompt,
     content: original,
@@ -21962,9 +22029,10 @@ test("denied streamed replacement approval preserves exact note bytes and create
         approvals.push(request);
         assert.equal(vault.content.get("Current.md"), original);
         assert.equal(vault.content.has(".agent-backups/323-Current.md"), false);
-        broker.resolve(request.id, "denied");
+        if (approvalDecision === "denied") broker.resolve(request.id, "denied");
       },
       onReceipt: (receipt) => receipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
     },
   });
 
@@ -21978,7 +22046,11 @@ test("denied streamed replacement approval preserves exact note bytes and create
   assert.equal(vault.content.has(".agent-backups/323-Current.md"), false);
   assert.equal(vault.operations.includes("modify:Current.md"), false);
   assert.deepEqual(receipts, []);
+  assert.equal(completions.length, 1);
+  assert.doesNotMatch(completions[0].stopDetail ?? "", /expected running before result/);
+  assert.match(completions[0].stopDetail ?? "", /approval/i);
 });
+}
 
 test("section edit writeback prepares heading and preserves surrounding content", async () => {
   const chatRequests: ModelChatRequest[] = [];
@@ -22528,6 +22600,11 @@ function createRunnerVaultContext(options: {
       ],
       cachedRead: async (file: { path: string }) => content.get(file.path) ?? "",
       read: async (file: { path: string }) => content.get(file.path) ?? "",
+      process: async (file: { path: string }, transform: (current: string) => string) => {
+        const next = transform(content.get(file.path) ?? "");
+        await app.vault.modify(file, next);
+        return next;
+      },
       modify: async (file: { path: string }, data: string) => {
         operations.push(`modify:${file.path}`);
         content.set(file.path, data);
@@ -24781,7 +24858,7 @@ test("proof-sensitive streamed final holds the invalid draft and emits the exact
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search", "web_fetch"],
+    ["web_search", "web_fetch", "web_fetch"],
   );
   assert.equal(streamRequests.length, 2);
   assert.ok(
@@ -24896,7 +24973,7 @@ test("proof-sensitive candidate exhaustion emits only a resumable blocker", asyn
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search", "web_fetch"],
+    ["web_search", "web_fetch", "web_fetch"],
   );
   assert.equal(streamRequests.length, 1);
   assert.doesNotMatch(assistantDeltas.join(""), /INVALID UNVERIFIED DRAFT/);

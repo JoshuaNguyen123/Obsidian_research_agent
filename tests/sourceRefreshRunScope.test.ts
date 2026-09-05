@@ -1,8 +1,12 @@
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { HttpRequest, HttpResponse } from "../src/model/types";
 import type { ToolExecutionContext } from "../src/tools/types";
 import { webFetchTool } from "../src/tools/webTools";
+import { findFreshCachedSource, writeSourceCacheNote } from "../src/tools/sourceCache";
+import { resolveRetrievalCachePolicy } from "../src/tools/retrievalCachePolicy";
+import { createMissionRuntimeSnapshot, normalizeMissionRuntimeSnapshot } from "../src/agent/runStore";
 
 /**
  * A refresh request means "do not hand me a copy from an earlier mission". It
@@ -22,6 +26,54 @@ const BODY = [
   "Convergence follows because the join is idempotent, commutative, and associative.",
   "An observed-remove set records add tags and removes only the tags a replica has observed.",
 ].join(" ");
+
+for (const policy of [{ max_age_ms: 0 }, { refresh: true }, { max_age_ms: 1 }]) {
+  test(`fallback obeys ${JSON.stringify(policy)} across missions`, async () => {
+    const app = createSharedVault();
+    let alternateHits = 0;
+    const context = createContext({ app, rootMissionId: "old-mission", originalPrompt: "CRDT convergence", transport: async (request) => {
+      if (request.url.endsWith("/web_fetch") && JSON.parse(String(request.body)).url === SOURCE_URL) alternateHits++;
+      return { status: 404, headers: {}, json: {} };
+    } });
+    context.now = () => new Date("2026-09-04T10:00:00Z");
+    const old = await writeSourceCacheNote(context, { url: SOURCE_URL, title: "CRDT", content: BODY });
+    context.rootMissionId = "new-mission";
+    context.now = () => new Date("2026-09-04T12:00:00Z");
+    await assert.rejects(webFetchTool.execute({ url: "https://unreachable.example/linear-issue", alternate_urls: [SOURCE_URL], ...policy }, context));
+    assert.ok(alternateHits > 0, "a bypass must attempt transport instead of accepting old bytes");
+    const after = await findFreshCachedSource(context, SOURCE_URL);
+    assert.equal(after?.fetchedAt, old.fetchedAt);
+    assert.equal(after?.fetchedForMission, "old-mission");
+  });
+}
+
+test("cached substitute preserves transport provenance without rewriting the note", async () => {
+  const app = createSharedVault();
+  const context = createContext({ app, rootMissionId: "same-mission", originalPrompt: "CRDT convergence", transport: async () => ({ status: 404, headers: {}, json: {} }) });
+  context.now = () => new Date("2026-09-04T10:00:00Z");
+  const old = await writeSourceCacheNote(context, { url: SOURCE_URL, title: "CRDT", content: BODY });
+  context.now = () => new Date("2026-09-04T12:00:00Z");
+  const result = await webFetchTool.execute({ url: "https://unreachable.example/linear-issue", alternate_urls: [SOURCE_URL], refresh: true }, context) as Record<string, unknown>;
+  assert.equal(result.fromCache, true);
+  assert.equal(result.sourceTransport, "cache");
+  assert.equal(result.fetchedAt, old.fetchedAt);
+  assert.equal(result.contentHash, old.contentHash);
+  assert.equal(result.fetchedForMission, old.fetchedForMission);
+});
+
+test("host defaults survive snapshots and ignore worker wording; explicit args win", () => {
+  const saved = normalizeMissionRuntimeSnapshot(JSON.parse(JSON.stringify(createMissionRuntimeSnapshot({
+    runId: "root", originalMission: "Research current CRDT implementations", retrievalCacheDefaults: { refresh: true },
+  }))));
+  const context = { originalPrompt: "Explain CRDT algebra", retrievalCacheDefaults: saved?.retrievalCacheDefaults, rootMissionId: "root" } as ToolExecutionContext;
+  assert.equal(resolveRetrievalCachePolicy({}, context).refresh, true);
+  assert.equal(resolveRetrievalCachePolicy({ refresh: false }, context).refresh, false);
+  assert.equal(resolveRetrievalCachePolicy({ max_age_ms: 10 }, context).refresh, false);
+  assert.equal(resolveRetrievalCachePolicy({ refresh: true, max_age_ms: 0 }, context).maxAgeMs, 0);
+  context.originalPrompt = "Get latest CRDT sources";
+  context.retrievalCacheDefaults = { refresh: false };
+  assert.equal(resolveRetrievalCachePolicy({}, context).refresh, false);
+});
 
 function createSharedVault() {
   const content = new Map<string, string>();
@@ -45,6 +97,9 @@ function createSharedVault() {
       create: async (path: string, data: string) => {
         content.set(path, data);
         return getFile(path);
+      },
+      process: function (file: any, transform: (content: string) => string): Promise<string> {
+        return processTestVaultFile(this, file, transform);
       },
       modify: async (file: { path: string }, data: string) => {
         content.set(file.path, data);

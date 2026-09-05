@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+
+recordToolCallOutcomesAfterEach();
 
 test("optional provider canary performs a real note write", async () => {
   test.setTimeout(900_000);

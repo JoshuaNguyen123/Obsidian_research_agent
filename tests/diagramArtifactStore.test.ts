@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { processTestVaultFile } from "./helpers/atomicTestVault";
 
 import {
   DiagramArtifactStore,
@@ -33,6 +34,31 @@ test("diagram artifact paths are normalized vault-relative Canvas, SVG, or Markd
       DiagramArtifactStoreError,
       path,
     );
+  }
+});
+
+test("atomic diagram writes and rollback preserve intervening user revisions", async () => {
+  for (const during of ["write", "rollback"] as const) {
+    const path = "Designs/brief.md";
+    const original = "# Original";
+    const vault = new MemoryDiagramVault({ [path]: original });
+    const nativeProcess = vault.process.bind(vault);
+    if (during === "write") vault.process = async (file, transform) => {
+      vault.files.set(path, "# User revision");
+      return nativeProcess(file, transform);
+    };
+    const update = new DiagramArtifactStore(vault).update({
+      path, expectedSha256: await sha256DiagramContent(original), content: "# Candidate",
+      validator: () => { vault.files.set(path, "# User revision"); return false; },
+    });
+    if (during === "write") await assert.rejects(update, (error: any) => error.code === "vault_write_conflict");
+    else {
+      const receipt = await update;
+      assert.equal(receipt.status, "rollback_failed");
+      assert.equal(receipt.error?.code, "vault_write_conflict");
+      assert.equal(vault.files.get(receipt.backupPath), original);
+    }
+    assert.equal(vault.files.get(path), "# User revision");
   }
 });
 
@@ -295,6 +321,9 @@ function fixtureStore(vault: MemoryDiagramVault): DiagramArtifactStore {
 }
 
 class MemoryDiagramVault implements DiagramArtifactVaultLike {
+  process(file: DiagramArtifactFileLike, transform: (content: string) => string): Promise<string> {
+    return processTestVaultFile(this, file, transform);
+  }
   readonly files = new Map<string, string>();
   readonly folders = new Set<string>(["Designs"]);
   readonly operations: string[] = [];

@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { Server } from "node:http";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -15,6 +15,7 @@ import {
   type OfflineExpandScenarioV1,
 } from "./offlineExpandScenarios";
 import { startRealAiHarness } from "./realAiHarness";
+import { beginOfflineAttempt, saveOfflineAttempt, observeOfflineTools, readOfflineToolCounts, boundedOfflineRead, readOfflineBuildIdentity, saveOfflineProbe } from "./offlineEvidence";
 
 const execFileAsync = promisify(execFile);
 // Must match E2E_OPENAI_COMPATIBLE_BASE_URL, which run-e2e-exclusive.mjs
@@ -23,7 +24,6 @@ const execFileAsync = promisify(execFile);
 // and every mission died on ERR_CONNECTION_REFUSED.
 const OFFLINE_BASE_URL = "http://127.0.0.1:7331/v1";
 const OFFLINE_TOKEN = "offline-e2e-ephemeral-token";
-const SUMMARY_PATH = path.join("test-results", "offline-application-attempts.json");
 
 test.describe("zero-cloud expand: replace, page-clear, word-count, title, research catalog", () => {
   test.skip(
@@ -63,26 +63,19 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
       } as const;
       expect(installedBundleSha256).toBe(bundleSha256);
 
+      const failures: unknown[] = [];
       for (const scenario of OFFLINE_EXPAND_SCENARIOS) {
-        attempts.push(await runExpandScenario({
+        try { attempts.push(await runExpandScenario({
           scenario,
           backend,
           identity,
           cloudModelRequests,
           validateOfflineApplicationAttempt,
-        }));
+        })); } catch (error) { failures.push(error); }
       }
 
       expect(cloudModelRequests).toEqual([]);
-      const prior = await readExistingAttempts(SUMMARY_PATH);
-      await writeFile(
-        SUMMARY_PATH,
-        `${JSON.stringify({
-          version: 1,
-          attempts: [...prior, ...attempts],
-        }, null, 2)}\n`,
-        "utf8",
-      );
+      if (failures.length) throw new Error(`${failures.length} offline scenarios failed; each attempt was preserved. ${failures.map(String).join("\n")}`);
     } finally {
       await close(bridge);
     }
@@ -101,7 +94,9 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
     try {
       await listen(bridge, 7331);
       for (const probe of OFFLINE_RESEARCH_CATALOG_PROBES) {
-        const offeredBefore = new Set(backend.snapshot().offeredToolNames);
+        const probeAttempt = beginOfflineAttempt(await readOfflineBuildIdentity(), `catalog:${probe.id}`);
+        await saveOfflineProbe(probeAttempt);
+        const requestsBefore = backend.snapshot().offeredToolsByRequest.length;
         let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
         try {
           harness = await startRealAiHarness(
@@ -124,6 +119,7 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
             },
           );
           const marker = `${probe.markerPrefix}_${harness.marker.replace(/[^A-Z0-9_]/giu, "_").toUpperCase()}`;
+          backend.setCatalogNotePath(harness.notePath);
           await harness.seedNote(
             harness.notePath,
             `# Catalog probe\n\n${marker}\n`,
@@ -142,17 +138,32 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
               },
               marker,
             ),
-            { timeoutMs: 90_000 },
+            { timeoutMs: 90_000, waitForCompletion: probe.expectedTool !== "upsert_mermaid_block" },
           );
+          if (probe.expectedTool === "upsert_mermaid_block") {
+            await harness.approveUntilMissionComplete(120_000);
+            const snapshot = await harness.attestProductionRun();
+            const receipt = snapshot.lastReceipts.find((row: any) => row.toolName === "upsert_mermaid_block");
+            expect(receipt, JSON.stringify(snapshot.lastComplete)).toBeTruthy();
+            expect(receipt.backupPath).toMatch(/^\.agent-backups\//u);
+            expect(await readFile(harness.noteFilePath, "utf8")).toContain("Research --> Verify");
+            probeAttempt.artifactReadbacks = [`receipt:upsert_mermaid_block:${receipt.path}`, `backup:${receipt.backupPath}`];
+          }
+          probeAttempt.status = "passed";
+        } catch (error) {
+          probeAttempt.failureDetail = error instanceof Error ? error.message : String(error);
+          missing.push(`${probe.id}: ${probeAttempt.failureDetail}`);
         } finally {
+          const offered = backend.snapshot().offeredToolsByRequest.slice(requestsBefore).flat();
+          probeAttempt.offeredTools = [...new Set(offered)];
+          if (!offered.includes(probe.expectedTool)) probeAttempt.status = "failed";
+          probeAttempt.failureClass = probeAttempt.status === "passed" ? "none" : "process:unclassified";
+          await saveOfflineProbe(probeAttempt);
           await harness?.close();
         }
-        const offered = backend.snapshot().offeredToolNames.filter(
-          (name) => !offeredBefore.has(name),
-        );
+        const offered = backend.snapshot().offeredToolsByRequest.slice(requestsBefore).flat();
         const sawExpected =
-          offered.includes(probe.expectedTool) ||
-          backend.snapshot().offeredToolNames.includes(probe.expectedTool);
+          offered.includes(probe.expectedTool);
         if (!sawExpected) {
           missing.push(
             `${probe.id}: expected ${probe.expectedTool}; offered=${JSON.stringify(offered)}`,
@@ -163,6 +174,151 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
       await close(bridge);
     }
     expect(missing, missing.join("\n")).toEqual([]);
+  });
+
+  test("installed retrieval cache, atomic conflict, and durable scheduled preflight", async () => {
+    test.setTimeout(300_000);
+    const probeAttempt = beginOfflineAttempt(await readOfflineBuildIdentity(), "retrieval-and-atomic-conflict");
+    await saveOfflineProbe(probeAttempt);
+    const backend = createOfflineAgentBackendV1();
+    const { createAgentBridgeServer } = await importNativeEsm<{ createAgentBridgeServer(options: { token: string; backend: typeof backend }): Server }>(pathToFileURL(path.resolve("scripts", "agent-bridge.mjs")).href);
+    const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
+    let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+    try {
+      await listen(bridge, 7331);
+      harness = await startRealAiHarness("offline-cache-conflict", { baseUrl: OFFLINE_BASE_URL, model: "offline-scripted-v1", missionTimeoutMs: 120_000, firstChunkTimeoutMs: 30_000, completionTimeoutMs: 120_000 }, { modelRouterEnabled: false, semanticIndexEnabled: false });
+      await harness.seedNote(harness.notePath, "# Original\n", true);
+      const result = await harness.page.evaluate(async ({ notePath, marker }) => {
+        const app = (window as any).app;
+        const plugin = app.plugins.plugins["agentic-researcher"];
+        const registry = plugin.createToolRegistry();
+        const ctx = plugin.createToolExecutionContext("Research CRDT convergence and append to the current note.");
+        ctx.settings = { ...ctx.settings, ollamaBaseUrl: "http://127.0.0.1:7331", ollamaApiKey: "", freeSearchFallbackEnabled: false };
+        ctx.rootMissionId = `offline-cache-${marker}`;
+        ctx.runId = ctx.rootMissionId;
+        ctx.now = () => new Date("2026-09-04T10:00:00Z");
+        ctx.getCurrentMarkdownFile = () => app.vault.getFileByPath(notePath);
+        const source = `https://offline-${marker.toLowerCase()}.example/crdt`;
+        const body = "A state-based G-Counter assigns each replica its own slot and merges by pointwise maximum. Convergence follows because the join is idempotent, commutative, and associative. An observed-remove set records add tags and removes only the tags a replica has observed.";
+        let sourceHits = 0;
+        let searchHits = 0;
+        const createdPaths = new Set<string>();
+        ctx.httpTransport = async (request: any) => {
+          if (request.url.endsWith("/web_search")) { searchHits++; return { status: 200, headers: {}, json: { results: [{ title: "CRDT", url: source, snippet: body }] } }; }
+          const url = JSON.parse(String(request.body ?? "{}")).url;
+          if (url === source) { sourceHits++; return { status: 200, headers: {}, json: { title: `Offline ${marker}`, content: body, links: [] } }; }
+          return { status: 404, headers: {}, json: {} };
+        };
+        const execute = async (name: string, args: any) => {
+          const result = await registry.execute({ name, arguments: args }, ctx);
+          if (result.output?.cachedPath && result.output.cachedPath.endsWith(".md")) createdPaths.add(result.output.cachedPath);
+          return result;
+        };
+        const process = app.vault.process.bind(app.vault);
+        try {
+          const initial = await execute("web_fetch", { url: source, refresh: true });
+          ctx.now = () => new Date("2026-09-04T12:00:00Z");
+          const fallback = await execute("web_fetch", { url: "https://unreachable.example/offline", alternate_urls: [source], refresh: true });
+          const reusedHits = sourceHits;
+          const bypass = await execute("web_fetch", { url: "https://unreachable.example/offline", alternate_urls: [source], max_age_ms: 0 });
+          const searchQuery = `CRDT ${marker}`;
+          await execute("web_search", { query: searchQuery, refresh: true });
+          const searchBefore = searchHits;
+          const search = await execute("web_search", { query: searchQuery, refresh: true });
+          const verified = await execute("verify_citation", { url: source, quote: "Convergence follows because the join is idempotent, commutative, and associative." });
+          app.vault.process = async (file: any, transform: (s: string) => string) => {
+            if (file.path === notePath) await app.vault.modify(file, "# Original\nUser edit survives.\n");
+            return process(file, transform);
+          };
+          const conflict = await execute("append_to_current_file", { text: "Agent addition." });
+          const observed = await app.vault.read(app.vault.getFileByPath(notePath));
+          ctx.getCurrentMarkdownFile = () => null;
+          const unbound = await execute("read_current_file", {});
+          return { initial: initial.ok, fallback: fallback.output, original: initial.output, bypass: bypass.output, reusedHits, sourceHits, searchCached: search.output?.fromCache, searchExtraHits: searchHits - searchBefore, citationStatus: verified.output?.status, conflictCode: conflict.error?.code, observed, unboundRejected: !unbound.ok };
+        } finally {
+          app.vault.process = process;
+          for (const path of createdPaths) {
+            const file = app.vault.getFileByPath(path);
+            if (file) await app.vault.trash(file, true);
+          }
+        }
+      }, { notePath: harness.notePath, marker: harness.marker.replace(/[^a-z0-9]/gi, "") });
+      expect(result.initial).toBe(true);
+      expect(result.fallback.fromCache).toBe(true);
+      expect(result.fallback.fetchedAt).toBe(result.original.fetchedAt);
+      expect(result.fallback.contentHash).toBe(result.original.contentHash);
+      expect(result.reusedHits).toBe(1);
+      expect(result.sourceHits).toBe(2);
+      expect(result.bypass.fromCache).toBe(false);
+      expect(result.searchCached).toBe(true);
+      expect(result.searchExtraHits).toBe(0);
+      expect(result.citationStatus).toBe("supported");
+      expect(result.conflictCode).toBe("vault_write_conflict");
+      expect(result.observed).toContain("User edit survives.");
+      expect(result.observed).not.toContain("Agent addition.");
+      expect(result.unboundRejected).toBe(true);
+      const scheduleProof = await harness.page.evaluate(async ({ notePath, marker }) => {
+        const app = (window as any).app;
+        const plugin = app.plugins.plugins["agentic-researcher"];
+        plugin.missionScheduler?.stop();
+        const target = notePath.replace(/\.md$/u, "-schedule.md");
+        await app.vault.create(target, "# Scheduled output\n");
+        let schedule = { id: `offline-schedule-${marker}`, prompt: "Append a bounded summary to the current note.",
+          cadence: "hourly", enabled: true, targetNotePath: target, lastRunAt: null, lastRunId: null } as any;
+        plugin.settings.scheduledMissions = [schedule];
+        const runMission = plugin.runMission;
+        let launches = 0;
+        let persistedBeforeLaunch = false;
+        let isolatedHistory = false;
+        let missionId = "";
+        let manifestPath = "";
+        plugin.runMission = async (_prompt: string, history: unknown[], options: any) => {
+          launches++;
+          isolatedHistory = history.length === 0;
+          missionId = options.durableManifest.missionId;
+          const file = app.vault.getMarkdownFiles().find((candidate: any) =>
+            candidate.path.startsWith("Agent Runs/Missions/") && candidate.basename === missionId);
+          manifestPath = file?.path ?? "";
+          persistedBeforeLaunch = Boolean(file && (await app.vault.read(file)).includes(missionId));
+          throw Object.assign(new Error("Injected crash after durable dispatch, before launch."), { code: "offline_dispatch_fault" });
+        };
+        try {
+          await Promise.all([plugin.runScheduledMission(schedule), plugin.runScheduledMission(schedule)]);
+          const initialOccurrence = schedule.occurrence?.missionId;
+          const firstFailure = schedule.occurrence?.failureCode;
+          // Deserialize the saved occurrence as startup does, then change a
+          // binding before retry. An existing manifest must re-run preflight.
+          schedule = JSON.parse(JSON.stringify(schedule));
+          plugin.settings.scheduledMissions = [schedule];
+          await app.vault.trash(app.vault.getFileByPath(target), true);
+          await plugin.runScheduledMission(schedule);
+          return { launches, isolatedHistory, persistedBeforeLaunch, firstFailure,
+            sameOccurrence: initialOccurrence === schedule.occurrence?.missionId && initialOccurrence === missionId,
+            retryFailure: schedule.occurrence?.failureCode, retryPersisted: Boolean(schedule.occurrence?.retryAt) };
+        } finally {
+          plugin.runMission = runMission;
+          plugin.settings.scheduledMissions = [];
+          await plugin.saveSettings();
+          for (const ownedPath of [target, manifestPath]) {
+            const file = ownedPath ? app.vault.getFileByPath(ownedPath) : null;
+            if (file) await app.vault.trash(file, true);
+          }
+        }
+      }, { notePath: harness.notePath, marker: harness.marker.replace(/[^a-z0-9]/giu, "") });
+      expect(scheduleProof).toEqual({ launches: 1, isolatedHistory: true, persistedBeforeLaunch: true,
+        firstFailure: "offline_dispatch_fault", sameOccurrence: true, retryFailure: "scheduled_preflight_blocked", retryPersisted: true });
+      probeAttempt.status = "passed";
+      probeAttempt.failureClass = "none";
+      probeAttempt.observations = { sourceHits: result.sourceHits, searchExtraHits: result.searchExtraHits,
+        citationStatus: result.citationStatus, conflictCode: result.conflictCode, unboundRejected: result.unboundRejected, scheduleProof };
+    } catch (error) {
+      probeAttempt.failureDetail = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      await saveOfflineProbe(probeAttempt);
+      await harness?.close();
+      await close(bridge);
+    }
   });
 });
 
@@ -181,6 +337,8 @@ async function runExpandScenario(input: {
   const startedAt = Date.now();
   const modelCallsBefore = input.backend.snapshot().requestCount;
   let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+  let attempt: Record<string, unknown> = beginOfflineAttempt(input.identity, input.scenario.id);
+  await saveOfflineAttempt(attempt);
   try {
     harness = await startRealAiHarness(
       `offline-expand-${input.scenario.id}`,
@@ -207,6 +365,7 @@ async function runExpandScenario(input: {
         input.cloudModelRequests.push(request.url());
       }
     });
+    await observeOfflineTools(harness.page);
     const marker = `${input.scenario.markerPrefix}_${harness.marker.replace(/[^A-Z0-9_]/giu, "_").toUpperCase()}`;
     const original = `# Original\n\nKEEP_UNTIL_REPLACE_${harness.marker}\n`;
     await harness.seedNote(harness.notePath, original, true);
@@ -214,18 +373,32 @@ async function runExpandScenario(input: {
       timeoutMs: 120_000,
       waitForCompletion: false,
     });
-    await approveReplaceIfShown(harness);
-    await harness.waitForMissionComplete(120_000);
+    if (input.scenario.requiresBackup) await harness.approveUntilMissionComplete(180_000);
+    else await harness.waitForMissionComplete(120_000);
 
-    const after = await harness.readNote();
+    const snapshot = await harness.attestProductionRun();
+    const receipts = Array.isArray(snapshot.lastReceipts) ? snapshot.lastReceipts : [];
+    const renamed = receipts.find((receipt: any) => receipt.toolName === "rename_current_file");
+    const outputPath = renamed?.toPath ?? harness.notePath;
+    if (input.scenario.id === "title_rename_plus_body") {
+      expect(typeof renamed?.toPath, JSON.stringify(receipts)).toBe("string");
+      expect(path.posix.dirname(outputPath)).toBe(path.posix.dirname(harness.notePath));
+      expect(path.posix.basename(outputPath)).toBe("Offline Title Brief.md");
+    }
+    const after = await harness.page.evaluate(async (notePath) => {
+      const app = (window as any).app;
+      const file = app.vault.getFileByPath(notePath);
+      if (!file) throw new Error(`Verified output note missing: ${notePath}`);
+      return app.vault.read(file);
+    }, outputPath);
     expect(after.includes(marker), after).toBe(true);
     if (input.scenario.expectedMutation === "replace") {
       expect(after.includes(`KEEP_UNTIL_REPLACE_${harness.marker}`)).toBe(false);
     }
 
-    const snapshot = await harness.attestProductionRun();
     const ledger = assertCompletedLedgerAcceptance(snapshot);
-    const receipts = Array.isArray(snapshot.lastReceipts) ? snapshot.lastReceipts : [];
+    const counts = await readOfflineToolCounts(harness.page);
+    const scorecard = snapshot.lastMissionScorecard;
     if (input.scenario.requiresBackup) {
       expect(
         receipts.some((receipt: { backupPath?: string }) =>
@@ -236,22 +409,19 @@ async function runExpandScenario(input: {
       ).toBe(true);
     }
 
-    return input.validateOfflineApplicationAttempt({
+    attempt = input.validateOfflineApplicationAttempt({
+      ...attempt,
       version: 1,
       scenarioId: input.scenario.id,
       repetition: 1,
       ...input.identity,
       status: "passed",
       acceptanceStatus: "pass",
-      scorecardAcceptancePassed: true,
-      scorecardTotal: 1,
-      scorecardDimensions: [
-        { id: "artifact_correctness", score: 1 },
-        { id: "receipt_coverage", score: 1 },
-        { id: "mutation_uniqueness", score: 1 },
-      ],
+      scorecardAcceptancePassed: scorecard?.acceptancePassed === true,
+      scorecardTotal: typeof scorecard?.total === "number" ? scorecard.total : null,
+      scorecardDimensions: (scorecard?.dimensions ?? []).map((dimension: any) => ({ id: dimension.id, score: dimension.score })),
       artifactReadbacks: [
-        `note:${harness.notePath}:${marker}`,
+        `note:${outputPath}:${marker}`,
         ...receipts
           .filter((receipt: { toolName?: string; operation?: string }) =>
             typeof receipt.toolName === "string",
@@ -267,37 +437,30 @@ async function runExpandScenario(input: {
       mutationsPerformed: Math.max(1, receipts.length),
       mutationsWithReceipts: receipts.length,
       mutationEventsObserved: receipts.length,
-      toolEventsObserved: ledger.expectedTools.length,
-      toolEventsFailed: 0,
+      ...counts,
       modelCalls: Math.max(0, input.backend.snapshot().requestCount - modelCallsBefore),
       providerWaitMs: 0,
       durationMs: Date.now() - startedAt,
     });
+    return attempt;
+  } catch (error) {
+    attempt.failureDetail = error instanceof Error ? error.message : String(error);
+    await saveOfflineAttempt(attempt);
+    if (harness) {
+      const partial = await boundedOfflineRead(harness.attestProductionRun());
+      if (partial) attempt.partialRun = partial;
+    }
+    throw error;
   } finally {
+    attempt.durationMs = Date.now() - startedAt;
+    attempt.modelCalls = Math.max(0, input.backend.snapshot().requestCount - modelCallsBefore);
+    attempt.cloudRequestCount = input.cloudModelRequests.length;
+    if (harness) {
+      Object.assign(attempt, await readOfflineToolCounts(harness.page));
+      await boundedOfflineRead(harness.page.evaluate(() => { (window as any).__offlineUnsubscribe?.(); }));
+    }
+    await saveOfflineAttempt(attempt);
     await harness?.close();
-  }
-}
-
-async function approveReplaceIfShown(
-  harness: Awaited<ReturnType<typeof startRealAiHarness>>,
-): Promise<void> {
-  const card = harness.activePreparedApproval("replace_current_file");
-  try {
-    await expect(card).toBeVisible({ timeout: 8_000 });
-    await harness.approve(card);
-  } catch {
-    // Streamed replace writes without a prepared-approval card.
-  }
-}
-
-async function readExistingAttempts(filePath: string): Promise<unknown[]> {
-  try {
-    const parsed = JSON.parse(await readFile(filePath, "utf8")) as {
-      attempts?: unknown[];
-    };
-    return Array.isArray(parsed.attempts) ? parsed.attempts : [];
-  } catch {
-    return [];
   }
 }
 

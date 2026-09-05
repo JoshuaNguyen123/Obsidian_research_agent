@@ -23,6 +23,7 @@ import {
   type KeepAwakeLease,
 } from "../platform/keepAwake";
 import { formatFailureCopy, keepAwakeFailureCopy } from "./failureCopy";
+import { classifyDurableResumeScanCandidate } from "./durableResumeSelection";
 
 export type DurableMissionBudgetStopReason =
   | "budget"
@@ -430,46 +431,15 @@ export class LiveDurableMissionRuntime implements DurableMissionSupervisor {
     state: RunningDurableMission,
   ): Promise<boolean> {
     const now = this.now();
-    if (hasDurableMissionDeadlineElapsed(state.current, now)) {
-      await this.persistTerminalState(state, "expired", {
-        code: "deadline_reached",
-        message: "The durable mission reached its absolute deadline.",
-      });
+    const decision = classifyDurableResumeScanCandidate(state.current, now, this.ownerId);
+    if (decision.type === "terminalize") {
+      await this.persistTerminalState(state, decision.status, { code: decision.code, message: decision.message });
       return false;
     }
-
-    const budgetReason = getDurableMissionBudgetExhaustionReason(state.current);
-    if (budgetReason) {
-      await this.persistTerminalState(state, "blocked", {
-        code: budgetReason,
-        message: `The durable mission cannot resume because ${budgetReason.replace(/_/g, " ")}.`,
-      });
-      return false;
-    }
+    if (decision.type === "skip") return false;
 
     if (
-      state.current.status === "complete" ||
-      state.current.status === "cancelled" ||
-      state.current.status === "expired" ||
-      state.current.status === "blocked" ||
-      state.current.status === "paused_for_approval" ||
-      state.current.pendingApproval ||
-      state.current.reconciliation.status !== "clean"
-    ) {
-      return false;
-    }
-
-    if (isDurableMissionRetryExhausted(state.current.retry, state.current.policy)) {
-      await this.persistTerminalState(state, "blocked", {
-        code: "transient_failure_limit",
-        message: "The durable mission exhausted its transient retry budget.",
-      });
-      return false;
-    }
-
-    if (
-      isDurableMissionLeaseLive(state.current.lease, now) &&
-      !canClaimDurableMissionLease(state.current, this.ownerId, now)
+      decision.type === "wait" && decision.reason === "live_lease"
     ) {
       throw new DurableMissionLeaseConflictError(
         state.current.missionId,

@@ -3657,6 +3657,9 @@ interface ObservedWebFetchDecision {
   refreshArg?: boolean;
   maxAgeArg?: number;
   fromCache?: boolean;
+  sourceTransport?: "cache" | "network";
+  fetchedAt?: string;
+  fetchedForMission?: string;
   cacheMaxAgeMs?: number;
   fallbackUsed?: boolean;
   promptSample: string;
@@ -4024,6 +4027,9 @@ async function installToolExecutionObserver(
                 ...(typeof output?.fromCache === "boolean"
                   ? { fromCache: output.fromCache }
                   : {}),
+                ...(output?.sourceTransport === "cache" || output?.sourceTransport === "network" ? { sourceTransport: output.sourceTransport } : {}),
+                ...(typeof output?.fetchedAt === "string" ? { fetchedAt: output.fetchedAt } : {}),
+                ...(typeof output?.fetchedForMission === "string" ? { fetchedForMission: output.fetchedForMission } : {}),
                 ...(typeof output?.cacheMaxAgeMs === "number"
                   ? { cacheMaxAgeMs: output.cacheMaxAgeMs }
                   : {}),

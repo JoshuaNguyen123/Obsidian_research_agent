@@ -16,7 +16,6 @@ import {
   type ToolExecutionContext,
 } from "./types";
 import {
-  getOptionalBoolean,
   getOptionalInteger,
   getOptionalString,
   getRequiredString,
@@ -24,12 +23,10 @@ import {
   truncateText,
 } from "./validation";
 import {
-  SOURCE_CACHE_FRESH_MS,
   SOURCE_CACHE_MAX_AGE_MS,
   findFreshCachedSource,
   readCachedSourceContent,
   readSourceSection,
-  resolveSourceCacheMissionId,
   writeSourceCacheNote,
 } from "./sourceCache";
 import type { SourceParserStatus } from "./sourceCache";
@@ -61,6 +58,7 @@ import { createDocumentExtractProvider } from "./documentExtract";
 import { inferSourceSignals } from "../agent/sourceSignals";
 import { scoreSourceCandidate } from "../orchestrator/sourceCandidateLedger";
 import { requestWithRetry } from "./httpRetry";
+import { resolveRetrievalCachePolicy, type ResolvedRetrievalCachePolicy } from "./retrievalCachePolicy";
 
 export function createWebTools(): AgentTool[] {
   return [webSearchTool, webFetchTool, readSourceSectionTool];
@@ -94,7 +92,11 @@ export const webSearchTool: AgentTool = {
       },
       refresh: {
         type: "boolean",
-        description: "Bypass cached results (24 h). Freshness-sensitive missions default to true.",
+        description: "Require results fetched for this mission; reuse them within the accepted age. Defaults from the user mission unless max_age_ms is supplied.",
+      },
+      max_age_ms: {
+        type: "integer", minimum: 0, maximum: SOURCE_CACHE_MAX_AGE_MS,
+        description: "Accepted cache age (default 24 h); 0 always bypasses cache.",
       },
     },
     additionalProperties: false,
@@ -118,19 +120,13 @@ export const webSearchTool: AgentTool = {
       );
     }
 
-    // Same bypass rule as web_fetch: an explicit refresh wins, otherwise a
-    // freshness-sensitive mission ("latest", "current", "as of") never reads
-    // yesterday's results. `fromCache` / `cachedPath` are web_fetch's
-    // vocabulary for the same fact, so coverage and receipts read one word.
-    const refresh =
-      getOptionalBoolean(args, "refresh") ??
-      isFreshnessSensitivePrompt(context.originalPrompt ?? "");
+    const cachePolicy = resolveRetrievalCachePolicy(args, context);
     const cacheLookup: SearchCacheLookup = {
       query,
       index: requestedProviders ? requestedProviders.join(",") : "",
       maxResults,
     };
-    const cached = await findFreshCachedSearch(context, cacheLookup, { refresh });
+    const cached = await findFreshCachedSearch(context, cacheLookup, cachePolicy);
     if (cached) {
       return {
         ...(cached.index ? { index: cached.index } : {}),
@@ -138,6 +134,8 @@ export const webSearchTool: AgentTool = {
         fromCache: true,
         cachedPath: SEARCH_CACHE_PATH,
         searchedAt: cached.searchedAt,
+        searchedForMission: cached.searchedForMission,
+        cacheMaxAgeMs: cachePolicy.maxAgeMs,
       };
     }
 
@@ -365,7 +363,7 @@ export const webFetchTool: AgentTool = {
       refresh: {
         type: "boolean",
         description:
-          "Bypass cached content. Use for current/latest claims; freshness-sensitive missions default to true when no cache policy is supplied.",
+          "Require a source fetched for this mission; reuse it within the accepted age. Defaults from the user mission unless max_age_ms is supplied.",
       },
       alternate_urls: {
         type: "array",
@@ -380,20 +378,10 @@ export const webFetchTool: AgentTool = {
   async execute(args, context) {
     assertOperationActive(context);
     const url = normalizeWebFetchUrl(getRequiredString(args, "url"));
-    const requestedMaxAgeMs = getOptionalInteger(args, "max_age_ms");
-    const maxAgeMs = getCacheMaxAgeMs(requestedMaxAgeMs);
-    const requestedRefresh = getOptionalBoolean(args, "refresh");
-    const refresh = requestedRefresh ?? (
-      requestedMaxAgeMs === undefined &&
-      isFreshnessSensitivePrompt(context.originalPrompt)
-    );
+    const cachePolicy = resolveRetrievalCachePolicy(args, context);
+    const { maxAgeMs } = cachePolicy;
     const query = getEvidenceQuery(args, context.originalPrompt);
-    const missionId = resolveSourceCacheMissionId(context);
-    const cached = await findFreshCachedSource(context, url, {
-      maxAgeMs,
-      refresh,
-      ...(missionId ? { missionId } : {}),
-    });
+    const cached = await findFreshCachedSource(context, url, cachePolicy);
     if (cached) {
       const section = await readSourceSection(
         context,
@@ -415,6 +403,8 @@ export const webFetchTool: AgentTool = {
         content: truncateText(section.content, MAX_WEB_FETCH_CHARS),
         links: [],
         fromCache: true,
+        sourceTransport: "cache",
+        fetchedForMission: cached.fetchedForMission,
         cachedPath: cached.vaultPath,
         fetchedAt: cached.fetchedAt,
         sourceChars: cached.sourceChars,
@@ -455,6 +445,7 @@ export const webFetchTool: AgentTool = {
         query,
         url,
         maxAgeMs,
+        cachePolicy,
         failureCode: "source_http_error",
         failureSummary: `web_fetch could not retrieve ${url} (${getHttpErrorMessage(response, "web_fetch")})`,
       });
@@ -477,6 +468,7 @@ export const webFetchTool: AgentTool = {
         query,
         url,
         maxAgeMs,
+        cachePolicy,
         failureCode: "source_unusable",
         failureSummary: `web_fetch could not extract usable source passages from ${url} (${sourceUsability.reason})`,
       });
@@ -497,6 +489,8 @@ export const webFetchTool: AgentTool = {
       links: normalized.links,
       fromCache: false,
       cachedPath: cache.vaultPath,
+      sourceTransport: "network",
+      fetchedForMission: cache.fetchedForMission,
       fetchedAt: cache.fetchedAt,
       sourceChars: cache.sourceChars,
       totalChars: cache.totalChars,
@@ -528,12 +522,13 @@ async function retrieveWebFetchSubstituteV1(input: {
   query: string | undefined;
   url: string;
   maxAgeMs: number;
+  cachePolicy: ResolvedRetrievalCachePolicy;
   failureCode: "source_unusable" | "source_http_error";
   failureSummary: string;
 }) {
   const { args, context, query, url, maxAgeMs } = input;
   assertOperationActive(context);
-  const alternateUrls = await resolveFallbackUrls(args, context, query, url);
+  const alternateUrls = await resolveFallbackUrls(args, context, query, url, input.cachePolicy);
   const fallback = await retrieveUsableResearchSource({
     candidates: buildResearchFallbackCandidates({
       url,
@@ -546,7 +541,7 @@ async function retrieveWebFetchSubstituteV1(input: {
         candidate.strategy === "document_extract" ||
         candidate.strategy === "alternate_result",
     ),
-    providers: createRuntimeResearchProviders(context),
+    providers: createRuntimeResearchProviders(context, input.cachePolicy),
     signal: context.abortSignal,
     maxAttempts: 12,
   });
@@ -564,7 +559,7 @@ async function retrieveWebFetchSubstituteV1(input: {
     );
   }
   const effectiveUrl = normalizeWebFetchUrl(fallback.output.url || url);
-  const fallbackCache = await writeSourceCacheNote(context, {
+  const fallbackCache = fallback.output.cachedSource ?? await writeSourceCacheNote(context, {
     url: effectiveUrl,
     title: fallback.output.title,
     content: fallback.output.content,
@@ -581,7 +576,9 @@ async function retrieveWebFetchSubstituteV1(input: {
     query,
     content: truncateText(fallback.output.content, MAX_WEB_FETCH_CHARS),
     links: getProviderLinks(fallback.output.providerMetadata),
-    fromCache: false,
+    fromCache: Boolean(fallback.output.cachedSource),
+    sourceTransport: fallback.output.cachedSource ? "cache" : "network",
+    fetchedForMission: fallbackCache.fetchedForMission,
     cachedPath: fallbackCache.vaultPath,
     fetchedAt: fallbackCache.fetchedAt,
     sourceChars: fallbackCache.sourceChars,
@@ -723,6 +720,7 @@ function normalizeWebFetchResponse(body: unknown, url: string) {
 
 function createRuntimeResearchProviders(
   context: ToolExecutionContext,
+  cachePolicy: ResolvedRetrievalCachePolicy,
 ): ResearchRetrievalProvider[] {
   const alternateProvider: ResearchRetrievalProvider = {
     id: "ollama-web-fetch",
@@ -736,9 +734,7 @@ function createRuntimeResearchProviders(
       // failure re-pulled bytes the vault already held and the owned-source
       // backend counted the hit twice. A stored copy answers the same
       // candidate; only a cache miss now costs a request.
-      const substitute = await findFreshCachedSource(context, normalizedUrl, {
-        maxAgeMs: SOURCE_CACHE_FRESH_MS,
-      });
+      const substitute = await findFreshCachedSource(context, normalizedUrl, cachePolicy);
       if (substitute) {
         const storedContent = await readCachedSourceContent(
           context,
@@ -750,6 +746,7 @@ function createRuntimeResearchProviders(
             url: normalizedUrl,
             content: storedContent,
             parserStatus: substitute.parserStatus,
+            cachedSource: substitute,
             providerMetadata: { links: [] },
           };
         }
@@ -838,6 +835,7 @@ async function resolveFallbackUrls(
   context: ToolExecutionContext,
   query: string | undefined,
   primaryUrl: string,
+  cachePolicy: ResolvedRetrievalCachePolicy,
 ): Promise<string[]> {
   const values = readAlternateUrlArgs(args.alternate_urls);
   // An open-access edition of the same work comes first: it is the same
@@ -857,7 +855,7 @@ async function resolveFallbackUrls(
   if (query && values.length < 5) {
     try {
       const output = await webSearchTool.execute(
-        { query, max_results: 5 },
+        { query, max_results: 5, refresh: cachePolicy.refresh, max_age_ms: cachePolicy.maxAgeMs },
         context,
       );
       if (isRecord(output) && Array.isArray(output.results)) {
@@ -936,18 +934,6 @@ function getBrowserFallbackFailure(value: unknown, operation: string): string {
   return `Companion browser could not ${operation} the source.`;
 }
 
-function getCacheMaxAgeMs(value: number | undefined): number {
-  if (value === undefined) {
-    return SOURCE_CACHE_FRESH_MS;
-  }
-  if (value < 0 || value > SOURCE_CACHE_MAX_AGE_MS) {
-    throw new Error(
-      `web_fetch max_age_ms must be between 0 and ${SOURCE_CACHE_MAX_AGE_MS}.`,
-    );
-  }
-  return value;
-}
-
 function getEvidenceQuery(
   args: Record<string, unknown>,
   originalPrompt: string,
@@ -955,12 +941,6 @@ function getEvidenceQuery(
   const explicit = getOptionalString(args, "query")?.trim();
   const value = explicit || originalPrompt.trim();
   return value ? value.replace(/\s+/g, " ").slice(0, 500) : undefined;
-}
-
-function isFreshnessSensitivePrompt(prompt: string): boolean {
-  return /\b(current(?:ly)?|latest|today|now|recent|newest|up[- ]to[- ]date|as of)\b/i.test(
-    prompt,
-  );
 }
 
 function normalizeWebFetchUrl(rawUrl: string): string {

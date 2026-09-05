@@ -77,6 +77,7 @@ export async function seedDurableChildRun(
   const snapshot = createMissionRuntimeSnapshot({
     runId: input.childRunId,
     originalMission: priorRuntime?.originalMission ?? priorLedger?.mission ?? input.mission,
+    retrievalCacheDefaults: priorRuntime?.retrievalCacheDefaults ?? context.retrievalCacheDefaults,
     currentNotePath:
       priorRuntime?.currentNotePath ?? input.currentNotePath ?? undefined,
     rootRunId: priorRuntime?.lineage.rootRunId ?? input.rootMissionId,

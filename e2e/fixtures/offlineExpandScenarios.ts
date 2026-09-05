@@ -87,8 +87,9 @@ export function assertOfflineExpandCatalogComplete(): void {
 
 /**
  * Installed-plugin catalog probes for extract / citation / dataset / mermaid.
- * Chat-only; the scripted backend records the offered tool menu and does not
- * call the tools (no live web, no PDF fetch, no vault dataset file).
+ * The scripted backend records offered tools and executes native prerequisite
+ * reads. Flowchart creation also exercises prepared approval and writeback;
+ * extract, citation and dataset availability require no live web or PDF fetch.
  */
 export const OFFLINE_RESEARCH_CATALOG_PROBES: readonly {
   id: string;

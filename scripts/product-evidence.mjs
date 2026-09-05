@@ -25,8 +25,14 @@
 // The Python projection at the bottom exists so the generated notebook cells
 // are derived from these same constants rather than hand-copied a fourth time.
 
-/** The class recorded when nothing failed. Blank normalizes to this. */
+/** The explicit class recorded when nothing failed. Blank remains unresolved. */
 export const NO_FAILURE_CLASS = "none";
+export const EVIDENCE_SEMANTICS_VERSION = 2;
+export const UNRESOLVED_FAILURE_CLASS = "unclassified";
+
+export function isUnresolvedFailureClass(value) {
+  return !String(value ?? "").trim() || /(?:^|[:_])(?:unclassified|unknown)$/u.test(String(value));
+}
 
 /**
  * The lane refused to start because a variable IT requires is absent (or
@@ -53,7 +59,7 @@ export const ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS = "environment_not_configu
  * Class prefixes that mark a failure as measuring the HARNESS or the matrix
  * PROCESS rather than the product: `harness:renderer_death`,
  * `harness:cleanup_failed`, `harness:provider_quota_exhausted`,
- * `process:matrix_unclassified`, and every future sibling.
+ * Classified future siblings follow the same rule; unknown causes remain unresolved.
  */
 export const INFRASTRUCTURE_FAILURE_CLASS_PREFIXES = Object.freeze(["harness", "process"]);
 
@@ -75,6 +81,7 @@ export const INFRASTRUCTURE_FAILURE_CLASS_PATTERN = new RegExp(
  */
 export function isInfrastructureFailureClass(failureClass) {
   const cls = String(failureClass ?? "");
+  if (isUnresolvedFailureClass(cls)) return false;
   if (cls === ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS) return true;
   return INFRASTRUCTURE_FAILURE_CLASS_PATTERN.test(cls);
 }
@@ -91,7 +98,7 @@ export function isInfrastructureFailureClass(failureClass) {
  * agree by construction rather than by review.
  */
 export function measuresProduct(subject) {
-  return Boolean(subject?.green) || !isInfrastructureFailureClass(subject?.failureClass);
+  return Boolean(subject?.green) || (!isUnresolvedFailureClass(subject?.failureClass) && !isInfrastructureFailureClass(subject?.failureClass));
 }
 
 // ---------------------------------------------------------------------------
@@ -104,19 +111,15 @@ export function measuresProduct(subject) {
  * use `write_completed`, `AUDIT_PASSED_8_OF_8`, `fix_merged`, `lane_green` and
  * friends, so the match is a substring test over that legacy vocabulary.
  *
- * It is a WEAK signal and deliberately stays one: a curated row like
- * `stages_1-7_passed_stage8_external` matches it while recording a real
- * failure class. Every reader has counted such rows green since the CSV
- * existed and this module does not change that verdict — but the weak signal
- * is never allowed to decide whether a row is SCORED. See
- * `runRowRecordedNoFailure`.
+ * Retained for consumers of the legacy vocabulary. This pattern cannot decide
+ * success: runRowIsGreen checks the recorded failure and acceptance/proof fields.
  */
 export const GREEN_OUTCOME_PATTERN = /passed|green|write_completed|fix_merged/iu;
 
-/** Blank is unrecorded, not a distinct class: it normalizes to `none`. */
+/** Missing classification stays unresolved; it does not certify success. */
 export function normalizeFailureClass(value) {
   const text = String(value ?? "").trim();
-  return text === "" ? NO_FAILURE_CLASS : text;
+  return text === "" ? UNRESOLVED_FAILURE_CLASS : text;
 }
 
 /**
@@ -127,6 +130,9 @@ export function toRunRow(record) {
   return {
     outcome: String(record?.mission_outcome ?? ""),
     failureClass: normalizeFailureClass(record?.primary_failure_class),
+    acceptanceStatus: String(record?.acceptance_status ?? ""),
+    scorecardAcceptancePassed: String(record?.scorecard_acceptance_passed ?? ""),
+    artifactProofCount: optionalCount(record?.artifact_proof_count),
   };
 }
 
@@ -139,10 +145,17 @@ export function runRowRecordedNoFailure(row) {
   return normalizeFailureClass(row?.failureClass) === NO_FAILURE_CLASS;
 }
 
-/** True when the row recorded a success (authoritative, or curated vocabulary). */
+/** True when explicit no-failure evidence is consistent with acceptance and proof. */
 export function runRowIsGreen(row) {
-  if (runRowRecordedNoFailure(row)) return true;
-  return GREEN_OUTCOME_PATTERN.test(String(row?.outcome ?? ""));
+  // A failed stage cannot be rescued by another stage's word "passed".
+  if (!runRowRecordedNoFailure(row)) return false;
+  if (/(?:^|[_ -])(?:failed?|red|blocked|partial|incomplete|error|cancelled|timeout|timed_out)(?:$|[_ -])/iu.test(String(row?.outcome ?? ""))) return false;
+  if (row?.acceptanceStatus && row.acceptanceStatus !== "pass") return false;
+  if (row?.scorecardAcceptancePassed && String(row.scorecardAcceptancePassed) !== "true") return false;
+  if (row?.artifactProofCount === 0) return false;
+  // Legacy rows can use their explicitly recorded no-failure verdict, but
+  // never override modern negative acceptance/proof fields.
+  return true;
 }
 
 /**
@@ -164,18 +177,20 @@ export function runRowMeasuresProduct(row) {
 
 /** True when the row is a harness/process death — reported, never scored. */
 export function runRowIsInfrastructure(row) {
-  return !runRowMeasuresProduct(row);
+  return !runRowRecordedNoFailure(row) && isInfrastructureFailureClass(row?.failureClass);
 }
 
 /** Split rows into the ones a pass rate may see and the ones it may not. */
 export function partitionRunRows(rows) {
   const scored = [];
   const infrastructure = [];
+  const unresolved = [];
   for (const row of rows ?? []) {
-    if (runRowIsInfrastructure(row)) infrastructure.push(row);
+    if (isUnresolvedFailureClass(row?.failureClass)) unresolved.push(row);
+    else if (runRowIsInfrastructure(row)) infrastructure.push(row);
     else scored.push(row);
   }
-  return { scored, infrastructure };
+  return { scored, infrastructure, unresolved };
 }
 
 /**
@@ -185,7 +200,7 @@ export function partitionRunRows(rows) {
  */
 export function summarizeRunRows(rows) {
   const list = rows ?? [];
-  const { scored, infrastructure } = partitionRunRows(list);
+  const { scored, infrastructure, unresolved } = partitionRunRows(list);
   const green = scored.filter(runRowIsGreen).length;
   return {
     rows: list.length,
@@ -193,6 +208,8 @@ export function summarizeRunRows(rows) {
     green,
     red: scored.length - green,
     infrastructure: infrastructure.length,
+    unresolved: unresolved.length,
+    semanticsVersion: EVIDENCE_SEMANTICS_VERSION,
     passRate: scored.length > 0 ? (100 * green) / scored.length : null,
   };
 }
@@ -200,6 +217,21 @@ export function summarizeRunRows(rows) {
 /** "51.9%", or "n/a" when nothing was scored. */
 export function formatRate(part, whole) {
   return whole > 0 ? `${((100 * part) / whole).toFixed(1)}%` : "n/a";
+}
+
+export function optionalCount(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+export function summarizeToolCounts(rows) {
+  const known = rows.filter((r) => r.toolEvents !== null && r.toolFailed !== null && r.toolFailed <= r.toolEvents);
+  return {
+    observed: known.reduce((n, r) => n + r.toolEvents, 0),
+    failed: known.reduce((n, r) => n + r.toolFailed, 0),
+    coveredRows: known.length, totalRows: rows.length,
+  };
 }
 
 /**
@@ -274,16 +306,23 @@ export function pythonProductEvidenceSource() {
     `ENVIRONMENT_NOT_CONFIGURED = '${ENVIRONMENT_NOT_CONFIGURED_FAILURE_CLASS}'`,
     `NO_FAILURE_CLASS = '${NO_FAILURE_CLASS}'`,
     "def failure_class(r):",
-    "    return (r.get('primary_failure_class') or '').strip() or NO_FAILURE_CLASS",
+    "    return (r.get('primary_failure_class') or '').strip() or 'unclassified'",
+    "def unresolved(r):",
+    "    return bool(re.search(r'(?:^|[:_])(?:unclassified|unknown)$', failure_class(r)))",
     "def is_infrastructure_class(cls):",
     "    return cls == ENVIRONMENT_NOT_CONFIGURED or bool(INFRASTRUCTURE_CLASS_RE.match(cls))",
     "def recorded_no_failure(r):",
     "    return failure_class(r) == NO_FAILURE_CLASS",
     "def green(r):",
-    "    return recorded_no_failure(r) or bool(GREEN_OUTCOME_RE.search(r.get('mission_outcome') or ''))",
+    "    if not recorded_no_failure(r): return False",
+    "    if re.search(r'(?:^|[_ -])(?:failed?|red|blocked|partial|incomplete|error|cancelled|timeout|timed_out)(?:$|[_ -])', r.get('mission_outcome') or '', re.I): return False",
+    "    if r.get('acceptance_status') and r['acceptance_status'] != 'pass': return False",
+    "    if r.get('scorecard_acceptance_passed') and str(r['scorecard_acceptance_passed']) != 'true': return False",
+    "    if str(r.get('artifact_proof_count', '')).strip() == '0': return False",
+    "    return True",
     "def measures_product(r):",
-    "    return recorded_no_failure(r) or not is_infrastructure_class(failure_class(r))",
+    "    return not unresolved(r) and (recorded_no_failure(r) or not is_infrastructure_class(failure_class(r)))",
     "def infrastructure(r):",
-    "    return not measures_product(r)",
+    "    return not unresolved(r) and not measures_product(r)",
   ];
 }

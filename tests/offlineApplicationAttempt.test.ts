@@ -81,6 +81,20 @@ test("offline attempt contract rejects incomplete or contradictory evidence", ()
   );
 });
 
+test("failed offline attempts retain unknown counts and report coverage", () => {
+  const result = evaluateOfflineApplicationRelease({
+    attempts: [{ ...green("chat_only", 1), status: "failed", failureClass: "harness:renderer_death",
+      toolEventsObserved: null, toolEventsFailed: null, mutationsPerformed: null, mutationsWithReceipts: null }],
+    requiredScenarioIds: ["chat_only"], requiredRepetitions: 1,
+  });
+  assert.equal(result.passed, false);
+  assert.equal(result.toolEvents, null);
+  assert.equal(result.failedToolEvents, null);
+  assert.equal(result.toolContractFriction, null);
+  assert.equal(result.receiptCoverage, null);
+  assert.equal(result.toolCountCoverage, 0);
+});
+
 test("release evidence rejects a dirty tree while a development gate labels it", () => {
   const attempt = { ...green("chat_only", 1), sourceState: "dirty_worktree" as const };
   const release = evaluateOfflineApplicationRelease({
