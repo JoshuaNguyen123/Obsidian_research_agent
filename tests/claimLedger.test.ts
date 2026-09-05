@@ -10,6 +10,7 @@ import {
 } from "../src/agent/claimLedger";
 import { mergeClaimGroundingIntoAcceptance } from "../src/agent/missionAcceptance";
 import { quoteAppearsVerbatim } from "../src/agent/quoteMatch";
+import { UNVERIFIED_CLAIM_MARKER_V1 } from "../src/agent/degradedDelivery";
 import {
   claimPassagesFromToolResult,
   evidenceFromToolResult,
@@ -164,6 +165,29 @@ test("standalone required literal markers are metadata rather than material clai
   assert.equal(ledger.status, "pass", ledger.missing.join(", "));
   assert.equal(ledger.claims.length, 1);
   assert.doesNotMatch(ledger.claims[0]?.text ?? "", /E2E_MARKER/iu);
+});
+
+test("host verification labels do not become claims or exempt adjacent unsupported claims", () => {
+  const marker = UNVERIFIED_CLAIM_MARKER_V1;
+  assert.deepEqual(buildClaimLedger({ draft: marker, forceRequire: true }).claims, []);
+  const unsupported = "Every code validation passed and a release was published.";
+  for (const draft of [`${unsupported} ${marker}`, `${marker} ${unsupported}`]) {
+    const ledger = buildClaimLedger({ draft, forceRequire: true });
+    assert.equal(ledger.status, "needs_more_work");
+    assert.ok(ledger.claims.some((claim) => claim.text.includes(unsupported) && claim.status === "ungrounded"));
+    assert.ok(ledger.claims.every((claim) => claim.text !== marker));
+    for (const claim of ledger.claims) {
+      assert.equal(draft.slice(claim.draftStart, claim.draftEnd), claim.text);
+    }
+  }
+  const source = fetchedSource();
+  const supported = buildClaimLedger({
+    draft: `${marker}\n\nQuantum battery evidence compares independent laboratory sources [${source.passageId}].`,
+    forceRequire: true,
+    evidence: [source], passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+  });
+  assert.equal(supported.status, "pass", supported.missing.join(", "));
+  assert.equal(supported.claims.length, 1);
 });
 
 test("word-count verification does not manufacture passage grounding debt", () => {

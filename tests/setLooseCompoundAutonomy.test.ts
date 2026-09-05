@@ -49,12 +49,44 @@ import type { ProjectLifecycleStageV1 } from "../src/agent/projectLifecycle";
 import { createMissionRuntimeSnapshot } from "../src/agent/runStore";
 import {
   appendWorkItemLineageTransitionV1,
+  buildLinearOperationId,
   createAcceptedResearchArtifactV1,
   createExternalWorkItemBindingV1,
   createWorkItemLineageV1,
   createWorkItemSpecV2,
   renderQueueExecutableHumanWorkItemSpecV2,
 } from "../src/integrations/linear";
+
+test("publication proof accepts production node identity only for its bound root and matching provider receipt", () => {
+  const receipt = completedResearchPublicationReceiptFixture("created");
+  const output = receipt.output as Record<string, any>;
+  const key = buildLinearOperationId({
+    resourceType: "issue", verb: "create", runId: receipt.runId!, taskId: "retried-call",
+    nodeScope: { rootMissionId: output.artifact.originRunId,
+      nodeId: "tool-08-publish_research_to_linear", toolName: "linear_create_issue" },
+  });
+  receipt.idempotencyKey = key;
+  output.receipt.idempotencyKey = key;
+  assert.equal(isCompletedAcceptedResearchPublicationReceipt(receipt), true);
+  assert.equal(seedSetLooseDeliveryStateFromReceipts([receipt]).proofs.acceptedResearchPublication, true);
+  for (const invalidKey of [
+    key.replace(output.artifact.originRunId, "wrong-root-mission"),
+    key.replace(":linear_create_issue:", ":linear_update_issue:"),
+    key.replace(":0", ":1"),
+    key.replace("tool-08-", "tool 08-"),
+  ]) {
+    const invalid = structuredClone(receipt);
+    invalid.idempotencyKey = invalidKey;
+    (invalid.output as Record<string, any>).receipt.idempotencyKey = invalidKey;
+    assert.equal(isCompletedAcceptedResearchPublicationReceipt(invalid), false, invalidKey);
+  }
+  const mismatched = structuredClone(receipt);
+  (mismatched.output as Record<string, any>).receipt.idempotencyKey = "different-operation";
+  assert.equal(isCompletedAcceptedResearchPublicationReceipt(mismatched), false);
+  const unverified = structuredClone(receipt);
+  unverified.readback = { status: "not_verified" };
+  assert.equal(isCompletedAcceptedResearchPublicationReceipt(unverified), false);
+});
 
 function completedResearchPublicationReceiptFixture(
   publication: "created" | "deduplicated",

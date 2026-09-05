@@ -24,6 +24,7 @@ import {
   type MissionNodeV3,
 } from "../src/agent/missionGraphV3";
 import type { PreparedAction } from "../src/agent/actions";
+import { isCompletedAcceptedResearchPublicationReceipt } from "../src/agent/setLooseCompoundAutonomy";
 import {
   BYOK_01_ACCEPTANCE_TOKENS,
   type ByokAcceptanceObservationCategory,
@@ -977,6 +978,13 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       (receipt: any) => receipt?.resource?.id === issueId,
     );
     expect(publicationReceipts).toHaveLength(1);
+    expect(
+      isCompletedAcceptedResearchPublicationReceipt(publicationReceipts[0]),
+      "The publication receipt must satisfy the same complete note/issue/backlink proof used by terminal acceptance",
+    ).toBe(true);
+    if (publicationReceipts[0]?.toolName === "linear_create_issue") {
+      expect(publicationReceipts[0]?.idempotencyKey).toMatch(/^linear:issue:create:node:/u);
+    }
     expect(phaseASnapshot.attestedRunLineage?.segmentIds).toContain(
       publicationReceipts[0]?.runId,
     );

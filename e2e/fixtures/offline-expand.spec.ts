@@ -411,6 +411,8 @@ test("OFFLINE-11 verifies a corrected citation draft before requesting more tool
     expect(await harness.readNote()).toBe("Preserve this note during cited chat.");
     expect(traceProof.rejected?.candidateExcerpt).toContain("MCP servers expose tools");
     expect(traceProof.rejected?.missing.length).toBeGreaterThan(0);
+    expect(traceProof.rejected?.candidateExcerpt).toContain("[unverified — no cited source passage confirms this]");
+    expect(traceProof.rejected?.missing.some((key: string) => key.includes("claim:s-15fb002f52"))).toBe(false);
     expect(traceProof.admitted).toBe(true);
     Object.assign(attempt, {
       status: "passed", acceptanceStatus: "pass", scorecardAcceptancePassed: true,

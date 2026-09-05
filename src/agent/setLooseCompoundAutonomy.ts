@@ -30,6 +30,7 @@ import { parseExternalWorkItemBindingV1 } from "../integrations/linear/ExternalW
 import { parseWorkItemLineageV1 } from "../integrations/linear/WorkItemLineageV1";
 import { parseRenderedCompatibleWorkItemSpec } from "../integrations/linear/WorkItemParser";
 import { researchPublicationStatusOwnsLinearIssueV1 } from "../integrations/linear/ResearchPublicationWorkflow";
+import { buildLinearOperationId } from "../integrations/linear/reconciliation";
 import { resolveExplicitRepositoryVisibilityChoiceV1 } from "../integrations/github/RepositoryVisibility";
 import { hasMeaningfulReflectionContentV1 } from "../../packages/core-api/src/reflectionContentV1";
 import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
@@ -808,29 +809,32 @@ function isIsoTimestamp(value: string | null): value is string {
   return Boolean(value && Number.isFinite(Date.parse(value)));
 }
 
-function linearOperationPart(value: string): string {
-  return (
-    value
-      .trim()
-      .replace(/[^A-Za-z0-9._-]+/gu, "-")
-      .replace(/^-+|-+$/gu, "")
-      .slice(0, 64) || "unknown"
-  );
-}
-
 function hasProductionCreateOperationKey(
   idempotencyKey: string | null | undefined,
   runId: string | null | undefined,
+  rootMissionId: string,
 ): boolean {
   const normalizedRunId = typeof runId === "string" ? runId.trim() : "";
   if (!normalizedRunId || typeof idempotencyKey !== "string") return false;
   const parts = idempotencyKey.split(":");
+  // Current keys bind the logical operation to the artifact's root mission;
+  // receipt.runId still identifies the executing segment. Use the emitter's
+  // canonical builder so replay and terminal proof accept the same identity.
+  if (parts.length === 8 && parts[3] === "node") {
+    return Boolean(
+      rootMissionId.trim() && parts[5] &&
+      idempotencyKey === buildLinearOperationId({
+        resourceType: "issue", verb: "create", runId: normalizedRunId,
+        taskId: "unused-for-node-identity",
+        nodeScope: { rootMissionId, nodeId: parts[5], toolName: "linear_create_issue" },
+      }),
+    );
+  }
   if (
     parts.length !== 6 ||
     parts[0] !== "linear" ||
     parts[1] !== "issue" ||
     parts[2] !== "create" ||
-    parts[3] !== linearOperationPart(normalizedRunId) ||
     parts[5] !== "0"
   ) {
     return false;
@@ -838,9 +842,9 @@ function hasProductionCreateOperationKey(
   const callToken = parts[4];
   return (
     Boolean(callToken) &&
-    callToken === linearOperationPart(callToken) &&
-    idempotencyKey ===
-      `linear:issue:create:${linearOperationPart(normalizedRunId)}:${callToken}:0`
+    idempotencyKey === buildLinearOperationId({
+      resourceType: "issue", verb: "create", runId: normalizedRunId, taskId: callToken,
+    })
   );
 }
 
@@ -1167,7 +1171,7 @@ function evaluateAcceptedResearchPublicationReceiptV1(
 
   const providerProofHolds = createdPublication
     ? Boolean(
-        hasProductionCreateOperationKey(receipt.idempotencyKey, receiptRunId) &&
+        hasProductionCreateOperationKey(receipt.idempotencyKey, receiptRunId, artifact.originRunId) &&
           nestedProviderReceiptMatchesOuter(receipt, nestedReceipt) &&
           receipt.readback?.observedRevision ===
             receipt.readback?.observedFingerprint &&

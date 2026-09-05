@@ -2,6 +2,7 @@ import type { MissionEvidence } from "./missionLedger";
 import { getEvidencePassageIdentifiers } from "./missionPlan";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import { hasWordCountIntent } from "./wordCountIntent";
+import { UNVERIFIED_CLAIM_MARKER_V1 } from "./degradedDelivery";
 import {
   createQuotedSpanPattern,
   findQuoteRawOffset,
@@ -1011,6 +1012,12 @@ function splitClaimSentences(draft: string): ClaimSentenceChunk[] {
 
 function isCandidateClaimSentence(text: string): boolean {
   if (text.length < 24) {
+    return false;
+  }
+  // The host's annotation describes verification state, not another factual
+  // claim. Match only the entire label: adjacent unsupported prose still owes
+  // grounding, and its original draft offsets must remain intact for repair.
+  if (text.trim() === UNVERIFIED_CLAIM_MARKER_V1) {
     return false;
   }
   // Exact user-required markers and other standalone identifiers are

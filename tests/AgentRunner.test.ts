@@ -13460,6 +13460,12 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
   });
   const strictPublication =
     completedResearchPublicationReceiptFixture("created");
+  // Match the current Linear emitter, whose operation belongs to the root
+  // mission and graph node while its prepared receipt retains the segment.
+  const publicationOutput = strictPublication.output as Record<string, any>;
+  strictPublication.idempotencyKey =
+    `linear:issue:create:node:${publicationOutput.artifact.originRunId}:tool-08-publish_research_to_linear:linear_create_issue:0`;
+  publicationOutput.receipt.idempotencyKey = strictPublication.idempotencyKey;
   assert.equal(
     isCompletedAcceptedResearchPublicationReceipt(strictPublication),
     true,

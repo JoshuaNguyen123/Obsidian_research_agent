@@ -2,6 +2,7 @@ import type {
   AgentBackend,
   AgentBackendResult,
 } from "../../scripts/agent-bridge.mjs";
+import { UNVERIFIED_CLAIM_MARKER_V1 } from "../../src/agent/degradedDelivery";
 
 export interface OfflineAgentBackendMetricsV1 {
   version: 1;
@@ -114,10 +115,10 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
       const reportScope = "\n\n## Limitations\nThis brief is limited to the cited source passages.\n\n## Confidence\nHigh confidence in these passage-supported statements.";
       if (metrics.citationRepair.unverifiedDrafts === 0) {
         metrics.citationRepair.unverifiedDrafts += 1;
-        return { content: `MCP servers expose tools and resources through a standard protocol. Clients discover the approved server capabilities.${reportScope}` };
+        return { content: `MCP servers expose tools and resources through a standard protocol. Clients discover the approved server capabilities. ${UNVERIFIED_CLAIM_MARKER_V1}${reportScope}` };
       }
       metrics.citationRepair.correctedDrafts += 1;
-      return { content: `MCP servers expose tools and resources through a standard protocol [${ids[0]}]. Clients discover the approved server capabilities [${ids[1]}].${reportScope}` };
+      return { content: `MCP servers expose tools and resources through a standard protocol [${ids[0]}]. Clients discover the approved server capabilities [${ids[1]}]. ${UNVERIFIED_CLAIM_MARKER_V1}${reportScope}` };
     }
 
     const catalogMarker = transcript.match(/OFFLINE_CATALOG_[A-Z0-9_]+/u)?.[0];
