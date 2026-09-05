@@ -94,6 +94,8 @@ const DEFAULT_GAP_Y = 80;
 const MAX_LANE_COLUMNS = 6;
 const LANE_PADDING = 40;
 const LANE_GAP_Y = 120;
+const MAX_CANVAS_AXIS = 6_000;
+const MAX_CANVAS_ASPECT = 4;
 
 export function buildLayoutCanvas(input: CanvasLayoutInput): JsonCanvas {
   const items = input.items.length > 0
@@ -160,7 +162,7 @@ function buildLaneCanvas(
     laneLayouts.set(lane, { columns, rows, y: nextLaneY });
     nextLaneY += laneHeight(rows) + LANE_GAP_Y;
   }
-  const groupNodes = lanes.map((lane, index) => {
+  const stackedGroups = lanes.map((lane, index) => {
     const layout = laneLayouts.get(lane) ?? { columns: 1, rows: 1, y: yOffset };
     return buildLaneGroupNode(
       lane,
@@ -170,6 +172,8 @@ function buildLaneCanvas(
       layout.y,
     );
   });
+  const groupNodes = compactLaneGroups(stackedGroups, yOffset, titleNode?.width ?? 0);
+  const groupsByLane = new Map(groupNodes.map((group, index) => [lanes[index], group]));
   const itemNodes = items.map((item, index) => {
     const lane = getItemLane(item, diagramType);
     const laneLayout = laneLayouts.get(lane) ?? {
@@ -177,6 +181,7 @@ function buildLaneCanvas(
       rows: 1,
       y: yOffset,
     };
+    const group = groupsByLane.get(lane)!;
     const itemIndex = laneItemCounters.get(lane) ?? 0;
     laneItemCounters.set(lane, itemIndex + 1);
     return buildLaneItemNode(
@@ -184,7 +189,8 @@ function buildLaneCanvas(
       index,
       itemIndex,
       laneLayout.columns,
-      laneLayout.y,
+      group.x,
+      group.y,
       diagramType,
     );
   });
@@ -195,6 +201,56 @@ function buildLaneCanvas(
   const canvas = { nodes, edges };
   assertValidJsonCanvas(canvas);
   return canvas;
+}
+
+function compactLaneGroups(
+  groups: JsonCanvasNode[],
+  yOffset: number,
+  titleWidth: number,
+): JsonCanvasNode[] {
+  const measure = (nodes: JsonCanvasNode[]) => {
+    const width = Math.max(titleWidth, ...nodes.map((node) => node.x + node.width));
+    const height = Math.max(...nodes.map((node) => node.y + node.height));
+    const longest = Math.max(width, height);
+    const aspect = longest / Math.min(width, height);
+    return { longest, aspect, area: width * height };
+  };
+  const fits = ({ longest, aspect }: ReturnType<typeof measure>) =>
+    longest <= MAX_CANVAS_AXIS && aspect <= MAX_CANVAS_ASPECT;
+  let best = groups;
+  let bestSize = measure(best);
+  if (fits(bestSize)) return best;
+
+  // Several individually small lanes can still form an unusably tall strip.
+  // Pack whole lanes, retaining their internal direction, IDs, and contents.
+  // Only generated layouts that exceed the viewing bounds are rearranged.
+  for (let columns = 2; columns <= Math.min(MAX_LANE_COLUMNS, groups.length); columns += 1) {
+    let x = 0;
+    let y = yOffset;
+    let rowHeight = 0;
+    const candidate = groups.map((group, index) => {
+      if (index > 0 && index % columns === 0) {
+        x = 0;
+        y += rowHeight + LANE_GAP_Y;
+        rowHeight = 0;
+      }
+      const positioned = { ...group, x, y };
+      x += group.width + DEFAULT_GAP_X;
+      rowHeight = Math.max(rowHeight, group.height);
+      return positioned;
+    });
+    const size = measure(candidate);
+    if (
+      (fits(size) && !fits(bestSize)) ||
+      (fits(size) === fits(bestSize) &&
+        (size.longest < bestSize.longest ||
+          (size.longest === bestSize.longest && size.area < bestSize.area)))
+    ) {
+      best = candidate;
+      bestSize = size;
+    }
+  }
+  return best;
 }
 
 function buildTitleNode(title: string, items: CanvasLayoutItem[]): JsonCanvasNode {
@@ -344,6 +400,7 @@ function buildLaneItemNode(
   index: number,
   laneItemIndex: number,
   columns: number,
+  laneX: number,
   laneY: number,
   diagramType: CanvasLayoutDiagramType,
 ): JsonCanvasNode {
@@ -352,7 +409,7 @@ function buildLaneItemNode(
   const row = Math.floor(laneItemIndex / columns);
   return {
     ...base,
-    x: LANE_PADDING + column * (DEFAULT_NODE_WIDTH + DEFAULT_GAP_X),
+    x: laneX + LANE_PADDING + column * (DEFAULT_NODE_WIDTH + DEFAULT_GAP_X),
     y: laneY + LANE_PADDING + row * (DEFAULT_NODE_HEIGHT + DEFAULT_GAP_Y),
   };
 }

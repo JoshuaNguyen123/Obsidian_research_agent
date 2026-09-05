@@ -104,6 +104,67 @@ test("architecture maps stay connected even when model requests no auto-edges", 
   assert.equal(nonArchitecture.edges.length, 0);
 });
 
+test("multiple small column lanes form a compact canvas without changing their contents or edges", () => {
+  const lanes = ["Input", "Encoder", "Decoder", "Output", "System"];
+  const counts = [3, 4, 6, 2, 1];
+  const items = lanes.flatMap((lane, index) =>
+    Array.from({ length: counts[index] }, (_, itemIndex) => ({
+      id: `${lane}-${itemIndex}`,
+      lane,
+      title: `${lane} component ${itemIndex}`,
+      text: `Preserve ${lane} details ${itemIndex}`,
+    })),
+  );
+  const connections = items.slice(1).map((item, index) => ({
+    from: items[index].id, to: item.id, label: `Connection ${index}`,
+  }));
+  const canvas = buildLayoutCanvas({
+    title: "Transformer architecture",
+    diagramType: "architecture",
+    direction: "column",
+    items,
+    connections,
+  });
+  const width = Math.max(...canvas.nodes.map((node) => node.x + node.width));
+  const height = Math.max(...canvas.nodes.map((node) => node.y + node.height));
+  assert.ok(Math.max(width, height) <= 6_000, `${width} x ${height}`);
+  assert.ok(Math.max(width, height) / Math.min(width, height) <= 4, `${width} x ${height}`);
+  assert.deepEqual(groupLabels(canvas), lanes);
+  assert.deepEqual(canvas.edges.map((edge) => ({
+    from: edge.fromNode, to: edge.toNode, label: edge.label,
+  })), connections);
+  const groups = canvas.nodes.filter((node) => node.type === "group");
+  for (const [index, group] of groups.entries()) {
+    for (const other of groups.slice(index + 1)) {
+      assert.ok(group.x + group.width <= other.x || other.x + other.width <= group.x ||
+        group.y + group.height <= other.y || other.y + other.height <= group.y,
+      `${group.label} overlaps ${other.label}`);
+    }
+    const members = items.filter((item) => item.lane === group.label)
+      .map((item) => canvas.nodes.find((node) => node.id === item.id)!);
+    assert.equal(new Set(members.map((node) => node.x)).size, 1, "column direction retained");
+    for (const node of members) {
+      assert.ok(node.x > group.x && node.x + node.width < group.x + group.width);
+      assert.ok(node.y > group.y && node.y + node.height < group.y + group.height);
+      assert.ok(node.type === "text" && node.text.includes(items.find((item) => item.id === node.id)!.text));
+    }
+  }
+});
+
+test("already compact lane layouts retain their original positions", () => {
+  const canvas = buildLayoutCanvas({
+    title: "Two stages",
+    diagramType: "architecture",
+    direction: "column",
+    items: [
+      { id: "input", title: "Input", lane: "Input" },
+      { id: "output", title: "Output", lane: "Output" },
+    ],
+  });
+  assert.deepEqual(canvas.nodes.filter((node) => node.type === "group")
+    .map((node) => [node.x, node.y]), [[0, 220], [0, 600]]);
+});
+
 test("business and manufacturing layouts infer process-specific swimlanes", () => {
   assert.equal(inferCanvasLane("business_process", "actor"), "Participants");
   assert.equal(inferCanvasLane("business_process", "process"), "Process Flow");

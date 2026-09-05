@@ -15,6 +15,10 @@ import {
   type MissionE2EProofV1,
 } from "./fixtures/missionE2EProof";
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
+import { resolvePreloopSkip } from "../src/agent/preloopSkip";
+
+recordToolCallOutcomesAfterEach();
 
 const TRANSFORMER_BRIEF_PROMPT =
   "Can you write me a brief including diagrams, explaining in depth the transformer architecture and its importance?";
@@ -50,9 +54,7 @@ test.describe("Core native product health", () => {
       await harness.submitMission(missionPrompt, {
         timeoutMs: 8 * 60_000,
       });
-      const snapshot = await harness.attestProductionRun({
-        requireStructuredRouting: true,
-      });
+      const snapshot = await harness.attestProductionRun();
       const receipts = Array.isArray(snapshot.lastReceipts)
         ? snapshot.lastReceipts
         : [];
@@ -136,6 +138,13 @@ test.describe("Core native product health", () => {
         body: Buffer.from(JSON.stringify(safeState, null, 2), "utf8"),
         contentType: "application/json",
       });
+      // This exact target-only writing request intentionally skips paid
+      // classification/planning. Prove the host route and its saved calls;
+      // forcing a structured planner here contradicts the production policy.
+      expect(resolvePreloopSkip({ prompt: missionPrompt }).reason).toBe("target_only_write");
+      expect(snapshot.lastMissionGraph?.routing?.source, JSON.stringify(safeState)).toBe("deterministic");
+      expect(snapshot.modelCallEvidence.filter((item: any) =>
+        item.phase === "router" || item.phase === "graph_planner"), JSON.stringify(safeState)).toHaveLength(0);
       const stateScreenshotPath = testInfo.outputPath(
         "core-01-transformer-final-state.png",
       );
