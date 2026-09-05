@@ -75,7 +75,7 @@ export default defineConfig({
     },
     {
       name: "offline-expand",
-      testMatch: /offline-expand\.spec\.ts/u,
+      testMatch: [/offline-expand\.spec\.ts/u, /conversation-persistence\.spec\.ts/u],
       retries: 0,
       timeout: 900_000,
       expect: { timeout: 30_000 },

@@ -8476,7 +8476,9 @@ export default class AgenticResearcherPlugin extends Plugin {
               githubGitPushAttempts: gitPushAttemptNamespace,
               linearCapabilitySnapshot: this.linearCapabilitySnapshot,
               capabilityRatchetState: this.capabilityRatchetState,
-              conversationHistory: this.conversationHistory,
+              // Settings/checkpoint saves must not copy a folder transcript
+              // into the separate vault-wide conversation store.
+              conversationHistory: this.pluginDataConversationHistory,
               researchMemoryIndex: this.researchMemoryIndex,
               latestOrchestratorSnapshot: this.latestOrchestratorSnapshot,
               topLevelChildTerminalCheckpoint:
