@@ -8680,6 +8680,51 @@ test("note writes pay requested word-count proof before completing", async () =>
   assert.equal(vault.content.get("Current.md")?.trim().split(/\s+/u).length, 40);
 });
 
+test("fresh ordered appends execute offered tools without authority refusals", async () => {
+  const markerA = "E2E_MARKER_FRESH_ORDERED_A1";
+  const markerB = "E2E_MARKER_FRESH_ORDERED_B2";
+  const prompt = "Perform exactly two ordered durable appends to the current note, then finish. " +
+    `First append exactly one line containing ${markerA} and verify that write. ` +
+    `Then append exactly one separate line containing ${markerB} and verify that write. ` +
+    "Two appends total, in that order. This task needs no web, memory, or vault research.";
+  const vault = createRunnerVaultContext({ prompt, content: "# Existing note\n\nInitial note\n" });
+  (vault.context.app as any).metadataCache = {
+    getFileCache: () => ({ headings: [{ heading: "Existing note", level: 1 }] }),
+  };
+  vault.context.settings = createRunnerSettings({ maxAgentSteps: 12, modelRouterMode: "authority", model: "glm-5.3-flash:cloud", agenticReflexEnabled: true });
+  const calls: ModelToolCall[] = [];
+  const requests: ModelChatRequest[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const completions: any[] = [];
+  const respond: ChatResponder = (request) => {
+    if (isMissionRouterFormat(request)) return responseWithContent(JSON.stringify({
+      mode: "vault_read", writeScope: "none", needsWebEvidence: false, needsVaultContext: true,
+      needsCodeExecution: false, wordTarget: null, confidence: 0.95, rationale: "Verify the current note.",
+    }));
+    const tools = request.tools?.map((tool) => tool.function.name) ?? [];
+    if (tools.includes("read_current_file")) return responseWithToolCall("read_current_file", {});
+    if (tools.includes("append_to_current_file")) {
+      const written = vault.content.get("Current.md") ?? "";
+      return responseWithToolCall("append_to_current_file", { text: written.includes(markerA) ? markerB : markerA });
+    }
+    return responseWithContent(`Completed exactly two ordered appends: ${markerA}, then ${markerB}.`);
+  };
+  await runAgentMission({ prompt, toolContext: vault.context, toolRegistry: createCollectingRegistry(calls),
+    modelClient: createClient({ chatRequests: requests, chatResponders: Array(20).fill(respond), streamResponders: Array(20).fill(respond) }),
+    enableStreaming: true, events: { onTrace: (event) => traces.push(event), onReceipt: (receipt) => { receipts.push(receipt); },
+      onRunComplete: (event) => { completions.push(event); } },
+  });
+  assert.deepEqual(traces.filter((event) => event.kind === "tool_rejected"), [], JSON.stringify({
+    menus: requests.map((request) => ({phase: request.evidencePhase, tools: request.tools?.map((tool) => tool.function.name)})),
+    diagnostics: traces.filter((event) => /frontier|rejected/u.test(event.id)),
+  }));
+  assert.equal(receipts.filter((receipt) => receipt.operation === "append").length, 2);
+  assert.equal((vault.content.get("Current.md")?.split(markerA).length ?? 1) - 1, 1);
+  assert.equal((vault.content.get("Current.md")?.split(markerB).length ?? 1) - 1, 1);
+  assert.notEqual(completions.at(-1)?.stopReason, "budget", JSON.stringify(completions));
+});
+
 test("completed ordered appends finalize without requesting a third streamed write", async () => {
   const markerA = "E2E_MARKER_1788571939_ORDERED_A1";
   const markerB = "E2E_MARKER_1788571939_ORDERED_B2";

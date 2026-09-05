@@ -52,18 +52,23 @@ const APPEND_VERB_PATTERN =
 /**
  * Language that means "operate on part of this note" even when no heading name
  * is recognised. Used only to decide whether to ask; never to authorize a write.
+ * Ordering phrases such as "in that order" describe sequencing, not a location.
+ * Keep quoted names and explicit section/heading references eligible for the
+ * missing-section guard even when the name itself contains an ordering phrase.
  */
 const SECTION_REFERENCE_PATTERN =
-  /\b(section|heading|subsection|chapter|part|paragraph)\b|\b(?:under|below|beneath|inside|within|in)\s+(?:the\s+)?["'`“]?[A-Za-z][^,.?!\n]{2,60}["'`”]?\s*(?:section|heading)?\b/iu;
+  /\b(section|heading|subsection|chapter|part|paragraph)\b|\b(?:under|below|beneath|inside|within|in(?!\s+(?:(?:that|this)\s+|the\s+(?:specified|same|requested|given|stated|listed)\s+)?order\b))\s+(?:the\s+)?["'`“]?[A-Za-z][^,.?!\n]{2,60}["'`”]?\s*(?:section|heading)?\b/iu;
 
 /**
  * Language that creates a new section as part of a whole-note append. This is
  * not an attempt to address an existing heading. Generated research prompts
  * commonly say "append a ## Findings section"; treating the word `section`
  * alone as an existing-heading selector strips a clearly scoped append.
+ * A positional clause inside the candidate ("append text inside the Missing
+ * section") is not a new section title and must retain the ambiguity guard.
  */
 const NEW_SECTION_APPEND_PATTERN =
-  /\b(?:append|add|insert|create|include)\s+(?:(?:a|an|new|another|the\s+following)\s+)?(?:#{1,6}\s*)?[A-Za-z][A-Za-z0-9 _/-]{0,60}\s+(?:section|heading)\b/iu;
+  /\b(?:append|add|insert|create|include)\s+(?:(?:a|an|new|another|the\s+following)\s+)?(?:#{1,6}\s*)?[A-Za-z](?:(?!\b(?:under|below|beneath|inside|within|in|to)\b)[A-Za-z0-9 _/-]){0,60}\s+(?:section|heading)\b/iu;
 
 const STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "vs",

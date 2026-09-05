@@ -383,6 +383,82 @@ test.describe("zero-cloud expand: replace, page-clear, word-count, title, resear
   });
 });
 
+test("installed fresh ordered appends preserve note scope with native heading metadata", async () => {
+  test.skip(process.env.E2E_PLAYWRIGHT_LANE !== "offline-expand" || process.env.E2E_OFFLINE_AI !== "1", "Requires the offline-expand lane.");
+  test.setTimeout(240_000);
+  const backend = createOfflineAgentBackendV1();
+  const { createAgentBridgeServer } = await importNativeEsm<{
+    createAgentBridgeServer(options: { token: string; backend: typeof backend }): Server;
+  }>(pathToFileURL(path.resolve("scripts", "agent-bridge.mjs")).href);
+  const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
+  const attempt = beginOfflineAttempt(await readOfflineBuildIdentity(), "fresh-ordered-appends");
+  const startedAt = Date.now();
+  const cloudModelRequests: string[] = [];
+  let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+  await saveOfflineProbe(attempt);
+  try {
+    await listen(bridge, 7331);
+    harness = await startRealAiHarness("offline-ordered-appends", {
+      baseUrl: OFFLINE_BASE_URL, model: "offline-scripted-v1",
+      missionTimeoutMs: 120_000, firstChunkTimeoutMs: 30_000, completionTimeoutMs: 120_000,
+    }, { autoContinueLongRuns: false, semanticIndexEnabled: false, researchMemoryEnabled: false });
+    harness.page.on("request", (request) => {
+      if (isKnownCloudModelUrl(request.url())) cloudModelRequests.push(request.url());
+    });
+    await observeOfflineTools(harness.page);
+    const original = "# Existing note\n\nInitial note content.\n\n## Details\n\nPreserve these details.\n";
+    await harness.seedNote(harness.notePath, original, true);
+    // The original unit fixture had no metadata cache and missed this native
+    // path entirely. Require real parsed headings before starting the mission.
+    await expect.poll(() => harness!.page.evaluate((notePath) => {
+      const app = (window as any).app;
+      return app.metadataCache.getFileCache(app.vault.getFileByPath(notePath))?.headings?.map((heading: any) => heading.heading) ?? [];
+    }, harness!.notePath)).toEqual(["Existing note", "Details"]);
+    const marker = `OFFLINE_ORDERED_${attempt.attemptId.replace(/-/gu, "").toUpperCase()}`;
+    const markerA = `${marker}_A1`;
+    const markerB = `${marker}_B2`;
+    await harness.submitMission("Perform exactly two ordered durable appends to the current note, then finish. " +
+      `First append exactly one line containing ${markerA} and verify that write. ` +
+      `Then append exactly one separate line containing ${markerB} and verify that write. ` +
+      "Two appends total, in that order. This task needs no web, memory, or vault research.", { waitForCompletion: false });
+    await harness.approveUntilMissionComplete(120_000, {
+      maxContinuations: 0, allowedApprovalToolNames: ["append_to_current_file"], requireExactPreparedActionApproval: true,
+    });
+    const snapshot = await harness.attestProductionRun();
+    const note = await harness.readNote();
+    const receipts = snapshot.lastReceipts.filter((receipt: any) => receipt.operation === "append");
+    Object.assign(attempt, {
+      ...await readOfflineToolCounts(harness.page), backend: backend.snapshot(),
+      acceptanceStatus: snapshot.lastMissionLedger?.acceptance?.status ?? null,
+      scorecardAcceptancePassed: snapshot.lastMissionScorecard?.acceptancePassed ?? null,
+      scorecardTotal: snapshot.lastMissionScorecard?.total ?? null,
+      progress: harness.readProgressCounters(),
+      delivery: { originalPreserved: note.startsWith(original), firstMarkerCount: note.split(markerA).length - 1,
+        secondMarkerCount: note.split(markerB).length - 1, ordered: note.indexOf(markerA) < note.indexOf(markerB),
+        receiptCount: receipts.length, uniqueReceiptCount: new Set(receipts.map((receipt: any) => receipt.id)).size },
+    });
+    await saveOfflineProbe(attempt);
+    expect(attempt.delivery).toEqual({ originalPreserved: true, firstMarkerCount: 1, secondMarkerCount: 1,
+      ordered: true, receiptCount: 2, uniqueReceiptCount: 2 });
+    expect(attempt.toolEventsObserved).toBeGreaterThanOrEqual(2);
+    expect(attempt.toolEventsFailed).toBe(0);
+    expect(attempt.progress.continuations).toBe(0);
+    expect(attempt.acceptanceStatus).toBe("pass");
+    expect(attempt.scorecardAcceptancePassed).toBe(true);
+    expect(cloudModelRequests).toEqual([]);
+    Object.assign(attempt, { status: "passed", failureClass: "none", failureDetail: "" });
+  } catch (error) {
+    attempt.failureDetail = error instanceof Error ? error.message : String(error);
+    throw error;
+  } finally {
+    attempt.durationMs = Date.now() - startedAt;
+    attempt.cloudRequestCount = cloudModelRequests.length;
+    if (harness) Object.assign(attempt, await readOfflineToolCounts(harness.page));
+    await saveOfflineProbe(attempt);
+    try { await harness?.close(); } finally { await close(bridge); }
+  }
+});
+
 for (const memoryEnabled of [false, true]) test(memoryEnabled
   ? "installed host-planned research memory obtains exact authority after cited research"
   : "OFFLINE-11 verifies a corrected citation draft before requesting more tools", async () => {

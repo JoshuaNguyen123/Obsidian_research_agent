@@ -32,6 +32,7 @@ export interface OfflineAgentBackendV1 extends AgentBackend {
  */
 export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
   let catalogNotePath: string | null = null;
+  const orderedAppendsIssued = new Map<string, number>();
   const metrics: OfflineAgentBackendMetricsV1 = {
     version: 1,
     requestCount: 0,
@@ -152,6 +153,22 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
           selector: { kind: "heading", heading: "Catalog probe" }, mermaid: "flowchart TD\n  Research --> Verify\n  Verify --> Reflect" } }], finishReason: "tool_calls" };
       }
       return { content: `Catalog probe complete ${catalogMarker}.` };
+    }
+
+    const orderedMarkers = [...new Set(transcript.match(/OFFLINE_ORDERED_[A-Z0-9_]+_[AB][12]/gu) ?? [])];
+    if (orderedMarkers.length === 2) {
+      const key = orderedMarkers.join("|");
+      const issued = orderedAppendsIssued.get(key) ?? 0;
+      if (toolNames.has("read_current_file") && !toolNameObserved(messages, "read_current_file")) {
+        metrics.emittedToolCalls += 1;
+        return { toolCalls: [{ name: "read_current_file", arguments: {} }], finishReason: "tool_calls" };
+      }
+      if (toolNames.has("append_to_current_file") && issued < orderedMarkers.length) {
+        orderedAppendsIssued.set(key, issued + 1);
+        metrics.emittedToolCalls += 1;
+        return { toolCalls: [{ name: "append_to_current_file", arguments: { text: orderedMarkers[issued] } }], finishReason: "tool_calls" };
+      }
+      return { content: `Completed exactly two ordered appends: ${orderedMarkers.join(", then ")}.` };
     }
 
     const appendMarker = transcript.match(/OFFLINE_APPEND_[A-Z0-9_]+/u)?.[0];

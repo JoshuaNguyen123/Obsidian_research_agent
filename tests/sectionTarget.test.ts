@@ -243,6 +243,29 @@ test("a named section takes the tool loop instead of streaming to the end", () =
   );
 });
 
+test("ordered whole-note appends do not name a section through an ordering phrase", () => {
+  for (const ordering of ["in that order", "in this order", "in the specified order", "in the same order", "in order"]) {
+    const target = detectSectionTargetV1({
+      prompt: `Append line ALPHA then line BETA to the current note, ${ordering}.`,
+      markdown: "# Existing note\n\nBody.\n\n## Details\n\nExisting details.",
+    });
+    assert.equal(target.ambiguous, false, ordering);
+    assert.equal(target.confident, false, ordering);
+    const missing = detectSectionTargetV1({
+      prompt: `Append ALPHA then BETA inside the Missing section, ${ordering}.`,
+      markdown: THREAD_LOCKING_NOTE,
+    });
+    assert.equal(missing.ambiguous, true, "an ordering phrase cannot waive a missing section target");
+  }
+  for (const prompt of [
+    'Append ALPHA in "That Order".',
+    "Append ALPHA in that order section.",
+    "Append ALPHA under Missing.",
+  ]) {
+    assert.equal(detectSectionTargetV1({ prompt, markdown: THREAD_LOCKING_NOTE }).ambiguous, true, prompt);
+  }
+});
+
 test("an unmatched section plans chat, not a write", () => {
   // The whole point of the ambiguous branch: when the named section cannot be
   // found, the note must be left alone. Planning a write here is what produced

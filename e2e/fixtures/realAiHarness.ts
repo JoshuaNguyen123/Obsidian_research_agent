@@ -1127,7 +1127,7 @@ async function raceRendererResponsive<T>(
   }
 }
 
-async function approveUntilMissionComplete(
+export async function approveUntilMissionComplete(
   page: Page,
   timeoutMs: number,
   options: CompoundMissionApprovalOptions & {
@@ -1173,7 +1173,7 @@ async function approveUntilMissionComplete(
   // Long code-stage repair ladders (read → write_expected × N → revalidate)
   // need more durable Continues than short vault missions.
   const maximumContinuations = Math.max(
-    1,
+    0,
     Math.min(24, Math.floor(options.maxContinuations ?? 3)),
   );
   const restartStages = new Set(options.restartAfterProjectStages ?? []);
@@ -1555,11 +1555,9 @@ async function approveUntilMissionComplete(
           continue;
         }
         missingContinuationPolls = 0;
-        continuations += 1;
-        options.onProgress?.(progress());
-        if (continuations > maximumContinuations) {
+        if (continuations >= maximumContinuations) {
           throw new Error(
-            `Mission exceeded ${maximumContinuations} explicit continuations; approved=${approvals}; state=${JSON.stringify(ui)}.`,
+            `Mission reached its limit of ${maximumContinuations} explicit continuations; approved=${approvals}; state=${JSON.stringify(ui)}.`,
           );
         }
         // A provider terminal stop is already the result of the production
@@ -1581,6 +1579,8 @@ async function approveUntilMissionComplete(
           modelCallPhases: ui.modelCallPhases,
         });
         await continuation.click();
+        continuations += 1;
+        options.onProgress?.(progress());
         // `submitMissionContinuation` first copies the durable command into the
         // Chat composer, then asynchronously enters `capturePrompt`. Do not
         // read the still-idle snapshot and click Continue again during that
