@@ -69,6 +69,24 @@ export type ToolCallOutcomeEventV1 =
       id: string | null;
       toolName: string | null;
       receipt: VacuousDetectableReceipt;
+    }
+  | {
+      /**
+       * ONE tool execution sighting, from the runner's `kind:"tool"` metric
+       * event. It answers "did this execution actually transport, or was it
+       * served from the in-run tool cache" — a question no other event on the
+       * stream can answer.
+       *
+       * Deliberately NOT a call: `AgentRunMetricEvent` carries no `id`, only
+       * `(name, step)`, so two calls to one tool in one step are
+       * indistinguishable and these sightings can never be de-duplicated.
+       * That is why a capture that could have replayed them reports the
+       * retrieval counters as unknown rather than summing them.
+       */
+      kind: "tool_execution";
+      toolName: string | null;
+      step: number | null;
+      servedFromCache: boolean;
     };
 
 export type ToolCallOutcomeCoverageV1 = "complete" | "lossy";
@@ -127,6 +145,20 @@ export interface ToolCallOutcomeCountsV1 {
   failureDetails: ToolCallFailureDetailV1[] | null;
   /** True when the bounded detail list omitted additional failed calls. */
   failureDetailsTruncated: boolean | null;
+  /**
+   * Tool executions the runner served from its in-run tool cache instead of
+   * transporting (`AgentRunMetricEvent.cached === true`).
+   *
+   * SIGHTINGS, not de-duplicated logical calls — see the `tool_execution`
+   * event. Null (never 0) when no execution metric was observed, or when a
+   * contributing segment armed beside a running mission and could therefore
+   * have received the same un-keyed metric twice from the replay buffer.
+   * A cached serve is still an attempted call: cache is a claim about
+   * transport, never about outcome.
+   */
+  servedFromCache: number | null;
+  /** Tool executions that actually ran, same sighting semantics as above. */
+  transportExecuted: number | null;
   /**
    * Lower bounds recovered from a lossy capture. Diagnostic only: never
    * promote these into the headline counters, which are already null.
@@ -197,10 +229,27 @@ function errorCodeOf(value: unknown): string | null {
  */
 export function normalizeMissionToolEventV1(
   raw: unknown,
-  source: "trace" | "tool_done" | "receipt",
+  source: "trace" | "tool_done" | "receipt" | "metric",
 ): ToolCallOutcomeEventV1 | null {
   if (!raw || typeof raw !== "object") return null;
   const event = raw as Record<string, unknown>;
+
+  if (source === "metric") {
+    // Only `kind:"tool"` metrics describe a tool execution. Two fields cross:
+    // the tool name and the cached flag.
+    //
+    // `cacheKey` is `${name}:${stableStringify(args)}` (src/AgentRunner.ts) —
+    // it CONTAINS THE RAW TOOL ARGUMENTS and must never be projected. Neither
+    // are durations or char counts, which nothing here needs.
+    if (event.kind !== "tool") return null;
+    const toolName = asText(event.name) ?? asText(event.toolName);
+    return {
+      kind: "tool_execution",
+      toolName,
+      step: Number.isSafeInteger(event.step) ? (event.step as number) : null,
+      servedFromCache: event.cached === true,
+    };
+  }
 
   if (source === "tool_done") {
     const id = asText(event.id);
@@ -331,6 +380,8 @@ export function unknownToolCallOutcomeCountsV1(
     failureBuckets: null,
     failureDetails: null,
     failureDetailsTruncated: null,
+    servedFromCache: null,
+    transportExecuted: null,
     atLeast: null,
     observedEvents: 0,
   };
@@ -346,9 +397,22 @@ export function unknownToolCallOutcomeCountsV1(
  */
 export function foldToolCallOutcomesV1(
   events: Iterable<ToolCallOutcomeEventV1>,
-  options: { coverage?: ToolCallOutcomeCoverageV1 } = {},
+  options: {
+    coverage?: ToolCallOutcomeCoverageV1;
+    /**
+     * False when this stream could contain replayed execution metrics. They
+     * carry no id, so a replay is undetectable and the retrieval counters
+     * must report unknown instead of a possibly doubled number. Call counts
+     * are unaffected: those DO de-duplicate by (kind, id).
+     */
+    retrievalCountable?: boolean;
+  } = {},
 ): ToolCallOutcomeCountsV1 {
   const coverage = options.coverage ?? "complete";
+  const retrievalCountable = options.retrievalCountable !== false;
+  let servedFromCache = 0;
+  let transportExecuted = 0;
+  let executionSightings = 0;
   const seen = new Set<string>();
   const calls = new Map<string, CallAccumulator>();
   const rejections: {
@@ -380,6 +444,15 @@ export function foldToolCallOutcomesV1(
       }
       observedEvents += 1;
       receipts.push(event.receipt);
+      continue;
+    }
+    if (event.kind === "tool_execution") {
+      // Never de-duplicated: the metric has no id. Counted as an observation
+      // so an execution-only stream is not mistaken for silence.
+      observedEvents += 1;
+      executionSightings += 1;
+      if (event.servedFromCache) servedFromCache += 1;
+      else transportExecuted += 1;
       continue;
     }
     const dedupeKey = `${event.kind}:${event.id}`;
@@ -477,7 +550,16 @@ export function foldToolCallOutcomesV1(
   }
 
   if (observedEvents === 0) {
-    return unknownToolCallOutcomeCountsV1("unobserved");
+    // A caller that PROVED its capture was holed does not un-prove it by
+    // seeing nothing: an empty lossy segment still contaminates the merge.
+    // Only an undeclared empty stream is "nobody was listening".
+    return coverage === "lossy"
+      ? {
+          ...unknownToolCallOutcomeCountsV1("lossy"),
+          atLeast: { attempted: 0, failed: 0 },
+          observedEvents: 0,
+        }
+      : unknownToolCallOutcomeCountsV1("unobserved");
   }
   if (coverage === "lossy") {
     return {
@@ -505,6 +587,12 @@ export function foldToolCallOutcomesV1(
     failureBuckets,
     failureDetails,
     failureDetailsTruncated: allFailureDetails.length > failureDetails.length,
+    // Unknown, never zero: no sighting proves nothing about transport, and a
+    // stream that could have replayed them cannot be summed.
+    servedFromCache:
+      retrievalCountable && executionSightings > 0 ? servedFromCache : null,
+    transportExecuted:
+      retrievalCountable && executionSightings > 0 ? transportExecuted : null,
     atLeast: null,
     observedEvents,
   };
@@ -534,6 +622,15 @@ function addNullable(a: number | null, b: number | null): number | null {
 }
 
 /**
+ * Sum that propagates unknown. Used for the retrieval counters, where one
+ * unknown side makes the total unknown: reading it as 0 would report a
+ * confident undercount of real transport.
+ */
+function addStrict(a: number | null, b: number | null): number | null {
+  return a === null || b === null ? null : a + b;
+}
+
+/**
  * Combine two folds (e.g. one segment per plugin restart). Coverage is the
  * WEAKER of the two: one lossy segment makes the whole answer lossy, which
  * is the only combination that cannot overcount.
@@ -542,8 +639,12 @@ export function mergeToolCallOutcomeCountsV1(
   left: ToolCallOutcomeCountsV1,
   right: ToolCallOutcomeCountsV1,
 ): ToolCallOutcomeCountsV1 {
-  if (left.observedEvents === 0) return right;
-  if (right.observedEvents === 0) return left;
+  // Only "nobody was listening" is absorbable. A LOSSY input with no events is
+  // a capture we know we lost — absorbing it turned one dead harvest beside one
+  // good one into a `complete` answer, which is the false-green this fold
+  // exists to prevent.
+  if (left.observedEvents === 0 && left.coverage === "unobserved") return right;
+  if (right.observedEvents === 0 && right.coverage === "unobserved") return left;
   const observedEvents = left.observedEvents + right.observedEvents;
   const atLeastAttempted =
     (left.atLeast?.attempted ?? left.attempted ?? 0) +
@@ -591,6 +692,8 @@ export function mergeToolCallOutcomeCountsV1(
       left.failureDetailsTruncated === true ||
       right.failureDetailsTruncated === true ||
       mergedFailureDetails.length > failureDetails.length,
+    servedFromCache: addStrict(left.servedFromCache, right.servedFromCache),
+    transportExecuted: addStrict(left.transportExecuted, right.transportExecuted),
     atLeast: null,
     observedEvents,
   };
