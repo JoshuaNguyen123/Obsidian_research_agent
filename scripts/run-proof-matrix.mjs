@@ -770,6 +770,7 @@ export function summarizeAttemptAcceptance(summary, summaryFresh, expectedScenar
       retries: null,
       artifactProofCount: null,
       cleanupProofCount: null,
+      artifactIdentity: null,
     };
   }
   const acceptancePassed = summaries.every(
@@ -778,9 +779,29 @@ export function summarizeAttemptAcceptance(summary, summaryFresh, expectedScenar
   const scorecards = summaries
     .map((record) => record?.missionScorecard)
     .filter((scorecard) => scorecard && Number.isFinite(scorecard.total));
+  // Artifact identity for the cohort gate. Every summary must carry one: a
+  // PARTIALLY identified attempt cannot establish that its artifacts are
+  // distinct from another attempt, and the gate treats an absent identity as
+  // missing proof rather than clean evidence. Null is the honest answer.
+  const summaryIdentities = summaries.map(
+    (record) => record?.artifactIdentity ?? null,
+  );
+  const identified = summaryIdentities.filter(
+    (value) => typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value),
+  );
+  const distinctIdentities = [...new Set(identified)].sort();
+  const artifactIdentity =
+    distinctIdentities.length === 0
+      ? null
+      : distinctIdentities.length === 1
+        ? distinctIdentities[0]
+        : `sha256:${createHash("sha256")
+            .update(distinctIdentities.join(String.fromCharCode(10)))
+            .digest("hex")}`;
   return {
     missionOutcome: acceptancePassed ? "accepted" : "needs_more_work",
     acceptanceStatus: acceptancePassed ? "pass" : "needs_more_work",
+    artifactIdentity,
     scorecardTotal: scorecards.length === summaries.length
       ? Math.min(...scorecards.map((scorecard) => scorecard.total))
       : null,

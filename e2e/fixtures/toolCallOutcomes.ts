@@ -1,6 +1,10 @@
+import { createHash } from "node:crypto";
+
 import {
   classifyToolReceiptWork,
   TOOL_REFUSAL_MARKER_BUCKETS,
+  VERDICT_ONLY_RECEIPT_OPERATIONS,
+  VERDICT_ONLY_RECEIPT_PURPOSES,
   type VacuousDetectableReceipt,
 } from "../reporters/dailyUseReporter";
 
@@ -166,6 +170,13 @@ export interface ToolCallOutcomeCountsV1 {
   atLeast: { attempted: number; failed: number } | null;
   /** Events the fold actually consumed, after de-duplication. */
   observedEvents: number;
+  /**
+   * Content-derived identity of the artifacts this mission produced, or null
+   * when no receipt carried one. See artifactIdentityFromReceiptsV1. Additive:
+   * old readers ignore it and no existing field changes meaning, so the
+   * contract stays at version 1.
+   */
+  artifactIdentity: string | null;
 }
 
 export interface ToolCallFailureDetailV1 {
@@ -384,6 +395,7 @@ export function unknownToolCallOutcomeCountsV1(
     transportExecuted: null,
     atLeast: null,
     observedEvents: 0,
+    artifactIdentity: null,
   };
 }
 
@@ -395,6 +407,98 @@ export function unknownToolCallOutcomeCountsV1(
  * stream cannot change the result. Idempotent: events are de-duplicated by
  * (kind, id), so a replayed buffer merged with the live tail counts once.
  */
+
+/** A content-derived readback identity, as the product emits it. */
+const RECEIPT_IDENTITY_SHA256 = /^sha256:[0-9a-f]{64}$/u;
+
+/**
+ * Content-derived identity for the artifacts a mission actually produced.
+ *
+ * WHY THIS EXISTS. `artifactProofCount >= 1` is a per-record check, so 300
+ * records each carrying "1" and the SAME artifact satisfy it. The cohort gate
+ * refuses a cohort whose delivered occurrences do not carry distinct
+ * identities, but nothing emitted one, so that guard was inert and a harness
+ * re-reading one stale snapshot 300 times would have qualified.
+ *
+ * WHAT IS HASHED. Only `readback.observedRevision` (a hash of {path, content})
+ * or, failing that, `readback.observedFingerprint` (a hash of content). Both
+ * are already digests produced by the product, so no path, note body or command
+ * text enters this value — it is a hash OF hashes. `observedRevision` is
+ * preferred because it binds the path too, so two missions writing identical
+ * content to different notes stay distinct.
+ *
+ * WHAT IS EXCLUDED. Receipts that did no work: `vacuous`, `intentional_no_op`,
+ * and `unknown` all contribute nothing. A validation verdict is not an
+ * artifact, and a receipt we cannot classify is not evidence of one.
+ *
+ * NULL IS THE HONEST ANSWER. When no receipt carries a usable identity this
+ * returns `null`, never a placeholder. The cohort gate treats an absent
+ * identity as missing proof and refuses to qualify, which is correct: an
+ * artifact whose distinctness cannot be evaluated has not been shown distinct.
+ */
+export function artifactIdentityFromReceiptsV1(
+  receipts: readonly (VacuousDetectableReceipt | null | undefined)[] | null | undefined,
+): string | null {
+  const identities = new Set<string>();
+  for (const receipt of receipts ?? []) {
+    if (!receipt || typeof receipt !== "object") continue;
+    if (classifyToolReceiptWork(receipt) !== "worked") continue;
+    // A verdict is not an artifact. Validation receipts classify as "worked"
+    // -- correctly, their command really ran -- but they change nothing, so
+    // counting their readback would give a mission an artifact it never
+    // produced, and two missions validating identical workspaces would
+    // collide as if one artifact had stood in for both.
+    if (
+      VERDICT_ONLY_RECEIPT_OPERATIONS.has(
+        (receipt as { operation?: unknown }).operation as string,
+      ) ||
+      VERDICT_ONLY_RECEIPT_PURPOSES.has(
+        (receipt as { purpose?: unknown }).purpose as string,
+      )
+    ) {
+      continue;
+    }
+    const readback = (receipt as { readback?: unknown }).readback;
+    if (!readback || typeof readback !== "object") continue;
+    const { observedRevision, observedFingerprint } = readback as {
+      observedRevision?: unknown;
+      observedFingerprint?: unknown;
+    };
+    const candidate =
+      typeof observedRevision === "string" && RECEIPT_IDENTITY_SHA256.test(observedRevision)
+        ? observedRevision
+        : typeof observedFingerprint === "string" &&
+            RECEIPT_IDENTITY_SHA256.test(observedFingerprint)
+          ? observedFingerprint
+          : null;
+    if (candidate) identities.add(candidate);
+  }
+  if (identities.size === 0) return null;
+  return `sha256:${createHash("sha256")
+    .update([...identities].sort().join(String.fromCharCode(10)))
+    .digest("hex")}`;
+}
+
+/**
+ * Combine two artifact identities under merge.
+ *
+ * `null` means the side contributed NO artifact, not that its artifacts are
+ * unknown -- a fold with no identity-bearing receipt genuinely produced none,
+ * and a lossy fold already carries null for every headline count. So a single
+ * side survives unchanged and two sides hash their sorted pair, which keeps
+ * the result deterministic regardless of merge order.
+ */
+function mergeArtifactIdentityV1(
+  left: string | null,
+  right: string | null,
+): string | null {
+  if (!left) return right ?? null;
+  if (!right) return left;
+  if (left === right) return left;
+  return `sha256:${createHash("sha256")
+    .update([left, right].sort().join(String.fromCharCode(10)))
+    .digest("hex")}`;
+}
 export function foldToolCallOutcomesV1(
   events: Iterable<ToolCallOutcomeEventV1>,
   options: {
@@ -604,6 +708,7 @@ export function foldToolCallOutcomesV1(
       retrievalCountable && executionSightings > 0 ? transportExecuted : null,
     atLeast: null,
     observedEvents,
+    artifactIdentity: artifactIdentityFromReceiptsV1(receipts),
   };
 }
 
@@ -686,6 +791,7 @@ export function mergeToolCallOutcomeCountsV1(
   return {
     version: 1,
     coverage: "complete",
+    artifactIdentity: mergeArtifactIdentityV1(left.artifactIdentity, right.artifactIdentity),
     attempted: addNullable(left.attempted, right.attempted),
     succeeded,
     failed: addNullable(left.failed, right.failed),
