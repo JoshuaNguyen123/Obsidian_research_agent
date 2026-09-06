@@ -67,7 +67,11 @@ import {
   recordDailyUseAcceptance,
 } from "./fixtures/dailyUseAcceptance";
 import { harvestToolCallCollector, recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
-import { preserveFailureEvidence } from "./fixtures/preserveFailureEvidence";
+import {
+  preserveFailureEvidence,
+  preserveMissionAttemptRecordV1,
+} from "./fixtures/preserveFailureEvidence";
+import type { ToolCallOutcomeCountsV1 } from "./fixtures/toolCallOutcomes";
 import type { MissionScorecardV1 } from "../src/agent/missionScorecard";
 import { runScopedProviderUsageV1 } from "../src/agent/runCoordinator";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
@@ -1860,6 +1864,8 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     primaryError = error;
   } finally {
     const cleanupErrors: string[] = [];
+    /** Harvested before teardown; null when nothing could be captured. */
+    let attemptToolCallOutcomes: ToolCallOutcomeCountsV1 | null = null;
     let preCleanupPage: Page | undefined;
     if (harness) {
       try {
@@ -1907,7 +1913,44 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
       })).catch((error) => cleanupErrors.push(`Tool journal evidence: ${safeExternalCleanupError(error)}`));
       // Owned-process relaunch destroys the renderer's collector. Preserve its
       // current fold before that boundary; afterEach merges it with later arms.
-      if (preCleanupPage) await harvestToolCallCollector(preCleanupPage);
+      if (preCleanupPage) attemptToolCallOutcomes = await harvestToolCallCollector(preCleanupPage);
+    } else if (harness && preCleanupPage) {
+      // A GREEN attempt reaches the same destructive teardown. Harvesting only
+      // on the failure path meant a passing mission whose renderer went away
+      // during cleanup left no tool evidence at all.
+      attemptToolCallOutcomes = await harvestToolCallCollector(preCleanupPage);
+    }
+    if (harness) {
+      // Every attempted mission leaves a record, passed or failed, written
+      // BEFORE the teardown below can destroy the renderer. An occurrence that
+      // vanishes at teardown is indistinguishable from one that never launched.
+      const attemptProgress = harness.readProgressCounters();
+      const attemptPath = test.info().outputPath("byok-attempt-record.json");
+      await preserveMissionAttemptRecordV1({
+        file: attemptPath,
+        scenarioId: "BYOK-01",
+        outcome: primaryError === null ? "passed" : "failed",
+        model: harness.config.model,
+        progress: {
+          modelCalls: attemptProgress.modelCalls,
+          continuations: attemptProgress.continuations,
+          approvals: attemptProgress.approvals,
+          // Completed registry calls only — partial coverage by construction,
+          // and deliberately NOT the attempted/failed totals, which only the
+          // collector fold beside it can supply.
+          observedCompletedToolEvents: observedToolJournal.length,
+        },
+        toolCallOutcomes: attemptToolCallOutcomes,
+      })
+        .then(() =>
+          test.info().attach("byok-attempt-record", {
+            contentType: "application/json",
+            path: attemptPath,
+          }),
+        )
+        .catch((error) =>
+          cleanupErrors.push(`Attempt record: ${safeExternalCleanupError(error)}`),
+        );
     }
     // Any failed live assertion may leave the coordinator active. Relaunching
     // the same owned process first aborts that execution boundary, then hydrates

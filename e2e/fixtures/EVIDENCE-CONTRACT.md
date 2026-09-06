@@ -1,10 +1,12 @@
-# Evidence contract v1 (normalized tool-call and mission evidence)
+# Evidence contract v1.1 (normalized tool-call and mission evidence)
 
 Owner: Agent 3. Reviewers: Agent 2 (runtime producer), Agent 4 (qualification consumer).
 Base: `0f63c501fe14d471d5010e8dfd49b33b9857552e`.
-Status: **v1, minimal, publishable now.** Sections marked `[v1.1 pending]` are the changes
-I am implementing; they are additive and named here so Agent 2 and Agent 4 can build against
-the final shape instead of waiting.
+Status: **v1.1, landed.** Everything below is implemented and tested at `7071117`.
+Every rule below is live; none is aspirational. No field changed meaning,
+so `ToolCallOutcomeCountsV1.version` stays `1` and old readers are unaffected. Note that the
+version field therefore does NOT distinguish pre-fix from post-fix counts — bind a cohort to
+its build SHA.
 
 This document specifies **semantics over the types that already exist**. It creates no new
 schema, no second classifier, no second counter and no second persistent evidence store.
@@ -59,14 +61,15 @@ per participant. Evidence therefore telescopes over `rootMissionId`, never `runI
    live tail therefore counts once. Receipts de-duplicate by `receipt.id`; an id-less receipt
    counts once per sighting, so producers should carry `id`.
 2. Segments that share a **non-null** coordinator-start identity are folded **together** (one
-   id namespace). `[v1.1 pending]` — today they are folded separately, which double-counts a
-   replayed prefix when a lane arms twice against the same coordinator.
+   id namespace) `[landed]`. Folding them apart and summing double-counted a replayed prefix
+   whenever a lane armed twice against the same coordinator — measured as 4 attempted for 2
+   real calls.
 3. Segments with **different** coordinator-start identities are folded **separately** and then
    merged. This is what keeps a `restartCorePlugin` resume honest: a resumed run may re-issue
    `step:index:name` ids, and one flat fold would collapse two real calls into one.
 4. A segment that observed events but cannot name its coordinator-start identity, when more
    than one such segment exists, degrades the merged answer to `lossy`. Unprovable sameness is
-   unknown, never assumed. `[v1.1 pending]`
+   unknown, never assumed. `[landed]`
 
 ---
 
@@ -88,20 +91,26 @@ per participant. Evidence therefore telescopes over `rootMissionId`, never `runI
 - segment overflow (`TOOL_CALL_COLLECTOR_EVENT_CAP`, 5000 events per segment);
 - armed beside an already-running mission whose coordinator had already dropped events, or
   would not say how many (`armDroppedEventCount === null || > 0`);
-- **a harvest that threw on a page we know was armed** `[v1.1 pending]` — today this returns
-  `unobserved` with `observedEvents: 0`, and the merge silently absorbs it, so a lane with one
-  dead harvest and one good one reports **complete**. That is a false green;
-- **an armed page that closed without ever being harvested** `[v1.1 pending]` — owned-process
-  relaunch destroys the renderer and with it every unharvested segment;
+- **a harvest that threw on a page we know was armed** `[landed]`. It previously returned
+  `unobserved` with `observedEvents: 0`, which the merge absorbed, so a lane with one dead
+  harvest beside one good one reported **complete** — a false green. A page that never armed
+  lost nothing and is still `unobserved`;
+- **an armed page that closed without ever being harvested** `[landed]`, detected by
+  `drainArmedToolCallCollectorsV1`. Owned-process relaunch destroys the renderer and with it
+  every unharvested segment;
 - **a fold whose caller declared `coverage: "lossy"` but which saw zero events**
-  `[v1.1 pending]` — today it returns `unobserved`, which the merge then absorbs.
+  `[landed]`;
+- **execution metrics arriving with no call-bearing events** `[landed]` — sightings say a
+  tool ran but nothing about how many logical calls there were, so a `complete, attempted: 0`
+  row beside a non-zero `transportExecuted` would contradict itself. The unknown-counts
+  branch keys on call-bearing events, not on total observations.
 
 ### Merge rule
 
 `mergeToolCallOutcomeCountsV1` takes the **weaker** coverage: one lossy input makes the merged
-answer lossy. Only an `unobserved` input with `observedEvents === 0` is absorbed as a no-op.
-`[v1.1 pending]` — today the absorb test is `observedEvents === 0` alone, which swallows
-`lossy` too.
+answer lossy. Only an `unobserved` input with `observedEvents === 0` is absorbed as a no-op
+`[landed]`. The absorb test was previously `observedEvents === 0` alone, which swallowed
+`lossy` results too.
 
 **Anti-vacuity rule (binding on all consumers).** An empty evidence set is **not** complete.
 `unobserved` and `lossy` must never satisfy a completeness or qualification predicate. A gate
@@ -179,7 +188,7 @@ requires a new contract version (section 8).
 ## 6. Actual transport versus cached fallback
 
 The distinction already exists in the runtime and is currently **not represented in the
-evidence at all**. `[v1.1 pending]` adds it, from the existing signal only:
+evidence at all**. `[landed]` adds it, from the existing signal only:
 
 `AgentRunner` emits `onMetric({ kind: "tool", name, step, ... })` on **every** tool execution:
 
@@ -225,7 +234,7 @@ What crosses the renderer boundary is an allowlist, not a redaction pass.
 `affectedCount`, `commitKind`, `purpose` (only the three `validation_*` literals),
 `readback.status === "verified"`, `exitCode`, `effects.changed`; segment `index`,
 `armDroppedEventCount`, `armedWhileRunning`, `overflowed`; coordinator-start identity and
-`runId` `[v1.1 pending]`; the `cached` boolean `[v1.1 pending]`.
+`runId` `[landed]`; the `cached` boolean `[landed]`.
 
 **Forbidden, with no exception:** raw tool arguments; `cacheKey`; note or vault content; file
 system or vault paths (`path`, `toPath`, `backupPath`, `cachedPath`); commands and command
@@ -268,18 +277,19 @@ projection.
 
 ## 9. Known collection limits (unresolved as of v1)
 
-1. `e2e/fixtures/realAiHarness.ts` `relaunchOwnedProcess` **neither harvests before nor re-arms
-   after** an owned-process relaunch. The renderer, and with it every unharvested segment, is
-   destroyed. `e2e/byok-autonomous-journey.spec.ts` harvests first, but only on the failure
-   path (`if (primaryError !== null && harness)`), so a green attempt whose page closed
-   unexpectedly loses its whole capture. That file is **not** in my ownership row — Agent 4,
-   I am requesting either that path or a narrower assignment.
+1. `e2e/fixtures/realAiHarness.ts` `relaunchOwnedProcess` **still neither harvests before nor
+   re-arms after** an owned-process relaunch; the renderer and every unharvested segment are
+   destroyed. Independently confirmed by `host-001` against the base commit. The loss is now
+   *visible* — an armed page that closes unharvested is recorded `lossy` — but it is not
+   *recovered*. The BYOK spec now harvests before teardown on the green path as well as the
+   failure path. Recovery needs a pre-harvest and a re-arm inside that file, which is not in
+   my ownership row; requested from Agent 4.
 2. Retrieval counters (section 6) are sightings, not logical calls, and are unknown whenever
    any segment armed mid-run.
 3. `MAX_BUFFERED_RUN_EVENTS` / `MAX_BUFFERED_RUN_EVENT_CHARS` truncation before a mid-run arm
    is detectable only through `droppedEventCount`; when the coordinator is gone the drop count
    is unrecoverable and the segment is `lossy` forever.
-4. A single-segment capture whose coordinator identity is null is folded as today. There is no
+4. A single-segment capture whose coordinator identity is null is still folded exactly. There is no
    double-count risk with one segment, but there is also no proof of which mission it belongs
    to.
 5. `preserveFailureEvidence` writes to `testInfo.outputPath(...)`, which a report cleanup can

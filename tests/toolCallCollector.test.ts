@@ -66,6 +66,13 @@ function segment(
     armDroppedEventCount: 0,
     armedWhileRunning: false,
     overflowed: false,
+    // Each arm here models a DISTINCT coordinator start, which is what
+    // `restartCorePlugin` actually produces: the disable/enable cycle destroys
+    // the coordinator, so the resumed run is a new id namespace. Two arms
+    // against the SAME start (a replayed prefix) and the anonymous/ambiguous
+    // case are covered in tests/toolCallCollectorAttribution.test.ts.
+    coordinatorStartId: `scope-${index}`,
+    runId: `run-${index}`,
     events,
     ...overrides,
   };
