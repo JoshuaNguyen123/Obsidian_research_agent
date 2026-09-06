@@ -272,6 +272,58 @@ export async function assertProductionAdoptedSandboxV1(
   };
 }
 
+/**
+ * Carry tool-call capture ACROSS an owned-process relaunch.
+ *
+ * A relaunch terminates the Obsidian process and builds a new page, which takes
+ * `window.__agenticToolCallCollectorV1` and every unharvested segment with it.
+ * Before this seam existed the harness neither harvested before the teardown nor
+ * re-armed after it, so calls on BOTH sides of a restart disappeared: the ones
+ * before were recorded and then discarded, and the ones after were never
+ * subscribed to at all.
+ *
+ * `drainArmedToolCallCollectorsV1` already makes that loss VISIBLE — a closed
+ * armed page parks `lossy`. This seam RECOVERS it instead:
+ *
+ *   1. harvest the outgoing page FIRST, which parks its real counts against the
+ *      current test rather than letting the teardown void them;
+ *   2. re-arm the incoming page BEFORE any lane work runs on it, so the new
+ *      process is subscribed from its first mission event.
+ *
+ * The ORDER is the contract, and it is what `tests/realAiHarnessRelaunchCapture.test.ts`
+ * pins: harvesting after the relaunch reads a dead page, and arming after the
+ * lane's readiness work leaves a window in which calls are missed.
+ *
+ * A harvest here never throws — `harvestToolCallCollector` converts an unreadable
+ * armed page into `lossy` — so instrumentation cannot turn a product relaunch red.
+ */
+export async function relaunchPreservingToolCallCaptureV1<T>(options: {
+  /** The live page being torn down. Harvested before the relaunch begins. */
+  pageBeforeRelaunch: Page | null;
+  /** Performs the relaunch, invoking its argument once the new page is connected. */
+  relaunch: (
+    afterConnect: (context: { page: Page }) => Promise<void>,
+  ) => Promise<T>;
+  /** The lane's own post-relaunch readiness work. Runs AFTER the collector is re-armed. */
+  afterReady: (context: { page: Page }) => Promise<void>;
+  hooks?: {
+    harvest: (page: Page) => Promise<unknown>;
+    arm: (page: Page) => Promise<void>;
+  };
+}): Promise<T> {
+  const harvest = options.hooks?.harvest ?? harvestToolCallCollector;
+  const arm = options.hooks?.arm ?? armToolCallCollector;
+  if (options.pageBeforeRelaunch && !options.pageBeforeRelaunch.isClosed()) {
+    await harvest(options.pageBeforeRelaunch);
+  }
+  // The relaunch's own result (the new Page) is passed through unchanged, so
+  // this seam is invisible to callers.
+  return await options.relaunch(async ({ page }) => {
+    await arm(page);
+    await options.afterReady({ page });
+  });
+}
+
 export async function startRealAiHarness(
   label: string,
   overrides: Partial<E2EAiConfig> = {},
@@ -400,7 +452,10 @@ export async function startRealAiHarness(
     },
     config,
     relaunch: async () =>
-      native.relaunchOwnedProcess(async ({ page }) => {
+      relaunchPreservingToolCallCaptureV1({
+        pageBeforeRelaunch: native.page,
+        relaunch: (afterConnect) => native.relaunchOwnedProcess(afterConnect),
+        afterReady: async ({ page }) => {
         await page.evaluate(async (pluginId) => {
           const app = (window as typeof window & { app?: any }).app;
           const plugin = app?.plugins?.plugins?.[pluginId];
@@ -416,6 +471,7 @@ export async function startRealAiHarness(
           timeout: 30_000,
         });
         await assertProductionClientReady(page, config, provider);
+        },
       }),
     submitMission: (prompt, options = {}) => submitMission(native.page, prompt, {
       timeoutMs: options.timeoutMs ?? config.missionTimeoutMs,
