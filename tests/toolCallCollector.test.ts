@@ -20,6 +20,7 @@ import {
   foldToolCallOutcomesV1,
   unknownToolCallOutcomeCountsV1,
   type ToolCallOutcomeEventV1,
+  RECEIPT_IDENTITY_DIGEST,
 } from "../e2e/fixtures/toolCallOutcomes";
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -379,6 +380,14 @@ test("collector retains only bounded validation-verdict receipt fields", () => {
   assert.match(collector, /receipt\?\.readback\?\.status === "verified"/u);
   assert.match(collector, /receipt\?\.purpose === "validation_fast"/u);
   assert.match(collector, /Number\.isSafeInteger\(receipt\?\.exitCode\)/u);
+  // The digest allowlist is copied into the page because page.evaluate cannot
+  // import; the copy must stay byte-identical to the module's regex.
+  assert.ok(
+    collector.includes(RECEIPT_IDENTITY_DIGEST.source),
+    "the page-side digest allowlist must be a verbatim copy of RECEIPT_IDENTITY_DIGEST",
+  );
+  assert.match(collector, /digestOf\(receipt\?\.readback\?\.observedRevision\)/u);
+  assert.match(collector, /digestOf\(receipt\?\.readback\?\.observedFingerprint\)/u);
   assert.doesNotMatch(
     collector,
     /receipt:\s*\{[^}]*\b(?:path|content|output|command)\s*:/su,

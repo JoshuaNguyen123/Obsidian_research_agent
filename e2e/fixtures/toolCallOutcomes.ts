@@ -237,6 +237,51 @@ function errorCodeOf(value: unknown): string | null {
 }
 
 /**
+ * A content-derived readback identity, in the two shapes the product emits.
+ * `sha256:<64 hex>` comes from `sha256Fingerprint` (vault replace, GitHub
+ * cleanup); `fnv1a32:<8 hex>` comes from `hashOperationInput` in AgentRunner,
+ * which stamps every note append and streamed replace/update readback. Both
+ * are digests: no path, note body or command text can be recovered from them,
+ * which is why they alone may cross the page boundary. The collector carries a
+ * verbatim copy of this literal because `page.evaluate` cannot reach this
+ * module; a source test pins the two equal.
+ */
+export const RECEIPT_IDENTITY_DIGEST = /^(?:sha256:[0-9a-f]{64}|fnv1a32:[0-9a-f]{8})$/u;
+
+/**
+ * Project a receipt's readback down to its verdict plus the two identity
+ * digests, or undefined when the readback is not verified. This is the ONLY
+ * readback shape a normalized receipt may carry.
+ *
+ * Until 2026-09-06 this kept `{status}` alone, which silently discarded the
+ * identities that artifactIdentityFromReceiptsV1 hashes: the first live
+ * qualification attempt reported `writeReceipts: 1, artifactIdentity: null`
+ * ("wrote without identity") and the cohort gate correctly refused. The
+ * producer had been unit-tested on receipts that never passed through here.
+ */
+export function projectVerifiedReadbackV1(
+  readback: unknown,
+): { status: "verified"; observedRevision?: string; observedFingerprint?: string } | undefined {
+  if (!readback || typeof readback !== "object") return undefined;
+  const { status, observedRevision, observedFingerprint } = readback as {
+    status?: unknown;
+    observedRevision?: unknown;
+    observedFingerprint?: unknown;
+  };
+  if (status !== "verified") return undefined;
+  const projected: { status: "verified"; observedRevision?: string; observedFingerprint?: string } = {
+    status: "verified",
+  };
+  if (typeof observedRevision === "string" && RECEIPT_IDENTITY_DIGEST.test(observedRevision)) {
+    projected.observedRevision = observedRevision;
+  }
+  if (typeof observedFingerprint === "string" && RECEIPT_IDENTITY_DIGEST.test(observedFingerprint)) {
+    projected.observedFingerprint = observedFingerprint;
+  }
+  return projected;
+}
+
+/**
  * Map one raw mission event onto the normalized union, or null when the
  * event says nothing about a tool call. Accepts the three native shapes:
  * `AgentTraceEvent` (kind tool_start/tool_result/tool_rejected) from
@@ -295,12 +340,7 @@ export function normalizeMissionToolEventV1(
       receipt.purpose === "validation_full"
         ? receipt.purpose
         : undefined;
-    const readback =
-      receipt.readback &&
-      typeof receipt.readback === "object" &&
-      (receipt.readback as { status?: unknown }).status === "verified"
-        ? { status: "verified" }
-        : undefined;
+    const readback = projectVerifiedReadbackV1(receipt.readback);
     const exitCode = Number.isSafeInteger(receipt.exitCode)
       ? receipt.exitCode
       : undefined;
@@ -443,9 +483,6 @@ export function writeReceiptCountV1(
   return count;
 }
 
-/** A content-derived readback identity, as the product emits it. */
-const RECEIPT_IDENTITY_SHA256 = /^sha256:[0-9a-f]{64}$/u;
-
 /**
  * Content-derived identity for the artifacts a mission actually produced.
  *
@@ -461,6 +498,14 @@ const RECEIPT_IDENTITY_SHA256 = /^sha256:[0-9a-f]{64}$/u;
  * text enters this value — it is a hash OF hashes. `observedRevision` is
  * preferred because it binds the path too, so two missions writing identical
  * content to different notes stay distinct.
+ *
+ * TWO DIGEST SHAPES (see RECEIPT_IDENTITY_DIGEST). The fnv1a32 identity is a
+ * 32-bit non-cryptographic hash, which is enough for DISTINCTNESS: an
+ * accidental collision between two unrelated missions (about 2e-5 across 500)
+ * can only make the cohort gate REFUSE, never pass, because the gate fails on
+ * fewer distinct identities than deliveries. Rejecting fnv1a32 would instead
+ * make every append-writing mission read as "wrote without identity", which is
+ * the exact inertness this producer exists to end.
  *
  * WHAT IS EXCLUDED. Receipts that did no work: `vacuous`, `intentional_no_op`,
  * and `unknown` all contribute nothing. A validation verdict is not an
@@ -500,10 +545,10 @@ export function artifactIdentityFromReceiptsV1(
       observedFingerprint?: unknown;
     };
     const candidate =
-      typeof observedRevision === "string" && RECEIPT_IDENTITY_SHA256.test(observedRevision)
+      typeof observedRevision === "string" && RECEIPT_IDENTITY_DIGEST.test(observedRevision)
         ? observedRevision
         : typeof observedFingerprint === "string" &&
-            RECEIPT_IDENTITY_SHA256.test(observedFingerprint)
+            RECEIPT_IDENTITY_DIGEST.test(observedFingerprint)
           ? observedFingerprint
           : null;
     if (candidate) identities.add(candidate);

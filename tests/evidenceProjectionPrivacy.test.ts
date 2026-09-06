@@ -139,6 +139,13 @@ function firePoisonedMissionEvents(handlers: FakeHandlers): void {
     message: POISON.noteBody,
     output: POISON.providerPayload,
     commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-09-06T18:00:00.000Z",
+      observedRevision: "fnv1a32:0badf00d",
+      observedFingerprint: "fnv1a32:deadbeef",
+      priorRevision: "fnv1a32:00000001",
+    },
   });
   handlers.onMetric?.({
     kind: "tool",
@@ -214,6 +221,18 @@ test("no vault content, path, command, payload, credential or reasoning crosses 
       everythingThatCrossed.includes("append_to_current_file"),
       "tool identity is allowed and must still be present",
     );
+    // The readback's two identity digests are the ONE thing the projection may
+    // carry beyond the verdict: they are hashes of content, and the cohort gate
+    // needs them to tell 500 distinct deliveries from one stale snapshot. The
+    // rest of the readback stays on the page.
+    assert.equal(counts.writeReceipts, 1, "the append receipt is a written artifact");
+    assert.ok(
+      typeof counts.artifactIdentity === "string" && counts.artifactIdentity.startsWith("sha256:"),
+      "the identity digests crossed and were hashed; until 2026-09-06 the projection dropped them",
+    );
+    for (const kept of ["checkedAt", "priorRevision", "fnv1a32:00000001"]) {
+      assert.ok(!everythingThatCrossed.includes(kept), `${kept} must stay on the page`);
+    }
   } finally {
     uninstallFakeRenderer();
     resetToolCallCollectorStateForTestsV1();
