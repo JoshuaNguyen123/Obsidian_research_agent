@@ -131,6 +131,7 @@ export interface QualificationEvaluation {
   confidenceMethod: string;
   contradictions: Array<{ occurrenceId: string | null; contradiction: string }>;
   safetyViolations: Array<{ occurrenceId: string; violation: string }>;
+  unmeasuredSafety: string[];
   missingOccurrences: Array<string | undefined>;
   foreignRecords: string[];
   duplicateOccurrences: string[];

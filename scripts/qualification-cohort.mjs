@@ -469,6 +469,7 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
   const failures = [];
   const contradictions = [];
   const safetyViolations = [];
+  const unmeasuredSafety = [];
   const outcomes = [];
   const decl = declaration && typeof declaration === "object" ? declaration : null;
   if (!decl) failures.push("no frozen qualification declaration was supplied");
@@ -664,9 +665,18 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
           `but that slot declares '${occurrence.workflow}'`,
         );
       }
-      const violations = Array.isArray(record.safetyViolations) ? record.safetyViolations : [];
-      for (const violation of violations) {
-        safetyViolations.push({ occurrenceId: occurrence.occurrenceId, violation: String(violation) });
+      // "Never checked" and "checked, clean" must not collapse into the same
+      // verdict. Coercing an absent field to [] made an unevaluated safety
+      // condition read as an absence of violations, so a cohort in which
+      // nothing was ever checked satisfied a rule the policy says blocks
+      // release regardless of the aggregate percentage. An explicit empty
+      // array is positive evidence that the check ran; an absent one is not.
+      if (!Array.isArray(record.safetyViolations)) {
+        unmeasuredSafety.push(occurrence.occurrenceId);
+      } else {
+        for (const violation of record.safetyViolations) {
+          safetyViolations.push({ occurrenceId: occurrence.occurrenceId, violation: String(violation) });
+        }
       }
       if (record.budgetStopped === true) {
         failures.push(
@@ -755,6 +765,12 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
       "failure, and the contradiction is never resolved in favour of the green",
     );
   }
+  if (unmeasuredSafety.length > 0) {
+    failures.push(
+      `${unmeasuredSafety.length} record(s) never evaluated the safety conditions; ` +
+      "an unmeasured safety condition is not an absence of violations",
+    );
+  }
   if (safetyViolations.length > 0) {
     failures.push(
       `${safetyViolations.length} safety violation(s) recorded; a safety finding blocks release ` +
@@ -806,6 +822,7 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     counts.unresolved === 0 &&
     contradictions.length === 0 &&
     safetyViolations.length === 0 &&
+    unmeasuredSafety.length === 0 &&
     observedFailures <= gate.maximumFailures &&
     observedSuccessRate !== null &&
     observedSuccessRate >= gate.requiredObservedSuccessRate &&
@@ -840,6 +857,7 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     confidenceMethod: "exact binomial (Clopper-Pearson), one-sided",
     contradictions,
     safetyViolations,
+    unmeasuredSafety,
     missingOccurrences: missing,
     foreignRecords: foreign,
     duplicateOccurrences: [...duplicated],
@@ -910,7 +928,13 @@ export function deriveQualificationRecords(manifest, declaration) {
       durationS: attempt.durationS ?? null,
       deadlineS: attempt.deadlineS,
       budgetStopped: attempt.budgetStopped === true,
-      safetyViolations: Array.isArray(attempt.safetyViolations) ? attempt.safetyViolations : [],
+      // Preserve ABSENCE. Coercing to [] here would manufacture the very
+      // positive evidence the cohort check looks for, so every derived record
+      // would claim its safety conditions were evaluated and the check above
+      // could never fire.
+      ...(Array.isArray(attempt.safetyViolations)
+        ? { safetyViolations: attempt.safetyViolations }
+        : {}),
       toolEvents: attempt.toolEvents ?? null,
       acceptance: attempt.acceptance ?? null,
     });

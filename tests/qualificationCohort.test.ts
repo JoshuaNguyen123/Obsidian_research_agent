@@ -7,6 +7,7 @@ import {
   buildQualificationCohort,
   classifyQualificationRecord,
   evaluateQualificationCohort,
+  deriveQualificationRecords,
   freezeQualificationDeclaration,
   lowerSuccessBound,
 } from "../scripts/qualification-cohort.mjs";
@@ -784,4 +785,72 @@ test("identities that are present and distinct still qualify", () => {
   assert.equal(result.missingArtifactIdentities, 0);
   assert.equal(result.distinctArtifactIdentities, decl.cohortSize);
   assert.equal(result.passed, true);
+});
+
+// ---------------------------------------------------------------------------
+// Unmeasured safety. The five safety conditions block release regardless of
+// the aggregate percentage, but the aggregation coerced an ABSENT
+// safetyViolations field to [], so "never checked" and "checked, clean"
+// produced the same verdict and a campaign that evaluated nothing read green.
+// deriveQualificationRecords did the same coercion one layer up, which would
+// have manufactured the positive evidence this check looks for.
+// ---------------------------------------------------------------------------
+
+test("a cohort that never evaluated the safety conditions cannot qualify", () => {
+  const { decl, records } = fullGreenCohort();
+  const unmeasured = records.map((record: any) => {
+    const { safetyViolations, ...rest } = record;
+    return rest;
+  });
+  const result = evaluate(decl, unmeasured);
+  assert.equal(result.passed, false);
+  assert.equal(result.unmeasuredSafety.length, decl.cohortSize);
+  assert.ok(
+    result.failures.some((failure: string) => failure.includes("never evaluated the safety")),
+    `expected an unmeasured-safety failure, got: ${JSON.stringify(result.failures)}`,
+  );
+});
+
+test("a single record with no safety evaluation blocks the cohort", () => {
+  const { decl, records } = fullGreenCohort();
+  const oneMissing = records.map((record: any, index: number) => {
+    if (index !== 11) return record;
+    const { safetyViolations, ...rest } = record;
+    return rest;
+  });
+  const result = evaluate(decl, oneMissing);
+  assert.equal(result.passed, false);
+  assert.equal(result.unmeasuredSafety.length, 1);
+});
+
+test("an explicit empty safety array is positive evidence and still qualifies", () => {
+  const { decl, records } = fullGreenCohort();
+  const result = evaluate(decl, records);
+  assert.equal(result.unmeasuredSafety.length, 0);
+  assert.equal(result.passed, true);
+});
+
+test("deriveQualificationRecords preserves an absent safety evaluation", () => {
+  const decl = declaration(gate99);
+  const manifest = {
+    attempts: [
+      {
+        occurrenceId: decl.occurrences[0].occurrenceId,
+        cohortId: decl.cohortId,
+        workflow: decl.occurrences[0].workflow,
+        model: MODEL,
+        headSha: HEAD,
+        launched: true,
+        green: true,
+        failureClass: "none",
+        durationS: 300,
+      },
+    ],
+  };
+  const derived = deriveQualificationRecords(manifest, decl);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(derived[0] ?? {}, "safetyViolations"),
+    false,
+    "an attempt that never reported safety must not gain an empty array on the way through",
+  );
 });
