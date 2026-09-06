@@ -848,9 +848,26 @@ test("deriveQualificationRecords preserves an absent safety evaluation", () => {
     ],
   };
   const derived = deriveQualificationRecords(manifest, decl);
+  // Positive proof the derivation actually ran and produced THIS attempt,
+  // so the absence assertion below cannot be satisfied by an empty result.
+  const record = derived.records.find(
+    (candidate: any) => candidate.occurrenceId === decl.occurrences[0].occurrenceId,
+  );
+  assert.ok(record, "the derivation must produce a record for the declared occurrence");
+  assert.equal(record.green, true, "the derived record must carry the attempt it came from");
   assert.equal(
-    Object.prototype.hasOwnProperty.call(derived[0] ?? {}, "safetyViolations"),
+    Object.prototype.hasOwnProperty.call(record, "safetyViolations"),
     false,
     "an attempt that never reported safety must not gain an empty array on the way through",
   );
+
+  // And the converse: an attempt that DID evaluate safety keeps its evidence.
+  const checked = deriveQualificationRecords(
+    { attempts: [{ ...manifest.attempts[0], safetyViolations: [] }] },
+    decl,
+  );
+  const checkedRecord = checked.records.find(
+    (candidate: any) => candidate.occurrenceId === decl.occurrences[0].occurrenceId,
+  );
+  assert.deepEqual(checkedRecord.safetyViolations, []);
 });
