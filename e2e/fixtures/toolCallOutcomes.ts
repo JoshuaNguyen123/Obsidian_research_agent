@@ -549,15 +549,24 @@ export function foldToolCallOutcomesV1(
     else if (verdict === "unknown") receiptsUnknown += 1;
   }
 
-  if (observedEvents === 0) {
-    // A caller that PROVED its capture was holed does not un-prove it by
-    // seeing nothing: an empty lossy segment still contaminates the merge.
-    // Only an undeclared empty stream is "nobody was listening".
-    return coverage === "lossy"
+  // Keyed on CALL-BEARING events, not on every observation. Execution metrics
+  // say a tool ran; they say nothing about how many logical calls there were.
+  // Counting them here would let a metric-only stream report "complete: 0
+  // attempted" while its own transportExecuted said a tool had transported —
+  // a row that contradicts itself, which a completeness predicate accepts.
+  const callBearingEvents = observedEvents - executionSightings;
+  if (callBearingEvents === 0) {
+    // Executions with no call stream is a HOLED capture, not silence: we
+    // provably missed the traces for tools we watched run. A caller that
+    // already declared the capture lossy does not un-declare it by seeing
+    // nothing. Only a genuinely empty, undeclared stream is "nobody listening".
+    const state =
+      coverage === "lossy" || executionSightings > 0 ? "lossy" : "unobserved";
+    return state === "lossy"
       ? {
           ...unknownToolCallOutcomeCountsV1("lossy"),
           atLeast: { attempted: 0, failed: 0 },
-          observedEvents: 0,
+          observedEvents,
         }
       : unknownToolCallOutcomeCountsV1("unobserved");
   }

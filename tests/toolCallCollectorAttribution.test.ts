@@ -330,3 +330,48 @@ test("unknown counts include the retrieval counters and survive JSON", () => {
   assert.ok("transportExecuted" in parsed);
   assert.equal(parsed.servedFromCache, null);
 });
+
+test("execution metrics alone are a HOLED capture, never a complete zero", () => {
+  // Regression found by Agent 2's review of 6ad4f0f. Counting execution
+  // sightings as observed events lifted a metric-only stream past the
+  // unknown-counts branch, so it reported `complete, attempted: 0` while its
+  // own `transportExecuted: 1` said a tool had actually run. A row that
+  // contradicts itself is worse than a missing row: a completeness predicate
+  // accepts it.
+  //
+  // Reachable when a segment armed late or lost its trace subscription while
+  // metrics survived.
+  const metricsOnly = foldToolCallOutcomesV1([
+    { kind: "tool_execution", toolName: "web_search", step: 1, servedFromCache: false },
+    { kind: "tool_execution", toolName: "web_fetch", step: 2, servedFromCache: true },
+  ]);
+  assert.notEqual(metricsOnly.coverage, "complete");
+  assert.equal(metricsOnly.coverage, "lossy");
+  assert.equal(metricsOnly.attempted, null);
+  assert.equal(metricsOnly.failed, null);
+  assert.equal(metricsOnly.failureBuckets, null, "no explicit zero buckets to satisfy a gate");
+  assert.equal(metricsOnly.observedEvents, 2, "the sightings are still reported as seen");
+
+  // It must not launder itself through the merge either.
+  const merged = mergeToolCallOutcomeCountsV1(
+    metricsOnly,
+    unknownToolCallOutcomeCountsV1("unobserved"),
+  );
+  assert.equal(merged.coverage, "lossy");
+  assert.equal(merged.attempted, null);
+
+  // ANTI-VACUITY PAIRING: this must not be satisfied by making everything
+  // lossy. A real call stream WITH an execution metric still counts exactly.
+  const realStream = foldToolCallOutcomesV1([
+    { kind: "tool_start", id: "1:0:web_search", toolName: "web_search" },
+    { kind: "tool_done", id: "1:0:web_search", toolName: "web_search", ok: true, errorCode: null },
+    { kind: "tool_execution", toolName: "web_search", step: 1, servedFromCache: false },
+  ]);
+  assert.equal(realStream.coverage, "complete");
+  assert.equal(realStream.attempted, 1);
+  assert.equal(realStream.succeeded, 1);
+  assert.equal(realStream.transportExecuted, 1);
+
+  // And a genuinely empty stream is still `unobserved`, not upgraded to lossy.
+  assert.equal(foldToolCallOutcomesV1([]).coverage, "unobserved");
+});
