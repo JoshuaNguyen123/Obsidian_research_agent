@@ -35,6 +35,15 @@ import {
   createCodeExecutionContributionsV2,
 } from "../extensions/code/sandbox/CodeExecutionContributionsV2";
 import {
+  classifySandboxPreparationFailureV2,
+  SANDBOX_PREPARATION_FAILURE_CODES_V2,
+} from "../extensions/code/sandbox/CodeExecutionContributionsV2";
+import {
+  TOOL_CALL_FAILURE_BUCKET_OTHER,
+  classifyToolFailureBucketV1,
+} from "../e2e/fixtures/toolCallOutcomes";
+import { TOOL_REFUSAL_MARKER_BUCKETS } from "../e2e/reporters/dailyUseReporter";
+import {
   DurableSandboxExecutionJournalV1,
   type DurableSandboxExecutionJournalPersistenceV1,
   type DurableSandboxExecutionNamespaceV1,
@@ -1692,4 +1701,138 @@ test("a throwing sandbox runner cannot write foreign error text into the durable
     blocked.blocker.code,
     "sandbox_execution_failed",
   );
+});
+
+
+/**
+ * Integration watch item W1: the runtime producer and the evidence consumer
+ * live in files that never touch, so git merges them clean while every newly
+ * attributed failure could silently classify as "other" - both lanes green, the
+ * bucketed evidence no better. This is the repository's recurring
+ * two-subsystems-disagree shape, and the cure is one test that spans both.
+ *
+ * The codes below are NOT hardcoded. They are read back from a real
+ * SandboxManagerV2 run and then handed to the consumer's classifier, so the
+ * test breaks if either side drifts.
+ */
+async function runtimeBlockerCodeV1(
+  mode: "execution_throw" | "artifact_throw",
+): Promise<string> {
+  const artifact = new Uint8Array([1, 2, 3]);
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      if (mode === "execution_throw") throw new Error("provider exploded");
+      return { exitCode: 0, stdout: "ok", stderr: "", artifacts: { "dist/out.bin": artifact } };
+    },
+  };
+  const manager = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(
+    mode === "artifact_throw"
+      ? {
+          ...prepareInput(),
+          expectedArtifacts: [
+            { path: "dist/out.bin", expectedSha256: sha256(artifact), maxBytes: 100, required: true },
+          ],
+        }
+      : prepareInput(),
+  );
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") throw new Error("fixture did not prepare");
+  const blocked = await manager.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: [
+      { path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") },
+    ],
+    ...(mode === "artifact_throw"
+      ? {
+          artifactImporter: {
+            async importArtifacts() {
+              throw new Error("importer exploded");
+            },
+          },
+        }
+      : {}),
+  });
+  assert.equal(blocked.status, "blocked");
+  if (blocked.status !== "blocked") throw new Error("fixture did not block");
+  // Anti-vacuity: an empty code classifies as "other" too, so a fixture that
+  // silently produced nothing would make every assertion below meaningless.
+  assert.ok(
+    blocked.blocker.code.length > 0,
+    "the fixture must produce a real runtime code, not an empty one",
+  );
+  return blocked.blocker.code;
+}
+
+/** The consumer's classifier, re-driven against a mutated allowlist. */
+function classifyAgainstV1(
+  errorCode: string,
+  buckets: ReadonlyArray<readonly [string, string]>,
+): string {
+  for (const [key, source] of buckets) {
+    if (new RegExp(source, "iu").test(errorCode)) return key;
+  }
+  return TOOL_CALL_FAILURE_BUCKET_OTHER;
+}
+
+test("W1: a code the sandbox runtime actually emits classifies into a non-other bucket", async () => {
+  const code = await runtimeBlockerCodeV1("execution_throw");
+  assert.equal(code, "sandbox_execution_failed");
+  assert.equal(classifyToolFailureBucketV1(code), "execution_failed");
+  assert.notEqual(classifyToolFailureBucketV1(code), TOOL_CALL_FAILURE_BUCKET_OTHER);
+});
+
+test("W1: the same code falls back to other when its entry leaves the allowlist", async () => {
+  const code = await runtimeBlockerCodeV1("execution_throw");
+  // Both halves are required. The positive assertion above passes today even
+  // for an unlisted code by landing in "other", and a negative assertion alone
+  // is satisfied by breaking everything.
+  const without = TOOL_REFUSAL_MARKER_BUCKETS.filter(([key]) => key !== "execution_failed");
+  assert.equal(
+    without.length,
+    TOOL_REFUSAL_MARKER_BUCKETS.length - 1,
+    "the mutation must actually remove one entry",
+  );
+  assert.equal(classifyAgainstV1(code, without), TOOL_CALL_FAILURE_BUCKET_OTHER);
+  assert.equal(classifyAgainstV1(code, TOOL_REFUSAL_MARKER_BUCKETS), "execution_failed");
+});
+
+test("W1: codes that bucket as other still carry stage and cause from the single projection", async () => {
+  // This is the OTHER half of the agreed design. Most new sandbox codes bucket
+  // as "other" deliberately - the CSV header is append-only and readers index
+  // by name - and the stage/cause dimension is served by one pure projection
+  // rather than a second bucket table that would drift from it.
+  const code = await runtimeBlockerCodeV1("artifact_throw");
+  assert.equal(code, "sandbox_artifact_readback_failed");
+  assert.equal(classifyToolFailureBucketV1(code), TOOL_CALL_FAILURE_BUCKET_OTHER);
+
+  for (const preparationCode of SANDBOX_PREPARATION_FAILURE_CODES_V2) {
+    const projected = classifySandboxPreparationFailureV2(preparationCode);
+    assert.notEqual(
+      projected.stage,
+      null,
+      `${preparationCode} must project a stage from the single table`,
+    );
+  }
+  // An unrecognized code yields nulls rather than borrowing an explanation.
+  assert.deepEqual(classifySandboxPreparationFailureV2("not_a_real_code_v1"), {
+    stage: null,
+    cause: null,
+  });
+  // And the two vocabularies stay separate: no bucket key is a stage name, so
+  // a consumer cannot mistake one dimension for the other.
+  const stages = new Set(
+    SANDBOX_PREPARATION_FAILURE_CODES_V2.map(
+      (entry) => classifySandboxPreparationFailureV2(entry).stage,
+    ),
+  );
+  for (const [bucketKey] of TOOL_REFUSAL_MARKER_BUCKETS) {
+    assert.equal(
+      stages.has(bucketKey as never),
+      false,
+      `bucket key ${bucketKey} must not double as a preparation stage name`,
+    );
+  }
 });
