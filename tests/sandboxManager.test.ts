@@ -603,18 +603,39 @@ test("code contribution preparation preserves typed failure codes and keeps unkn
     },
   });
 
-  preparationError = new Error("Unexpected journal failure.");
-  const unknown = await validation.prepare!(
+  // An UNTYPED exception raised by a KNOWN preparation step is attributed to
+  // that step and has its text withheld. The previous assertion pinned
+  // `{ code: "sandbox_prepare_rejected", message: "Unexpected journal failure." }`
+  // for this case: it required the boundary both to collapse a locatable
+  // failure onto the unknown-exception code and to copy foreign error text
+  // into a persisted tool error.
+  preparationError = new Error(
+    "Unexpected journal failure at C:/Users/joshb/vault/Private.md",
+  );
+  const attributed = await validation.prepare!(
     { workspaceId: "workspace-1", repairRequestId: "request-1" },
     context(),
   );
-  assert.deepEqual(unknown, {
-    ok: false,
-    error: {
-      code: "sandbox_prepare_rejected",
-      message: "Unexpected journal failure.",
-    },
-  });
+  assert.equal(attributed.ok, false);
+  if (attributed.ok) return;
+  assert.equal(attributed.error.code, "sandbox_host_preparation_failed");
+  assert.equal(attributed.error.message.includes("C:/Users/joshb/vault/Private.md"), false);
+  assert.equal(attributed.error.message.includes("Unexpected journal failure"), false);
+  assert.match(attributed.error.message, /withheld/iu);
+
+  // The generic code is still REACHABLE, and still means "unattributed". A
+  // throw from outside every known step - here a non-object argument payload,
+  // which fails before argument validation can classify it - keeps
+  // `sandbox_prepare_rejected`. Without this case the "unknown stays unknown"
+  // half of this test would be vacuous: every other path now has a stage.
+  const unattributed = await validation.prepare!(
+    null as unknown as Record<string, unknown>,
+    context(),
+  );
+  assert.equal(unattributed.ok, false);
+  if (unattributed.ok) return;
+  assert.equal(unattributed.error.code, "sandbox_prepare_rejected");
+  assert.match(unattributed.error.message, /withheld/iu);
 });
 
 test("validation contribution withholds success when durable receipt persistence/readback fails", async () => {
@@ -673,7 +694,11 @@ test("validation contribution withholds success when durable receipt persistence
     (error: unknown) =>
       error instanceof CodeSandboxContributionErrorV2 &&
       error.code === "validation_receipt_persistence_failed" &&
-      /readback hash mismatch/u.test(error.message),
+      // The typed code survives; the caught cause's own text does not. The
+      // previous assertion required `/readback hash mismatch/` — foreign text
+      // copied verbatim out of a durable-persistence failure.
+      /withheld/iu.test(error.message) &&
+      !/readback hash mismatch/u.test(error.message),
   );
   assert.equal(executions, 1, "sandbox ran once, but no green tool result was returned");
 });
