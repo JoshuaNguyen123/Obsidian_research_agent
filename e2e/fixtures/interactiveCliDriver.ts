@@ -297,9 +297,13 @@ export interface InteractiveCliRunResult {
   timedOut: boolean;
   responses: string[];
   /**
-   * Times the program printed something new after the driver answered it.
-   * Zero means the program never read a line the driver wrote, so nothing it
-   * printed is evidence that it is interactive at all.
+   * Times the program printed something new after an answer its own output
+   * asked for. Speculative answers -- the ones sent into startup silence --
+   * are excluded on purpose: a program that prints its first line a moment
+   * after the driver guessed into the dark has not read anything, and
+   * counting that would let a program that never touches stdin look
+   * interactive. Zero means nothing the program printed is evidence that it
+   * consumed input.
    */
   exchanges: number;
   /** Answers sent while the program had printed nothing at all. */
@@ -372,6 +376,7 @@ export function runInteractiveCliProgram(options: {
     let timedOut = false;
     let closed = false;
     let exchanges = 0;
+    let promptedAnswers = 0;
     let answeredBeforeOutput = 0;
     let stopReason: InteractiveCliRunResult["stopReason"] = "exit";
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -401,12 +406,14 @@ export function runInteractiveCliProgram(options: {
     const respond = () => {
       idleTimer = null;
       if (closed || child.stdin.destroyed || !child.stdin.writable) return;
+      const speculativeBefore = state.speculativeResponses;
       const answer = decideCliResponse(state, pending, stdout);
       pending = "";
       if (answer === null) {
         child.stdin.end();
         return;
       }
+      if (state.speculativeResponses === speculativeBefore) promptedAnswers += 1;
       responses.push(answer);
       child.stdin.write(`${answer}\n`);
       // A program that reads its next line without printing anything still
@@ -427,9 +434,9 @@ export function runInteractiveCliProgram(options: {
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
       pending += chunk;
-      if (responses.length > answeredBeforeOutput) {
+      if (promptedAnswers > answeredBeforeOutput) {
         exchanges += 1;
-        answeredBeforeOutput = responses.length;
+        answeredBeforeOutput = promptedAnswers;
       }
       if (stdout.length > OUTPUT_CAP) {
         stopReason = "output_limit";

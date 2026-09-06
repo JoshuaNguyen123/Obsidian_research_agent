@@ -211,6 +211,18 @@ say("Correct! You win! Congratulations.");
 done(0);
 `;
 
+/**
+ * Broken, and the hardest of the four to catch: it prints nothing until after
+ * the driver has already answered into silence, then claims a win and exits 0
+ * without ever reading a line. Exit status, the lane's lexical win check, and
+ * a naive "did anything print after we wrote?" test all accept it.
+ */
+const GAME_SLOW_VACUOUS_WINNER = `
+await sleep(400);
+say("Correct! You win! Congratulations.");
+done(0);
+`;
+
 /** Broken: prompts, then neither reads nor exits. */
 const GAME_HANGS = `
 write("Your guess: ");
@@ -331,6 +343,18 @@ test("a program that never reads stdin is not driven at all", async () => {
   assert.equal(result.exitCode, 0, describe(result));
   assert.match(result.stdout, /You win!/u);
   assert.deepEqual(result.responses, [], describe(result));
+  assert.equal(result.exchanges, 0, describe(result));
+});
+
+test("a slow program that claims a win without reading is not credited with an exchange", async () => {
+  const result = await play("slow-vacuous-winner", GAME_SLOW_VACUOUS_WINNER, {
+    timing: { startupQuietMs: 100, silentReadMs: 150 },
+  });
+  assert.equal(result.exitCode, 0, describe(result));
+  assert.match(result.stdout, /You win!/u);
+  // The driver answered into the dark and the program printed afterwards, but
+  // it printed what it was always going to print. Only output that follows an
+  // answer the program's own prompt asked for counts.
   assert.equal(result.exchanges, 0, describe(result));
 });
 
