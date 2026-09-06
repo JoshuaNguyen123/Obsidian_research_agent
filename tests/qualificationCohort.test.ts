@@ -523,3 +523,80 @@ test("2995 zero-failure trials is the separate 99.9% benchmark named by the plan
   assert.ok(Number(lowerSuccessBound(2995, 0)) >= 0.999);
   assert.ok(Number(lowerSuccessBound(2994, 0)) < 0.999);
 });
+
+// ---------------------------------------------------------------------------
+// Agent 3's capture states. An instrument that got better at admitting
+// ignorance must produce MORE non-qualifying rows, never more passes.
+// ---------------------------------------------------------------------------
+
+test("REJECTS lossy and unobserved capture: only `complete` coverage can qualify", () => {
+  for (const coverage of ["lossy", "unobserved"]) {
+    const { decl, records } = fullGreenCohort();
+    records[41] = deliveredRecord(decl.occurrences[41], {
+      toolEvents: { source: "summary", coverage, observed: null, failed: null },
+    });
+    const result = evaluate(decl, records);
+    assert.equal(result.passed, false, `${coverage} must not qualify`);
+    assert.equal(result.counts.measurementInvalid, 1);
+  }
+
+  // A recovered lower bound is diagnostic and must never be promoted into a
+  // headline count: `lossy` with integer counts still cannot qualify.
+  const { decl, records } = fullGreenCohort();
+  records[41] = deliveredRecord(decl.occurrences[41], {
+    toolEvents: { source: "summary", coverage: "lossy", observed: 4, failed: 0 },
+  });
+  assert.equal(evaluate(decl, records).counts.measurementInvalid, 1);
+
+  // ...and an explicitly complete capture with real counts still passes, so the
+  // check above is not simply rejecting everything.
+  const ok = fullGreenCohort();
+  ok.records[41] = deliveredRecord(ok.decl.occurrences[41], {
+    toolEvents: { source: "summary", coverage: "complete", observed: 4, failed: 0 },
+  });
+  assert.equal(evaluate(ok.decl, ok.records).passed, true);
+});
+
+test("REJECTS an unbalanced cohort: the per-workflow counts are part of the design", () => {
+  // 1002 and 300 are "smallest statistically valid n, rounded up to a multiple
+  // of six". A cohort whose totals look right but whose mix does not is not the
+  // declared sample.
+  const decl = declaration();
+  const tamperedMix = {
+    ...decl,
+    workflowMix: { ...decl.workflowMix, "code-delivery": 60, "vault-recall": 40 },
+  };
+  const records = decl.occurrences.map((o: any) => deliveredRecord(o));
+  const result = evaluate(tamperedMix, records);
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.some((f: string) => /workflow mix/iu.test(f)));
+
+  // A genuinely unbalanced occurrence list fails the recomputation too.
+  const skewed = {
+    ...decl,
+    occurrences: decl.occurrences.map((o: any, index: number) =>
+      index < 10 ? { ...o, workflow: "code-delivery" } : o,
+    ),
+  };
+  assert.equal(evaluate(skewed, skewed.occurrences.map((o: any) => deliveredRecord(o))).passed, false);
+});
+
+test("the bound is exact and one-sided, not a normal approximation", () => {
+  // A normal-approximation bound for a zero-failure sample is degenerate: zero
+  // variance yields 1.0 (or NaN). Either would silently qualify any n.
+  const perfect = Number(lowerSuccessBound(300, 0));
+  assert.ok(perfect < 1, "a zero-failure bound must be below 1, not degenerate");
+  assert.ok(Number.isFinite(perfect));
+
+  // The tight pair that catches an off-by-one or a one-sided/two-sided mixup:
+  // 299 is the minimum n for k=0, so 299 clears 99% and 295 does not. A
+  // two-sided 95% calculation would fail at 299.
+  assert.ok(Number(lowerSuccessBound(299, 0)) >= 0.99, "n=299,k=0 is the minimum passing sample");
+  assert.ok(Number(lowerSuccessBound(295, 0)) < 0.99, "n=295,k=0 must fail");
+  assert.equal(Number(Number(lowerSuccessBound(299, 0)).toFixed(6)), 0.990031);
+  assert.equal(Number(Number(lowerSuccessBound(295, 0)).toFixed(6)), 0.989896);
+
+  // Monotone in n at fixed k, and strictly worse for an extra failure.
+  assert.ok(Number(lowerSuccessBound(310, 0)) > Number(lowerSuccessBound(300, 0)));
+  assert.ok(Number(lowerSuccessBound(300, 1)) < Number(lowerSuccessBound(300, 0)));
+});

@@ -256,10 +256,30 @@ export function freezeQualificationDeclaration({
 // Classification of one occurrence's terminal record.
 // ---------------------------------------------------------------------------
 
+/**
+ * The one capture state that can support a delivered verdict.
+ *
+ * Agent 3's evidence contract (section 3) ships
+ * `ToolCallOutcomeCountsV1.coverage` as `complete | lossy | unobserved`, with a
+ * binding anti-vacuity rule on every consumer: `lossy` and `unobserved` must
+ * never satisfy a qualification predicate. That rule matters MORE after an
+ * honesty repair, not less — a collector that got better at admitting ignorance
+ * emits more non-complete rows, and a gate that counted those as passes would
+ * convert the repair into a false green.
+ */
+export const QUALIFYING_EVIDENCE_COVERAGE = "complete";
+
 function hasToolEventCoverage(events) {
+  if (!events || typeof events !== "object") return false;
+  // When the producer states a capture state, it is authoritative and must be
+  // positively `complete`. The integer checks below are a second, independent
+  // requirement rather than a substitute: a `lossy` row nulls its headline
+  // counts today, but a future producer that recovered a lower bound into
+  // `atLeast` must still not qualify.
+  if (events.coverage !== undefined && events.coverage !== QUALIFYING_EVIDENCE_COVERAGE) {
+    return false;
+  }
   return Boolean(
-    events &&
-    typeof events === "object" &&
     events.source &&
     events.source !== "none" &&
     Number.isSafeInteger(events.observed) &&
@@ -431,13 +451,20 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     if (typeof decl.seed === "string" && decl.seed.trim() !== "") {
       try {
         const recomputed = buildQualificationCohort({ gate, cells, seed: decl.seed });
-        const declaredIds = declaredOccurrences.map((entry) => entry?.occurrenceId);
-        const expectedIds = recomputed.occurrences.map((entry) => entry.occurrenceId);
+        // Compare the whole tuple, not just the identity string. An earlier
+        // version compared ids alone, and a test found the hole: relabelling a
+        // slot's `workflow` while keeping its id silently changes the effective
+        // workflow mix, which IS part of the sample design (300 and 1002 are the
+        // smallest valid n rounded up to a multiple of six).
+        const fingerprint = (entry) =>
+          `${entry?.occurrenceId}|${entry?.workflow}|${entry?.ordinal}`;
+        const declaredIds = declaredOccurrences.map(fingerprint);
+        const expectedIds = recomputed.occurrences.map(fingerprint);
         if (declaredIds.length !== expectedIds.length ||
           declaredIds.some((id, index) => id !== expectedIds[index])) {
           failures.push(
             "declared cohort does not match the deterministic cohort for its own seed " +
-            "(identities, order or size were changed after the freeze)",
+            "(identities, workflows, order or size were changed after the freeze)",
           );
         }
         for (const [workflow, expected] of Object.entries(recomputed.workflowMix)) {
