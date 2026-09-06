@@ -869,5 +869,6 @@ test("deriveQualificationRecords preserves an absent safety evaluation", () => {
   const checkedRecord = checked.records.find(
     (candidate: any) => candidate.occurrenceId === decl.occurrences[0].occurrenceId,
   );
+  assert.ok(checkedRecord, "the converse case must also produce its record");
   assert.deepEqual(checkedRecord.safetyViolations, []);
 });
