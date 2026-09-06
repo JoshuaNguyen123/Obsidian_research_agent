@@ -1,6 +1,8 @@
 import type { ReliabilityGate } from "./reliability-campaign.d.mts";
 
 export const QUALIFICATION_POLICY_VERSION: "mission-success/v1";
+/** The only capture state that can support a delivered verdict. */
+export const QUALIFYING_EVIDENCE_COVERAGE: "complete";
 
 export type QualificationOutcome =
   | "delivered"
@@ -44,6 +46,9 @@ export interface QualificationCohort {
 }
 
 export interface QualificationDeclaration extends QualificationCohort {
+  /** Stable id for this cohort under this build and model; every record names it. */
+  readonly cohortId: string;
+  readonly evidenceContractVersion: string;
   readonly model: string;
   readonly headSha: string;
   readonly artifactHashes: Record<string, string | null>;
@@ -54,6 +59,9 @@ export interface QualificationDeclaration extends QualificationCohort {
 
 export interface QualificationRecord {
   readonly occurrenceId: string;
+  readonly cohortId?: string | null;
+  /** Self-reported deadline; a value other than the frozen one is drift. */
+  readonly deadlineS?: number | null;
   readonly workflow?: string | null;
   readonly model?: string | null;
   readonly headSha?: string | null;
@@ -65,6 +73,8 @@ export interface QualificationRecord {
   readonly safetyViolations?: readonly string[];
   readonly toolEvents?: {
     readonly source?: string | null;
+    /** ToolCallOutcomeCountsV1.coverage; only "complete" can qualify. */
+    readonly coverage?: "complete" | "lossy" | "unobserved" | null;
     readonly observed?: number | null;
     readonly failed?: number | null;
   } | null;
@@ -74,6 +84,8 @@ export interface QualificationRecord {
     readonly scorecardAcceptancePassed?: boolean | null;
     readonly scorecardTotal?: number | null;
     readonly artifactProofCount?: number | null;
+    /** Path + content hash (or receipt readback identity) of the delivered artifact. */
+    readonly artifactIdentity?: string | null;
   } | null;
 }
 
@@ -87,6 +99,11 @@ export interface QualificationEvaluation {
   policyVersion: string;
   gate: string;
   seed: string | null;
+  cohortId: string | null;
+  evidenceContractVersion: string | null;
+  /** Always reported, so 300 deliveries against 1 artifact is visible. */
+  distinctArtifactIdentities: number;
+  deliveredWithArtifactIdentity: number;
   model: string | null;
   headSha: string | null;
   artifactHashes: Record<string, string | null> | null;
@@ -148,7 +165,13 @@ export function freezeQualificationDeclaration(input: {
   artifactHashes: Record<string, string | null>;
   deadlineSecondsPerOccurrence: number;
   frozenAt?: string;
+  evidenceContractVersion?: string;
 }): QualificationDeclaration;
+
+/** Recomputed by the evaluator; a mismatch means the declaration was edited. */
+export function qualificationCohortId(
+  declaration: Partial<QualificationDeclaration> | null | undefined,
+): string;
 
 export function classifyQualificationRecord(
   record: QualificationRecord | null | undefined,

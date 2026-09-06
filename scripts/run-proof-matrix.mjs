@@ -2519,9 +2519,11 @@ async function main() {
         ...(occurrence
           ? {
               occurrenceId: occurrence.occurrenceId,
+              cohortId: declaration.cohortId,
               workflow: occurrence.workflow,
               model: PROOF_MATRIX_MODEL,
               headSha: expectedHead,
+              deadlineS: QUALIFICATION_DEADLINE_SECONDS,
               launched: true,
             }
           : {}),

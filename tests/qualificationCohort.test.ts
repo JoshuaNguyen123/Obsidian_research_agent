@@ -41,10 +41,14 @@ function declaration(gate = gate99, overrides: Record<string, unknown> = {}) {
   };
 }
 
+const COHORT_ID_99 = declaration(gate99).cohortId;
+const COHORT_ID_999 = declaration(gate999).cohortId;
+
 /** A fully proven delivered record. Every counterexample below degrades THIS. */
 function deliveredRecord(occurrence: any, overrides: Record<string, unknown> = {}) {
   return {
     occurrenceId: occurrence.occurrenceId,
+    cohortId: COHORT_ID_99,
     workflow: occurrence.workflow,
     model: MODEL,
     headSha: HEAD,
@@ -68,7 +72,12 @@ function deliveredRecord(occurrence: any, overrides: Record<string, unknown> = {
 
 function fullGreenCohort(gate = gate99) {
   const decl = declaration(gate);
-  return { decl, records: decl.occurrences.map((occurrence: any) => deliveredRecord(occurrence)) };
+  return {
+    decl,
+    records: decl.occurrences.map((occurrence: any) =>
+      deliveredRecord(occurrence, { cohortId: decl.cohortId })
+    ),
+  };
 }
 
 function evaluate(decl: any, records: any[], gate = gate99) {
@@ -96,6 +105,7 @@ test("POSITIVE CONTROL: a complete, fully proven 300-mission cohort passes", () 
 test("POSITIVE CONTROL: the 1002-mission cohort tolerates exactly one failure", () => {
   const { decl, records } = fullGreenCohort(gate999);
   records[17] = deliveredRecord(decl.occurrences[17], {
+    cohortId: COHORT_ID_999,
     green: false,
     failureClass: "model:draft_rejected",
   });
@@ -107,6 +117,7 @@ test("POSITIVE CONTROL: the 1002-mission cohort tolerates exactly one failure", 
   assert.ok(Number(result.lowerBound) >= 0.99);
 
   records[18] = deliveredRecord(decl.occurrences[18], {
+    cohortId: COHORT_ID_999,
     green: false,
     failureClass: "model:draft_rejected",
   });
@@ -282,6 +293,7 @@ test("REJECTS contradictory product failures: green plus product:* is never reso
   // A contradiction must block even where the sample could absorb one failure.
   const big = fullGreenCohort(gate999);
   big.records[15] = deliveredRecord(big.decl.occurrences[15], {
+    cohortId: COHORT_ID_999,
     green: true,
     failureClass: "product:receipt_missing",
   });
@@ -599,4 +611,132 @@ test("the bound is exact and one-sided, not a normal approximation", () => {
   // Monotone in n at fixed k, and strictly worse for an extra failure.
   assert.ok(Number(lowerSuccessBound(310, 0)) > Number(lowerSuccessBound(300, 0)));
   assert.ok(Number(lowerSuccessBound(300, 1)) < Number(lowerSuccessBound(300, 0)));
+});
+
+// ---------------------------------------------------------------------------
+// Counterexamples contributed by Agent 1's review of the published contract.
+// Each attacks a check that a record could satisfy while containing nothing,
+// or by self-reporting the thing it is judged against.
+// ---------------------------------------------------------------------------
+
+test("REJECTS a delivered record with zero observed tool events", () => {
+  // `observed: 0` is a safe integer and 0/0 failed calls is a perfect rate, so
+  // the naive coverage check passes hardest when the evidence is emptiest.
+  const { decl, records } = fullGreenCohort();
+  records[3] = deliveredRecord(decl.occurrences[3], {
+    cohortId: decl.cohortId,
+    toolEvents: { source: "collector", observed: 0, failed: 0 },
+  });
+  const result = evaluate(decl, records);
+  assert.equal(result.passed, false);
+  assert.equal(result.counts.measurementInvalid, 1);
+  assert.equal(result.counts.delivered, 299);
+
+  // More failed calls than observed is incoherent, not a perfect record.
+  const incoherent = fullGreenCohort();
+  incoherent.records[3] = deliveredRecord(incoherent.decl.occurrences[3], {
+    cohortId: incoherent.decl.cohortId,
+    toolEvents: { source: "collector", observed: 2, failed: 5 },
+  });
+  assert.equal(evaluate(incoherent.decl, incoherent.records).counts.measurementInvalid, 1);
+});
+
+test("REJECTS an unmeasured mission read as a passing one", () => {
+  // summarizeAttemptAcceptance returns "unknown" when no fresh summary existed:
+  // the killed-worker case. "No failure seen" must not become "pass".
+  const { decl, records } = fullGreenCohort();
+  records[4] = deliveredRecord(decl.occurrences[4], {
+    cohortId: decl.cohortId,
+    acceptance: {
+      missionOutcome: "unknown",
+      acceptanceStatus: "unknown",
+      scorecardAcceptancePassed: null,
+      scorecardTotal: null,
+      artifactProofCount: null,
+    },
+  });
+  const result = evaluate(decl, records);
+  assert.equal(result.passed, false);
+  assert.equal(result.counts.unresolved, 1, "unmeasured is unresolved, not merely not-delivered");
+  assert.equal(result.counts.delivered, 299);
+});
+
+test("REJECTS a record that self-reports a deadline other than the frozen one", () => {
+  const { decl, records } = fullGreenCohort();
+  records[6] = deliveredRecord(decl.occurrences[6], {
+    cohortId: decl.cohortId,
+    deadlineS: 999999,
+    durationS: 90000,
+  });
+  const result = evaluate(decl, records);
+  assert.equal(result.passed, false);
+  assert.equal(result.counts.notDelivered, 1);
+  const outcome = result.outcomes.find(
+    (entry: any) => entry.occurrenceId === decl.occurrences[6].occurrenceId,
+  );
+  assert.ok(outcome);
+  assert.ok(outcome.reasons.some((reason: string) => /frozen manifest declares/u.test(reason)));
+});
+
+test("REJECTS a record that does not name this cohort", () => {
+  const { decl, records } = fullGreenCohort();
+  records[8] = deliveredRecord(decl.occurrences[8], { cohortId: "0123456789abcdef" });
+  const wrong = evaluate(decl, records);
+  assert.equal(wrong.passed, false);
+  assert.ok(wrong.failures.some((f: string) => /names cohort/u.test(f)));
+
+  // A screening row carries no cohort id at all and cannot become a trial by
+  // merely acquiring an occurrence identity.
+  const bare = fullGreenCohort();
+  const stripped: any = { ...deliveredRecord(bare.decl.occurrences[8], { cohortId: bare.decl.cohortId }) };
+  delete stripped.cohortId;
+  bare.records[8] = stripped;
+  assert.equal(evaluate(bare.decl, bare.records).passed, false);
+});
+
+test("REJECTS a declaration whose cohortId does not match its own identity fields", () => {
+  const decl = declaration();
+  const records = decl.occurrences.map((o: any) => deliveredRecord(o, { cohortId: decl.cohortId }));
+  // Swapping the model without recomputing the id is the shape of a hand-edited
+  // manifest that keeps every per-record check satisfied.
+  const tampered = { ...decl, model: "some-other-model:cloud" };
+  const result = evaluate(tampered, records);
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.some((f: string) => /cohortId/u.test(f)));
+});
+
+test("REJECTS one artifact standing in for a whole cohort", () => {
+  const { decl, records } = fullGreenCohort();
+  const shared = records.map((record: any) =>
+    ({
+      ...record,
+      acceptance: { ...record.acceptance, artifactIdentity: "Agent Runs/one-note.md#sha256:abc" },
+    }));
+  const result = evaluate(decl, shared);
+  assert.equal(result.deliveredWithArtifactIdentity, 300);
+  assert.equal(result.distinctArtifactIdentities, 1);
+  assert.equal(result.passed, false);
+  assert.ok(result.failures.some((f: string) => /distinct artifact identity/u.test(f)));
+
+  // Distinct identities for distinct missions still pass, so the check is not
+  // simply rejecting every cohort that carries identities at all.
+  const distinct = records.map((record: any, index: number) =>
+    ({
+      ...record,
+      acceptance: { ...record.acceptance, artifactIdentity: `Agent Runs/note-${index}.md#sha256:${index}` },
+    }));
+  const ok = evaluate(decl, distinct);
+  assert.equal(ok.distinctArtifactIdentities, 300);
+  assert.equal(ok.passed, true);
+});
+
+test("REJECTS a declaration whose stated size disagrees with its occurrence list", () => {
+  // cohortSize: 300 with a mix that resolved to zero occurrences would make
+  // "every declared occurrence has a terminal record" trivially true.
+  const decl = declaration(gate99, { occurrences: [] });
+  const result = evaluate(decl, []);
+  assert.equal(result.passed, false);
+  assert.equal(result.denominator, 0);
+  assert.ok(result.failures.some((f: string) => /empty|n = 0/iu.test(f)));
+  assert.ok(result.failures.some((f: string) => /states cohortSize 300 but lists 0/u.test(f)));
 });

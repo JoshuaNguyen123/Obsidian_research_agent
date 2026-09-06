@@ -28,6 +28,8 @@
 // `passed: false` with `positiveProof: false`, and tests/qualificationCohort.test.ts
 // pins each of those cases.
 
+import { createHash } from "node:crypto";
+
 import {
   isInfrastructureFailureClass,
   isUnresolvedFailureClass,
@@ -240,16 +242,47 @@ export function freezeQualificationDeclaration({
   artifactHashes,
   deadlineSecondsPerOccurrence,
   frozenAt = new Date().toISOString(),
+  evidenceContractVersion = "ToolCallOutcomeCountsV1@1",
 }) {
-  return {
+  const declaration = {
     ...cohort,
     model,
     headSha,
     artifactHashes,
     deadlineSecondsPerOccurrence,
     frozenAt,
+    evidenceContractVersion,
     confidenceLevel: 0.95,
   };
+  return { ...declaration, cohortId: qualificationCohortId(declaration) };
+}
+
+/**
+ * A stable id for THIS cohort under THIS build and model.
+ *
+ * Every record must carry it. "Screening rows carry no occurrenceId" is a
+ * NEGATIVE property, and negative properties leak the moment files are merged
+ * by glob — a screening row only has to acquire an id to become a cohort row.
+ * A positive, verified binding closes that: a row from another campaign, an
+ * earlier build or a screening pass cannot name this cohort by accident.
+ */
+export function qualificationCohortId(declaration) {
+  const artifacts = Object.entries(declaration?.artifactHashes ?? {})
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([file, hash]) => `${file}=${hash}`)
+    .join(",");
+  return createHash("sha256")
+    .update([
+      declaration?.policyVersion,
+      declaration?.gate,
+      declaration?.seed,
+      declaration?.cohortSize,
+      declaration?.model,
+      declaration?.headSha,
+      artifacts,
+    ].join("|"))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,9 +316,16 @@ function hasToolEventCoverage(events) {
     events.source &&
     events.source !== "none" &&
     Number.isSafeInteger(events.observed) &&
-    events.observed >= 0 &&
+    // STRICTLY positive, not >= 0. `observed: 0` is a safe integer and gives a
+    // perfect 0/0 tool-call rate, so the old check passed hardest when the
+    // evidence was emptiest — the repository's recurring vacuous-input shape,
+    // caught in review by Agent 1. No mission in this population can deliver
+    // its artifacts without making a single tool call; a zero-coverage
+    // "delivered" record is an unobserved mission, not a successful one.
+    events.observed > 0 &&
     Number.isSafeInteger(events.failed) &&
-    events.failed >= 0,
+    events.failed >= 0 &&
+    events.failed <= events.observed,
   );
 }
 
@@ -343,9 +383,18 @@ export function classifyQualificationRecord(record, options = {}) {
   }
 
   const acceptance = record.acceptance;
-  if (!acceptance || typeof acceptance !== "object") {
-    reasons.push("no mission acceptance record");
-  } else {
+  // An ABSENT or explicitly `unknown` acceptance record is not a failed
+  // mission — it is an unmeasured one, and the two must not collapse into the
+  // same verdict. `summarizeAttemptAcceptance` returns `unknown` when no fresh
+  // summary existed, which is exactly the killed-worker / never-reached-its-
+  // assertions case: treating that as "no failure seen, therefore pass" is how
+  // a crash becomes a success. It is `unresolved`, which blocks the pass.
+  if (!acceptance || typeof acceptance !== "object" || acceptance.acceptanceStatus === "unknown") {
+    return verdict(UNRESOLVED, [
+      "no mission acceptance record: the mission was not measured, which is not the same as not failing",
+    ], contradictions);
+  }
+  {
     if (acceptance.acceptanceStatus !== "pass") {
       reasons.push(`acceptance status is '${acceptance.acceptanceStatus ?? "absent"}', not pass`);
     }
@@ -363,7 +412,17 @@ export function classifyQualificationRecord(record, options = {}) {
     }
   }
 
+  // The deadline comes from the FROZEN declaration, never from the record. A
+  // record compared against its own self-reported deadline can never exceed it.
   const deadline = Number(options.deadlineSecondsPerOccurrence);
+  if (
+    record.deadlineS !== undefined &&
+    Number(record.deadlineS) !== deadline
+  ) {
+    reasons.push(
+      `record declares a ${record.deadlineS}s deadline but the frozen manifest declares ${deadline}s`,
+    );
+  }
   if (Number.isFinite(deadline) && deadline > 0) {
     if (!Number.isFinite(Number(record.durationS))) {
       return verdict(MEASUREMENT_INVALID, [
@@ -442,9 +501,31 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     ) {
       failures.push("declaration has no frozen installed artifact hashes");
     }
+    // Refuse n = 0 EXPLICITLY, before any ratio is computed. AGENTS.md already
+    // documents this bug class in the scorecard, where coverage() and
+    // ratioMet() return 1 on a zero denominator: the arithmetic cannot be
+    // trusted to fail closed, so the count is asserted directly. The two
+    // numbers must also agree with each other — a declaration claiming 300 whose
+    // mix resolves to zero occurrences would otherwise satisfy "every declared
+    // occurrence has a terminal record" trivially over an empty list.
+    if (declaredCount === 0) {
+      failures.push("the declared cohort is empty; an n = 0 sample cannot qualify anything");
+    }
     if (declaredCount !== gate.cohortSize) {
       failures.push(
         `declared cohort size is ${declaredCount}; gate ${gate.id} fixes it at ${gate.cohortSize}`,
+      );
+    }
+    if (Number(decl.cohortSize) !== declaredCount) {
+      failures.push(
+        `declaration states cohortSize ${decl.cohortSize} but lists ${declaredCount} occurrences`,
+      );
+    }
+    const expectedCohortId = qualificationCohortId(decl);
+    if (decl.cohortId !== expectedCohortId) {
+      failures.push(
+        `declaration cohortId '${decl.cohortId ?? "absent"}' does not match its own identity ` +
+        `fields (expected '${expectedCohortId}')`,
       );
     }
     // Recompute from the seed: a hand-edited cohort fails here.
@@ -568,6 +649,15 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
           `not the frozen build '${decl.headSha}'`,
         );
       }
+      // Positive binding to THIS cohort. "Screening rows carry no occurrenceId"
+      // is a negative property and negative properties leak when files are
+      // merged by glob; a row only has to acquire an id to become a trial.
+      if (decl?.cohortId && record.cohortId !== decl.cohortId) {
+        failures.push(
+          `record ${occurrence.occurrenceId} names cohort '${record.cohortId ?? "absent"}', not ` +
+          `this campaign's '${decl.cohortId}'; a screening or foreign row cannot become a trial`,
+        );
+      }
       if (record.workflow !== occurrence.workflow) {
         failures.push(
           `record ${occurrence.occurrenceId} reports workflow '${record.workflow ?? "absent"}' ` +
@@ -623,6 +713,25 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
   // the count reports instrument defects, not absent rows (already reported as
   // incompleteness).
   counts.measurementInvalid -= missing.length;
+
+  // Artifact identity. `artifactProofCount >= 1` is a PER-RECORD check, so 300
+  // records each carrying "1" and the SAME artifact satisfy it — and the
+  // realistic producer of that is not fraud but a harness re-reading a stale
+  // snapshot after the first attempt, which has happened in this repository
+  // before. Where identities are emitted, distinct identities must keep pace
+  // with deliveries; the count is always reported so 300-vs-1 is visible even
+  // when no producer emits one yet.
+  const deliveredIds = outcomes
+    .filter((entry) => entry.outcome === QUALIFICATION_OUTCOMES.DELIVERED)
+    .map((entry) => byId.get(entry.occurrenceId)?.acceptance?.artifactIdentity)
+    .filter((identity) => typeof identity === "string" && identity !== "");
+  const distinctArtifactIdentities = new Set(deliveredIds).size;
+  if (deliveredIds.length > 0 && distinctArtifactIdentities < deliveredIds.length) {
+    failures.push(
+      `${deliveredIds.length} delivered occurrence(s) report only ${distinctArtifactIdentities} ` +
+      "distinct artifact identity(ies); one artifact cannot satisfy many missions",
+    );
+  }
 
   if (contradictions.length > 0) {
     failures.push(
@@ -692,9 +801,14 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     policyVersion: QUALIFICATION_POLICY_VERSION,
     gate: gate.id,
     seed: decl?.seed ?? null,
+    cohortId: decl?.cohortId ?? null,
     model: decl?.model ?? null,
     headSha: decl?.headSha ?? null,
     artifactHashes: decl?.artifactHashes ?? null,
+    evidenceContractVersion: decl?.evidenceContractVersion ?? null,
+    /** Reported ALWAYS, so 300 deliveries against 1 artifact is visible. */
+    distinctArtifactIdentities,
+    deliveredWithArtifactIdentity: deliveredIds.length,
     // `passed` is a CONJUNCTION: no failures AND affirmative proof. Either half
     // alone has produced a false green in this repository before.
     passed: failures.length === 0 && positiveProof,
@@ -769,6 +883,7 @@ export function deriveQualificationRecords(manifest, declaration) {
     }
     records.push({
       occurrenceId: attempt.occurrenceId,
+      cohortId: attempt.cohortId ?? declaration?.cohortId ?? null,
       workflow: occurrence.workflow,
       model: attempt.model ?? manifest?.model ?? null,
       headSha: attempt.headSha ?? manifest?.expectedHead ?? null,
@@ -776,6 +891,7 @@ export function deriveQualificationRecords(manifest, declaration) {
       green: attempt.green,
       failureClass: attempt.failureClass,
       durationS: attempt.durationS ?? null,
+      deadlineS: attempt.deadlineS,
       budgetStopped: attempt.budgetStopped === true,
       safetyViolations: Array.isArray(attempt.safetyViolations) ? attempt.safetyViolations : [],
       toolEvents: attempt.toolEvents ?? null,
