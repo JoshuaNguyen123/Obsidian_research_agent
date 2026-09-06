@@ -318,3 +318,8 @@ export declare function evaluateAttemptSafetyV1(input: {
   safetyEvaluated: string[];
   safetyViolations: string[];
 };
+
+export declare function classifyPreexistingWorkspacesV1(
+  entries: readonly (string | null | undefined)[] | null | undefined,
+  allowValue: string | null | undefined,
+): { accepted: string[]; refused: string[]; allowed: string[] };

@@ -15,6 +15,7 @@ import {
 } from "../scripts/qualification-cohort.mjs";
 import {
   QUALIFICATION_ARTIFACT_FILES,
+  classifyPreexistingWorkspacesV1,
   qualificationArtifactHashes,
 } from "../scripts/run-proof-matrix.mjs";
 import {
@@ -2066,4 +2067,44 @@ test("the cohort gate is DRIVEN by the runner, not merely declared beside it", (
   // The dry run proves the empty case is refused before anything is spent.
   assert.match(source, /vacuity self-check on an EMPTY record set/u);
   assert.match(source, /if \(empty\.passed\)/u, "a vacuous PASS must abort the dry run");
+});
+
+// --- pre-existing workspace override: exact names only ---------------------
+// 2026-09-06: a bare --allow-preexisting-workspaces, meant for one expired
+// orphan, also accepted the workspace a killed attempt had left behind; the
+// next code-delivery mission adopted it, collided on main.py, and the cohort
+// was lost at occurrence 2. The override must be able to say "this one and
+// nothing else".
+
+test("the override accepts exactly the named entries and refuses every other pre-existing one", () => {
+  const result = classifyPreexistingWorkspacesV1(["workspace-app-284", "python-number-guessing-game"], "workspace-app-284");
+  assert.deepEqual(result.accepted, ["workspace-app-284"]);
+  assert.deepEqual(result.refused, ["python-number-guessing-game"], "a killed attempt's debris is refused even when the orphan is allowed");
+});
+
+test("no allowlist accepts nothing: absent flag and bare flag both refuse every entry", () => {
+  assert.deepEqual(classifyPreexistingWorkspacesV1(["workspace-app-284"], null).refused, ["workspace-app-284"]);
+  assert.deepEqual(classifyPreexistingWorkspacesV1(["workspace-app-284"], "").refused, ["workspace-app-284"]);
+  assert.deepEqual(classifyPreexistingWorkspacesV1(["workspace-app-284"], "   ,  ").refused, ["workspace-app-284"]);
+});
+
+test("names match exactly, whitespace-trimmed, never by prefix or substring", () => {
+  const result = classifyPreexistingWorkspacesV1(["workspace-app-284", "workspace-app-2840", "app-284"], " workspace-app-284 , other ");
+  assert.deepEqual(result.accepted, ["workspace-app-284"]);
+  assert.deepEqual(result.refused, ["workspace-app-2840", "app-284"]);
+  assert.deepEqual(result.allowed, ["workspace-app-284", "other"], "an allowed name that is not on disk is harmless");
+});
+
+test("an empty scratch root accepts and refuses nothing", () => {
+  assert.deepEqual(classifyPreexistingWorkspacesV1([], "workspace-app-284"), { accepted: [], refused: [], allowed: ["workspace-app-284"] });
+  assert.deepEqual(classifyPreexistingWorkspacesV1(null, null), { accepted: [], refused: [], allowed: [] });
+});
+
+test("the launch guard rejects the bare override and refuses unlisted entries at the source", () => {
+  const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const source = readFileSync(path.join(repoRoot, "scripts/run-proof-matrix.mjs"), "utf8");
+  assert.match(source, /if \(flag\("--allow-preexisting-workspaces"\)\) \{\s*fail\(/u, "the bare flag must fail the launch");
+  assert.match(source, /classifyPreexistingWorkspacesV1\(\s*preexistingWorkspaces,\s*opt\("--allow-preexisting-workspaces"\),?\s*\)/u, "the guard must consult the exact-name helper");
+  assert.match(source, /if \(preexisting\.refused\.length > 0\) \{\s*fail\(/u, "any refused entry must fail the launch");
+  assert.match(source, /accepting \$\{preexisting\.accepted\.length\} pre-existing workspaces-v2 entries by name/u, "accepted names must be printed into the campaign log");
 });

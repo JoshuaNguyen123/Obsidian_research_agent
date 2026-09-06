@@ -30,7 +30,7 @@
 // Usage:
 //   node scripts/run-proof-matrix.mjs [--model=exact-tag] [--cells=a,b]
 //                                     [--dry-run] [--resume]
-//                                     [--allow-preexisting-workspaces]
+//                                     [--allow-preexisting-workspaces=name[,name]]
 //
 // Evidence duties handled per attempt (previously hand-maintained):
 //   - one row appended to docs/eval/playwright-run-metrics.csv
@@ -296,6 +296,37 @@ const opt = (name) => {
 function fail(message) {
   console.error(`proof-matrix: ${message}`);
   process.exit(1);
+}
+
+/**
+ * Sort the pre-existing scratch-workspace entries into the ones an explicit,
+ * exact-name allowlist accepts and the ones that must still refuse the launch.
+ *
+ * WHY EXACT NAMES. On 2026-09-06 a campaign was killed 2.5 minutes into a
+ * code-delivery attempt, after the lane had created its model-named workspace
+ * and main.py. A killed attempt reaches neither the runner's time-scoped
+ * debris sweep nor the lane's own cleanup, so the workspace outlived the
+ * abort. The next launch passed the bare override, meant for one expired
+ * orphan, and it waved the fresh debris through as well; the next
+ * code-delivery mission adopted the stale workspace, collided on main.py, and
+ * the cohort was lost at occurrence 2. A blanket override cannot express "this
+ * one, and nothing else", so it is no longer accepted: `allowValue` is the
+ * text after `=`, and `null` (flag absent) or `""` (bare flag) accepts
+ * nothing.
+ */
+export function classifyPreexistingWorkspacesV1(entries, allowValue) {
+  const allowed = new Set(
+    typeof allowValue === "string"
+      ? allowValue.split(",").map((name) => name.trim()).filter((name) => name.length > 0)
+      : [],
+  );
+  const accepted = [];
+  const refused = [];
+  for (const entry of entries ?? []) {
+    if (typeof entry !== "string" || entry.length === 0) continue;
+    (allowed.has(entry) ? accepted : refused).push(entry);
+  }
+  return { accepted, refused, allowed: [...allowed] };
 }
 
 export function normalizeGitCommandOutput(output, { preserveLeading = false } = {}) {
@@ -2092,18 +2123,38 @@ async function main() {
     }
     if (preexistingWorkspaces.length > 0) {
       console.log(
-        `  NOTE: workspaces-v2 holds ${preexistingWorkspaces.length} pre-existing entries; ` +
-        "a live run refuses to start until they are cleaned up or --allow-preexisting-workspaces is passed.",
+        `  NOTE: workspaces-v2 holds ${preexistingWorkspaces.length} pre-existing entries ` +
+        `(${preexistingWorkspaces.join(", ")}); a live run refuses to start until they are cleaned up ` +
+        "or each accepted entry is named: --allow-preexisting-workspaces=name[,name].",
       );
     }
     return;
   }
 
-  if (preexistingWorkspaces.length > 0 && !flag("--allow-preexisting-workspaces")) {
+  if (flag("--allow-preexisting-workspaces")) {
     fail(
-      `workspaces-v2 already holds ${preexistingWorkspaces.length} entries the matrix must not touch ` +
-      `and code cells may collide with: ${preexistingWorkspaces.join(", ")}. ` +
-      "Clean them up (or pass --allow-preexisting-workspaces to accept the collision risk).",
+      "--allow-preexisting-workspaces needs an explicit exact-name allowlist " +
+      "(--allow-preexisting-workspaces=name[,name]). The bare form accepted a killed attempt's " +
+      "leftover workspace alongside the intended orphan on 2026-09-06 and cost a cohort at occurrence 2.",
+    );
+  }
+  const preexisting = classifyPreexistingWorkspacesV1(
+    preexistingWorkspaces,
+    opt("--allow-preexisting-workspaces"),
+  );
+  if (preexisting.refused.length > 0) {
+    fail(
+      `workspaces-v2 already holds ${preexisting.refused.length} entries the matrix must not touch ` +
+      `and code cells may collide with: ${preexisting.refused.join(", ")}. ` +
+      "Clean them up, or name each entry you accept: --allow-preexisting-workspaces=name[,name].",
+    );
+  }
+  if (preexisting.accepted.length > 0) {
+    // Into the campaign log, so the next post-mortem does not have to guess
+    // what was on disk at launch.
+    console.log(
+      `proof-matrix: accepting ${preexisting.accepted.length} pre-existing workspaces-v2 entries by name: ` +
+      preexisting.accepted.join(", "),
     );
   }
 
