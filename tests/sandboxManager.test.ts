@@ -603,24 +603,39 @@ test("code contribution preparation preserves typed failure codes and keeps unkn
     },
   });
 
-  // An UNTYPED exception keeps the generic code AND has its text withheld.
-  // The previous assertion pinned `message: "Unexpected journal failure."`,
-  // i.e. it required the boundary to copy foreign error text into a persisted
-  // tool error. Host errors on this path carry absolute vault paths, command
-  // lines and provider payloads, so the message is now a fixed notice.
+  // An UNTYPED exception raised by a KNOWN preparation step is attributed to
+  // that step and has its text withheld. The previous assertion pinned
+  // `{ code: "sandbox_prepare_rejected", message: "Unexpected journal failure." }`
+  // for this case: it required the boundary both to collapse a locatable
+  // failure onto the unknown-exception code and to copy foreign error text
+  // into a persisted tool error.
   preparationError = new Error(
     "Unexpected journal failure at C:/Users/joshb/vault/Private.md",
   );
-  const unknown = await validation.prepare!(
+  const attributed = await validation.prepare!(
     { workspaceId: "workspace-1", repairRequestId: "request-1" },
     context(),
   );
-  assert.equal(unknown.ok, false);
-  if (unknown.ok) return;
-  assert.equal(unknown.error.code, "sandbox_prepare_rejected");
-  assert.equal(unknown.error.message.includes("C:/Users/joshb/vault/Private.md"), false);
-  assert.equal(unknown.error.message.includes("Unexpected journal failure"), false);
-  assert.match(unknown.error.message, /withheld/iu);
+  assert.equal(attributed.ok, false);
+  if (attributed.ok) return;
+  assert.equal(attributed.error.code, "sandbox_host_preparation_failed");
+  assert.equal(attributed.error.message.includes("C:/Users/joshb/vault/Private.md"), false);
+  assert.equal(attributed.error.message.includes("Unexpected journal failure"), false);
+  assert.match(attributed.error.message, /withheld/iu);
+
+  // The generic code is still REACHABLE, and still means "unattributed". A
+  // throw from outside every known step - here a non-object argument payload,
+  // which fails before argument validation can classify it - keeps
+  // `sandbox_prepare_rejected`. Without this case the "unknown stays unknown"
+  // half of this test would be vacuous: every other path now has a stage.
+  const unattributed = await validation.prepare!(
+    null as unknown as Record<string, unknown>,
+    context(),
+  );
+  assert.equal(unattributed.ok, false);
+  if (unattributed.ok) return;
+  assert.equal(unattributed.error.code, "sandbox_prepare_rejected");
+  assert.match(unattributed.error.message, /withheld/iu);
 });
 
 test("validation contribution withholds success when durable receipt persistence/readback fails", async () => {
