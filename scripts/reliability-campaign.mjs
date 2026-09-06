@@ -49,6 +49,29 @@ export const RELIABILITY_GATES = Object.freeze({
     requireArtifactProof: true,
     rejectAnyProductFailure: true,
   }),
+  // Declared 2026-09-06 for a staged campaign: abort-only checkpoints at 102
+  // and 300, claim made only at 504. Under the plan's DUAL criterion (lower
+  // bound >= 99% AND observed >= 99.9%) this is a zero-failure design: one
+  // failure gives 503/504 = 99.80% observed, which misses 99.9% even though
+  // the lower bound (99.06%) survives. 504 = 84 x 6 keeps every checkpoint
+  // balanced (17 / 50 / 84 per workflow). Exact one-sided 95% bound at
+  // 504/0 is 0.99405.
+  qualification504: Object.freeze({
+    id: "qualification504",
+    kind: "predeclared-cohort",
+    policyVersion: "mission-success/v1",
+    cohortSize: 504,
+    maximumFailures: 0,
+    workflows: 6,
+    occurrencesPerWorkflow: 84,
+    confidenceLevel: 0.95,
+    requiredLowerBound: 0.99,
+    requiredObservedSuccessRate: 0.999,
+    infrastructureLaunchRateMaxExclusive: 0.05,
+    requireToolEventCoverage: true,
+    requireArtifactProof: true,
+    rejectAnyProductFailure: true,
+  }),
   qualification999: Object.freeze({
     id: "qualification999",
     kind: "predeclared-cohort",
@@ -80,6 +103,8 @@ export function resolveReliabilityGate(value = "recovery") {
     "99": "qualification99",
     qualification: "qualification99",
     qualification99: "qualification99",
+    "504": "qualification504",
+    qualification504: "qualification504",
     "999": "qualification999",
     "99.9": "qualification999",
     qualification999: "qualification999",

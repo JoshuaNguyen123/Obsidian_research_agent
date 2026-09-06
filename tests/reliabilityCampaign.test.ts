@@ -191,7 +191,7 @@ test("a cohort gate CANNOT be laundered through the fixed-attempt evaluator", ()
   // The lane evaluator excludes harness attempts from its denominator. The
   // cohort policy forbids exactly that, so passing one to the other must throw
   // rather than quietly produce a number under the wrong counting rules.
-  for (const id of ["qualification99", "qualification999", "recovery"]) {
+  for (const id of ["qualification99", "qualification504", "qualification999", "recovery"]) {
     assert.throws(
       () =>
         evaluateReliabilityCampaign({
@@ -202,4 +202,19 @@ test("a cohort gate CANNOT be laundered through the fixed-attempt evaluator", ()
       /Fixed-attempt evaluation requires/u,
     );
   }
+});
+
+test("qualification504 is a balanced, zero-failure, predeclared cohort gate", () => {
+  const gate = resolveReliabilityGate("qualification504");
+  assert.equal(gate.kind, "predeclared-cohort");
+  assert.equal(gate.cohortSize, 504);
+  assert.equal(gate.workflows, 6);
+  assert.equal(gate.occurrencesPerWorkflow, 84);
+  assert.equal(gate.cohortSize, gate.workflows * gate.occurrencesPerWorkflow);
+  // One failure gives 503/504 = 99.80% observed, below the 99.9% target, so
+  // the gate must not advertise a tolerance the observed criterion rejects.
+  assert.equal(gate.maximumFailures, 0);
+  assert.equal(gate.requiredObservedSuccessRate, 0.999);
+  assert.equal(gate.requiredLowerBound, 0.99);
+  assert.equal(resolveReliabilityGate("504").id, "qualification504");
 });

@@ -872,3 +872,12 @@ test("deriveQualificationRecords preserves an absent safety evaluation", () => {
   assert.ok(checkedRecord, "the converse case must also produce its record");
   assert.deepEqual(checkedRecord.safetyViolations, []);
 });
+
+test("504/0 reproduces the independently computed bound and 504/1 misses observed 99.9%", () => {
+  const bound = lowerSuccessBound(504, 0);
+  assert.ok(bound !== null, "504/0 bound must be computable");
+  assert.ok(Math.abs(bound - 0.99405) < 5e-5, `504/0 lower bound was ${bound}`);
+  const oneFailure = lowerSuccessBound(504, 1);
+  assert.ok(oneFailure !== null && oneFailure >= 0.99, "one failure still clears the 99% lower bound");
+  assert.ok(503 / 504 < 0.999, "but one failure misses the 99.9% observed target");
+});

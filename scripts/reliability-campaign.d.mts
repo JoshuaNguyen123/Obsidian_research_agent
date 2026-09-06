@@ -3,6 +3,7 @@ export type ReliabilityGateId =
   | "acceptable90"
   | "target95"
   | "qualification99"
+  | "qualification504"
   | "qualification999";
 
 export interface ReliabilityGate {

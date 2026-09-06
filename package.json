@@ -58,6 +58,8 @@
     "test:e2e:reliability-90": "node scripts/run-proof-matrix.mjs --gate=acceptable90",
     "test:e2e:reliability-95": "node scripts/run-proof-matrix.mjs --gate=target95",
     "test:e2e:reliability-99": "node scripts/run-proof-matrix.mjs --gate=qualification99 --model=glm-5.3-flash:cloud",
+    "test:e2e:reliability-504": "node scripts/run-proof-matrix.mjs --gate=qualification504 --model=glm-5.3-flash:cloud",
+    "test:e2e:reliability-504:plan": "node scripts/run-proof-matrix.mjs --gate=qualification504 --model=glm-5.3-flash:cloud --dry-run",
     "test:e2e:reliability-999": "node scripts/run-proof-matrix.mjs --gate=qualification999 --model=glm-5.3-flash:cloud",
     "test:e2e:reliability-99:plan": "node scripts/run-proof-matrix.mjs --gate=qualification99 --model=glm-5.3-flash:cloud --dry-run",
     "test:e2e:provider-canary": "node scripts/run-e2e-exclusive.mjs --real-ai --project=provider-canary",
