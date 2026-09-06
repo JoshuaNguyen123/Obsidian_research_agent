@@ -14,6 +14,13 @@ import { spawn } from "node:child_process";
  * game gives no feedback). Everything is bounded: a response cap, an output
  * cap, and a wall-clock deadline.
  *
+ * "Play again?" is answered with the token the program OFFERS. Cohort 2 of the
+ * 504-mission qualification (2026-09-06) was lost at occurrence 77 to a game
+ * that validated its prompt strictly -- "Play again? (yes / no)" accepted only
+ * those two words -- while the driver answered "n" until the repeat cap closed
+ * stdin and the program died on EOFError. The program was a correct, runnable
+ * game; the harness could not finish talking to it.
+ *
  * Two states are kept apart, because conflating them cost a campaign attempt.
  *
  * 1. Startup and menu selection. The program has not said what game it is
@@ -57,6 +64,8 @@ export interface CliDriverState {
   speculativeResponses: number;
   /** Times the program's own feedback collapsed the range to nothing. */
   contradictions: number;
+  /** Play-again prompts answered without an offered token to copy. */
+  declineAttempts: number;
 }
 
 export const CLI_DRIVER_RESPONSE_CAP = 300;
@@ -97,12 +106,59 @@ export function createCliDriverState(): CliDriverState {
     roundsWon: 0,
     speculativeResponses: 0,
     contradictions: 0,
+    declineAttempts: 0,
   };
 }
 
 const AGAIN_RE =
   /play again|again\?|another (?:round|game|go)|one more|continue\?|\(y\/n\)|\[y\/n\]|yes\/no|y\/n/u;
 const NAME_RE = /\bname\b/u;
+/** Spellings of "no" a program might accept; matched against what it offers. */
+const DECLINE_RE = /^(?:n|no|nope|q|quit|exit|stop|0|false)$/iu;
+/**
+ * Fallback when the prompt offers nothing to copy. The ladder advances on
+ * every play-again prompt, so a program that rejects "n" gets "no" next; one
+ * that rejects everything repeats its prompt until the repeat cap closes
+ * stdin, exactly as before.
+ */
+const DECLINE_LADDER = ["n", "no", "N", "No", "q", "0"];
+
+/**
+ * The answer tokens a prompt offers, in order: "(yes / no)", "[Y/N]", "(y|n)",
+ * "Please type one of: yes, no.", "Enter yes or no". Only short alphanumeric
+ * tokens count, so "1=yes, 2=no" and prose in parentheses offer nothing.
+ */
+export function offeredChoiceTokens(promptText: string): string[] {
+  const found: string[] = [];
+  const push = (raw: string): void => {
+    for (const part of raw.split(/\s*(?:\/|\||,|\bor\b)\s*/u)) {
+      const token = part.trim().replace(/[.:!?]+$/u, "");
+      if (/^[a-z0-9]{1,8}$/iu.test(token) && !found.includes(token)) found.push(token);
+    }
+  };
+  const bracketed = /[([]([^()[\]]{1,40})[)\]]/gu;
+  let match: RegExpExecArray | null;
+  while ((match = bracketed.exec(promptText)) !== null) {
+    if (/\/|\||,|\bor\b/u.test(match[1]!)) push(match[1]!);
+  }
+  const listed =
+    /(?:one of|type|enter|choose|answer|reply)\s*:?\s*([a-z0-9]{1,8}(?:\s*(?:\/|\||,|\bor\b)\s*[a-z0-9]{1,8})+)/giu;
+  while ((match = listed.exec(promptText)) !== null) push(match[1]!);
+  return found;
+}
+
+/**
+ * Decline a play-again prompt in the program's own vocabulary. An offered
+ * negative token is copied verbatim (its spelling and case are what the
+ * program will compare against); otherwise the ladder is walked.
+ */
+export function chooseDeclineAnswer(state: CliDriverState, promptText: string): string {
+  const negative = offeredChoiceTokens(promptText).find((token) => DECLINE_RE.test(token));
+  if (negative !== undefined) return negative;
+  const answer = DECLINE_LADDER[Math.min(state.declineAttempts, DECLINE_LADDER.length - 1)]!;
+  state.declineAttempts += 1;
+  return answer;
+}
 const NUMBER_WORD_RE = /number|guess|digit/u;
 const MENU_RE =
   /difficulty|level|easy|medium|hard|choose (?:an? )?(?:option|mode)|select (?:an? )?(?:option|mode)|\bmenu\b|\bmode\b/u;
@@ -239,7 +295,9 @@ export function decideCliResponse(
 
   learnRange(state, text);
 
-  if (AGAIN_RE.test(lastLine)) return "n";
+  // The whole pending chunk, not just the last line: a strict program prints
+  // "Please type one of: yes, no." on the line BEFORE it re-asks.
+  if (AGAIN_RE.test(lastLine)) return chooseDeclineAnswer(state, prompt);
   if (NAME_RE.test(lastLine) && !NUMBER_WORD_RE.test(lastLine)) return "Player";
 
   const menuLike = MENU_RE.test(lastLine) && !GUESS_PROMPT_RE.test(lastLine);
@@ -251,8 +309,8 @@ export function decideCliResponse(
   }
 
   // A win with no question attached: the game may still be reading one more
-  // line (a "press enter" or an unlabelled play-again). "n" is harmless.
-  if (roundEnded && !GUESS_PROMPT_RE.test(lastLine)) return "n";
+  // line (a "press enter" or an unlabelled play-again). A decline is harmless.
+  if (roundEnded && !GUESS_PROMPT_RE.test(lastLine)) return chooseDeclineAnswer(state, prompt);
 
   if (state.low > state.high) {
     // The program's own feedback ruled out every value it offered. Give it a

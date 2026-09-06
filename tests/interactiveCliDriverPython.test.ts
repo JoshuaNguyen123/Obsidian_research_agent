@@ -62,6 +62,52 @@ print("Out of attempts! The number was {}.".format(target))
 sys.exit(2)
 `;
 
+/**
+ * The shape that ended cohort 2 on the real interpreter: input() validated
+ * against a tuple of exact words, re-asking on anything else, and EOF on the
+ * re-ask raises EOFError with exit 1.
+ */
+const PY_STRICT_YES_NO = `
+import sys
+
+
+def prompt_choice(prompt, choices):
+    while True:
+        raw = input(prompt).strip().lower()
+        if raw in choices:
+            return raw
+        print("  Please type one of: " + ", ".join(choices) + ".")
+
+
+print("NUMBER GUESSING GAME")
+prompt_choice("Choose difficulty (easy / medium / hard): ", ("easy", "medium", "hard"))
+print("I'm thinking of a number between 1 and 50.")
+target = 46
+attempts = 0
+while attempts < 10:
+    raw = input("Guess ({} left): ".format(10 - attempts))
+    attempts += 1
+    try:
+        value = int(raw)
+    except ValueError:
+        print("Please enter a whole number.")
+        continue
+    if value > target:
+        print("Too high!")
+        continue
+    if value < target:
+        print("Too low!")
+        continue
+    print("Correct! You got it in {} attempt(s).".format(attempts))
+    break
+again = prompt_choice("\\nPlay again? (yes / no): ", ("yes", "no"))
+if again == "yes":
+    print("A second round was not requested.")
+    sys.exit(3)
+print("Thanks for playing!")
+sys.exit(0)
+`;
+
 /** Correct game, but the prompt is a print() and the read is silent. */
 const PY_SILENT_READ = `
 import sys
@@ -156,6 +202,19 @@ test("python: a slow start, a name, a difficulty menu and a 1-10 range are playe
   assert.match(result.stdout, /Correct! You win in \d+ tries\./u);
   assert.doesNotMatch(result.stdout, /Out of range\./u, describe(result));
   assert.ok(result.exchanges >= 3, describe(result));
+});
+
+test("python: a strict yes/no play-again prompt is declined in its own words", async (t) => {
+  if (!pythonAvailable) {
+    t.skip("python is not on PATH");
+    return;
+  }
+  const result = await playPython("strict-yes-no", PY_STRICT_YES_NO);
+  assert.equal(result.timedOut, false, describe(result));
+  assert.equal(result.exitCode, 0, describe(result));
+  assert.match(result.stdout, /Thanks for playing!/u, describe(result));
+  assert.doesNotMatch(result.stdout, /Please type one of: yes, no/u, describe(result));
+  assert.doesNotMatch(result.stderr, /EOFError/u, describe(result));
 });
 
 test("python: a printed prompt with a silent read is still answered", async (t) => {

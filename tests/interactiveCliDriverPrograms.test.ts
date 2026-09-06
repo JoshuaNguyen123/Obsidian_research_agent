@@ -76,6 +76,40 @@ done(0);
 `;
 
 /**
+ * The game that ended cohort 2 (2026-09-06, occurrence 77): a strict
+ * play-again prompt that accepts exactly the two words it offers and re-asks
+ * on anything else. "n" is not "no"; a driver that cannot read the offer
+ * feeds the re-ask until its repeat cap closes stdin, and the program dies on
+ * EOF with exit 1 even though it is a correct, runnable game.
+ */
+const GAME_STRICT_YES_NO = `
+say("========================================");
+say("      NUMBER GUESSING GAME");
+say("========================================");
+const difficulty = (await ask("Choose difficulty (easy / medium / hard): ")).toLowerCase();
+const high = difficulty === "hard" ? 500 : difficulty === "medium" ? 100 : 50;
+say("I'm thinking of a number between 1 and " + high + ".");
+const target = 46;
+let attempts = 0;
+while (attempts < 10) {
+  const raw = await ask("Guess (" + (10 - attempts) + " left): ");
+  attempts += 1;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value)) { say("Please enter a whole number."); continue; }
+  if (value > target) { say("Too high!"); continue; }
+  if (value < target) { say("Too low!"); continue; }
+  say("Correct! You got it in " + attempts + " attempt(s).");
+  break;
+}
+for (;;) {
+  const again = (await ask("\\nPlay again? (yes / no): ")).toLowerCase();
+  if (again === "no") { say("Thanks for playing!"); done(0); }
+  if (again === "yes") { say("A second round was not requested."); done(3); }
+  say("  Please type one of: yes, no.");
+}
+`;
+
+/**
  * Slow start, a name prompt, a difficulty menu that *selects* the range, and a
  * small 1-10 range. Every entered line costs an attempt, so a driver that
  * spends its budget on a range the program never offered loses a winnable
@@ -314,6 +348,17 @@ test("a prompt split across two writes is answered as one question", async () =>
   assert.equal(result.exitCode, 0, describe(result));
   assert.match(result.stdout, /Hello, Player!/u, describe(result));
   assert.match(result.stdout, /Correct! You win in \d+ tries\./u);
+});
+
+test("a strict yes/no play-again prompt is declined in its own words and the game exits clean", async () => {
+  const result = await play("strict-yes-no", GAME_STRICT_YES_NO);
+  assert.equal(result.timedOut, false, describe(result));
+  assert.equal(result.exitCode, 0, describe(result));
+  assert.match(result.stdout, /Correct! You got it/u, describe(result));
+  assert.match(result.stdout, /Thanks for playing!/u, describe(result));
+  assert.doesNotMatch(result.stdout, /Please type one of/u, "the first decline must already be in the offered vocabulary");
+  assert.doesNotMatch(result.stderr, /EOFError/u, describe(result));
+  assert.equal(result.responses[result.responses.length - 1], "no", describe(result));
 });
 
 test("a game that replays itself on a new range is won twice", async () => {

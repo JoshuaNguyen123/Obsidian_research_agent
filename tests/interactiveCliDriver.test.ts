@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   CLI_DRIVER_RESPONSE_CAP,
   CLI_DRIVER_SPECULATIVE_ANSWER,
+  chooseDeclineAnswer,
   createCliDriverState,
   decideCliResponse,
+  offeredChoiceTokens,
 } from "../e2e/fixtures/interactiveCliDriver";
 
 test("a difficulty menu gets a menu answer, then the game's guesses follow its feedback", () => {
@@ -69,6 +71,42 @@ test("name prompts and play-again prompts are answered by content", () => {
   const state = createCliDriverState();
   assert.equal(decideCliResponse(state, "What is your name? ", ""), "Player");
   assert.equal(decideCliResponse(state, "Would you like to play again? [y/n] ", ""), "n");
+});
+
+// --- play-again is declined in the program's own vocabulary ----------------
+// Cohort 2 of the 504-mission qualification (2026-09-06) was lost at
+// occurrence 77: "Play again? (yes / no)" accepted only those words, the
+// driver answered "n" thirteen times, the repeat cap closed stdin, and a
+// correct game died on EOFError.
+
+test("the offered tokens of a yes/no prompt are read in every common spelling", () => {
+  assert.deepEqual(offeredChoiceTokens("Play again? (yes / no): "), ["yes", "no"]);
+  assert.deepEqual(offeredChoiceTokens("Again? [Y/N] "), ["Y", "N"]);
+  assert.deepEqual(offeredChoiceTokens("Continue? (y|n) "), ["y", "n"]);
+  assert.deepEqual(offeredChoiceTokens("Please type one of: yes, no."), ["yes", "no"]);
+  assert.deepEqual(offeredChoiceTokens("Enter yes or no: "), ["yes", "no"]);
+  assert.deepEqual(offeredChoiceTokens("Play again? "), [], "nothing offered");
+  assert.deepEqual(offeredChoiceTokens("Play again? (type your answer) "), [], "prose is not a token list");
+  assert.deepEqual(offeredChoiceTokens("Continue? [1=yes, 2=no] "), [], "key=value pairs are not copied");
+});
+
+test("a strict yes/no play-again prompt gets the word it offers, verbatim", () => {
+  const state = createCliDriverState();
+  assert.equal(decideCliResponse(state, "Correct! You got it.\n\nPlay again? (yes / no): ", ""), "no");
+  const rejected = "  Please type one of: yes, no.\n\nPlay again? (yes / no): ";
+  assert.equal(decideCliResponse(state, rejected, ""), "no", "the re-ask names the tokens on the line before the prompt");
+  assert.equal(decideCliResponse(createCliDriverState(), "Play again? [Y/N] ", ""), "N", "case copied from the offer");
+  assert.equal(decideCliResponse(createCliDriverState(), "One more round? (y/n): ", ""), "n");
+});
+
+test("with nothing offered the decline ladder escalates and stays bounded", () => {
+  const state = createCliDriverState();
+  assert.equal(chooseDeclineAnswer(state, "Play again?"), "n");
+  assert.equal(chooseDeclineAnswer(state, "Play again?"), "no");
+  assert.equal(chooseDeclineAnswer(state, "Play again?"), "N");
+  for (let index = 0; index < 20; index += 1) chooseDeclineAnswer(state, "Play again?");
+  assert.equal(chooseDeclineAnswer(state, "Play again?"), "0", "the last rung repeats; the repeat cap ends the run");
+  assert.equal(chooseDeclineAnswer(state, "Play again? (yes/no)"), "no", "an offer always wins over the ladder");
 });
 
 // --- startup silence must not establish a gameplay range -------------------
