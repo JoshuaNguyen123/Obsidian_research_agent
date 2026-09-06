@@ -10,10 +10,19 @@ import { promisify } from "node:util";
 import { createOfflineAgentBackendV1 } from "./fixtures/offlineAgentBackend";
 import { startRealAiHarness } from "./fixtures/realAiHarness";
 import { beginOfflineAttempt, saveOfflineAttempt, observeOfflineTools, readOfflineToolCounts, boundedOfflineRead } from "./fixtures/offlineEvidence";
+import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
 
 const execFileAsync = promisify(execFile);
 const OFFLINE_BASE_URL = "http://127.0.0.1:7331/v1";
 const OFFLINE_TOKEN = "offline-e2e-ephemeral-token";
+
+// Registers the per-test recorder that annotates each result with the tool-call
+// outcome counts harvested from the armed collector. `startRealAiHarness` ARMS the
+// collector for this lane, but arming alone only buffers calls in the page; without
+// this registration nothing harvests or annotates them, so the lane exits green with
+// an empty evidence set -- a green that proves nothing. Every other native spec
+// registers it at module scope; this lane was the only one that did not.
+recordToolCallOutcomesAfterEach();
 
 test.describe("zero-cloud installed production client", () => {
   test.skip(
