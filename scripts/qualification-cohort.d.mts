@@ -103,6 +103,7 @@ export interface QualificationEvaluation {
   evidenceContractVersion: string | null;
   /** Always reported, so 300 deliveries against 1 artifact is visible. */
   distinctArtifactIdentities: number;
+  missingArtifactIdentities: number;
   deliveredWithArtifactIdentity: number;
   model: string | null;
   headSha: string | null;

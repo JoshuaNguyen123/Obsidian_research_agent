@@ -65,6 +65,7 @@ function deliveredRecord(occurrence: any, overrides: Record<string, unknown> = {
       scorecardAcceptancePassed: true,
       scorecardTotal: 0.93,
       artifactProofCount: 2,
+      artifactIdentity: `sha256:${occurrence.occurrenceId}`,
     },
     ...overrides,
   };
@@ -739,4 +740,48 @@ test("REJECTS a declaration whose stated size disagrees with its occurrence list
   assert.equal(result.denominator, 0);
   assert.ok(result.failures.some((f: string) => /empty|n = 0/iu.test(f)));
   assert.ok(result.failures.some((f: string) => /states cohortSize 300 but lists 0/u.test(f)));
+});
+
+// ---------------------------------------------------------------------------
+// Absent artifact identity. The distinctness check used to filter absent
+// identities out and then guard on `length > 0`, which made it INERT whenever
+// no producer emitted one -- the state of every lane today. A cohort whose
+// harness re-read one stale snapshot 300 times passed with
+// distinctArtifactIdentities: 0. Each assertion below is paired with the
+// positive control above, which still passes with identities present.
+// ---------------------------------------------------------------------------
+
+test("a delivered cohort carrying NO artifact identity cannot qualify", () => {
+  const { decl, records } = fullGreenCohort();
+  const stripped = records.map((record: any) => ({
+    ...record,
+    acceptance: { ...record.acceptance, artifactIdentity: undefined },
+  }));
+  const result = evaluate(decl, stripped);
+  assert.equal(result.passed, false);
+  assert.equal(result.missingArtifactIdentities, decl.cohortSize);
+  assert.ok(
+    result.failures.some((failure: string) => failure.includes("no artifact identity")),
+    `expected an absent-identity failure, got: ${JSON.stringify(result.failures)}`,
+  );
+});
+
+test("a single delivered occurrence missing its artifact identity blocks the cohort", () => {
+  const { decl, records } = fullGreenCohort();
+  const oneStripped = records.map((record: any, index: number) =>
+    index === 7
+      ? { ...record, acceptance: { ...record.acceptance, artifactIdentity: undefined } }
+      : record,
+  );
+  const result = evaluate(decl, oneStripped);
+  assert.equal(result.passed, false);
+  assert.equal(result.missingArtifactIdentities, 1);
+});
+
+test("identities that are present and distinct still qualify", () => {
+  const { decl, records } = fullGreenCohort();
+  const result = evaluate(decl, records);
+  assert.equal(result.missingArtifactIdentities, 0);
+  assert.equal(result.distinctArtifactIdentities, decl.cohortSize);
+  assert.equal(result.passed, true);
 });

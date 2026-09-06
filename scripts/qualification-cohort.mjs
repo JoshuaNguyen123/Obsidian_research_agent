@@ -721,11 +721,27 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
   // before. Where identities are emitted, distinct identities must keep pace
   // with deliveries; the count is always reported so 300-vs-1 is visible even
   // when no producer emits one yet.
-  const deliveredIds = outcomes
+  const deliveredIdentities = outcomes
     .filter((entry) => entry.outcome === QUALIFICATION_OUTCOMES.DELIVERED)
-    .map((entry) => byId.get(entry.occurrenceId)?.acceptance?.artifactIdentity)
-    .filter((identity) => typeof identity === "string" && identity !== "");
+    .map((entry) => byId.get(entry.occurrenceId)?.acceptance?.artifactIdentity);
+  const deliveredIds = deliveredIdentities.filter(
+    (identity) => typeof identity === "string" && identity !== "",
+  );
+  const missingArtifactIdentities = deliveredIdentities.length - deliveredIds.length;
   const distinctArtifactIdentities = new Set(deliveredIds).size;
+  // An ABSENT identity is missing proof, not clean evidence. Filtering absent
+  // ones out and then guarding on `length > 0` made this check inert whenever
+  // no producer emitted an identity -- which is every lane today -- so a cohort
+  // whose harness re-read one stale snapshot 300 times passed with
+  // distinctArtifactIdentities: 0. Distinctness that cannot be evaluated has
+  // not been established, and the policy does not award the benefit of the
+  // doubt to unproven delivery.
+  if (missingArtifactIdentities > 0) {
+    failures.push(
+      `${missingArtifactIdentities} delivered occurrence(s) carry no artifact identity; ` +
+      "distinctness is unproven, so one artifact may stand for many missions",
+    );
+  }
   if (deliveredIds.length > 0 && distinctArtifactIdentities < deliveredIds.length) {
     failures.push(
       `${deliveredIds.length} delivered occurrence(s) report only ${distinctArtifactIdentities} ` +
@@ -808,6 +824,7 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     evidenceContractVersion: decl?.evidenceContractVersion ?? null,
     /** Reported ALWAYS, so 300 deliveries against 1 artifact is visible. */
     distinctArtifactIdentities,
+    missingArtifactIdentities,
     deliveredWithArtifactIdentity: deliveredIds.length,
     // `passed` is a CONJUNCTION: no failures AND affirmative proof. Either half
     // alone has produced a false green in this repository before.
