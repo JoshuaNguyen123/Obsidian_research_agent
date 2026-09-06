@@ -6,6 +6,17 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { PLAYWRIGHT_PROJECTS } from "../scripts/run-e2e-exclusive.mjs";
+import { measuresProduct } from "../scripts/product-evidence.mjs";
+import { resolveReliabilityGate } from "../scripts/reliability-campaign.mjs";
+import {
+  buildQualificationCohort,
+  deriveQualificationRecords,
+  occurrenceHasTerminalRecord,
+} from "../scripts/qualification-cohort.mjs";
+import {
+  QUALIFICATION_ARTIFACT_FILES,
+  qualificationArtifactHashes,
+} from "../scripts/run-proof-matrix.mjs";
 import {
   ATTEMPT_LOG_DIR,
   ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS,
@@ -1908,4 +1919,151 @@ test("the no-verdict contract keys on the manager's stable marker, not runner pr
     SANDBOX_UNAVAILABLE_FAILURE_CLASS,
     "a provider that cannot run at all is not a transient no-verdict",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Predeclared-cohort wiring. The policy is only worth anything if the RUNNER
+// consumes it; an unused schema is the failure mode this section guards.
+// ---------------------------------------------------------------------------
+
+test("qualification artifact hashes are sha256, and a missing artifact is null not empty", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(path.join(dir, "main.js"), "console.log(1);\n");
+    writeFileSync(path.join(dir, "manifest.json"), "{}\n");
+    const hashes = qualificationArtifactHashes(dir);
+    assert.deepEqual(Object.keys(hashes).sort(), [...QUALIFICATION_ARTIFACT_FILES].sort());
+    assert.match(hashes["main.js"] ?? "", /^[0-9a-f]{64}$/u);
+    assert.match(hashes["manifest.json"] ?? "", /^[0-9a-f]{64}$/u);
+    // The two that do not exist must be explicitly unknown. An empty-string
+    // digest would let "never built" read as "hashed to this value".
+    assert.equal(hashes["styles.css"], null);
+    assert.equal(hashes["companion-assets.json"], null);
+    assert.notEqual(hashes["main.js"], hashes["manifest.json"]);
+    assert.ok(!QUALIFICATION_ARTIFACT_FILES.includes("data.json"), "data.json is never synced or hashed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an infrastructure death does not close a predeclared occurrence; a real red does", () => {
+  const id = "mission-success/v1:seed:code-delivery#001";
+  const manifest = {
+    attempts: [
+      { occurrenceId: id, green: false, failureClass: "harness:renderer_death" },
+      { occurrenceId: id, green: false, failureClass: "harness:build_failed" },
+    ],
+  };
+  assert.equal(
+    occurrenceHasTerminalRecord(manifest, id, measuresProduct),
+    false,
+    "harness deaths are retained and the SAME identity is re-run",
+  );
+
+  manifest.attempts.push({ occurrenceId: id, green: false, failureClass: "product:receipt_missing" });
+  assert.equal(
+    occurrenceHasTerminalRecord(manifest, id, measuresProduct),
+    true,
+    "a real red closes the occurrence so it can never be retried into a green",
+  );
+
+  const greenOnly = {
+    attempts: [{ occurrenceId: id, green: true, failureClass: "none" }],
+  };
+  assert.equal(occurrenceHasTerminalRecord(greenOnly, id, measuresProduct), true);
+  assert.equal(occurrenceHasTerminalRecord({ attempts: [] }, id, measuresProduct), false);
+  assert.equal(occurrenceHasTerminalRecord(null, id, measuresProduct), false);
+});
+
+test("deriveQualificationRecords keeps harness attempts as retries, never as trials", () => {
+  const gate = resolveReliabilityGate("qualification99");
+  const cohort = buildQualificationCohort({ gate, cells: CELLS, seed: "wiring-seed" });
+  const first = cohort.occurrences[0];
+  const second = cohort.occurrences[1];
+  const manifest = {
+    model: "glm-5.3-flash:cloud",
+    expectedHead: "0".repeat(40),
+    attempts: [
+      // A lane attempt with no cohort identity (a recovery/90/95 row) is ignored.
+      { cell: first.workflow, green: true, failureClass: "none" },
+      {
+        occurrenceId: first.occurrenceId,
+        green: false,
+        failureClass: "harness:renderer_death",
+        durationS: 12,
+      },
+      {
+        occurrenceId: first.occurrenceId,
+        green: true,
+        failureClass: "none",
+        durationS: 301,
+        model: "glm-5.3-flash:cloud",
+        headSha: "0".repeat(40),
+        launched: true,
+        toolEvents: { source: "summary", observed: 7, failed: 0 },
+        acceptance: {
+          missionOutcome: "accepted",
+          acceptanceStatus: "pass",
+          scorecardAcceptancePassed: true,
+          scorecardTotal: 0.9,
+          artifactProofCount: 3,
+        },
+      },
+      {
+        occurrenceId: second.occurrenceId,
+        green: false,
+        failureClass: "model:draft_rejected",
+        durationS: 200,
+        model: "glm-5.3-flash:cloud",
+        headSha: "0".repeat(40),
+        launched: true,
+      },
+    ],
+  };
+  const { records, measurementRetries } = deriveQualificationRecords(manifest, cohort);
+  assert.equal(records.length, 2, "only product-measuring attempts become trials");
+  assert.equal(measurementRetries[first.occurrenceId], 1, "the harness death is disclosed, not hidden");
+  assert.equal(records[0].occurrenceId, first.occurrenceId);
+  assert.equal(records[0].workflow, first.workflow);
+  assert.equal(records[0].green, true);
+  assert.equal(records[0].model, "glm-5.3-flash:cloud");
+  assert.equal(records[1].green, false);
+  assert.equal(records[1].failureClass, "model:draft_rejected");
+});
+
+test("the cohort gate is DRIVEN by the runner, not merely declared beside it", () => {
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "run-proof-matrix.mjs"),
+    "utf8",
+  );
+  // The schedule replaces the plain cell walk, and the inner loop asks the
+  // shared predicate whether this identity already holds a product measurement.
+  assert.match(source, /const schedule = declaration/u, "the runner must build a cohort schedule");
+  assert.match(
+    source,
+    /!occurrenceHasTerminalRecord\(manifest, occurrence\.occurrenceId, measuresProduct\)/u,
+    "the loop must consume the shared product-evidence predicate for resume",
+  );
+  assert.match(
+    source,
+    /occurrenceId: occurrence\.occurrenceId/u,
+    "the attempt record must carry the frozen occurrence identity",
+  );
+
+  // The false-green this guards: a new gate KIND falling through the
+  // fixed-attempts check and printing the consecutive-green success line
+  // without evaluating anything at all.
+  const cohortBranch = source.indexOf("const derived = deriveQualificationRecords(manifest, declaration);");
+  const fixedBranch = source.indexOf("const evaluation = evaluateReliabilityCampaign({");
+  const consecutiveSuccess = source.indexOf("all selected cells reached their consecutive-green bar");
+  assert.ok(cohortBranch > 0, "the cohort gate needs its own final-evaluation branch");
+  assert.ok(fixedBranch > cohortBranch, "it must be checked before the fixed-attempt branch");
+  assert.ok(consecutiveSuccess > cohortBranch, "and before the consecutive success line");
+  const branchBody = source.slice(cohortBranch, fixedBranch);
+  assert.match(branchBody, /if \(!evaluation\.passed\)/u, "a failing cohort must fail the process");
+  assert.match(branchBody, /QUALIFIED/u);
+
+  // The dry run proves the empty case is refused before anything is spent.
+  assert.match(source, /vacuity self-check on an EMPTY record set/u);
+  assert.match(source, /if \(empty\.passed\)/u, "a vacuous PASS must abort the dry run");
 });

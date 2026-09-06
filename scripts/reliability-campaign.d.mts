@@ -1,12 +1,29 @@
+export type ReliabilityGateId =
+  | "recovery"
+  | "acceptable90"
+  | "target95"
+  | "qualification99"
+  | "qualification999";
+
 export interface ReliabilityGate {
-  readonly id: "recovery" | "acceptable90" | "target95";
-  readonly kind: "consecutive" | "fixed-attempts";
+  readonly id: ReliabilityGateId;
+  readonly kind: "consecutive" | "fixed-attempts" | "predeclared-cohort";
   readonly validAttemptsPerLane?: number;
   readonly minimumGreensPerLane?: number;
   readonly minimumGreensOverall?: number;
   readonly infrastructureLaunchRateMaxExclusive: number;
   readonly requireToolEventCoverage?: boolean;
   readonly rejectAnyProductFailure?: boolean;
+  /** predeclared-cohort only. */
+  readonly policyVersion?: string;
+  readonly cohortSize?: number;
+  readonly maximumFailures?: number;
+  readonly workflows?: number;
+  readonly occurrencesPerWorkflow?: number;
+  readonly confidenceLevel?: number;
+  readonly requiredLowerBound?: number;
+  readonly requiredObservedSuccessRate?: number;
+  readonly requireArtifactProof?: boolean;
 }
 
 export interface ReliabilityAttempt {
@@ -20,9 +37,7 @@ export interface ReliabilityAttempt {
   };
 }
 
-export const RELIABILITY_GATES: Readonly<
-  Record<"recovery" | "acceptable90" | "target95", ReliabilityGate>
->;
+export const RELIABILITY_GATES: Readonly<Record<ReliabilityGateId, ReliabilityGate>>;
 
 export function resolveReliabilityGate(value?: string): ReliabilityGate;
 export function isValidApplicationAttempt(attempt: ReliabilityAttempt): boolean;

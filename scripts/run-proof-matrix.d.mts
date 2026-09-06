@@ -298,3 +298,12 @@ export function registerProductFailure(
   manifest: ProofMatrixManifest,
   failureClass: string,
 ): boolean;
+
+/** The four artifacts sync:test-vault installs. `data.json` is never included. */
+export const QUALIFICATION_ARTIFACT_FILES: readonly string[];
+/** Per-occurrence wall-clock deadline; exceeding it is a delivery failure. */
+export const QUALIFICATION_DEADLINE_SECONDS: number;
+/** sha256 per built artifact; a missing artifact hashes to null, never "". */
+export function qualificationArtifactHashes(
+  root?: string,
+): Record<string, string | null>;

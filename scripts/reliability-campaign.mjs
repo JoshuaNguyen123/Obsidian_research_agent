@@ -24,6 +24,47 @@ export const RELIABILITY_GATES = Object.freeze({
     requireToolEventCoverage: true,
     rejectAnyProductFailure: true,
   }),
+  // ---------------------------------------------------------------------
+  // The predeclared-cohort policy (`mission-success/v1`). A THIRD kind, not
+  // an edit to the two above: recovery/acceptable90/target95 keep their
+  // denominators, their infrastructure allowance and their recorded verdicts
+  // exactly as they are. See scripts/qualification-cohort.mjs for why the
+  // denominators differ, and note that evaluateReliabilityCampaign below
+  // REFUSES this kind — a cohort gate can never be evaluated by the
+  // fixed-attempt evaluator that excludes harness attempts.
+  // ---------------------------------------------------------------------
+  qualification99: Object.freeze({
+    id: "qualification99",
+    kind: "predeclared-cohort",
+    policyVersion: "mission-success/v1",
+    cohortSize: 300,
+    maximumFailures: 0,
+    workflows: 6,
+    occurrencesPerWorkflow: 50,
+    confidenceLevel: 0.95,
+    requiredLowerBound: 0.99,
+    requiredObservedSuccessRate: 0.999,
+    infrastructureLaunchRateMaxExclusive: 0.05,
+    requireToolEventCoverage: true,
+    requireArtifactProof: true,
+    rejectAnyProductFailure: true,
+  }),
+  qualification999: Object.freeze({
+    id: "qualification999",
+    kind: "predeclared-cohort",
+    policyVersion: "mission-success/v1",
+    cohortSize: 1002,
+    maximumFailures: 1,
+    workflows: 6,
+    occurrencesPerWorkflow: 167,
+    confidenceLevel: 0.95,
+    requiredLowerBound: 0.99,
+    requiredObservedSuccessRate: 0.999,
+    infrastructureLaunchRateMaxExclusive: 0.05,
+    requireToolEventCoverage: true,
+    requireArtifactProof: true,
+    rejectAnyProductFailure: true,
+  }),
 });
 
 export function resolveReliabilityGate(value = "recovery") {
@@ -36,11 +77,18 @@ export function resolveReliabilityGate(value = "recovery") {
     "95": "target95",
     target: "target95",
     target95: "target95",
+    "99": "qualification99",
+    qualification: "qualification99",
+    qualification99: "qualification99",
+    "999": "qualification999",
+    "99.9": "qualification999",
+    qualification999: "qualification999",
   };
   const key = aliases[normalized];
   if (!key) {
     throw new Error(
-      `Unknown reliability gate '${value}'. Use recovery, acceptable90, or target95.`,
+      `Unknown reliability gate '${value}'. Use recovery, acceptable90, target95, ` +
+      "qualification99, or qualification999.",
     );
   }
   return RELIABILITY_GATES[key];
@@ -83,7 +131,12 @@ export function hasGreenAcceptanceProof(attempt) {
  */
 export function evaluateReliabilityCampaign({ gate, cells, attempts }) {
   if (gate.kind !== "fixed-attempts") {
-    throw new Error("Fixed-attempt evaluation requires acceptable90 or target95.");
+    throw new Error(
+      "Fixed-attempt evaluation requires acceptable90 or target95. " +
+      "A predeclared-cohort gate (qualification99/qualification999) must be evaluated by " +
+      "evaluateQualificationCohort in scripts/qualification-cohort.mjs: this evaluator excludes " +
+      "harness attempts from its denominator, which that policy forbids.",
+    );
   }
   const selectedCells = Array.from(cells ?? []);
   const allAttempts = Array.from(attempts ?? []);

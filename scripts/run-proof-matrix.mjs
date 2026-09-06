@@ -45,6 +45,7 @@
 // after each attempt). proof-matrix-state/ is gitignored, survives Playwright,
 // and every manifest write is temp-then-rename so a kill never tears it.
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   copyFileSync,
@@ -71,6 +72,14 @@ import {
   hasGreenAcceptanceProof,
   resolveReliabilityGate,
 } from "./reliability-campaign.mjs";
+import {
+  QUALIFICATION_POLICY_VERSION,
+  buildQualificationCohort,
+  deriveQualificationRecords,
+  evaluateQualificationCohort,
+  freezeQualificationDeclaration,
+  occurrenceHasTerminalRecord,
+} from "./qualification-cohort.mjs";
 
 // Re-exported so this script stays the campaign's single entry point while the
 // DEFINITION lives in scripts/product-evidence.mjs — the same module every eval
@@ -1861,6 +1870,49 @@ export function cellStatusOf(manifest, cellId) {
   return manifest.cellStatus?.[cellId]?.status ?? null;
 }
 
+/**
+ * The four artifacts `npm run sync:test-vault` installs, and the only files a
+ * qualification cohort is frozen against. `data.json` is deliberately absent:
+ * it holds the user's settings and history and is never synced, hashed or
+ * touched by this campaign.
+ */
+/**
+ * Per-occurrence wall-clock deadline. The prior 60-attempt campaign averaged
+ * 5.303 minutes per attempt, so 30 minutes is roughly 5.7x the observed mean:
+ * generous enough that ordinary provider latency is not scored as a failure,
+ * tight enough that a hung mission is. Exceeding it is a DELIVERY FAILURE of
+ * that occurrence, never an exclusion.
+ */
+export const QUALIFICATION_DEADLINE_SECONDS = Number(
+  process.env.QUALIFICATION_DEADLINE_SECONDS ?? 1800,
+);
+
+export const QUALIFICATION_ARTIFACT_FILES = Object.freeze([
+  "main.js",
+  "styles.css",
+  "manifest.json",
+  "companion-assets.json",
+]);
+
+/**
+ * sha256 of each built artifact. A missing artifact hashes to null rather than
+ * to an empty-string digest, so "the build was never made" cannot be mistaken
+ * for "the build hashed to this value" — the evaluator rejects a declaration
+ * whose hashes are absent.
+ */
+export function qualificationArtifactHashes(root = REPO_ROOT) {
+  const hashes = {};
+  for (const file of QUALIFICATION_ARTIFACT_FILES) {
+    const target = path.join(root, file);
+    try {
+      hashes[file] = createHash("sha256").update(readFileSync(target)).digest("hex");
+    } catch {
+      hashes[file] = null;
+    }
+  }
+  return hashes;
+}
+
 async function main() {
   const gate = resolveReliabilityGate(opt("--gate") ?? "recovery");
   const expectedHead = (process.env.PROOF_MATRIX_EXPECTED_HEAD ?? "").trim().toLowerCase();
@@ -1877,8 +1929,75 @@ async function main() {
 
   const preexistingWorkspaces = listWorkspaceEntries();
 
+  // A predeclared cohort fixes the mission population BEFORE any result is
+  // observed, so the seed is required and has deliberately no default, and the
+  // cell selection is refused: narrowing the lanes would change the denominator
+  // after the fact, which is the exact move the policy exists to prevent.
+  const qualificationSeed = gate.kind === "predeclared-cohort"
+    ? String(opt("--seed") ?? process.env.QUALIFICATION_SEED ?? "").trim()
+    : null;
+  if (gate.kind === "predeclared-cohort") {
+    if (!qualificationSeed) {
+      fail(
+        `gate ${gate.id} requires an explicitly predeclared sample seed: pass --seed=<text> or set ` +
+        "QUALIFICATION_SEED. The seed fixes the mission population before any result is observed, " +
+        "so there is no default and none can be inferred.",
+      );
+    }
+    if (selected) {
+      fail(
+        `gate ${gate.id} qualifies the whole declared ${gate.workflows}-workflow population; --cells ` +
+        "would change the denominator. Declare a different population instead of narrowing this one.",
+      );
+    }
+  }
+  const cohort = gate.kind === "predeclared-cohort"
+    ? buildQualificationCohort({ gate, cells, seed: qualificationSeed })
+    : null;
+
   if (flag("--dry-run")) {
     console.log(`proof-matrix ${gate.id} dry run @ ${expectedHead} model=${PROOF_MATRIX_MODEL}`);
+    if (cohort) {
+      console.log(
+        `  policy=${QUALIFICATION_POLICY_VERSION} seed=${cohort.seed} cohort=${cohort.cohortSize} ` +
+        `maximumFailures=${cohort.maximumFailures} requiredLowerBound=${gate.requiredLowerBound} ` +
+        `requiredObservedSuccess=${gate.requiredObservedSuccessRate}`,
+      );
+      for (const cell of cells) {
+        console.log(`  ${cell.id}: project=${cell.project} occurrences=${cohort.workflowMix[cell.id]}`);
+      }
+      console.log(
+        `  first rotation: ${cohort.occurrences.slice(0, gate.workflows)
+          .map((occurrence) => occurrence.occurrenceId).join(", ")}`,
+      );
+      // The vacuity self-check. An instrument that cannot fail is worthless, so
+      // the dry run PROVES the empty case is rejected before anything is spent.
+      const empty = evaluateQualificationCohort({
+        gate,
+        cells,
+        declaration: freezeQualificationDeclaration({
+          cohort,
+          model: PROOF_MATRIX_MODEL,
+          headSha: expectedHead,
+          artifactHashes: qualificationArtifactHashes(),
+          deadlineSecondsPerOccurrence: QUALIFICATION_DEADLINE_SECONDS,
+        }),
+        records: [],
+      });
+      console.log(
+        `  vacuity self-check on an EMPTY record set: passed=${empty.passed} ` +
+        `positiveProof=${empty.positiveProof} denominator=${empty.denominator} ` +
+        `delivered=${empty.counts.delivered}`,
+      );
+      if (empty.passed) {
+        fail(
+          "the qualification gate reported a PASS on an empty record set. That is a vacuous " +
+          "instrument; refusing to run a campaign behind it.",
+        );
+      }
+      console.log(`  first refusal: ${empty.failures[0]}`);
+      return;
+    }
     for (const cell of cells) {
       console.log(
         `  ${cell.id}: project=${cell.project}` +
@@ -1932,6 +2051,52 @@ async function main() {
   manifest.expectedHead = expectedHead;
   manifest.gate = gate.id;
   manifest.model = PROOF_MATRIX_MODEL;
+
+  // The frozen declaration. On a fresh campaign it is written once, before any
+  // attempt; on --resume it must match EXACTLY, because resuming with a
+  // different seed, policy version or cohort would be a new sample wearing an
+  // old campaign's identity.
+  let declaration = null;
+  if (cohort) {
+    declaration = freezeQualificationDeclaration({
+      cohort,
+      model: PROOF_MATRIX_MODEL,
+      headSha: expectedHead,
+      artifactHashes: qualificationArtifactHashes(),
+      deadlineSecondsPerOccurrence: QUALIFICATION_DEADLINE_SECONDS,
+    });
+    const pinned = manifest.qualification;
+    if (flag("--resume") && pinned) {
+      const drift = [];
+      if (pinned.policyVersion !== declaration.policyVersion) drift.push("policy version");
+      if (pinned.seed !== declaration.seed) drift.push("seed");
+      if (pinned.gate !== declaration.gate) drift.push("gate");
+      if (pinned.cohortSize !== declaration.cohortSize) drift.push("cohort size");
+      if (pinned.model !== declaration.model) drift.push("model");
+      if (pinned.headSha !== declaration.headSha) drift.push("build");
+      for (const file of QUALIFICATION_ARTIFACT_FILES) {
+        if (pinned.artifactHashes?.[file] !== declaration.artifactHashes[file]) {
+          drift.push(`installed artifact ${file}`);
+        }
+      }
+      if (drift.length > 0) {
+        fail(
+          `refusing to resume: the frozen cohort pins a different ${drift.join(", ")}. ` +
+          "A changed application, model, harness or acceptance contract invalidates continuity — " +
+          "retain this partial cohort as failed and start a new predefined one.",
+        );
+      }
+      // Resume keeps the ORIGINAL declaration, including its frozen timestamp.
+      declaration = pinned;
+    }
+    manifest.qualification = declaration;
+    console.log(
+      `proof-matrix: ${gate.id} cohort frozen — policy=${declaration.policyVersion} ` +
+      `seed=${declaration.seed} n=${declaration.cohortSize} maxFailures=${declaration.maximumFailures} ` +
+      `model=${declaration.model} head=${declaration.headSha}`,
+    );
+  }
+
   if (flag("--resume")) {
     const reconciled = reconcileInFlightAttempt(manifest);
     if (reconciled) {
@@ -1945,12 +2110,32 @@ async function main() {
   }
   saveManifest(manifest);
 
-  for (const cell of cells) {
+  // The schedule is the ONE place the two campaign shapes diverge. A lane gate
+  // walks each cell once and lets the inner `while` spend that cell's attempt
+  // budget. A predeclared cohort walks the frozen, interleaved occurrence list
+  // and runs each identity exactly once — resume skips the identities that
+  // already hold a product-measuring record, so a failure can never be re-run
+  // into a replacement green.
+  const cellsById = new Map(cells.map((cell) => [cell.id, cell]));
+  const schedule = declaration
+    ? declaration.occurrences.map((occurrence) => ({
+        cell: cellsById.get(occurrence.workflow),
+        occurrence,
+      }))
+    : cells.map((cell) => ({ cell, occurrence: null }));
+  for (const step of schedule) {
+    const cell = step.cell;
+    const occurrence = step.occurrence;
+    if (!cell) {
+      fail(`declared workflow '${occurrence?.workflow}' has no matching cell in this build.`);
+    }
     while (
-      gate.kind === "consecutive"
-        ? consecutiveGreens(manifest, cell.id) < cell.requiredGreens &&
-          consumedAttemptCount(manifest, cell.id) < cell.maxAttempts
-        : consumedAttemptCount(manifest, cell.id) < gate.validAttemptsPerLane
+      occurrence
+        ? !occurrenceHasTerminalRecord(manifest, occurrence.occurrenceId, measuresProduct)
+        : gate.kind === "consecutive"
+          ? consecutiveGreens(manifest, cell.id) < cell.requiredGreens &&
+            consumedAttemptCount(manifest, cell.id) < cell.maxAttempts
+          : consumedAttemptCount(manifest, cell.id) < gate.validAttemptsPerLane
     ) {
       // Ordinal over ALL runs of this cell (harness deaths included) so stage
       // labels and per-attempt log files never collide or overwrite.
@@ -2243,12 +2428,16 @@ async function main() {
       const consumesBudget = green || !isInfrastructureFailureClass(failureClass);
       const attemptBudget = gate.kind === "consecutive"
         ? cell.maxAttempts
-        : gate.validAttemptsPerLane;
+        : gate.kind === "predeclared-cohort"
+          ? gate.occurrencesPerWorkflow
+          : gate.validAttemptsPerLane;
       const csvNotes = consumesBudget
         ? `gate ${gate.id}; attempt ${consumedAttemptCount(manifest, cell.id) + 1}/${attemptBudget}; ` +
           (gate.kind === "consecutive"
             ? `streak target ${cell.requiredGreens}`
-            : `lane minimum ${gate.minimumGreensPerLane}/${gate.validAttemptsPerLane}`)
+            : gate.kind === "predeclared-cohort"
+              ? `occurrence ${occurrence.occurrenceId}`
+              : `lane minimum ${gate.minimumGreensPerLane}/${gate.validAttemptsPerLane}`)
         : `harness failure ${harnessFailureCount(manifest, cell.id) + 1}; ` +
           `attempt budget ${consumedAttemptCount(manifest, cell.id)}/${attemptBudget} unspent; streak preserved`;
 
@@ -2323,6 +2512,19 @@ async function main() {
         cell: cell.id,
         project: cell.project,
         attempt: attemptIndex,
+        // Cohort identity, stamped only for a predeclared campaign. The model
+        // and head travel WITH the record rather than being read back from the
+        // manifest at evaluation time, so a record can be checked against the
+        // frozen declaration on its own terms.
+        ...(occurrence
+          ? {
+              occurrenceId: occurrence.occurrenceId,
+              workflow: occurrence.workflow,
+              model: PROOF_MATRIX_MODEL,
+              headSha: expectedHead,
+              launched: true,
+            }
+          : {}),
         startedAt: new Date(startedAt).toISOString(),
         durationS: Math.round((endedAt - startedAt) / 1000),
         green,
@@ -2400,6 +2602,36 @@ async function main() {
       }
     }
 
+    if (occurrence) {
+      // Per-occurrence progress and the impossible-to-pass stop. Early stopping
+      // for a result that CANNOT pass is allowed and is recorded as a failure;
+      // early declaration of success, and running on to dilute the failures,
+      // are both refused.
+      const progress = evaluateQualificationCohort({
+        gate,
+        cells,
+        declaration,
+        records: deriveQualificationRecords(manifest, declaration).records,
+      });
+      const shortfall = progress.counts.terminalRecords - progress.counts.delivered;
+      console.log(
+        `proof-matrix: ${occurrence.occurrenceId} done — ` +
+        `${progress.counts.delivered}/${progress.counts.terminalRecords} delivered of ` +
+        `${declaration.cohortSize} declared (shortfall ${shortfall}/${gate.maximumFailures} allowed).`,
+      );
+      if (shortfall > gate.maximumFailures) {
+        saveManifest(manifest);
+        fail(
+          `cohort ${declaration.seed} can no longer pass: ${shortfall} of ` +
+          `${progress.counts.terminalRecords} completed occurrences did not deliver and ` +
+          `${gate.id} allows ${gate.maximumFailures}. Stopping now and RETAINING every record. ` +
+          "Repair the demonstrated failures, then start a new predefined cohort — this one does " +
+          "not continue and is not re-run into a green sample.",
+        );
+      }
+      continue;
+    }
+
     if (gate.kind === "consecutive") {
       const streak = consecutiveGreens(manifest, cell.id);
       const cellVerdict = {
@@ -2429,6 +2661,40 @@ async function main() {
   }
 
   saveManifest(manifest);
+  if (gate.kind === "predeclared-cohort") {
+    const derived = deriveQualificationRecords(manifest, declaration);
+    const evaluation = evaluateQualificationCohort({
+      gate,
+      cells,
+      declaration,
+      records: derived.records,
+    });
+    manifest.qualificationEvaluation = { ...evaluation, measurementRetries: derived.measurementRetries };
+    saveManifest(manifest);
+    // The full outcome list is on the manifest; the console gets the verdict and
+    // every refusal, so a failing campaign says WHY without needing the file.
+    console.log(JSON.stringify({
+      ...evaluation,
+      outcomes: undefined,
+      outcomeSample: evaluation.outcomes.slice(0, 5),
+    }, null, 2));
+    if (!evaluation.passed) {
+      fail(
+        `${gate.id} did NOT qualify: ${evaluation.failures.join("; ")}. ` +
+        "Every record is retained in the manifest; do not re-run this cohort into a green sample.",
+      );
+    }
+    console.log(
+      `proof-matrix: ${gate.id} QUALIFIED — ${evaluation.counts.delivered}/${evaluation.denominator} ` +
+      `predeclared missions delivered (${(evaluation.observedSuccessRate * 100).toFixed(3)}% observed), ` +
+      `one-sided 95% exact-binomial lower bound ${(evaluation.lowerBound * 100).toFixed(3)}%, ` +
+      `policy ${evaluation.policyVersion}, seed ${evaluation.seed}, model ${evaluation.model}, ` +
+      `build ${evaluation.headSha}. This qualifies the declared six-workflow mix on the stated ` +
+      "dates and build; it is not a per-workflow claim and not a lifetime guarantee.",
+    );
+    console.log("proof-matrix: run `npm run eval:dashboard` to refresh the KPI dashboard, and finish the campaign with the 8-stage workflow audit bookend.");
+    return;
+  }
   if (gate.kind === "fixed-attempts") {
     const evaluation = evaluateReliabilityCampaign({
       gate,
