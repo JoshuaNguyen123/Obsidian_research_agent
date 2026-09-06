@@ -1585,3 +1585,111 @@ class FakeSandboxChild extends EventEmitter {
     return true;
   }
 }
+
+
+/**
+ * A durable blocker's `message` is copied verbatim into
+ * `PreparedActionResultV1.error.message` by `CodeExecutionContributionsV2`
+ * (line 288 on the preparation path, line 362 on the execution path). From
+ * there it reaches the retry plan sent OUTBOUND to the provider, the persisted
+ * mission trace, user-visible status and answer, and Run Details.
+ *
+ * `f0fcb0b` repaired FOUR sites inside the contributions module. These two
+ * producers in SandboxManager fed the same field through `blocker.message` and
+ * bypassed that boundary entirely, so the leak class was not closed by those
+ * green tests. Each secret below is a distinct exposure kind: a host path, a
+ * credential, a command line, and a private note title.
+ */
+const BLOCKER_LEAK_PROBES_V1 = [
+  "C:/Users/joshb/vault/Private Therapy Notes.md",
+  "sk-live-51H9ZqQq7xTESTONLY",
+  "npm run deploy -- --prod",
+  "Q3 Layoff Plan",
+] as const;
+
+const FOREIGN_ERROR_TEXT_V1 = `ENOENT reading ${BLOCKER_LEAK_PROBES_V1[0]} while ${BLOCKER_LEAK_PROBES_V1[2]} used ${BLOCKER_LEAK_PROBES_V1[1]} for "${BLOCKER_LEAK_PROBES_V1[3]}"`;
+
+function assertNoForeignTextSurvives(message: string, code: string, expectedCode: string): void {
+  for (const probe of BLOCKER_LEAK_PROBES_V1) {
+    assert.equal(
+      message.includes(probe),
+      false,
+      `blocker message leaked ${JSON.stringify(probe)}: ${message}`,
+    );
+  }
+  // The message must be withheld, but attribution must SURVIVE. A guard that
+  // also destroyed the typed code would be privacy at the cost of the only
+  // telemetry channel this boundary has, which is not an improvement.
+  assert.equal(code, expectedCode);
+  assert.match(message, /withheld/iu);
+}
+
+test("a throwing artifact importer cannot write foreign error text into the durable blocker", async () => {
+  const artifact = new Uint8Array([1, 2, 3]);
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      return { exitCode: 0, stdout: "ok", stderr: "", artifacts: { "dist/out.bin": artifact } };
+    },
+  };
+  const manager = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution({
+    ...prepareInput(),
+    expectedArtifacts: [
+      { path: "dist/out.bin", expectedSha256: sha256(artifact), maxBytes: 100, required: true },
+    ],
+  });
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") return;
+
+  const blocked = await manager.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: [
+      { path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") },
+    ],
+    artifactImporter: {
+      async importArtifacts() {
+        throw new Error(FOREIGN_ERROR_TEXT_V1);
+      },
+    },
+  });
+  assert.equal(blocked.status, "blocked");
+  if (blocked.status !== "blocked") return;
+  assertNoForeignTextSurvives(
+    blocked.blocker.message,
+    blocked.blocker.code,
+    "sandbox_artifact_readback_failed",
+  );
+});
+
+test("a throwing sandbox runner cannot write foreign error text into the durable blocker", async () => {
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      throw new Error(FOREIGN_ERROR_TEXT_V1);
+    },
+  };
+  const manager = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(prepareInput());
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") return;
+
+  const blocked = await manager.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: [
+      { path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") },
+    ],
+  });
+  assert.equal(blocked.status, "blocked");
+  if (blocked.status !== "blocked") return;
+  // `safeDiagnostic` used to bound this one. It redacts credential-shaped
+  // keywords and caps length, so the credential probe alone would have passed
+  // while the host path, command line and note title all survived.
+  assertNoForeignTextSurvives(
+    blocked.blocker.message,
+    blocked.blocker.code,
+    "sandbox_execution_failed",
+  );
+});

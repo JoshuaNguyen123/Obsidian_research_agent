@@ -593,7 +593,7 @@ export class SandboxManagerV2 {
         status: "blocked",
         blocker: blocker(
           "sandbox_staging_mismatch",
-          error instanceof Error ? error.message : String(error),
+          `Workspace staging did not match the declared manifest. ${WITHHELD_BLOCKER_DETAIL_V2}`,
           "Restage the workspace from the declared manifest and retry with fresh hashes.",
           true,
         ),
@@ -629,7 +629,7 @@ export class SandboxManagerV2 {
           unsupportedStaging
             ? "sandbox_staging_transport_unsupported"
             : "sandbox_execution_failed",
-          `Sandbox provider failed before a validated result: ${safeDiagnostic(error)}.`,
+          `Sandbox provider failed before a validated result. ${WITHHELD_BLOCKER_DETAIL_V2}`,
           unsupportedStaging
             ? "Install a sandbox runtime implementing verified_staging_bundle and artifact_bundle protocol v1; native execution is not permitted."
             : "Inspect the provider diagnostic and retry from the prepared action if its fingerprint remains current.",
@@ -687,7 +687,7 @@ export class SandboxManagerV2 {
         status: "blocked",
         blocker: blocker(
           "sandbox_artifact_readback_failed",
-          error instanceof Error ? error.message : String(error),
+          `Imported artifacts failed durable readback. ${WITHHELD_BLOCKER_DETAIL_V2}`,
           "Discard imported artifacts, restage from the verified workspace, and rerun validation.",
           true,
         ),
@@ -1451,6 +1451,26 @@ function pathMatches(root: string, path: string): boolean {
 function basename(path: string): string {
   return path.replace(/\\/g, "/").slice(path.replace(/\\/g, "/").lastIndexOf("/") + 1);
 }
+
+/**
+ * Fixed notice for a blocker whose detail would otherwise be a caught
+ * exception's own text.
+ *
+ * `blocker(...)` stores its message verbatim on `SandboxDurableBlockerV2`, and
+ * `CodeExecutionContributionsV2` copies that string into
+ * `PreparedActionResultV1.error.message`. From there it reaches the retry plan
+ * sent OUTBOUND to the provider, the persisted mission trace, user-visible
+ * status and answer, and Run Details. A caught exception's message is arbitrary
+ * foreign text: host `ENOENT` strings carry absolute vault paths, spawn
+ * failures carry command lines, and readback failures carry note titles.
+ *
+ * `safeDiagnostic` is NOT sufficient here. It redacts credential-shaped
+ * keywords and caps length, which leaves host paths, note titles and command
+ * output intact. The typed blocker CODE is the attribution channel; the message
+ * must not be a second, unbounded one.
+ */
+const WITHHELD_BLOCKER_DETAIL_V2 =
+  "The underlying error text is withheld because it can carry host paths, command output, or credentials; use the blocker code to attribute it.";
 
 function safeDiagnostic(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
