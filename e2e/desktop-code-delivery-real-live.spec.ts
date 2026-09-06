@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { lstat, readdir, readFile, rm } from "node:fs/promises";
+import path from "node:path";
 import { promisify } from "node:util";
 
 import { expect, test } from "@playwright/test";
@@ -32,7 +33,11 @@ import {
   peekToolCallCollectorDiagnosticsV1,
   recordToolCallOutcomesAfterEach,
 } from "./fixtures/toolCallCollector";
-import { runInteractiveCliProgram } from "./fixtures/interactiveCliDriver";
+import {
+  runInteractiveCliProgram,
+  type InteractiveCliRunResult,
+} from "./fixtures/interactiveCliDriver";
+import { preserveFailureEvidence } from "./fixtures/preserveFailureEvidence";
 
 recordToolCallOutcomesAfterEach();
 
@@ -51,6 +56,16 @@ const REQUIRED_CODE_LADDER = [
   "code_workspace_export_directory",
 ] as const;
 const execFileAsync = promisify(execFile);
+// A cold Python interpreter inside a running lane can take seconds to reach
+// its first prompt. Answering before it does puts a line in the pipe that the
+// program's first real question then eats, so the driver waits out a silent
+// start rather than guessing into it.
+const GAME_STARTUP_QUIET_MS = 8_000;
+const GAME_RUNTIME_TIMEOUT_MS = 120_000;
+// Enough of a failing program to explain the failure, and no more. This is a
+// private artifact under the run's own output directory: it holds the file
+// this mission wrote and nothing else from the repository or the vault.
+const FAILED_PROGRAM_PREFIX_CHARS = 4_000;
 
 test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game", async (
   {},
@@ -80,6 +95,10 @@ test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game",
   let workspaceContainer: string | null = null;
   let approvalCount = 0;
   let primaryError: unknown = null;
+  // Kept for the failure artifact: the export directory is deleted in the
+  // finally block, so a failing program has to be preserved before that.
+  let authoredPythonFile: string | null = null;
+  let runtimeSummary: Record<string, unknown> | null = null;
   const cleanupErrors: string[] = [];
   const observed = {
     artifacts: new Set<string>(),
@@ -217,6 +236,7 @@ test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game",
     observed.proofs.add("receipt:verified_desktop_export");
     const pythonFiles = await listFilesBounded(canonicalExport, ".py");
     expect(pythonFiles).toHaveLength(1);
+    authoredPythonFile = pythonFiles[0]!;
     const authoredSource = await readFile(pythonFiles[0]!, "utf8");
     expect(authoredSource.length).toBeGreaterThan(120);
     expect(authoredSource).toMatch(/\binput\s*\(/u);
@@ -242,6 +262,7 @@ test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game",
     observed.proofs.add("validation:python_compile");
 
     const runtime = await runNumberGuessingGame(pythonFiles[0]!, canonicalExport);
+    runtimeSummary = summarizeRuntime(runtime);
     await testInfo.attach("number-guessing-driver-responses", {
       body: runtime.responses.join("\n"),
       contentType: "text/plain",
@@ -254,6 +275,18 @@ test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game",
     expect(runtime.exitCode, `number game exited red: ${runtime.stderr}`).toBe(0);
     expect(runtime.stderr).not.toMatch(/Traceback \(most recent call last\):/u);
     expect(runtime.stdout).toMatch(/guess|number|correct|won|congrat/iu);
+    // Exit status and a congratulating line are both reachable without ever
+    // reading stdin: a program that prints "You win!" and exits satisfies
+    // them. An exchange is output the program produced *after* the driver
+    // answered it, so it is the assertion a non-interactive program fails.
+    expect(
+      runtime.responses.length,
+      `the delivered program never asked for input: ${runtime.stdout.slice(-400)}`,
+    ).toBeGreaterThan(0);
+    expect(
+      runtime.exchanges,
+      `the delivered program never reacted to input: ${runtime.stdout.slice(-400)}`,
+    ).toBeGreaterThan(0);
     observed.artifacts.add("code:runnable_cli");
     observed.proofs.add("runtime:number_game_completed");
 
@@ -303,6 +336,41 @@ test("CODE-DELIVERY-01 bare prompt authors and delivers a runnable Python game",
       workspaceContainer = await resolveOwnedWorkspaceContainerById(
         capturedWorkspaceId,
       ).catch(() => null);
+    }
+    // Before the export directory is deleted. Attempt nine failed its runtime
+    // check and its program was already gone by the time anyone asked why.
+    if (primaryError !== null && authoredPythonFile !== null) {
+      const failedProgramPath = testInfo.outputPath("code-delivery-failed-program.json");
+      const sourceFile = authoredPythonFile;
+      await preserveFailureEvidence({
+        file: failedProgramPath,
+        metadata: {
+          scenarioId: "CODE-DELIVERY-01",
+          outcome: "failed",
+          runtime: runtimeSummary,
+        },
+        read: async () => {
+          const source = await readFile(sourceFile, "utf8");
+          return {
+            file: path.basename(sourceFile),
+            bytes: Buffer.byteLength(source, "utf8"),
+            truncated: source.length > FAILED_PROGRAM_PREFIX_CHARS,
+            sourcePrefix: source.slice(0, FAILED_PROGRAM_PREFIX_CHARS),
+          };
+        },
+      })
+        .then(() =>
+          testInfo.attach("code-delivery-failed-program", {
+            contentType: "application/json",
+            path: failedProgramPath,
+          }),
+        )
+        .catch((error) => {
+          testInfo.annotations.push({
+            type: "failed-program-evidence-error",
+            description: String(error).slice(0, 500),
+          });
+        });
     }
     if (exportPath) {
       try {
@@ -441,13 +509,7 @@ async function assertPathAbsent(target: string): Promise<void> {
 async function runNumberGuessingGame(
   entryPoint: string,
   cwd: string,
-): Promise<{
-  stdout: string;
-  stderr: string;
-  exitCode: number | null;
-  timedOut: boolean;
-  responses: string[];
-}> {
+): Promise<InteractiveCliRunResult> {
   // Drive the delivered game by its own prompts (difficulty menus, play-again
   // questions, higher/lower feedback) instead of a fixed number script: the
   // acceptance is "a runnable game", not "a game that reads exactly the
@@ -457,6 +519,22 @@ async function runNumberGuessingGame(
     args: ["-X", "utf8", entryPoint],
     cwd,
     env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-    timeoutMs: 30_000,
+    timeoutMs: GAME_RUNTIME_TIMEOUT_MS,
+    timing: { startupQuietMs: GAME_STARTUP_QUIET_MS },
   });
+}
+
+/** Bounded, run-owned runtime facts for the failure artifact. */
+function summarizeRuntime(runtime: InteractiveCliRunResult): Record<string, unknown> {
+  return {
+    exitCode: runtime.exitCode,
+    timedOut: runtime.timedOut,
+    stopReason: runtime.stopReason,
+    exchanges: runtime.exchanges,
+    speculativeResponses: runtime.speculativeResponses,
+    responses: runtime.responses.slice(0, 50),
+    responseCount: runtime.responses.length,
+    stdoutTail: runtime.stdout.slice(-2_000),
+    stderrTail: runtime.stderr.slice(-2_000),
+  };
 }

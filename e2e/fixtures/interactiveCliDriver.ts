@@ -13,6 +13,23 @@ import { spawn } from "node:child_process";
  * game's own higher/lower feedback (falling back to counting up when the
  * game gives no feedback). Everything is bounded: a response cap, an output
  * cap, and a wall-clock deadline.
+ *
+ * Two states are kept apart, because conflating them cost a campaign attempt.
+ *
+ * 1. Startup and menu selection. The program has not said what game it is
+ *    playing yet. An answer sent here is a guess about *what is being asked*
+ *    -- possibly a name, possibly a difficulty, possibly nothing at all --
+ *    and it is not a move in a round. It must not record a guess, freeze the
+ *    range, or let unattributable feedback narrow the bounds.
+ * 2. A confirmed round. The program has asked for a guess, and the driver has
+ *    committed one. Its bisection now owns the bounds, and only the program's
+ *    own higher/lower feedback moves them.
+ *
+ * The range comes from the program: the announcement is re-read on every
+ * chunk until the program's feedback starts constraining the search, and a
+ * finished round resets the bounds so a second round is played on the range
+ * the program announced for it, not on the collapsed bounds that solved the
+ * first one.
  */
 
 export interface CliDriverState {
@@ -29,16 +46,42 @@ export interface CliDriverState {
   sequentialNext: number | null;
   /** The bisection value the sequential walk must skip. */
   bisectionTried: number | null;
+  /** The range the program itself announced; survives a round transition. */
+  announcedLow: number | null;
+  announcedHigh: number | null;
+  /** Guesses committed in the current round. Speculative answers are not guesses. */
+  roundGuesses: number;
+  /** Rounds the program has said were solved. */
+  roundsWon: number;
+  /** Answers sent while the program had printed nothing at all. */
+  speculativeResponses: number;
+  /** Times the program's own feedback collapsed the range to nothing. */
+  contradictions: number;
 }
 
 export const CLI_DRIVER_RESPONSE_CAP = 300;
+/** Identical prompts in a row before the driver stops answering. */
+export const CLI_DRIVER_REPEAT_CAP = 12;
+/** Impossible feedback tolerated before the driver calls the program broken. */
+export const CLI_DRIVER_CONTRADICTION_CAP = 2;
+/**
+ * Answer for a program that has printed nothing at all. It has to be
+ * plausible in every slot it might land in -- a name, the first item of a
+ * numbered menu, or an in-range first guess -- because the driver cannot yet
+ * know which one it is. The recorded attempt-nine transcript is the argument
+ * against a mid-range number: its "50" was read as a name, then as an invalid
+ * difficulty, and the range it implied was wrong for the game that followed.
+ */
+export const CLI_DRIVER_SPECULATIVE_ANSWER = "1";
 
+const DEFAULT_LOW = 1;
+const DEFAULT_HIGH = 100;
 const MENU_ANSWERS = ["easy", "1", "e", "medium", "2", "normal"];
 
 export function createCliDriverState(): CliDriverState {
   return {
-    low: 1,
-    high: 100,
+    low: DEFAULT_LOW,
+    high: DEFAULT_HIGH,
     lastGuess: null,
     feedbackSeen: false,
     guessesWithoutFeedback: 0,
@@ -48,6 +91,12 @@ export function createCliDriverState(): CliDriverState {
     responses: 0,
     sequentialNext: null,
     bisectionTried: null,
+    announcedLow: null,
+    announcedHigh: null,
+    roundGuesses: 0,
+    roundsWon: 0,
+    speculativeResponses: 0,
+    contradictions: 0,
   };
 }
 
@@ -61,24 +110,71 @@ const GUESS_PROMPT_RE = /guess|enter (?:a |your )?number|pick a number|your numb
 const TOO_HIGH_RE = /too high|too big|too large|\blower\b|\bsmaller\b|\bless\b|go down/u;
 const TOO_LOW_RE = /too low|too small|\bhigher\b|\bbigger\b|\bgreater\b|\blarger\b|\bmore\b|go up/u;
 const WON_RE = /correct|congrat|you won|you win|well done|got it|you guessed/u;
-const RANGE_RE = /between\s+(\d{1,6})\s+and\s+(\d{1,6})|(\d{1,6})\s*(?:-|to)\s*(\d{1,6})/gu;
+// "between 1 and 10" is the game telling the driver its range. A bare "1-10"
+// is weaker evidence and only used when no explicit announcement is present,
+// because "Difficulty [1-3]" is a list of choices, not a range of answers.
+const RANGE_BETWEEN_RE = /\bbetween\s+(\d{1,6})\s+and\s+(\d{1,6})/gu;
+const RANGE_LOOSE_RE = /(\[)?(\d{1,6})\s*(?:-|to)\s*(\d{1,6})(\])?/gu;
 
-function learnRange(state: CliDriverState, transcript: string): void {
-  if (state.lastGuess !== null) return;
-  let match: RegExpExecArray | null;
-  let found: [number, number] | null = null;
-  RANGE_RE.lastIndex = 0;
-  while ((match = RANGE_RE.exec(transcript)) !== null) {
-    const lo = Number(match[1] ?? match[3]);
-    const hi = Number(match[2] ?? match[4]);
-    if (Number.isSafeInteger(lo) && Number.isSafeInteger(hi) && lo < hi && hi <= 1_000_000) {
-      found = [lo, hi];
+function candidateRanges(chunk: string): Array<[number, number]> {
+  const found: Array<[number, number]> = [];
+  const push = (low: number, high: number): void => {
+    if (
+      Number.isSafeInteger(low) &&
+      Number.isSafeInteger(high) &&
+      low < high &&
+      high <= 1_000_000
+    ) {
+      found.push([low, high]);
     }
+  };
+  let match: RegExpExecArray | null;
+  RANGE_BETWEEN_RE.lastIndex = 0;
+  while ((match = RANGE_BETWEEN_RE.exec(chunk)) !== null) {
+    push(Number(match[1]), Number(match[2]));
   }
-  if (found) {
-    state.low = found[0];
-    state.high = found[1];
+  if (found.length > 0) return found;
+  RANGE_LOOSE_RE.lastIndex = 0;
+  while ((match = RANGE_LOOSE_RE.exec(chunk)) !== null) {
+    if (match[1] === "[" && match[4] === "]") continue;
+    push(Number(match[2]), Number(match[3]));
   }
+  return found;
+}
+
+function learnRange(state: CliDriverState, chunk: string): void {
+  // Once the program's own higher/lower feedback has moved the bounds they are
+  // the driver's deductions, and a "3 to 5" in a status line must not widen
+  // them again. Until then every chunk may still name the real range: a
+  // difficulty menu is chosen before the game announces what was selected.
+  if (state.feedbackSeen) return;
+  const candidates = candidateRanges(chunk);
+  if (candidates.length === 0) return;
+  // A chunk offering several ranges is a menu the driver has not answered yet
+  // ("1) Easy (1 to 10) ... 3) Hard (1 to 100)"). Take the widest so no valid
+  // answer is excluded; the game's own announcement replaces it a chunk later.
+  let chosen = candidates[0]!;
+  for (const candidate of candidates) {
+    if (candidate[1] - candidate[0] > chosen[1] - chosen[0]) chosen = candidate;
+  }
+  state.announcedLow = chosen[0];
+  state.announcedHigh = chosen[1];
+  state.low = chosen[0];
+  state.high = chosen[1];
+  state.sequentialNext = null;
+  state.bisectionTried = null;
+}
+
+/** Begin a fresh round on the announced range, forgetting the solved one. */
+function startNewRound(state: CliDriverState): void {
+  state.low = state.announcedLow ?? DEFAULT_LOW;
+  state.high = state.announcedHigh ?? DEFAULT_HIGH;
+  state.lastGuess = null;
+  state.feedbackSeen = false;
+  state.guessesWithoutFeedback = 0;
+  state.sequentialNext = null;
+  state.bisectionTried = null;
+  state.roundGuesses = 0;
 }
 
 /**
@@ -103,19 +199,21 @@ export function decideCliResponse(
   state.lastPrompt = prompt;
   state.responses += 1;
 
-  if (AGAIN_RE.test(lastLine)) return "n";
-  if (NAME_RE.test(lastLine) && !NUMBER_WORD_RE.test(lastLine)) return "Player";
+  // The same prompt over and over means the program wanted something the
+  // driver cannot supply. Closing stdin ends the run instead of feeding it.
+  if (state.repeats >= CLI_DRIVER_REPEAT_CAP) return null;
 
-  const menuLike = MENU_RE.test(lastLine) && !GUESS_PROMPT_RE.test(lastLine);
-  if (menuLike) {
-    if (state.menuAttempts >= MENU_ANSWERS.length * 2) return null;
-    const answer = MENU_ANSWERS[state.menuAttempts % MENU_ANSWERS.length];
-    state.menuAttempts += 1;
-    return answer;
+  // Startup silence: the program has printed nothing, so nothing is known
+  // about it. This answer is speculative -- it may be read as a name, a menu
+  // choice, or a guess -- and it must leave the gameplay state untouched, or
+  // a program that announces "between 1 and 1000" a moment later is played
+  // on the range the silence invented.
+  if (prompt === "" && transcript.trim() === "") {
+    state.speculativeResponses += 1;
+    return CLI_DRIVER_SPECULATIVE_ANSWER;
   }
 
-  learnRange(state, transcript.toLowerCase());
-
+  // Feedback is only attributable to a guess the driver actually committed.
   if (state.lastGuess !== null) {
     if (TOO_HIGH_RE.test(text)) {
       state.high = Math.min(state.high, state.lastGuess - 1);
@@ -130,13 +228,45 @@ export function decideCliResponse(
     }
   }
 
+  // A solved round is the one supported reset point: bounds that identify the
+  // previous answer are worthless for the next one. A win claimed before the
+  // driver ever guessed is a rules banner, not a round.
+  const roundEnded = state.roundGuesses > 0 && WON_RE.test(text);
+  if (roundEnded) {
+    state.roundsWon += 1;
+    startNewRound(state);
+  }
+
+  learnRange(state, text);
+
+  if (AGAIN_RE.test(lastLine)) return "n";
+  if (NAME_RE.test(lastLine) && !NUMBER_WORD_RE.test(lastLine)) return "Player";
+
+  const menuLike = MENU_RE.test(lastLine) && !GUESS_PROMPT_RE.test(lastLine);
+  if (menuLike) {
+    if (state.menuAttempts >= MENU_ANSWERS.length * 2) return null;
+    const answer = MENU_ANSWERS[state.menuAttempts % MENU_ANSWERS.length]!;
+    state.menuAttempts += 1;
+    return answer;
+  }
+
   // A win with no question attached: the game may still be reading one more
   // line (a "press enter" or an unlabelled play-again). "n" is harmless.
-  if (WON_RE.test(text) && !GUESS_PROMPT_RE.test(lastLine)) return "n";
+  if (roundEnded && !GUESS_PROMPT_RE.test(lastLine)) return "n";
 
-  // The same guess prompt repeating without feedback usually means the
-  // program wanted something else on that line; after a few tries, bow out.
-  if (state.repeats >= 12) return null;
+  if (state.low > state.high) {
+    // The program's own feedback ruled out every value it offered. Give it a
+    // bounded second chance on the announced range, then stop: a game that
+    // cannot be won is a result, not something to keep answering.
+    state.contradictions += 1;
+    if (state.contradictions > CLI_DRIVER_CONTRADICTION_CAP) return null;
+    state.low = state.announcedLow ?? DEFAULT_LOW;
+    state.high = state.announcedHigh ?? DEFAULT_HIGH;
+    state.feedbackSeen = false;
+    state.guessesWithoutFeedback = 0;
+    state.sequentialNext = null;
+    state.bisectionTried = null;
+  }
 
   let guess: number;
   if (!state.feedbackSeen && state.guessesWithoutFeedback >= 3) {
@@ -147,16 +277,16 @@ export function decideCliResponse(
       state.bisectionTried = state.lastGuess;
     }
     while (state.sequentialNext === state.bisectionTried) state.sequentialNext += 1;
+    // Walking past the top of the range would only send answers the program
+    // already said were invalid.
+    if (state.sequentialNext > state.high) return null;
     guess = state.sequentialNext;
     state.sequentialNext += 1;
   } else {
-    if (state.low > state.high) {
-      state.low = 1;
-      state.high = 1000;
-    }
     guess = Math.floor((state.low + state.high) / 2);
   }
   state.lastGuess = guess;
+  state.roundGuesses += 1;
   return String(guess);
 }
 
@@ -166,7 +296,50 @@ export interface InteractiveCliRunResult {
   exitCode: number | null;
   timedOut: boolean;
   responses: string[];
+  /**
+   * Times the program printed something new after an answer its own output
+   * asked for. Speculative answers -- the ones sent into startup silence --
+   * are excluded on purpose: a program that prints its first line a moment
+   * after the driver guessed into the dark has not read anything, and
+   * counting that would let a program that never touches stdin look
+   * interactive. Zero means nothing the program printed is evidence that it
+   * consumed input.
+   */
+  exchanges: number;
+  /** Answers sent while the program had printed nothing at all. */
+  speculativeResponses: number;
+  stopReason: "exit" | "timeout" | "output_limit" | "spawn_error";
 }
+
+/** Quiet periods, in milliseconds, that decide when the program is waiting. */
+export interface InteractiveCliTiming {
+  /** Silence tolerated before answering a program that has printed nothing. */
+  startupQuietMs: number;
+  /** Quiet period after output that stops mid-line: a prompt is waiting. */
+  promptQuietMs: number;
+  /** Quiet period after output that ends with a newline: more may follow. */
+  lineQuietMs: number;
+  /** Quiet period after the driver answers and the program prints nothing. */
+  silentReadMs: number;
+}
+
+/**
+ * Startup dominates these numbers: a cold Python interpreter on Windows can
+ * take seconds to reach its first prompt, and answering before it does puts a
+ * line in the pipe that the program's first real question then eats. Output
+ * that ends with a newline gets a long quiet period because a banner and the
+ * question after it are often two writes; output that stops mid-line is a
+ * prompt (Python's input() flushes without a newline) and answers quickly.
+ */
+export const CLI_DRIVER_TIMING: InteractiveCliTiming = {
+  startupQuietMs: 4_000,
+  promptQuietMs: 250,
+  lineQuietMs: 900,
+  silentReadMs: 1_200,
+};
+
+const OUTPUT_CAP = 500_000;
+const STDERR_CAP = 100_000;
 
 /**
  * Run a program and drive its stdin adaptively until it exits, the deadline
@@ -181,8 +354,10 @@ export function runInteractiveCliProgram(options: {
   cwd: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  timing?: Partial<InteractiveCliTiming>;
 }): Promise<InteractiveCliRunResult> {
   const timeoutMs = options.timeoutMs ?? 30_000;
+  const timing: InteractiveCliTiming = { ...CLI_DRIVER_TIMING, ...options.timing };
   return new Promise((resolve) => {
     const child = spawn(options.command, options.args, {
       cwd: options.cwd,
@@ -200,6 +375,10 @@ export function runInteractiveCliProgram(options: {
     let pending = "";
     let timedOut = false;
     let closed = false;
+    let exchanges = 0;
+    let promptedAnswers = 0;
+    let answeredBeforeOutput = 0;
+    let stopReason: InteractiveCliRunResult["stopReason"] = "exit";
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
     const finish = (exitCode: number | null, extraStderr = "") => {
@@ -213,27 +392,33 @@ export function runInteractiveCliProgram(options: {
         exitCode,
         timedOut,
         responses,
+        exchanges,
+        speculativeResponses: state.speculativeResponses,
+        stopReason,
       });
     };
     const deadline = setTimeout(() => {
       timedOut = true;
+      stopReason = "timeout";
       child.kill("SIGKILL");
     }, timeoutMs);
 
     const respond = () => {
       idleTimer = null;
       if (closed || child.stdin.destroyed || !child.stdin.writable) return;
+      const speculativeBefore = state.speculativeResponses;
       const answer = decideCliResponse(state, pending, stdout);
       pending = "";
       if (answer === null) {
         child.stdin.end();
         return;
       }
+      if (state.speculativeResponses === speculativeBefore) promptedAnswers += 1;
       responses.push(answer);
       child.stdin.write(`${answer}\n`);
       // A program that reads its next line without printing anything still
       // gets an answer; otherwise the next prompt reschedules sooner.
-      schedule(600);
+      schedule(timing.silentReadMs);
     };
     const schedule = (ms: number) => {
       if (closed) return;
@@ -249,18 +434,32 @@ export function runInteractiveCliProgram(options: {
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
       pending += chunk;
-      if (stdout.length > 500_000) {
+      if (promptedAnswers > answeredBeforeOutput) {
+        exchanges += 1;
+        answeredBeforeOutput = promptedAnswers;
+      }
+      if (stdout.length > OUTPUT_CAP) {
+        stopReason = "output_limit";
         child.kill("SIGKILL");
         return;
       }
-      schedule(80);
+      // Output that stops mid-line is a prompt waiting for an answer. Output
+      // that ends with a newline may be a banner with its question still to
+      // come, so wait long enough for the rest of the turn to arrive.
+      schedule(/\n[ \t]*$/u.test(pending) ? timing.lineQuietMs : timing.promptQuietMs);
     });
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
-      if (stderr.length > 100_000) child.kill("SIGKILL");
+      if (stderr.length > STDERR_CAP) {
+        stopReason = "output_limit";
+        child.kill("SIGKILL");
+      }
     });
-    child.on("error", (error) => finish(null, String(error)));
+    child.on("error", (error) => {
+      stopReason = "spawn_error";
+      finish(null, String(error));
+    });
     child.on("close", (code) => finish(code));
-    schedule(600);
+    schedule(timing.startupQuietMs);
   });
 }
