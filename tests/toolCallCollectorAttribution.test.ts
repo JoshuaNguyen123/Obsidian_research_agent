@@ -375,3 +375,45 @@ test("execution metrics alone are a HOLED capture, never a complete zero", () =>
   // And a genuinely empty stream is still `unobserved`, not upgraded to lossy.
   assert.equal(foldToolCallOutcomesV1([]).coverage, "unobserved");
 });
+
+test("a harvest that never returns gives up and reports lost capture, not a hung teardown", async () => {
+  // nativeObsidianHarness rethrows a failing beforeClose out of close(), so an
+  // overrunning harvest would turn a passing lane red because of its own
+  // instrumentation. It must give up -- and, because the page WAS armed, what
+  // it gives up on is lost capture, not silence.
+  resetToolCallCollectorStateForTestsV1();
+  let armed = false;
+  const page = {
+    isClosed: () => false,
+    evaluate: async () => {
+      if (!armed) {
+        armed = true;
+        return true;
+      }
+      return new Promise<never>(() => {});
+    },
+  } as any;
+  await armToolCallCollector(page);
+  const startedAt = Date.now();
+  const counts = await harvestToolCallCollector(page);
+  const elapsed = Date.now() - startedAt;
+  assert.equal(counts.coverage, "lossy");
+  assert.equal(counts.attempted, null);
+  assert.ok(
+    elapsed < 5_000,
+    `the harvest must abandon a hung renderer well inside the 5s beforeClose budget (took ${elapsed}ms)`,
+  );
+  // POSITIVE PROOF the bound is real and not simply an immediate give-up: a
+  // responsive page in the same code path still returns exact counts.
+  resetToolCallCollectorStateForTestsV1();
+  const live = {
+    isClosed: () => false,
+    evaluate: async (_fn: unknown, arg: any) =>
+      arg?.consumeSlot === undefined ? true : raw(segment(0, callPair(1))),
+  } as any;
+  await armToolCallCollector(live);
+  const good = await harvestToolCallCollector(live);
+  assert.equal(good.coverage, "complete");
+  assert.equal(good.attempted, 2);
+  resetToolCallCollectorStateForTestsV1();
+});
