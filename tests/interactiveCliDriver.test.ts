@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   CLI_DRIVER_RESPONSE_CAP,
+  CLI_DRIVER_SPECULATIVE_ANSWER,
   createCliDriverState,
   decideCliResponse,
 } from "../e2e/fixtures/interactiveCliDriver";
@@ -127,4 +128,110 @@ test("a round transition re-learns the range instead of reusing the solved one",
     "10",
     "round two must be played on round two's range",
   );
+});
+
+// --- the attempt-nine transcript, as a regression fixture ------------------
+// The prompts below are quoted from the immutable campaign diagnostic
+// docs/eval/qualification/2026-09-04/acceptable90-0f63c50-complete/
+// code-delivery-attempt-9-driver-replay-0f63c50.json (a deterministic
+// reconstruction of a removed generated program, not a rerun of it). The
+// recorded driver answered "50" three times into silence, then "51" forever
+// against a game whose numbers ran 1..10. The assertions below are about the
+// property that failed -- an in-range guess inside the game's own budget --
+// not about reproducing one program's output.
+
+const ATTEMPT_NINE_STARTUP = [
+  "",
+  "",
+  "",
+  "What is your name? Choose a difficulty:\n1) Easy (1 to 10)\n2) Medium (1 to 50)\n3) Hard (1 to 100)\nDifficulty [1-3]: ",
+  "Invalid choice. Please enter 1, 2, or 3.\nDifficulty [1-3]: ",
+];
+
+test("a difficulty menu's choice list is not mistaken for the game's range", () => {
+  const state = createCliDriverState();
+  let transcript = "";
+  for (const pending of ATTEMPT_NINE_STARTUP) {
+    transcript += pending;
+    decideCliResponse(state, pending, transcript);
+  }
+  // "Difficulty [1-3]" is a list of options. Reading it as the answer range
+  // would leave the driver unable to reach the number the game picked.
+  assert.equal(state.announcedHigh, 100, "the widest offered range is the safe assumption");
+  assert.equal(state.speculativeResponses, 3);
+});
+
+test("the attempt-nine game is solved in range and inside its four-guess budget", () => {
+  for (let target = 1; target <= 10; target += 1) {
+    const state = createCliDriverState();
+    let transcript = "";
+    for (const pending of ATTEMPT_NINE_STARTUP) {
+      transcript += pending;
+      const answer = decideCliResponse(state, pending, transcript);
+      assert.notEqual(answer, null, "the driver must keep answering during startup");
+    }
+
+    let pending =
+      "I picked a number between 1 and 10.\nYou have at most 4 guesses.\nGuess (4 left): ";
+    let guesses = 0;
+    let won = false;
+    while (guesses < 8 && !won) {
+      transcript += pending;
+      const answer = decideCliResponse(state, pending, transcript);
+      const value = Number.parseInt(String(answer), 10);
+      assert.ok(
+        Number.isInteger(value),
+        `target ${target}: expected a numeric guess, got ${String(answer)}`,
+      );
+      assert.ok(
+        value >= 1 && value <= 10,
+        `target ${target}: guess ${value} is outside the range the game announced`,
+      );
+      guesses += 1;
+      if (value === target) {
+        won = true;
+        break;
+      }
+      const left = 4 - guesses;
+      pending = `${value > target ? "Too high!" : "Too low!"}\nGuess (${left} left): `;
+    }
+    assert.ok(won, `target ${target}: never guessed`);
+    assert.ok(
+      guesses <= 4,
+      `target ${target}: needed ${guesses} guesses, the game allows 4`,
+    );
+  }
+});
+
+test("startup silence answers with a value that fits a name, a menu or a guess", () => {
+  const state = createCliDriverState();
+  assert.equal(decideCliResponse(state, "", ""), CLI_DRIVER_SPECULATIVE_ANSWER);
+  assert.equal(state.speculativeResponses, 1);
+  assert.equal(state.roundGuesses, 0, "silence is not a round");
+});
+
+test("a banner alone is answered as a guess, so coalescing a split prompt is the runner's job", () => {
+  // This is the negative half of the chunked-prompt proof in
+  // tests/interactiveCliDriverPrograms.test.ts: the decision function has no
+  // way to know a question is still coming, so the quiet period that waits
+  // for it is load-bearing, not incidental.
+  const state = createCliDriverState();
+  const banner = "Welcome to the Number Guessing Game!\n";
+  assert.match(String(decideCliResponse(state, banner, banner)), /^\d+$/u);
+});
+
+test("impossible feedback ends the run instead of being answered forever", () => {
+  const state = createCliDriverState();
+  let pending = "I'm thinking of a number between 1 and 100.\nYour guess: ";
+  let answers = 0;
+  let last: string | null = "";
+  while (answers < CLI_DRIVER_RESPONSE_CAP && last !== null) {
+    last = decideCliResponse(state, pending, pending);
+    if (last === null) break;
+    answers += 1;
+    // Every guess is "too low", including the top of the range.
+    pending = "Too low!\nYour guess: ";
+  }
+  assert.equal(last, null, "the driver must stop answering a game it cannot win");
+  assert.ok(answers < 60, `gave ${answers} answers before giving up`);
 });

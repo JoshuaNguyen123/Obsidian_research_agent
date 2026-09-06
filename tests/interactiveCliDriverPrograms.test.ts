@@ -7,6 +7,7 @@ import test, { after, before } from "node:test";
 import {
   runInteractiveCliProgram,
   type InteractiveCliRunResult,
+  type InteractiveCliTiming,
 } from "../e2e/fixtures/interactiveCliDriver";
 
 /**
@@ -236,7 +237,7 @@ after(async () => {
 async function play(
   name: string,
   body: string,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; timing?: Partial<InteractiveCliTiming> } = {},
 ): Promise<InteractiveCliRunResult> {
   const file = path.join(workspace, `${name}.mjs`);
   await writeFile(file, `${PRELUDE}\n${body}`, "utf8");
@@ -245,6 +246,7 @@ async function play(
     args: [file],
     cwd: workspace,
     timeoutMs: options.timeoutMs ?? 30_000,
+    timing: options.timing,
   });
 }
 
@@ -252,6 +254,9 @@ function describe(result: InteractiveCliRunResult): string {
   return JSON.stringify({
     exitCode: result.exitCode,
     timedOut: result.timedOut,
+    stopReason: result.stopReason,
+    exchanges: result.exchanges,
+    speculativeResponses: result.speculativeResponses,
     responses: result.responses,
     tail: result.stdout.trim().split(/\r?\n/u).slice(-4),
     stderr: result.stderr.trim().slice(0, 200),
@@ -264,6 +269,10 @@ test("a plain guessing game is played to a win and declines a second round", asy
   assert.equal(result.exitCode, 0, describe(result));
   assert.match(result.stdout, /Correct! You guessed it in \d+ tries\./u);
   assert.match(result.stdout, /Thanks for playing!/u);
+  assert.equal(result.stopReason, "exit");
+  // The program answered the driver: this is what separates a played game
+  // from a program that printed a congratulation and exited.
+  assert.ok(result.exchanges >= 3, describe(result));
 });
 
 test("a slow-starting game with a difficulty menu is played on the range it selected", async () => {
@@ -272,6 +281,9 @@ test("a slow-starting game with a difficulty menu is played on the range it sele
   assert.equal(result.exitCode, 0, describe(result));
   assert.match(result.stdout, /Correct! You win in \d+ tries\./u);
   assert.doesNotMatch(result.stdout, /Out of attempts!/u, describe(result));
+  // 900ms of startup silence is inside the startup wait, so the driver never
+  // had to speculate at all.
+  assert.equal(result.speculativeResponses, 0, describe(result));
 });
 
 test("a game that reads its first line with no prompt is still played on its own range", async () => {
@@ -279,6 +291,9 @@ test("a game that reads its first line with no prompt is still played on its own
   assert.equal(result.timedOut, false, describe(result));
   assert.equal(result.exitCode, 0, describe(result));
   assert.match(result.stdout, /Correct! You win in \d+ tries\./u);
+  // The startup wait expired against a program that prints nothing, so the
+  // driver did speculate -- and still played the range the program announced.
+  assert.ok(result.speculativeResponses >= 1, describe(result));
 });
 
 test("a prompt split across two writes is answered as one question", async () => {
@@ -310,15 +325,25 @@ test("a game that never accepts an answer is rejected, bounded, without a win", 
 
 test("a program that never reads stdin is not driven at all", async () => {
   const result = await play("ignores-stdin", GAME_IGNORES_STDIN);
+  // It exits 0 and prints a congratulation, so exit status and a lexical
+  // "you win" both accept it. Nothing was ever driven, and that is the only
+  // signal that separates it from the played game above.
   assert.equal(result.exitCode, 0, describe(result));
+  assert.match(result.stdout, /You win!/u);
   assert.deepEqual(result.responses, [], describe(result));
+  assert.equal(result.exchanges, 0, describe(result));
 });
 
 test("a program that prompts and then hangs is killed at the deadline", async () => {
   const startedAt = Date.now();
-  const result = await play("hangs", GAME_HANGS, { timeoutMs: 6_000 });
+  const result = await play("hangs", GAME_HANGS, {
+    timeoutMs: 6_000,
+    timing: { startupQuietMs: 200, silentReadMs: 150 },
+  });
   assert.equal(result.timedOut, true, describe(result));
+  assert.equal(result.stopReason, "timeout", describe(result));
   assert.notEqual(result.exitCode, 0, describe(result));
+  assert.equal(result.exchanges, 0, describe(result));
   assert.ok(Date.now() - startedAt < 20_000, "the deadline must bound the run");
 });
 
@@ -327,4 +352,6 @@ test("a program that dies on start is reported red with its traceback", async ()
   assert.equal(result.exitCode, 1, describe(result));
   assert.match(result.stderr, /Traceback \(most recent call last\):/u);
   assert.deepEqual(result.responses, [], describe(result));
+  assert.equal(result.exchanges, 0, describe(result));
+  assert.equal(result.stopReason, "exit", describe(result));
 });
