@@ -104,6 +104,7 @@ export interface QualificationEvaluation {
   /** Always reported, so 300 deliveries against 1 artifact is visible. */
   distinctArtifactIdentities: number;
   missingArtifactIdentities: number;
+  readOnlyDeliveries: number;
   deliveredWithArtifactIdentity: number;
   model: string | null;
   headSha: string | null;

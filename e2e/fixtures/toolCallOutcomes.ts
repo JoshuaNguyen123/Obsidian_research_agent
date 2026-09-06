@@ -177,6 +177,13 @@ export interface ToolCallOutcomeCountsV1 {
    * contract stays at version 1.
    */
   artifactIdentity: string | null;
+  /**
+   * Worked receipts whose operation mutated something. 0 means the mission
+   * wrote nothing (a read-only workflow); null means unknown. The cohort gate
+   * applies artifact distinctness only when this is > 0, and stays fail-closed
+   * when it is null so an older producer cannot claim the read-only exemption.
+   */
+  writeReceipts: number | null;
 }
 
 export interface ToolCallFailureDetailV1 {
@@ -396,6 +403,7 @@ export function unknownToolCallOutcomeCountsV1(
     atLeast: null,
     observedEvents: 0,
     artifactIdentity: null,
+    writeReceipts: null,
   };
 }
 
@@ -407,6 +415,33 @@ export function unknownToolCallOutcomeCountsV1(
  * stream cannot change the result. Idempotent: events are de-duplicated by
  * (kind, id), so a replayed buffer merged with the live tail counts once.
  */
+
+/**
+ * Receipt operations that MUTATE something. A worked receipt with one of these
+ * is a written artifact; a worked receipt without one (search, recall, read)
+ * produced no artifact and has nothing to be distinct about.
+ */
+export const WRITE_RECEIPT_OPERATIONS = Object.freeze(
+  new Set([
+    "create", "append", "update", "replace", "write", "mkdir", "trash",
+    "restore", "publish", "move", "copy", "commit", "git_push",
+    "export_workspace_artifact", "export_directory",
+  ]),
+);
+
+/** Count the worked receipts that actually wrote something. */
+export function writeReceiptCountV1(
+  receipts: readonly (VacuousDetectableReceipt | null | undefined)[] | null | undefined,
+): number {
+  let count = 0;
+  for (const receipt of receipts ?? []) {
+    if (!receipt || typeof receipt !== "object") continue;
+    if (classifyToolReceiptWork(receipt) !== "worked") continue;
+    const operation = (receipt as { operation?: unknown }).operation;
+    if (typeof operation === "string" && WRITE_RECEIPT_OPERATIONS.has(operation)) count += 1;
+  }
+  return count;
+}
 
 /** A content-derived readback identity, as the product emits it. */
 const RECEIPT_IDENTITY_SHA256 = /^sha256:[0-9a-f]{64}$/u;
@@ -709,6 +744,7 @@ export function foldToolCallOutcomesV1(
     atLeast: null,
     observedEvents,
     artifactIdentity: artifactIdentityFromReceiptsV1(receipts),
+    writeReceipts: writeReceiptCountV1(receipts),
   };
 }
 
@@ -792,6 +828,7 @@ export function mergeToolCallOutcomeCountsV1(
     version: 1,
     coverage: "complete",
     artifactIdentity: mergeArtifactIdentityV1(left.artifactIdentity, right.artifactIdentity),
+    writeReceipts: addNullable(left.writeReceipts, right.writeReceipts),
     attempted: addNullable(left.attempted, right.attempted),
     succeeded,
     failed: addNullable(left.failed, right.failed),

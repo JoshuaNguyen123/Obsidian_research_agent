@@ -671,7 +671,16 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
       // nothing was ever checked satisfied a rule the policy says blocks
       // release regardless of the aggregate percentage. An explicit empty
       // array is positive evidence that the check ran; an absent one is not.
-      if (!Array.isArray(record.safetyViolations)) {
+      // Both halves are required: an array of violations AND a non-empty list
+      // naming which conditions were evaluated. An empty violations array
+      // beside an empty evaluated list is the vacuous producer this exists to
+      // refuse: "nothing found" by a check that checked nothing.
+      const evaluated = record.safetyEvaluated;
+      if (
+        !Array.isArray(record.safetyViolations) ||
+        !Array.isArray(evaluated) ||
+        evaluated.length === 0
+      ) {
         unmeasuredSafety.push(occurrence.occurrenceId);
       } else {
         for (const violation of record.safetyViolations) {
@@ -731,9 +740,20 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
   // before. Where identities are emitted, distinct identities must keep pace
   // with deliveries; the count is always reported so 300-vs-1 is visible even
   // when no producer emits one yet.
-  const deliveredIdentities = outcomes
+  // Distinctness applies to WRITTEN artifacts. A delivered occurrence that
+  // wrote nothing (writeReceipts === 0, a read-only workflow) has no artifact
+  // to be distinct about and is exempt from this check only. An occurrence
+  // whose writeReceipts is null or absent is NOT exempt: unknown is not zero,
+  // and an older producer must not inherit the read-only exemption by omission.
+  const deliveredAcceptances = outcomes
     .filter((entry) => entry.outcome === QUALIFICATION_OUTCOMES.DELIVERED)
-    .map((entry) => byId.get(entry.occurrenceId)?.acceptance?.artifactIdentity);
+    .map((entry) => byId.get(entry.occurrenceId)?.acceptance ?? {});
+  let readOnlyDeliveries = 0;
+  const deliveredIdentities = [];
+  for (const acceptance of deliveredAcceptances) {
+    if (acceptance.writeReceipts === 0) { readOnlyDeliveries += 1; continue; }
+    deliveredIdentities.push(acceptance.artifactIdentity);
+  }
   const deliveredIds = deliveredIdentities.filter(
     (identity) => typeof identity === "string" && identity !== "",
   );
@@ -842,6 +862,7 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     /** Reported ALWAYS, so 300 deliveries against 1 artifact is visible. */
     distinctArtifactIdentities,
     missingArtifactIdentities,
+    readOnlyDeliveries,
     deliveredWithArtifactIdentity: deliveredIds.length,
     // `passed` is a CONJUNCTION: no failures AND affirmative proof. Either half
     // alone has produced a false green in this repository before.
@@ -934,6 +955,9 @@ export function deriveQualificationRecords(manifest, declaration) {
       // could never fire.
       ...(Array.isArray(attempt.safetyViolations)
         ? { safetyViolations: attempt.safetyViolations }
+        : {}),
+      ...(Array.isArray(attempt.safetyEvaluated)
+        ? { safetyEvaluated: attempt.safetyEvaluated }
         : {}),
       toolEvents: attempt.toolEvents ?? null,
       acceptance: attempt.acceptance ?? null,

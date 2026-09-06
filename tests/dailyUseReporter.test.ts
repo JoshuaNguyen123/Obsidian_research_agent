@@ -292,6 +292,7 @@ function outcomesAnnotation(
       atLeast: null,
       observedEvents: 0,
       artifactIdentity: null,
+      writeReceipts: null,
       ...counts,
     }),
   };
@@ -340,6 +341,7 @@ test("a folded outcomes annotation supplies real counters for a scenario-less la
           failureDetailsTruncated: false,
           observedEvents: 120,
           artifactIdentity: null,
+          writeReceipts: null,
         }),
       ],
     }),
@@ -385,6 +387,7 @@ test("a lossy or malformed outcomes annotation stays unknown rather than becomin
             atLeast: { attempted: 12, failed: 2 },
             observedEvents: 30,
             artifactIdentity: null,
+            writeReceipts: null,
           }),
         },
       ],
@@ -497,6 +500,7 @@ test("counters come from ONE source: annotation and fold are never blended", () 
       atLeast: null,
       observedEvents: 300,
       artifactIdentity: null,
+      writeReceipts: null,
     },
   );
   assert.equal(annotated.toolCallsAttempted, 19);
@@ -534,6 +538,7 @@ test("counters come from ONE source: annotation and fold are never blended", () 
       atLeast: null,
       observedEvents: 40,
       artifactIdentity: null,
+      writeReceipts: null,
     },
   );
   assert.equal(folded.toolCallsAttempted, 10);

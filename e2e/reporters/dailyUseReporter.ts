@@ -635,6 +635,7 @@ export function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         artifactProofCount: metrics?.artifactProofCount ?? 0,
         cleanupProofCount: metrics?.cleanupProofCount ?? 0,
         artifactIdentity: summaryArtifactIdentityV1(group),
+        writeReceipts: summaryWriteReceiptsV1(group),
         acceptanceStatus: atomicPass ? "pass" : "needs_more_work",
         acceptanceRetry: atomicRecord?.retry ?? null,
         missingAcceptanceCriteria,
@@ -675,6 +676,19 @@ export function summaryArtifactIdentityV1(
     .update(identities.join(String.fromCharCode(10)))
     .digest("hex")}`;
 }
+/** Sum of the group's written-artifact receipts; null when no record knew. */
+export function summaryWriteReceiptsV1(
+  group: ReadonlyArray<{ toolCallOutcomes?: { writeReceipts?: number | null } | null }>,
+): number | null {
+  let total = 0;
+  let known = false;
+  for (const record of group) {
+    const value = record?.toolCallOutcomes?.writeReceipts;
+    if (typeof value === "number" && Number.isSafeInteger(value)) { total += value; known = true; }
+  }
+  return known ? total : null;
+}
+
 export function shouldWriteDailyUseSummary(recordCount: number): boolean {
   return Number.isSafeInteger(recordCount) && recordCount > 0;
 }

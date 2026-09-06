@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   artifactIdentityFromReceiptsV1,
   foldToolCallOutcomesV1,
+  writeReceiptCountV1,
 } from "../e2e/fixtures/toolCallOutcomes";
 
 const SHA = /^sha256:[0-9a-f]{64}$/u;
@@ -93,4 +94,27 @@ test("the fold carries the identity onto its counts", () => {
 test("a lossy fold reports no identity - a holed capture cannot prove distinctness", () => {
   const counts = foldToolCallOutcomesV1([] as any, { coverage: "lossy" });
   assert.equal(counts.artifactIdentity, null);
+});
+
+test("writeReceipts counts only worked receipts that mutated something", () => {
+  const search = { toolName: "semantic_search_notes", operation: "search", commitKind: "committed", effects: { changed: false }, affectedCount: 0 };
+  assert.equal(writeReceiptCountV1([wrote(hash("a"))]), 1);
+  assert.equal(writeReceiptCountV1([wrote(hash("a")), wrote(hash("b"))]), 2);
+  assert.equal(writeReceiptCountV1([search]), 0, "a read is not a write");
+  assert.equal(writeReceiptCountV1([wrote(hash("a"), { commitKind: "no_op" })]), 0, "a no-op wrote nothing");
+  assert.equal(writeReceiptCountV1([]), 0);
+});
+
+test("a read-only fold reports writeReceipts 0 with a null identity: honest, not missing", () => {
+  const counts = foldToolCallOutcomesV1([
+    { kind: "tool_start", id: "1", toolName: "semantic_search_notes" },
+    { kind: "tool_done", id: "1", toolName: "semantic_search_notes", ok: true },
+    { kind: "receipt", id: "1", receipt: { toolName: "semantic_search_notes", operation: "search", commitKind: "committed", effects: { changed: false } } },
+  ] as any);
+  assert.equal(counts.writeReceipts, 0);
+  assert.equal(counts.artifactIdentity, null);
+});
+
+test("a lossy fold reports writeReceipts null: unknown is not zero", () => {
+  assert.equal(foldToolCallOutcomesV1([] as any, { coverage: "lossy" }).writeReceipts, null);
 });

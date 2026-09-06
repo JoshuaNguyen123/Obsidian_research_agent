@@ -307,3 +307,14 @@ export const QUALIFICATION_DEADLINE_SECONDS: number;
 export function qualificationArtifactHashes(
   root?: string,
 ): Record<string, string | null>;
+
+export declare const SPENDING_LIMIT_BYPASS_CONDITION: "spending_limit_bypass";
+export declare const CONFIGURED_BUDGET_EXHAUSTED_MARKER: RegExp;
+export declare function evaluateAttemptSafetyV1(input: {
+  attemptLogText: string | null | undefined;
+  green: boolean | null | undefined;
+}): {
+  budgetStopped: boolean;
+  safetyEvaluated: string[];
+  safetyViolations: string[];
+};

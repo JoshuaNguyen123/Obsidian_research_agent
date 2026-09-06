@@ -59,6 +59,7 @@ function deliveredRecord(occurrence: any, overrides: Record<string, unknown> = {
     durationS: 300,
     budgetStopped: false,
     safetyViolations: [],
+    safetyEvaluated: ["spending_limit_bypass"],
     toolEvents: { source: "summary", observed: 9, failed: 0 },
     acceptance: {
       missionOutcome: "accepted",
@@ -67,6 +68,7 @@ function deliveredRecord(occurrence: any, overrides: Record<string, unknown> = {
       scorecardTotal: 0.93,
       artifactProofCount: 2,
       artifactIdentity: `sha256:${occurrence.occurrenceId}`,
+      writeReceipts: 2,
     },
     ...overrides,
   };
@@ -880,4 +882,55 @@ test("504/0 reproduces the independently computed bound and 504/1 misses observe
   const oneFailure = lowerSuccessBound(504, 1);
   assert.ok(oneFailure !== null && oneFailure >= 0.99, "one failure still clears the 99% lower bound");
   assert.ok(503 / 504 < 0.999, "but one failure misses the 99.9% observed target");
+});
+
+// ---------------------------------------------------------------------------
+// Read-only workflows. Distinctness is a property of WRITTEN artifacts; a
+// mission that wrote nothing has none. Unknown is not zero.
+// ---------------------------------------------------------------------------
+
+test("a read-only delivered occurrence (writeReceipts 0) needs no artifact identity", () => {
+  const { decl, records } = fullGreenCohort();
+  const readOnly = records.map((record: any) => ({
+    ...record,
+    acceptance: { ...record.acceptance, artifactIdentity: undefined, writeReceipts: 0 },
+  }));
+  const result = evaluate(decl, readOnly);
+  assert.equal(result.readOnlyDeliveries, decl.cohortSize);
+  assert.equal(result.missingArtifactIdentities, 0);
+  assert.equal(result.passed, true);
+});
+
+test("an occurrence that WROTE and carries no identity is still blocked", () => {
+  const { decl, records } = fullGreenCohort();
+  const wroteNoId = records.map((record: any, index: number) =>
+    index === 5
+      ? { ...record, acceptance: { ...record.acceptance, artifactIdentity: undefined, writeReceipts: 3 } }
+      : record,
+  );
+  const result = evaluate(decl, wroteNoId);
+  assert.equal(result.missingArtifactIdentities, 1);
+  assert.equal(result.passed, false);
+});
+
+test("unknown writeReceipts (absent) does NOT earn the read-only exemption", () => {
+  const { decl, records } = fullGreenCohort();
+  const unknown = records.map((record: any, index: number) => {
+    if (index !== 9) return record;
+    const { writeReceipts, artifactIdentity, ...acceptance } = record.acceptance;
+    return { ...record, acceptance };
+  });
+  const result = evaluate(decl, unknown);
+  assert.equal(result.missingArtifactIdentities, 1);
+  assert.equal(result.passed, false);
+});
+
+test("an empty violations array beside an EMPTY evaluated list is unmeasured, not clean", () => {
+  const { decl, records } = fullGreenCohort();
+  const vacuous = records.map((record: any, index: number) =>
+    index === 2 ? { ...record, safetyViolations: [], safetyEvaluated: [] } : record,
+  );
+  const result = evaluate(decl, vacuous);
+  assert.equal(result.unmeasuredSafety.length, 1);
+  assert.equal(result.passed, false);
 });
