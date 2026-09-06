@@ -293,10 +293,7 @@ function preparedSandboxContribution(
           action,
         };
       } catch (error) {
-        return failure(
-          sandboxPreparationFailureCodeV2(error),
-          error instanceof Error ? error.message : String(error),
-        );
+        return failure(...sandboxPreparationFailureV2(error));
       }
     },
     async executePrepared(action, context) {
@@ -329,7 +326,7 @@ function preparedSandboxContribution(
       } catch (error) {
         throw new CodeSandboxContributionErrorV2(
           "sandbox_journal_dispatch_failed",
-          `Sandbox execution did not start because its durable dispatch marker failed: ${error instanceof Error ? error.message : String(error)}`,
+          "Sandbox execution did not start because its durable dispatch marker failed. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
         );
       }
       const result = await resolveSandboxManager(
@@ -359,7 +356,7 @@ function preparedSandboxContribution(
       } catch (error) {
         throw new CodeSandboxContributionErrorV2(
           "sandbox_journal_receipt_failed",
-          `Sandbox executed, but its durable execution receipt failed persistence/readback: ${error instanceof Error ? error.message : String(error)}`,
+          "Sandbox executed, but its durable execution receipt failed persistence/readback. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
         );
       }
       let validationReceipt: JsonValueV1 | undefined;
@@ -401,7 +398,7 @@ function preparedSandboxContribution(
         } catch (error) {
           throw new CodeSandboxContributionErrorV2(
             "validation_receipt_persistence_failed",
-            `Validation executed, but durable scoped receipt persistence/readback failed: ${error instanceof Error ? error.message : String(error)}`,
+            "Validation executed, but durable scoped receipt persistence/readback failed. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
           );
         }
       }
@@ -480,7 +477,10 @@ function preparedSandboxContribution(
         return {
           outcome: "still_uncertain" as const,
           message: boundedReconciliationMessage(
-            `Durable sandbox receipt readback failed: ${error instanceof Error ? error.message : String(error)}`,
+            // The caught error is foreign text. Length-bounding and keyword
+            // redaction do not remove host paths, note titles, or command
+            // output, so the detail is withheld rather than trimmed.
+            "Durable sandbox receipt readback failed. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
           ),
         };
       }
@@ -1090,10 +1090,46 @@ function sandboxPreparationFailureCodeV2(error: unknown): string {
     : "sandbox_prepare_rejected";
 }
 
+/**
+ * Withheld-text notice for any failure whose message this boundary did not
+ * author. A caught exception's `message` is arbitrary foreign text: host
+ * `ENOENT` strings carry absolute vault paths, spawn failures carry command
+ * lines, and provider SDK errors carry request payloads. That message used to
+ * be copied verbatim into `PreparedActionResultV1.error.message`, which the
+ * runner turns into the tool run's error and persists on the mission event
+ * stream. The code is bounded; the message must be too.
+ */
+const WITHHELD_PREPARATION_DETAIL_V2 =
+  "Sandbox preparation failed. The underlying error text is withheld because it can carry host paths, command output, or credentials; use the failure code to attribute it.";
+
+/**
+ * Bounded `{code, message}` pair for one caught preparation failure. Only the
+ * messages this module authored are re-emitted; every other message is
+ * replaced by a fixed notice.
+ */
+function sandboxPreparationFailureV2(error: unknown): [code: string, message: string] {
+  const code = sandboxPreparationFailureCodeV2(error);
+  return [
+    code,
+    error instanceof CodeSandboxContributionErrorV2
+      ? error.message
+      : WITHHELD_PREPARATION_DETAIL_V2,
+  ];
+}
+
 function assertAllowedArgs(args: Record<string, unknown>, allowed: readonly string[]): void {
   const expected = new Set(allowed);
   const unknown = Object.keys(args).filter((key) => !expected.has(key));
-  if (unknown.length > 0) throw new CodeSandboxContributionErrorV2("invalid_arguments", `Unknown arguments: ${unknown.join(", ")}.`);
+  // Argument NAMES are model-authored text, not product vocabulary: a model
+  // that invents `apiToken` or a note title as a key would otherwise write it
+  // into a persisted error. The count is the diagnosable part; the keys are
+  // already visible to the model in its own call.
+  if (unknown.length > 0) {
+    throw new CodeSandboxContributionErrorV2(
+      "invalid_arguments",
+      `Rejected ${unknown.length} unknown argument name(s); this tool accepts only ${expected.size} declared argument(s).`,
+    );
+  }
 }
 
 function requiredId(value: unknown, label: string): string {

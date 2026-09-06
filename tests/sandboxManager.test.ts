@@ -603,18 +603,24 @@ test("code contribution preparation preserves typed failure codes and keeps unkn
     },
   });
 
-  preparationError = new Error("Unexpected journal failure.");
+  // An UNTYPED exception keeps the generic code AND has its text withheld.
+  // The previous assertion pinned `message: "Unexpected journal failure."`,
+  // i.e. it required the boundary to copy foreign error text into a persisted
+  // tool error. Host errors on this path carry absolute vault paths, command
+  // lines and provider payloads, so the message is now a fixed notice.
+  preparationError = new Error(
+    "Unexpected journal failure at C:/Users/joshb/vault/Private.md",
+  );
   const unknown = await validation.prepare!(
     { workspaceId: "workspace-1", repairRequestId: "request-1" },
     context(),
   );
-  assert.deepEqual(unknown, {
-    ok: false,
-    error: {
-      code: "sandbox_prepare_rejected",
-      message: "Unexpected journal failure.",
-    },
-  });
+  assert.equal(unknown.ok, false);
+  if (unknown.ok) return;
+  assert.equal(unknown.error.code, "sandbox_prepare_rejected");
+  assert.equal(unknown.error.message.includes("C:/Users/joshb/vault/Private.md"), false);
+  assert.equal(unknown.error.message.includes("Unexpected journal failure"), false);
+  assert.match(unknown.error.message, /withheld/iu);
 });
 
 test("validation contribution withholds success when durable receipt persistence/readback fails", async () => {
@@ -673,7 +679,11 @@ test("validation contribution withholds success when durable receipt persistence
     (error: unknown) =>
       error instanceof CodeSandboxContributionErrorV2 &&
       error.code === "validation_receipt_persistence_failed" &&
-      /readback hash mismatch/u.test(error.message),
+      // The typed code survives; the caught cause's own text does not. The
+      // previous assertion required `/readback hash mismatch/` — foreign text
+      // copied verbatim out of a durable-persistence failure.
+      /withheld/iu.test(error.message) &&
+      !/readback hash mismatch/u.test(error.message),
   );
   assert.equal(executions, 1, "sandbox ran once, but no green tool result was returned");
 });
