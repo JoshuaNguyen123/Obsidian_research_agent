@@ -864,6 +864,12 @@ function parseToolCallOutcomesAnnotation(
       receiptsUnknown: nullableCounter(value.receiptsUnknown),
       succeededWithWork: nullableCounter(value.succeededWithWork),
       failureBuckets: explicitCounterRecord(value.failureBuckets),
+      // Additive in the evidence contract, and re-validated like every other
+      // counter so a malformed annotation degrades to unknown, not to zero.
+      // An older annotation that predates these fields is `undefined` here and
+      // must read as unknown, which is exactly what nullableCounter gives.
+      servedFromCache: nullableCounter(value.servedFromCache),
+      transportExecuted: nullableCounter(value.transportExecuted),
       observedEvents: nullableCounter(value.observedEvents) ?? 0,
     };
   } catch {
