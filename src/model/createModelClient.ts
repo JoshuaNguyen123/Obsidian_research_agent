@@ -385,8 +385,15 @@ export async function hybridStreamingTransport(
     try {
       return await nodeStreamingTransport(request);
     } catch (nodeError) {
-      throw new Error(
+      // A timeout or cancellation on the fallback keeps its exact shape: the
+      // retry budget and the abort handling key on those messages.
+      if (isTimeoutOrCancellation(nodeError)) {
+        throw nodeError;
+      }
+      throw new ModelClientErrorClass(
+        "network",
         `Fetch streaming failed: ${getErrorMessage(fetchError)}. Desktop streaming fallback failed: ${getErrorMessage(nodeError)}.`,
+        { originalError: nodeError },
       );
     }
   }
@@ -430,7 +437,7 @@ async function fetchStreamingTransport(
       );
     }
 
-    throw error;
+    throw asNetworkModelClientError(error, "Streaming request failed");
   }
 
   if (!response.body) {
@@ -478,7 +485,7 @@ async function fetchStreamingTransport(
             originalError: error,
           });
         }
-        return error;
+        return asNetworkModelClientError(error, "Streaming connection failed");
       },
     ),
   };
@@ -584,7 +591,9 @@ async function nodeStreamingTransport(
       },
     );
 
-    req.on("error", reject);
+    req.on("error", (error) =>
+      reject(asNetworkModelClientError(error, "Desktop streaming request failed")),
+    );
     const unlinkAbort = linkAbortSignal(request.abortSignal, () => {
       req.destroy(
         new ModelClientErrorClass("network", "Request cancelled."),
@@ -670,12 +679,18 @@ async function* decodeNodeStream(
 ): AsyncIterable<string> {
   const decoder = new TextDecoder();
 
-  for await (const chunk of stream) {
-    if (typeof chunk === "string") {
-      yield chunk;
-    } else {
-      yield decoder.decode(chunk, { stream: true });
+  try {
+    for await (const chunk of stream) {
+      if (typeof chunk === "string") {
+        yield chunk;
+      } else {
+        yield decoder.decode(chunk, { stream: true });
+      }
     }
+  } catch (error) {
+    // Node's IncomingMessage reports a dropped connection as Error("aborted")
+    // with code ECONNRESET; without the network shape it is never retried.
+    throw asNetworkModelClientError(error, "Desktop streaming connection failed");
   }
 
   const final = decoder.decode();
@@ -690,6 +705,35 @@ function getErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+/**
+ * A socket-level failure surfaces from Node's http client and from fetch as a
+ * bare Error: "aborted" (code ECONNRESET, the server dropped the connection),
+ * "socket hang up", "fetch failed". The retry loop retries only errors shaped
+ * as transient model errors, so a bare socket error on the first call of a
+ * mission ended the mission with zero retries (qualification cohort 8,
+ * compound lane, 2026-09-07: "Model step failed: … Why: aborted", 26 s in).
+ * A dropped connection is a network error: name the context, keep the
+ * original, and let the bounded retry budget apply. Errors that already carry
+ * a model-client shape (timeouts, cancellations, breaker) pass through.
+ */
+function asNetworkModelClientError(
+  error: unknown,
+  context: string,
+): ModelClientErrorClass {
+  if (error instanceof ModelClientErrorClass) {
+    return error;
+  }
+  const code =
+    error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+      ? ` (${(error as { code: string }).code})`
+      : "";
+  return new ModelClientErrorClass(
+    "network",
+    `${context}: ${getErrorMessage(error)}${code}`,
+    { originalError: error },
+  );
 }
 
 function isTimeoutOrCancellation(error: unknown): boolean {
