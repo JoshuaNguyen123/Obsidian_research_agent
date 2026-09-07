@@ -773,6 +773,7 @@ test("identical bytes from two missions of the SAME workflow are honest work, re
   const workflows = [...new Set(records.map(workflowOf))];
   assert.ok(workflows.length >= 2, "the fixture declares several workflows");
   const other = records.find((record: any) => workflowOf(record) === workflows[1]);
+  assert.ok(other, "a record of the second workflow exists");
   const crossWorkflow = sameWorkflowRepeat.map((record: any) =>
     record.occurrenceId === other.occurrenceId
       ? { ...record, acceptance: { ...record.acceptance, artifactIdentity: "sha256:e43bea1f-deterministic-notebook" } }

@@ -103,6 +103,10 @@ export interface QualificationEvaluation {
   evidenceContractVersion: string | null;
   /** Always reported, so 300 deliveries against 1 artifact is visible. */
   distinctArtifactIdentities: number;
+  /** Identical bytes from the same workflow: expected of deterministic tasks. */
+  repeatedArtifactIdentities: number;
+  /** Identical bytes across different workflows: never honest; fails the cohort. */
+  crossWorkflowArtifactIdentities: number;
   missingArtifactIdentities: number;
   readOnlyDeliveries: number;
   deliveredWithArtifactIdentity: number;
