@@ -37,6 +37,14 @@ import {
   recoverStalePluginDataBackup,
   restorePluginDataSnapshot,
 } from "./pluginDataBackup";
+import {
+  QUIET_OBSIDIAN_CHROMIUM_SWITCHES,
+  parkObsidianWindowAfterAttachV1,
+  parkObsidianWindowStateBeforeLaunchV1,
+  quietObsidianWindowRequested,
+  restoreObsidianWindowStateAfterExitV1,
+  type ParkedObsidianWindowStateV1,
+} from "./quietObsidianWindow";
 import { fingerprintCanonicalJson } from "../../src/agent/queue/fingerprint";
 import { parseRepositoryProfileRegistry } from "../../src/agent/repositories/RepositoryProfile";
 import {
@@ -215,10 +223,27 @@ export async function startNativeObsidianHarness(
   let page: Page | null = null;
   let closed = false;
   let rootCreatedAtMs: number | null = null;
+  // Proof lanes keep Obsidian's window off the user's screen (see
+  // quietObsidianWindow.ts). The demo recorder opts back into a visible window.
+  const quietWindow = quietObsidianWindowRequested();
+  let parkedWindowState: ParkedObsidianWindowStateV1 | null = null;
   const launchOwnedProcess = async (
     allowTrustRestart = true,
   ): Promise<Page> => {
     rootCreatedAtMs = Date.now();
+    if (quietWindow) {
+      const parkOutcome = await parkObsidianWindowStateBeforeLaunchV1({
+        appStatePath: obsidianAppStatePath(),
+        vaultRoot,
+      });
+      if (parkOutcome.status === "parked") {
+        parkedWindowState = parkOutcome.parked;
+      } else {
+        console.log(
+          `[quiet-window] ${options.label}: launch placement not parked — ${parkOutcome.reason}`,
+        );
+      }
+    }
     processHandle = spawn(
       obsidianExe,
       [
@@ -238,6 +263,9 @@ export async function startNativeObsidianHarness(
         // ceiling keeps a finite spike alive; the product allocation bug is
         // tracked separately and this flag must not be treated as the fix.
         "--js-flags=--max-old-space-size=8192",
+        // Keep rendering, animation frames and timers at full rate while the
+        // window is parked off-screen; Playwright's stability waits need frames.
+        ...(quietWindow ? QUIET_OBSIDIAN_CHROMIUM_SWITCHES : []),
         vaultRoot,
       ],
       {
@@ -257,6 +285,9 @@ export async function startNativeObsidianHarness(
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     page = await findOnlyVaultPage(browser, vaultRoot);
     watchRendererLiveness(browser, page, options.label, cdpPort);
+    if (quietWindow) {
+      await parkObsidianWindowAfterAttachV1(page, options.label);
+    }
     const trustChanged = await trustDisposableVaultIfPrompted(page);
     if (trustChanged) {
       if (!allowTrustRestart) {
@@ -352,6 +383,17 @@ export async function startNativeObsidianHarness(
         await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch((error) => {
           teardownError ??= error;
         });
+        if (parkedWindowState) {
+          // The owned process is gone; put the user's saved placement back so
+          // opening the vault by hand later looks exactly as before the lane.
+          const restored = await restoreObsidianWindowStateAfterExitV1(parkedWindowState);
+          parkedWindowState = null;
+          if (restored === "failed") {
+            console.warn(
+              `[quiet-window] ${options.label}: could not restore the saved window placement`,
+            );
+          }
+        }
         if (browser) {
           await withTimeout(browser.close(), 5_000, "Playwright CDP close")
             .catch(() => undefined);

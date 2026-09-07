@@ -1,0 +1,165 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import {
+  QUIET_OBSIDIAN_CHROMIUM_SWITCHES,
+  QUIET_WINDOW_X,
+  QUIET_WINDOW_Y,
+  isParkedObsidianWindowStateV1,
+  parkObsidianWindowStateBeforeLaunchV1,
+  quietObsidianWindowRequested,
+  quietObsidianWindowStateV1,
+  resolveObsidianVaultIdV1,
+  restoreObsidianWindowStateAfterExitV1,
+} from "../e2e/fixtures/quietObsidianWindow";
+
+const LIVE_STATE = {
+  x: 272,
+  y: 16,
+  width: 1428,
+  height: 800,
+  isMaximized: true,
+  devTools: false,
+  zoom: 0,
+};
+
+test("a maximized on-screen placement becomes windowed and off-screen at the same size", () => {
+  const { state, changed } = quietObsidianWindowStateV1(LIVE_STATE);
+  assert.equal(changed, true);
+  assert.deepEqual(state, {
+    x: QUIET_WINDOW_X,
+    y: QUIET_WINDOW_Y,
+    width: 1428,
+    height: 800,
+    isMaximized: false,
+    devTools: false,
+    zoom: 0,
+  });
+  assert.equal(isParkedObsidianWindowStateV1(state), true);
+  assert.equal(quietObsidianWindowStateV1(state).changed, false, "parking is idempotent");
+});
+
+test("garbage or missing placement falls back to a sane windowed default", () => {
+  for (const input of [undefined, null, "x", 3, [], { width: -1, height: "tall" }]) {
+    const { state } = quietObsidianWindowStateV1(input);
+    assert.equal(state.x, QUIET_WINDOW_X);
+    assert.equal(state.y, QUIET_WINDOW_Y);
+    assert.equal(state.width, 1428);
+    assert.equal(state.height, 800);
+    assert.equal(state.isMaximized, false);
+  }
+});
+
+test("the vault id is resolved by normalized path, never by string equality", () => {
+  const appState = {
+    vaults: {
+      ae0c6fd8fe85395f: { path: "C:\\Users\\me\\Documents\\Obsidian Vault ", ts: 1 },
+      e4ac721a9af5e1c9: { path: "C:\\Users\\me\\Desktop\\test_vault_obsidian_ai", ts: 2, open: true },
+    },
+  };
+  assert.equal(
+    resolveObsidianVaultIdV1(appState, "c:/users/me/desktop/TEST_VAULT_OBSIDIAN_AI/"),
+    "e4ac721a9af5e1c9",
+  );
+  assert.equal(
+    resolveObsidianVaultIdV1(appState, "C:\\Users\\me\\Documents\\Obsidian Vault"),
+    "ae0c6fd8fe85395f",
+    "a trailing space in the registry entry still matches the real path",
+  );
+  assert.equal(resolveObsidianVaultIdV1(appState, "C:\\elsewhere"), null);
+  assert.equal(resolveObsidianVaultIdV1({ vaults: "nope" }, "C:\\x"), null);
+  assert.equal(resolveObsidianVaultIdV1(null, "C:\\x"), null);
+});
+
+test("park before launch keeps the original in a sidecar and restore puts it back", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "quiet-window-"));
+  try {
+    const vaultRoot = path.join(dir, "vault");
+    const appStatePath = path.join(dir, "obsidian.json");
+    await writeFile(appStatePath, JSON.stringify({ vaults: { abc123: { path: vaultRoot } } }));
+    const stateFile = path.join(dir, "abc123.json");
+    await writeFile(stateFile, JSON.stringify(LIVE_STATE));
+
+    const first = await parkObsidianWindowStateBeforeLaunchV1({ appStatePath, vaultRoot });
+    assert.equal(first.status, "parked");
+    if (first.status !== "parked") return;
+    assert.equal(first.originalRecorded, true);
+    const parkedState = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(parkedState.isMaximized, false);
+    assert.equal(parkedState.x, QUIET_WINDOW_X);
+    assert.equal(parkedState.zoom, 0);
+    const sidecar = JSON.parse(await readFile(first.parked.sidecarPath, "utf8"));
+    assert.deepEqual(sidecar, LIVE_STATE);
+
+    // A previous lane died before restoring: the file is already parked, so the
+    // sidecar's original must survive a second park untouched.
+    const second = await parkObsidianWindowStateBeforeLaunchV1({ appStatePath, vaultRoot });
+    assert.equal(second.status, "parked");
+    if (second.status !== "parked") return;
+    assert.equal(second.originalRecorded, false);
+    assert.deepEqual(JSON.parse(await readFile(second.parked.sidecarPath, "utf8")), LIVE_STATE);
+
+    assert.equal(await restoreObsidianWindowStateAfterExitV1(second.parked), "restored");
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), LIVE_STATE);
+    await assert.rejects(stat(second.parked.sidecarPath), "the sidecar is removed after restore");
+    assert.equal(
+      await restoreObsidianWindowStateAfterExitV1(second.parked),
+      "nothing-to-restore",
+      "a second restore is a no-op",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("park is skipped, never thrown, when the vault is unregistered or the app state is absent", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "quiet-window-"));
+  try {
+    const appStatePath = path.join(dir, "obsidian.json");
+    const absent = await parkObsidianWindowStateBeforeLaunchV1({ appStatePath, vaultRoot: dir });
+    assert.equal(absent.status, "skipped");
+    await writeFile(appStatePath, JSON.stringify({ vaults: { z: { path: path.join(dir, "other") } } }));
+    const unregistered = await parkObsidianWindowStateBeforeLaunchV1({ appStatePath, vaultRoot: dir });
+    assert.equal(unregistered.status, "skipped");
+    // No placement file yet: park writes one and leaves nothing to restore.
+    await writeFile(appStatePath, JSON.stringify({ vaults: { z: { path: dir } } }));
+    const fresh = await parkObsidianWindowStateBeforeLaunchV1({ appStatePath, vaultRoot: dir });
+    assert.equal(fresh.status, "parked");
+    if (fresh.status !== "parked") return;
+    assert.equal(fresh.originalRecorded, false);
+    assert.equal(await restoreObsidianWindowStateAfterExitV1(fresh.parked), "nothing-to-restore");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the demo recorder's visible mode is honoured and the quiet mode is the default", () => {
+  assert.equal(quietObsidianWindowRequested({}), true);
+  assert.equal(quietObsidianWindowRequested({ E2E_SHOW_OBSIDIAN_WINDOW: "1" }), false);
+  assert.equal(quietObsidianWindowRequested({ E2E_SHOW_OBSIDIAN_WINDOW: "0" }), true);
+});
+
+test("the native harness wires the quiet window into launch, attach and teardown", async () => {
+  const source = await readFile(
+    path.join(__dirname, "..", "e2e", "fixtures", "nativeObsidianHarness.ts"),
+    "utf8",
+  );
+  // The Chromium switches ride on the same argv as the vault path, gated by
+  // the same env the spawn already honours for the demo recorder.
+  assert.match(source, /\.\.\.\(quietWindow \? QUIET_OBSIDIAN_CHROMIUM_SWITCHES : \[\]\)/u);
+  assert.match(source, /windowsHide: process\.env\.E2E_SHOW_OBSIDIAN_WINDOW !== "1"/u);
+  // The placement is parked before spawn and confirmed right after the page is found.
+  const parkAt = source.indexOf("parkObsidianWindowStateBeforeLaunchV1(");
+  const spawnAt = source.indexOf("processHandle = spawn(");
+  const attachAt = source.indexOf("parkObsidianWindowAfterAttachV1(");
+  const pageAt = source.indexOf("page = await findOnlyVaultPage(browser, vaultRoot);");
+  assert.ok(parkAt > 0 && spawnAt > parkAt, "park before spawn");
+  assert.ok(pageAt > 0 && attachAt > pageAt, "confirm after the vault page is found");
+  assert.match(source, /restoreObsidianWindowStateAfterExitV1\(/u);
+  for (const flag of QUIET_OBSIDIAN_CHROMIUM_SWITCHES) {
+    assert.ok(flag.startsWith("--disable-"), flag);
+  }
+});
