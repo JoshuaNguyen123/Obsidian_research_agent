@@ -226,18 +226,23 @@ interface RendererParkResult {
 
 /**
  * How the attach step proves the parked renderer is alive. Each window counts
- * animation frames and zero-delay timer ticks side by side: enough frames say
- * "live"; timers without frames say the compositor is throttled; neither says
- * the main thread is busy (vault indexing right after launch) and the window
+ * animation frames and zero-delay timer ticks side by side: two frames say
+ * "live" (Playwright's own stability wait needs exactly two consecutive
+ * frames); timers with NO frame at all say the compositor is throttled, which
+ * is what Chromium does to an occluded window it throttles (0 fps, not a
+ * slow rate); anything else says the main thread is busy (vault indexing
+ * right after launch, or a renderer drawing slowly under load) and the window
  * is sampled again. Only a throttled or never-live renderer is put back on
  * screen, so a busy start no longer flashes the window at the user (cohorts
- * 9-10, 2026-09-07: one launch in nine did, and every one of them passed).
+ * 9-10, 2026-09-07: one launch in nine did on a five-frame bar; cohort 12,
+ * one in fifteen at 10 fps, still called "throttled"; every one of them
+ * passed).
  */
 export const RENDERER_PROBE_THRESHOLDS = {
   /** Length of one sampling window. */
   windowMs: 400,
   /** Frames in one window that prove the compositor runs. */
-  minLiveFrames: 5,
+  minLiveFrames: 2,
   /** Zero-delay timer ticks in one window that prove the main thread was free. */
   minTimerTicks: 10,
   /** Windows sampled before a never-live renderer is put back on screen. */
@@ -290,7 +295,12 @@ export function judgeRendererProbeV1(
     if (sample.frames >= thresholds.minLiveFrames) {
       return { verdict: "live", frames: sample.frames, windows: index + 1, timedOut };
     }
-    throttledRun = sample.timerTicks >= thresholds.minTimerTicks ? throttledRun + 1 : 0;
+    // Throttled means the compositor produced NOTHING while the main thread
+    // was demonstrably free; a straggler frame is not a verdict either way.
+    throttledRun =
+      sample.frames === 0 && sample.timerTicks >= thresholds.minTimerTicks
+        ? throttledRun + 1
+        : 0;
     if (throttledRun >= thresholds.throttledWindowsToConclude) {
       return { verdict: "throttled", frames: best, windows: index + 1, timedOut };
     }
@@ -437,7 +447,8 @@ export async function parkObsidianWindowAfterAttachV1(
                   timedOut,
                 });
                 const live = frames >= t.minLiveFrames;
-                throttledRun = !live && timerTicks >= t.minTimerTicks ? throttledRun + 1 : 0;
+                throttledRun =
+                  !live && frames === 0 && timerTicks >= t.minTimerTicks ? throttledRun + 1 : 0;
                 if (
                   live ||
                   throttledRun >= t.throttledWindowsToConclude ||

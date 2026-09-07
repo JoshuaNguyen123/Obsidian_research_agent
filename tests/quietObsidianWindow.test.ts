@@ -193,14 +193,23 @@ test("the renderer probe judge: busy windows are sampled again, timers without f
   const busy = { frames: 1, timerTicks: 0, elapsedMs: 812, timedOut: false };
   const stalled = { frames: 0, timerTicks: 0, elapsedMs: 1500, timedOut: true };
   const live = { frames: 19, timerTicks: 96, elapsedMs: 401, timedOut: false };
-  const throttled = { frames: 1, timerTicks: 88, elapsedMs: 400, timedOut: false };
+  const throttled = { frames: 0, timerTicks: 88, elapsedMs: 400, timedOut: false };
+  // Cohort 12 (2026-09-07): a renderer drawing at 10 fps under load, timers
+  // running. That is live, not throttled; it was put back on screen.
+  const slow = { frames: 4, timerTicks: 90, elapsedMs: 400, timedOut: false };
+  // A lone straggler frame while timers run proves nothing either way.
+  const straggler = { frames: 1, timerTicks: 90, elapsedMs: 400, timedOut: false };
+  assert.deepEqual(judgeRendererProbeV1([slow]), { verdict: "live", frames: 4, windows: 1, timedOut: false });
+  assert.deepEqual(judgeRendererProbeV1([straggler, straggler, live]).verdict, "live");
+  assert.equal(judgeRendererProbeV1([straggler, straggler]).verdict, "busy", "stragglers never conclude throttled");
+  assert.equal(RENDERER_PROBE_THRESHOLDS.minLiveFrames, 2, "Playwright's stability wait needs two consecutive frames");
 
   assert.deepEqual(judgeRendererProbeV1([live]), { verdict: "live", frames: 19, windows: 1, timedOut: false });
   // Cohorts 9-10 (2026-09-07): one frame in the first window while Obsidian
   // indexed the vault, then normal frames. Ten lanes in ninety-two were put
   // back on screen for this; they must stay parked.
   assert.deepEqual(judgeRendererProbeV1([busy, stalled, live]), { verdict: "live", frames: 19, windows: 3, timedOut: true });
-  assert.deepEqual(judgeRendererProbeV1([throttled, throttled]), { verdict: "throttled", frames: 1, windows: 2, timedOut: false });
+  assert.deepEqual(judgeRendererProbeV1([throttled, throttled]), { verdict: "throttled", frames: 0, windows: 2, timedOut: false });
   // One timers-without-frames window between busy ones concludes nothing.
   assert.equal(judgeRendererProbeV1([throttled, busy, live]).verdict, "live");
   const never = judgeRendererProbeV1(
