@@ -24,14 +24,19 @@
  * checks, in stdlib Python, with no third-party dependency and no write into
  * the workspace being delivered.
  *
- * The two checks cover the ways generated code most often compiles and still
- * cannot run:
+ * The checks cover the ways generated code most often compiles and still
+ * fails the person who asked for it:
  *   - unpacking a call into the wrong number of targets (ValueError), the
  *     cohort-14 loss above;
  *   - calling a function of this module with the wrong arguments
  *     (TypeError) — too many positionals, a missing required parameter, an
  *     unknown keyword, a duplicated one. A signature edit that misses one
- *     call site is the single most common shape in generated code.
+ *     call site is the single most common shape in generated code;
+ *   - shipping code that says in its own comments that it is unfinished. The
+ *     candidate after cohort 15 delivered `int(input("Press Enter to
+ *     continue...") or 0)  # placeholder replaced below`, which crashed on
+ *     the first non-numeric answer. A deliverable that marks itself a
+ *     placeholder is not finished work, whatever it does at runtime.
  *
  * Deliberately NOT included: executing the program. That is the obvious next
  * step, and it would catch crashes before the first prompt, but it needs an
@@ -48,11 +53,15 @@
  * is never flagged. A call is judged only against a module-level function
  * that is undecorated, defined once, and never shadowed by an assignment or
  * import, and only when neither the signature nor the call uses `*args` or
- * `**kwargs`. Anything less certain is left alone.
+ * `**kwargs`. Unfinished markers are read from comment tokens only, so the
+ * word "placeholder" in a docstring, a string or an identifier is untouched.
+ * Anything less certain is left alone.
  */
 export const SCRATCH_PYTHON_CONTRACT_CHECK_SOURCE_V1 = `import ast
+import io
 import os
 import sys
+import tokenize
 
 SKIP_DIRECTORIES = {
     ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
@@ -199,6 +208,44 @@ def call_signature_problem(function, call):
     return None
 
 
+UNFINISHED_MARKERS = (
+    "todo",
+    "fixme",
+    "xxx",
+    "hack",
+    "placeholder",
+    "not implemented",
+    "implement this",
+    "implement later",
+    "fill this in",
+)
+
+
+def unfinished_comment_markers(source):
+    found = []
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return found
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        text = token.string.lstrip("#").strip()
+        lowered = text.lower()
+        for marker in UNFINISHED_MARKERS:
+            index = lowered.find(marker)
+            if index < 0:
+                continue
+            before = lowered[index - 1] if index > 0 else " "
+            after_index = index + len(marker)
+            after = lowered[after_index] if after_index < len(lowered) else " "
+            if before.isalnum() or after.isalnum():
+                continue
+            found.append((token.start[0], marker, text[:120]))
+            break
+    return found
+
+
 def check_source(path, source, problems):
     try:
         compile(source, path, "exec")
@@ -248,6 +295,11 @@ def check_source(path, source, problems):
                 "unpacks %d. Python raises ValueError here on every run."
                 % (path, node.lineno, name, size, reason, len(target.elts))
             )
+    for line, marker, text in unfinished_comment_markers(source):
+        problems.append(
+            "%s:%s: the delivered code marks itself unfinished (%s): %s"
+            % (path, line, marker, text)
+        )
     functions = module_level_functions(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):

@@ -390,3 +390,44 @@ test("calls the checker cannot be certain about are never reported", () => {
     assert.equal(result.status, 0, `${label}: false positive: ${result.stderr}`);
   }
 });
+
+test("code that marks itself unfinished is not a delivery", () => {
+  // The candidate after cohort 15 shipped exactly this line, and it crashed
+  // on the first non-numeric answer. Whatever it does at runtime, a
+  // deliverable whose own comment calls it a placeholder is not finished.
+  const result = runChecker({
+    "main.py": [
+      "MAX_GUESS = 7",
+      "",
+      "",
+      "def main():",
+      '    used = int(input("Press Enter to continue...") or 0)  # placeholder replaced below',
+      "    return used",
+      "",
+    ].join("\n"),
+  });
+  assert.equal(result.status, 1, `expected a finding; stdout=${result.stdout}`);
+  assert.match(result.stderr, /main\.py:5: the delivered code marks itself unfinished \(placeholder\)/u);
+  assert.match(result.stderr, /placeholder replaced below/u);
+
+  for (const marker of ["TODO: finish scoring", "FIXME broken", "XXX revisit", "not implemented yet"]) {
+    const each = runChecker({ "main.py": `def main():\n    return 1  # ${marker}\n` });
+    assert.equal(each.status, 1, `${marker} should be reported`);
+    assert.match(each.stderr, /marks itself unfinished/u, marker);
+  }
+});
+
+test("the word placeholder outside a comment is never a finding", () => {
+  // Comment tokens only: a docstring, a user-facing string and an identifier
+  // all legitimately contain these words in finished programs.
+  const result = runChecker({
+    "main.py": [
+      "def render(placeholder_text):",
+      '    """Render the placeholder shown before real input arrives."""',
+      '    todo_list = ["fixme later"]',
+      '    return "placeholder: " + placeholder_text + str(len(todo_list))',
+      "",
+    ].join("\n"),
+  });
+  assert.equal(result.status, 0, `false positive: ${result.stderr}`);
+});
