@@ -719,8 +719,10 @@ test("REJECTS one artifact standing in for a whole cohort", () => {
   const result = evaluate(decl, shared);
   assert.equal(result.deliveredWithArtifactIdentity, 300);
   assert.equal(result.distinctArtifactIdentities, 1);
+  assert.equal(result.repeatedArtifactIdentities, 299);
+  assert.ok(result.crossWorkflowArtifactIdentities >= 1);
   assert.equal(result.passed, false);
-  assert.ok(result.failures.some((f: string) => /distinct artifact identity/u.test(f)));
+  assert.ok(result.failures.some((f: string) => /shared across different workflows/u.test(f)));
 
   // Distinct identities for distinct missions still pass, so the check is not
   // simply rejecting every cohort that carries identities at all.
@@ -731,7 +733,54 @@ test("REJECTS one artifact standing in for a whole cohort", () => {
     }));
   const ok = evaluate(decl, distinct);
   assert.equal(ok.distinctArtifactIdentities, 300);
+  assert.equal(ok.repeatedArtifactIdentities, 0);
+  assert.equal(ok.crossWorkflowArtifactIdentities, 0);
   assert.equal(ok.passed, true);
+});
+
+test("identical bytes from two missions of the SAME workflow are honest work, reported and not failed", () => {
+  // Qualification cohort 9 (2026-09-07): notebook-execution#005 and #009 each
+  // wrote the same notebook output with their own run-scoped receipts. A
+  // deterministic task repeating its bytes is not one artifact standing in for
+  // many missions.
+  const { decl, records } = fullGreenCohort();
+  const workflowOf = (record: any) =>
+    decl.occurrences.find((o: any) => o.occurrenceId === record.occurrenceId)?.workflow ?? null;
+  const firstWorkflow = workflowOf(records[0]);
+  let repeated = 0;
+  const sameWorkflowRepeat = records.map((record: any, index: number) => {
+    if (workflowOf(record) === firstWorkflow && repeated < 2) {
+      repeated += 1;
+      return {
+        ...record,
+        acceptance: { ...record.acceptance, artifactIdentity: "sha256:e43bea1f-deterministic-notebook" },
+      };
+    }
+    return {
+      ...record,
+      acceptance: { ...record.acceptance, artifactIdentity: `Agent Runs/note-${index}.md#sha256:${index}` },
+    };
+  });
+  assert.equal(repeated, 2, "two occurrences of one workflow share the identity");
+  const result = evaluate(decl, sameWorkflowRepeat);
+  assert.equal(result.deliveredWithArtifactIdentity, 300);
+  assert.equal(result.distinctArtifactIdentities, 299);
+  assert.equal(result.repeatedArtifactIdentities, 1);
+  assert.equal(result.crossWorkflowArtifactIdentities, 0);
+  assert.equal(result.passed, true, result.failures.join(" | "));
+
+  // The same identity on two DIFFERENT workflows is the stale-snapshot shape and fails.
+  const workflows = [...new Set(records.map(workflowOf))];
+  assert.ok(workflows.length >= 2, "the fixture declares several workflows");
+  const other = records.find((record: any) => workflowOf(record) === workflows[1]);
+  const crossWorkflow = sameWorkflowRepeat.map((record: any) =>
+    record.occurrenceId === other.occurrenceId
+      ? { ...record, acceptance: { ...record.acceptance, artifactIdentity: "sha256:e43bea1f-deterministic-notebook" } }
+      : record);
+  const failed = evaluate(decl, crossWorkflow);
+  assert.equal(failed.crossWorkflowArtifactIdentities, 1);
+  assert.equal(failed.passed, false);
+  assert.ok(failed.failures.some((f: string) => /shared across different workflows/u.test(f)));
 });
 
 test("REJECTS a declaration whose stated size disagrees with its occurrence list", () => {

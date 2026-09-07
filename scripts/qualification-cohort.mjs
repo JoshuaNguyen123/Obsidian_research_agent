@@ -745,20 +745,34 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
   // to be distinct about and is exempt from this check only. An occurrence
   // whose writeReceipts is null or absent is NOT exempt: unknown is not zero,
   // and an older producer must not inherit the read-only exemption by omission.
-  const deliveredAcceptances = outcomes
+  const deliveredEntries = outcomes
     .filter((entry) => entry.outcome === QUALIFICATION_OUTCOMES.DELIVERED)
-    .map((entry) => byId.get(entry.occurrenceId)?.acceptance ?? {});
+    .map((entry) => ({
+      workflow: entry.workflow ?? null,
+      acceptance: byId.get(entry.occurrenceId)?.acceptance ?? {},
+    }));
   let readOnlyDeliveries = 0;
   const deliveredIdentities = [];
-  for (const acceptance of deliveredAcceptances) {
+  const workflowsByIdentity = new Map();
+  for (const { workflow, acceptance } of deliveredEntries) {
     if (acceptance.writeReceipts === 0) { readOnlyDeliveries += 1; continue; }
-    deliveredIdentities.push(acceptance.artifactIdentity);
+    const identity = acceptance.artifactIdentity;
+    deliveredIdentities.push(identity);
+    if (typeof identity === "string" && identity !== "") {
+      const workflows = workflowsByIdentity.get(identity) ?? new Set();
+      workflows.add(workflow);
+      workflowsByIdentity.set(identity, workflows);
+    }
   }
   const deliveredIds = deliveredIdentities.filter(
     (identity) => typeof identity === "string" && identity !== "",
   );
   const missingArtifactIdentities = deliveredIdentities.length - deliveredIds.length;
   const distinctArtifactIdentities = new Set(deliveredIds).size;
+  const repeatedArtifactIdentities = deliveredIds.length - distinctArtifactIdentities;
+  const crossWorkflowArtifactIdentities = [...workflowsByIdentity.values()].filter(
+    (workflows) => workflows.size > 1,
+  ).length;
   // An ABSENT identity is missing proof, not clean evidence. Filtering absent
   // ones out and then guarding on `length > 0` made this check inert whenever
   // no producer emitted an identity -- which is every lane today -- so a cohort
@@ -772,10 +786,20 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
       "distinctness is unproven, so one artifact may stand for many missions",
     );
   }
-  if (deliveredIds.length > 0 && distinctArtifactIdentities < deliveredIds.length) {
+  // A repeated identity WITHIN one workflow is what a deterministic task
+  // produces when two missions write the same bytes: qualification cohort 9
+  // (2026-09-07) had notebook-execution#005 and #009 emit the same notebook
+  // output, each with its own run-scoped write receipts. Every occurrence's
+  // receipts are collected from its own run, so a repeat is not one artifact
+  // standing for many missions; it is reported, never failed. An identity
+  // shared ACROSS workflows cannot come from honest work — a research note and
+  // a notebook do not have the same bytes — and that is the shape a harness
+  // re-reading one stale snapshot for every lane would produce, so it fails.
+  if (crossWorkflowArtifactIdentities > 0) {
     failures.push(
-      `${deliveredIds.length} delivered occurrence(s) report only ${distinctArtifactIdentities} ` +
-      "distinct artifact identity(ies); one artifact cannot satisfy many missions",
+      `${crossWorkflowArtifactIdentities} artifact identity(ies) are shared across different ` +
+      "workflows; unrelated missions cannot honestly produce the same bytes, so one artifact " +
+      "is standing in for many missions",
     );
   }
 
@@ -861,6 +885,10 @@ export function evaluateQualificationCohort({ gate, cells, declaration, records 
     evidenceContractVersion: decl?.evidenceContractVersion ?? null,
     /** Reported ALWAYS, so 300 deliveries against 1 artifact is visible. */
     distinctArtifactIdentities,
+    /** Identical bytes from the same workflow: expected of deterministic tasks. */
+    repeatedArtifactIdentities,
+    /** Identical bytes across different workflows: never honest; fails the cohort. */
+    crossWorkflowArtifactIdentities,
     missingArtifactIdentities,
     readOnlyDeliveries,
     deliveredWithArtifactIdentity: deliveredIds.length,
