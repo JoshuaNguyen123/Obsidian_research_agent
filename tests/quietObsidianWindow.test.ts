@@ -174,11 +174,14 @@ test("the native harness wires the quiet window into launch, attach and teardown
   // focus is handed back, and a renderer-side watchdog keeps handing it back
   // when Obsidian re-focuses itself while opening notes.
   assert.match(module, /setFocusable\?\.\(false\)/u);
-  assert.match(module, /__quietWindowWatchdog = setInterval\(/u);
   // blur() cannot hand focus back from the foreground window (measured); the
   // hand-back minimizes, which activates the next window, then shows inactive.
   assert.match(module, /win\.minimize\?\.\(\);\s*win\.showInactive\?\.\(\);/u);
-  assert.match(module, /if \(win\.isFocused\?\.\(\)\) handBack\(\);/u);
+  // Electron's isFocused() lags the OS, so a polling watchdog thrashed the
+  // window every tick; the hand-back re-runs only on the window's focus event.
+  assert.doesNotMatch(module, /setInterval\(/u, "no polling watchdog");
+  assert.match(module, /win\.on\?\.\("focus", onFocus\)/u);
+  assert.match(module, /win\.removeListener\?\.\("focus"/u, "the visible fallback detaches the listener");
   assert.doesNotMatch(module, /win\.blur\?\.\(\)/u, "blur is not relied on any more");
   assert.match(module, /setFocusable\?\.\(true\)/u, "the visible fallback re-enables activation");
   assert.match(module, /if \(win\.isMinimized\?\.\(\)\) win\.restore\?\.\(\);/u, "the visible fallback un-minimizes");

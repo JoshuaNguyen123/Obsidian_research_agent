@@ -303,15 +303,15 @@ export async function parkObsidianWindowAfterAttachV1(
           }
         };
         if (wasFocused) handBack();
+        // Electron's isFocused() stays true after the hand-back (its flag lags
+        // the OS), so a polling watchdog would minimize and restore the window
+        // every tick for the whole mission. React to the window's own "focus"
+        // event instead: it fires only when the window really gains focus.
         const globalScope = window as unknown as { __quietWindowWatchdog?: unknown };
         if (!globalScope.__quietWindowWatchdog) {
-          globalScope.__quietWindowWatchdog = setInterval(() => {
-            try {
-              if (win.isFocused?.()) handBack();
-            } catch {
-              /* the window may be closing */
-            }
-          }, 750);
+          const onFocus = () => handBack();
+          win.on?.("focus", onFocus);
+          globalScope.__quietWindowWatchdog = onFocus;
         }
         return {
           ok: true,
@@ -367,7 +367,7 @@ export async function parkObsidianWindowAfterAttachV1(
             if (!win) return;
             const globalScope = window as unknown as { __quietWindowWatchdog?: unknown };
             if (globalScope.__quietWindowWatchdog) {
-              clearInterval(globalScope.__quietWindowWatchdog as number);
+              win.removeListener?.("focus", globalScope.__quietWindowWatchdog);
               globalScope.__quietWindowWatchdog = undefined;
             }
             win.setFocusable?.(true);
