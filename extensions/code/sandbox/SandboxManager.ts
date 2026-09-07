@@ -628,20 +628,7 @@ export class SandboxManagerV2 {
     try {
       execution = await this.runner.run(spec, { stagedFiles, signal: input.signal });
     } catch (error) {
-      const unsupportedStaging = sandboxRunnerErrorCodeV2(error) === "unsupported_staging";
-      return {
-        status: "blocked",
-        blocker: blocker(
-          unsupportedStaging
-            ? "sandbox_staging_transport_unsupported"
-            : "sandbox_execution_failed",
-          `Sandbox provider failed before a validated result. ${WITHHELD_BLOCKER_DETAIL_V2}`,
-          unsupportedStaging
-            ? "Install a sandbox runtime implementing verified_staging_bundle and artifact_bundle protocol v1; native execution is not permitted."
-            : "Inspect the provider diagnostic and retry from the prepared action if its fingerprint remains current.",
-          true,
-        ),
-      };
+      return { status: "blocked", blocker: sandboxExecutionFailedBlockerV2(error) };
     }
     assertBoundedRunnerResult(execution);
     const imported: SandboxImportedArtifactV2[] = [];
@@ -874,12 +861,55 @@ function classifyProbeFailureV2(error: unknown): "verdict" | "unavailable" | "no
     case "provider_timeout":
     case "provider_aborted":
       return "no_verdict";
-    // The provider binary never started; it cannot have judged anything.
+    // The provider binary never started, or exited with its own failure
+    // signature (a code above 255) on every launch of the ladder; it cannot
+    // have judged anything.
     case "provider_spawn_failed":
+    case "provider_exit_signature":
       return "unavailable";
     default:
       return "verdict";
   }
+}
+
+/**
+ * The blocker for a runner that threw before a validated result. Its text is
+ * fixed (a caught exception's message can carry host paths or command lines)
+ * except for one number: a provider exit signature is a 32-bit code from the
+ * provider binary itself, never command output, and it is what tells a WSL
+ * launch failure apart from everything else in retained telemetry.
+ */
+export function sandboxExecutionFailedBlockerV2(error: unknown): SandboxDurableBlockerV2 {
+  const code = sandboxRunnerErrorCodeV2(error);
+  if (code === "unsupported_staging") {
+    return blocker(
+      "sandbox_staging_transport_unsupported",
+      `Sandbox provider failed before a validated result. ${WITHHELD_BLOCKER_DETAIL_V2}`,
+      "Install a sandbox runtime implementing verified_staging_bundle and artifact_bundle protocol v1; native execution is not permitted.",
+      true,
+    );
+  }
+  const signature = providerExitSignatureV2(error);
+  return blocker(
+    "sandbox_execution_failed",
+    signature === null
+      ? `Sandbox provider failed before a validated result. ${WITHHELD_BLOCKER_DETAIL_V2}`
+      : `Sandbox provider process exited with signature 0x${signature.exitCode.toString(16)} on ${signature.launches} launch(es); the provider failed to run the command at all. ${WITHHELD_BLOCKER_DETAIL_V2}`,
+    signature === null
+      ? "Inspect the provider diagnostic and retry from the prepared action if its fingerprint remains current."
+      : "The sandbox provider (for WSL2, wsl.exe) could not start the instance; check the provider's own health, then retry from the prepared action if its fingerprint remains current.",
+    true,
+  );
+}
+
+/** Structural read of a provider exit signature, duck-typed like the code. */
+function providerExitSignatureV2(error: unknown): { exitCode: number; launches: number } | null {
+  if (sandboxRunnerErrorCodeV2(error) !== "provider_exit_signature") return null;
+  const record = error as { exitCode?: unknown; launches?: unknown };
+  const exitCode = typeof record.exitCode === "number" && Number.isSafeInteger(record.exitCode) ? record.exitCode : null;
+  if (exitCode === null) return null;
+  const launches = typeof record.launches === "number" && Number.isSafeInteger(record.launches) && record.launches > 0 ? record.launches : 1;
+  return { exitCode, launches };
 }
 
 /**
