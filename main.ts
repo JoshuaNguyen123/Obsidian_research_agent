@@ -296,6 +296,10 @@ import {
   writeMissionLedger,
   type MissionEvidence,
 } from "./src/agent/missionLedger";
+import {
+  resolveElectronDomStorageFlusherV1,
+  type DomStorageFlusherV1,
+} from "./src/platform/electronDomStorageFlush";
 import { createElectronKeepAwakeController } from "./src/platform/electronKeepAwake";
 import {
   createDefaultToolRegistry,
@@ -5510,8 +5514,25 @@ export default class AgenticResearcherPlugin extends Plugin {
     return { ok: true, message: `Queue setup selected ${project.name ?? project.id} for ${team.name ?? team.id}. Move an issue to ${ready.name ?? ready.id} to authorize pickup; then review the recommendations and activate authority.` };
   }
 
+  /** Resolved once; null when this runtime exposes no main-process bridge. */
+  private domStorageFlusher: DomStorageFlusherV1 | null | undefined;
+
+  /**
+   * Native SecretStorage with a disk commit after every write, so a secret
+   * and the data.json record that references it become durable in the same
+   * order they were written (see electronDomStorageFlush).
+   */
   private createObsidianSecretStore(): ObsidianSecretStoreV1 {
-    return new ObsidianSecretStoreV1(this.app.secretStorage);
+    if (this.domStorageFlusher === undefined) {
+      this.domStorageFlusher = resolveElectronDomStorageFlusherV1();
+    }
+    const storage = this.app.secretStorage;
+    const flush = this.domStorageFlusher;
+    return new ObsidianSecretStoreV1({
+      getSecret: (id) => storage.getSecret(id),
+      setSecret: (id, value) => storage.setSecret(id, value),
+      ...(flush ? { flush } : {}),
+    });
   }
 
   private createForegroundSecretStore(referenceId?: string): SecretStoreV1 {

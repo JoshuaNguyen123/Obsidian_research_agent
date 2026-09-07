@@ -337,3 +337,115 @@ test("a failing survivor sweep still defers to the terminal drain recheck", asyn
 
   assert.equal(processDrainChecks, 2);
 });
+
+test("a graceful quit that exits the root replaces the owned-tree kill", async () => {
+  // 2026-09-07: SecretStorage lives in DOMStorage, committed on a delay; a
+  // taskkill inside that delay lost a rotated Linear OAuth pair that
+  // data.json still referenced. Asking the app to quit lets Chromium commit
+  // before the process is gone. The kill stays as the fallback only.
+  const calls: string[] = [];
+  await terminateControlledObsidian(
+    { pid: 2468, exitCode: null },
+    {
+      requestGracefulExit: async () => {
+        calls.push("graceful-request");
+        return true;
+      },
+      terminateOwnedTree: async () => {
+        calls.push("unexpected-terminate");
+      },
+      waitForOwnedExit: async (phase) => {
+        calls.push(`owned-exit:${phase}`);
+        return true;
+      },
+      waitForNoRunningProcess: async () => {
+        calls.push("process-drain");
+        return true;
+      },
+      waitForCdpClose: async () => {
+        calls.push("cdp-close");
+        return true;
+      },
+    },
+  );
+  assert.deepEqual(calls, [
+    "graceful-request",
+    "owned-exit:graceful",
+    "owned-exit:initial",
+    "process-drain",
+    "cdp-close",
+  ]);
+});
+
+test("a graceful quit that does not finish in its bound hands the root to the kill unchanged", async () => {
+  const calls: string[] = [];
+  await terminateControlledObsidian(
+    { pid: 1357, exitCode: null },
+    {
+      requestGracefulExit: async () => {
+        calls.push("graceful-request");
+        return true;
+      },
+      terminateOwnedTree: async (pid) => {
+        calls.push(`terminate:${pid}`);
+      },
+      waitForOwnedExit: async (phase) => {
+        calls.push(`owned-exit:${phase}`);
+        return phase !== "graceful";
+      },
+      waitForNoRunningProcess: async () => true,
+      waitForCdpClose: async () => true,
+    },
+  );
+  assert.deepEqual(calls, [
+    "graceful-request",
+    "owned-exit:graceful",
+    "terminate:1357",
+    "owned-exit:initial",
+  ]);
+});
+
+test("an undeliverable or throwing graceful request goes straight to the kill", async () => {
+  for (const request of [async () => false, async () => { throw new Error("no bridge"); }]) {
+    const calls: string[] = [];
+    await terminateControlledObsidian(
+      { pid: 8642, exitCode: null },
+      {
+        requestGracefulExit: request,
+        terminateOwnedTree: async (pid) => {
+          calls.push(`terminate:${pid}`);
+        },
+        waitForOwnedExit: async (phase) => {
+          calls.push(`owned-exit:${phase}`);
+          return true;
+        },
+        waitForNoRunningProcess: async () => true,
+        waitForCdpClose: async () => true,
+      },
+    );
+    assert.deepEqual(calls, ["terminate:8642", "owned-exit:initial"]);
+  }
+});
+
+test("an already-exited root is never asked to quit", async () => {
+  const calls: string[] = [];
+  await terminateControlledObsidian(
+    { pid: 9753, exitCode: 0 },
+    {
+      requestGracefulExit: async () => {
+        calls.push("unexpected-graceful-request");
+        return true;
+      },
+      terminateOwnedTree: async () => {
+        calls.push("unexpected-terminate");
+      },
+      waitForOwnedExit: async (phase) => {
+        calls.push(`owned-exit:${phase}`);
+        return true;
+      },
+      waitForNoRunningProcess: async () => true,
+      waitForCdpClose: async () => true,
+    },
+  );
+  assert.deepEqual(calls, ["owned-exit:initial"]);
+});

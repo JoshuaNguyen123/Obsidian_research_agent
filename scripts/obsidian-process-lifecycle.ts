@@ -6,6 +6,13 @@ export interface ControlledProcessHandle {
 /**
  * Which pass a process readback is running in.
  *
+ *   graceful — the app was ASKED to quit (Electron app.quit through the
+ *             renderer bridge) and nothing has been killed yet. A normal
+ *             Chromium shutdown commits DOMStorage — where Obsidian keeps its
+ *             SecretStorage — so a secret rotated seconds before teardown
+ *             reaches disk instead of dying with the process (the 2026-09-07
+ *             Linear OAuth loss). The bound is short: a quit that does not
+ *             finish promptly is handed to the kill below, unchanged.
  *   initial — nothing has been done since the kill was dispatched, so the probe
  *             must allow the OS the full unwind time it may legitimately need.
  *   recheck — the survivor sweep has just run. It force-kills with
@@ -15,9 +22,17 @@ export interface ControlledProcessHandle {
  *             pure duplication: it repeated a wait that had already expired
  *             with no remediation in between.
  */
-export type TeardownProbePhase = "initial" | "recheck";
+export type TeardownProbePhase = "graceful" | "initial" | "recheck";
 
 export interface ControlledObsidianTeardownOperations {
+  /**
+   * Optional: ask the application to exit on its own before anything is
+   * killed. Resolves true when the request was delivered; false (or a throw)
+   * means the bridge was unavailable and the teardown proceeds straight to
+   * the owned-tree kill. When delivered, the "graceful" owned-exit wait
+   * decides whether the kill is still needed.
+   */
+  requestGracefulExit?(): Promise<boolean>;
   terminateOwnedTree(pid: number): Promise<void>;
   waitForOwnedExit(phase: TeardownProbePhase): Promise<boolean>;
   waitForNoRunningProcess(phase: TeardownProbePhase): Promise<boolean>;
@@ -49,7 +64,23 @@ export async function terminateControlledObsidian(
   }
 
   let dispatchError: string | null = null;
-  if (process.exitCode === null) {
+  let exitedGracefully = false;
+  if (process.exitCode === null && operations.requestGracefulExit) {
+    let delivered = false;
+    try {
+      delivered = await operations.requestGracefulExit();
+    } catch {
+      delivered = false;
+    }
+    if (delivered) {
+      try {
+        exitedGracefully = await operations.waitForOwnedExit("graceful");
+      } catch {
+        exitedGracefully = false;
+      }
+    }
+  }
+  if (process.exitCode === null && !exitedGracefully) {
     try {
       await operations.terminateOwnedTree(process.pid);
     } catch (error) {

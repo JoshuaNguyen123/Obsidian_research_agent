@@ -24,6 +24,16 @@ const METADATA_KEYS = new Set([
 export interface ObsidianSecretStoragePortV1 {
   getSecret(id: string): string | null;
   setSecret(id: string, value: string): void;
+  /**
+   * Commit the storage backing SecretStorage to disk now. Obsidian keeps
+   * secrets in Chromium DOMStorage, which is committed on a delay; the
+   * plugin's data.json that references a secret is written straight through.
+   * Without this, a kill inside that delay leaves a durable reference to a
+   * secret that never existed on disk (the 2026-09-07 Linear OAuth loss).
+   * Optional and best-effort: a missing or failing flush changes nothing
+   * about what the write already did.
+   */
+  flush?(): void;
 }
 
 interface StoredSecretEnvelopeV1 {
@@ -86,8 +96,10 @@ export class ObsidianSecretStoreV1 implements SecretStoreV1 {
     const readback = this.storage.getSecret(referenceId);
     if (readback !== serialized) {
       this.storage.setSecret(referenceId, "");
+      this.flushAfterWrite();
       throw new Error("Obsidian SecretStorage write readback failed.");
     }
+    this.flushAfterWrite();
     return description;
   }
 
@@ -146,7 +158,19 @@ export class ObsidianSecretStoreV1 implements SecretStoreV1 {
     requireReferenceId(referenceId);
     if (!this.storage.getSecret(referenceId)) return false;
     this.storage.setSecret(referenceId, "");
-    return this.storage.getSecret(referenceId) === "";
+    const removed = this.storage.getSecret(referenceId) === "";
+    this.flushAfterWrite();
+    return removed;
+  }
+
+  /** Every write is followed by a commit request; see the port contract. */
+  private flushAfterWrite(): void {
+    try {
+      this.storage.flush?.();
+    } catch {
+      // The write itself already succeeded and was read back; a flush bridge
+      // that throws leaves Chromium's own commit schedule in force.
+    }
   }
 
   private readEnvelope(referenceId: string): StoredSecretEnvelopeV1 {

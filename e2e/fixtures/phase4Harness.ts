@@ -9,6 +9,7 @@ import {
   terminateControlledObsidian,
   type TeardownProbePhase,
 } from "../../scripts/obsidian-process-lifecycle";
+import { requestGracefulObsidianQuitV1 } from "./gracefulObsidianQuit";
 import {
   describeSweepOutcomeV1,
   enumerateObsidianProcessesV1,
@@ -292,7 +293,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
           ).catch(() => false);
         }
         try {
-          await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
+          await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page);
         } catch (error) {
           teardownError ??= error;
         }
@@ -319,7 +320,9 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
     };
     return harness;
   } catch (error) {
-    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch(() => undefined);
+    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page).catch(
+      () => undefined,
+    );
     await browser?.close().catch(() => undefined);
     await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch(() => undefined);
     await removeNewPhase4OwnedWorkspaces(ownedWorkspacesBefore, marker).catch(
@@ -1206,10 +1209,12 @@ async function findVaultPage(browser: Browser, expectedVaultRoot: string): Promi
 /** See nativeObsidianHarness: initial passes bound the OS unwind, the
  *  post-sweep recheck only CONFIRMS a synchronous TerminateProcess. */
 const PHASE4_OWNED_EXIT_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  graceful: 10_000,
   initial: 30_000,
   recheck: 10_000,
 };
 const PHASE4_PROCESS_DRAIN_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  graceful: 10_000,
   initial: 30_000,
   recheck: 10_000,
 };
@@ -1218,11 +1223,14 @@ async function terminateObsidian(
   processHandle: ChildProcessWithoutNullStreams | null,
   cdpPort: number,
   rootCreatedAtMs: number | null,
+  page: Page | null,
 ): Promise<void> {
   if (!processHandle?.pid) return;
   const rootPid = processHandle.pid;
   const teardownStartedAtMs = Date.now();
   await terminateControlledObsidian(processHandle, {
+    requestGracefulExit: async () =>
+      (await requestGracefulObsidianQuitV1(page)) === "dispatched",
     terminateOwnedTree: async (pid) => {
       await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"]).catch(() => {
         processHandle.kill();

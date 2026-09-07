@@ -10,6 +10,7 @@ import {
   terminateControlledObsidian,
   type TeardownProbePhase,
 } from "../../scripts/obsidian-process-lifecycle";
+import { requestGracefulObsidianQuitV1 } from "./gracefulObsidianQuit";
 import {
   appendHostEventV1,
   describeSweepOutcomeV1,
@@ -295,7 +296,7 @@ export async function startNativeObsidianHarness(
           "Obsidian still requested disposable-vault trust after the controlled restart.",
         );
       }
-      await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
+      await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page, options.label);
       await withTimeout(browser.close(), 5_000, "Disposable-vault trust restart close")
         .catch(() => undefined);
       processHandle = null;
@@ -345,7 +346,7 @@ export async function startNativeObsidianHarness(
         if (closed) {
           throw new Error("Cannot relaunch a closed native Obsidian harness.");
         }
-        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
+        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page, options.label);
         if (browser) {
           await withTimeout(browser.close(), 5_000, "Playwright CDP relaunch close")
             .catch(() => undefined);
@@ -380,7 +381,13 @@ export async function startNativeObsidianHarness(
             },
           );
         }
-        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch((error) => {
+        await terminateObsidian(
+          processHandle,
+          cdpPort,
+          rootCreatedAtMs,
+          activePage,
+          options.label,
+        ).catch((error) => {
           teardownError ??= error;
         });
         if (parkedWindowState) {
@@ -451,7 +458,13 @@ export async function startNativeObsidianHarness(
         "Native Obsidian failed-start beforeClose hook",
       ).catch(() => undefined);
     }
-    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch(() => undefined);
+    await terminateObsidian(
+      processHandle,
+      cdpPort,
+      rootCreatedAtMs,
+      failedPage,
+      options.label,
+    ).catch(() => undefined);
     if (failedBrowser) {
       await withTimeout(failedBrowser.close(), 5_000, "Playwright failed-start CDP close")
         .catch(() => undefined);
@@ -1141,10 +1154,15 @@ async function waitForCdp(
  * true, not the wait longer.
  */
 const OWNED_EXIT_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  // A graceful quit closed the page in under 100 ms when probed on
+  // 2026-09-07; ten seconds absorbs a slow plugin unload without holding a
+  // teardown that will be killed anyway.
+  graceful: 10_000,
   initial: 30_000,
   recheck: 10_000,
 };
 const PROCESS_DRAIN_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  graceful: 10_000,
   initial: 45_000,
   recheck: 10_000,
 };
@@ -1153,6 +1171,8 @@ async function terminateObsidian(
   processHandle: ChildProcessWithoutNullStreams | null,
   cdpPort: number,
   rootCreatedAtMs: number | null,
+  page: Page | null,
+  label: string,
 ): Promise<void> {
   if (!processHandle?.pid) return;
   const rootPid = processHandle.pid;
@@ -1163,6 +1183,11 @@ async function terminateObsidian(
   // Mark BEFORE dispatching the kill so the exit record cannot race the flag.
   hostTeardownRequested = true;
   await terminateControlledObsidian(processHandle, {
+    requestGracefulExit: async () => {
+      const outcome = await requestGracefulObsidianQuitV1(page);
+      console.log(`[teardown] ${label}: graceful quit ${outcome}`);
+      return outcome === "dispatched";
+    },
     terminateOwnedTree: async (pid) => {
       // Bounded and hidden. This dispatch had NO timeout, so a taskkill that
       // itself blocked — reachable when a process is wedged in termination,
