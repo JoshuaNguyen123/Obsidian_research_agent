@@ -14,6 +14,8 @@ import {
   quietObsidianWindowStateV1,
   resolveObsidianVaultIdV1,
   restoreObsidianWindowStateAfterExitV1,
+  judgeRendererProbeV1,
+  RENDERER_PROBE_THRESHOLDS,
 } from "../e2e/fixtures/quietObsidianWindow";
 
 const LIVE_STATE = {
@@ -185,4 +187,41 @@ test("the native harness wires the quiet window into launch, attach and teardown
   assert.doesNotMatch(module, /win\.blur\?\.\(\)/u, "blur is not relied on any more");
   assert.match(module, /setFocusable\?\.\(true\)/u, "the visible fallback re-enables activation");
   assert.match(module, /if \(win\.isMinimized\?\.\(\)\) win\.restore\?\.\(\);/u, "the visible fallback un-minimizes");
+});
+
+test("the renderer probe judge: busy windows are sampled again, timers without frames conclude throttled, a never-live renderer is not parked", () => {
+  const busy = { frames: 1, timerTicks: 0, elapsedMs: 812, timedOut: false };
+  const stalled = { frames: 0, timerTicks: 0, elapsedMs: 1500, timedOut: true };
+  const live = { frames: 19, timerTicks: 96, elapsedMs: 401, timedOut: false };
+  const throttled = { frames: 1, timerTicks: 88, elapsedMs: 400, timedOut: false };
+
+  assert.deepEqual(judgeRendererProbeV1([live]), { verdict: "live", frames: 19, windows: 1, timedOut: false });
+  // Cohorts 9-10 (2026-09-07): one frame in the first window while Obsidian
+  // indexed the vault, then normal frames. Ten lanes in ninety-two were put
+  // back on screen for this; they must stay parked.
+  assert.deepEqual(judgeRendererProbeV1([busy, stalled, live]), { verdict: "live", frames: 19, windows: 3, timedOut: true });
+  assert.deepEqual(judgeRendererProbeV1([throttled, throttled]), { verdict: "throttled", frames: 1, windows: 2, timedOut: false });
+  // One timers-without-frames window between busy ones concludes nothing.
+  assert.equal(judgeRendererProbeV1([throttled, busy, live]).verdict, "live");
+  const never = judgeRendererProbeV1(
+    Array.from({ length: RENDERER_PROBE_THRESHOLDS.maxWindows }, () => busy),
+  );
+  assert.equal(never.verdict, "busy");
+  assert.equal(never.windows, RENDERER_PROBE_THRESHOLDS.maxWindows);
+  assert.deepEqual(judgeRendererProbeV1([]), { verdict: "busy", frames: 0, windows: 0, timedOut: false });
+  assert.ok(RENDERER_PROBE_THRESHOLDS.maxWindows >= 6, "a busy start gets several windows of patience");
+  assert.ok(RENDERER_PROBE_THRESHOLDS.minTimerTicks < 40, "an idle main thread runs ~100 zero-delay timers per 400ms; the bar must sit well below that");
+});
+
+test("the attach step samples frames and timers side by side and lets the one judge decide", async () => {
+  const module = await readFile(
+    path.join(__dirname, "..", "e2e", "fixtures", "quietObsidianWindow.ts"),
+    "utf8",
+  );
+  assert.match(module, /setTimeout\(timerTick, 0\)/u, "zero-delay timers tell a busy main thread from a throttled compositor");
+  assert.match(module, /requestAnimationFrame\(frameTick\)/u);
+  assert.match(module, /RENDERER_PROBE_THRESHOLDS,\s*\)\) as RendererProbeSamples/u, "the sampler receives the shared thresholds");
+  assert.match(module, /const judgement = judgeRendererProbeV1\(probe\.history\)/u, "one judge decides");
+  assert.match(module, /judgement\.verdict === "live" && probe\.visibility === "visible" && !parked\.minimized/u);
+  assert.doesNotMatch(module, /MIN_LIVE_FRAMES/u, "no second copy of the live threshold");
 });

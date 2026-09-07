@@ -21,8 +21,12 @@
  * for two stable animation frames, so a parked window would hang every click.
  * The launch therefore adds the three Chromium switches below, the renderer
  * disables background throttling on itself, and the attach step measures
- * requestAnimationFrame for real; if frames stop, the window is put back on
- * screen and the lane proceeds visibly rather than silently slower.
+ * requestAnimationFrame for real. Frames are sampled in short windows and the
+ * probe keeps sampling while the main thread is merely busy (Obsidian indexes
+ * the vault right after launch, and its timers starve together with its
+ * frames); only a renderer whose timers run while its frames do not, or one
+ * that never proves itself live, is put back on screen, and that lane proceeds
+ * visibly rather than silently slower.
  *
  * `E2E_SHOW_OBSIDIAN_WINDOW=1` (the demo recorder) keeps everything visible
  * and skips all of this.
@@ -201,6 +205,9 @@ export interface QuietWindowAttachReportV1 {
   status: "parked" | "restored-visible" | "unavailable";
   detail: string;
   frames?: number;
+  /** Sampling windows it took the renderer probe to reach its verdict. */
+  probeWindows?: number;
+  probeVerdict?: RendererProbeVerdictV1;
   visibility?: string;
   wasMaximized?: boolean;
   wasFocused?: boolean;
@@ -217,13 +224,84 @@ interface RendererParkResult {
   after?: { x: number; y: number; width: number; height: number };
 }
 
-interface RendererFrameProbe {
+/**
+ * How the attach step proves the parked renderer is alive. Each window counts
+ * animation frames and zero-delay timer ticks side by side: enough frames say
+ * "live"; timers without frames say the compositor is throttled; neither says
+ * the main thread is busy (vault indexing right after launch) and the window
+ * is sampled again. Only a throttled or never-live renderer is put back on
+ * screen, so a busy start no longer flashes the window at the user (cohorts
+ * 9-10, 2026-09-07: one launch in nine did, and every one of them passed).
+ */
+export const RENDERER_PROBE_THRESHOLDS = {
+  /** Length of one sampling window. */
+  windowMs: 400,
+  /** Frames in one window that prove the compositor runs. */
+  minLiveFrames: 5,
+  /** Zero-delay timer ticks in one window that prove the main thread was free. */
+  minTimerTicks: 10,
+  /** Windows sampled before a never-live renderer is put back on screen. */
+  maxWindows: 8,
+  /** Consecutive timers-without-frames windows that conclude "throttled". */
+  throttledWindowsToConclude: 2,
+  /** A window in which neither frames nor timers ran at all ends here. */
+  windowTimeoutMs: 1500,
+} as const;
+
+export interface RendererProbeWindowV1 {
   frames: number;
-  visibility: string;
+  timerTicks: number;
+  elapsedMs: number;
   timedOut: boolean;
 }
 
-const MIN_LIVE_FRAMES = 5;
+export type RendererProbeVerdictV1 = "live" | "throttled" | "busy";
+
+export interface RendererProbeJudgementV1 {
+  verdict: RendererProbeVerdictV1;
+  /** Frames in the live window, or the best window when none was live. */
+  frames: number;
+  /** Windows it took to reach the verdict. */
+  windows: number;
+  timedOut: boolean;
+}
+
+interface RendererProbeSamples {
+  history: RendererProbeWindowV1[];
+  visibility: string;
+}
+
+/**
+ * The single judge of a renderer probe. The in-page sampler only decides when
+ * to stop sampling; whether the window stays parked is decided here, from the
+ * returned history, so the rule lives in one tested place.
+ */
+export function judgeRendererProbeV1(
+  history: readonly RendererProbeWindowV1[],
+  thresholds: typeof RENDERER_PROBE_THRESHOLDS = RENDERER_PROBE_THRESHOLDS,
+): RendererProbeJudgementV1 {
+  let best = 0;
+  let throttledRun = 0;
+  let timedOut = false;
+  for (let index = 0; index < history.length; index += 1) {
+    const sample = history[index]!;
+    best = Math.max(best, sample.frames);
+    timedOut = timedOut || sample.timedOut;
+    if (sample.frames >= thresholds.minLiveFrames) {
+      return { verdict: "live", frames: sample.frames, windows: index + 1, timedOut };
+    }
+    throttledRun = sample.timerTicks >= thresholds.minTimerTicks ? throttledRun + 1 : 0;
+    if (throttledRun >= thresholds.throttledWindowsToConclude) {
+      return { verdict: "throttled", frames: best, windows: index + 1, timedOut };
+    }
+  }
+  return {
+    verdict: throttledRun > 0 ? "throttled" : "busy",
+    frames: best,
+    windows: history.length,
+    timedOut,
+  };
+}
 
 /**
  * Confirm the placement from inside the renderer, then prove animation frames
@@ -328,27 +406,76 @@ export async function parkObsidianWindowAfterAttachV1(
     if (!parked.ok) {
       report = { status: "unavailable", detail: parked.reason ?? "unknown" };
     } else {
+      // Sampler only: it counts frames and zero-delay timer ticks per window
+      // and stops when a window is live, when timers-without-frames repeats,
+      // or when the window budget is spent. The verdict is the judge's below.
       const probe = (await page.evaluate(
-        () =>
+        (t) =>
           new Promise((resolve) => {
-            let frames = 0;
-            const start = performance.now();
-            const done = (timedOut: boolean) =>
-              resolve({ frames, visibility: document.visibilityState, timedOut });
-            const tick = () => {
-              frames += 1;
-              if (performance.now() - start < 400) requestAnimationFrame(tick);
-              else done(false);
+            const history: Array<{
+              frames: number;
+              timerTicks: number;
+              elapsedMs: number;
+              timedOut: boolean;
+            }> = [];
+            let throttledRun = 0;
+            const finish = () => resolve({ history, visibility: document.visibilityState });
+            const sample = () => {
+              let frames = 0;
+              let timerTicks = 0;
+              let settled = false;
+              let guard: ReturnType<typeof setTimeout> | undefined;
+              const start = performance.now();
+              const settle = (timedOut: boolean) => {
+                if (settled) return;
+                settled = true;
+                if (guard !== undefined) clearTimeout(guard);
+                history.push({
+                  frames,
+                  timerTicks,
+                  elapsedMs: Math.round(performance.now() - start),
+                  timedOut,
+                });
+                const live = frames >= t.minLiveFrames;
+                throttledRun = !live && timerTicks >= t.minTimerTicks ? throttledRun + 1 : 0;
+                if (
+                  live ||
+                  throttledRun >= t.throttledWindowsToConclude ||
+                  history.length >= t.maxWindows
+                ) {
+                  finish();
+                } else {
+                  sample();
+                }
+              };
+              const frameTick = () => {
+                if (settled) return;
+                frames += 1;
+                if (performance.now() - start < t.windowMs) requestAnimationFrame(frameTick);
+                else settle(false);
+              };
+              const timerTick = () => {
+                if (settled) return;
+                timerTicks += 1;
+                if (performance.now() - start < t.windowMs) setTimeout(timerTick, 0);
+                else settle(false);
+              };
+              guard = setTimeout(() => settle(true), t.windowTimeoutMs);
+              requestAnimationFrame(frameTick);
+              setTimeout(timerTick, 0);
             };
-            requestAnimationFrame(tick);
-            setTimeout(() => done(true), 1500);
+            sample();
           }),
-      )) as RendererFrameProbe;
-      if (probe.frames >= MIN_LIVE_FRAMES && probe.visibility === "visible" && !parked.minimized) {
+        RENDERER_PROBE_THRESHOLDS,
+      )) as RendererProbeSamples;
+      const judgement = judgeRendererProbeV1(probe.history);
+      if (judgement.verdict === "live" && probe.visibility === "visible" && !parked.minimized) {
         report = {
           status: "parked",
           detail: `off-screen at ${parked.after?.x},${parked.after?.y} (${parked.after?.width}x${parked.after?.height}), focus handed back=${String(!parked.stillFocused)}`,
-          frames: probe.frames,
+          frames: judgement.frames,
+          probeWindows: judgement.windows,
+          probeVerdict: judgement.verdict,
           visibility: probe.visibility,
           wasMaximized: parked.wasMaximized,
           wasFocused: parked.wasFocused,
@@ -378,10 +505,19 @@ export async function parkObsidianWindowAfterAttachV1(
           },
           { before: parked.before, wasMaximized: parked.wasMaximized },
         );
+        const windowMs = RENDERER_PROBE_THRESHOLDS.windowMs;
+        const why =
+          judgement.verdict === "live"
+            ? `renderer is live (${judgement.frames} frames in ${windowMs}ms) but the window ${parked.minimized ? "stayed minimized" : `reports visibility ${probe.visibility}`}`
+            : judgement.verdict === "throttled"
+              ? `renderer's animation frames stopped while its timers kept running (best ${judgement.frames} frames in ${windowMs}ms over ${judgement.windows} window(s))`
+              : `renderer never proved itself live in ${judgement.windows} window(s) (best ${judgement.frames} frames in ${windowMs}ms, main thread busy${judgement.timedOut ? ", probe timed out" : ""})`;
         report = {
           status: "restored-visible",
-          detail: `renderer stopped animating while parked (frames ${probe.frames} in 400ms, visibility ${probe.visibility}${probe.timedOut ? ", probe timed out" : ""}${parked.minimized ? ", window stayed minimized" : ""}); window put back on screen`,
-          frames: probe.frames,
+          detail: `${why}; window put back on screen`,
+          frames: judgement.frames,
+          probeWindows: judgement.windows,
+          probeVerdict: judgement.verdict,
           visibility: probe.visibility,
           wasMaximized: parked.wasMaximized,
           wasFocused: parked.wasFocused,
@@ -396,7 +532,12 @@ export async function parkObsidianWindowAfterAttachV1(
   }
   console.log(
     `[quiet-window] ${label}: ${report.status} — ${report.detail}` +
-      (report.frames !== undefined ? ` | rAF ${report.frames}/400ms` : "") +
+      (report.frames !== undefined
+        ? ` | rAF ${report.frames}/${RENDERER_PROBE_THRESHOLDS.windowMs}ms` +
+          (report.probeWindows !== undefined && report.probeWindows > 1
+            ? ` after ${report.probeWindows} windows`
+            : "")
+        : "") +
       (report.wasMaximized !== undefined
         ? ` | launched ${report.wasMaximized ? "maximized" : "windowed"}, focused=${String(report.wasFocused)}`
         : ""),
