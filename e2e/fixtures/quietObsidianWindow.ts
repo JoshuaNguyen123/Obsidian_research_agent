@@ -277,7 +277,25 @@ export async function parkObsidianWindowAfterAttachV1(
         const height = work && work.height > 0 ? work.height : before.height;
         win.setBounds?.({ x, y, width, height });
         win.setSkipTaskbar?.(true);
+        // An invisible window that owns keyboard focus is worse than a visible
+        // one: the user's keystrokes vanish into the parked editor. Refuse
+        // activation from now on, hand focus to the next window in the Z order
+        // (Chromium's Deactivate does exactly that), and keep doing so from
+        // inside the renderer, because Obsidian re-focuses its window when it
+        // opens notes during the mission. CDP input never needs OS focus;
+        // Playwright's focus emulation keeps the page "focused" for the DOM.
+        win.setFocusable?.(false);
         if (wasFocused) win.blur?.();
+        const globalScope = window as unknown as { __quietWindowWatchdog?: unknown };
+        if (!globalScope.__quietWindowWatchdog) {
+          globalScope.__quietWindowWatchdog = setInterval(() => {
+            try {
+              if (win.isFocused?.()) win.blur?.();
+            } catch {
+              /* the window may be closing */
+            }
+          }, 750);
+        }
         return { ok: true, wasMaximized, wasFocused, before, after: win.getBounds() };
       },
       { x: QUIET_WINDOW_X, y: QUIET_WINDOW_Y },
@@ -322,6 +340,12 @@ export async function parkObsidianWindowAfterAttachV1(
             }
             const win = remote?.getCurrentWindow?.();
             if (!win) return;
+            const globalScope = window as unknown as { __quietWindowWatchdog?: unknown };
+            if (globalScope.__quietWindowWatchdog) {
+              clearInterval(globalScope.__quietWindowWatchdog as number);
+              globalScope.__quietWindowWatchdog = undefined;
+            }
+            win.setFocusable?.(true);
             win.setSkipTaskbar?.(false);
             if (before) win.setBounds?.(before);
             if (wasMaximized) win.maximize?.();

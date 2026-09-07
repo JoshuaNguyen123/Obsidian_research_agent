@@ -170,4 +170,11 @@ test("the native harness wires the quiet window into launch, attach and teardown
   );
   assert.match(module, /getPrimaryDisplay\?\.\(\)\?\.workAreaSize/u);
   assert.match(module, /setBackgroundThrottling\?\.\(false\)/u);
+  // A parked window must never own the user's keyboard: activation is refused,
+  // focus is handed back, and a renderer-side watchdog keeps handing it back
+  // when Obsidian re-focuses itself while opening notes.
+  assert.match(module, /setFocusable\?\.\(false\)/u);
+  assert.match(module, /__quietWindowWatchdog = setInterval\(/u);
+  assert.match(module, /if \(win\.isFocused\?\.\(\)\) win\.blur\?\.\(\);/u);
+  assert.match(module, /setFocusable\?\.\(true\)/u, "the visible fallback re-enables activation");
 });
