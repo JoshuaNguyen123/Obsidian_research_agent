@@ -362,6 +362,8 @@ import {
   formatUnproductiveModelResponseMessage,
   UNPRODUCTIVE_MODEL_RESPONSE_METRIC_NAME_V1,
   UNPRODUCTIVE_MODEL_RESPONSE_STOP_THRESHOLD_V1,
+  degenerateStreamVerdictFromError,
+  retryRequestAfterDegenerateStreamV1,
 } from "./model/degenerateStreamGuard";
 import {
   createRunPlan,
@@ -28199,11 +28201,14 @@ async function chatForAgentStep(
     );
   }
 
+  // Same rule as the streaming wrapper: a degenerate reply is retried with a
+  // different request, never the same one.
+  let attemptRequest = request;
   try {
     const response = await withModelRetry(
       () =>
         withModelWaitStatus(
-          () => modelClient.chat(request),
+          () => modelClient.chat(attemptRequest),
           events,
           "model API response",
           step,
@@ -28217,7 +28222,13 @@ async function chatForAgentStep(
             : undefined,
         abortSignal: request.abortSignal,
         onRetry: (attempt, error, delayMs) => {
-          if (isRateLimitModelError(error)) {
+          const verdict = degenerateStreamVerdictFromError(error);
+          if (verdict) {
+            attemptRequest = retryRequestAfterDegenerateStreamV1(request, verdict);
+            events.onStatus?.(
+              `Model output collapsed into repetition; retrying model step ${step} with a repetition nudge and thinking off (attempt ${attempt}) after ${delayMs}ms.`,
+            );
+          } else if (isRateLimitModelError(error)) {
             events.onStatus?.(
               `Model provider is rate limiting this account; waiting ${Math.round(delayMs / 1000)} s before retrying model step ${step} (attempt ${attempt}): ${getUnknownErrorMessage(error)}`,
             );
@@ -29188,11 +29199,15 @@ async function streamChatWithThinkingFallback({
   /** Agent-loop step, when known; retries are then recorded as diagnostics. */
   step?: number;
 }): Promise<ModelChatResponse> {
+  // A retry after a degenerate stream must not be the same request (cohort
+  // 12, 2026-09-07: the identical retry collapsed again within seconds). The
+  // attempt closure reads this binding, which the retry hook rewrites.
+  let attemptRequest = request;
   try {
     return await withModelRetry(
       () =>
         withModelWaitStatus(
-          () => modelClient.streamChat(request, streamEvents),
+          () => modelClient.streamChat(attemptRequest, streamEvents),
           events,
           "streaming model response",
           step,
@@ -29201,9 +29216,17 @@ async function streamChatWithThinkingFallback({
         abortSignal: request.abortSignal,
         shouldRetry,
         onRetry: (attempt, error, delayMs) => {
-          events.onStatus?.(
-            `Transient streaming model error; retrying stream (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
-          );
+          const verdict = degenerateStreamVerdictFromError(error);
+          if (verdict) {
+            attemptRequest = retryRequestAfterDegenerateStreamV1(request, verdict);
+            events.onStatus?.(
+              `Model output collapsed into repetition; retrying stream with a repetition nudge and thinking off (attempt ${attempt}) after ${delayMs}ms.`,
+            );
+          } else {
+            events.onStatus?.(
+              `Transient streaming model error; retrying stream (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
+            );
+          }
           emitModelRetryDiagnostic(events, step, attempt, delayMs, error);
         },
       },

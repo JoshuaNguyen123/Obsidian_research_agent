@@ -41,6 +41,7 @@
  *   see consecutive steps and the remaining budget, decides what to do.
  */
 
+import type { ModelChatMessage, ModelChatRequest } from "./types";
 import { measureAssistantPayloadChars } from "./modelCallEvidence";
 
 /** The window that must be wholly periodic before the stream is condemned. */
@@ -88,6 +89,66 @@ export function createDegenerateStreamDetector(): DegenerateStreamDetector {
       return verdict;
     },
   };
+}
+
+/**
+ * The verdict carried by a thrown degenerate-stream error, or null. Read
+ * structurally (an instance check would tie the runner to one bundle copy of
+ * the error class): category invalid_response with the detector's details.
+ */
+export function degenerateStreamVerdictFromError(
+  error: unknown,
+): DegenerateStreamVerdict | null {
+  if (!error || typeof error !== "object") return null;
+  const record = error as { name?: unknown; category?: unknown; details?: unknown };
+  if (record.name !== "ModelClientError" || record.category !== "invalid_response") {
+    return null;
+  }
+  const details = record.details;
+  if (!details || typeof details !== "object") return null;
+  const { unit, windowChars } = details as { unit?: unknown; windowChars?: unknown };
+  if (typeof unit !== "string" || unit.length === 0) return null;
+  if (typeof windowChars !== "number" || !Number.isFinite(windowChars)) return null;
+  return { unit, windowChars };
+}
+
+/**
+ * The request to send INSTEAD of repeating one whose reply collapsed. A
+ * degenerate stream is an `invalid_response`, which the retry policy treats as
+ * a malformed provider body and retries once, and until reliability cohort 12
+ * (2026-09-07) that retry was the identical request: the final synthesis of a
+ * compound mission collapsed into "\\nak" after thirty minutes, the identical
+ * retry collapsed into ".3" within seconds, and the mission stopped. The retry
+ * now differs in every way the provider can see: a system nudge naming the
+ * collapse, thinking off (a long reasoning stream is where a loop starts), a
+ * repetition penalty, and a fresh sampling seed. The original request object
+ * is never mutated.
+ */
+export function retryRequestAfterDegenerateStreamV1(
+  request: ModelChatRequest,
+  verdict: DegenerateStreamVerdict,
+  seed: number = freshSeed(),
+): ModelChatRequest {
+  const shown = verdict.unit.length > 16 ? `${verdict.unit.slice(0, 16)}…` : verdict.unit;
+  const nudge: ModelChatMessage = {
+    role: "system",
+    content:
+      `Your previous reply to this exact request collapsed into repeating ${JSON.stringify(shown)} ` +
+      `for ${verdict.windowChars} characters and was discarded before anything was saved. ` +
+      "Write the reply once, in plain prose, without repeated lines, characters, or list markers, " +
+      "and stop as soon as it is complete.",
+  };
+  return {
+    ...request,
+    messages: [...request.messages, nudge],
+    think: undefined,
+    options: { ...(request.options ?? {}), repeat_penalty: 1.15, seed },
+    evidencePhase: "retry",
+  };
+}
+
+function freshSeed(): number {
+  return Math.floor(Math.random() * 0x7fffffff);
 }
 
 /** Human-readable message for the thrown ModelClientError; the runner's

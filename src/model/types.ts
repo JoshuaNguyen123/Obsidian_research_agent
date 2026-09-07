@@ -94,6 +94,10 @@ export interface ModelRequestOptions {
   top_p?: number;
   /** Ollama context window. Not sent to OpenAI-compatible endpoints (no equivalent field). */
   num_ctx?: number;
+  /** Ollama repetition penalty; set only on the retry after a degenerate stream. */
+  repeat_penalty?: number;
+  /** Ollama sampling seed; a fresh one makes the retry a different draw. */
+  seed?: number;
 }
 
 export interface ModelChatResponse {
