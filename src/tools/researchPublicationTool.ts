@@ -1051,6 +1051,14 @@ async function parseToolArguments(input: {
   nowProvider?: () => Date;
 }) {
   const { value, runId } = input;
+  // The model sometimes places the package's schemaVersion beside `package`
+  // instead of inside it, or omits it altogether; both shapes were rejected
+  // as invalid arguments in qualification cohort 9 (compound lane, 2026-09-07)
+  // before a third call got the placement right. The package format has
+  // exactly one accepted version, so a misplaced version is folded into the
+  // package and a missing one defaults to 1. The version's VALUE is still
+  // checked below, and every other unknown key still fails.
+  foldMisplacedPackageSchemaVersion(value);
   assertExactKeys(value, ["mode", "package"], ["notePath", "baseHash"]);
   const packageRecord = expectRecord(value.package, "accepted research package");
   // Host seed substitution runs before objective hydration and the drift
@@ -1830,6 +1838,25 @@ function assertAcceptedResearchPackageShape(
         : "The accepted research package is invalid.",
       { mutationState: "not_applied" },
     );
+  }
+}
+
+function foldMisplacedPackageSchemaVersion(value: Record<string, unknown>): void {
+  const candidate = value.package;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return;
+  }
+  const packageRecord = candidate as Record<string, unknown>;
+  const has = (record: Record<string, unknown>, key: string) =>
+    Object.prototype.hasOwnProperty.call(record, key);
+  if (has(value, "schemaVersion")) {
+    if (!has(packageRecord, "schemaVersion")) {
+      packageRecord.schemaVersion = value.schemaVersion;
+    }
+    delete value.schemaVersion;
+  }
+  if (!has(packageRecord, "schemaVersion")) {
+    packageRecord.schemaVersion = 1;
   }
 }
 
