@@ -12,6 +12,10 @@ import {
 } from "../../scripts/obsidian-process-lifecycle";
 import { requestGracefulObsidianQuitV1 } from "./gracefulObsidianQuit";
 import {
+  discardedSecretReferencesV1,
+  removeDiscardedSecretsV1,
+} from "./discardedSecretReferences";
+import {
   appendHostEventV1,
   describeSweepOutcomeV1,
   describeWindowsExitCodeV1,
@@ -188,6 +192,30 @@ export async function startNativeObsidianHarness(
     ]);
   const ownedArtifactsBefore = await snapshotOwnedE2EArtifacts(vaultRoot);
   const retainVaultPaths = options.retainVaultPaths ?? [];
+  // The data.json restore below forgets every credential reference this lane
+  // created from the plaintext it seeded, while the secret stays in
+  // SecretStorage forever (966 ids on 2026-09-07). Remove those secrets from
+  // inside the app while it is still running, before teardown; preserved
+  // Linear/GitHub records are carried forward and never touched.
+  const removeSecretsTheRestoreDiscards = async (
+    activePage: Page | null,
+  ): Promise<void> => {
+    if (!activePage || activePage.isClosed()) return;
+    const currentText = await readOptionalText(pluginDataPaths[0]).catch(() => null);
+    const discarded = discardedSecretReferencesV1(
+      pluginDataBefore[0] ?? null,
+      currentText,
+      {
+        preserveLinear: options.preserveConfiguredLinearCredential === true,
+        preserveGitHub: options.preserveConfiguredGitHubCredential === true,
+      },
+    );
+    if (discarded.length === 0) return;
+    const removed = await removeDiscardedSecretsV1(activePage, discarded);
+    console.log(
+      `[teardown] ${options.label}: removed ${removed}/${discarded.length} secret(s) this lane created and the data.json restore discards`,
+    );
+  };
   await mkdir(path.dirname(VAULT_CLEANUP_MANIFEST_PATH), { recursive: true });
   await writeFile(
     VAULT_CLEANUP_MANIFEST_PATH,
@@ -381,6 +409,7 @@ export async function startNativeObsidianHarness(
             },
           );
         }
+        await removeSecretsTheRestoreDiscards(activePage).catch(() => undefined);
         await terminateObsidian(
           processHandle,
           cdpPort,
@@ -458,6 +487,7 @@ export async function startNativeObsidianHarness(
         "Native Obsidian failed-start beforeClose hook",
       ).catch(() => undefined);
     }
+    await removeSecretsTheRestoreDiscards(failedPage).catch(() => undefined);
     await terminateObsidian(
       processHandle,
       cdpPort,
