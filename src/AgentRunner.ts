@@ -953,6 +953,7 @@ import {
   type ResearchModeAssist,
   type ResearchPlan,
 } from "./agent/researchPlan";
+import { reportStructureCorrectionLinesV1 } from "./agent/researchReportStructure";
 import {
   RESEARCH_EFFORT_TIER_ORDER,
   resolveResearchEffortBudget,
@@ -39226,12 +39227,10 @@ function buildFinalOutputVerificationCorrectionPrompt(
     acceptance.missing.some((item) => item.includes("open_evidence_conflicts"))
       ? "Include an explicit ## Limitations section that says the sources conflict, contradict, disagree, or differ. Do not imply that the disagreement was resolved when the evidence remains contradictory."
       : "",
-    acceptance.missing.includes("limitations_section")
-      ? "Include an explicit Limitations section."
-      : "",
-    acceptance.missing.includes("confidence_section")
-      ? "Include an explicit Confidence section."
-      : "",
+    // Generated beside the patterns that judge them: a model that obeyed the
+    // old one-line asks could still fail the strict structural check, spend
+    // the single progressive correction, and lose the mission (cohort 15).
+    ...reportStructureCorrectionLinesV1(acceptance.missing),
     finalRelevanceMissing && requiredLiteralAnchors.length > 0
       ? `Preserve every exact user-required literal marker in the final answer: ${requiredLiteralAnchors.join(", ")}. Copy each marker character-for-character.`
       : "",

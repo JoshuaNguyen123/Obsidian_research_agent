@@ -5,6 +5,10 @@ import {
   evaluateResearchAcceptance,
   type ResearchPlan,
 } from "./researchPlan";
+import {
+  reportStructureCorrectionAppliesV1,
+  reportStructureCorrectionLinesV1,
+} from "./researchReportStructure";
 import type { EvidenceConflict } from "./evidenceConflicts";
 import {
   claimGroundingAcceptanceDelta,
@@ -333,9 +337,8 @@ export function formatMissionAcceptanceCorrection(
     result.missing.includes("citation_url_coverage")
       ? "Revise the final answer so each fetched source is cited by URL or exact persisted passage identifier."
       : "",
-    result.missing.includes("limitations_section") ||
-    result.missing.includes("confidence_section")
-      ? "Include limitations and confidence in the final answer."
+    reportStructureCorrectionAppliesV1(result.missing)
+      ? reportStructureCorrectionLinesV1(result.missing).join(" ")
       : "",
     result.missing.some((item) => item.startsWith("open_evidence_conflicts"))
       ? "Resolve open evidence conflicts or acknowledge them as limitations before accepting."

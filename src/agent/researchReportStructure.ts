@@ -171,3 +171,50 @@ export function reportStrictnessForTier(
 ): ReportStructureStrictness {
   return tier === "deep" || tier === "extended" ? "strict" : "baseline";
 }
+
+/**
+ * What the model must be told so that following the instruction actually
+ * satisfies `evaluateReportStructure`.
+ *
+ * Reliability cohort 15 (2026-09-07) lost its third occurrence here. The
+ * strict checker wants a heading naming limitations with real prose beneath
+ * it, and a GRADED confidence level; the two seats that ask for a revision
+ * said only "Include an explicit Limitations section." and "Include an
+ * explicit Confidence section.". A model can obey both to the letter — a
+ * bare "Limitations" bullet, the word "confidence" in a sentence — and still
+ * fail. The mission then spent its single progressive correction, changed
+ * nothing the progress fingerprint could see, and stopped on the no-progress
+ * circuit without delivering.
+ *
+ * So the instruction is generated from this module, beside the patterns that
+ * judge it, and states the heading form, the prose minimum and the grade
+ * words explicitly. The wording is deliberately the STRICT contract in every
+ * tier: an answer that satisfies it also satisfies the baseline checks, so
+ * the caller never has to thread an effort tier through to get this right.
+ */
+export function reportStructureCorrectionLinesV1(
+  missing: readonly string[],
+): string[] {
+  const lines: string[] = [];
+  if (missing.includes("limitations_section")) {
+    lines.push(
+      `Add a Markdown heading that names the limitations — for example "## Limitations" — followed by at least ${MIN_LIMITATIONS_BODY_CHARS} characters of prose saying what the evidence could not cover, which areas were sampled, and what remains unanswered. A heading with nothing under it, or the bare word "limitations" inside another paragraph, does not satisfy this.`,
+    );
+  }
+  if (missing.includes("confidence_section")) {
+    lines.push(
+      'State the confidence as a graded level, not as a bare mention: write "Confidence: high", "Confidence: medium", or "Confidence: low" (a percentage such as "about 70% confidence" also counts). The word "confidence" on its own does not satisfy this.',
+    );
+  }
+  return lines;
+}
+
+/** True when both correction seats can be satisfied by one shared answer. */
+export function reportStructureCorrectionAppliesV1(
+  missing: readonly string[],
+): boolean {
+  return (
+    missing.includes("limitations_section") ||
+    missing.includes("confidence_section")
+  );
+}
