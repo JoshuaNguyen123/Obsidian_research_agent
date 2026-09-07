@@ -1,4 +1,5 @@
 import test from "node:test";
+import { getRequiredLiteralAnchorsMissingFromTextV1 } from "../src/agent/missionPlan";
 import { MISSION_ROUTER_SYSTEM_PROMPT } from "../src/agent/missionRouter";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -1418,6 +1419,54 @@ test("finalization prunes only uniquely matched ungrounded claims", () => {
   );
   assert.deepEqual(duplicate.removedClaimIds, []);
   assert.equal(duplicate.content, `${unsupported}\n${unsupported}`);
+});
+
+test("exact Findings finalization never removes the sentence carrying a required literal marker", () => {
+  // Qualification cohort 4, DU-02 (2026-09-07): the prompt said "Include
+  // <marker>", the model put the marker inside a material preamble sentence,
+  // the trim deleted it, and isFinalOutputRelevant then failed the trimmed
+  // draft for the anchor the runner itself removed; the model resent the same
+  // text until the finalization budget was spent. Reproduced offline.
+  const marker = "du02-9f3a1b2c7e";
+  const alpha = "source:alpha:passage:0-40";
+  const beta = "source:beta:passage:0-42";
+  const preamble = `Comparison for ${marker}: the alpha study and the beta study reach opposite conclusions.`;
+  const first = `Alpha evidence supports the first finding [${alpha}].`;
+  const second = `Beta evidence supports the second finding [${beta}].`;
+  const extra = `A third material finding repeats the beta conclusion [${beta}].`;
+  const draft = [preamble, "", "## Findings", first, second, extra].join("\n");
+  const prompt = `Append a ## Findings section with exactly two cited finding sentences. Include ${marker}.`;
+  const ledger = {
+    version: 1 as const,
+    status: "pass" as const,
+    knownPassageIds: [alpha, beta],
+    missing: [],
+    reasons: [],
+    requireQuoteSpans: false,
+    claims: [
+      { id: "claim:1", text: preamble, status: "grounded" as const, passageIds: [alpha] },
+      { id: "claim:2", text: first, status: "grounded" as const, passageIds: [alpha] },
+      { id: "claim:3", text: second, status: "grounded" as const, passageIds: [beta] },
+      { id: "claim:4", text: extra, status: "grounded" as const, passageIds: [beta] },
+    ],
+  };
+  const constrained = constrainExactFindingSentenceContract(draft, prompt, ledger);
+  assert.deepEqual(constrained.removedClaimIds, ["claim:4"], "the excess finding is still removed");
+  assert.match(constrained.content, new RegExp(marker, "u"), "the marker-bearing preamble survives");
+  assert.doesNotMatch(constrained.content, /third material finding/u);
+  assert.deepEqual(
+    getRequiredLiteralAnchorsMissingFromTextV1(prompt, constrained.content),
+    [],
+    "the trimmed draft still satisfies the literal-anchor half of final_relevance",
+  );
+
+  // Control: without the anchor demand the same preamble is trimmed as before.
+  const unanchored = constrainExactFindingSentenceContract(
+    draft,
+    "Append a ## Findings section with exactly two cited finding sentences.",
+    ledger,
+  );
+  assert.deepEqual(unanchored.removedClaimIds, ["claim:4", "claim:1"]);
 });
 
 test("exact Findings finalization removes material preamble and excess sentences only", () => {

@@ -40989,6 +40989,11 @@ interface ExactFindingSentenceInspectionV1 {
   outsideMaterialClaimIds: string[];
   mappingComplete: boolean;
   removableClaims: Array<{ id: string; start: number; end: number }>;
+  /**
+   * Claims the trim would have removed but must keep because their text
+   * carries a literal anchor the mission requires ("Include <marker>").
+   */
+  protectedClaimIds: string[];
 }
 
 function resolveExactFindingSentenceCount(prompt: string): number | null {
@@ -41037,6 +41042,7 @@ function inspectExactFindingSentenceContract(
         .map((claim) => claim.id),
       mappingComplete: false,
       removableClaims: [],
+      protectedClaimIds: [],
     };
   }
 
@@ -41061,10 +41067,31 @@ function inspectExactFindingSentenceContract(
   const outsideClaims = mapped.filter(
     (claim) => claim.start < bounds.start || claim.start >= bounds.end,
   );
-  const removableClaims =
+  // A required literal anchor ("Include <marker>") is demanded by
+  // isFinalOutputRelevant until a durable write exists. Deleting the sentence
+  // that carries it made the runner fail its own trimmed draft for the anchor
+  // the runner had removed, and the model, whose draft already had the
+  // marker, resent the same text until the finalization budget was spent
+  // (qualification cohort 4, DU-02, 2026-09-07). Such a claim is never
+  // removable; the exact-N contract is enforced on the rest.
+  const requiredAnchors = extractRequiredLiteralAnchors(prompt).map((anchor) =>
+    anchor.toLowerCase(),
+  );
+  const carriesRequiredAnchor = (claim: { start: number; end: number }): boolean => {
+    if (requiredAnchors.length === 0) return false;
+    const text = draft.slice(claim.start, claim.end).toLowerCase();
+    return requiredAnchors.some((anchor) => text.includes(anchor));
+  };
+  const candidateRemovals =
     findingClaims.length >= requiredCount && mappingComplete
       ? [...findingClaims.slice(requiredCount), ...outsideClaims]
       : [];
+  const removableClaims = candidateRemovals.filter(
+    (claim) => !carriesRequiredAnchor(claim),
+  );
+  const protectedClaimIds = candidateRemovals
+    .filter((claim) => carriesRequiredAnchor(claim))
+    .map((claim) => claim.id);
   return {
     requiredCount,
     observedFindingCount: findingClaims.length,
@@ -41072,6 +41099,7 @@ function inspectExactFindingSentenceContract(
     outsideMaterialClaimIds: outsideClaims.map((claim) => claim.id),
     mappingComplete,
     removableClaims,
+    protectedClaimIds,
   };
 }
 
