@@ -211,6 +211,8 @@ interface RendererParkResult {
   reason?: string;
   wasMaximized?: boolean;
   wasFocused?: boolean;
+  stillFocused?: boolean;
+  minimized?: boolean;
   before?: { x: number; y: number; width: number; height: number };
   after?: { x: number; y: number; width: number; height: number };
 }
@@ -285,18 +287,41 @@ export async function parkObsidianWindowAfterAttachV1(
         // opens notes during the mission. CDP input never needs OS focus;
         // Playwright's focus emulation keeps the page "focused" for the DOM.
         win.setFocusable?.(false);
-        if (wasFocused) win.blur?.();
+        // Electron's blur() activates the window ABOVE ours in the Z order, and
+        // the foreground window has none, so it did nothing (measured: 99% of
+        // a mission with Obsidian foreground). Minimizing the active window
+        // makes Windows activate the next one; showInactive then restores ours
+        // off-screen without activation. Once another process owns the
+        // foreground, Windows refuses Obsidian's own re-focus attempts.
+        const handBack = () => {
+          try {
+            win.minimize?.();
+            win.showInactive?.();
+            if (win.isMinimized?.()) win.showInactive?.();
+          } catch {
+            /* the window may be closing */
+          }
+        };
+        if (wasFocused) handBack();
         const globalScope = window as unknown as { __quietWindowWatchdog?: unknown };
         if (!globalScope.__quietWindowWatchdog) {
           globalScope.__quietWindowWatchdog = setInterval(() => {
             try {
-              if (win.isFocused?.()) win.blur?.();
+              if (win.isFocused?.()) handBack();
             } catch {
               /* the window may be closing */
             }
           }, 750);
         }
-        return { ok: true, wasMaximized, wasFocused, before, after: win.getBounds() };
+        return {
+          ok: true,
+          wasMaximized,
+          wasFocused,
+          before,
+          after: win.getBounds(),
+          stillFocused: Boolean(win.isFocused?.()),
+          minimized: Boolean(win.isMinimized?.()),
+        };
       },
       { x: QUIET_WINDOW_X, y: QUIET_WINDOW_Y },
     )) as RendererParkResult;
@@ -319,10 +344,10 @@ export async function parkObsidianWindowAfterAttachV1(
             setTimeout(() => done(true), 1500);
           }),
       )) as RendererFrameProbe;
-      if (probe.frames >= MIN_LIVE_FRAMES && probe.visibility === "visible") {
+      if (probe.frames >= MIN_LIVE_FRAMES && probe.visibility === "visible" && !parked.minimized) {
         report = {
           status: "parked",
-          detail: `off-screen at ${parked.after?.x},${parked.after?.y} (${parked.after?.width}x${parked.after?.height})`,
+          detail: `off-screen at ${parked.after?.x},${parked.after?.y} (${parked.after?.width}x${parked.after?.height}), focus handed back=${String(!parked.stillFocused)}`,
           frames: probe.frames,
           visibility: probe.visibility,
           wasMaximized: parked.wasMaximized,
@@ -347,6 +372,7 @@ export async function parkObsidianWindowAfterAttachV1(
             }
             win.setFocusable?.(true);
             win.setSkipTaskbar?.(false);
+            if (win.isMinimized?.()) win.restore?.();
             if (before) win.setBounds?.(before);
             if (wasMaximized) win.maximize?.();
           },
@@ -354,7 +380,7 @@ export async function parkObsidianWindowAfterAttachV1(
         );
         report = {
           status: "restored-visible",
-          detail: `renderer stopped animating while parked (frames ${probe.frames} in 400ms, visibility ${probe.visibility}${probe.timedOut ? ", probe timed out" : ""}); window put back on screen`,
+          detail: `renderer stopped animating while parked (frames ${probe.frames} in 400ms, visibility ${probe.visibility}${probe.timedOut ? ", probe timed out" : ""}${parked.minimized ? ", window stayed minimized" : ""}); window put back on screen`,
           frames: probe.frames,
           visibility: probe.visibility,
           wasMaximized: parked.wasMaximized,

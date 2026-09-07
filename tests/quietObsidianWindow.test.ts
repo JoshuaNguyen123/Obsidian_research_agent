@@ -175,6 +175,11 @@ test("the native harness wires the quiet window into launch, attach and teardown
   // when Obsidian re-focuses itself while opening notes.
   assert.match(module, /setFocusable\?\.\(false\)/u);
   assert.match(module, /__quietWindowWatchdog = setInterval\(/u);
-  assert.match(module, /if \(win\.isFocused\?\.\(\)\) win\.blur\?\.\(\);/u);
+  // blur() cannot hand focus back from the foreground window (measured); the
+  // hand-back minimizes, which activates the next window, then shows inactive.
+  assert.match(module, /win\.minimize\?\.\(\);\s*win\.showInactive\?\.\(\);/u);
+  assert.match(module, /if \(win\.isFocused\?\.\(\)\) handBack\(\);/u);
+  assert.doesNotMatch(module, /win\.blur\?\.\(\)/u, "blur is not relied on any more");
   assert.match(module, /setFocusable\?\.\(true\)/u, "the visible fallback re-enables activation");
+  assert.match(module, /if \(win\.isMinimized\?\.\(\)\) win\.restore\?\.\(\);/u, "the visible fallback un-minimizes");
 });
