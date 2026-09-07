@@ -262,7 +262,20 @@ export async function parkObsidianWindowAfterAttachV1(
           /* best effort */
         }
         if (wasMaximized) win.unmaximize?.();
-        win.setBounds?.({ x, y, width: before.width, height: before.height });
+        // Every earlier proof record ran in a maximized window. Parking at the
+        // primary display's work-area size keeps the same viewport, so
+        // layout-dependent selectors and the mission console behave as they
+        // did on screen; a smaller default window would change what the
+        // product lays out and what the lane sees.
+        let work: { width: number; height: number } | undefined;
+        try {
+          work = remote?.screen?.getPrimaryDisplay?.()?.workAreaSize;
+        } catch {
+          work = undefined;
+        }
+        const width = work && work.width > 0 ? work.width : before.width;
+        const height = work && work.height > 0 ? work.height : before.height;
+        win.setBounds?.({ x, y, width, height });
         win.setSkipTaskbar?.(true);
         if (wasFocused) win.blur?.();
         return { ok: true, wasMaximized, wasFocused, before, after: win.getBounds() };

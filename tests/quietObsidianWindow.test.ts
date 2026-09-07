@@ -162,4 +162,12 @@ test("the native harness wires the quiet window into launch, attach and teardown
   for (const flag of QUIET_OBSIDIAN_CHROMIUM_SWITCHES) {
     assert.ok(flag.startsWith("--disable-"), flag);
   }
+  // The parked window keeps the viewport every earlier proof record had: the
+  // primary display's work area, the size a maximized window renders at.
+  const module = await readFile(
+    path.join(__dirname, "..", "e2e", "fixtures", "quietObsidianWindow.ts"),
+    "utf8",
+  );
+  assert.match(module, /getPrimaryDisplay\?\.\(\)\?\.workAreaSize/u);
+  assert.match(module, /setBackgroundThrottling\?\.\(false\)/u);
 });
