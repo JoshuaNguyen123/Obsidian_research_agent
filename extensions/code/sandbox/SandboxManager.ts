@@ -272,7 +272,13 @@ export interface SandboxManagerOptionsV2 {
   now?: () => Date;
 }
 
-const ENVIRONMENT_ALLOWLIST = new Set([
+/**
+ * Environment keys a sandbox command may receive. Exported so the host-owned
+ * validation path can drop a model's other hints before they reach
+ * `prepareExecution`, where an unknown key is a rejection; the manager keeps
+ * enforcing this list for every caller.
+ */
+export const SANDBOX_ENVIRONMENT_ALLOWLIST_V2: ReadonlySet<string> = new Set([
   "CI",
   "LANG",
   "LC_ALL",
@@ -1316,7 +1322,7 @@ function parseExpectedArtifactsWithoutProfile(value: unknown): SandboxExpectedAr
 function parseEnvironment(value: Readonly<Record<string, string>>): Record<string, string> {
   const output: Record<string, string> = {};
   for (const [key, raw] of Object.entries(value)) {
-    if (!ENVIRONMENT_ALLOWLIST.has(key)) throw new SandboxManagerV2Error(`Sandbox environment key is not allowed: ${key}.`);
+    if (!SANDBOX_ENVIRONMENT_ALLOWLIST_V2.has(key)) throw new SandboxManagerV2Error(`Sandbox environment key is not allowed: ${key}.`);
     const content = boundedText(raw, `environment ${key}`, 1, 512);
     if (/(?:token|secret|password|authorization|cookie|credential|api[_-]?key)/i.test(content)) {
       throw new SandboxManagerV2Error("Sandbox environment cannot receive application credentials.");
@@ -1446,6 +1452,28 @@ function enumValue<T extends string>(value: unknown, allowed: readonly T[], labe
 
 function pathMatches(root: string, path: string): boolean {
   return root === path || path.startsWith(`${root}/`);
+}
+
+/**
+ * The subset of declared expected artifacts the profile can honour: those at
+ * or under one of its declared generated-output roots. `prepareExecution`
+ * rejects any other declaration; a host-owned validation run drops it
+ * instead, because there the model's artifact list is a hint. Shape and
+ * bounds are still checked by the manager on what survives.
+ */
+export function declaredExpectedArtifactsV2<T extends { path: unknown }>(
+  artifacts: readonly T[],
+  generatedOutputs: readonly string[],
+): T[] {
+  const declared: T[] = [];
+  for (const artifact of artifacts) {
+    if (typeof artifact?.path !== "string") continue;
+    const path = artifact.path.replace(/\\/g, "/").replace(/^(?:\.\/)+/u, "");
+    if (generatedOutputs.some((root) => pathMatches(root, path))) {
+      declared.push({ ...artifact, path });
+    }
+  }
+  return declared;
 }
 
 function basename(path: string): string {

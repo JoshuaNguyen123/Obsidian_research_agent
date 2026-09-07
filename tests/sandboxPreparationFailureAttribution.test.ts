@@ -414,3 +414,111 @@ function context(
     ...overrides,
   };
 }
+
+test("a host-owned validation run drops the model's environment hints outside the allowlist instead of failing", async () => {
+  // Reliability cohort 10 (2026-09-07, code-delivery#007): both validate
+  // calls of an otherwise complete mission were rejected by the manager, the
+  // validation node blocked after the second, and the cohort was lost. The
+  // host binding was proven sound with the mission's own receipts, so the
+  // rejection came from a model-authored hint.
+  const fixture = prepareInput();
+  const manager = await verifiedManager();
+  const contributions = createCodeExecutionContributionsV2({
+    sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
+    getProfile: async () => fixture.profile,
+    resolvePreparationInput: hostProof(fixture),
+  });
+  const result = await validationTool(contributions).prepare!(
+    {
+      workspaceId: "workspace-1",
+      repairRequestId: "request-1",
+      environment: { PYTHONUNBUFFERED: "1", TZ: "UTC" },
+    },
+    context(),
+  );
+  assert.equal(result.ok, true, JSON.stringify(result).slice(0, 300));
+  if (!result.ok) return;
+  const sandboxAction = result.action.normalizedArgs.sandboxAction as { environment: Record<string, string> };
+  assert.deepEqual(sandboxAction.environment, { TZ: "UTC" }, "the allowlisted hint survives, the other is dropped");
+
+  // POSITIVE PROOF the hint really is refused where the host does not own
+  // the run: the model-driven path sends the same key to the manager.
+  const modelDriven = await prepareOnce(
+    {
+      sandboxManager: manager,
+      executionJournal: testExecutionJournal(),
+      getProfile: async () => fixture.profile,
+    },
+    {
+      workspaceId: fixture.workspaceId,
+      repairRequestId: "request-1",
+      profileKey: fixture.profile.key,
+      projectId: fixture.projectId,
+      commandId: fixture.commandId,
+      workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
+      stagingManifest: fixture.stagingManifest,
+      environment: { PYTHONUNBUFFERED: "1", TZ: "UTC" },
+    },
+  );
+  assert.equal(modelDriven.code, "sandbox_prepare_rejected_by_manager");
+
+  // The credential screen is the manager's and still applies to what survives.
+  const credential = await validationTool(contributions).prepare!(
+    { workspaceId: "workspace-1", repairRequestId: "request-1", environment: { TZ: "token=sk-live-1" } },
+    context(),
+  );
+  assert.equal(credential.ok, false);
+  if (credential.ok) return;
+  assert.equal(credential.error.code, "sandbox_prepare_rejected_by_manager");
+});
+
+test("a host-owned validation run keeps only the model's artifacts the profile declares", async () => {
+  const fixture = prepareInput();
+  const profile = { ...fixture.profile, generatedOutputs: ["dist"] };
+  const manager = await verifiedManager();
+  const proof = hostProof(fixture);
+  const contributions = createCodeExecutionContributionsV2({
+    sandboxManager: manager,
+    executionJournal: testExecutionJournal(),
+    getProfile: async () => profile,
+    resolvePreparationInput: async () => ({ ...(await proof()), profile }),
+  });
+  const artifacts = [
+    { path: "main.py", expectedSha256: null, maxBytes: 4096, required: true },
+    { path: "./dist/bundle.js", expectedSha256: null, maxBytes: 4096, required: false },
+  ];
+  const result = await validationTool(contributions).prepare!(
+    { workspaceId: "workspace-1", repairRequestId: "request-1", expectedArtifacts: artifacts },
+    context(),
+  );
+  assert.equal(result.ok, true, JSON.stringify(result).slice(0, 300));
+  if (!result.ok) return;
+  const sandboxAction = result.action.normalizedArgs.sandboxAction as { expectedArtifacts: Array<{ path: string }> };
+  assert.deepEqual(
+    sandboxAction.expectedArtifacts.map((artifact) => artifact.path),
+    ["dist/bundle.js"],
+    "the declared artifact survives, the undeclared hint is dropped",
+  );
+
+  // POSITIVE PROOF: the same undeclared artifact is a rejection on the
+  // model-driven path, so the drop is doing real work.
+  const modelDriven = await prepareOnce(
+    {
+      sandboxManager: manager,
+      executionJournal: testExecutionJournal(),
+      getProfile: async () => profile,
+    },
+    {
+      workspaceId: fixture.workspaceId,
+      repairRequestId: "request-1",
+      profileKey: fixture.profile.key,
+      projectId: fixture.projectId,
+      commandId: fixture.commandId,
+      workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
+      stagingManifest: fixture.stagingManifest,
+      expectedArtifacts: artifacts,
+    },
+  );
+  assert.equal(modelDriven.code, "sandbox_prepare_rejected_by_manager");
+});

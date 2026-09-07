@@ -19,7 +19,9 @@ import {
   type RepositoryProfileV2,
 } from "../repositories/RepositoryProfileV2";
 import {
+  SANDBOX_ENVIRONMENT_ALLOWLIST_V2,
   SandboxManagerV2,
+  declaredExpectedArtifactsV2,
   parsePreparedSandboxActionV2,
   type PreparedSandboxActionV2,
   type SandboxArtifactImporterV2,
@@ -264,6 +266,24 @@ function preparedSandboxContribution(
         await preparationStageV2("repository_profile_invalid", () =>
           parseRepositoryProfileV2(profile),
         );
+        // On a host-owned run the host has already rebound the profile,
+        // workspace, command, staging manifest and repair scope; what the
+        // model still supplies is a hint. The manager rejects an environment
+        // key outside its allowlist and an artifact outside the profile's
+        // declared outputs, and a model repeats its hint verbatim, so one
+        // benign hint blocked a validation node after two identical
+        // rejections (reliability cohort 10, code-delivery, 2026-09-07). Drop
+        // what cannot be honoured here; the manager still checks the rest.
+        const environment = hostProof
+          ? hostOwnedEnvironmentV2(normalized.environment ?? {})
+          : normalized.environment;
+        const expectedArtifacts = hostProof
+          ? hostProof.expectedArtifacts ??
+            declaredExpectedArtifactsV2(
+              normalized.expectedArtifacts ?? [],
+              profile.generatedOutputs,
+            )
+          : normalized.expectedArtifacts;
         const prepared = await preparationStageV2(
           "sandbox_prepare_rejected_by_manager",
           () => resolveSandboxManager(options.sandboxManager).prepareExecution({
@@ -279,9 +299,8 @@ function preparedSandboxContribution(
           workspaceManifestFingerprint:
             hostProof?.workspaceManifestFingerprint ?? normalized.workspaceManifestFingerprint!,
           stagingManifest: hostProof?.stagingManifest ?? normalized.stagingManifest!,
-          expectedArtifacts:
-            hostProof?.expectedArtifacts ?? normalized.expectedArtifacts,
-          environment: normalized.environment,
+          expectedArtifacts,
+          environment,
           }),
         );
         if (prepared.status === "blocked") {
@@ -1237,6 +1256,17 @@ function sandboxPreparationFailureV2(error: unknown): [code: string, message: st
       ? error.message
       : WITHHELD_PREPARATION_DETAIL_V2,
   ];
+}
+
+/** A model's environment hints, reduced to the keys the sandbox may receive. */
+function hostOwnedEnvironmentV2(
+  environment: Readonly<Record<string, string>>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([key]) =>
+      SANDBOX_ENVIRONMENT_ALLOWLIST_V2.has(key),
+    ),
+  );
 }
 
 function assertAllowedArgs(args: Record<string, unknown>, allowed: readonly string[]): void {
