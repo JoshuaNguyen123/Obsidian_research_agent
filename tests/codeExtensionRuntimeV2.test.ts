@@ -44,6 +44,7 @@ import {
 } from "../extensions/code/repair";
 import { WorkspaceManagerV2 } from "../extensions/code/workspaces";
 import { buildJupyterNotebookV1 } from "../extensions/code/JupyterNotebookV1";
+import { scratchPythonContractCheckArgsV1 } from "../extensions/code/ScratchPythonValidationV1";
 import {
   buildNotebookExecutionProofV1,
   decodeNotebookRunnerArgsV1,
@@ -1118,10 +1119,17 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
     assert.match(fast.profile.key, /^scratch-[a-f0-9]{32}$/u);
     assert.equal(fast.projectId, "scratch");
     assert.equal(fast.commandId, "scratch-python-fast");
-    assert.equal(
-      fast.profile.validationCatalog.find((command) => command.id === fast.commandId)
-        ?.args.join(" "),
-      "-m compileall -q .",
+    // Until 2026-09-07 this was `-m compileall -q .`, which only byte-compiles.
+    // Cohort 14 shipped a game that raised ValueError on launch past three
+    // such green validations, so the fast phase now runs the contract checker
+    // (compile plus static unpack arity) from ScratchPythonValidationV1.
+    const fastArgs = fast.profile.validationCatalog.find(
+      (command) => command.id === fast.commandId,
+    )?.args;
+    assert.deepEqual(fastArgs, scratchPythonContractCheckArgsV1());
+    assert.ok(
+      !fastArgs?.includes("compileall"),
+      "a compile-only command cannot see a crash-on-launch delivery",
     );
     assert.deepEqual(fast.stagingManifest.map((entry) => entry.path), [
       "number_game.py",
