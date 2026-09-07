@@ -332,3 +332,61 @@ test("the argument vector obeys the sandbox provider spec's own limits", () => {
     "the declared limits must match the profile parser that enforces them",
   );
 });
+
+test("a call to a module function with the wrong arguments is caught", () => {
+  // A signature edited without its call sites is the most common shape in
+  // generated code, and it compiles perfectly. Each of these raises TypeError
+  // on every run.
+  const cases: Array<[string, string, RegExp]> = [
+    [
+      "too many positional",
+      "def play(low, high):\n    return low + high\n\n\ndef main():\n    return play(1, 2, 3)\n",
+      /play\(\) takes at most 2 positional argument\(s\) but 3 were given/u,
+    ],
+    [
+      "missing required",
+      "def play(low, high, attempts):\n    return low\n\n\ndef main():\n    return play(1, 2)\n",
+      /play\(\) is missing required argument\(s\): attempts/u,
+    ],
+    [
+      "unexpected keyword",
+      "def play(low, high):\n    return low\n\n\ndef main():\n    return play(low=1, hi=2)\n",
+      /play\(\) got an unexpected keyword argument hi/u,
+    ],
+    [
+      "duplicate argument",
+      "def play(low, high):\n    return low\n\n\ndef main():\n    return play(1, low=2)\n",
+      /play\(\) got multiple values for argument low/u,
+    ],
+    [
+      "missing keyword-only",
+      "def play(low, *, high):\n    return low\n\n\ndef main():\n    return play(1)\n",
+      /play\(\) is missing required argument\(s\): high/u,
+    ],
+  ];
+  for (const [label, source, expected] of cases) {
+    const result = runChecker({ "main.py": source });
+    assert.equal(result.status, 1, `${label}: expected a finding, stdout=${result.stdout}`);
+    assert.match(result.stderr, expected, label);
+    assert.match(result.stderr, /TypeError/u, label);
+  }
+});
+
+test("calls the checker cannot be certain about are never reported", () => {
+  // Defaults satisfied, *args/**kwargs on either side, a decorator that can
+  // rewrite the signature, a name reassigned later, a method rather than a
+  // bare name, and two same-named definitions. None is a provable TypeError.
+  const quiet: Array<[string, string]> = [
+    ["defaults", "def play(low, high=10, *, verbose=False):\n    return low\n\n\ndef main():\n    play(1)\n    play(1, 2)\n    play(1, high=3, verbose=True)\n"],
+    ["varargs", "def play(*values, **options):\n    return len(values)\n\n\ndef main():\n    play(1, 2, 3, mode='fast')\n"],
+    ["starred call", "def play(low, high):\n    return low\n\n\ndef main():\n    values = (1, 2)\n    play(*values)\n"],
+    ["decorated", "import functools\n\n\ndef wrap(function):\n    @functools.wraps(function)\n    def inner(*args, **kwargs):\n        return function(1, 2)\n    return inner\n\n\n@wrap\ndef play(low, high):\n    return low\n\n\ndef main():\n    play()\n"],
+    ["reassigned name", "def play(low, high):\n    return low\n\n\nplay = lambda *a: 0\n\n\ndef main():\n    play(1, 2, 3)\n"],
+    ["method", "class Game:\n    def play(self, low, high):\n        return low\n\n\ndef main():\n    Game().play(1, 2)\n"],
+    ["conditional definition", "import sys\n\nif sys.version_info >= (3, 0):\n    def play(low, high):\n        return low\nelse:\n    def play(low):\n        return low\n\n\ndef main():\n    play(1)\n"],
+  ];
+  for (const [label, source] of quiet) {
+    const result = runChecker({ "main.py": source });
+    assert.equal(result.status, 0, `${label}: false positive: ${result.stderr}`);
+  }
+});

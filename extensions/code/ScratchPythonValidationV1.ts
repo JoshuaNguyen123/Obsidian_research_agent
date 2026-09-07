@@ -20,9 +20,18 @@
  *
  * Only ONE validation command may exist per phase (a second one is refused as
  * `sandbox_validation_command_ambiguous`), so the fix strengthens the single
- * command rather than adding another: the same compile check plus a static
- * unpacking-arity check, in stdlib Python, with no third-party dependency and
- * no write into the workspace being delivered.
+ * command rather than adding another: the same compile check plus two static
+ * checks, in stdlib Python, with no third-party dependency and no write into
+ * the workspace being delivered.
+ *
+ * The two checks cover the ways generated code most often compiles and still
+ * cannot run:
+ *   - unpacking a call into the wrong number of targets (ValueError), the
+ *     cohort-14 loss above;
+ *   - calling a function of this module with the wrong arguments
+ *     (TypeError) — too many positionals, a missing required parameter, an
+ *     unknown keyword, a duplicated one. A signature edit that misses one
+ *     call site is the single most common shape in generated code.
  *
  * Deliberately NOT included: executing the program. That is the obvious next
  * step, and it would catch crashes before the first prompt, but it needs an
@@ -33,10 +42,13 @@
 /**
  * The checker, run as `python -c <source>` from the workspace root.
  *
- * It reports a call site only when the callee's arity is unambiguous, taking
- * the function's own return statements over its annotation when every return
- * is a tuple literal, and never flags a starred target. A disagreement it
- * does report is a guaranteed runtime ValueError, not a style opinion.
+ * Everything it reports is a certainty, never a style opinion. Arity comes
+ * from a function's own return statements when every return is a tuple
+ * literal, otherwise from a fixed `Tuple[...]` annotation; a starred target
+ * is never flagged. A call is judged only against a module-level function
+ * that is undecorated, defined once, and never shadowed by an assignment or
+ * import, and only when neither the signature nor the call uses `*args` or
+ * `**kwargs`. Anything less certain is left alone.
  */
 export const SCRATCH_PYTHON_CONTRACT_CHECK_SOURCE_V1 = `import ast
 import os
@@ -114,6 +126,79 @@ def declared_arity(function):
     return None, None
 
 
+DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def module_level_functions(tree):
+    functions = {}
+    shadowed = set()
+    for node in tree.body:
+        if isinstance(node, DEF_TYPES):
+            if node.name in functions:
+                shadowed.add(node.name)
+            functions[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            shadowed.add(node.name)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        shadowed.add(name.id)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if isinstance(node.target, ast.Name):
+                shadowed.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                shadowed.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.Global):
+            for name in node.names:
+                shadowed.add(name)
+    return {
+        name: node
+        for name, node in functions.items()
+        if name not in shadowed and not node.decorator_list
+    }
+
+
+def call_signature_problem(function, call):
+    spec = function.args
+    if spec.vararg is not None or spec.kwarg is not None:
+        return None
+    if any(isinstance(argument, ast.Starred) for argument in call.args):
+        return None
+    if any(keyword.arg is None for keyword in call.keywords):
+        return None
+    positional_names = [argument.arg for argument in spec.posonlyargs] + [
+        argument.arg for argument in spec.args
+    ]
+    keyword_only_names = [argument.arg for argument in spec.kwonlyargs]
+    positional_only = {argument.arg for argument in spec.posonlyargs}
+    given_positional = len(call.args)
+    if given_positional > len(positional_names):
+        return "takes at most %d positional argument(s) but %d were given" % (
+            len(positional_names),
+            given_positional,
+        )
+    supplied = set(positional_names[:given_positional])
+    for keyword in call.keywords:
+        if keyword.arg in positional_only:
+            return "does not accept %s as a keyword argument" % keyword.arg
+        if keyword.arg not in positional_names and keyword.arg not in keyword_only_names:
+            return "got an unexpected keyword argument %s" % keyword.arg
+        if keyword.arg in supplied:
+            return "got multiple values for argument %s" % keyword.arg
+        supplied.add(keyword.arg)
+    required_positional = positional_names[: len(positional_names) - len(spec.defaults)]
+    missing = [name for name in required_positional if name not in supplied]
+    for index, argument in enumerate(spec.kwonlyargs):
+        if spec.kw_defaults[index] is None and argument.arg not in supplied:
+            missing.append(argument.arg)
+    if missing:
+        return "is missing required argument(s): %s" % ", ".join(missing)
+    return None
+
+
 def check_source(path, source, problems):
     try:
         compile(source, path, "exec")
@@ -162,6 +247,19 @@ def check_source(path, source, problems):
                 "%s:%s: %s() returns %d value(s) according to %s, but this line "
                 "unpacks %d. Python raises ValueError here on every run."
                 % (path, node.lineno, name, size, reason, len(target.elts))
+            )
+    functions = module_level_functions(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        function = functions.get(node.func.id)
+        if function is None:
+            continue
+        problem = call_signature_problem(function, node)
+        if problem is not None:
+            problems.append(
+                "%s:%s: %s() %s. Python raises TypeError here on every run."
+                % (path, node.lineno, node.func.id, problem)
             )
 
 
