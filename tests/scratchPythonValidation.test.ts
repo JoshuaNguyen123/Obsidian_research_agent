@@ -96,14 +96,18 @@ test("the exact cohort-14 delivery is caught: annotated four-tuple unpacked as t
       "    print(key, label, low, high, max_attempts)",
       "    return 0",
       "",
+      "",
+      'if __name__ == "__main__":',
+      "    raise SystemExit(main())",
+      "",
     ].join("\n"),
   });
+  // The annotation rule that first caught this was removed: it rejected
+  // correct programs whose Tuple[...] annotation was loose. Running the
+  // program catches the same defect and reports Python's own words.
   assert.equal(result.status, 1, `checker should fail; stdout=${result.stdout} stderr=${result.stderr}`);
-  assert.match(result.stderr, /main\.py:16/u);
-  assert.match(result.stderr, /choose_difficulty\(\) returns 4 value\(s\)/u);
-  assert.match(result.stderr, /its return annotation/u);
-  assert.match(result.stderr, /unpacks 2/u);
-  assert.match(result.stderr, /ValueError/u);
+  assert.match(result.stderr, /running it raises ValueError/u);
+  assert.match(result.stderr, /too many values to unpack/u);
 });
 
 test("the corrected program passes, so the checker admits the repair", () => {
@@ -151,6 +155,7 @@ test("return statements outrank a stale annotation, and are themselves checked",
   assert.equal(result.status, 1, `checker should fail; stdout=${result.stdout}`);
   assert.match(result.stderr, /pair\(\) returns 3 value\(s\) according to its return statements/u);
   assert.match(result.stderr, /app\.py:9/u);
+  assert.doesNotMatch(result.stderr, /return annotation/u, "arity never comes from an annotation");
 });
 
 test("a syntax error is still reported, so the old compile guarantee is kept", () => {
@@ -410,10 +415,30 @@ test("code that marks itself unfinished is not a delivery", () => {
   assert.match(result.stderr, /main\.py:5: the delivered code marks itself unfinished \(placeholder\)/u);
   assert.match(result.stderr, /placeholder replaced below/u);
 
-  for (const marker of ["TODO: finish scoring", "FIXME broken", "XXX revisit", "not implemented yet"]) {
+  for (const marker of ["TODO: finish scoring", "FIXME broken", "placeholder - replace"]) {
     const each = runChecker({ "main.py": `def main():\n    return 1  # ${marker}\n` });
     assert.equal(each.status, 1, `${marker} should be reported`);
     assert.match(each.stderr, /marks itself unfinished/u, marker);
+  }
+});
+
+test("a marker word used as ordinary English is never a finding", () => {
+  // The worst false positive this rule can produce: a todo list is the
+  // commonest program anyone asks for, so a substring match rejects a
+  // correct one outright. A marker now has to be the comment's own
+  // subject, standing at its start.
+  const innocent = [
+    "# Append a todo to the list",
+    "# 1) Add a todo   2) List them   3) Quit",
+    "# Fill the {name} placeholder before printing",
+    "# Spec: https://example.com/docs/todo-list-format",
+    "# Subclasses raise if the method is not implemented below",
+    "# Expected shape: XXX-XXXX, digits only",
+    "# todos are stored newest first",
+  ];
+  for (const comment of innocent) {
+    const each = runChecker({ "main.py": `def main():\n    return 1  ${comment}\n` });
+    assert.equal(each.status, 0, `false positive on ${comment}: ${each.stderr}`);
   }
 });
 
@@ -430,4 +455,96 @@ test("the word placeholder outside a comment is never a finding", () => {
     ].join("\n"),
   });
   assert.equal(result.status, 0, `false positive: ${result.stderr}`);
+});
+
+test("arity read from a constant table catches the cohort-14 shape without running it", () => {
+  // The delivered game returned a row out of a module-level table, so its
+  // arity was written in the table and not in any return statement. The
+  // annotation that did state it was dropped for rejecting correct code, and
+  // running the program only helps when the defective path is reached. This
+  // is the third route to the same defect, and the only static one.
+  const result = runChecker({
+    "main.py": [
+      'LEVELS = {"easy": ("Easy", 1, 10, 5), "hard": ("Hard", 1, 99, 3)}',
+      "",
+      "",
+      "def choose():",
+      '    return LEVELS["easy"]',
+      "",
+      "",
+      "def run():",
+      "    label, low, high = choose()",
+      "    return label",
+      "",
+    ].join("\n"),
+  });
+  // No entry point, so nothing runs: the finding has to come from reading it.
+  assert.equal(result.status, 1, `checker should fail; stdout=${result.stdout}`);
+  assert.match(result.stderr, /choose\(\) returns 4 value\(s\)/u);
+  assert.match(result.stderr, /unpacks 3/u);
+  assert.doesNotMatch(result.stderr, /annotation/u, "arity never comes from an annotation");
+});
+
+test("a table that any code could change is not evidence about a row", () => {
+  // Each of these is a correct program, and each would be rejected by a rule
+  // that read the table without first proving it constant. Killing a correct
+  // delivery costs a whole cohort; missing one costs a single lane.
+  const table = 'LEVELS = {"easy": ("Easy", 1, 10, 5)}';
+  const reads = [
+    "def choose():",
+    '    return LEVELS["easy"]',
+    "",
+    "",
+    "def run():",
+    "    label, low = choose()",
+    "    return label",
+  ];
+  const doubts: Array<[string, string[]]> = [
+    ["a row is replaced at run time", ['def install(name, row):', '    LEVELS[name] = row', ""]],
+    ["the table is handed to a call that could mutate it", ["import json", "", "def dump():", "    return json.dumps(LEVELS)", ""]],
+    ["a mutating method is called on it", ["def extend(extra):", "    LEVELS.update(extra)", ""]],
+    ["the name is also a parameter somewhere", ["def report(LEVELS):", '    return LEVELS["easy"]', ""]],
+  ];
+  for (const [why, extra] of doubts) {
+    const result = runChecker({
+      "main.py": [table, "", ""].concat(extra, reads, [""]).join("\n"),
+    });
+    assert.equal(result.status, 0, `rejected a correct program because ${why}: ${result.stderr}`);
+  }
+});
+
+test("a ragged table proves nothing, and a correct unpack of a constant one is quiet", () => {
+  const ragged = runChecker({
+    "main.py": [
+      'LEVELS = {"easy": ("Easy", 1, 10, 5), "hard": ("Hard", 1, 99)}',
+      "",
+      "",
+      "def choose():",
+      '    return LEVELS["easy"]',
+      "",
+      "",
+      "def run():",
+      "    label, low = choose()",
+      "    return label",
+      "",
+    ].join("\n"),
+  });
+  assert.equal(ragged.status, 0, `rows of different widths size nothing: ${ragged.stderr}`);
+
+  const correct = runChecker({
+    "main.py": [
+      'LEVELS = {"easy": ("Easy", 1, 10, 5)}',
+      "",
+      "",
+      "def choose():",
+      '    return LEVELS["easy"]',
+      "",
+      "",
+      "def run():",
+      "    label, low, high, tries = choose()",
+      "    return label, low, high, tries",
+      "",
+    ].join("\n"),
+  });
+  assert.equal(correct.status, 0, `the right arity must pass: ${correct.stderr}`);
 });
