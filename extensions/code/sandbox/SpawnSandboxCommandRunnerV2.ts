@@ -47,6 +47,27 @@ export interface SandboxSpawnAdapterV2 {
 export interface SpawnSandboxCommandRunnerOptionsV2 {
   spawnAdapter?: SandboxSpawnAdapterV2;
   hostEnvironment?: NodeJS.ProcessEnv;
+  /** Waits between launches after a provider exit signature; tests shorten them. */
+  providerRetryDelaysMs?: readonly number[];
+}
+
+/**
+ * A provider process exit above 255 is not a command status. The sandbox
+ * entrypoint clamps every command status to 0..255 (a timeout is 124) and the
+ * close handler below clamps a null or negative code to 255, so a larger
+ * code can only be the provider binary reporting its OWN failure: on Windows,
+ * wsl.exe exits with a 32-bit HRESULT (0x80070490 "element not found") or
+ * 0xFFFFFFFF when the instance is torn down under it. Reliability cohort 11
+ * (2026-09-07) lost a mission to one: the code went through as a plain
+ * non-zero status, the manager rejected it as an invalid exit code, and the
+ * second attempt eleven seconds later did the same. It is a launch-level
+ * failure, transient by nature, so the launch is retried on this ladder and
+ * only then surfaced, with its signature, as a provider failure.
+ */
+export const PROVIDER_EXIT_SIGNATURE_RETRY_DELAYS_MS_V2: readonly number[] = [1_500, 4_000, 10_000];
+
+export function isProviderExitSignatureV2(exitCode: number): boolean {
+  return Number.isSafeInteger(exitCode) && exitCode > 255;
 }
 
 interface StagingBundleV1 {
@@ -99,10 +120,13 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 export class SpawnSandboxCommandRunnerV2 implements SandboxCommandRunnerV2 {
   private readonly spawnAdapter: SandboxSpawnAdapterV2;
   private readonly hostEnvironment: NodeJS.ProcessEnv;
+  private readonly providerRetryDelaysMs: readonly number[];
 
   constructor(options: SpawnSandboxCommandRunnerOptionsV2 = {}) {
     this.spawnAdapter = options.spawnAdapter ?? nodeSpawnAdapter();
     this.hostEnvironment = options.hostEnvironment ?? process.env;
+    this.providerRetryDelaysMs =
+      options.providerRetryDelaysMs ?? PROVIDER_EXIT_SIGNATURE_RETRY_DELAYS_MS_V2;
   }
 
   async run(
@@ -113,28 +137,46 @@ export class SpawnSandboxCommandRunnerV2 implements SandboxCommandRunnerV2 {
     } = {},
   ): Promise<SandboxRunnerResultV2> {
     const spec = validateFixedProviderSpec(rawSpec);
-    const stdin = buildStdin(spec, input.stagedFiles);
     const env = cleanEnvironment(this.hostEnvironment, spec.env);
-    let result: SandboxRunnerResultV2;
-    try {
-      result = await spawnBounded(
-        this.spawnAdapter,
-        spec,
-        env,
-        stdin,
-        input.signal,
-      );
-    } finally {
-      stdin?.fill(0);
+    for (let launch = 0; ; launch += 1) {
+      const stdin = buildStdin(spec, input.stagedFiles);
+      let result: SandboxRunnerResultV2;
+      try {
+        result = await spawnBounded(
+          this.spawnAdapter,
+          spec,
+          env,
+          stdin,
+          input.signal,
+        );
+      } finally {
+        stdin?.fill(0);
+      }
+      if (!isProviderExitSignatureV2(result.exitCode)) {
+        if (spec.purpose === "boundary_probe" || result.exitCode !== 0) {
+          return result;
+        }
+        return parseArtifactBundle(result.stdout, result.stderr);
+      }
+      const delay = this.providerRetryDelaysMs[launch];
+      if (delay === undefined) {
+        throw new SandboxSpawnRunnerV2Error(
+          "provider_exit_signature",
+          `Sandbox provider process exited with signature 0x${result.exitCode.toString(16)} on ${launch + 1} launch(es); this is a provider failure, not a command result.`,
+          { exitCode: result.exitCode, launches: launch + 1 },
+        );
+      }
+      await waitBeforeRelaunch(delay, input.signal);
     }
-    if (spec.purpose === "boundary_probe" || result.exitCode !== 0) {
-      return result;
-    }
-    return parseArtifactBundle(result.stdout, result.stderr);
   }
 }
 
 export class SandboxSpawnRunnerV2Error extends Error {
+  /** Provider exit signature (a code above 255) when `code` names one. */
+  readonly exitCode?: number;
+  /** Launches attempted before the failure was surfaced. */
+  readonly launches?: number;
+
   constructor(
     readonly code:
       | "invalid_provider_spec"
@@ -143,12 +185,40 @@ export class SandboxSpawnRunnerV2Error extends Error {
       | "provider_timeout"
       | "provider_aborted"
       | "provider_spawn_failed"
+      | "provider_exit_signature"
       | "invalid_artifact_bundle",
     message: string,
+    details: { exitCode?: number; launches?: number } = {},
   ) {
     super(message);
     this.name = "SandboxSpawnRunnerV2Error";
+    if (details.exitCode !== undefined) this.exitCode = details.exitCode;
+    if (details.launches !== undefined) this.launches = details.launches;
   }
+}
+
+/** Sleep between provider launches; a caller abort ends the wait as an abort. */
+function waitBeforeRelaunch(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abortError = () =>
+      new SandboxSpawnRunnerV2Error(
+        "provider_aborted",
+        "Sandbox provider relaunch was aborted.",
+      );
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function nodeSpawnAdapter(): SandboxSpawnAdapterV2 {

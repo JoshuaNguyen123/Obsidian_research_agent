@@ -11,6 +11,42 @@ import { createMissionPlan, type MissionPlan } from "../src/agent/missionPlan";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
 import type { MissionIntent } from "../src/tools/types";
 
+test("a code that names arguments as the fault is an argument failure in any spelling", () => {
+  // The blob regex only ever knew `invalid_argument(s)`, so validators that
+  // wrote the reverse word order fell through to `other` and escalated: no
+  // auto-retry, no argument-specific handling, on a failure that applied
+  // nothing. Every code below is a real one in this repo.
+  for (const code of [
+    "linear_queue_vault_arguments_invalid",
+    "github_publication_arguments_invalid",
+    "git_argument_invalid",
+    "github_repository_invalid_argument",
+  ]) {
+    const classification = classifySafeFailureRetry({
+      source: "create_thing",
+      code,
+      message: "The supplied value is invalid.",
+    });
+    assert.equal(classification.safeToAutoRetry, true, code);
+    assert.ok(
+      classification.kind === "schema" ||
+        classification.kind === "invalid_tool_args",
+      `${code} -> ${classification.kind}`,
+    );
+  }
+
+  // A refusal that merely ends in `_invalid` still gets no silent retry.
+  for (const code of ["authority_grant_invalid", "diff_readback_invalid"]) {
+    const classification = classifySafeFailureRetry({
+      source: "create_thing",
+      code,
+      message: "The host refused the call.",
+    });
+    assert.equal(classification.kind, "other", code);
+    assert.equal(classification.safeToAutoRetry, false, code);
+  }
+});
+
 test("schema and invalid tool args are safe to auto-retry", () => {
   const schema = classifySafeFailureRetry({
     source: "model",

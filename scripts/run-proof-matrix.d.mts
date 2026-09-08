@@ -64,6 +64,22 @@ export function upgradeRunCsvHeader(
 export const TOOL_EVENT_SOURCE_SUMMARY: "summary";
 export const TOOL_EVENT_SOURCE_GRAPHS: "graphs";
 export const TOOL_EVENT_SOURCE_NONE: "none";
+/** Mirror of TOOL_CALL_FAILURE_DETAIL_CAP; a source test pins the two equal. */
+export const PROOF_MATRIX_FAILURE_DETAIL_CAP: number;
+/**
+ * One retained failed call, as this roll-up re-shapes it. Structurally the same
+ * fields as ToolCallFailureDetailV1 in e2e/fixtures/toolCallOutcomes.ts, and it
+ * must STAY the same: a field this type omits is a field the roll-up silently
+ * drops on its way into the manifest.
+ */
+export interface ProofMatrixFailureDetail {
+  id: string;
+  toolName: string | null;
+  errorCode: string | null;
+  /** The product's failure sentence, already redacted upstream; null = unobserved. */
+  errorMessage: string | null;
+  bucket: string;
+}
 export interface SummaryToolEventTotals {
   /** Null when no record knew a real call count — unknown, never zero. */
   observed: number | null;
@@ -74,12 +90,8 @@ export interface SummaryToolEventTotals {
   undetermined: number | null;
   /** Only contributed vocabulary keys; null when no record carried buckets. */
   buckets: Record<string, number> | null;
-  failureDetails: Array<{
-    id: string;
-    toolName: string | null;
-    errorCode: string | null;
-    bucket: string;
-  }> | null;
+  failureDetails: ProofMatrixFailureDetail[] | null;
+  /** True once details were dropped — by a record's own fold, or by the cap. */
   failureDetailsTruncated: boolean | null;
 }
 export function summaryToolEventTotals(
@@ -94,12 +106,7 @@ export interface AttemptToolEvents {
   undetermined: number | null;
   succeeded: number | null;
   buckets: Record<string, number> | null;
-  failureDetails: Array<{
-    id: string;
-    toolName: string | null;
-    errorCode: string | null;
-    bucket: string;
-  }> | null;
+  failureDetails: ProofMatrixFailureDetail[] | null;
   failureDetailsTruncated: boolean | null;
 }
 export function resolveAttemptToolEvents(input: {
@@ -298,3 +305,28 @@ export function registerProductFailure(
   manifest: ProofMatrixManifest,
   failureClass: string,
 ): boolean;
+
+/** The four artifacts sync:test-vault installs. `data.json` is never included. */
+export const QUALIFICATION_ARTIFACT_FILES: readonly string[];
+/** Per-occurrence wall-clock deadline; exceeding it is a delivery failure. */
+export const QUALIFICATION_DEADLINE_SECONDS: number;
+/** sha256 per built artifact; a missing artifact hashes to null, never "". */
+export function qualificationArtifactHashes(
+  root?: string,
+): Record<string, string | null>;
+
+export declare const SPENDING_LIMIT_BYPASS_CONDITION: "spending_limit_bypass";
+export declare const CONFIGURED_BUDGET_EXHAUSTED_MARKER: RegExp;
+export declare function evaluateAttemptSafetyV1(input: {
+  attemptLogText: string | null | undefined;
+  green: boolean | null | undefined;
+}): {
+  budgetStopped: boolean;
+  safetyEvaluated: string[];
+  safetyViolations: string[];
+};
+
+export declare function classifyPreexistingWorkspacesV1(
+  entries: readonly (string | null | undefined)[] | null | undefined,
+  allowValue: string | null | undefined,
+): { accepted: string[]; refused: string[]; allowed: string[] };

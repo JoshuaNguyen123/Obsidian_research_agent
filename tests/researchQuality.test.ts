@@ -9,6 +9,7 @@ import {
 import {
   acknowledgeEvidenceConflict,
   detectEvidenceConflicts,
+  evaluateEvidenceConflictAcceptance,
   projectEvidenceConflictAcknowledgements,
 } from "../src/agent/evidenceConflicts";
 import {
@@ -542,6 +543,85 @@ test("candidate conflict acknowledgement requires an explicit disagreement secti
   assert.equal(explicitConflict[0]?.status, "acknowledged_limitation");
   assert.match(explicitConflict[0]?.resolutionNote ?? "", /source disagreement/iu);
   assert.equal(open[0]?.status, "open", "projection must not mutate durable state");
+});
+
+test("candidate conflict acknowledgement accepts every phrasing the corrective prompt invites", () => {
+  // Qualification cohort 5, DU-02 (2026-09-07): the note cited both passages
+  // and said "The two sources deliberately conflict" under ## Limitations, yet
+  // the conflict stayed open and the write was held until the finalization
+  // budget was spent. The corrective prompt asks for exactly this vocabulary.
+  const alpha = "source:alpha:passage:0-146";
+  const beta = "source:beta:passage:0-156";
+  const conflict = {
+    id: "conflict:cohort5",
+    claimIds: [],
+    passageIds: [alpha, beta].sort(),
+    status: "open" as const,
+  };
+  const note = (limitation: string) =>
+    [
+      "## Findings",
+      `The alpha study reports a reliable benefit. ${alpha}`,
+      `The beta study reports no reliable benefit. ${beta}`,
+      "",
+      "## Limitations",
+      limitation,
+      "",
+      "## Confidence",
+      "Confidence is low.",
+    ].join("\n");
+
+  for (const phrase of [
+    "The two sources deliberately conflict: the primary source concludes a reliable benefit, while the alternate source concludes no reliable benefit.",
+    "These sources are in conflict.",
+    "The sources directly conflict on the outcome.",
+    "The two fetched sources reach opposite conclusions.",
+    "The alpha and beta sources are at odds.",
+    "The sources differ sharply on the outcome.",
+    "The findings are inconsistent across the two sources.",
+  ]) {
+    const projected = projectEvidenceConflictAcknowledgements([conflict], note(phrase));
+    assert.equal(projected[0]?.status, "acknowledged_limitation", phrase);
+    const accepted = evaluateEvidenceConflictAcceptance({
+      conflicts: projected,
+      finalOutput: note(phrase),
+    });
+    assert.deepEqual(accepted.missing, [], phrase);
+  }
+
+  // A limitations section that never records the disagreement still leaves
+  // the candidate-bound conflict open: the section, not the vocabulary, is
+  // what stops a generic caveat from discharging contradictory evidence.
+  const generic = projectEvidenceConflictAcknowledgements(
+    [conflict],
+    note("Both passages are short fixtures with no methodology."),
+  );
+  assert.equal(generic[0]?.status, "open");
+
+  // Conflict language outside any limitations-style section is not enough.
+  const noSection = projectEvidenceConflictAcknowledgements(
+    [conflict],
+    `The two sources deliberately conflict. ${alpha} ${beta}`,
+  );
+  assert.equal(noSection[0]?.status, "open");
+});
+
+test("acknowledged conflicts pass the limitation-text check under every accepted heading", () => {
+  const alpha = "source:alpha:passage:0-146";
+  const beta = "source:beta:passage:0-156";
+  const conflict = {
+    id: "conflict:headings",
+    claimIds: [],
+    passageIds: [alpha, beta].sort(),
+    status: "open" as const,
+  };
+  for (const heading of ["## Limitations", "## Uncertainties", "## Source disagreements", "## Open questions"]) {
+    const output = `Findings cite ${alpha} and ${beta}.\n\n${heading}\nThe two sources disagree on the outcome.`;
+    const projected = projectEvidenceConflictAcknowledgements([conflict], output);
+    assert.equal(projected[0]?.status, "acknowledged_limitation", heading);
+    const accepted = evaluateEvidenceConflictAcceptance({ conflicts: projected, finalOutput: output });
+    assert.deepEqual(accepted.missing, [], heading);
+  }
 });
 
 test("hybrid web citation coverage does not expose opaque vault-context passage ids", () => {

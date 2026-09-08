@@ -1,3 +1,4 @@
+import { normalizeAcceptanceCriterionIdV1 } from "./acceptanceCriterionIdV1";
 import {
   parseWorkItemSpecV1,
   type WorkItemAcceptanceCriterionV1,
@@ -225,6 +226,31 @@ function parseUnsigned(value: unknown): WorkItemSpecV2Unsigned {
   };
 }
 
+/**
+ * Ids are normalized here rather than matched against a private copy of the
+ * canonical pattern, which is what this seat used to do.
+ *
+ * The decision this records: v2 adopts the lenient-normalize behaviour of v1
+ * and the three Linear seats instead of staying strict. Staying strict looked
+ * defensible -- v2 is the fingerprint-bound durable contract, so "storage must
+ * already be canonical" is a real property of this file and not of v1. But the
+ * property is enforced by `assertCanonicalContract` in parseWorkItemSpecV2,
+ * not by this parser: readback compares the raw record against the parsed one
+ * and refuses any value that was not already canonical. Normalizing here
+ * therefore cannot loosen storage, and measurement confirms it -- a stored
+ * "ac-01" is still refused after this change, by the canonical-contract
+ * assertion rather than by this line.
+ *
+ * What strictness did cost was agreement. `parseUnsigned` already normalizes
+ * every OTHER field it reads: expectString trims, and an untrimmed objective
+ * is caught on readback by exactly the same assertion. The id was the one
+ * field enforcing canonical form inline instead of normalize-then-assert, so
+ * this change makes it conform to the file's own design rather than diverge
+ * from it. It also removes a live disagreement: the publisher's draft seat
+ * branches on schemaVersion alone, so a single draft carrying "ac-01" was
+ * accepted when published as v1 and refused when published as v2 -- the
+ * successor contract silently less tolerant than the one it replaces.
+ */
 function parseAcceptanceCriteria(value: unknown): WorkItemAcceptanceCriterionV1[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > 20) {
     throw new DurableLinearContractError("Acceptance criteria require 1-20 entries.");
@@ -233,21 +259,22 @@ function parseAcceptanceCriteria(value: unknown): WorkItemAcceptanceCriterionV1[
   return value.map((raw, index) => {
     const record = expectPlainRecord(raw, `acceptance criterion ${index + 1}`);
     assertExactKeys(record, ["id", "text"], [], `acceptance criterion ${index + 1}`);
-    if (typeof record.id !== "string" || !/^AC-[1-9][0-9]?$/.test(record.id)) {
+    const id = normalizeAcceptanceCriterionIdV1(record.id);
+    if (!id) {
       throw new DurableLinearContractError(
         `Acceptance criterion ${index + 1} id must match AC-1 through AC-99.`,
       );
     }
-    if (ids.has(record.id)) {
-      throw new DurableLinearContractError(`Acceptance criterion id ${record.id} is duplicated.`);
+    if (ids.has(id)) {
+      throw new DurableLinearContractError(`Acceptance criterion id ${id} is duplicated.`);
     }
-    ids.add(record.id);
+    ids.add(id);
     const text = expectString(record.text, `acceptance criterion ${index + 1} text`, 1, 500, {
       allowNewlines: true,
       secretFree: true,
     });
     assertNoRawAuthority(text, `acceptance criterion ${index + 1} text`);
-    return { id: record.id, text };
+    return { id, text };
   });
 }
 

@@ -60,13 +60,15 @@ export async function commitGitPushAttemptNamespaceAfterVerifiedWriteV1(
   const readback = parseGitPushAttemptNamespaceV1(readbackInput);
   if (!sameNamespace(namespace, readback)) {
     throw new Error(
-      "Git push attempt persistence readback did not match the exact written namespace.",
+      "Git push attempt persistence readback did not match the exact written namespace " +
+        `(differs: ${describeNamespaceDifference(namespace, readback)}).`,
     );
   }
   const cachedAfter = parseGitPushAttemptNamespaceV1(options.readCached());
   if (!sameNamespace(cachedBefore, cachedAfter)) {
     throw new Error(
-      "Git push attempt in-memory namespace changed during its durable write.",
+      "Git push attempt in-memory namespace changed during its durable write " +
+        `(differs: ${describeNamespaceDifference(cachedBefore, cachedAfter)}).`,
     );
   }
   options.commitCached(clone(readback));
@@ -115,7 +117,8 @@ export class DurableGitPushAttemptStoreV1 implements GitPushAttemptStoreV1 {
       );
       if (!sameNamespace(candidate, readback)) {
         throw new Error(
-          "Git push attempt persistence did not return the exact written namespace.",
+          "Git push attempt persistence did not return the exact written namespace " +
+            `(differs: ${describeNamespaceDifference(candidate, readback)}).`,
         );
       }
       return true;
@@ -312,6 +315,145 @@ function parseVerifiedPushReceipt(value: unknown): VerifiedGitPushReceiptV1 {
   return { ...evidence, fingerprint };
 }
 
+export interface GitPushReceiptAttemptBindingV1 {
+  /**
+   * The name reported when this binding drifts. It names the binding only and
+   * never carries a value, so it is safe to place in a durable blocker record.
+   */
+  readonly field: string;
+  readonly matches: (
+    receipt: VerifiedGitPushReceiptV1,
+    attempt: GitPushAttemptRecordV1,
+    expectedReceiptId: string,
+  ) => boolean;
+}
+
+export interface GitPushReceiptAttemptOrderingV1 {
+  /** The name reported when this ordering is violated; a name, never a time. */
+  readonly fault: string;
+  readonly ordered: (
+    receipt: VerifiedGitPushReceiptV1,
+    attempt: GitPushAttemptRecordV1,
+  ) => boolean;
+}
+
+/**
+ * Every equality a verified receipt owes its containing attempt, named. These
+ * lived as one thirteen-clause conjunction behind a single sentence, so a
+ * publication blocked here could only be diagnosed by reproducing the twelve
+ * minute live mission that produced it; collecting the failures by name costs
+ * nothing and turns the blocker into a readable one. The table is exported so
+ * a test can enumerate it and prove each clause is represented in the message,
+ * which is what stops this from silently regressing to a bare sentence.
+ *
+ * Only field names ever reach the message, never the compared values. The
+ * fingerprints and SHAs here are digests and would be safe to quote, but the
+ * remote URL is not: userinfo is rejected upstream, yet a query string such as
+ * "?access_token=..." survives the trusted-host check, and the branch is
+ * caller-supplied text. Rather than leave a later editor to re-derive which of
+ * the thirteen values is safe, the rule is uniform — name the binding, quote
+ * nothing — which also keeps the message inside its length budget.
+ */
+export const GIT_PUSH_RECEIPT_ATTEMPT_BINDINGS_V1: readonly GitPushReceiptAttemptBindingV1[] = [
+  {
+    field: "receipt id",
+    matches: (receipt, _attempt, expectedReceiptId) => receipt.id === expectedReceiptId,
+  },
+  {
+    field: "handoff fingerprint",
+    matches: (receipt, attempt) => receipt.handoffFingerprint === attempt.handoffFingerprint,
+  },
+  {
+    field: "binding fingerprint",
+    matches: (receipt, attempt) =>
+      receipt.repositoryBindingFingerprint === attempt.bindingFingerprint,
+  },
+  {
+    field: "visibility binding fingerprint",
+    matches: (receipt, attempt) =>
+      receipt.repositoryVisibilityBindingFingerprint === attempt.visibilityBindingFingerprint,
+  },
+  {
+    field: "visibility attestation fingerprint",
+    matches: (receipt, attempt) =>
+      receipt.repositoryVisibilityAttestationFingerprint ===
+      attempt.visibilityAttestationFingerprint,
+  },
+  {
+    field: "repository readback fingerprint",
+    matches: (receipt, attempt) =>
+      receipt.repositoryReadbackFingerprint === attempt.repositoryReadbackFingerprint,
+  },
+  {
+    field: "repository visibility",
+    matches: (receipt, attempt) => receipt.repositoryVisibility === attempt.expectedVisibility,
+  },
+  {
+    field: "remote URL",
+    matches: (receipt, attempt) => receipt.remoteUrl === attempt.remoteUrl,
+  },
+  {
+    field: "branch",
+    matches: (receipt, attempt) => receipt.branch === attempt.branch,
+  },
+  {
+    field: "before-remote SHA",
+    matches: (receipt, attempt) => receipt.beforeRemoteSha === attempt.beforeRemoteSha,
+  },
+  {
+    field: "remote SHA",
+    matches: (receipt, attempt) => receipt.remoteSha === attempt.expectedCommitSha,
+  },
+  {
+    field: "commit SHA",
+    matches: (receipt, attempt) => receipt.commitSha === attempt.expectedCommitSha,
+  },
+  {
+    field: "verified-at",
+    matches: (receipt, attempt) => receipt.verifiedAt === attempt.updatedAt,
+  },
+];
+
+/**
+ * The orderings the receipt owes the attempt it sits in. They are separated
+ * from the equalities because a time that is merely out of order is a
+ * different failure from a binding that points at another attempt, and the
+ * original message could not tell an operator which of the two had happened.
+ */
+export const GIT_PUSH_RECEIPT_ATTEMPT_ORDERINGS_V1: readonly GitPushReceiptAttemptOrderingV1[] = [
+  {
+    fault: "pushed-at precedes the attempt start",
+    ordered: (receipt, attempt) =>
+      Date.parse(receipt.pushedAt) >= Date.parse(attempt.startedAt),
+  },
+  {
+    fault: "pushed-at follows its own verification",
+    ordered: (receipt) => Date.parse(receipt.pushedAt) <= Date.parse(receipt.verifiedAt),
+  },
+];
+
+const MAX_NAMED_FAULTS = 5;
+
+/**
+ * Names the faults that actually occurred and stops. The message travels into
+ * a blocker record that downstream truncates near 400 characters, so spelling
+ * out all thirteen bindings would push the first — and in practice the only —
+ * real mismatch out of the record that an operator reads. Five names plus a
+ * count of the remainder keeps the diagnosis inside that budget.
+ *
+ * The limit is a parameter because not every fault name costs the same. A
+ * receipt binding is a short fixed phrase; a namespace fault also carries the
+ * attempt it happened in, so fewer of those fit in the same 400 characters.
+ */
+function summarizeFaults(
+  faults: readonly string[],
+  limit: number = MAX_NAMED_FAULTS,
+): string {
+  const named = faults.slice(0, limit);
+  const remaining = faults.length - named.length;
+  return remaining > 0 ? `${named.join(", ")} and ${remaining} more` : named.join(", ");
+}
+
 function validateReceiptAgainstAttempt(
   receipt: VerifiedGitPushReceiptV1,
   attempt: GitPushAttemptRecordV1,
@@ -321,34 +463,20 @@ function validateReceiptAgainstAttempt(
     visibilityBinding: attempt.visibilityBindingFingerprint,
     expectedVisibility: attempt.expectedVisibility,
   }).slice("sha256:".length, "sha256:".length + 32)}`;
-  const bindingsMatch =
-    receipt.id === expectedReceiptId &&
-    receipt.handoffFingerprint === attempt.handoffFingerprint &&
-    receipt.repositoryBindingFingerprint === attempt.bindingFingerprint &&
-    receipt.repositoryVisibilityBindingFingerprint ===
-      attempt.visibilityBindingFingerprint &&
-    receipt.repositoryVisibilityAttestationFingerprint ===
-      attempt.visibilityAttestationFingerprint &&
-    receipt.repositoryReadbackFingerprint ===
-      attempt.repositoryReadbackFingerprint &&
-    receipt.repositoryVisibility === attempt.expectedVisibility &&
-    receipt.remoteUrl === attempt.remoteUrl &&
-    receipt.branch === attempt.branch &&
-    receipt.beforeRemoteSha === attempt.beforeRemoteSha &&
-    receipt.remoteSha === attempt.expectedCommitSha &&
-    receipt.commitSha === attempt.expectedCommitSha &&
-    receipt.verifiedAt === attempt.updatedAt;
-  if (!bindingsMatch) {
+  const mismatched = GIT_PUSH_RECEIPT_ATTEMPT_BINDINGS_V1.filter(
+    (binding) => !binding.matches(receipt, attempt, expectedReceiptId),
+  ).map((binding) => binding.field);
+  if (mismatched.length > 0) {
     throw new Error(
-      "Verified Git push receipt does not match its containing attempt.",
+      `Verified Git push receipt does not match its containing attempt (mismatched: ${summarizeFaults(mismatched)}).`,
     );
   }
-  if (
-    Date.parse(receipt.pushedAt) < Date.parse(attempt.startedAt) ||
-    Date.parse(receipt.pushedAt) > Date.parse(receipt.verifiedAt)
-  ) {
+  const misordered = GIT_PUSH_RECEIPT_ATTEMPT_ORDERINGS_V1.filter(
+    (ordering) => !ordering.ordered(receipt, attempt),
+  ).map((ordering) => ordering.fault);
+  if (misordered.length > 0) {
     throw new Error(
-      "Verified Git push receipt timestamps do not match its containing attempt.",
+      `Verified Git push receipt timestamps do not match its containing attempt (${summarizeFaults(misordered)}).`,
     );
   }
 }
@@ -500,10 +628,223 @@ function gitSha(value: unknown, label: string): string {
   return value;
 }
 
+/**
+ * Rejects a record whose key set is not exactly the closed contract, and says
+ * which keys were wrong. The bare form of this message hid a field rename
+ * behind the same sentence as a truncated record.
+ *
+ * Missing keys are named because they come from the closed contract written
+ * above — our own text, with no value in it. Unknown keys are only counted:
+ * they are attacker-reachable strings out of persisted JSON, and the namespace
+ * call site runs before any credential scan, so echoing them would be the one
+ * way a secret could reach a durable blocker record from here.
+ */
 function exact(record: Record<string, unknown>, keys: string[], label: string): void {
   const actual = Object.keys(record).sort();
   const expected = [...keys].sort();
-  if (actual.join("\0") !== expected.join("\0")) throw new Error(`${label} keys are invalid.`);
+  if (actual.join("\0") === expected.join("\0")) return;
+  const missing = expected.filter((key) => !actual.includes(key));
+  const unknown = actual.filter((key) => !expected.includes(key)).length;
+  throw new Error(
+    `${label} keys are invalid (missing: ${missing.length > 0 ? summarizeFaults(missing) : "none"}; unknown: ${unknown}).`,
+  );
+}
+
+export interface GitPushAttemptNamespaceFacetV1 {
+  /**
+   * The namespace field reported when it drifts. It names the field only and
+   * never carries a value, so it is safe to place in a durable blocker record.
+   */
+  readonly field: string;
+  readonly same: (
+    left: GitPushAttemptNamespaceV1,
+    right: GitPushAttemptNamespaceV1,
+  ) => boolean;
+}
+
+export interface GitPushAttemptRecordFacetV1 {
+  /** The attempt field reported when it drifts; a name, never a value. */
+  readonly field: string;
+  readonly same: (
+    left: GitPushAttemptRecordV1,
+    right: GitPushAttemptRecordV1,
+  ) => boolean;
+}
+
+/**
+ * Every namespace field outside the attempt map, named. `attempts` is absent on
+ * purpose: it is not one comparison but a membership check plus the record
+ * facets below, and the difference report walks it that way. A test derives
+ * both key sets from a parsed namespace and asserts this table plus `attempts`
+ * accounts for all of them, so a field added to the namespace cannot slip past
+ * the message.
+ */
+export const GIT_PUSH_ATTEMPT_NAMESPACE_FACETS_V1: readonly GitPushAttemptNamespaceFacetV1[] = [
+  { field: "version", same: (left, right) => left.version === right.version },
+  { field: "revision", same: (left, right) => left.revision === right.revision },
+];
+
+/**
+ * Every field an attempt owes its own readback, named. `sameNamespace` compares
+ * one digest of the whole map, so it can prove a durable write was not applied
+ * verbatim but never say what the writer changed; an operator who hit this had
+ * to reproduce the live publication that produced it to find out. Naming the
+ * differing fields costs nothing on a path that is already about to throw.
+ *
+ * `retryHistory` and `receipt` are nested, so they are compared by their own
+ * canonical digest rather than by identity — a facet that compared references
+ * would report every readback as drifted, and one that compared them loosely
+ * would report a real drift as clean.
+ *
+ * Only field names ever reach the message; the differing values never do. The
+ * remote URL is the reason the rule has to be uniform rather than per-field:
+ * userinfo is rejected upstream, but a query string such as "?access_token=..."
+ * survives the trusted-host check and the credential scan does not recognise
+ * it, so quoting even one "obviously safe" value invites the next editor to
+ * quote that one.
+ */
+export const GIT_PUSH_ATTEMPT_RECORD_FACETS_V1: readonly GitPushAttemptRecordFacetV1[] = [
+  { field: "version", same: (left, right) => left.version === right.version },
+  { field: "id", same: (left, right) => left.id === right.id },
+  { field: "revision", same: (left, right) => left.revision === right.revision },
+  {
+    field: "handoffFingerprint",
+    same: (left, right) => left.handoffFingerprint === right.handoffFingerprint,
+  },
+  {
+    field: "bindingFingerprint",
+    same: (left, right) => left.bindingFingerprint === right.bindingFingerprint,
+  },
+  {
+    field: "visibilityBindingFingerprint",
+    same: (left, right) =>
+      left.visibilityBindingFingerprint === right.visibilityBindingFingerprint,
+  },
+  {
+    field: "visibilityAttestationFingerprint",
+    same: (left, right) =>
+      left.visibilityAttestationFingerprint === right.visibilityAttestationFingerprint,
+  },
+  {
+    field: "repositoryReadbackFingerprint",
+    same: (left, right) =>
+      left.repositoryReadbackFingerprint === right.repositoryReadbackFingerprint,
+  },
+  {
+    field: "expectedVisibility",
+    same: (left, right) => left.expectedVisibility === right.expectedVisibility,
+  },
+  {
+    field: "retryHistory",
+    same: (left, right) =>
+      fingerprintContract(left.retryHistory) === fingerprintContract(right.retryHistory),
+  },
+  { field: "branch", same: (left, right) => left.branch === right.branch },
+  { field: "remoteUrl", same: (left, right) => left.remoteUrl === right.remoteUrl },
+  {
+    field: "beforeRemoteSha",
+    same: (left, right) => left.beforeRemoteSha === right.beforeRemoteSha,
+  },
+  {
+    field: "expectedCommitSha",
+    same: (left, right) => left.expectedCommitSha === right.expectedCommitSha,
+  },
+  { field: "status", same: (left, right) => left.status === right.status },
+  {
+    field: "dispatchCount",
+    same: (left, right) => left.dispatchCount === right.dispatchCount,
+  },
+  {
+    field: "reconciliationKey",
+    same: (left, right) => left.reconciliationKey === right.reconciliationKey,
+  },
+  { field: "startedAt", same: (left, right) => left.startedAt === right.startedAt },
+  { field: "updatedAt", same: (left, right) => left.updatedAt === right.updatedAt },
+  {
+    field: "receipt",
+    same: (left, right) =>
+      fingerprintContract(left.receipt) === fingerprintContract(right.receipt),
+  },
+  { field: "diagnostic", same: (left, right) => left.diagnostic === right.diagnostic },
+];
+
+/**
+ * Namespace faults carry an attempt id as well as a field name, so three of
+ * them plus the id bound below is what fits beside the sentence inside the
+ * ~400-character blocker record. A drifted write in practice reports one.
+ */
+const MAX_NAMED_NAMESPACE_FAULTS = 3;
+
+/**
+ * An attempt id is minted as "git-push-" plus a 40-character digest, so the
+ * real ones arrive whole; the bound exists because the parser accepts any
+ * identifier up to 256 characters out of persisted JSON, and three of those
+ * would bury the sentence that explains them.
+ */
+const MAX_NAMED_ATTEMPT_ID = 52;
+
+/**
+ * Reported only if the digests disagree while every named facet agrees. The
+ * facets cover both key sets and compare nested values by the same canonical
+ * digest `sameNamespace` uses, so this is unreachable, and the suite drives
+ * every facet to keep it that way. It exists so the path can never answer a
+ * real mismatch with an empty list — a message that named nothing while
+ * claiming a difference would be the defect being repaired here, one layer
+ * down.
+ */
+const UNNAMED_NAMESPACE_FAULT = "an unnamed field";
+
+/**
+ * Attempt ids are safe to name where the compared values are not. Both sides of
+ * every difference reported here have already been through
+ * parseGitPushAttemptNamespaceV1, so each id has passed expectIdentifier — no
+ * whitespace, quotes, "?", "=" or "&", which is every shape a query-string
+ * secret needs — and both credential scans, and has been proved equal to the
+ * key it is filed under. That is exactly what the unknown keys in `exact` lack:
+ * those are read before any scan runs, which is why they are counted there and
+ * named here.
+ */
+function boundedAttemptId(id: string): string {
+  return id.length > MAX_NAMED_ATTEMPT_ID
+    ? `${id.slice(0, MAX_NAMED_ATTEMPT_ID - 3)}...`
+    : id;
+}
+
+/**
+ * Says what differs between a written namespace and what came back, in the
+ * vocabulary an operator can act on: the attempt, and the field inside it or
+ * the fact that the record was not there. Ids are sorted so the same drift
+ * always reports the same message.
+ */
+function describeNamespaceDifference(
+  written: GitPushAttemptNamespaceV1,
+  observed: GitPushAttemptNamespaceV1,
+): string {
+  const faults: string[] = [];
+  for (const facet of GIT_PUSH_ATTEMPT_NAMESPACE_FACETS_V1) {
+    if (!facet.same(written, observed)) faults.push(facet.field);
+  }
+  const writtenIds = Object.keys(written.attempts).sort();
+  const observedIds = Object.keys(observed.attempts).sort();
+  const present = new Set(observedIds);
+  for (const id of writtenIds) {
+    if (!present.has(id)) {
+      faults.push(`attempt ${boundedAttemptId(id)} vanished`);
+      continue;
+    }
+    const counterpart = observed.attempts[id];
+    for (const facet of GIT_PUSH_ATTEMPT_RECORD_FACETS_V1) {
+      if (!facet.same(written.attempts[id], counterpart)) {
+        faults.push(`attempt ${boundedAttemptId(id)} ${facet.field}`);
+      }
+    }
+  }
+  const wrote = new Set(writtenIds);
+  for (const id of observedIds) {
+    if (!wrote.has(id)) faults.push(`attempt ${boundedAttemptId(id)} appeared`);
+  }
+  if (faults.length < 1) faults.push(UNNAMED_NAMESPACE_FAULT);
+  return summarizeFaults(faults, MAX_NAMED_NAMESPACE_FAULTS);
 }
 
 function sameNamespace(

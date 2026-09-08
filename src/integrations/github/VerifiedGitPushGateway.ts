@@ -792,8 +792,34 @@ export class VerifiedGitPushGatewayV1 {
       repositoryVisibility: prepared.expectedVisibility,
       repositoryVisibilityBindingFingerprint:
         prepared.visibilityBinding.fingerprint,
+      // The visibility attestation is a freshness claim, not an identity. It
+      // hashes observedAt and trustedAt on top of the binding fingerprint, so
+      // it answers "how recently did GitHub tell us this repository is
+      // private", never "which repository is this" — that question is answered
+      // by the binding, visibility binding, and repository readback
+      // fingerprints beside it, every one of which still comes from the freshly
+      // prepared evidence and is still matched against the attempt.
+      //
+      // It has to come from the attempt rather than from `prepared`. Reconcile
+      // always re-observes: an ambiguous push leaves a reconcile_required
+      // attempt, that routes the next call to reconcile, and reconcile refreshes
+      // the binding from the GitHub API, which stamps a new observedAt. The
+      // binding fingerprint excludes observedAt and the attestation includes it,
+      // so a refresh is guaranteed to produce the same identity and a different
+      // attestation, and the durable record is not allowed to move either one.
+      // Minting the receipt from the refreshed attestation therefore left the
+      // receipt disagreeing with the attempt containing it, and the store
+      // rejected the write on every retry — permanently losing a publication
+      // that had already reached GitHub.
+      //
+      // Dispatch-time is also the honest value. The push physically happened
+      // under the evidence that authorized it; reconcile only reads back that
+      // it happened, and it never dispatches. Freshness is still enforced for
+      // this call — prepare() rejects any binding older than the five minute
+      // visibility window before reconcile touches the network — it is simply
+      // not the claim the receipt is making.
       repositoryVisibilityAttestationFingerprint:
-        prepared.visibilityBinding.visibilityAttestationFingerprint,
+        attempt.visibilityAttestationFingerprint,
       repositoryReadbackFingerprint:
         prepared.visibilityBinding.repositoryReadbackFingerprint,
       repositoryProfileKey: prepared.handoff.repositoryProfileKey,

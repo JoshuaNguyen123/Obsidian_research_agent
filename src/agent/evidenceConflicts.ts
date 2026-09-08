@@ -170,6 +170,21 @@ export function acknowledgeEvidenceConflict(
 }
 
 /**
+ * Language that records a source disagreement. This is the vocabulary the
+ * corrective prompt asks the model for ("say the sources conflict, contradict,
+ * disagree, or differ"), so every phrasing that instruction invites must pass
+ * here: the bare verb or noun ("the two sources deliberately conflict", "are
+ * in conflict"), an adverb between subject and verb, and the plain synonyms a
+ * model reaches for ("reach opposite conclusions", "at odds"). Qualification
+ * cohort 5 (DU-02, 2026-09-07) was lost to "deliberately conflict", which the
+ * earlier adjacency form `sources conflict` did not match while the note
+ * satisfied the human contract exactly. The section requirement below is what
+ * keeps a generic caveat from discharging a conflict, not the vocabulary.
+ */
+const CONFLICT_LANGUAGE_RE =
+  /\b(?:conflict(?:s|ed|ing)?|contradict(?:s|ed|ion|ions|ory)?|disagree(?:s|d|ment|ments)?|inconsistent|at\s+odds|opposi(?:te|ng)\s+(?:conclusions?|findings?|results?|directions?|claims?)|sources?\b[^.\n]{0,40}?\b(?:differ|diverge)s?)\b/iu;
+
+/**
  * Project candidate-scoped acknowledgements without mutating durable conflict
  * state. An accepted answer must contain both an explicit limitations-style
  * section and clear source-disagreement language; a generic caveat paragraph
@@ -200,10 +215,7 @@ export function projectEvidenceConflictAcknowledgements(
     /(?:^|\n)\s{0,3}(?:(?:#{1,6}\s+)|\*\*)?(?:limitations?|uncertaint(?:y|ies)|conflicting\s+evidence|source\s+disagreements?|open\s+questions?)(?:\*\*)?(?:\s*:|\s*(?:\n|$))/imu.test(
       output,
     );
-  const explicitlyDescribesConflict =
-    /\b(?:conflicting?|contradict(?:s|ed|ion|ions|ory)?|disagree(?:s|d|ment|ments)?|inconsistent|sources?\s+(?:differ|conflict|disagree))\b/iu.test(
-      output,
-    );
+  const explicitlyDescribesConflict = CONFLICT_LANGUAGE_RE.test(output);
   if (!hasExplicitLimitationsSection || !explicitlyDescribesConflict) {
     return candidateBoundConflicts;
   }
@@ -259,10 +271,13 @@ export function evaluateEvidenceConflictAcceptance({
 
   if (finalOutput !== undefined) {
     const output = finalOutput.trim();
+    // Must accept every heading the projection accepts as a limitations-style
+    // section (uncertainties, source disagreements) plus the conflict language
+    // itself, or an acknowledged conflict fails here for text that passed there.
     const hasLimitationLanguage =
-      /\blimitations?\b|\bopen questions?\b|\bunanswered\b|\buncertainty\b|\bconflicting\b|\bcontradict/i.test(
+      /\blimitations?\b|\bopen questions?\b|\bunanswered\b|\buncertaint(?:y|ies)\b|\bsource\s+disagreements?\b/iu.test(
         output,
-      );
+      ) || CONFLICT_LANGUAGE_RE.test(output);
     for (const conflict of conflicts.filter(
       (item) => item.status === "acknowledged_limitation",
     )) {

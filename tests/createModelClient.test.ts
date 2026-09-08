@@ -6,6 +6,7 @@ import {
   hybridStreamingTransport,
 } from "../src/model/createModelClient";
 import { ModelClientError } from "../src/model/types";
+import { isTransientModelError } from "../src/model/retry";
 import type { AgentSettings } from "../src/settings";
 
 function settings(overrides: Partial<AgentSettings> = {}): AgentSettings {
@@ -132,6 +133,74 @@ test("hybrid streaming transport does not re-run a timed-out request over the de
       },
     );
     assert.ok(Date.now() - startedAt < 5_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a connection dropped mid-stream is a transient network error, not a bare socket error", async () => {
+  // Qualification cohort 8 (2026-09-07): the mission's first model call died
+  // with "Why: aborted" after 26 s and zero retries. Node reports a dropped
+  // connection as Error("aborted") with code ECONNRESET; the retry loop only
+  // retries errors shaped as transient model errors.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((_input: unknown) => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encoder.encode("{\"partial\":true}"));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        controller.error(Object.assign(new Error("aborted"), { code: "ECONNRESET" }));
+      },
+    });
+    return Promise.resolve(new Response(body, { status: 200 }));
+  }) as typeof fetch;
+  try {
+    const response = await hybridStreamingTransport({
+      url: "http://127.0.0.1:9/api/chat",
+      method: "POST",
+      body: "{}",
+      timeoutMs: 5_000,
+    });
+    await assert.rejects(
+      (async () => {
+        for await (const _chunk of response.body) {
+          /* drain until the connection drops */
+        }
+      })(),
+      (error: unknown) => {
+        assert.ok(error instanceof ModelClientError);
+        assert.equal(error.category, "network");
+        assert.match(error.message, /Streaming connection failed: aborted \(ECONNRESET\)/u);
+        assert.equal(isTransientModelError(error), true, "the retry budget must apply");
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a request that fails on both transports is a transient network error with both causes named", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (() => Promise.reject(new TypeError("fetch failed"))) as typeof fetch;
+  try {
+    await assert.rejects(
+      hybridStreamingTransport({
+        // A closed loopback port: the desktop fallback fails fast with ECONNREFUSED.
+        url: "http://127.0.0.1:9/api/chat",
+        method: "POST",
+        body: "{}",
+        timeoutMs: 5_000,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof ModelClientError);
+        assert.equal(error.category, "network");
+        assert.match(error.message, /^Fetch streaming failed: Streaming request failed: fetch failed\. Desktop streaming fallback failed: Desktop streaming request failed: .*ECONNREFUSED/u);
+        assert.equal(isTransientModelError(error), true, "the retry budget must apply");
+        return true;
+      },
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

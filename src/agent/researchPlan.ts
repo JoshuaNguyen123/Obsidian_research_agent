@@ -28,6 +28,8 @@ import { hasExplicitNoVaultReadIntent } from "./missionScope";
 import {
   evaluateReportStructure,
   reportStrictnessForTier,
+  reportStructureCorrectionAppliesV1,
+  reportStructureCorrectionLinesV1,
 } from "./researchReportStructure";
 import { getUrlHostname } from "./sourceSignals";
 import {
@@ -1941,8 +1943,13 @@ function getResearchAcceptanceNextAction(missing: string[]): string | undefined 
   if (missing.includes("citation_url_coverage")) {
     return "Revise the answer to cite each fetched source by URL or exact persisted passage identifier.";
   }
-  if (missing.includes("limitations_section") || missing.includes("confidence_section")) {
-    return "Revise the answer with limitations and confidence.";
+  if (reportStructureCorrectionAppliesV1(missing)) {
+    // This seat wins: the next action is what the live run puts in front of
+    // the model, ahead of the acceptance copy and the runner's verification
+    // prompt. A hand-written summary here therefore reinstates the
+    // under-specified ask on its own, no matter how precise the other two
+    // seats are — which is how cohort 15's fix would have shipped inert.
+    return reportStructureCorrectionLinesV1(missing).join(" ");
   }
   return undefined;
 }

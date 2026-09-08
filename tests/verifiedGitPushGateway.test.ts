@@ -20,6 +20,7 @@ import {
 import {
   DurableGitPushAttemptStoreV1,
   parseGitPushAttemptNamespaceV1,
+  parseGitPushAttemptRecordV1,
   type GitPushAttemptNamespaceV1,
 } from "../src/integrations/github/GitPushAttemptStore";
 import {
@@ -225,6 +226,150 @@ test("ambiguous push is persisted for reconciliation and is never retried", asyn
     assert.equal(reconciled.receipt.commitKind, "reconciled");
   }
   assert.equal(fixture.runner.pushes, 1);
+});
+
+test("reconcile against a refreshed visibility observation completes through the durable store", async () => {
+  // This is the shape production always supplies and no test used to cover.
+  // A reconcile_required attempt routes the next tool call to workflow.reconcile,
+  // which refreshes the repository binding from the GitHub API first. The
+  // refresh stamps a new observedAt, and because the binding fingerprint
+  // excludes observedAt while the visibility attestation hashes it in, the
+  // refreshed binding is byte-identical in identity and guaranteed different in
+  // attestation. The old reconcile test passed the same unrefreshed binding
+  // back in, so it never crossed that boundary; a live compound mission did,
+  // retried three times, and lost a push that had already reached GitHub.
+  const fixture = createFixture({ pushMode: "applied_throw" });
+  let namespace: GitPushAttemptNamespaceV1 | null = null;
+  const store = new DurableGitPushAttemptStoreV1({
+    async read() {
+      return clone(namespace);
+    },
+    async write(next, expectedRevision) {
+      if ((namespace?.revision ?? 0) !== expectedRevision) return false;
+      namespace = clone(next);
+      return true;
+    },
+  });
+  const gateway = new VerifiedGitPushGatewayV1({
+    runner: fixture.runner,
+    askpassBroker: fixture.broker,
+    attemptStore: store,
+    disabledHooksPath: "C:\\agent-runtime\\empty-hooks",
+    now: tickingClock(),
+  });
+
+  const first = await gateway.push(fixture.input);
+  assert.equal(first.status, "reconcile_required");
+  assert.equal(fixture.runner.pushes, 1);
+
+  const refreshed = refreshVisibilityObservation(fixture, "2026-07-12T12:03:00.000Z");
+  assert.equal(
+    refreshed.fingerprint,
+    fixture.privateRepositoryBinding.fingerprint,
+    "a refresh must not move the identity-bearing binding fingerprint",
+  );
+  assert.equal(
+    refreshed.repositoryReadbackFingerprint,
+    fixture.privateRepositoryBinding.repositoryReadbackFingerprint,
+    "a refresh of the same repository must not move the readback fingerprint",
+  );
+  assert.notEqual(
+    refreshed.visibilityAttestationFingerprint,
+    fixture.privateRepositoryBinding.visibilityAttestationFingerprint,
+    "a refresh always moves the attestation, which is what the guard used to reject",
+  );
+
+  const reconciled = await gateway.reconcile({
+    ...fixture.input,
+    privateRepositoryBinding: refreshed,
+  });
+  assert.equal(reconciled.status, "pushed_verified");
+  if (reconciled.status !== "pushed_verified") return;
+  assert.equal(reconciled.receipt.commitKind, "reconciled");
+  assert.equal(fixture.runner.pushes, 1, "reconcile must never dispatch a second push");
+
+  const persisted = namespace as unknown as GitPushAttemptNamespaceV1;
+  const [attempt] = Object.values(persisted.attempts);
+  assert.equal(attempt?.status, "verified");
+  // The receipt attests the push, and the push was dispatched under the
+  // evidence stored on the attempt, so both sides carry the dispatch-time
+  // attestation. Reconcile reads back; it never re-authorizes, so it must not
+  // restamp the record's evidence either.
+  assert.equal(
+    attempt?.visibilityAttestationFingerprint,
+    fixture.privateRepositoryBinding.visibilityAttestationFingerprint,
+    "reconcile must not move the durable attempt's evidence",
+  );
+  assert.equal(
+    attempt?.receipt?.repositoryVisibilityAttestationFingerprint,
+    attempt?.visibilityAttestationFingerprint,
+    "the receipt must agree with the attempt containing it",
+  );
+  assert.notEqual(
+    attempt?.receipt?.repositoryVisibilityAttestationFingerprint,
+    refreshed.visibilityAttestationFingerprint,
+    "the refreshed observation is a freshness gate for this call, not receipt evidence",
+  );
+  // Everything that names *which* push this is stayed pinned across the refresh.
+  assert.equal(attempt?.handoffFingerprint, fixture.handoff.fingerprint);
+  assert.equal(attempt?.bindingFingerprint, fixture.binding.fingerprint);
+  assert.equal(
+    attempt?.visibilityBindingFingerprint,
+    fixture.privateRepositoryBinding.fingerprint,
+  );
+  assert.equal(
+    attempt?.repositoryReadbackFingerprint,
+    fixture.privateRepositoryBinding.repositoryReadbackFingerprint,
+  );
+  assert.equal(attempt?.expectedCommitSha, COMMIT);
+  assert.equal(attempt?.dispatchCount, 1);
+});
+
+test("a refreshed attestation never launders a receipt from another push", async () => {
+  // The attestation moved for a benign reason above. It must not become a way
+  // in for a receipt that belongs to a different handoff, binding, branch, or
+  // commit, so drive the same refreshed-reconcile shape with each identity
+  // dimension perturbed and require the store to refuse every one of them.
+  const fixture = createFixture({ pushMode: "applied_throw" });
+  const first = await fixture.gateway.push(fixture.input);
+  assert.equal(first.status, "reconcile_required");
+  const [stored] = fixture.store.all();
+  assert.ok(stored);
+
+  const reconciled = await fixture.gateway.reconcile({
+    ...fixture.input,
+    privateRepositoryBinding: refreshVisibilityObservation(
+      fixture,
+      "2026-07-12T12:03:00.000Z",
+    ),
+  });
+  assert.equal(reconciled.status, "pushed_verified");
+  if (reconciled.status !== "pushed_verified") return;
+
+  const verified = fixture.store.all()[0];
+  assert.ok(verified);
+  const forgeries: Array<[string, Partial<GitPushAttemptRecordV1>]> = [
+    ["handoff fingerprint", { handoffFingerprint: FP_B }],
+    ["binding fingerprint", { bindingFingerprint: FP_B }],
+    ["visibility binding fingerprint", { visibilityBindingFingerprint: FP_B }],
+    ["repository readback fingerprint", { repositoryReadbackFingerprint: FP_B }],
+    ["branch", { branch: "codex/other-branch" }],
+    ["before-remote SHA", { beforeRemoteSha: REMOTE_OLD }],
+    ["remote SHA", { expectedCommitSha: "f".repeat(40) }],
+    ["verified-at", { updatedAt: "2026-07-12T12:59:00.000Z" }],
+  ];
+  for (const [field, mutation] of forgeries) {
+    assert.throws(
+      () => parseGitPushAttemptRecordV1({ ...verified, ...mutation }),
+      (error: unknown) =>
+        error instanceof Error &&
+        (error.message.includes(field) ||
+          // A moved binding fingerprint also re-derives the receipt id, so the
+          // id clause fires first; either name proves the forgery was caught.
+          error.message.includes("receipt id")),
+      `a forged ${field} must not survive the attestation-tolerant guard`,
+    );
+  }
 });
 
 test("non-durable verified state is rejected and the durable dispatch marker suppresses replay", async () => {
@@ -667,6 +812,39 @@ function createFixture(options: {
       credentialReferenceId: "secret-ref-github-1",
     },
   };
+}
+
+/**
+ * Rebuilds the fixture's visibility binding exactly as a live refresh does:
+ * the same repository readback, the same trust anchor, a later observedAt. It
+ * is the only difference between a binding that came out of the settings cache
+ * and one that just came back from the GitHub API, and it is enough to move the
+ * attestation while leaving every identity fingerprint untouched.
+ */
+function refreshVisibilityObservation(
+  fixture: ReturnType<typeof createFixture>,
+  observedAt: string,
+) {
+  return createTrustedGitHubRepositoryBindingV2({
+    key: fixture.binding.key,
+    profile: fixture.profile,
+    owner: fixture.binding.owner,
+    repository: fixture.binding.repository,
+    repositoryReadback: {
+      id: fixture.binding.repositoryId,
+      fullName: `${fixture.binding.owner}/${fixture.binding.repository}`,
+      htmlUrl: `https://github.com/${fixture.binding.owner}/${fixture.binding.repository}`,
+      defaultBranch: fixture.binding.defaultBranch,
+      private: true,
+      visibility: "private",
+      archived: false,
+    },
+    expectedVisibility: "private",
+    observedAt,
+    verifiedAccountId: fixture.binding.verifiedAccountId,
+    verifiedAccountLogin: fixture.binding.verifiedAccountLogin,
+    trustedAt: fixture.binding.trustedAt,
+  });
 }
 
 class FakeAskpassBroker implements EphemeralGitAskpassBrokerV1 {

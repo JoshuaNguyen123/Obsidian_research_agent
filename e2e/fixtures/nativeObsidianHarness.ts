@@ -7,9 +7,18 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import {
+  createTeardownOwnershipWindow,
   terminateControlledObsidian,
   type TeardownProbePhase,
 } from "../../scripts/obsidian-process-lifecycle";
+import {
+  gracefulQuitMayHaveReachedAppV1,
+  requestGracefulObsidianQuitV1,
+} from "./gracefulObsidianQuit";
+import {
+  discardedSecretReferencesV1,
+  removeDiscardedSecretsV1,
+} from "./discardedSecretReferences";
 import {
   appendHostEventV1,
   describeSweepOutcomeV1,
@@ -37,6 +46,14 @@ import {
   recoverStalePluginDataBackup,
   restorePluginDataSnapshot,
 } from "./pluginDataBackup";
+import {
+  QUIET_OBSIDIAN_CHROMIUM_SWITCHES,
+  parkObsidianWindowAfterAttachV1,
+  parkObsidianWindowStateBeforeLaunchV1,
+  quietObsidianWindowRequested,
+  restoreObsidianWindowStateAfterExitV1,
+  type ParkedObsidianWindowStateV1,
+} from "./quietObsidianWindow";
 import { fingerprintCanonicalJson } from "../../src/agent/queue/fingerprint";
 import { parseRepositoryProfileRegistry } from "../../src/agent/repositories/RepositoryProfile";
 import {
@@ -179,6 +196,30 @@ export async function startNativeObsidianHarness(
     ]);
   const ownedArtifactsBefore = await snapshotOwnedE2EArtifacts(vaultRoot);
   const retainVaultPaths = options.retainVaultPaths ?? [];
+  // The data.json restore below forgets every credential reference this lane
+  // created from the plaintext it seeded, while the secret stays in
+  // SecretStorage forever (966 ids on 2026-09-07). Remove those secrets from
+  // inside the app while it is still running, before teardown; preserved
+  // Linear/GitHub records are carried forward and never touched.
+  const removeSecretsTheRestoreDiscards = async (
+    activePage: Page | null,
+  ): Promise<void> => {
+    if (!activePage || activePage.isClosed()) return;
+    const currentText = await readOptionalText(pluginDataPaths[0]).catch(() => null);
+    const discarded = discardedSecretReferencesV1(
+      pluginDataBefore[0] ?? null,
+      currentText,
+      {
+        preserveLinear: options.preserveConfiguredLinearCredential === true,
+        preserveGitHub: options.preserveConfiguredGitHubCredential === true,
+      },
+    );
+    if (discarded.length === 0) return;
+    const removed = await removeDiscardedSecretsV1(activePage, discarded);
+    console.log(
+      `[teardown] ${options.label}: removed ${removed}/${discarded.length} secret(s) this lane created and the data.json restore discards`,
+    );
+  };
   await mkdir(path.dirname(VAULT_CLEANUP_MANIFEST_PATH), { recursive: true });
   await writeFile(
     VAULT_CLEANUP_MANIFEST_PATH,
@@ -215,10 +256,27 @@ export async function startNativeObsidianHarness(
   let page: Page | null = null;
   let closed = false;
   let rootCreatedAtMs: number | null = null;
+  // Proof lanes keep Obsidian's window off the user's screen (see
+  // quietObsidianWindow.ts). The demo recorder opts back into a visible window.
+  const quietWindow = quietObsidianWindowRequested();
+  let parkedWindowState: ParkedObsidianWindowStateV1 | null = null;
   const launchOwnedProcess = async (
     allowTrustRestart = true,
   ): Promise<Page> => {
     rootCreatedAtMs = Date.now();
+    if (quietWindow) {
+      const parkOutcome = await parkObsidianWindowStateBeforeLaunchV1({
+        appStatePath: obsidianAppStatePath(),
+        vaultRoot,
+      });
+      if (parkOutcome.status === "parked") {
+        parkedWindowState = parkOutcome.parked;
+      } else {
+        console.log(
+          `[quiet-window] ${options.label}: launch placement not parked — ${parkOutcome.reason}`,
+        );
+      }
+    }
     processHandle = spawn(
       obsidianExe,
       [
@@ -238,6 +296,9 @@ export async function startNativeObsidianHarness(
         // ceiling keeps a finite spike alive; the product allocation bug is
         // tracked separately and this flag must not be treated as the fix.
         "--js-flags=--max-old-space-size=8192",
+        // Keep rendering, animation frames and timers at full rate while the
+        // window is parked off-screen; Playwright's stability waits need frames.
+        ...(quietWindow ? QUIET_OBSIDIAN_CHROMIUM_SWITCHES : []),
         vaultRoot,
       ],
       {
@@ -257,6 +318,9 @@ export async function startNativeObsidianHarness(
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     page = await findOnlyVaultPage(browser, vaultRoot);
     watchRendererLiveness(browser, page, options.label, cdpPort);
+    if (quietWindow) {
+      await parkObsidianWindowAfterAttachV1(page, options.label);
+    }
     const trustChanged = await trustDisposableVaultIfPrompted(page);
     if (trustChanged) {
       if (!allowTrustRestart) {
@@ -264,7 +328,7 @@ export async function startNativeObsidianHarness(
           "Obsidian still requested disposable-vault trust after the controlled restart.",
         );
       }
-      await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
+      await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page, options.label);
       await withTimeout(browser.close(), 5_000, "Disposable-vault trust restart close")
         .catch(() => undefined);
       processHandle = null;
@@ -314,7 +378,7 @@ export async function startNativeObsidianHarness(
         if (closed) {
           throw new Error("Cannot relaunch a closed native Obsidian harness.");
         }
-        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
+        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page, options.label);
         if (browser) {
           await withTimeout(browser.close(), 5_000, "Playwright CDP relaunch close")
             .catch(() => undefined);
@@ -349,9 +413,27 @@ export async function startNativeObsidianHarness(
             },
           );
         }
-        await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch((error) => {
+        await removeSecretsTheRestoreDiscards(activePage).catch(() => undefined);
+        await terminateObsidian(
+          processHandle,
+          cdpPort,
+          rootCreatedAtMs,
+          activePage,
+          options.label,
+        ).catch((error) => {
           teardownError ??= error;
         });
+        if (parkedWindowState) {
+          // The owned process is gone; put the user's saved placement back so
+          // opening the vault by hand later looks exactly as before the lane.
+          const restored = await restoreObsidianWindowStateAfterExitV1(parkedWindowState);
+          parkedWindowState = null;
+          if (restored === "failed") {
+            console.warn(
+              `[quiet-window] ${options.label}: could not restore the saved window placement`,
+            );
+          }
+        }
         if (browser) {
           await withTimeout(browser.close(), 5_000, "Playwright CDP close")
             .catch(() => undefined);
@@ -409,7 +491,14 @@ export async function startNativeObsidianHarness(
         "Native Obsidian failed-start beforeClose hook",
       ).catch(() => undefined);
     }
-    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch(() => undefined);
+    await removeSecretsTheRestoreDiscards(failedPage).catch(() => undefined);
+    await terminateObsidian(
+      processHandle,
+      cdpPort,
+      rootCreatedAtMs,
+      failedPage,
+      options.label,
+    ).catch(() => undefined);
     if (failedBrowser) {
       await withTimeout(failedBrowser.close(), 5_000, "Playwright failed-start CDP close")
         .catch(() => undefined);
@@ -1099,10 +1188,15 @@ async function waitForCdp(
  * true, not the wait longer.
  */
 const OWNED_EXIT_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  // A graceful quit closed the page in under 100 ms when probed on
+  // 2026-09-07; ten seconds absorbs a slow plugin unload without holding a
+  // teardown that will be killed anyway.
+  graceful: 10_000,
   initial: 30_000,
   recheck: 10_000,
 };
 const PROCESS_DRAIN_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  graceful: 10_000,
   initial: 45_000,
   recheck: 10_000,
 };
@@ -1111,16 +1205,34 @@ async function terminateObsidian(
   processHandle: ChildProcessWithoutNullStreams | null,
   cdpPort: number,
   rootCreatedAtMs: number | null,
+  page: Page | null,
+  label: string,
 ): Promise<void> {
   if (!processHandle?.pid) return;
   const rootPid = processHandle.pid;
   // Our root's PID cannot be recycled until our root dies, and our root dies
-  // during teardown — so this instant is the upper bound that makes "PID N,
-  // image Obsidian.exe" an identity instead of a coincidence.
-  const teardownStartedAtMs = Date.now();
+  // during teardown — so the instant this window closes is the upper bound that
+  // makes "PID N, image Obsidian.exe" an identity instead of a coincidence. It
+  // stays OPEN across the graceful quit, because the app is still alive there by
+  // our own choice and still spawning helpers; the teardown closes it once, at
+  // the start of the kill phase. A bound stamped here instead disowned every
+  // process born during the graceful window, and a disowned orphan is never
+  // swept — it keeps the vault and the machine lock into the next lane.
+  const ownership = createTeardownOwnershipWindow();
   // Mark BEFORE dispatching the kill so the exit record cannot race the flag.
   hostTeardownRequested = true;
   await terminateControlledObsidian(processHandle, {
+    requestGracefulExit: async () => {
+      const outcome = await requestGracefulObsidianQuitV1(page);
+      console.log(`[teardown] ${label}: graceful quit ${outcome}`);
+      // The dispatch bound is NOT the graceful budget: a renderer that the quit
+      // is already unloading cannot answer the evaluate that asked for it, so
+      // only a request that provably never reached the app skips the exit wait.
+      return gracefulQuitMayHaveReachedAppV1(outcome);
+    },
+    closeOwnershipWindow: () => {
+      ownership.close();
+    },
     terminateOwnedTree: async (pid) => {
       // Bounded and hidden. This dispatch had NO timeout, so a taskkill that
       // itself blocked — reachable when a process is wedged in termination,
@@ -1131,12 +1243,15 @@ async function terminateObsidian(
         timeout: 30_000,
       }).catch(() => processHandle.kill());
     },
+    // Every ownership question below reads the SAME window, at call time. The
+    // probe that decides whether the teardown drained and the sweep that is its
+    // only remediation must never disagree about what we own.
     waitForOwnedExit: (phase) =>
       waitForOwnedRootExitV1({
         handle: processHandle,
         rootPid,
         rootCreatedAtMs,
-        teardownStartedAtMs,
+        teardownStartedAtMs: ownership.upperBoundMs(),
         imageName: obsidianImageName(),
         timeoutMs: OWNED_EXIT_TIMEOUT_MS[phase],
       }),
@@ -1145,12 +1260,17 @@ async function terminateObsidian(
         cdpPort,
         rootPid,
         rootCreatedAtMs,
-        teardownStartedAtMs,
+        ownership.upperBoundMs(),
         PROCESS_DRAIN_TIMEOUT_MS[phase],
       ),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
     sweepSurvivingProcesses: () =>
-      sweepObsidianSurvivors(cdpPort, rootPid, rootCreatedAtMs, teardownStartedAtMs),
+      sweepObsidianSurvivors(
+        cdpPort,
+        rootPid,
+        rootCreatedAtMs,
+        ownership.upperBoundMs(),
+      ),
   });
 }
 

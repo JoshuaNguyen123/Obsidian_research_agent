@@ -6,6 +6,18 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { PLAYWRIGHT_PROJECTS } from "../scripts/run-e2e-exclusive.mjs";
+import { measuresProduct } from "../scripts/product-evidence.mjs";
+import { resolveReliabilityGate } from "../scripts/reliability-campaign.mjs";
+import {
+  buildQualificationCohort,
+  deriveQualificationRecords,
+  occurrenceHasTerminalRecord,
+} from "../scripts/qualification-cohort.mjs";
+import {
+  QUALIFICATION_ARTIFACT_FILES,
+  classifyPreexistingWorkspacesV1,
+  qualificationArtifactHashes,
+} from "../scripts/run-proof-matrix.mjs";
 import {
   ATTEMPT_LOG_DIR,
   ACCEPTANCE_PROOF_MISSING_FAILURE_CLASS,
@@ -46,6 +58,7 @@ import {
   LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
   PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR,
+  PROOF_MATRIX_FAILURE_DETAIL_CAP,
   PROOF_MATRIX_MANIFEST_RELATIVE_PATH,
   PROOF_MATRIX_STATE_RELATIVE_DIR,
   RENDERER_DEATH_FAILURE_CLASS,
@@ -75,6 +88,11 @@ import {
 } from "../scripts/run-proof-matrix.mjs";
 import { TOOL_REFUSAL_MARKER_BUCKETS } from "../e2e/reporters/dailyUseReporter";
 import { composeMandatoryCleanupError } from "../e2e/fixtures/externalCleanup";
+import {
+  TOOL_CALL_FAILURE_DETAIL_CAP,
+  foldToolCallOutcomesV1,
+  normalizeMissionToolEventV1,
+} from "../e2e/fixtures/toolCallOutcomes";
 
 function manifestWith(attempts: ProofMatrixAttempt[]): ProofMatrixManifest {
   return { attempts, productClassCounts: {} };
@@ -919,12 +937,16 @@ test("a fresh run summary outranks graph mining as the tool-event source", () =>
 });
 
 test("fresh summaries preserve bounded failed-call identity after graph cleanup", () => {
+  // Deliberately a PRE-FIELD detail: no errorMessage key at all, the shape a
+  // record written by a reporter that predates the field still has. It must
+  // survive whole, with the message reported as unobserved.
   const detail = {
     id: "2:1:read_current_file",
     toolName: "read_current_file",
     errorCode: null,
     bucket: "other",
   };
+  const unobserved = { ...detail, errorMessage: null };
   const summary = {
     records: [
       {
@@ -938,7 +960,9 @@ test("fresh summaries preserve bounded failed-call identity after graph cleanup"
     ],
   };
   const totals = summaryToolEventTotals(summary);
-  assert.deepEqual(totals?.failureDetails, [detail]);
+  assert.deepEqual(totals?.failureDetails, [unobserved]);
+  // An unobserved message must not make an otherwise complete record look
+  // lossy: nothing was dropped, so nothing claims a truncation.
   assert.equal(totals?.failureDetailsTruncated, false);
 
   const events = resolveAttemptToolEvents({
@@ -946,7 +970,7 @@ test("fresh summaries preserve bounded failed-call identity after graph cleanup"
     summaryFresh: true,
     minedCounts: { observed: 0, failed: 0, buckets: null },
   });
-  assert.deepEqual(events.failureDetails, [detail]);
+  assert.deepEqual(events.failureDetails, [unobserved]);
   assert.equal(events.failureDetailsTruncated, false);
 
   const stale = resolveAttemptToolEvents({
@@ -956,6 +980,205 @@ test("fresh summaries preserve bounded failed-call identity after graph cleanup"
   });
   assert.equal(stale.failureDetails, null, "graphs cannot recover per-call failure identity");
   assert.equal(stale.failureDetailsTruncated, null);
+});
+
+/**
+ * Build the record a run summary really holds for one failed call, by driving
+ * the PRODUCERS rather than writing the shape out by hand: raw native events
+ * through normalizeMissionToolEventV1, the fold, and the JSON round-trip the
+ * annotation and the summary file both perform. The defect this pins is that
+ * the roll-up never wrote `errorMessage` at all, so a fixture that simply
+ * asserts a hand-made object into the roll-up proves nothing about the producer.
+ */
+function summaryRecordForFailedCall(input: {
+  code: string | null;
+  message?: string;
+}): Record<string, unknown> {
+  const events = [
+    { kind: "tool_start", id: "3:0:project_idea_brief", toolName: "project_idea_brief" },
+    {
+      kind: "tool_result",
+      id: "3:0:project_idea_brief:result",
+      toolName: "project_idea_brief",
+      error: {
+        ...(input.code === null ? {} : { code: input.code }),
+        ...(input.message === undefined ? {} : { message: input.message }),
+      },
+    },
+    { kind: "tool_start", id: "3:1:append_to_note", toolName: "append_to_note" },
+    { kind: "tool_result", id: "3:1:append_to_note:result", toolName: "append_to_note" },
+  ].map((event) => normalizeMissionToolEventV1(event, "trace")!);
+  const counts = foldToolCallOutcomesV1(events);
+  // The round-trip is not decoration: the summary reaches the roll-up as text
+  // on disk, and an `undefined` field would not survive it.
+  return JSON.parse(
+    JSON.stringify({
+      scenarioId: "DU-06",
+      toolCallsAttempted: counts.attempted,
+      toolCallsFailed: counts.failed,
+      toolCallOutcomes: counts,
+    }),
+  ) as Record<string, unknown>;
+}
+
+test("a failed call's CAUSE, not just its code, reaches the manifest on disk", () => {
+  // One of the eight sentences behind `project_idea_brief_invalid` — the code
+  // that killed a 504-run cohort while naming a family instead of a rule.
+  const raised = "project idea brief must name at least one acceptance criterion";
+  const record = summaryRecordForFailedCall({
+    code: "project_idea_brief_invalid",
+    message: raised,
+  });
+  // The fixture is realistic only if the real fold actually carries the
+  // sentence; assert that before asking the roll-up to preserve it.
+  const folded = record.toolCallOutcomes as { failureDetails: { errorMessage: string }[] };
+  assert.equal(folded.failureDetails[0]?.errorMessage, raised);
+
+  const summary = { records: [record] };
+  const totals = summaryToolEventTotals(summary);
+  assert.equal(totals?.failureDetails?.length, 1);
+  assert.equal(totals?.failureDetails?.[0]?.errorCode, "project_idea_brief_invalid");
+  assert.equal(
+    totals?.failureDetails?.[0]?.errorMessage,
+    raised,
+    "the roll-up must keep the sentence that names WHICH rule broke",
+  );
+
+  const toolEvents = resolveAttemptToolEvents({
+    summary,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(toolEvents.failureDetails?.[0]?.errorMessage, raised);
+
+  // ...and all the way onto disk, because the manifest — not the run summary,
+  // which the next attempt's Playwright wipe deletes — is the artifact a dead
+  // cohort is diagnosed from.
+  const gate = resolveReliabilityGate("qualification99");
+  const cohort = buildQualificationCohort({
+    gate,
+    cells: CELLS,
+    seed: "failure-message-seed",
+  });
+  const occurrence = cohort.occurrences[0];
+  const declaration = { ...cohort, cohortId: "cohort-under-test" };
+  const manifest = {
+    model: PROOF_MATRIX_MODEL,
+    expectedHead: "0".repeat(40),
+    attempts: [
+      {
+        cell: occurrence.workflow,
+        occurrenceId: occurrence.occurrenceId,
+        cohortId: declaration.cohortId,
+        workflow: occurrence.workflow,
+        model: PROOF_MATRIX_MODEL,
+        headSha: "0".repeat(40),
+        launched: true,
+        green: false,
+        failureClass: "product:tool_call_failed",
+        durationS: 240,
+        toolEvents,
+        acceptance: null,
+      },
+    ],
+  };
+  const dir = tempDir();
+  try {
+    const target = path.join(dir, "proof-matrix-manifest.json");
+    writeJsonAtomic(target, manifest);
+    const onDisk = readFileSync(target, "utf8");
+    assert.ok(
+      onDisk.includes(raised),
+      "the retained manifest must spell out the broken rule, not only its code",
+    );
+    const parsed = JSON.parse(onDisk) as {
+      attempts: { toolEvents: { failureDetails: { errorMessage: string | null }[] } }[];
+    };
+    assert.equal(parsed.attempts[0].toolEvents.failureDetails[0].errorMessage, raised);
+
+    // The cohort projection copies toolEvents wholesale; pin that it keeps
+    // doing so, since a field-by-field rebuild there would make the fix inert.
+    // Read through a local widening: qualification-cohort.d.mts declares a
+    // narrower toolEvents than the record actually carries.
+    const derived = deriveQualificationRecords(parsed, declaration);
+    const kept = derived.records.find(
+      (entry) => entry.occurrenceId === occurrence.occurrenceId,
+    ) as unknown as
+      | { toolEvents?: { failureDetails?: { errorMessage?: string | null }[] } | null }
+      | undefined;
+    assert.equal(kept?.toolEvents?.failureDetails?.[0]?.errorMessage, raised);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unobserved failure message is null, and does not make a record look lossy", () => {
+  // A refusal with a typed code and no sentence at all — the honest shape when
+  // the product raised no message. Null must mean UNOBSERVED here, exactly as
+  // it does in the fold, so a reader cannot mistake "" for "the rule was blank".
+  const record = summaryRecordForFailedCall({ code: "mission_graph_authority_blocked" });
+  const totals = summaryToolEventTotals({ records: [record] });
+  const detail = totals?.failureDetails?.[0];
+  assert.equal(detail?.errorCode, "mission_graph_authority_blocked");
+  assert.equal(detail?.errorMessage, null);
+  assert.notEqual(detail?.errorMessage, "");
+  // Explicitly PRESENT, not merely absent: an `undefined` property would vanish
+  // through JSON.stringify and the manifest could not tell "nobody observed a
+  // message" from "this roll-up forgot the field again".
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(detail ?? {}, "errorMessage"),
+    "errorMessage must be emitted explicitly so null survives serialization",
+  );
+  assert.deepEqual(Object.keys(detail ?? {}).sort(), [
+    "bucket",
+    "errorCode",
+    "errorMessage",
+    "id",
+    "toolName",
+  ]);
+  // Nothing about a missing message is lossy: the rest of the record is intact
+  // and the counters are untouched.
+  assert.equal(totals?.failureDetailsTruncated, false);
+  assert.equal(totals?.observed, 2);
+  assert.equal(totals?.failed, 1);
+  assert.equal(detail?.toolName, "project_idea_brief");
+});
+
+test("the rolled-up failure list is capped, and says so when it caps", () => {
+  // The roll-up MERGES records, so an attempt with several run summaries could
+  // hand the manifest an unbounded list. The cap is the sibling fold's, and a
+  // truncated list has to admit it — a short list read as complete is a worse
+  // diagnosis than no list at all.
+  assert.equal(
+    PROOF_MATRIX_FAILURE_DETAIL_CAP,
+    TOOL_CALL_FAILURE_DETAIL_CAP,
+    "the roll-up's cap must equal the fold's; the copy exists only because " +
+      "this module runs under plain node and cannot import the TypeScript one",
+  );
+  const records = Array.from({ length: PROOF_MATRIX_FAILURE_DETAIL_CAP + 4 }, (_, index) =>
+    summaryRecordForFailedCall({
+      code: "project_idea_brief_invalid",
+      message: `rule ${index} was broken`,
+    }),
+  );
+  const totals = summaryToolEventTotals({ records });
+  assert.equal(totals?.failureDetails?.length, PROOF_MATRIX_FAILURE_DETAIL_CAP);
+  assert.equal(
+    totals?.failureDetailsTruncated,
+    true,
+    "a capped list must be reported as capped, not passed off as complete",
+  );
+  // Every retained entry still carries its cause; the cap drops whole details,
+  // it does not hollow them out.
+  assert.ok(
+    totals?.failureDetails?.every((entry) => typeof entry.errorMessage === "string"),
+  );
+  // A list that fits is NOT flagged — the flag has to mean something.
+  const fits = summaryToolEventTotals({
+    records: records.slice(0, 2),
+  });
+  assert.equal(fits?.failureDetails?.length, 2);
+  assert.equal(fits?.failureDetailsTruncated, false);
 });
 
 test("unknown is never collapsed into zero: explicit summary zeros vs no source at all", () => {
@@ -1908,4 +2131,191 @@ test("the no-verdict contract keys on the manager's stable marker, not runner pr
     SANDBOX_UNAVAILABLE_FAILURE_CLASS,
     "a provider that cannot run at all is not a transient no-verdict",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Predeclared-cohort wiring. The policy is only worth anything if the RUNNER
+// consumes it; an unused schema is the failure mode this section guards.
+// ---------------------------------------------------------------------------
+
+test("qualification artifact hashes are sha256, and a missing artifact is null not empty", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(path.join(dir, "main.js"), "console.log(1);\n");
+    writeFileSync(path.join(dir, "manifest.json"), "{}\n");
+    const hashes = qualificationArtifactHashes(dir);
+    assert.deepEqual(Object.keys(hashes).sort(), [...QUALIFICATION_ARTIFACT_FILES].sort());
+    assert.match(hashes["main.js"] ?? "", /^[0-9a-f]{64}$/u);
+    assert.match(hashes["manifest.json"] ?? "", /^[0-9a-f]{64}$/u);
+    // The two that do not exist must be explicitly unknown. An empty-string
+    // digest would let "never built" read as "hashed to this value".
+    assert.equal(hashes["styles.css"], null);
+    assert.equal(hashes["companion-assets.json"], null);
+    assert.notEqual(hashes["main.js"], hashes["manifest.json"]);
+    assert.ok(!QUALIFICATION_ARTIFACT_FILES.includes("data.json"), "data.json is never synced or hashed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an infrastructure death does not close a predeclared occurrence; a real red does", () => {
+  const id = "mission-success/v1:seed:code-delivery#001";
+  const manifest = {
+    attempts: [
+      { occurrenceId: id, green: false, failureClass: "harness:renderer_death" },
+      { occurrenceId: id, green: false, failureClass: "harness:build_failed" },
+    ],
+  };
+  assert.equal(
+    occurrenceHasTerminalRecord(manifest, id, measuresProduct),
+    false,
+    "harness deaths are retained and the SAME identity is re-run",
+  );
+
+  manifest.attempts.push({ occurrenceId: id, green: false, failureClass: "product:receipt_missing" });
+  assert.equal(
+    occurrenceHasTerminalRecord(manifest, id, measuresProduct),
+    true,
+    "a real red closes the occurrence so it can never be retried into a green",
+  );
+
+  const greenOnly = {
+    attempts: [{ occurrenceId: id, green: true, failureClass: "none" }],
+  };
+  assert.equal(occurrenceHasTerminalRecord(greenOnly, id, measuresProduct), true);
+  assert.equal(occurrenceHasTerminalRecord({ attempts: [] }, id, measuresProduct), false);
+  assert.equal(occurrenceHasTerminalRecord(null, id, measuresProduct), false);
+});
+
+test("deriveQualificationRecords keeps harness attempts as retries, never as trials", () => {
+  const gate = resolveReliabilityGate("qualification99");
+  const cohort = buildQualificationCohort({ gate, cells: CELLS, seed: "wiring-seed" });
+  const first = cohort.occurrences[0];
+  const second = cohort.occurrences[1];
+  const manifest = {
+    model: "glm-5.3-flash:cloud",
+    expectedHead: "0".repeat(40),
+    attempts: [
+      // A lane attempt with no cohort identity (a recovery/90/95 row) is ignored.
+      { cell: first.workflow, green: true, failureClass: "none" },
+      {
+        occurrenceId: first.occurrenceId,
+        green: false,
+        failureClass: "harness:renderer_death",
+        durationS: 12,
+      },
+      {
+        occurrenceId: first.occurrenceId,
+        green: true,
+        failureClass: "none",
+        durationS: 301,
+        model: "glm-5.3-flash:cloud",
+        headSha: "0".repeat(40),
+        launched: true,
+        toolEvents: { source: "summary", observed: 7, failed: 0 },
+        acceptance: {
+          missionOutcome: "accepted",
+          acceptanceStatus: "pass",
+          scorecardAcceptancePassed: true,
+          scorecardTotal: 0.9,
+          artifactProofCount: 3,
+        },
+      },
+      {
+        occurrenceId: second.occurrenceId,
+        green: false,
+        failureClass: "model:draft_rejected",
+        durationS: 200,
+        model: "glm-5.3-flash:cloud",
+        headSha: "0".repeat(40),
+        launched: true,
+      },
+    ],
+  };
+  const { records, measurementRetries } = deriveQualificationRecords(manifest, cohort);
+  assert.equal(records.length, 2, "only product-measuring attempts become trials");
+  assert.equal(measurementRetries[first.occurrenceId], 1, "the harness death is disclosed, not hidden");
+  assert.equal(records[0].occurrenceId, first.occurrenceId);
+  assert.equal(records[0].workflow, first.workflow);
+  assert.equal(records[0].green, true);
+  assert.equal(records[0].model, "glm-5.3-flash:cloud");
+  assert.equal(records[1].green, false);
+  assert.equal(records[1].failureClass, "model:draft_rejected");
+});
+
+test("the cohort gate is DRIVEN by the runner, not merely declared beside it", () => {
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "run-proof-matrix.mjs"),
+    "utf8",
+  );
+  // The schedule replaces the plain cell walk, and the inner loop asks the
+  // shared predicate whether this identity already holds a product measurement.
+  assert.match(source, /const schedule = declaration/u, "the runner must build a cohort schedule");
+  assert.match(
+    source,
+    /!occurrenceHasTerminalRecord\(manifest, occurrence\.occurrenceId, measuresProduct\)/u,
+    "the loop must consume the shared product-evidence predicate for resume",
+  );
+  assert.match(
+    source,
+    /occurrenceId: occurrence\.occurrenceId/u,
+    "the attempt record must carry the frozen occurrence identity",
+  );
+
+  // The false-green this guards: a new gate KIND falling through the
+  // fixed-attempts check and printing the consecutive-green success line
+  // without evaluating anything at all.
+  const cohortBranch = source.indexOf("const derived = deriveQualificationRecords(manifest, declaration);");
+  const fixedBranch = source.indexOf("const evaluation = evaluateReliabilityCampaign({");
+  const consecutiveSuccess = source.indexOf("all selected cells reached their consecutive-green bar");
+  assert.ok(cohortBranch > 0, "the cohort gate needs its own final-evaluation branch");
+  assert.ok(fixedBranch > cohortBranch, "it must be checked before the fixed-attempt branch");
+  assert.ok(consecutiveSuccess > cohortBranch, "and before the consecutive success line");
+  const branchBody = source.slice(cohortBranch, fixedBranch);
+  assert.match(branchBody, /if \(!evaluation\.passed\)/u, "a failing cohort must fail the process");
+  assert.match(branchBody, /QUALIFIED/u);
+
+  // The dry run proves the empty case is refused before anything is spent.
+  assert.match(source, /vacuity self-check on an EMPTY record set/u);
+  assert.match(source, /if \(empty\.passed\)/u, "a vacuous PASS must abort the dry run");
+});
+
+// --- pre-existing workspace override: exact names only ---------------------
+// 2026-09-06: a bare --allow-preexisting-workspaces, meant for one expired
+// orphan, also accepted the workspace a killed attempt had left behind; the
+// next code-delivery mission adopted it, collided on main.py, and the cohort
+// was lost at occurrence 2. The override must be able to say "this one and
+// nothing else".
+
+test("the override accepts exactly the named entries and refuses every other pre-existing one", () => {
+  const result = classifyPreexistingWorkspacesV1(["workspace-app-284", "python-number-guessing-game"], "workspace-app-284");
+  assert.deepEqual(result.accepted, ["workspace-app-284"]);
+  assert.deepEqual(result.refused, ["python-number-guessing-game"], "a killed attempt's debris is refused even when the orphan is allowed");
+});
+
+test("no allowlist accepts nothing: absent flag and bare flag both refuse every entry", () => {
+  assert.deepEqual(classifyPreexistingWorkspacesV1(["workspace-app-284"], null).refused, ["workspace-app-284"]);
+  assert.deepEqual(classifyPreexistingWorkspacesV1(["workspace-app-284"], "").refused, ["workspace-app-284"]);
+  assert.deepEqual(classifyPreexistingWorkspacesV1(["workspace-app-284"], "   ,  ").refused, ["workspace-app-284"]);
+});
+
+test("names match exactly, whitespace-trimmed, never by prefix or substring", () => {
+  const result = classifyPreexistingWorkspacesV1(["workspace-app-284", "workspace-app-2840", "app-284"], " workspace-app-284 , other ");
+  assert.deepEqual(result.accepted, ["workspace-app-284"]);
+  assert.deepEqual(result.refused, ["workspace-app-2840", "app-284"]);
+  assert.deepEqual(result.allowed, ["workspace-app-284", "other"], "an allowed name that is not on disk is harmless");
+});
+
+test("an empty scratch root accepts and refuses nothing", () => {
+  assert.deepEqual(classifyPreexistingWorkspacesV1([], "workspace-app-284"), { accepted: [], refused: [], allowed: ["workspace-app-284"] });
+  assert.deepEqual(classifyPreexistingWorkspacesV1(null, null), { accepted: [], refused: [], allowed: [] });
+});
+
+test("the launch guard rejects the bare override and refuses unlisted entries at the source", () => {
+  const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const source = readFileSync(path.join(repoRoot, "scripts/run-proof-matrix.mjs"), "utf8");
+  assert.match(source, /if \(flag\("--allow-preexisting-workspaces"\)\) \{\s*fail\(/u, "the bare flag must fail the launch");
+  assert.match(source, /classifyPreexistingWorkspacesV1\(\s*preexistingWorkspaces,\s*opt\("--allow-preexisting-workspaces"\),?\s*\)/u, "the guard must consult the exact-name helper");
+  assert.match(source, /if \(preexisting\.refused\.length > 0\) \{\s*fail\(/u, "any refused entry must fail the launch");
+  assert.match(source, /accepting \$\{preexisting\.accepted\.length\} pre-existing workspaces-v2 entries by name/u, "accepted names must be printed into the campaign log");
 });

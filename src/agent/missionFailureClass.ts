@@ -26,7 +26,10 @@
  */
 
 import { isModelRequestTimeoutError, isTransientModelError } from "../model/retry";
-import { classifySafeFailureRetry } from "./safeFailureRetry";
+import {
+  classifySafeFailureRetry,
+  codeNamesItsOwnArgumentFaultV1,
+} from "./safeFailureRetry";
 
 export type MissionFailureClassV1 =
   | "external"
@@ -97,7 +100,50 @@ const MODEL_CONTENT_ERROR_CODES = new Set([
   "template_verification_failed",
   "research_pack_verification_failed",
   "schema_validation_failed",
+  // `create_project_idea_brief` refuses a payload that fails its closed
+  // contract — a bad grounding reference, an option list that does not
+  // typecheck, a missing acceptance criterion — and nothing was applied. It is
+  // an argument fault by definition, but its name does not say so, so no
+  // structural rule can reach it: `_invalid` is 106 codes in this repo and
+  // most of them are refusals or host state. It is listed here by hand, which
+  // is the cost of a code that does not name its own fault. A 504-run cohort
+  // ended on this one because all three mechanisms below read it as "cause
+  // unknown".
+  "project_idea_brief_invalid",
 ]);
+
+/**
+ * The single authority on "the model's arguments or produced content were
+ * rejected". Three subsystems needed this answer and each had its own
+ * spelling of it — this set, a regex in `safeFailureRetry`, and a private
+ * suffix test in `AgentRunner` — so a code could be an argument error to one
+ * of them and a mystery to the other two, which is exactly what happened to
+ * `project_idea_brief_invalid`. They all read this now, so a new validator
+ * opts in once.
+ *
+ * It is fail-closed on purpose: a code the external or product sets already
+ * claim can never also be an argument error, whatever its spelling. A refusal
+ * that started claiming to be a correctable argument fault would tell the
+ * model to resend the same call with tidier arguments and would exempt a real
+ * block from the failed-tool count, which is worse than not recognising the
+ * argument fault at all.
+ */
+export function isModelContentErrorCodeV1(code: string | undefined): boolean {
+  const normalized = normalize(code);
+  if (!normalized) return false;
+  if (EXTERNAL_TOOL_ERROR_CODES.has(normalized)) return false;
+  if (PRODUCT_ERROR_CODES.has(normalized)) return false;
+  if (
+    normalized.startsWith("approval_") ||
+    normalized.startsWith("phase_gate")
+  ) {
+    return false;
+  }
+  return (
+    MODEL_CONTENT_ERROR_CODES.has(normalized) ||
+    codeNamesItsOwnArgumentFaultV1(normalized)
+  );
+}
 
 /** Attribute a node failure to whoever actually failed. Never throws. */
 export function classifyMissionFailureV1(
@@ -132,10 +178,12 @@ function classifyUnsafe(
   if (code) {
     if (EXTERNAL_TOOL_ERROR_CODES.has(code)) return "external";
     if (PRODUCT_ERROR_CODES.has(code)) return "product";
-    if (MODEL_CONTENT_ERROR_CODES.has(code)) return "model_content";
     if (code.startsWith("approval_") || code.startsWith("phase_gate")) {
       return "product";
     }
+    // Asked after the refusal sets, and fail-closed against them anyway, so
+    // the two orderings cannot drift apart.
+    if (isModelContentErrorCodeV1(code)) return "model_content";
   }
 
   if (signals.error !== undefined && signals.error !== null) {

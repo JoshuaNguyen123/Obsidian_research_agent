@@ -296,6 +296,10 @@ import {
   writeMissionLedger,
   type MissionEvidence,
 } from "./src/agent/missionLedger";
+import {
+  resolveElectronDomStorageFlusherV1,
+  type DomStorageFlusherV1,
+} from "./src/platform/electronDomStorageFlush";
 import { createElectronKeepAwakeController } from "./src/platform/electronKeepAwake";
 import {
   createDefaultToolRegistry,
@@ -5510,8 +5514,22 @@ export default class AgenticResearcherPlugin extends Plugin {
     return { ok: true, message: `Queue setup selected ${project.name ?? project.id} for ${team.name ?? team.id}. Move an issue to ${ready.name ?? ready.id} to authorize pickup; then review the recommendations and activate authority.` };
   }
 
+  /** Resolved once; null when this runtime exposes no main-process bridge. */
+  private domStorageFlusher: DomStorageFlusherV1 | null | undefined;
+
+  /**
+   * Native SecretStorage with a disk commit after every write, so a secret
+   * and the data.json record that references it become durable in the same
+   * order they were written (see electronDomStorageFlush).
+   */
   private createObsidianSecretStore(): ObsidianSecretStoreV1 {
-    return new ObsidianSecretStoreV1(this.app.secretStorage);
+    const storage = this.app.secretStorage;
+    const flush = this.resolveSecretStorageCommit();
+    return new ObsidianSecretStoreV1({
+      getSecret: (id) => storage.getSecret(id),
+      setSecret: (id, value) => storage.setSecret(id, value),
+      ...(flush ? { flush } : {}),
+    });
   }
 
   private createForegroundSecretStore(referenceId?: string): SecretStoreV1 {
@@ -6075,12 +6093,43 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
   }
 
+  /**
+   * The legacy Linear credential predates reference ids, so it is cleared by
+   * its fixed id rather than through the store. That made it the one write
+   * into SecretStorage with no commit request behind it: Chromium's DOMStorage
+   * commits lazily, so a kill inside the delay leaves a credential the user
+   * has just disconnected still on disk, while the data.json record that says
+   * it is gone was write-through and landed immediately. The pair then
+   * disagree in the direction that matters least in a lane and most to a
+   * person. The commit follows the readback, which is the order the store
+   * itself uses, so a value that could not be verified is never committed.
+   */
   private clearLinearCredentialFromObsidianSecretStorage(): boolean {
     try {
       this.app.secretStorage.setSecret(OBSIDIAN_LINEAR_SECRET_ID, "");
       return this.app.secretStorage.getSecret(OBSIDIAN_LINEAR_SECRET_ID) === "";
     } catch {
       return false;
+    } finally {
+      this.commitSecretStorage();
+    }
+  }
+
+  /** Resolved once, and the only place the bridge is looked up. */
+  private resolveSecretStorageCommit(): DomStorageFlusherV1 | null {
+    if (this.domStorageFlusher === undefined) {
+      this.domStorageFlusher = resolveElectronDomStorageFlusherV1();
+    }
+    return this.domStorageFlusher;
+  }
+
+  /** Ask the main process to commit DOMStorage; absent bridge, absent commit. */
+  private commitSecretStorage(): void {
+    try {
+      this.resolveSecretStorageCommit()?.();
+    } catch {
+      // A flush bridge that throws leaves Chromium's own schedule in force,
+      // which is where this code stood before the bridge existed.
     }
   }
 

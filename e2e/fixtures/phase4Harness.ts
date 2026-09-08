@@ -6,9 +6,14 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import {
+  createTeardownOwnershipWindow,
   terminateControlledObsidian,
   type TeardownProbePhase,
 } from "../../scripts/obsidian-process-lifecycle";
+import {
+  gracefulQuitMayHaveReachedAppV1,
+  requestGracefulObsidianQuitV1,
+} from "./gracefulObsidianQuit";
 import {
   describeSweepOutcomeV1,
   enumerateObsidianProcessesV1,
@@ -292,7 +297,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
           ).catch(() => false);
         }
         try {
-          await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs);
+          await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page);
         } catch (error) {
           teardownError ??= error;
         }
@@ -319,7 +324,9 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
     };
     return harness;
   } catch (error) {
-    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs).catch(() => undefined);
+    await terminateObsidian(processHandle, cdpPort, rootCreatedAtMs, page).catch(
+      () => undefined,
+    );
     await browser?.close().catch(() => undefined);
     await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch(() => undefined);
     await removeNewPhase4OwnedWorkspaces(ownedWorkspacesBefore, marker).catch(
@@ -1206,10 +1213,12 @@ async function findVaultPage(browser: Browser, expectedVaultRoot: string): Promi
 /** See nativeObsidianHarness: initial passes bound the OS unwind, the
  *  post-sweep recheck only CONFIRMS a synchronous TerminateProcess. */
 const PHASE4_OWNED_EXIT_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  graceful: 10_000,
   initial: 30_000,
   recheck: 10_000,
 };
 const PHASE4_PROCESS_DRAIN_TIMEOUT_MS: Record<TeardownProbePhase, number> = {
+  graceful: 10_000,
   initial: 30_000,
   recheck: 10_000,
 };
@@ -1218,22 +1227,42 @@ async function terminateObsidian(
   processHandle: ChildProcessWithoutNullStreams | null,
   cdpPort: number,
   rootCreatedAtMs: number | null,
+  page: Page | null,
 ): Promise<void> {
   if (!processHandle?.pid) return;
   const rootPid = processHandle.pid;
-  const teardownStartedAtMs = Date.now();
+  // See nativeObsidianHarness.terminateObsidian: the instant this window CLOSES
+  // is the upper bound that makes "PID N, image Obsidian.exe" an identity
+  // rather than a coincidence. It stays open across the graceful quit, because
+  // the app is alive there by our own choice and a live Electron app still
+  // spawns helpers; the teardown closes it once, at the start of the kill
+  // phase. A bound stamped here instead disowned everything born during the
+  // graceful window, and a disowned orphan is never swept — it keeps the vault
+  // and the machine lock into the next occurrence of the cohort.
+  const ownership = createTeardownOwnershipWindow();
   await terminateControlledObsidian(processHandle, {
+    requestGracefulExit: async () =>
+      // The dispatch bound is NOT the graceful budget: a renderer that the quit
+      // is already unloading cannot answer the evaluate that asked for it, so
+      // only a request that provably never reached the app skips the exit wait.
+      gracefulQuitMayHaveReachedAppV1(await requestGracefulObsidianQuitV1(page)),
+    closeOwnershipWindow: () => {
+      ownership.close();
+    },
     terminateOwnedTree: async (pid) => {
       await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"]).catch(() => {
         processHandle.kill();
       });
     },
+    // All three ownership questions below read the SAME window, at call time.
+    // The probe that decides whether the teardown drained and the sweep that is
+    // its only remediation must never disagree about what we own.
     waitForOwnedExit: (phase) =>
       waitForOwnedRootExitV1({
         handle: processHandle,
         rootPid,
         rootCreatedAtMs,
-        teardownStartedAtMs,
+        teardownStartedAtMs: ownership.upperBoundMs(),
         imageName: phase4ObsidianImageName(),
         timeoutMs: PHASE4_OWNED_EXIT_TIMEOUT_MS[phase],
       }),
@@ -1242,7 +1271,7 @@ async function terminateObsidian(
         cdpPort,
         rootPid,
         rootCreatedAtMs,
-        teardownStartedAtMs,
+        ownership.upperBoundMs(),
         PHASE4_PROCESS_DRAIN_TIMEOUT_MS[phase],
       ),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
@@ -1251,7 +1280,7 @@ async function terminateObsidian(
         cdpPort,
         rootPid,
         rootCreatedAtMs,
-        teardownStartedAtMs,
+        ownership.upperBoundMs(),
       ),
   });
 }

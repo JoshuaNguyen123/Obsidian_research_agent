@@ -5,6 +5,7 @@ import { DAILY_USE_TOOL_OUTCOMES_ANNOTATION } from "./dailyUseAcceptance";
 import {
   foldToolCallOutcomesV1,
   mergeToolCallOutcomeCountsV1,
+  projectToolFailureMessageV1,
   unknownToolCallOutcomeCountsV1,
   type ToolCallOutcomeCountsV1,
   type ToolCallOutcomeEventV1,
@@ -86,6 +87,21 @@ export interface ToolCallCollectorSegmentV1 {
   armedWhileRunning: boolean;
   /** True when the segment stopped recording because it hit the cap. */
   overflowed: boolean;
+  /**
+   * Identity of the coordinator start this segment listened to, taken from
+   * `RunCoordinatorSnapshot.providerUsageScopeId` ("stable identity for one
+   * coordinator start, including all delegated model workers"), falling back
+   * to `runId`. Resolved at arm time and again on each event until known,
+   * because a segment armed BEFORE the mission starts has no scope yet.
+   *
+   * This is the deduplication boundary. Segments sharing a non-null value are
+   * one id namespace and fold together; different values are different
+   * coordinator starts whose `step:index:name` ids may legitimately collide.
+   * Null means the segment cannot say, which is unknown, not "different".
+   */
+  coordinatorStartId: string | null;
+  /** Coordinator runId at arm time. Attribution only; never a dedup key. */
+  runId: string | null;
   events: ToolCallOutcomeEventV1[];
 }
 
@@ -101,6 +117,15 @@ export interface ToolCallCollectorDiagnosticV1 {
   id: string | null;
   toolName: string | null;
   errorCode: string | null;
+  /**
+   * The failing call's own sentence, redacted and bounded, or null when no
+   * producer observed one. A code names a FAMILY of broken rules — the cohort
+   * that died on `project_idea_brief_invalid` could have been raised by any of
+   * eight different rules — so a lane that prints these diagnostics instead of
+   * the counts would otherwise be left with the same undiagnosable row the
+   * counts' `failureDetails` exists to fix.
+   */
+  errorMessage: string | null;
   ok: boolean | null;
   operation: string | null;
 }
@@ -115,8 +140,25 @@ export function summarizeCollectedToolCallsV1(
 ): ToolCallOutcomeCountsV1 {
   const segments = Array.isArray(raw?.segments) ? raw!.segments : [];
   if (segments.length === 0) return unknownToolCallOutcomeCountsV1("unobserved");
-  let merged: ToolCallOutcomeCountsV1 | null = null;
-  for (const segment of segments) {
+
+  /**
+   * Group by coordinator start, NOT by arm. Two arms against the same
+   * coordinator both subscribe with `replay: true`, so the second one receives
+   * the prefix the first already recorded; folding them separately and summing
+   * counted every replayed call TWICE. Folding one namespace together lets the
+   * fold's (kind, id) de-duplication do its job.
+   *
+   * A segment with no identity keeps its own group, which is exactly today's
+   * behavior — safe on its own, ambiguous beside another such segment. That
+   * ambiguity is resolved below as unknown, never as a guess in either
+   * direction.
+   */
+  const groups = new Map<
+    string,
+    { events: ToolCallOutcomeEventV1[]; lossy: boolean; retrievalCountable: boolean }
+  >();
+  let anonymousWithEvents = 0;
+  segments.forEach((segment, position) => {
     const events = Array.isArray(segment?.events) ? segment.events : [];
     // A segment is lossy when it cannot account for the run's prefix: it armed
     // beside an already-running mission whose buffer had already dropped
@@ -128,10 +170,41 @@ export function summarizeCollectedToolCallsV1(
       (segment?.armedWhileRunning === true &&
         (segment.armDroppedEventCount === null ||
           segment.armDroppedEventCount > 0));
-    const folded = foldToolCallOutcomesV1(
-      events,
-      lossy ? { coverage: "lossy" } : {},
-    );
+    const identity =
+      typeof segment?.coordinatorStartId === "string" &&
+      segment.coordinatorStartId.length > 0
+        ? segment.coordinatorStartId
+        : null;
+    if (identity === null && events.length > 0) anonymousWithEvents += 1;
+    const key = identity === null ? ` anonymous:${position}` : identity;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.events.push(...events);
+      existing.lossy ||= lossy;
+      // Replayed execution metrics carry no id; one un-countable member makes
+      // the whole namespace un-countable.
+      existing.retrievalCountable &&= segment?.armedWhileRunning !== true;
+      return;
+    }
+    groups.set(key, {
+      events: [...events],
+      lossy,
+      retrievalCountable: segment?.armedWhileRunning !== true,
+    });
+  });
+
+  // Two or more segments that OBSERVED events and cannot name their
+  // coordinator could be one namespace (double count) or two (short count).
+  // Unprovable sameness is unknown. Segments that observed nothing cannot
+  // double count anything and are excluded, so this cannot fire vacuously.
+  const identityAmbiguous = anonymousWithEvents > 1;
+
+  let merged: ToolCallOutcomeCountsV1 | null = null;
+  for (const group of groups.values()) {
+    const folded = foldToolCallOutcomesV1(group.events, {
+      ...(group.lossy || identityAmbiguous ? { coverage: "lossy" as const } : {}),
+      retrievalCountable: group.retrievalCountable,
+    });
     merged = merged ? mergeToolCallOutcomeCountsV1(merged, folded) : folded;
   }
   return merged ?? unknownToolCallOutcomeCountsV1("unobserved");
@@ -196,6 +269,12 @@ export async function armToolCallCollector(page: Page): Promise<void> {
           ?.plugins?.[pluginId];
         if (!plugin?.subscribeMissionEvents) return false;
         const snapshot = plugin.getMissionRunSnapshot?.() ?? null;
+        const identityOf = (value: any): string | null => {
+          const scope = value?.providerUsageScopeId;
+          if (typeof scope === "string" && scope.length > 0) return scope;
+          const run = value?.runId;
+          return typeof run === "string" && run.length > 0 ? run : null;
+        };
         const segment = {
           index: Array.isArray(existing?.segments)
             ? existing!.segments.length
@@ -207,6 +286,13 @@ export async function armToolCallCollector(page: Page): Promise<void> {
             : null,
           armedWhileRunning: snapshot?.isRunning === true,
           overflowed: false,
+          // Null when armed before the mission starts, which is the common
+          // case for segment 0; resolved on the first event instead.
+          coordinatorStartId: identityOf(snapshot),
+          runId:
+            typeof snapshot?.runId === "string" && snapshot.runId.length > 0
+              ? snapshot.runId
+              : null,
           events: [] as unknown[],
         };
         const state = {
@@ -234,7 +320,93 @@ export async function armToolCallCollector(page: Page): Promise<void> {
         };
         const codeOf = (value: any): string | null =>
           value && typeof value === "object" ? text(value.code) : null;
+        // Verbatim copy of FAILURE_MESSAGE_REDACTIONS in
+        // e2e/fixtures/toolCallOutcomes.ts, carried here for the same reason as
+        // the digest allowlist below: Playwright serializes this function into
+        // the renderer, where it can import nothing. A source test pins every
+        // literal against that module and a behavioral test pins this
+        // projection equal to `projectToolFailureMessageV1`, so the two copies
+        // cannot drift apart unnoticed.
+        //
+        // WHICH SIDE OWNS WHAT. The PAGE side owns the BOUNDARY: a message is
+        // redacted, collapsed and capped before it is allowed to cross, because
+        // `error.message` is free-form product text that can carry a vault path,
+        // a shell command or a forwarded credential, and this lane's privacy
+        // contract (tests/evidenceProjectionPrivacy.test.ts) is that no such
+        // value ever leaves the renderer. The NODE side owns RETENTION: the fold
+        // re-projects whatever it is handed, so a producer that skipped this
+        // step still cannot get a raw message into a retained record. The
+        // projection is idempotent, so paying for it on both sides costs
+        // nothing and neither side has to trust the other.
+        const messageRedactions: [RegExp, string][] = [
+          [/Bearer\s+\S+/giu, "Bearer [redacted]"],
+          [
+            /(--?(?:api[_-]?key|token|key|secret|password|auth|bearer)\b)[\s=:]+\S+/giu,
+            "$1=[redacted]",
+          ],
+          [
+            /\b(api[_-]?key|token|secret|password|passwd|authorization|credential)\b\s*[=:]\s*\S+/giu,
+            "$1=[redacted]",
+          ],
+          [
+            /\b(?:gh[pousr]_|github_pat_|sk-|xox[abprs]-|lin_api_)[A-Za-z0-9_-]{8,}/gu,
+            "[redacted-credential]",
+          ],
+          [/\b(?:https?|file|ftp|ws|wss):\/\/\S+/giu, "[redacted-url]"],
+          [/\S*[\\/]\S*/gu, "[redacted-path]"],
+          [
+            /\b[\w .()-]{0,64}\.(?:md|markdown|txt|json|jsonl|ya?ml|tsx?|jsx?|mjs|cjs|py|sh|ps1|csv|pdf|png|jpe?g|gif|log|html?)\b/giu,
+            "[redacted-path]",
+          ],
+          [/\b[A-Za-z0-9_-]{32,}\b/gu, "[redacted-opaque]"],
+        ];
+        // Verbatim copy of TOOL_CALL_FAILURE_MESSAGE_CAP, pinned by that same test.
+        const messageCap = 200;
+        // Read off the SAME error object `codeOf` reads, so a retained detail can
+        // never pair one failure's code with another failure's sentence. The
+        // result goes into the event object and NOWHERE else: it is deliberately
+        // kept out of the `recent` ring, which is free-form text this collector
+        // never projects but the harness does print.
+        const messageOf = (value: any): string | null => {
+          if (!value || typeof value !== "object") return null;
+          const raw = text(value.message);
+          if (raw === null) return null;
+          let redacted = raw;
+          for (const [pattern, replacement] of messageRedactions) {
+            redacted = redacted.replace(pattern, replacement);
+          }
+          // A stack trace or an echoed provider body arrives full of newlines,
+          // and the cap has to bound a value that has already lost its shape.
+          const collapsed = redacted.replace(/\s+/gu, " ").trim();
+          // Null, never "": a message we cannot keep has to be indistinguishable
+          // from a message nobody reported, because both mean the same thing —
+          // this detail cannot name the rule that broke.
+          if (collapsed.length === 0) return null;
+          return collapsed.length > messageCap
+            ? `${collapsed.slice(0, messageCap - 3)}...`
+            : collapsed;
+        };
         const push = (event: unknown): void => {
+          // Resolve the coordinator-start identity as soon as a run exists.
+          // Segment 0 arms before any mission, so its identity is only
+          // knowable once events start arriving. Cheap: one snapshot read per
+          // segment, then never again.
+          if (segment.coordinatorStartId === null) {
+            try {
+              const live = plugin.getMissionRunSnapshot?.() ?? null;
+              segment.coordinatorStartId = identityOf(live);
+              if (
+                segment.runId === null &&
+                typeof live?.runId === "string" &&
+                live.runId.length > 0
+              ) {
+                segment.runId = live.runId;
+              }
+            } catch {
+              // An identity we cannot read stays null, which the Node-side
+              // fold treats as unknown rather than as a distinct namespace.
+            }
+          }
           if (segment.events.length >= eventCap) {
             segment.overflowed = true;
             return;
@@ -263,8 +435,25 @@ export async function armToolCallCollector(page: Page): Promise<void> {
                   id,
                   toolName: text(event?.toolName),
                   errorCode: codeOf(event?.error),
+                  errorMessage: messageOf(event?.error),
                 });
               }
+            },
+            onMetric: (event: any) => {
+              // The ONLY signal that distinguishes an actual transport from a
+              // serve out of the in-run tool cache. Two fields cross the
+              // boundary: the tool name and the boolean.
+              //
+              // `event.cacheKey` is `${name}:${stableStringify(args)}` — it
+              // contains the RAW TOOL ARGUMENTS. It must never be projected,
+              // and neither must durations or char counts.
+              if (event?.kind !== "tool") return;
+              push({
+                kind: "tool_execution",
+                toolName: text(event?.name) ?? text(event?.toolName),
+                step: Number.isSafeInteger(event?.step) ? event.step : null,
+                servedFromCache: event?.cached === true,
+              });
             },
             onToolDone: (event: any) => {
               const id = text(event?.id);
@@ -275,6 +464,7 @@ export async function armToolCallCollector(page: Page): Promise<void> {
                 toolName: text(event?.name) ?? text(event?.toolName),
                 ok: typeof event?.ok === "boolean" ? event.ok : null,
                 errorCode: codeOf(event?.error),
+                errorMessage: messageOf(event?.error),
               });
             },
             onReceipt: (receipt: any) => {
@@ -292,6 +482,21 @@ export async function armToolCallCollector(page: Page): Promise<void> {
                 receipt?.readback?.status === "verified"
                   ? "verified"
                   : undefined;
+              // The two readback digests are hashes OF content, never content:
+              // they are what artifactIdentityFromReceiptsV1 hashes again, and
+              // dropping them here left every written artifact identity-less
+              // on the first live qualification attempt (2026-09-06). Verbatim
+              // copy of RECEIPT_IDENTITY_DIGEST: the page cannot import it,
+              // and a source test pins the two literals equal.
+              const digest = /^(?:sha256:[0-9a-f]{64}|fnv1a32:[0-9a-f]{8})$/u;
+              const digestOf = (value: unknown): string | undefined =>
+                typeof value === "string" && digest.test(value) ? value : undefined;
+              const observedRevision = readbackStatus
+                ? digestOf(receipt?.readback?.observedRevision)
+                : undefined;
+              const observedFingerprint = readbackStatus
+                ? digestOf(receipt?.readback?.observedFingerprint)
+                : undefined;
               const exitCode = Number.isSafeInteger(receipt?.exitCode)
                 ? receipt.exitCode
                 : undefined;
@@ -307,7 +512,11 @@ export async function armToolCallCollector(page: Page): Promise<void> {
                   commitKind: receipt?.commitKind,
                   purpose,
                   readback: readbackStatus
-                    ? { status: readbackStatus }
+                    ? {
+                        status: readbackStatus,
+                        ...(observedRevision ? { observedRevision } : {}),
+                        ...(observedFingerprint ? { observedFingerprint } : {}),
+                      }
                     : undefined,
                   exitCode,
                   ...(receipt?.effects && typeof receipt.effects === "object"
@@ -345,28 +554,40 @@ export async function armToolCallCollector(page: Page): Promise<void> {
 export async function harvestToolCallCollector(
   page: Page,
 ): Promise<ToolCallOutcomeCountsV1> {
+  const wasArmed = armedPages.has(page);
   let counts: ToolCallOutcomeCountsV1;
   try {
     const raw = await readToolCallCollectorRawV1(page, true);
     counts = summarizeCollectedToolCallsV1(raw);
   } catch {
-    // Distinguishable from "never armed" only in intent; both are unknown, and
-    // the honest report for both is all-null.
-    counts = unknownToolCallOutcomeCountsV1("unobserved");
+    // A page we ARMED and then could not read is lost capture: we know a
+    // subscription was recording and we know we did not get it. That is
+    // `lossy`, and the merge must not absorb it — one dead harvest beside one
+    // good one previously reported `complete`.
+    //
+    // A page that never armed lost nothing and stays `unobserved`, so this
+    // cannot turn healthy lanes lossy.
+    counts = unknownToolCallOutcomeCountsV1(wasArmed ? "lossy" : "unobserved");
   }
   armedPages.delete(page);
-  // Unknown harvests are parked too: merging one is a no-op, and keeping them
-  // makes "the harness ran but proved nothing" visible instead of silent.
-  const key = currentTestKey();
-  if (key) {
-    harvestsByTest.set(key, [...(harvestsByTest.get(key) ?? []), counts]);
-    while (harvestsByTest.size > MAX_RETAINED_TEST_HARVESTS) {
-      const oldest = harvestsByTest.keys().next().value;
-      if (oldest === undefined || oldest === key) break;
-      harvestsByTest.delete(oldest);
-    }
-  }
+  parkHarvestForCurrentTest(counts);
   return counts;
+}
+
+/**
+ * Park a fold against the test that took it. Unknown harvests are parked too:
+ * an `unobserved` one merges as a no-op, and a `lossy` one degrades the merged
+ * answer, which is how "the harness ran but proved nothing" stays visible.
+ */
+function parkHarvestForCurrentTest(counts: ToolCallOutcomeCountsV1): void {
+  const key = currentTestKey();
+  if (!key) return;
+  harvestsByTest.set(key, [...(harvestsByTest.get(key) ?? []), counts]);
+  while (harvestsByTest.size > MAX_RETAINED_TEST_HARVESTS) {
+    const oldest = harvestsByTest.keys().next().value;
+    if (oldest === undefined || oldest === key) break;
+    harvestsByTest.delete(oldest);
+  }
 }
 
 /**
@@ -403,13 +624,28 @@ export async function peekToolCallCollectorDiagnosticsV1(
         segment.events.map((event) => ({
           segmentIndex: segment.index,
           kind: event.kind,
-          id: event.kind === "receipt" ? null : event.id,
+          // Receipt ids are private, and an execution sighting has no id at
+          // all: `AgentRunMetricEvent` carries only (name, step).
+          id:
+            event.kind === "receipt" || event.kind === "tool_execution"
+              ? null
+              : event.id,
           toolName: event.toolName,
           errorCode:
             event.kind === "tool_done" ||
             event.kind === "tool_result" ||
             event.kind === "tool_rejected"
               ? event.errorCode
+              : null,
+          // Re-projected rather than trusted: the page side is a foreign
+          // producer to this module, exactly as it is to the fold, and an older
+          // collector still parked in a running renderer would hand over a
+          // message this boundary never redacted.
+          errorMessage:
+            event.kind === "tool_done" ||
+            event.kind === "tool_result" ||
+            event.kind === "tool_rejected"
+              ? projectToolFailureMessageV1(event.errorMessage)
               : null,
           ok: event.kind === "tool_done" ? event.ok : null,
           operation:
@@ -452,6 +688,15 @@ async function readToolCallCollectorRawV1(
             : null,
           armedWhileRunning: segment?.armedWhileRunning === true,
           overflowed: segment?.overflowed === true,
+          coordinatorStartId:
+            typeof segment?.coordinatorStartId === "string" &&
+            segment.coordinatorStartId.length > 0
+              ? segment.coordinatorStartId
+              : null,
+          runId:
+            typeof segment?.runId === "string" && segment.runId.length > 0
+              ? segment.runId
+              : null,
           events: Array.isArray(segment?.events)
             ? segment.events.map((event: object) => ({ ...event }))
             : [],
@@ -500,17 +745,41 @@ export function recordToolCallOutcomes(
  * later test whose harness never armed can never inherit an earlier test's
  * counts — across spec files in a reused worker included.
  */
+/**
+ * Close out every page this collector is still armed on.
+ *
+ * Two outcomes, and the difference is the whole point:
+ *   - the page is alive -> harvest it. A test that TIMED OUT never reached
+ *     harness.close(), so this is where its run gets reported instead of lost.
+ *   - the page is CLOSED -> its renderer took `window.__agenticToolCallCollectorV1`
+ *     and every unharvested segment with it. `relaunchOwnedProcess` does exactly
+ *     this mid-test. Previously the page was simply dropped from the set and the
+ *     lane reported `complete` on whatever happened to be left, which is a wrong
+ *     number, not a missing one. It is now recorded as LOSSY.
+ *
+ * Returns what it parked so the behavior is unit-testable outside Playwright,
+ * where `test.info()` has no current test to key a harvest against.
+ */
+export async function drainArmedToolCallCollectorsV1(): Promise<
+  ToolCallOutcomeCountsV1[]
+> {
+  const drained: ToolCallOutcomeCountsV1[] = [];
+  for (const page of [...armedPages]) {
+    if (page.isClosed()) {
+      armedPages.delete(page);
+      const lost = unknownToolCallOutcomeCountsV1("lossy");
+      parkHarvestForCurrentTest(lost);
+      drained.push(lost);
+      continue;
+    }
+    drained.push(await harvestToolCallCollector(page));
+  }
+  return drained;
+}
+
 export function recordToolCallOutcomesAfterEach(): void {
   test.afterEach(async ({}, testInfo) => {
-    for (const page of [...armedPages]) {
-      if (page.isClosed()) {
-        armedPages.delete(page);
-        continue;
-      }
-      // A test that timed out never reached harness.close(); harvest here so
-      // the run is reported rather than lost.
-      await harvestToolCallCollector(page);
-    }
+    await drainArmedToolCallCollectorsV1();
     const key = `${testInfo.testId}:${testInfo.repeatEachIndex}:${testInfo.retry}`;
     const harvests = harvestsByTest.get(key) ?? [];
     harvestsByTest.delete(key);

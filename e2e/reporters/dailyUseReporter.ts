@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -269,7 +270,7 @@ export interface VacuousDetectableReceipt {
  * change something reported success without changing it". A tool that never
  * claimed to change anything cannot be vacuously unchanged.
  */
-const VERDICT_ONLY_RECEIPT_PURPOSES = Object.freeze(
+export const VERDICT_ONLY_RECEIPT_PURPOSES = Object.freeze(
   new Set(["validation_fast", "validation_targeted", "validation_full"]),
 );
 
@@ -283,7 +284,7 @@ const VERDICT_ONLY_RECEIPT_PURPOSES = Object.freeze(
  * assuming the fix worked. The receipts carry `operation: "validate"` and a
  * verified `readback`, both of which are present and semantically exact.
  */
-const VERDICT_ONLY_RECEIPT_OPERATIONS = Object.freeze(new Set(["validate"]));
+export const VERDICT_ONLY_RECEIPT_OPERATIONS = Object.freeze(new Set(["validate"]));
 
 /** True when the receipt carries its own proof the action really ran. */
 function receiptReadbackVerified(receipt: VacuousDetectableReceipt): boolean {
@@ -633,12 +634,59 @@ export function summarizeRecords(records: readonly DailyUseRunRecord[]) {
           metrics?.approvalBoundaryProofCount ?? 0,
         artifactProofCount: metrics?.artifactProofCount ?? 0,
         cleanupProofCount: metrics?.cleanupProofCount ?? 0,
+        artifactIdentity: summaryArtifactIdentityV1(group),
+        writeReceipts: summaryWriteReceiptsV1(group),
         acceptanceStatus: atomicPass ? "pass" : "needs_more_work",
         acceptanceRetry: atomicRecord?.retry ?? null,
         missingAcceptanceCriteria,
         missionScorecard: atomicRecord?.missionScorecard ?? null,
       };
     });
+}
+
+/**
+ * Union of the artifact identities in one summary group.
+ *
+ * Each record identity is already a digest of that run's readback hashes, so
+ * this hashes a sorted set of digests -- no path or content text is involved.
+ * `null` means no record in the group carried one, which the cohort gate reads
+ * as missing proof rather than as clean evidence.
+ *
+ * This lives here because the summary ROLLUP is what
+ * `summarizeAttemptAcceptance` reads. The per-test `records` carry
+ * `toolCallOutcomes`; the `summaries` did not, so an aggregation that read
+ * `toolCallOutcomes` off a summary would have been silently inert.
+ */
+export function summaryArtifactIdentityV1(
+  group: ReadonlyArray<{ toolCallOutcomes?: { artifactIdentity?: string | null } | null }>,
+): string | null {
+  const identities = [
+    ...new Set(
+      group
+        .map((record) => record?.toolCallOutcomes?.artifactIdentity ?? null)
+        .filter(
+          (value): value is string =>
+            typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value),
+        ),
+    ),
+  ].sort();
+  if (identities.length === 0) return null;
+  if (identities.length === 1) return identities[0];
+  return `sha256:${createHash("sha256")
+    .update(identities.join(String.fromCharCode(10)))
+    .digest("hex")}`;
+}
+/** Sum of the group's written-artifact receipts; null when no record knew. */
+export function summaryWriteReceiptsV1(
+  group: ReadonlyArray<{ toolCallOutcomes?: { writeReceipts?: number | null } | null }>,
+): number | null {
+  let total = 0;
+  let known = false;
+  for (const record of group) {
+    const value = record?.toolCallOutcomes?.writeReceipts;
+    if (typeof value === "number" && Number.isSafeInteger(value)) { total += value; known = true; }
+  }
+  return known ? total : null;
 }
 
 export function shouldWriteDailyUseSummary(recordCount: number): boolean {
@@ -864,6 +912,12 @@ function parseToolCallOutcomesAnnotation(
       receiptsUnknown: nullableCounter(value.receiptsUnknown),
       succeededWithWork: nullableCounter(value.succeededWithWork),
       failureBuckets: explicitCounterRecord(value.failureBuckets),
+      // Additive in the evidence contract, and re-validated like every other
+      // counter so a malformed annotation degrades to unknown, not to zero.
+      // An older annotation that predates these fields is `undefined` here and
+      // must read as unknown, which is exactly what nullableCounter gives.
+      servedFromCache: nullableCounter(value.servedFromCache),
+      transportExecuted: nullableCounter(value.transportExecuted),
       observedEvents: nullableCounter(value.observedEvents) ?? 0,
     };
   } catch {

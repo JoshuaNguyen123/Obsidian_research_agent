@@ -19,7 +19,9 @@ import {
   type RepositoryProfileV2,
 } from "../repositories/RepositoryProfileV2";
 import {
+  SANDBOX_ENVIRONMENT_ALLOWLIST_V2,
   SandboxManagerV2,
+  declaredExpectedArtifactsV2,
   parsePreparedSandboxActionV2,
   type PreparedSandboxActionV2,
   type SandboxArtifactImporterV2,
@@ -245,20 +247,46 @@ function preparedSandboxContribution(
           Boolean(options.resolvePreparationInput),
         );
         const hostProof = options.resolvePreparationInput
-          ? await options.resolvePreparationInput({
-              purpose,
-              workspaceId: normalized.workspaceId,
-              context,
-            })
+          ? await preparationStageV2("sandbox_host_preparation_failed", () =>
+              options.resolvePreparationInput!({
+                purpose,
+                workspaceId: normalized.workspaceId,
+                context,
+              }),
+            )
           : null;
-        const profile = hostProof?.profile ?? await options.getProfile(normalized.profileKey!);
+        const profile =
+          hostProof?.profile ??
+          (await preparationStageV2("repository_profile_lookup_failed", () =>
+            options.getProfile(normalized.profileKey!),
+          ));
         if (!profile) {
           return failure("repository_profile_missing", "The trusted RepositoryProfileV2 is unavailable.");
         }
-        parseRepositoryProfileV2(profile);
-        const prepared = await resolveSandboxManager(
-          options.sandboxManager,
-        ).prepareExecution({
+        await preparationStageV2("repository_profile_invalid", () =>
+          parseRepositoryProfileV2(profile),
+        );
+        // On a host-owned run the host has already rebound the profile,
+        // workspace, command, staging manifest and repair scope; what the
+        // model still supplies is a hint. The manager rejects an environment
+        // key outside its allowlist and an artifact outside the profile's
+        // declared outputs, and a model repeats its hint verbatim, so one
+        // benign hint blocked a validation node after two identical
+        // rejections (reliability cohort 10, code-delivery, 2026-09-07). Drop
+        // what cannot be honoured here; the manager still checks the rest.
+        const environment = hostProof
+          ? hostOwnedEnvironmentV2(normalized.environment ?? {})
+          : normalized.environment;
+        const expectedArtifacts = hostProof
+          ? hostProof.expectedArtifacts ??
+            declaredExpectedArtifactsV2(
+              normalized.expectedArtifacts ?? [],
+              profile.generatedOutputs,
+            )
+          : normalized.expectedArtifacts;
+        const prepared = await preparationStageV2(
+          "sandbox_prepare_rejected_by_manager",
+          () => resolveSandboxManager(options.sandboxManager).prepareExecution({
           profile,
           purpose,
           projectId: hostProof?.projectId ?? normalized.projectId!,
@@ -271,21 +299,28 @@ function preparedSandboxContribution(
           workspaceManifestFingerprint:
             hostProof?.workspaceManifestFingerprint ?? normalized.workspaceManifestFingerprint!,
           stagingManifest: hostProof?.stagingManifest ?? normalized.stagingManifest!,
-          expectedArtifacts:
-            hostProof?.expectedArtifacts ?? normalized.expectedArtifacts,
-          environment: normalized.environment,
-        });
+          expectedArtifacts,
+          environment,
+          }),
+        );
         if (prepared.status === "blocked") {
           return failure(prepared.blocker.code, prepared.blocker.message);
         }
         const action = corePreparedAction(name, resourceType, prepared.action, context);
-        const journal = await options.executionJournal.recordPrepared({
-          runId: action.runId,
-          action: prepared.action,
-        });
+        const journal = await preparationStageV2("sandbox_journal_unavailable", () =>
+          options.executionJournal.recordPrepared({
+            runId: action.runId,
+            action: prepared.action,
+          }),
+        );
         if (journal.status !== "prepared") {
-          throw new Error(
-            `Durable sandbox action already has terminal or ambiguous state ${journal.status}; reconcile it instead of preparing a replay.`,
+          // This module's own known condition. It used to raise a plain Error,
+          // which the classifier then reported as `sandbox_prepare_rejected` -
+          // a replay of an already-dispatched action was indistinguishable in
+          // telemetry from an unknown host exception.
+          throw new CodeSandboxContributionErrorV2(
+            "sandbox_journal_state_conflict",
+            "This exact prepared sandbox action already has a terminal or ambiguous durable state; reconcile it instead of preparing a replay.",
           );
         }
         return {
@@ -293,10 +328,7 @@ function preparedSandboxContribution(
           action,
         };
       } catch (error) {
-        return failure(
-          sandboxPreparationFailureCodeV2(error),
-          error instanceof Error ? error.message : String(error),
-        );
+        return failure(...sandboxPreparationFailureV2(error));
       }
     },
     async executePrepared(action, context) {
@@ -329,7 +361,7 @@ function preparedSandboxContribution(
       } catch (error) {
         throw new CodeSandboxContributionErrorV2(
           "sandbox_journal_dispatch_failed",
-          `Sandbox execution did not start because its durable dispatch marker failed: ${error instanceof Error ? error.message : String(error)}`,
+          "Sandbox execution did not start because its durable dispatch marker failed. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
         );
       }
       const result = await resolveSandboxManager(
@@ -359,7 +391,7 @@ function preparedSandboxContribution(
       } catch (error) {
         throw new CodeSandboxContributionErrorV2(
           "sandbox_journal_receipt_failed",
-          `Sandbox executed, but its durable execution receipt failed persistence/readback: ${error instanceof Error ? error.message : String(error)}`,
+          "Sandbox executed, but its durable execution receipt failed persistence/readback. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
         );
       }
       let validationReceipt: JsonValueV1 | undefined;
@@ -401,7 +433,7 @@ function preparedSandboxContribution(
         } catch (error) {
           throw new CodeSandboxContributionErrorV2(
             "validation_receipt_persistence_failed",
-            `Validation executed, but durable scoped receipt persistence/readback failed: ${error instanceof Error ? error.message : String(error)}`,
+            "Validation executed, but durable scoped receipt persistence/readback failed. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
           );
         }
       }
@@ -480,7 +512,10 @@ function preparedSandboxContribution(
         return {
           outcome: "still_uncertain" as const,
           message: boundedReconciliationMessage(
-            `Durable sandbox receipt readback failed: ${error instanceof Error ? error.message : String(error)}`,
+            // The caught error is foreign text. Length-bounding and keyword
+            // redaction do not remove host paths, note titles, or command
+            // output, so the detail is withheld rather than trimmed.
+            "Durable sandbox receipt readback failed. The underlying error text is withheld because it can carry host paths, command output, or credentials.",
           ),
         };
       }
@@ -1090,10 +1125,163 @@ function sandboxPreparationFailureCodeV2(error: unknown): string {
     : "sandbox_prepare_rejected";
 }
 
+/**
+ * Bounded preparation stages. A failed tool call keeps only its error CODE in
+ * the retained mission evidence, so the code string is the entire channel this
+ * boundary has to telemetry; the stage is derived from it rather than carried
+ * as a second field. `unattributed` is a first-class value: an exception this
+ * module did not raise at a known step stays unexplained instead of borrowing
+ * a stage that would read as an explanation.
+ */
+export const SANDBOX_PREPARATION_FAILURE_STAGES_V2 = [
+  "arguments",
+  "identity",
+  "host_preparation",
+  "profile",
+  "sandbox_prepare",
+  "journal",
+  "unattributed",
+] as const;
+
+export type SandboxPreparationFailureStageV2 =
+  (typeof SANDBOX_PREPARATION_FAILURE_STAGES_V2)[number];
+
+/**
+ * Coarse cause class, for triage only. `model_arguments` is a mistake the
+ * model can correct on the next call; `host_environment` and `durable_state`
+ * are not. `null` means this boundary genuinely does not know: neither
+ * `SandboxManagerV2Error` nor `RepositoryProfileV2Error` carries a code, and
+ * guessing a sub-cause from their message text would be inventing evidence.
+ */
+export const SANDBOX_PREPARATION_FAILURE_CAUSES_V2 = [
+  "model_arguments",
+  "host_environment",
+  "durable_state",
+] as const;
+
+export type SandboxPreparationFailureCauseV2 =
+  (typeof SANDBOX_PREPARATION_FAILURE_CAUSES_V2)[number];
+
+/**
+ * The closed set of codes this boundary assigns, each bound to the stage that
+ * produced it. Blocker codes returned by SandboxManagerV2 are a separate typed
+ * vocabulary that passes through unchanged and is deliberately absent here.
+ */
+const SANDBOX_PREPARATION_FAILURE_TABLE_V2: Readonly<
+  Record<
+    string,
+    { stage: SandboxPreparationFailureStageV2; cause: SandboxPreparationFailureCauseV2 | null }
+  >
+> = {
+  invalid_arguments: { stage: "arguments", cause: "model_arguments" },
+  invalid_canonical_value: { stage: "arguments", cause: "model_arguments" },
+  mission_identity_required: { stage: "identity", cause: "model_arguments" },
+  sandbox_host_preparation_failed: { stage: "host_preparation", cause: "host_environment" },
+  repository_profile_lookup_failed: { stage: "profile", cause: "host_environment" },
+  repository_profile_missing: { stage: "profile", cause: "host_environment" },
+  repository_profile_invalid: { stage: "profile", cause: null },
+  sandbox_prepare_rejected_by_manager: { stage: "sandbox_prepare", cause: null },
+  sandbox_journal_unavailable: { stage: "journal", cause: "durable_state" },
+  sandbox_journal_state_conflict: { stage: "journal", cause: "durable_state" },
+  sandbox_prepare_rejected: { stage: "unattributed", cause: null },
+};
+
+/** Every code the preparation boundary can assign, in a stable order. */
+export const SANDBOX_PREPARATION_FAILURE_CODES_V2: readonly string[] =
+  Object.keys(SANDBOX_PREPARATION_FAILURE_TABLE_V2);
+
+/**
+ * Pure, allowlisted projection from a retained `errorCode` to its bounded
+ * stage and cause. Evidence consumers read this instead of building a second
+ * classifier; an unrecognized code yields nulls rather than a default.
+ */
+export function classifySandboxPreparationFailureV2(code: string): {
+  stage: SandboxPreparationFailureStageV2 | null;
+  cause: SandboxPreparationFailureCauseV2 | null;
+} {
+  const entry = Object.prototype.hasOwnProperty.call(
+    SANDBOX_PREPARATION_FAILURE_TABLE_V2,
+    code,
+  )
+    ? SANDBOX_PREPARATION_FAILURE_TABLE_V2[code]
+    : undefined;
+  return entry ? { stage: entry.stage, cause: entry.cause } : { stage: null, cause: null };
+}
+
+/**
+ * Run one preparation step and attribute anything it throws to that step.
+ *
+ * Attribution is STRUCTURAL — derived from which call threw — never from the
+ * message text. `SandboxManagerV2Error` and `RepositoryProfileV2Error` carry
+ * no code of their own, so before this the only way to tell "the model named a
+ * validation command that does not exist" from "the host staging boundary
+ * failed" was to read their prose, and both arrived as `sandbox_prepare_rejected`.
+ * An error that already carries one of our codes keeps it: the inner code is
+ * always the more specific of the two.
+ */
+async function preparationStageV2<T>(
+  code: string,
+  step: () => Promise<T> | T,
+): Promise<T> {
+  try {
+    return await step();
+  } catch (error) {
+    if (error instanceof CodeSandboxContributionErrorV2) throw error;
+    throw new CodeSandboxContributionErrorV2(code, WITHHELD_PREPARATION_DETAIL_V2);
+  }
+}
+
+/**
+ * Withheld-text notice for any failure whose message this boundary did not
+ * author. A caught exception's `message` is arbitrary foreign text: host
+ * `ENOENT` strings carry absolute vault paths, spawn failures carry command
+ * lines, and provider SDK errors carry request payloads. That message used to
+ * be copied verbatim into `PreparedActionResultV1.error.message`, which the
+ * runner turns into the tool run's error and persists on the mission event
+ * stream. The code is bounded; the message must be too.
+ */
+const WITHHELD_PREPARATION_DETAIL_V2 =
+  "Sandbox preparation failed. The underlying error text is withheld because it can carry host paths, command output, or credentials; use the failure code to attribute it.";
+
+/**
+ * Bounded `{code, message}` pair for one caught preparation failure. Only the
+ * messages this module authored are re-emitted; every other message is
+ * replaced by a fixed notice.
+ */
+function sandboxPreparationFailureV2(error: unknown): [code: string, message: string] {
+  const code = sandboxPreparationFailureCodeV2(error);
+  return [
+    code,
+    error instanceof CodeSandboxContributionErrorV2
+      ? error.message
+      : WITHHELD_PREPARATION_DETAIL_V2,
+  ];
+}
+
+/** A model's environment hints, reduced to the keys the sandbox may receive. */
+function hostOwnedEnvironmentV2(
+  environment: Readonly<Record<string, string>>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([key]) =>
+      SANDBOX_ENVIRONMENT_ALLOWLIST_V2.has(key),
+    ),
+  );
+}
+
 function assertAllowedArgs(args: Record<string, unknown>, allowed: readonly string[]): void {
   const expected = new Set(allowed);
   const unknown = Object.keys(args).filter((key) => !expected.has(key));
-  if (unknown.length > 0) throw new CodeSandboxContributionErrorV2("invalid_arguments", `Unknown arguments: ${unknown.join(", ")}.`);
+  // Argument NAMES are model-authored text, not product vocabulary: a model
+  // that invents `apiToken` or a note title as a key would otherwise write it
+  // into a persisted error. The count is the diagnosable part; the keys are
+  // already visible to the model in its own call.
+  if (unknown.length > 0) {
+    throw new CodeSandboxContributionErrorV2(
+      "invalid_arguments",
+      `Rejected ${unknown.length} unknown argument name(s); this tool accepts only ${expected.size} declared argument(s).`,
+    );
+  }
 }
 
 function requiredId(value: unknown, label: string): string {

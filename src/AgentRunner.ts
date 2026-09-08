@@ -283,6 +283,7 @@ import {
 } from "./agent/missionGraphAuthority";
 import {
   classifyMissionFailureV1,
+  isModelContentErrorCodeV1,
   type MissionFailureClassV1,
 } from "./agent/missionFailureClass";
 import {
@@ -362,6 +363,8 @@ import {
   formatUnproductiveModelResponseMessage,
   UNPRODUCTIVE_MODEL_RESPONSE_METRIC_NAME_V1,
   UNPRODUCTIVE_MODEL_RESPONSE_STOP_THRESHOLD_V1,
+  degenerateStreamVerdictFromError,
+  retryRequestAfterDegenerateStreamV1,
 } from "./model/degenerateStreamGuard";
 import {
   createRunPlan,
@@ -951,6 +954,7 @@ import {
   type ResearchModeAssist,
   type ResearchPlan,
 } from "./agent/researchPlan";
+import { reportStructureCorrectionLinesV1 } from "./agent/researchReportStructure";
 import {
   RESEARCH_EFFORT_TIER_ORDER,
   resolveResearchEffortBudget,
@@ -28199,11 +28203,14 @@ async function chatForAgentStep(
     );
   }
 
+  // Same rule as the streaming wrapper: a degenerate reply is retried with a
+  // different request, never the same one.
+  let attemptRequest = request;
   try {
     const response = await withModelRetry(
       () =>
         withModelWaitStatus(
-          () => modelClient.chat(request),
+          () => modelClient.chat(attemptRequest),
           events,
           "model API response",
           step,
@@ -28217,7 +28224,13 @@ async function chatForAgentStep(
             : undefined,
         abortSignal: request.abortSignal,
         onRetry: (attempt, error, delayMs) => {
-          if (isRateLimitModelError(error)) {
+          const verdict = degenerateStreamVerdictFromError(error);
+          if (verdict) {
+            attemptRequest = retryRequestAfterDegenerateStreamV1(request, verdict);
+            events.onStatus?.(
+              `Model output collapsed into repetition; retrying model step ${step} with a repetition nudge and thinking off (attempt ${attempt}) after ${delayMs}ms.`,
+            );
+          } else if (isRateLimitModelError(error)) {
             events.onStatus?.(
               `Model provider is rate limiting this account; waiting ${Math.round(delayMs / 1000)} s before retrying model step ${step} (attempt ${attempt}): ${getUnknownErrorMessage(error)}`,
             );
@@ -29188,11 +29201,15 @@ async function streamChatWithThinkingFallback({
   /** Agent-loop step, when known; retries are then recorded as diagnostics. */
   step?: number;
 }): Promise<ModelChatResponse> {
+  // A retry after a degenerate stream must not be the same request (cohort
+  // 12, 2026-09-07: the identical retry collapsed again within seconds). The
+  // attempt closure reads this binding, which the retry hook rewrites.
+  let attemptRequest = request;
   try {
     return await withModelRetry(
       () =>
         withModelWaitStatus(
-          () => modelClient.streamChat(request, streamEvents),
+          () => modelClient.streamChat(attemptRequest, streamEvents),
           events,
           "streaming model response",
           step,
@@ -29201,9 +29218,17 @@ async function streamChatWithThinkingFallback({
         abortSignal: request.abortSignal,
         shouldRetry,
         onRetry: (attempt, error, delayMs) => {
-          events.onStatus?.(
-            `Transient streaming model error; retrying stream (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
-          );
+          const verdict = degenerateStreamVerdictFromError(error);
+          if (verdict) {
+            attemptRequest = retryRequestAfterDegenerateStreamV1(request, verdict);
+            events.onStatus?.(
+              `Model output collapsed into repetition; retrying stream with a repetition nudge and thinking off (attempt ${attempt}) after ${delayMs}ms.`,
+            );
+          } else {
+            events.onStatus?.(
+              `Transient streaming model error; retrying stream (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
+            );
+          }
           emitModelRetryDiagnostic(events, step, attempt, delayMs, error);
         },
       },
@@ -38633,8 +38658,24 @@ function completeRun(
   }
 }
 
+/**
+ * This used to be a private spelling test: `invalid_arguments`, or a
+ * `_invalid_arguments` suffix. A code had to opt in by being named exactly
+ * right, and validators that were not named exactly right — the singular
+ * `..._invalid_argument`, the reversed `..._arguments_invalid`, and
+ * `project_idea_brief_invalid`, which says nothing about arguments at all —
+ * were read here as unattributable. That cost the model the schema resend
+ * below and pushed the tool onto `failedToolNames` on its FIRST occurrence,
+ * which is how a 504-run cohort ended on a payload the model could have
+ * corrected.
+ *
+ * The mission-failure classifier already owned the same question for retry
+ * guidance, and answered it differently. It is the authority now, so the seat
+ * that resends the schema and the guidance that tells the model to fix its
+ * arguments can no longer disagree about which failures those are.
+ */
 function isToolArgumentErrorCode(code: string | undefined): boolean {
-  return code === "invalid_arguments" || code?.endsWith("_invalid_arguments") === true;
+  return isModelContentErrorCodeV1(code);
 }
 
 function getStopReasonMessage(stopReason: AgentRunStopReason): string {
@@ -39203,12 +39244,10 @@ function buildFinalOutputVerificationCorrectionPrompt(
     acceptance.missing.some((item) => item.includes("open_evidence_conflicts"))
       ? "Include an explicit ## Limitations section that says the sources conflict, contradict, disagree, or differ. Do not imply that the disagreement was resolved when the evidence remains contradictory."
       : "",
-    acceptance.missing.includes("limitations_section")
-      ? "Include an explicit Limitations section."
-      : "",
-    acceptance.missing.includes("confidence_section")
-      ? "Include an explicit Confidence section."
-      : "",
+    // Generated beside the patterns that judge them: a model that obeyed the
+    // old one-line asks could still fail the strict structural check, spend
+    // the single progressive correction, and lose the mission (cohort 15).
+    ...reportStructureCorrectionLinesV1(acceptance.missing),
     finalRelevanceMissing && requiredLiteralAnchors.length > 0
       ? `Preserve every exact user-required literal marker in the final answer: ${requiredLiteralAnchors.join(", ")}. Copy each marker character-for-character.`
       : "",
@@ -40989,6 +41028,11 @@ interface ExactFindingSentenceInspectionV1 {
   outsideMaterialClaimIds: string[];
   mappingComplete: boolean;
   removableClaims: Array<{ id: string; start: number; end: number }>;
+  /**
+   * Claims the trim would have removed but must keep because their text
+   * carries a literal anchor the mission requires ("Include <marker>").
+   */
+  protectedClaimIds: string[];
 }
 
 function resolveExactFindingSentenceCount(prompt: string): number | null {
@@ -41037,6 +41081,7 @@ function inspectExactFindingSentenceContract(
         .map((claim) => claim.id),
       mappingComplete: false,
       removableClaims: [],
+      protectedClaimIds: [],
     };
   }
 
@@ -41061,10 +41106,31 @@ function inspectExactFindingSentenceContract(
   const outsideClaims = mapped.filter(
     (claim) => claim.start < bounds.start || claim.start >= bounds.end,
   );
-  const removableClaims =
+  // A required literal anchor ("Include <marker>") is demanded by
+  // isFinalOutputRelevant until a durable write exists. Deleting the sentence
+  // that carries it made the runner fail its own trimmed draft for the anchor
+  // the runner had removed, and the model, whose draft already had the
+  // marker, resent the same text until the finalization budget was spent
+  // (qualification cohort 4, DU-02, 2026-09-07). Such a claim is never
+  // removable; the exact-N contract is enforced on the rest.
+  const requiredAnchors = extractRequiredLiteralAnchors(prompt).map((anchor) =>
+    anchor.toLowerCase(),
+  );
+  const carriesRequiredAnchor = (claim: { start: number; end: number }): boolean => {
+    if (requiredAnchors.length === 0) return false;
+    const text = draft.slice(claim.start, claim.end).toLowerCase();
+    return requiredAnchors.some((anchor) => text.includes(anchor));
+  };
+  const candidateRemovals =
     findingClaims.length >= requiredCount && mappingComplete
       ? [...findingClaims.slice(requiredCount), ...outsideClaims]
       : [];
+  const removableClaims = candidateRemovals.filter(
+    (claim) => !carriesRequiredAnchor(claim),
+  );
+  const protectedClaimIds = candidateRemovals
+    .filter((claim) => carriesRequiredAnchor(claim))
+    .map((claim) => claim.id);
   return {
     requiredCount,
     observedFindingCount: findingClaims.length,
@@ -41072,6 +41138,7 @@ function inspectExactFindingSentenceContract(
     outsideMaterialClaimIds: outsideClaims.map((claim) => claim.id),
     mappingComplete,
     removableClaims,
+    protectedClaimIds,
   };
 }
 

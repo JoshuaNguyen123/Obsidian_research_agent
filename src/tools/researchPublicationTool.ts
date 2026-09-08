@@ -13,6 +13,7 @@ import { extractMarkdownPathMentions } from "../agent/missionScope";
 import { hasAffirmativeProjectIdeationIntentV1 } from "../agent/projectIdeationIntent";
 import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
 import { sha256DiagramContent } from "../design/diagramArtifactStore";
+import { normalizeAcceptanceCriterionIdV1 } from "../integrations/linear/acceptanceCriterionIdV1";
 import {
   assertNoRawAuthority,
   canonicalizeProviderSafeAcceptedResearchTextV1,
@@ -1051,6 +1052,14 @@ async function parseToolArguments(input: {
   nowProvider?: () => Date;
 }) {
   const { value, runId } = input;
+  // The model sometimes places the package's schemaVersion beside `package`
+  // instead of inside it, or omits it altogether; both shapes were rejected
+  // as invalid arguments in qualification cohort 9 (compound lane, 2026-09-07)
+  // before a third call got the placement right. The package format has
+  // exactly one accepted version, so a misplaced version is folded into the
+  // package and a missing one defaults to 1. The version's VALUE is still
+  // checked below, and every other unknown key still fails.
+  foldMisplacedPackageSchemaVersion(value);
   assertExactKeys(value, ["mode", "package"], ["notePath", "baseHash"]);
   const packageRecord = expectRecord(value.package, "accepted research package");
   // Host seed substitution runs before objective hydration and the drift
@@ -1833,6 +1842,25 @@ function assertAcceptedResearchPackageShape(
   }
 }
 
+function foldMisplacedPackageSchemaVersion(value: Record<string, unknown>): void {
+  const candidate = value.package;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return;
+  }
+  const packageRecord = candidate as Record<string, unknown>;
+  const has = (record: Record<string, unknown>, key: string) =>
+    Object.prototype.hasOwnProperty.call(record, key);
+  if (has(value, "schemaVersion")) {
+    if (!has(packageRecord, "schemaVersion")) {
+      packageRecord.schemaVersion = value.schemaVersion;
+    }
+    delete value.schemaVersion;
+  }
+  if (!has(packageRecord, "schemaVersion")) {
+    packageRecord.schemaVersion = 1;
+  }
+}
+
 function assertExactKeys(
   record: Record<string, unknown>,
   required: readonly string[],
@@ -1898,9 +1926,7 @@ function canonicalizePackageIdentifiers(
         return;
       }
       const criterion = candidate as Record<string, unknown>;
-      if (!isValidCriterionIdentifier(criterion.id)) {
-        criterion.id = `AC-${index + 1}`;
-      }
+      criterion.id = canonicalizeAcceptanceCriterionIdV1(criterion.id, index);
     });
   }
 }
@@ -2191,8 +2217,29 @@ function isSafeBoundedEvidenceText(value: unknown, maximum: number): boolean {
   );
 }
 
-function isValidCriterionIdentifier(value: unknown): boolean {
-  return typeof value === "string" && /^AC-[1-9][0-9]?$/u.test(value);
+/**
+ * The publication tool's criterion-id seat. Unlike the five validating seats
+ * it never refuses a value: this runs before the package validator, so its job
+ * is to hand that validator something canonical, and a criterion whose id is
+ * missing entirely still has to get one.
+ *
+ * It routes through the shared normalizer rather than the shared canonical
+ * predicate, which is a behaviour change and deliberate. The predicate this
+ * replaced only recognized the exact canonical form, so a caller that wrote
+ * "ac-01" or "AC1" -- spellings every other seat accepts and canonicalizes --
+ * did not get its id canonicalized, it got RENUMBERED to its position. Two
+ * consequences, both silent: a caller that listed AC-3 before AC-1 in lower
+ * case had its numbering inverted, and a caller that wrote "AC-1" and "ac-01"
+ * got two distinct criteria instead of the duplicate every other seat reports.
+ * Normalizing first preserves the id the caller meant and leaves the positional
+ * fallback for the case it was actually written for -- an absent or
+ * unrecoverable id, which is what the tool's existing tests pin.
+ */
+export function canonicalizeAcceptanceCriterionIdV1(
+  value: unknown,
+  index: number,
+): string {
+  return normalizeAcceptanceCriterionIdV1(value) ?? `AC-${index + 1}`;
 }
 
 function describeRedactedValueShape(value: unknown): string {

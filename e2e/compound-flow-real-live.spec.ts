@@ -37,6 +37,11 @@ import {
   peekToolCallCollector,
   recordToolCallOutcomesAfterEach,
 } from "./fixtures/toolCallCollector";
+import { peekToolCallCollectorDiagnosticsV1 } from "./fixtures/toolCallCollector";
+import {
+  judgeSingleIssueLinearApprovalsV1,
+  linearIssueUrlsInNoteV1,
+} from "./fixtures/linearApprovalSequence";
 
 // The compound lane was the ONLY proof lane with no tool-call meter attached,
 // which is why its run records carried `toolCallsFailed: null` /
@@ -435,10 +440,14 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
         approval.toolName === "publish_research_to_linear" ||
         approval.toolName === "linear_create_issue",
     );
+    // ONE prepared Linear action. Whether it was approved once or, after an
+    // ambiguous provider outcome (linear_timeout on 2026-09-07), re-approved
+    // for the same prepared action, is judged below once the issue id is
+    // known — so a red verdict still leaves the issue for cleanup.
     expect(
-      linearPreparedApprovals,
-      "the single-issue lane requires exactly one prepared Linear mutation approval",
-    ).toHaveLength(1);
+      linearPreparedApprovals.length,
+      "the single-issue lane requires at least one prepared Linear mutation approval",
+    ).toBeGreaterThanOrEqual(1);
     const linearPreparedApproval = linearPreparedApprovals[0];
     expect(linearPreparedApproval?.preparedActionId).toBeTruthy();
     expect(linearPreparedApproval?.payloadFingerprint).toMatch(
@@ -521,6 +530,24 @@ test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflecti
     }
     issueId = researchPublication!.issueId;
     issueUrl = researchPublication!.issueUrl;
+    // No duplicate committed effect, judged from three sides now that the
+    // issue is known and cleanup can reach it: one prepared action (a
+    // re-approval is licensed only by a preceding ambiguous dispatch
+    // failure), one issue id on the checkpoint, one Linear issue URL in the
+    // note.
+    const linearApprovalVerdict = judgeSingleIssueLinearApprovalsV1(
+      preparedApprovalObservations,
+      await peekToolCallCollectorDiagnosticsV1(harness.page),
+    );
+    expect(
+      linearApprovalVerdict.ok,
+      `Linear approvals: ${linearApprovalVerdict.reason} (${JSON.stringify(linearApprovalVerdict)})`,
+    ).toBe(true);
+    const linkedIssueUrls = linearIssueUrlsInNoteV1(finalNote);
+    expect(
+      linkedIssueUrls,
+      "the final note must link exactly one Linear issue",
+    ).toHaveLength(1);
     if (!issueUrl) {
       const title = `Flow real ${marker}`;
       const recovered =

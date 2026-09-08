@@ -4,6 +4,7 @@ export * from "./agentGitCommitIdentityV1";
 export * from "./secretStoreV1";
 export * from "./verifiedCodePublicationHandoffV1";
 export * from "./reflectionContentV1";
+export * from "./acceptanceCriterionIdV1";
 export * from "./projectIdeaBriefV1";
 export * from "./preparedExternalActionHandoffV1";
 export * from "./preparedBackgroundCodeActionV1";

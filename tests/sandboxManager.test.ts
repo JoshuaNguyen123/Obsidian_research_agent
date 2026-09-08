@@ -35,6 +35,15 @@ import {
   createCodeExecutionContributionsV2,
 } from "../extensions/code/sandbox/CodeExecutionContributionsV2";
 import {
+  classifySandboxPreparationFailureV2,
+  SANDBOX_PREPARATION_FAILURE_CODES_V2,
+} from "../extensions/code/sandbox/CodeExecutionContributionsV2";
+import {
+  TOOL_CALL_FAILURE_BUCKET_OTHER,
+  classifyToolFailureBucketV1,
+} from "../e2e/fixtures/toolCallOutcomes";
+import { TOOL_REFUSAL_MARKER_BUCKETS } from "../e2e/reporters/dailyUseReporter";
+import {
   DurableSandboxExecutionJournalV1,
   type DurableSandboxExecutionJournalPersistenceV1,
   type DurableSandboxExecutionNamespaceV1,
@@ -603,18 +612,39 @@ test("code contribution preparation preserves typed failure codes and keeps unkn
     },
   });
 
-  preparationError = new Error("Unexpected journal failure.");
-  const unknown = await validation.prepare!(
+  // An UNTYPED exception raised by a KNOWN preparation step is attributed to
+  // that step and has its text withheld. The previous assertion pinned
+  // `{ code: "sandbox_prepare_rejected", message: "Unexpected journal failure." }`
+  // for this case: it required the boundary both to collapse a locatable
+  // failure onto the unknown-exception code and to copy foreign error text
+  // into a persisted tool error.
+  preparationError = new Error(
+    "Unexpected journal failure at C:/Users/joshb/vault/Private.md",
+  );
+  const attributed = await validation.prepare!(
     { workspaceId: "workspace-1", repairRequestId: "request-1" },
     context(),
   );
-  assert.deepEqual(unknown, {
-    ok: false,
-    error: {
-      code: "sandbox_prepare_rejected",
-      message: "Unexpected journal failure.",
-    },
-  });
+  assert.equal(attributed.ok, false);
+  if (attributed.ok) return;
+  assert.equal(attributed.error.code, "sandbox_host_preparation_failed");
+  assert.equal(attributed.error.message.includes("C:/Users/joshb/vault/Private.md"), false);
+  assert.equal(attributed.error.message.includes("Unexpected journal failure"), false);
+  assert.match(attributed.error.message, /withheld/iu);
+
+  // The generic code is still REACHABLE, and still means "unattributed". A
+  // throw from outside every known step - here a non-object argument payload,
+  // which fails before argument validation can classify it - keeps
+  // `sandbox_prepare_rejected`. Without this case the "unknown stays unknown"
+  // half of this test would be vacuous: every other path now has a stage.
+  const unattributed = await validation.prepare!(
+    null as unknown as Record<string, unknown>,
+    context(),
+  );
+  assert.equal(unattributed.ok, false);
+  if (unattributed.ok) return;
+  assert.equal(unattributed.error.code, "sandbox_prepare_rejected");
+  assert.match(unattributed.error.message, /withheld/iu);
 });
 
 test("validation contribution withholds success when durable receipt persistence/readback fails", async () => {
@@ -673,7 +703,11 @@ test("validation contribution withholds success when durable receipt persistence
     (error: unknown) =>
       error instanceof CodeSandboxContributionErrorV2 &&
       error.code === "validation_receipt_persistence_failed" &&
-      /readback hash mismatch/u.test(error.message),
+      // The typed code survives; the caught cause's own text does not. The
+      // previous assertion required `/readback hash mismatch/` — foreign text
+      // copied verbatim out of a durable-persistence failure.
+      /withheld/iu.test(error.message) &&
+      !/readback hash mismatch/u.test(error.message),
   );
   assert.equal(executions, 1, "sandbox ran once, but no green tool result was returned");
 });
@@ -1560,3 +1594,245 @@ class FakeSandboxChild extends EventEmitter {
     return true;
   }
 }
+
+
+/**
+ * A durable blocker's `message` is copied verbatim into
+ * `PreparedActionResultV1.error.message` by `CodeExecutionContributionsV2`
+ * (line 288 on the preparation path, line 362 on the execution path). From
+ * there it reaches the retry plan sent OUTBOUND to the provider, the persisted
+ * mission trace, user-visible status and answer, and Run Details.
+ *
+ * `f0fcb0b` repaired FOUR sites inside the contributions module. These two
+ * producers in SandboxManager fed the same field through `blocker.message` and
+ * bypassed that boundary entirely, so the leak class was not closed by those
+ * green tests. Each secret below is a distinct exposure kind: a host path, a
+ * credential, a command line, and a private note title.
+ */
+const BLOCKER_LEAK_PROBES_V1 = [
+  "C:/Users/joshb/vault/Private Therapy Notes.md",
+  "sk-live-51H9ZqQq7xTESTONLY",
+  "npm run deploy -- --prod",
+  "Q3 Layoff Plan",
+] as const;
+
+const FOREIGN_ERROR_TEXT_V1 = `ENOENT reading ${BLOCKER_LEAK_PROBES_V1[0]} while ${BLOCKER_LEAK_PROBES_V1[2]} used ${BLOCKER_LEAK_PROBES_V1[1]} for "${BLOCKER_LEAK_PROBES_V1[3]}"`;
+
+function assertNoForeignTextSurvives(message: string, code: string, expectedCode: string): void {
+  for (const probe of BLOCKER_LEAK_PROBES_V1) {
+    assert.equal(
+      message.includes(probe),
+      false,
+      `blocker message leaked ${JSON.stringify(probe)}: ${message}`,
+    );
+  }
+  // The message must be withheld, but attribution must SURVIVE. A guard that
+  // also destroyed the typed code would be privacy at the cost of the only
+  // telemetry channel this boundary has, which is not an improvement.
+  assert.equal(code, expectedCode);
+  assert.match(message, /withheld/iu);
+}
+
+test("a throwing artifact importer cannot write foreign error text into the durable blocker", async () => {
+  const artifact = new Uint8Array([1, 2, 3]);
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      return { exitCode: 0, stdout: "ok", stderr: "", artifacts: { "dist/out.bin": artifact } };
+    },
+  };
+  const manager = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution({
+    ...prepareInput(),
+    expectedArtifacts: [
+      { path: "dist/out.bin", expectedSha256: sha256(artifact), maxBytes: 100, required: true },
+    ],
+  });
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") return;
+
+  const blocked = await manager.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: [
+      { path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") },
+    ],
+    artifactImporter: {
+      async importArtifacts() {
+        throw new Error(FOREIGN_ERROR_TEXT_V1);
+      },
+    },
+  });
+  assert.equal(blocked.status, "blocked");
+  if (blocked.status !== "blocked") return;
+  assertNoForeignTextSurvives(
+    blocked.blocker.message,
+    blocked.blocker.code,
+    "sandbox_artifact_readback_failed",
+  );
+});
+
+test("a throwing sandbox runner cannot write foreign error text into the durable blocker", async () => {
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      throw new Error(FOREIGN_ERROR_TEXT_V1);
+    },
+  };
+  const manager = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(prepareInput());
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") return;
+
+  const blocked = await manager.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: [
+      { path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") },
+    ],
+  });
+  assert.equal(blocked.status, "blocked");
+  if (blocked.status !== "blocked") return;
+  // `safeDiagnostic` used to bound this one. It redacts credential-shaped
+  // keywords and caps length, so the credential probe alone would have passed
+  // while the host path, command line and note title all survived.
+  assertNoForeignTextSurvives(
+    blocked.blocker.message,
+    blocked.blocker.code,
+    "sandbox_execution_failed",
+  );
+});
+
+
+/**
+ * Integration watch item W1: the runtime producer and the evidence consumer
+ * live in files that never touch, so git merges them clean while every newly
+ * attributed failure could silently classify as "other" - both lanes green, the
+ * bucketed evidence no better. This is the repository's recurring
+ * two-subsystems-disagree shape, and the cure is one test that spans both.
+ *
+ * The codes below are NOT hardcoded. They are read back from a real
+ * SandboxManagerV2 run and then handed to the consumer's classifier, so the
+ * test breaks if either side drifts.
+ */
+async function runtimeBlockerCodeV1(
+  mode: "execution_throw" | "artifact_throw",
+): Promise<string> {
+  const artifact = new Uint8Array([1, 2, 3]);
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      if (mode === "execution_throw") throw new Error("provider exploded");
+      return { exitCode: 0, stdout: "ok", stderr: "", artifacts: { "dist/out.bin": artifact } };
+    },
+  };
+  const manager = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(
+    mode === "artifact_throw"
+      ? {
+          ...prepareInput(),
+          expectedArtifacts: [
+            { path: "dist/out.bin", expectedSha256: sha256(artifact), maxBytes: 100, required: true },
+          ],
+        }
+      : prepareInput(),
+  );
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") throw new Error("fixture did not prepare");
+  const blocked = await manager.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: [
+      { path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") },
+    ],
+    ...(mode === "artifact_throw"
+      ? {
+          artifactImporter: {
+            async importArtifacts() {
+              throw new Error("importer exploded");
+            },
+          },
+        }
+      : {}),
+  });
+  assert.equal(blocked.status, "blocked");
+  if (blocked.status !== "blocked") throw new Error("fixture did not block");
+  // Anti-vacuity: an empty code classifies as "other" too, so a fixture that
+  // silently produced nothing would make every assertion below meaningless.
+  assert.ok(
+    blocked.blocker.code.length > 0,
+    "the fixture must produce a real runtime code, not an empty one",
+  );
+  return blocked.blocker.code;
+}
+
+/** The consumer's classifier, re-driven against a mutated allowlist. */
+function classifyAgainstV1(
+  errorCode: string,
+  buckets: ReadonlyArray<readonly [string, string]>,
+): string {
+  for (const [key, source] of buckets) {
+    if (new RegExp(source, "iu").test(errorCode)) return key;
+  }
+  return TOOL_CALL_FAILURE_BUCKET_OTHER;
+}
+
+test("W1: a code the sandbox runtime actually emits classifies into a non-other bucket", async () => {
+  const code = await runtimeBlockerCodeV1("execution_throw");
+  assert.equal(code, "sandbox_execution_failed");
+  assert.equal(classifyToolFailureBucketV1(code), "execution_failed");
+  assert.notEqual(classifyToolFailureBucketV1(code), TOOL_CALL_FAILURE_BUCKET_OTHER);
+});
+
+test("W1: the same code falls back to other when its entry leaves the allowlist", async () => {
+  const code = await runtimeBlockerCodeV1("execution_throw");
+  // Both halves are required. The positive assertion above passes today even
+  // for an unlisted code by landing in "other", and a negative assertion alone
+  // is satisfied by breaking everything.
+  const without = TOOL_REFUSAL_MARKER_BUCKETS.filter(([key]) => key !== "execution_failed");
+  assert.equal(
+    without.length,
+    TOOL_REFUSAL_MARKER_BUCKETS.length - 1,
+    "the mutation must actually remove one entry",
+  );
+  assert.equal(classifyAgainstV1(code, without), TOOL_CALL_FAILURE_BUCKET_OTHER);
+  assert.equal(classifyAgainstV1(code, TOOL_REFUSAL_MARKER_BUCKETS), "execution_failed");
+});
+
+test("W1: codes that bucket as other still carry stage and cause from the single projection", async () => {
+  // This is the OTHER half of the agreed design. Most new sandbox codes bucket
+  // as "other" deliberately - the CSV header is append-only and readers index
+  // by name - and the stage/cause dimension is served by one pure projection
+  // rather than a second bucket table that would drift from it.
+  const code = await runtimeBlockerCodeV1("artifact_throw");
+  assert.equal(code, "sandbox_artifact_readback_failed");
+  assert.equal(classifyToolFailureBucketV1(code), TOOL_CALL_FAILURE_BUCKET_OTHER);
+
+  for (const preparationCode of SANDBOX_PREPARATION_FAILURE_CODES_V2) {
+    const projected = classifySandboxPreparationFailureV2(preparationCode);
+    assert.notEqual(
+      projected.stage,
+      null,
+      `${preparationCode} must project a stage from the single table`,
+    );
+  }
+  // An unrecognized code yields nulls rather than borrowing an explanation.
+  assert.deepEqual(classifySandboxPreparationFailureV2("not_a_real_code_v1"), {
+    stage: null,
+    cause: null,
+  });
+  // And the two vocabularies stay separate: no bucket key is a stage name, so
+  // a consumer cannot mistake one dimension for the other.
+  const stages = new Set(
+    SANDBOX_PREPARATION_FAILURE_CODES_V2.map(
+      (entry) => classifySandboxPreparationFailureV2(entry).stage,
+    ),
+  );
+  for (const [bucketKey] of TOOL_REFUSAL_MARKER_BUCKETS) {
+    assert.equal(
+      stages.has(bucketKey as never),
+      false,
+      `bucket key ${bucketKey} must not double as a preparation stage name`,
+    );
+  }
+});

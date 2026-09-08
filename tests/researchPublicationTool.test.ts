@@ -160,6 +160,80 @@ test("host binds a pathless publication to the trusted initiating note", () => {
   );
 });
 
+test("a schemaVersion placed beside the package, as a string, is folded in and the publication proceeds", async () => {
+  // Qualification cohort 9 (2026-09-07): the first live call carried
+  // schemaVersion "1" at the top level of the arguments and was rejected as an
+  // unknown field; the mission recovered on its third call, but the lane's
+  // zero-failed-tool-calls contract had already been broken.
+  const fixture = createFixture("created");
+  const context = contextFixture(
+    "Publish the accepted research report to Linear in Published.md.",
+    "run-misplaced-version",
+    "call-misplaced-version",
+  );
+  context.requestNestedApproval = approveNested;
+  const args = argsFixture() as Record<string, unknown>;
+  delete (args.package as Record<string, unknown>).schemaVersion;
+  args.schemaVersion = "1";
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+  assert.equal(result.ok, true, JSON.stringify(result).slice(0, 400));
+  assert.equal(fixture.noteWrites.length, 1);
+  assert.equal(fixture.noteWrites[0]?.package.schemaVersion, 1);
+  assert.equal(fixture.publisher.publishCount, 1);
+});
+
+test("a package without schemaVersion defaults to the only accepted version", async () => {
+  // The second live call of the same mission omitted the field entirely.
+  const fixture = createFixture("created");
+  const context = contextFixture(
+    "Publish the accepted research report to Linear in Published.md.",
+    "run-missing-version",
+    "call-missing-version",
+  );
+  context.requestNestedApproval = approveNested;
+  const args = argsFixture() as Record<string, unknown>;
+  delete (args.package as Record<string, unknown>).schemaVersion;
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+  assert.equal(result.ok, true, JSON.stringify(result).slice(0, 400));
+  assert.equal(fixture.noteWrites[0]?.package.schemaVersion, 1);
+  assert.equal(fixture.publisher.publishCount, 1);
+});
+
+test("the tolerance is only for the version field: an unknown top-level key and a wrong version still fail closed", async () => {
+  const fixture = createFixture("created");
+  const context = contextFixture(
+    "Publish the accepted research report to Linear in Published.md.",
+    "run-unknown-key",
+    "call-unknown-key",
+  );
+  context.requestNestedApproval = approveNested;
+  const unknownKey = argsFixture() as Record<string, unknown>;
+  unknownKey.extraneous = true;
+  const rejected = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: unknownKey },
+    context,
+  );
+  assert.equal(rejected.ok, false);
+  assert.match(JSON.stringify(rejected), /research_publication_invalid_arguments/u);
+  assert.match(JSON.stringify(rejected), /unknown: extraneous/u);
+
+  const wrongVersion = argsFixture() as Record<string, unknown>;
+  (wrongVersion.package as Record<string, unknown>).schemaVersion = 2;
+  const alsoRejected = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: wrongVersion },
+    context,
+  );
+  assert.equal(alsoRejected.ok, false);
+  assert.match(JSON.stringify(alsoRejected), /schema version 1/u);
+  assert.equal(fixture.publisher.publishCount, 0);
+});
+
 test("composite publication captures the active note and host hash as an append binding", async () => {
   const fixture = createFixture("created");
   const context = contextFixture(

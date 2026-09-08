@@ -6,7 +6,10 @@ import {
   shouldRefuseUnchangedRetryV1,
   type MissionRetryVariationInputV1,
 } from "../src/agent/missionRetryVariation";
-import type { MissionFailureClassV1 } from "../src/agent/missionFailureClass";
+import {
+  classifyMissionFailureV1,
+  type MissionFailureClassV1,
+} from "../src/agent/missionFailureClass";
 
 function retriedNode(
   patch: {
@@ -173,6 +176,58 @@ test("a genuinely changed call passes, however few words it carries", () => {
       nextArguments: '{"section": 2, "path": "a.md"}',
     }),
     true,
+  );
+});
+
+test("a refused payload earns the corrective guidance, not the shrug", () => {
+  // Drive the real chain: classify the live failure, then build the guidance
+  // the model would actually be handed. The reference strings are produced by
+  // the same builder from codes whose classes have never been in doubt, so
+  // this asserts the product agrees with itself rather than with a copy of
+  // its own copy that would keep passing if the wording changed.
+  const guidanceFor = (failureClass: MissionFailureClassV1): string => {
+    const plan = buildMissionRetryVariationPlanV1({
+      node: retriedNode({ allowedTools: ["create_project_idea_brief"] }),
+      failureClass,
+      failureMessage: "Grounding reference 2 does not match its closed contract.",
+    });
+    assert.ok(plan, `no plan for ${failureClass}`);
+    return plan.guidance;
+  };
+
+  const observed = classifyMissionFailureV1({
+    toolName: "create_project_idea_brief",
+    errorCode: "project_idea_brief_invalid",
+    errorMessage: "Grounding reference 2 does not match its closed contract.",
+  });
+  const argumentGuidance = guidanceFor(
+    classifyMissionFailureV1({ errorCode: "invalid_arguments" }),
+  );
+  const unattributableGuidance = guidanceFor("unknown");
+
+  assert.equal(guidanceFor(observed), argumentGuidance);
+  assert.notEqual(guidanceFor(observed), unattributableGuidance);
+  // And the refusal it must not be confused with keeps its own guidance.
+  assert.notEqual(
+    guidanceFor(observed),
+    guidanceFor(classifyMissionFailureV1({ errorCode: "authority_grant_invalid" })),
+  );
+
+  // A corrected payload is a materially different attempt, so the node must
+  // still be allowed to make it — the plan only refuses a byte-identical one.
+  const plan = buildMissionRetryVariationPlanV1({
+    node: retriedNode({ allowedTools: ["create_project_idea_brief"] }),
+    failureClass: observed,
+    failureMessage: "Grounding reference 2 does not match its closed contract.",
+  });
+  assert.equal(plan?.requireDifferentApproach, true);
+  assert.equal(
+    shouldRefuseUnchangedRetryV1({
+      plan,
+      previousArguments: JSON.stringify({ ideaId: "idea-1", title: "A" }),
+      nextArguments: JSON.stringify({ ideaId: "idea-1", title: "B" }),
+    }),
+    false,
   );
 });
 

@@ -176,3 +176,63 @@ test("offline summary file is a fail-closed post-Playwright proof gate", async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+
+/**
+ * Vacuous-input compliance, the third family of instrument defect this campaign
+ * tracks: a gate that scores an empty input set as a pass.
+ *
+ * With `requiredScenarioIds: []` there are no expected keys, so every submitted
+ * attempt is skipped by the `expectedKeys.has(key)` filter, no failure can be
+ * pushed, `[].every(...)` makes `releaseEligibleSource` vacuously true, and the
+ * release previously returned `passed: true` having proven nothing.
+ *
+ * The refusal is paired with a POSITIVE PROOF below, because a guard that can be
+ * satisfied by rejecting everything is the same defect facing the other way.
+ */
+test("an empty required scenario set is refused rather than scored as a pass", () => {
+  assert.throws(
+    () =>
+      evaluateOfflineApplicationRelease({
+        attempts: [green("chat_only", 1)],
+        requiredScenarioIds: [],
+        requiredRepetitions: 1,
+      }),
+    /at least one scenario/u,
+  );
+  // Empty attempts against an empty required set is the purest form: nothing
+  // submitted, nothing required, previously a clean green.
+  assert.throws(
+    () =>
+      evaluateOfflineApplicationRelease({
+        attempts: [],
+        requiredScenarioIds: [],
+        requiredRepetitions: 3,
+      }),
+    /would pass on no evidence/u,
+  );
+});
+
+test("POSITIVE PROOF: the empty-set refusal does not reject a real required set", () => {
+  // Same shape, one scenario required: still evaluates, and still passes.
+  const passing = evaluateOfflineApplicationRelease({
+    attempts: [green("chat_only", 1)],
+    requiredScenarioIds: ["chat_only"],
+    requiredRepetitions: 1,
+  });
+  assert.equal(passing.passed, true);
+  assert.equal(passing.expectedAttempts, 1);
+  assert.equal(passing.observedAttempts, 1);
+
+  // And a real required set with nothing submitted still FAILS for the honest
+  // reason -- missing attempts -- rather than throwing or passing empty.
+  const missing = evaluateOfflineApplicationRelease({
+    attempts: [],
+    requiredScenarioIds: ["chat_only"],
+    requiredRepetitions: 1,
+  });
+  assert.equal(missing.passed, false);
+  assert.equal(missing.expectedAttempts, 1);
+  assert.equal(missing.observedAttempts, 0);
+  assert.ok(missing.failures.some((failure) => /missing attempt/u.test(failure)));
+});

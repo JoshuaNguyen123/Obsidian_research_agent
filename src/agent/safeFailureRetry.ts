@@ -43,6 +43,43 @@ export interface SafeFailureClassification {
   reason: string;
 }
 
+/**
+ * A code that says, in its own name, that arguments were the fault.
+ *
+ * The product already had a convention for this — `linear_issue_template_-
+ * invalid_arguments` was deliberately spelled that way so a suffix test would
+ * recognise it — but the test only ever knew one word order and one plural.
+ * Three validators wrote `..._arguments_invalid`, three more wrote the
+ * singular `..._invalid_argument`, and every one of them fell through to
+ * `other`: no schema resend, no argument-specific retry guidance, counted as a
+ * hard failed tool. This regex is the same idea with the spellings the
+ * codebase actually uses.
+ *
+ * It stays deliberately narrow. `_invalid` alone is NOT an argument marker
+ * here: 106 codes end that way and most of them are refusals or host state —
+ * `authority_grant_invalid`, `prepared_action_invalid`, `vault_root_invalid`,
+ * `diff_readback_invalid`, `checkpoint_fingerprint_invalid`. Telling the model
+ * to "correct the arguments" for any of those would be a lie, and exempting
+ * them from the failed-tool count would hide a real block. So the rule matches
+ * only codes whose own name contains the word argument/args, which is a claim
+ * the code's author made on purpose.
+ */
+const SELF_NAMED_ARGUMENT_ERROR_CODE_V1 =
+  /(?:^|_)invalid_(?:arguments?|args)$|_(?:arguments?|args)_invalid$/u;
+
+/**
+ * True when the error code names arguments as the fault. Exported because the
+ * mission-failure classifier and the runner's schema-correction seat must
+ * spell "argument error" the same way; three private spellings is how
+ * `project_idea_brief_invalid` ended up recognised by none of them.
+ */
+export function codeNamesItsOwnArgumentFaultV1(
+  code: string | undefined,
+): boolean {
+  const normalized = String(code ?? "").trim().toLowerCase();
+  return normalized.length > 0 && SELF_NAMED_ARGUMENT_ERROR_CODE_V1.test(normalized);
+}
+
 export interface SafeFailureRetryDecision {
   action: SafeFailureRetryAction;
   kind: SafeFailureKind;
@@ -122,7 +159,12 @@ export function classifySafeFailureRetry(
     };
   }
 
+  // The blob test stays as it was — it reads prose as well as codes, and the
+  // code test is added beside it rather than folded in, because a code is a
+  // deliberate claim and a message is not. `..._arguments_invalid` in the
+  // blob would never have matched the word-order the blob test knows.
   if (
+    codeNamesItsOwnArgumentFaultV1(failure.code) ||
     /invalid_arguments|invalid_argument|schema correction|schema validation|json schema|tool schema|malformed tool|invalid tool call|parse.?fail|failed to parse/i.test(
       blob,
     )

@@ -342,7 +342,16 @@ async function main() {
           `Offline application proof: ` +
             `${foundation.proofCompleteAttempts}/${foundation.expectedAttempts} ` +
             `cloud_requests=${foundation.cloudRequests} ` +
-            `receipt_coverage=${foundation.receiptCoverage.toFixed(3)} ` +
+            // receiptCoverage is null whenever a contributing count is UNKNOWN,
+            // which is the honest answer and not a zero. Calling .toFixed on it
+            // threw a TypeError in this success-reporting path, after a green
+            // lane — the report crashed precisely when the evidence was
+            // incomplete. Print the unknown instead of dying on it.
+            `receipt_coverage=${
+              typeof foundation.receiptCoverage === "number"
+                ? foundation.receiptCoverage.toFixed(3)
+                : "unknown"
+            } ` +
             `release_source=${foundation.releaseEligibleSource ? "clean" : "dirty"}`,
         );
       } else {

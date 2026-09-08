@@ -161,10 +161,22 @@ export function evaluateOfflineApplicationRelease({
   if (!Number.isSafeInteger(requiredRepetitions) || requiredRepetitions < 1) {
     throw new Error("requiredRepetitions must be a positive integer.");
   }
+  // An empty required set is REFUSED, not evaluated. With no expected keys every
+  // attempt is skipped by the `expectedKeys.has(key)` filter, no failure can be
+  // pushed, `[].every(...)` makes `releaseEligibleSource` vacuously true, and the
+  // release reports `passed: true` on zero evidence. That is the same
+  // empty-set-scores-perfect defect this campaign exists to remove, and it is
+  // refused here exactly as the qualification cohort refuses n = 0.
+  const requiredScenarioList = Array.from(requiredScenarioIds ?? []);
+  if (requiredScenarioList.length === 0) {
+    throw new Error(
+      "requiredScenarioIds must name at least one scenario; an empty required set would pass on no evidence.",
+    );
+  }
   const records = Array.from(attempts ?? []).map(validateOfflineApplicationAttempt);
   const failures = [];
   const expectedKeys = new Set();
-  for (const scenarioId of requiredScenarioIds) {
+  for (const scenarioId of requiredScenarioList) {
     if (!OFFLINE_REQUIRED_SCENARIOS.includes(scenarioId)) {
       throw new Error(`Unknown required offline scenario '${scenarioId}'.`);
     }

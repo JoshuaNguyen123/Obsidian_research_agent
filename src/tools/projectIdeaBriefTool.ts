@@ -54,8 +54,14 @@ export interface ProjectIdeaBriefToolOutputV1 {
 export function createProjectIdeaBriefTool(): AgentTool {
   return {
     name: CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME,
+    // The closing sentence used to read "Omit groundingReferences for
+    // independent unverified ideation." -- which is true, and which walked the
+    // caller into the one rule it cannot see: omitting grounding makes the
+    // brief unverified, and an unverified brief requires a limitation. The
+    // advice now carries the consequence with it, stated as an instruction
+    // the caller can follow without knowing which status the host will assign.
     description:
-      "Create a fingerprinted project-idea brief from narrative options. The host alone resolves requested web, vault, or original-user-mission evidence already observed in this run, assigns hashes/status/time, and caches an exact promotion seed when the brief is grounded and one option is selected. Omit groundingReferences for independent unverified ideation.",
+      "Create a fingerprinted project-idea brief from narrative options. The host alone resolves requested web, vault, or original-user-mission evidence already observed in this run, assigns hashes/status/time, and caches an exact promotion seed when the brief is grounded and one option is selected. Omit groundingReferences for independent unverified ideation, and always list at least one limitation, which is accepted whether or not the brief ends up grounded. Ids (ideaId, options[].id, selectedOptionId) are slugs: no spaces.",
     parameters: PROJECT_IDEA_BRIEF_PARAMETERS,
     descriptor: PROJECT_IDEA_BRIEF_DESCRIPTOR,
     async execute(args, context) {
@@ -412,18 +418,105 @@ function notApplied(code: string, message: string): ToolExecutionError {
   return new ToolExecutionError(code, message, { mutationState: "not_applied" });
 }
 
-const STRING: JsonSchemaObject = { type: "string" };
+/**
+ * Every free-text field is stored exactly as it arrives, so the validator
+ * rejects any value whose trimmed form differs from the value itself, and
+ * rejects credential-shaped text. Neither rule was written anywhere the model
+ * could read it, so an indented bullet or a pasted token cost a whole tool
+ * call to discover. It is repeated on each affected field instead of stated
+ * once, because a model fills one property at a time and reads the description
+ * attached to that property, not the schema as a whole.
+ */
+const CANONICAL_TEXT_RULE_V1 =
+  "Send it exactly as it should be stored: no leading or trailing whitespace, " +
+  "no control characters other than tab and line breaks, and no credentials, " +
+  "API keys or tokens.";
+
+/**
+ * The logical-id shape `createProjectIdeaBriefV1` enforces on `ideaId`, on
+ * every `options[].id`, and on `selectedOptionId`. All three were declared as
+ * bare strings -- no pattern, no description, no example -- while the
+ * validator rejected the first space. "Option A" and "Direction 1", the two
+ * most natural things a model writes here, therefore failed a rule they had
+ * never been shown, and a qualification cohort died on exactly that. It is the
+ * same defect and the same cure as the acceptance-criterion id below: publish
+ * the contract rather than only enforcing it.
+ *
+ * This is deliberately a second spelling of a rule owned by core-api, which is
+ * how drift usually starts. The guard against that is behavioural, not a
+ * comment: a test runs a corpus of candidate ids through the REAL validator
+ * and requires this pattern to accept exactly what the validator accepts, so
+ * changing either side alone fails loudly instead of quietly advertising a
+ * contract nobody enforces.
+ */
+const LOGICAL_ID_PATTERN_V1 = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$";
+const LOGICAL_ID_DESCRIPTION_V1 =
+  "1-160 characters, starting with a letter or digit and otherwise containing " +
+  'only letters, digits, ".", "_", ":" or "-". SPACES ARE REJECTED: write ' +
+  '"option-a", never "Option A".';
+
+function logicalIdField(purpose: string, example: string): JsonSchemaObject {
+  return {
+    type: "string",
+    pattern: LOGICAL_ID_PATTERN_V1,
+    description: `${purpose} ${LOGICAL_ID_DESCRIPTION_V1} Example: "${example}".`,
+    examples: [example],
+  };
+}
+
+/**
+ * Length bounds exist on every free-text field in the validator and existed on
+ * none of them in the schema. A model cannot ration a 4000-character problem
+ * statement it was never told the size of.
+ */
+function boundedText(
+  maximum: number,
+  purpose: string,
+  singleLine = false,
+): JsonSchemaObject {
+  return {
+    type: "string",
+    minLength: 1,
+    maxLength: maximum,
+    description: `${purpose} 1-${maximum} characters.${
+      singleLine ? " One line: line breaks are rejected." : ""
+    } ${CANONICAL_TEXT_RULE_V1}`,
+  };
+}
+
+const NARRATIVE_ENTRY_V1 = boundedText(1_000, "One entry.");
+
 const STRING_LIST: JsonSchemaObject = {
   type: "array",
-  items: STRING,
+  items: NARRATIVE_ENTRY_V1,
   maxItems: 20,
+  uniqueItems: true,
 };
+
+/**
+ * The one bound the caller genuinely cannot derive. The enforced minimum is 1
+ * while the brief is unverified and 0 once it is grounded -- but which of the
+ * two applies is decided by the HOST, after it resolves `groundingReferences`
+ * against what this run actually observed. At the moment the arguments are
+ * written the model cannot see that outcome, so publishing "0 or 1, depending"
+ * would be advice it cannot act on, and publishing 0 invites precisely the
+ * call that died: omit grounding, send `[]`, get rejected.
+ *
+ * The published minimum is therefore 1, the value accepted under BOTH
+ * outcomes. It is stricter than the grounded rule and never wrong, and it
+ * costs the caller one sentence it should be writing anyway.
+ */
 const LIMITATION_LIST: JsonSchemaObject = {
   type: "array",
-  items: STRING,
+  items: NARRATIVE_ENTRY_V1,
+  minItems: 1,
   maxItems: 10,
+  uniqueItems: true,
   description:
-    "Known limitations of this idea. Supply at most 10 entries; grounded ideas may use an empty list.",
+    "Known limitations of this idea. Supply at least 1 and at most 10 " +
+    "distinct entries. Always send at least one: whether an empty list is " +
+    "allowed depends on grounding the host resolves after this call, so an " +
+    "empty list is a coin flip and one entry always passes.",
 };
 const PROJECT_IDEA_BRIEF_PARAMETERS: JsonSchemaObject = {
   type: "object",
@@ -444,30 +537,70 @@ const PROJECT_IDEA_BRIEF_PARAMETERS: JsonSchemaObject = {
     "limitations",
   ],
   properties: {
-    ideaId: STRING,
-    title: STRING,
-    problem: STRING,
-    hypothesis: STRING,
+    ideaId: logicalIdField(
+      "Stable id for this brief.",
+      "idea-checkers-guidance",
+    ),
+    title: boundedText(200, "Short name for the idea.", true),
+    problem: boundedText(4_000, "The problem this idea addresses, and its impact."),
+    hypothesis: boundedText(4_000, "The hypothesis this idea would test."),
     options: {
       type: "array",
       minItems: 1,
       maxItems: 5,
+      description:
+        "1-5 directions evaluated for this idea. Every id must be distinct.",
       items: {
         type: "object",
         additionalProperties: false,
         required: ["id", "title", "summary"],
-        properties: { id: STRING, title: STRING, summary: STRING },
+        properties: {
+          id: logicalIdField(
+            "Id for this option, unique within options and the value selectedOptionId refers to.",
+            "option-a",
+          ),
+          title: boundedText(200, "Short name for this option.", true),
+          summary: boundedText(2_000, "What this option would do."),
+        },
       },
     },
-    selectedOptionId: { type: ["string", "null"] },
-    proposedWork: { ...STRING_LIST, minItems: 1 },
-    nonGoals: { ...STRING_LIST, minItems: 1 },
-    constraints: STRING_LIST,
-    risks: STRING_LIST,
+    selectedOptionId: {
+      type: ["string", "null"],
+      pattern: LOGICAL_ID_PATTERN_V1,
+      description:
+        "The chosen direction, copied character-for-character from one " +
+        "options[].id, or null when no direction is selected yet. " +
+        `${LOGICAL_ID_DESCRIPTION_V1} Example: "option-a".`,
+      examples: ["option-a", null],
+    },
+    proposedWork: {
+      ...STRING_LIST,
+      minItems: 1,
+      description:
+        "1-20 distinct pieces of work this idea proposes. Entries must not repeat.",
+    },
+    nonGoals: {
+      ...STRING_LIST,
+      minItems: 1,
+      description:
+        "1-20 distinct things this idea deliberately will not do. Entries must not repeat.",
+    },
+    constraints: {
+      ...STRING_LIST,
+      description:
+        "0-20 distinct constraints the work must respect. Entries must not repeat.",
+    },
+    risks: {
+      ...STRING_LIST,
+      description:
+        "0-20 distinct risks this idea carries. Entries must not repeat.",
+    },
     acceptanceCriteria: {
       type: "array",
       minItems: 1,
       maxItems: 20,
+      description:
+        "1-20 acceptance criteria, each with a distinct id and its own text.",
       items: {
         type: "object",
         additionalProperties: false,
@@ -479,28 +612,62 @@ const PROJECT_IDEA_BRIEF_PARAMETERS: JsonSchemaObject = {
         // have stated. A contract the caller cannot see is not a contract.
         properties: {
           id: {
-            ...STRING,
+            type: "string",
             pattern: ACCEPTANCE_CRITERION_ID_PATTERN_V1,
             description: ACCEPTANCE_CRITERION_ID_DESCRIPTION_V1,
+            examples: ["AC-1"],
           },
-          text: STRING,
+          text: boundedText(500, "What this criterion requires."),
         },
       },
     },
-    riskClass: { type: "string", enum: ["low", "medium", "high"] },
+    riskClass: {
+      type: "string",
+      enum: ["low", "medium", "high"],
+      description: "Overall risk class for the idea.",
+    },
     limitations: LIMITATION_LIST,
+    // The old description read naturally as "an array of URLs", and a caller
+    // that believed it sent bare strings and was rejected for breaking a
+    // closed contract it had been shown an ambiguous summary of. The shape is
+    // now stated as objects, with the exact keys, a worked example, and the
+    // reference spelling each kind requires.
     groundingReferences: {
       type: "array",
       maxItems: 50,
       description:
-        "Optional references already observed in this run. Supply references only; the host resolves their hashes and determines grounded/unverified status.",
+        "Optional. An ARRAY OF OBJECTS -- not URLs -- each with exactly the " +
+        "keys kind and reference, naming a source this run already observed. " +
+        'Example: [{"kind": "web", "reference": "https://example.com/a"}]. ' +
+        "Supply references only; the host resolves their hashes and decides " +
+        "grounded/unverified status. A reference this run did not observe is " +
+        "rejected, so fetch or read the source first.",
       items: {
         type: "object",
         additionalProperties: false,
         required: ["kind", "reference"],
         properties: {
-          kind: { type: "string", enum: ["web", "vault", "user"] },
-          reference: STRING,
+          kind: {
+            type: "string",
+            enum: ["web", "vault", "user"],
+            description:
+              'Which host record to resolve: "web" for a page fetched in this ' +
+              'run, "vault" for a note read in this run, "user" for the ' +
+              "original mission text.",
+          },
+          reference: {
+            type: "string",
+            minLength: 1,
+            description:
+              'For "web", the absolute http(s) URL exactly as fetched. For ' +
+              '"vault", the vault-relative Markdown path exactly as read, ' +
+              'ending in ".md". For "user", the literal "original_mission".',
+            examples: [
+              "https://example.com/a",
+              "Research/topic.md",
+              "original_mission",
+            ],
+          },
         },
       },
     },

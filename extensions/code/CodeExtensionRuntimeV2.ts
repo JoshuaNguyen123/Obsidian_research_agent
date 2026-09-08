@@ -31,6 +31,7 @@ import {
   parseRepositoryProfileRegistry,
 } from "../../src/agent/repositories/RepositoryProfile";
 import { withPluginDataLock } from "../shared/softDependency";
+import { scratchPythonContractCheckArgsV1 } from "./ScratchPythonValidationV1";
 import {
   CODE_EXECUTION_TOOL_NAMES_V2,
   CodeSandboxContributionErrorV2,
@@ -3803,7 +3804,7 @@ function createScratchPythonSandboxProfileV2(input: {
         executable: "python",
         args:
           phase === "fast" || pythonTestPaths.length === 0
-            ? ["-m", "compileall", "-q", "."]
+            ? scratchPythonContractCheckArgsV1()
             : [
                 "-m",
                 "unittest",
