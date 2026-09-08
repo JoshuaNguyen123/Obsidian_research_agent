@@ -92,14 +92,10 @@ export class ObsidianSecretStoreV1 implements SecretStoreV1 {
       description,
     };
     const serialized = JSON.stringify(envelope);
-    this.storage.setSecret(referenceId, serialized);
-    const readback = this.storage.getSecret(referenceId);
-    if (readback !== serialized) {
-      this.storage.setSecret(referenceId, "");
-      this.flushAfterWrite();
+    if (!this.writeSecret(referenceId, serialized)) {
+      this.writeSecret(referenceId, "");
       throw new Error("Obsidian SecretStorage write readback failed.");
     }
-    this.flushAfterWrite();
     return description;
   }
 
@@ -157,10 +153,27 @@ export class ObsidianSecretStoreV1 implements SecretStoreV1 {
   async remove(referenceId: string): Promise<boolean> {
     requireReferenceId(referenceId);
     if (!this.storage.getSecret(referenceId)) return false;
-    this.storage.setSecret(referenceId, "");
-    const removed = this.storage.getSecret(referenceId) === "";
-    this.flushAfterWrite();
-    return removed;
+    return this.writeSecret(referenceId, "");
+  }
+
+  /**
+   * The store's only mutation seam: write the value, prove it by reading it
+   * back, then request the disk commit. Spread over several write sites, that
+   * commit is a duty each new method has to remember, and a write that forgets
+   * it is invisible until a kill lands inside Chromium's commit delay (the
+   * 2026-09-07 Linear loss; the plugin still has one such direct SecretStorage
+   * write of its own, outside this store). One seam, and no method can forget.
+   * The commit request follows the readback so it never covers a value the
+   * store did not verify, and it runs even when `setSecret` throws, because
+   * a throwing write may still have mutated the one blob SecretStorage keeps.
+   */
+  private writeSecret(referenceId: string, value: string): boolean {
+    try {
+      this.storage.setSecret(referenceId, value);
+      return this.storage.getSecret(referenceId) === value;
+    } finally {
+      this.flushAfterWrite();
+    }
   }
 
   /** Every write is followed by a commit request; see the port contract. */

@@ -9,6 +9,7 @@ import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import { recordToolCallOutcomesAfterEach } from "./fixtures/toolCallCollector";
 import { assertApprovalSurfaceUsableV1 } from "./fixtures/uiSurfaceAssertions";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
+import { removeDiscardedSecretsV1 } from "./fixtures/discardedSecretReferences";
 import { resolveMissionEffortDecisionV1 } from "../src/agent/missionEffortDecision";
 import { missionCommittedWorkV1 } from "../src/agent/missionEffortEscalation";
 import { resolveConfiguredAgentStepSettingV1 } from "../src/agent/runBudget";
@@ -329,21 +330,23 @@ test.describe("Daily-use live research contract", () => {
       throw error;
     } finally {
       if (harness) {
-        await harness.page
-          .evaluate(async (pluginId) => {
+        // This used to call `secretStorage.removeSecret`, which the shipped
+        // Obsidian does not have: the optional call resolved to undefined and
+        // the cleanup silently did nothing, every run, which is part of how
+        // this machine accumulated hundreds of orphaned entries. The real API
+        // is `deleteSecret`, and the shared helper deletes, proves each one
+        // gone, and asks Chromium to commit before the harness kills the app.
+        const referenceIds = await harness.page
+          .evaluate((pluginId) => {
             const app = (window as typeof window & { app?: any }).app;
             const plugin = app?.plugins?.plugins?.[pluginId];
             const refs = plugin?.modelCredentialStore?.snapshot?.();
-            for (const referenceId of [
-              refs?.ollama?.referenceId,
-              refs?.specialist?.referenceId,
-            ]) {
-              if (typeof referenceId === "string") {
-                await app?.secretStorage?.removeSecret?.(referenceId);
-              }
-            }
+            return [refs?.ollama?.referenceId, refs?.specialist?.referenceId].filter(
+              (id: unknown): id is string => typeof id === "string",
+            );
           }, NATIVE_CORE_PLUGIN_ID)
-          .catch(() => undefined);
+          .catch(() => [] as string[]);
+        await removeDiscardedSecretsV1(harness.page, referenceIds).catch(() => 0);
       }
       await harness?.close();
       await specialistProxy?.close();
