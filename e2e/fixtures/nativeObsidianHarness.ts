@@ -7,10 +7,14 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import {
+  createTeardownOwnershipWindow,
   terminateControlledObsidian,
   type TeardownProbePhase,
 } from "../../scripts/obsidian-process-lifecycle";
-import { requestGracefulObsidianQuitV1 } from "./gracefulObsidianQuit";
+import {
+  gracefulQuitMayHaveReachedAppV1,
+  requestGracefulObsidianQuitV1,
+} from "./gracefulObsidianQuit";
 import {
   discardedSecretReferencesV1,
   removeDiscardedSecretsV1,
@@ -1207,16 +1211,27 @@ async function terminateObsidian(
   if (!processHandle?.pid) return;
   const rootPid = processHandle.pid;
   // Our root's PID cannot be recycled until our root dies, and our root dies
-  // during teardown — so this instant is the upper bound that makes "PID N,
-  // image Obsidian.exe" an identity instead of a coincidence.
-  const teardownStartedAtMs = Date.now();
+  // during teardown — so the instant this window closes is the upper bound that
+  // makes "PID N, image Obsidian.exe" an identity instead of a coincidence. It
+  // stays OPEN across the graceful quit, because the app is still alive there by
+  // our own choice and still spawning helpers; the teardown closes it once, at
+  // the start of the kill phase. A bound stamped here instead disowned every
+  // process born during the graceful window, and a disowned orphan is never
+  // swept — it keeps the vault and the machine lock into the next lane.
+  const ownership = createTeardownOwnershipWindow();
   // Mark BEFORE dispatching the kill so the exit record cannot race the flag.
   hostTeardownRequested = true;
   await terminateControlledObsidian(processHandle, {
     requestGracefulExit: async () => {
       const outcome = await requestGracefulObsidianQuitV1(page);
       console.log(`[teardown] ${label}: graceful quit ${outcome}`);
-      return outcome === "dispatched";
+      // The dispatch bound is NOT the graceful budget: a renderer that the quit
+      // is already unloading cannot answer the evaluate that asked for it, so
+      // only a request that provably never reached the app skips the exit wait.
+      return gracefulQuitMayHaveReachedAppV1(outcome);
+    },
+    closeOwnershipWindow: () => {
+      ownership.close();
     },
     terminateOwnedTree: async (pid) => {
       // Bounded and hidden. This dispatch had NO timeout, so a taskkill that
@@ -1228,12 +1243,15 @@ async function terminateObsidian(
         timeout: 30_000,
       }).catch(() => processHandle.kill());
     },
+    // Every ownership question below reads the SAME window, at call time. The
+    // probe that decides whether the teardown drained and the sweep that is its
+    // only remediation must never disagree about what we own.
     waitForOwnedExit: (phase) =>
       waitForOwnedRootExitV1({
         handle: processHandle,
         rootPid,
         rootCreatedAtMs,
-        teardownStartedAtMs,
+        teardownStartedAtMs: ownership.upperBoundMs(),
         imageName: obsidianImageName(),
         timeoutMs: OWNED_EXIT_TIMEOUT_MS[phase],
       }),
@@ -1242,12 +1260,17 @@ async function terminateObsidian(
         cdpPort,
         rootPid,
         rootCreatedAtMs,
-        teardownStartedAtMs,
+        ownership.upperBoundMs(),
         PROCESS_DRAIN_TIMEOUT_MS[phase],
       ),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
     sweepSurvivingProcesses: () =>
-      sweepObsidianSurvivors(cdpPort, rootPid, rootCreatedAtMs, teardownStartedAtMs),
+      sweepObsidianSurvivors(
+        cdpPort,
+        rootPid,
+        rootCreatedAtMs,
+        ownership.upperBoundMs(),
+      ),
   });
 }
 

@@ -24,15 +24,72 @@ export interface ControlledProcessHandle {
  */
 export type TeardownProbePhase = "graceful" | "initial" | "recheck";
 
+/**
+ * The upper bound of the creation window that makes "PID N, image Obsidian.exe"
+ * an identity rather than a coincidence: a PID is not an identity on Windows,
+ * where PIDs recycle and every Electron process in a tree shares one image
+ * name, so ownership is PID *plus* creation instant and that instant has to sit
+ * inside a bounded window.
+ *
+ * The bound used to be stamped when teardown STARTED — before the app was even
+ * asked to quit. That is wrong once a graceful quit exists: for the length of
+ * the graceful window Obsidian is deliberately still alive, and a live Electron
+ * app still spawns processes — a replacement renderer, a GPU or utility child,
+ * a sandboxed helper of its own. Every one of those was born after the old
+ * bound and so was disowned, and a disowned helper whose parent exits during
+ * the shutdown re-parents into an orphan that the survivor sweep may no longer
+ * claim. It then holds the vault and the machine lock into the next occurrence
+ * of the cohort.
+ *
+ * So the window closes when the KILL phase begins, not when teardown begins,
+ * and it closes exactly ONCE: an ownership bound that kept moving would keep
+ * widening what this teardown is entitled to kill, and the whole point of
+ * scoping is that a process which was never ours is never touched.
+ */
+export interface TeardownOwnershipWindow {
+  /** The bound to resolve ownership against right now. */
+  upperBoundMs(): number;
+  /** Freeze the bound. Idempotent — later calls return the first stamp. */
+  close(nowMs?: number): number;
+  isClosed(): boolean;
+}
+
+export function createTeardownOwnershipWindow(
+  now: () => number = Date.now,
+): TeardownOwnershipWindow {
+  let closedAtMs: number | null = null;
+  return {
+    upperBoundMs: () => closedAtMs ?? now(),
+    close: (nowMs?: number) => {
+      if (closedAtMs === null) closedAtMs = nowMs ?? now();
+      return closedAtMs;
+    },
+    isClosed: () => closedAtMs !== null,
+  };
+}
+
 export interface ControlledObsidianTeardownOperations {
   /**
    * Optional: ask the application to exit on its own before anything is
-   * killed. Resolves true when the request was delivered; false (or a throw)
-   * means the bridge was unavailable and the teardown proceeds straight to
-   * the owned-tree kill. When delivered, the "graceful" owned-exit wait
-   * decides whether the kill is still needed.
+   * killed. Resolves true when the request MAY have reached the app; only a
+   * request that provably never did — a throw, or a healthy renderer answering
+   * that the bridge is not there — resolves false and sends the teardown
+   * straight to the owned-tree kill. The distinction is load-bearing: quitting
+   * tears the renderer down, so the very request that succeeded is the one that
+   * cannot report back, and reading that silence as failure force-kills into the
+   * shutdown. When it may have landed, the "graceful" owned-exit wait — not the
+   * request's own dispatch bound — decides whether the kill is still needed.
    */
   requestGracefulExit?(): Promise<boolean>;
+  /**
+   * Optional: freeze the ownership window (see TeardownOwnershipWindow). Called
+   * exactly once, at the instant the graceful window closes and before anything
+   * is killed — this orchestrator is the only thing that knows when that is.
+   * It is a stamp, not an operation, so it is synchronous and runs even when no
+   * graceful quit was attempted, where it lands at the same instant teardown
+   * began and nothing moves.
+   */
+  closeOwnershipWindow?(): void;
   terminateOwnedTree(pid: number): Promise<void>;
   waitForOwnedExit(phase: TeardownProbePhase): Promise<boolean>;
   waitForNoRunningProcess(phase: TeardownProbePhase): Promise<boolean>;
@@ -80,6 +137,12 @@ export async function terminateControlledObsidian(
       }
     }
   }
+  // The graceful window is over. Everything past this line either kills or
+  // reads back, so nothing born after this instant can be ours — and equally,
+  // everything the still-live app spawned DURING the window has to stay ours or
+  // it survives the teardown unattributed. Stamping here rather than at the top
+  // of the teardown is what keeps both halves of that true.
+  operations.closeOwnershipWindow?.();
   if (process.exitCode === null && !exitedGracefully) {
     try {
       await operations.terminateOwnedTree(process.pid);

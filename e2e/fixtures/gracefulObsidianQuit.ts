@@ -23,7 +23,39 @@ export type GracefulQuitOutcome =
   | "page_closed"
   | "failed";
 
+/**
+ * How long the DISPATCH may take, and nothing else. `app.quit()` only starts an
+ * asynchronous shutdown — Electron still has to run before-quit and will-quit,
+ * unload the renderer, and only then does the browser process commit
+ * DOMStorage — so this bound says when to stop waiting for an ANSWER, never
+ * when to stop waiting for the app to go. The exit budget is the caller's
+ * owned-exit wait, and it starts here.
+ */
 export const GRACEFUL_QUIT_REQUEST_TIMEOUT_MS = 2_000;
+
+/**
+ * May the quit have reached the application?
+ *
+ * Only "unavailable" proves it did not: that outcome comes from a healthy
+ * renderer answering, in full, that `@electron/remote` is not there to call.
+ * Every other outcome is compatible with a quit that IS in flight. A renderer
+ * being torn down by the very quit we asked for cannot answer the evaluate that
+ * asked for it — a hung or throwing evaluate and a page that has already closed
+ * are the NORMAL signatures of success, not failures.
+ *
+ * Reading them as failures is what let a caller treat the 2s dispatch bound as
+ * the whole graceful budget and fire `taskkill /F` at ~2s, straight into
+ * Chromium's delayed DOMStorage commit — the exact race that lost a rotated
+ * Linear OAuth pair on 2026-09-07 and that this module exists to remove. The
+ * caller's bounded owned-exit wait is the honest arbiter: it returns the moment
+ * the root is actually gone, so waiting on a host that was never quitting costs
+ * that bound once, while killing into a live shutdown costs the secret store.
+ */
+export function gracefulQuitMayHaveReachedAppV1(
+  outcome: GracefulQuitOutcome,
+): boolean {
+  return outcome !== "unavailable";
+}
 
 export async function requestGracefulObsidianQuitV1(
   page: GracefulQuitPageLike | null,
