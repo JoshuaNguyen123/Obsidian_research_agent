@@ -283,6 +283,7 @@ import {
 } from "./agent/missionGraphAuthority";
 import {
   classifyMissionFailureV1,
+  isModelContentErrorCodeV1,
   type MissionFailureClassV1,
 } from "./agent/missionFailureClass";
 import {
@@ -38657,8 +38658,24 @@ function completeRun(
   }
 }
 
+/**
+ * This used to be a private spelling test: `invalid_arguments`, or a
+ * `_invalid_arguments` suffix. A code had to opt in by being named exactly
+ * right, and validators that were not named exactly right — the singular
+ * `..._invalid_argument`, the reversed `..._arguments_invalid`, and
+ * `project_idea_brief_invalid`, which says nothing about arguments at all —
+ * were read here as unattributable. That cost the model the schema resend
+ * below and pushed the tool onto `failedToolNames` on its FIRST occurrence,
+ * which is how a 504-run cohort ended on a payload the model could have
+ * corrected.
+ *
+ * The mission-failure classifier already owned the same question for retry
+ * guidance, and answered it differently. It is the authority now, so the seat
+ * that resends the schema and the guidance that tells the model to fix its
+ * arguments can no longer disagree about which failures those are.
+ */
 function isToolArgumentErrorCode(code: string | undefined): boolean {
-  return code === "invalid_arguments" || code?.endsWith("_invalid_arguments") === true;
+  return isModelContentErrorCodeV1(code);
 }
 
 function getStopReasonMessage(stopReason: AgentRunStopReason): string {

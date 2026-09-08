@@ -24182,6 +24182,154 @@ test("namespaced invalid-argument errors receive one schema-qualified correction
   );
 });
 
+/**
+ * One harness, two error codes. Everything else — the tool, the definition,
+ * the responder sequence — is held identical, so the only thing that can move
+ * the two observables below is whether the runner recognised the code as an
+ * argument fault. That is the seat a 504-run cohort died in.
+ */
+async function runFirstCallFailure(errorCode: string): Promise<{
+  chatRequests: ModelChatRequest[];
+  executedCalls: ModelToolCall[];
+  traceMessages: string[];
+}> {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const traceMessages: string[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () => [{
+      type: "function",
+      function: {
+        name: "append_to_current_file",
+        parameters: {
+          type: "object",
+          properties: { text: { type: "string" } },
+          required: ["text"],
+          additionalProperties: false,
+        },
+      },
+    }],
+    execute: async (call) => {
+      executedCalls.push(call);
+      if (executedCalls.length === 1) {
+        return {
+          ok: false,
+          toolName: call.name,
+          mutationState: "not_applied",
+          error: {
+            code: errorCode,
+            message: "Grounding reference 2 does not match its closed contract.",
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          path: "Current.md",
+          operation: "append",
+          bytesWritten: 20,
+          readback: {
+            status: "verified",
+            checkedAt: "2026-07-18T00:00:00.000Z",
+            observedFingerprint: `sha256:${"a".repeat(64)}`,
+          },
+        },
+      };
+    },
+  };
+
+  await runAgentMission({
+    prompt: "Append the bounded result to the current note.",
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithToolCall("append_to_current_file", { text: "first" }),
+        () => responseWithToolCall("append_to_current_file", { text: "corrected" }),
+        () => responseWithContent("The bounded append is complete."),
+      ],
+    }),
+    toolRegistry: registry,
+    toolContext: createRunnerVaultContext({
+      prompt: "Append the bounded result to the current note.",
+    }).context,
+    enableStreaming: false,
+    events: { onTrace: (event) => traceMessages.push(event.message ?? "") },
+  });
+
+  return { chatRequests, executedCalls, traceMessages };
+}
+
+/** The failed-tool count the loop actually decided on, after the first call. */
+function firstFailedToolCount(traceMessages: string[]): number {
+  const decision = traceMessages.find((message) =>
+    /^action=/u.test(message) && /failed_tools=/u.test(message),
+  );
+  assert.ok(decision, `no loop decision on the trace:\n${traceMessages.join("\n")}`);
+  const match = /failed_tools=(\d+)/u.exec(decision);
+  assert.ok(match, decision);
+  return Number(match[1]);
+}
+
+test("a validator that refuses the payload earns the schema back and no failed-tool strike", async () => {
+  // create_project_idea_brief rejects a brief built entirely from the model's
+  // own arguments with `project_idea_brief_invalid`. Nothing is applied. The
+  // runner used to read that as unattributable because the code does not spell
+  // "arguments", so the model never got the schema and the tool took a
+  // failed-tool strike on its FIRST occurrence — which is the harness-visible
+  // failure that ended the cohort.
+  const { chatRequests, executedCalls, traceMessages } =
+    await runFirstCallFailure("project_idea_brief_invalid");
+
+  assert.equal(executedCalls.length, 2);
+  assert.ok(
+    chatRequests.some((request) =>
+      /Tool-call schema correction: append_to_current_file rejected the supplied arguments/iu.test(
+        request.messages.at(-1)?.content ?? "",
+      ),
+    ),
+    "the model must be handed the tool's own JSON Schema back",
+  );
+  assert.equal(
+    firstFailedToolCount(traceMessages),
+    0,
+    "a correctable argument fault is exempt on its first occurrence",
+  );
+});
+
+test("an authority refusal is still a failed tool and is never told to fix its arguments", async () => {
+  // The widening hazard as a live test. `authority_grant_invalid` ends in
+  // `_invalid` exactly like the code above, but it is the host refusing by
+  // contract: resending tidier arguments cannot clear it, and exempting it
+  // from the failed-tool count would hide a real block from the loop.
+  const { chatRequests, traceMessages } =
+    await runFirstCallFailure("authority_grant_invalid");
+
+  assert.ok(
+    !chatRequests.some((request) =>
+      /Tool-call schema correction/iu.test(request.messages.at(-1)?.content ?? ""),
+    ),
+    "a refusal must never be dressed up as a correctable argument fault",
+  );
+  assert.equal(
+    firstFailedToolCount(traceMessages),
+    1,
+    "a refusal keeps its failed-tool strike",
+  );
+});
+
+test("a not-found is still a failed tool and is never told to fix its arguments", async () => {
+  const { chatRequests, traceMessages } =
+    await runFirstCallFailure("linear_not_found");
+
+  assert.ok(
+    !chatRequests.some((request) =>
+      /Tool-call schema correction/iu.test(request.messages.at(-1)?.content ?? ""),
+    ),
+  );
+  assert.equal(firstFailedToolCount(traceMessages), 1);
+});
+
 test("a missing workspace earns one corrective naming code_workspace_create", async () => {
   // Seen live on compound-flow-real-live: the model called a workspace tool for
   // a workspace it never created. workspace_not_found is a lookup failure, so
