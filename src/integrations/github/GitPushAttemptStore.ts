@@ -828,11 +828,11 @@ function describeNamespaceDifference(
   const observedIds = Object.keys(observed.attempts).sort();
   const present = new Set(observedIds);
   for (const id of writtenIds) {
-    const counterpart = observed.attempts[id];
     if (!present.has(id)) {
       faults.push(`attempt ${boundedAttemptId(id)} vanished`);
       continue;
     }
+    const counterpart = observed.attempts[id];
     for (const facet of GIT_PUSH_ATTEMPT_RECORD_FACETS_V1) {
       if (!facet.same(written.attempts[id], counterpart)) {
         faults.push(`attempt ${boundedAttemptId(id)} ${facet.field}`);

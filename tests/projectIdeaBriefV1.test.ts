@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 
 import {
   ACCEPTANCE_CRITERION_ID_PATTERN_V1,
@@ -11,6 +12,7 @@ import {
   type ProjectIdeaBriefUnsignedV1,
 } from "../packages/core-api/src";
 import { createAcceptedResearchArtifactV1 } from "../src/integrations/linear/AcceptedResearchArtifactV1";
+import { parseAcceptedResearchNotePackageV1 } from "../src/integrations/linear/AcceptedResearchNoteWriter";
 
 const CONTENT_SHA = `sha256:${"a".repeat(64)}`;
 
@@ -221,9 +223,31 @@ const REJECTION_PROBES: ReadonlyArray<{
     states: ["must be a single line", "no carriage return"],
   },
   {
-    name: "a NUL in narrative text names the NUL rule",
-    run: () => createProjectIdeaBriefV1({ ...groundedIdea(), problem: `A problem${"\u0000"}here.` }),
-    states: ["must not contain a NUL character"],
+    name: "a control character in narrative text names the rule and locates it",
+    run: () =>
+      createProjectIdeaBriefV1({
+        ...groundedIdea(),
+        problem: `A problem${"\u0000"}here.`,
+      }),
+    states: [
+      "must not contain a control character",
+      "tab, line feed and carriage return are the only ones",
+      "Found U+0000 at position 9",
+    ],
+  },
+  {
+    // The character that used to clear this seat and die two stages later at
+    // the accepted-research note writer. It is refused by the same one rule.
+    name: "a non-NUL control character is refused by the same rule",
+    run: () =>
+      createProjectIdeaBriefV1({
+        ...groundedIdea(),
+        problem: `A problem${"\u000b"}here.`,
+      }),
+    states: [
+      "must not contain a control character",
+      "Found U+000B at position 9",
+    ],
   },
   {
     name: "over-long narrative text names its own bound",
@@ -793,3 +817,385 @@ function groundedIdea(): ProjectIdeaBriefUnsignedV1 {
     createdAt: "2026-08-19T12:00:00.000Z",
   };
 }
+
+/**
+ * One question -- which control characters may text carry -- asked of every
+ * seat that answers it, over the whole table rather than a sampled character.
+ *
+ * The seats used to disagree: `oneLine` refused NUL, CR and LF, `narrative`
+ * refused only NUL, and the accepted-research note writer refused all 29 of
+ * the C0 controls that are not tab, line feed or carriage return, plus DEL. So
+ * a brief carrying U+000B was accepted here and rejected two stages later, at
+ * a seat the model cannot see and cannot retry into.
+ *
+ * The note writer's answer is the one adopted, because it is the strictest
+ * reader a brief actually reaches -- `expectPackageText` and `boundedText`
+ * both validate every seed-bound field -- and because it is the only answer
+ * that keeps tab, which is legitimate narrative content.
+ */
+const CONTROL_CODE_POINTS: readonly number[] = [
+  ...Array.from({ length: 0x20 }, (_unused, code) => code),
+  0x7f,
+];
+
+/** The three a text field may carry: tab, line feed, carriage return. */
+const TEXT_CONTROL_CODE_POINTS: ReadonlySet<number> = new Set([
+  0x09, 0x0a, 0x0d,
+]);
+
+const BENIGN_TEXT = "Benign example sentence.";
+
+function describeCodePoint(code: number): string {
+  return `U+${code.toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+/** The control character always lands inside the text, never at an edge, so
+ * the trim rule cannot answer in the control rule's place. */
+function textWithControl(code: number): string {
+  return `Benign${String.fromCodePoint(code)}example sentence.`;
+}
+
+type LeafPath = ReadonlyArray<string | number>;
+
+function stringLeafPaths(value: unknown, prefix: LeafPath = []): LeafPath[] {
+  if (typeof value === "string") return [prefix];
+  if (Array.isArray(value)) {
+    return value.flatMap((entry, index) =>
+      stringLeafPaths(entry, [...prefix, index]),
+    );
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).flatMap(([key, entry]) =>
+      stringLeafPaths(entry, [...prefix, key]),
+    );
+  }
+  return [];
+}
+
+function briefWithTextAt(
+  path: LeafPath,
+  replacement: string,
+): ProjectIdeaBriefUnsignedV1 {
+  const draft = structuredClone(groundedIdea()) as Record<string, unknown>;
+  let cursor = draft as Record<string | number, unknown>;
+  for (const step of path.slice(0, -1)) {
+    cursor = cursor[step] as Record<string | number, unknown>;
+  }
+  cursor[path[path.length - 1]!] = replacement;
+  return draft as unknown as ProjectIdeaBriefUnsignedV1;
+}
+
+function briefAcceptsAt(path: LeafPath, replacement: string): boolean {
+  try {
+    createProjectIdeaBriefV1(briefWithTextAt(path, replacement));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function describePath(path: LeafPath): string {
+  return path.map((step) => String(step)).join(".");
+}
+
+function acceptedPackage(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    schemaVersion: 1,
+    title: "Accessible checkers move guidance",
+    problemImpact: BENIGN_TEXT,
+    evidence: [
+      {
+        id: "web-1",
+        kind: "web",
+        reference: "https://example.com/research/checkers-learning",
+        contentSha256: CONTENT_SHA,
+        label: "Checkers learning study",
+        summary: "A cited source about new-player onboarding.",
+      },
+    ],
+    confidenceLimitations: BENIGN_TEXT,
+    proposedWork: ["Calculate legal destinations for the selected piece."],
+    nonGoals: ["Do not add an automated opponent in this iteration."],
+    scope: ["The rules engine only."],
+    dependencies: [],
+    acceptanceCriteria: [
+      {
+        id: "AC-1",
+        text: "Every displayed destination is legal under the existing rules.",
+      },
+    ],
+    validationRequirementKeys: ["unit-tests"],
+    riskClass: "low",
+    executionClass: "research",
+    objective: BENIGN_TEXT,
+    vaultBindingKey: "vault-fixture",
+    originRunId: "run-idea-1",
+    ...overrides,
+  };
+}
+
+function noteWriterAccepts(field: string, text: string): boolean {
+  try {
+    parseAcceptedResearchNotePackageV1(acceptedPackage({ [field]: text }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("every free-text seat in a brief gives the same control-character answer", () => {
+  // The seat list is DERIVED, never written down: every string leaf of a valid
+  // brief that accepts ordinary prose is a free-text seat, and everything that
+  // refuses prose (ids, hashes, timestamps, enums, URLs) classifies itself out
+  // by refusing it. A third text validator -- or a new free-text field wired to
+  // one -- joins this sweep by existing, so it cannot arrive with a third
+  // answer unnoticed. The closed `exactRecord` contract forces any new field
+  // through the fixture, which is what keeps the derivation complete.
+  const seats = stringLeafPaths(groundedIdea()).filter((path) =>
+    briefAcceptsAt(path, BENIGN_TEXT),
+  );
+
+  // Vacuous-input insurance: a walk that stopped finding seats would otherwise
+  // certify perfect agreement across nothing at all.
+  assert.ok(
+    seats.length >= 10,
+    `only ${seats.length} free-text seats were derived; the walk is reading the wrong shape`,
+  );
+
+  const unsupported = CONTROL_CODE_POINTS.filter(
+    (code) => !TEXT_CONTROL_CODE_POINTS.has(code),
+  );
+  assert.equal(unsupported.length, 30);
+
+  const oneLineSeats: LeafPath[] = [];
+  for (const seat of seats) {
+    for (const code of unsupported) {
+      assert.equal(
+        briefAcceptsAt(seat, textWithControl(code)),
+        false,
+        `${describePath(seat)} accepts ${describeCodePoint(code)}, which the accepted-research note writer refuses`,
+      );
+    }
+    assert.equal(
+      briefAcceptsAt(seat, textWithControl(0x09)),
+      true,
+      `${describePath(seat)} refuses a tab, which the accepted-research note writer accepts`,
+    );
+    // A seat may refuse line breaks -- that is the published one-line rule --
+    // but it may not answer differently about the two characters that spell
+    // one. Splitting CR from LF is exactly how a third answer would appear.
+    const lineFeed = briefAcceptsAt(seat, textWithControl(0x0a));
+    const carriageReturn = briefAcceptsAt(seat, textWithControl(0x0d));
+    assert.equal(
+      lineFeed,
+      carriageReturn,
+      `${describePath(seat)} answers differently about a line feed and a carriage return`,
+    );
+    if (!lineFeed) oneLineSeats.push(seat);
+  }
+
+  // Both kinds of seat must actually be in the sweep, or the agreement above
+  // is a statement about one of them.
+  assert.ok(oneLineSeats.length >= 1, "no one-line seat was exercised");
+  assert.ok(
+    oneLineSeats.length < seats.length,
+    "no newline-accepting narrative seat was exercised",
+  );
+});
+
+test("the narrative seat and the accepted-research note writer accept the same characters", () => {
+  let agreed = 0;
+  for (const code of CONTROL_CODE_POINTS) {
+    const text = textWithControl(code);
+    assert.equal(
+      briefAcceptsAt(["problem"], text),
+      noteWriterAccepts("problemImpact", text),
+      `the brief's narrative seat and the note writer disagree about ${describeCodePoint(code)}`,
+    );
+    agreed += 1;
+  }
+  assert.equal(agreed, 33);
+});
+
+test("the one-line seat is stricter than the note writer, never looser", () => {
+  for (const code of CONTROL_CODE_POINTS) {
+    const text = textWithControl(code);
+    assert.ok(
+      !briefAcceptsAt(["title"], text) || noteWriterAccepts("title", text),
+      `the brief title seat accepts ${describeCodePoint(code)} where the note writer refuses it`,
+    );
+  }
+  // The asymmetry is real and deliberate, not an artifact of both refusing
+  // everything: a line break is refused here and accepted there.
+  assert.equal(briefAcceptsAt(["title"], textWithControl(0x0a)), false);
+  assert.equal(noteWriterAccepts("title", textWithControl(0x0a)), true);
+});
+
+test("a tab survives ideation, promotion and the accepted-research note package", () => {
+  const brief = createProjectIdeaBriefV1({
+    ...groundedIdea(),
+    problem: textWithControl(0x09),
+  });
+  const seed = deriveAcceptedResearchSeedFromProjectIdeaBriefV1(brief);
+  assert.ok(seed.problemImpact.includes(String.fromCodePoint(0x09)));
+
+  // The whole chain, not two validators compared side by side: the seed-bound
+  // drift guard requires the package to carry the brief's text byte for byte,
+  // so this only passes if both seats and the writer agree about the tab.
+  const package_ = parseAcceptedResearchNotePackageV1(
+    acceptedPackage({
+      title: seed.title,
+      problemImpact: seed.problemImpact,
+      objective: seed.selectedDirection.summary,
+      proposedWork: seed.proposedWork,
+      nonGoals: seed.nonGoals,
+      acceptanceCriteria: seed.acceptanceCriteria,
+      evidence: seed.evidence.map((entry) => ({
+        ...entry,
+        label: "Checkers learning study",
+        summary: "A cited source about new-player onboarding.",
+      })),
+      riskClass: seed.riskClass,
+      projectIdeaSeed: seed,
+    }),
+  );
+  assert.equal(package_.problemImpact, seed.problemImpact);
+});
+
+/**
+ * The second layer of the same guard, and the one that fires earliest.
+ *
+ * The sweep above catches a third answer once something calls it. This catches
+ * the answer being WRITTEN DOWN a second time, before any field is wired to
+ * it: every control-character escape in the module must live inside the single
+ * shared class. `oneLine` may still spell the two line-break characters it
+ * refuses -- that is the published line-structure rule, not a second answer to
+ * this question -- so the check looks only for enumerated code points.
+ */
+test("the control-character answer is written down in exactly one place", () => {
+  const source = readFileSync(
+    new URL("../packages/core-api/src/projectIdeaBriefV1.ts", import.meta.url),
+    "utf8",
+  );
+  // Comments quote the rule in prose on purpose; only code can enforce a
+  // second copy of it.
+  const code = source
+    .split("\n")
+    .filter((line) => !/^\s*(?:\*|\/\/|\/\*)/u.test(line))
+    .join("\n");
+
+  // Both spellings of a code point, so a second answer written as `\\x0b`
+  // is caught as readily as one written as `\\u000b`.
+  const escape = new RegExp(
+    String.raw`\\(?:u00|x)[0-9a-fA-F]{2}`,
+    "gu",
+  );
+  const everywhere = code.match(escape) ?? [];
+
+  const declaration =
+    /const UNSUPPORTED_CONTROL =\s*(\/\[[^\n]*?\/[a-z]*);/u.exec(code);
+  assert.ok(
+    declaration,
+    "the shared control-character class is no longer declared as UNSUPPORTED_CONTROL",
+  );
+  const inDeclaration = declaration[1]!.match(escape) ?? [];
+
+  // Vacuous-input insurance: a matcher that stopped matching would otherwise
+  // report a perfectly single-sourced rule over zero escapes.
+  assert.ok(
+    inDeclaration.length >= 6,
+    `the shared class enumerates only ${inDeclaration.length} code points; the matcher is reading the wrong shape`,
+  );
+  assert.equal(
+    everywhere.length,
+    inDeclaration.length,
+    `${everywhere.length - inDeclaration.length} control-character escapes sit outside the shared class; every text seat must read the one answer in UNSUPPORTED_CONTROL`,
+  );
+});
+
+function briefAcceptsReference(
+  kind: "web" | "vault",
+  reference: string,
+): boolean {
+  try {
+    createProjectIdeaBriefV1({
+      ...groundedIdea(),
+      evidence: [
+        { id: "evidence-1", kind, reference, contentSha256: CONTENT_SHA },
+      ],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function noteWriterAcceptsReference(
+  kind: "web" | "vault",
+  reference: string,
+): boolean {
+  try {
+    parseAcceptedResearchNotePackageV1(
+      acceptedPackage({
+        evidence: [
+          {
+            id: "evidence-1",
+            kind,
+            reference,
+            contentSha256: CONTENT_SHA,
+            label: "Checkers learning study",
+            summary: "A cited source about new-player onboarding.",
+          },
+        ],
+      }),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The seat the first version of this proof missed.
+ *
+ * `oneLine` validates evidence references as well as titles, so "the two seats
+ * agree with the writer" is only true if it is checked where those references
+ * are read -- `parseHttpUrl` and `parseVaultMarkdownPath`, which run
+ * `expectString` in its default mode and admit no control character at all.
+ * A tab cleared this validator and was refused there, the same shape as the
+ * narrative gap and reachable by any caller of this independently callable
+ * contract, or by any brief replayed out of persistence.
+ */
+test("an evidence reference is refused here whenever the note writer refuses it", () => {
+  const references = [
+    ["web", "https://example.com/research/checkers", "learning"],
+    ["vault", "Notes/Checkers", "Research.md"],
+  ] as const;
+
+  // Vacuous-input insurance: without the control character, both sides accept.
+  // Otherwise every implication below holds because nothing is ever accepted.
+  for (const [kind, head, tail] of references) {
+    assert.ok(
+      briefAcceptsReference(kind, `${head}${tail}`),
+      `the brief validator refuses a clean ${kind} reference`,
+    );
+    assert.ok(
+      noteWriterAcceptsReference(kind, `${head}${tail}`),
+      `the note writer refuses a clean ${kind} reference`,
+    );
+  }
+
+  for (const code of CONTROL_CODE_POINTS) {
+    const control = String.fromCodePoint(code);
+    for (const [kind, head, tail] of references) {
+      const reference = `${head}${control}${tail}`;
+      assert.ok(
+        !briefAcceptsReference(kind, reference) ||
+          noteWriterAcceptsReference(kind, reference),
+        `a ${kind} reference carrying ${describeCodePoint(code)} is accepted by the brief validator and refused by the accepted-research note writer`,
+      );
+    }
+  }
+});

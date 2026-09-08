@@ -959,6 +959,24 @@ test("every free-text field publishes the canonical-form rules the validator enf
     seat.apply(credential, "api_key: sk-live-0123456789");
     await rejectsBrief(credential, `${seat.path} carrying a credential`);
 
+    // The rule the two seats used to answer differently. U+000B cleared the
+    // narrative validator and died at the accepted-research note writer, so
+    // both the refusal and the sentence that publishes it are checked here.
+    assert.match(
+      description,
+      /control characters/iu,
+      `${seat.path} does not publish the control-character rule the validator enforces`,
+    );
+    const control = ideaArgs();
+    seat.apply(control, `Interrupted${String.fromCodePoint(0x0b)}text.`);
+    await rejectsBrief(control, `${seat.path} carrying a control character`);
+
+    // Tab is the one control character that stays legal, on every seat,
+    // because the note writer downstream accepts it.
+    const tabbed = ideaArgs();
+    seat.apply(tabbed, `Indented${String.fromCodePoint(0x09)}detail.`);
+    await acceptsBrief(tabbed, `${seat.path} carrying a tab`);
+
     const wrapped = ideaArgs();
     seat.apply(wrapped, "First line\nSecond line");
     if (seat.singleLine) {
@@ -1170,7 +1188,11 @@ const VALIDATOR_RULES_V1: ReadonlyArray<
     "title",
     "The canonical-text sentence carried by every free-text description.",
   ],
-  ["{} must not contain a NUL character", "title", "Same canonical-text sentence."],
+  [
+    "{} must not contain a control character",
+    "title",
+    "Same canonical-text sentence. It used to read 'no NUL characters', which is what the validator enforced on narrative text and is NOT what the accepted-research note writer enforces downstream; both seats now refuse every C0 control and DEL except tab, line feed and carriage return, and the sentence says so.",
+  ],
   ["{} must be secret-free text", "title", "Same canonical-text sentence."],
   [
     "{} must be a single line",
@@ -1247,6 +1269,11 @@ const VALIDATOR_RULES_V1: ReadonlyArray<
     "Project idea evidence {} repeats the id of an earlier entry",
     null,
     "Evidence ids are minted and de-duplicated by the host from what this run observed.",
+  ],
+  [
+    "{} must be a single-line locator",
+    null,
+    "The control-character rule for evidence references, which are host-minted: `resolveGroundingReferences` stores the matched HOST candidate's reference, never the string the model requested, and the requested one is separately normalized by `normalizeRequestedReference` (WHATWG URL parsing strips tabs and line breaks outright). The rule exists because `createProjectIdeaBriefV1` is independently callable and briefs are re-parsed from persistence, where `parseHttpUrl` downstream admits no control character at all.",
   ],
   ["{} must be a SHA-256 fingerprint matching {}", null, "Content hashes are computed by the host."],
   ["{} must be a canonical ISO timestamp", null, "createdAt comes from the host clock."],

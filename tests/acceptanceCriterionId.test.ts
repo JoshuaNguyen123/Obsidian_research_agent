@@ -26,6 +26,8 @@ import {
 } from "../src/integrations/linear/acceptanceCriterionIdV1";
 import { parseAcceptedResearchNotePackageV1 } from "../src/integrations/linear/AcceptedResearchNoteWriter";
 import { createWorkItemSpecV1 } from "../src/integrations/linear/WorkItemSpecV1";
+import { createWorkItemSpecV2 } from "../src/integrations/linear/WorkItemSpecV2";
+import { canonicalizeAcceptanceCriterionIdV1 } from "../src/tools/researchPublicationTool";
 import { createProjectIdeaBriefTool } from "../src/tools/projectIdeaBriefTool";
 
 const FIXTURE_SHA = `sha256:${"a".repeat(64)}`;
@@ -128,22 +130,40 @@ test("normalization makes a duplicate visible that three separate regexes could 
 });
 
 /**
- * The four seats that turn a caller-supplied acceptance-criterion id into a
- * stored one, each driven through its own real validator rather than through a
+ * The six seats that turn a caller-supplied acceptance-criterion id into a
+ * stored one, each driven through its own real code path rather than through a
  * restatement of its rules. Each returns the id as stored, or null when the
  * seat refuses the value.
  *
  * `ProjectIdeaBriefV1` is the seat whose rejection motivated the shared
- * normalizer, and it was the last one still enforcing its own inlined copy.
+ * normalizer. `WorkItemSpecV2` and the publication tool are the two copies
+ * that stayed quarantined when the guard was first derived.
+ *
+ * Five of the six are validators: they fail closed on a value they cannot
+ * read. The publication tool is a REPAIR seat -- it runs before the package
+ * validator, so it never refuses, it substitutes. That difference is real and
+ * is asserted below rather than smoothed over, because a repair seat forced
+ * into a validator-shaped expectation is how a table stops describing the
+ * product it claims to measure.
  */
-const SEATS: ReadonlyArray<readonly [string, (id: string) => string | null]> = [
-  ["ProjectIdeaBriefV1", storedByProjectIdeaBrief],
-  ["AcceptedResearchArtifactV1", storedByAcceptedResearchArtifact],
-  ["AcceptedResearchNoteWriter", storedByAcceptedResearchNotePackage],
-  ["WorkItemSpecV1", storedByWorkItemSpec],
+type CriterionSeatKindV1 = "validator" | "repair";
+
+const SEATS: ReadonlyArray<
+  readonly [string, (id: string) => string | null, CriterionSeatKindV1]
+> = [
+  ["ProjectIdeaBriefV1", storedByProjectIdeaBrief, "validator"],
+  ["AcceptedResearchArtifactV1", storedByAcceptedResearchArtifact, "validator"],
+  ["AcceptedResearchNoteWriter", storedByAcceptedResearchNotePackage, "validator"],
+  ["WorkItemSpecV1", storedByWorkItemSpec, "validator"],
+  ["WorkItemSpecV2", storedByWorkItemSpecV2, "validator"],
+  ["researchPublicationTool", storedByResearchPublicationRepair, "repair"],
 ];
 
-test("all four seats answer one predicate, including the forms that drifted", () => {
+test("all six seats answer one predicate, including the forms that drifted", () => {
+  // The same disagreement had two further instances, quarantined rather than
+  // fixed when this guard was derived: WorkItemSpecV2 refused every variant
+  // its own predecessor accepted, and the publication tool did not refuse them
+  // but silently renumbered them by position.
   // Before this call the brief seat rejected `ac-01`, `AC1` and `AC-01` while
   // the three Linear validators downstream accepted and canonicalized them --
   // so a model could satisfy the seat that publishes to Linear and still fail
@@ -179,16 +199,41 @@ test("all four seats answer one predicate, including the forms that drifted", ()
   ];
 
   for (const [input, expected] of table) {
-    for (const [seat, store] of SEATS) {
+    for (const [seat, store, kind] of SEATS) {
+      // A repair seat has no "refuse" outcome to agree with: where the five
+      // validators fail closed it substitutes the positional id, which for a
+      // one-criterion list is AC-1. On every RECOVERABLE spelling -- the rows
+      // this table exists for -- it must return exactly what they store.
+      const seatExpected = kind === "repair" ? expected ?? "AC-1" : expected;
       assert.equal(
         store(input),
-        expected,
+        seatExpected,
         `${seat} stored ${JSON.stringify(input)} as ${JSON.stringify(
           store(input),
-        )}, but every seat must agree on ${JSON.stringify(expected)}`,
+        )}, but every seat must agree on ${JSON.stringify(seatExpected)}`,
       );
     }
   }
+});
+
+test("the repair seat canonicalizes a recoverable id instead of renumbering it", () => {
+  // The behaviour the publication tool lost by carrying its own copy of the
+  // canonical pattern. Its predicate recognized only the exact canonical form,
+  // so every variant spelling fell through to a positional fallback written
+  // for a MISSING id, and the caller ordering was silently overwritten.
+  assert.equal(canonicalizeAcceptanceCriterionIdV1("ac-3", 0), "AC-3");
+  assert.equal(canonicalizeAcceptanceCriterionIdV1("AC1", 4), "AC-1");
+  // Two spellings of one id now collide instead of becoming two criteria,
+  // which is what lets the package validator downstream report the duplicate.
+  assert.equal(
+    canonicalizeAcceptanceCriterionIdV1("AC-1", 0),
+    canonicalizeAcceptanceCriterionIdV1("ac-01", 1),
+  );
+  // The fallback still covers what it was written for: an absent id, and an
+  // id no normalization can recover.
+  assert.equal(canonicalizeAcceptanceCriterionIdV1(undefined, 0), "AC-1");
+  assert.equal(canonicalizeAcceptanceCriterionIdV1("", 1), "AC-2");
+  assert.equal(canonicalizeAcceptanceCriterionIdV1("AC-0", 2), "AC-3");
 });
 
 test("routing the fourth seat through the normalizer canonicalizes what it stores", () => {
@@ -294,22 +339,24 @@ function scanForRuleCopies(root: URL): RuleSeatScanV1 {
 }
 
 /**
- * Copies of the rule that are known, still unrouted, and deliberately left
- * alone by the change that derived this guard: both live outside the territory
- * that change was allowed to touch. This is a quarantine, not a seat list --
- * it may only shrink. Routing one of these through the shared module makes
- * this assertion fail until its line here is deleted, which is the point: a
- * pin that outlives the defect it records is the next inert guard.
+ * Copies of the rule that are known and still unrouted. This is a quarantine,
+ * not a seat list -- it may only shrink. Routing one of these through the
+ * shared module makes the assertion below fail until its line here is deleted,
+ * which is the point: a pin that outlives the defect it records is the next
+ * inert guard.
  *
- * A copy that is NOT on this list fails the guard the moment it appears, which
- * is the property the hand-written seat list did not have.
+ * It held two entries when the guard was derived, both outside the territory
+ * that change was allowed to touch: `parseAcceptanceCriteria` in
+ * WorkItemSpecV2, and `isValidCriterionIdentifier` in the publication tool.
+ * Both are routed now and both lines are deleted, so every occurrence of the
+ * rule in the tree is the one that defines it.
+ *
+ * Empty is the meaningful state, not a reason to delete the constant: it says
+ * zero unrouted copies are tolerated, and a copy that is NOT on this list
+ * fails the guard the moment it appears -- the property the hand-written seat
+ * list did not have.
  */
-const KNOWN_UNROUTED_RULE_COPIES = [
-  // `parseAcceptanceCriteria` re-inlines the pattern the V1 spec now imports.
-  "src/integrations/linear/WorkItemSpecV2.ts",
-  // `isValidCriterionIdentifier`, the publication tool's own criterion check.
-  "src/tools/researchPublicationTool.ts",
-];
+const KNOWN_UNROUTED_RULE_COPIES: readonly string[] = [];
 
 test("one definition serves every seat, and the seat list is derived, not declared", () => {
   const scan = scanForRuleCopies(new URL("../", import.meta.url));
@@ -515,6 +562,41 @@ function storedByAcceptedResearchNotePackage(id: string): string | null {
         originRunId: "run-agreement-1",
       }).acceptanceCriteria,
   );
+}
+
+/**
+ * The v2 contract, reached through `createWorkItemSpecV2` the way the
+ * publisher reaches it -- an unsigned draft -- because that is the seat a
+ * caller-supplied id actually passes through. Readback is a different
+ * property, enforced by assertCanonicalContract and covered by the v2
+ * contract suite.
+ */
+function storedByWorkItemSpecV2(id: string): string | null {
+  return stored(
+    () =>
+      createWorkItemSpecV2({
+        schemaVersion: 2,
+        ready: true,
+        executionClass: "research",
+        objective: "Make every seat answer one acceptance-criterion predicate.",
+        acceptanceCriteria: [{ id, text: "The criterion holds." }],
+        validationRequirementKeys: ["trusted.validation"],
+        evidenceRefs: ["https://example.com/research/acceptance-criteria"],
+        riskClass: "low",
+        originRunId: "run-agreement-1",
+        acceptedResearchArtifactFingerprint: FIXTURE_SHA,
+        generation: 0,
+      }).acceptanceCriteria,
+  );
+}
+
+/**
+ * The publication tool repairs a caller-supplied id before its package
+ * validator runs. The table drives the one-criterion case, so index 0 -- and
+ * therefore a positional fallback of AC-1.
+ */
+function storedByResearchPublicationRepair(id: string): string | null {
+  return canonicalizeAcceptanceCriterionIdV1(id, 0);
 }
 
 function storedByWorkItemSpec(id: string): string | null {

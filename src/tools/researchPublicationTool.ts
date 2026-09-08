@@ -13,6 +13,7 @@ import { extractMarkdownPathMentions } from "../agent/missionScope";
 import { hasAffirmativeProjectIdeationIntentV1 } from "../agent/projectIdeationIntent";
 import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
 import { sha256DiagramContent } from "../design/diagramArtifactStore";
+import { normalizeAcceptanceCriterionIdV1 } from "../integrations/linear/acceptanceCriterionIdV1";
 import {
   assertNoRawAuthority,
   canonicalizeProviderSafeAcceptedResearchTextV1,
@@ -1925,9 +1926,7 @@ function canonicalizePackageIdentifiers(
         return;
       }
       const criterion = candidate as Record<string, unknown>;
-      if (!isValidCriterionIdentifier(criterion.id)) {
-        criterion.id = `AC-${index + 1}`;
-      }
+      criterion.id = canonicalizeAcceptanceCriterionIdV1(criterion.id, index);
     });
   }
 }
@@ -2218,8 +2217,29 @@ function isSafeBoundedEvidenceText(value: unknown, maximum: number): boolean {
   );
 }
 
-function isValidCriterionIdentifier(value: unknown): boolean {
-  return typeof value === "string" && /^AC-[1-9][0-9]?$/u.test(value);
+/**
+ * The publication tool's criterion-id seat. Unlike the five validating seats
+ * it never refuses a value: this runs before the package validator, so its job
+ * is to hand that validator something canonical, and a criterion whose id is
+ * missing entirely still has to get one.
+ *
+ * It routes through the shared normalizer rather than the shared canonical
+ * predicate, which is a behaviour change and deliberate. The predicate this
+ * replaced only recognized the exact canonical form, so a caller that wrote
+ * "ac-01" or "AC1" -- spellings every other seat accepts and canonicalizes --
+ * did not get its id canonicalized, it got RENUMBERED to its position. Two
+ * consequences, both silent: a caller that listed AC-3 before AC-1 in lower
+ * case had its numbering inverted, and a caller that wrote "AC-1" and "ac-01"
+ * got two distinct criteria instead of the duplicate every other seat reports.
+ * Normalizing first preserves the id the caller meant and leaves the positional
+ * fallback for the case it was actually written for -- an absent or
+ * unrecoverable id, which is what the tool's existing tests pin.
+ */
+export function canonicalizeAcceptanceCriterionIdV1(
+  value: unknown,
+  index: number,
+): string {
+  return normalizeAcceptanceCriterionIdV1(value) ?? `AC-${index + 1}`;
 }
 
 function describeRedactedValueShape(value: unknown): string {

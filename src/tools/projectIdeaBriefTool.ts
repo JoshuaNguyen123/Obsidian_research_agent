@@ -429,7 +429,8 @@ function notApplied(code: string, message: string): ToolExecutionError {
  */
 const CANONICAL_TEXT_RULE_V1 =
   "Send it exactly as it should be stored: no leading or trailing whitespace, " +
-  "no NUL characters, and no credentials, API keys or tokens.";
+  "no control characters other than tab and line breaks, and no credentials, " +
+  "API keys or tokens.";
 
 /**
  * The logical-id shape `createProjectIdeaBriefV1` enforces on `ideaId`, on

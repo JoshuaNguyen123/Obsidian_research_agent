@@ -12,6 +12,28 @@ const SECRET_VALUE =
   /(?:\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*\S+)/iu;
 
 /**
+ * Which control characters text may carry, asked once for every free-text
+ * field in this module.
+ *
+ * The answer is not chosen here: it is READ OFF the strictest consumer a brief
+ * reaches. `AcceptedResearchNoteWriter` validates every field a promotion seed
+ * feeds it -- title, problemImpact, objective, proposed work, non-goals,
+ * criterion text, evidence label and summary -- through `expectString` with
+ * `allowNewlines`, whose reject class is exactly this one, and re-checks the
+ * same set in `boundedText`. Adopting anything narrower would refuse briefs
+ * that the note writer accepts; adopting anything wider re-opens the gap this
+ * constant closes.
+ *
+ * Tab survives deliberately. It is the one control character in legitimate
+ * narrative text -- an indented list, a pasted table -- and the note writer
+ * already accepts it, so banning it upstream would refuse content no reader
+ * downstream objects to. CR and LF survive for the same reason; `oneLine`
+ * refuses them for its own separate reason, that a title is one line.
+ */
+const UNSUPPORTED_CONTROL =
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
+
+/**
  * Every rejection below states the RULE it enforced, not only the field that
  * broke it. A cohort died here: `create_project_idea_brief` was refused with
  * "project idea option 1 id is invalid", which names a field and no constraint,
@@ -568,7 +590,7 @@ function evidenceReference(
   label: string,
 ): string {
   if (kind === "web") {
-    const reference = oneLine(value, label, 1, 2_048);
+    const reference = locator(value, label, 1, 2_048);
     let url: URL;
     try {
       url = new URL(reference);
@@ -589,7 +611,7 @@ function evidenceReference(
     return reference;
   }
   if (kind === "vault") {
-    const reference = oneLine(value, label, 1, 1_024);
+    const reference = locator(value, label, 1, 1_024);
     // One condition per message. The combined form fired for five distinct
     // path mistakes and named none of them.
     if (reference.includes("\\")) {
@@ -656,7 +678,23 @@ function narrativeList(
   return parsed;
 }
 
-function oneLine(
+/**
+ * The single body behind both text seats. The two used to be independent
+ * copies of the same four rules, and they had already drifted on the one rule
+ * below that is not obvious: `oneLine` refused NUL, CR and LF, `narrative`
+ * refused only NUL, and so a narrative field accepted the twenty-eight
+ * remaining C0 controls plus DEL. The accepted-research note writer refuses
+ * every one of them, so a brief could clear this validator and be rejected two
+ * stages later -- the failure shape this repository keeps paying for, two
+ * places answering one question differently.
+ *
+ * Both seats now ask the shared question once, here. `oneLine` adds a rule
+ * about line STRUCTURE on top; that is a different question, it is published
+ * on the two one-line fields, and it is stricter than anything downstream, so
+ * it can refuse text but can never let text through that a later stage
+ * refuses.
+ */
+function canonicalText(
   value: unknown,
   label: string,
   minimum: number,
@@ -673,9 +711,18 @@ function oneLine(
   if (value.trim() !== value) {
     fail(`${label} must not begin or end with whitespace.`);
   }
-  if (/[\0\r\n]/u.test(value)) {
+  const control = UNSUPPORTED_CONTROL.exec(value);
+  if (control) {
+    // The position and the code point, never the surrounding text. A control
+    // character is not caller prose, so naming it cannot leak a credential,
+    // and a caller who cannot see the character needs to be told which one it
+    // is and where.
     fail(
-      `${label} must be a single line: it must contain no carriage return, no line feed and no NUL character.`,
+      `${label} must not contain a control character: tab, line feed and carriage return are the only ones text may carry. Found U+${control[0]
+        .codePointAt(0)!
+        .toString(16)
+        .toUpperCase()
+        .padStart(4, "0")} at position ${control.index}.`,
     );
   }
   if (SECRET_VALUE.test(value)) {
@@ -684,30 +731,55 @@ function oneLine(
   return value;
 }
 
+function oneLine(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+): string {
+  const text = canonicalText(value, label, minimum, maximum);
+  if (/[\r\n]/u.test(text)) {
+    fail(
+      `${label} must be a single line: it must contain no carriage return and no line feed. A tab is accepted here; a line break is not.`,
+    );
+  }
+  return text;
+}
+
+/**
+ * A reference is a locator, not prose, and that is a different question
+ * from the one {@link canonicalText} answers. The strictest reader a stored
+ * reference reaches is `parseHttpUrl` / `parseVaultMarkdownPath`, which run
+ * `expectString` in its DEFAULT mode and admit no control character at all --
+ * tab included -- so a tab was accepted here and refused there.
+ *
+ * Refusing it costs nothing real: a URL and a vault path have no legitimate
+ * use for a tab, and WHATWG URL parsing silently STRIPS tabs and line breaks,
+ * so tolerating one would also mean the reference a brief stores and the URL a
+ * host actually fetches are two different strings.
+ */
+function locator(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+): string {
+  const text = canonicalText(value, label, minimum, maximum);
+  if (/[\t\r\n]/u.test(text)) {
+    fail(
+      `${label} must be a single-line locator: it must contain no tab, no carriage return and no line feed. Only free-text fields may carry them.`,
+    );
+  }
+  return text;
+}
+
 function narrative(
   value: unknown,
   label: string,
   minimum: number,
   maximum: number,
 ): string {
-  if (typeof value !== "string") {
-    fail(`${label} must be a string.`);
-  }
-  if (value.length < minimum || value.length > maximum) {
-    fail(
-      `${label} must be ${minimum}-${maximum} characters; received ${value.length}.`,
-    );
-  }
-  if (value.trim() !== value) {
-    fail(`${label} must not begin or end with whitespace.`);
-  }
-  if (value.includes("\0")) {
-    fail(`${label} must not contain a NUL character.`);
-  }
-  if (SECRET_VALUE.test(value)) {
-    fail(secretShapedFailure(label));
-  }
-  return value.replace(/\r\n?/gu, "\n");
+  return canonicalText(value, label, minimum, maximum).replace(/\r\n?/gu, "\n");
 }
 
 /**
