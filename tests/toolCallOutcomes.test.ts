@@ -6,7 +6,9 @@ import {
   foldToolCallOutcomesV1,
   mergeToolCallOutcomeCountsV1,
   normalizeMissionToolEventV1,
+  projectToolFailureMessageV1,
   TOOL_CALL_FAILURE_DETAIL_CAP,
+  TOOL_CALL_FAILURE_MESSAGE_CAP,
   TOOL_CALL_FAILURE_BUCKET_KEYS,
   toolCallOutcomeAcceptanceCountersV1,
   unknownToolCallOutcomeCountsV1,
@@ -114,18 +116,24 @@ test("a known stream folds to exact counts, and attempted includes failures", ()
       id: "2:0:append_to_current_file",
       toolName: "append_to_current_file",
       errorCode: "execution_failed",
+      // This fixture's events carry codes only, and a message nobody reported
+      // is null — never "" — so a reader can tell "no rule was named" from
+      // "the rule was named and it was empty".
+      errorMessage: null,
       bucket: "execution_failed",
     },
     {
       id: "2:1:create_file",
       toolName: "create_file",
       errorCode: "invalid_argument_path",
+      errorMessage: null,
       bucket: "invalid_arguments",
     },
     {
       id: "3:1:github_create_pull_request",
       toolName: "github_create_pull_request",
       errorCode: "tool_not_allowed",
+      errorMessage: null,
       bucket: "tool_not_allowed",
     },
   ]);
@@ -393,6 +401,7 @@ test("unknown error codes land in `other` instead of vanishing", () => {
       id: "9:9:mystery_tool",
       toolName: "mystery_tool",
       errorCode: "a_brand_new_refusal",
+      errorMessage: null,
       bucket: "other",
     },
   ]);
@@ -419,11 +428,13 @@ test("failed-call diagnostics are content-free, deterministic, and bounded", () 
     id: "00:mystery_tool",
     toolName: "mystery_tool",
     errorCode: null,
+    errorMessage: null,
     bucket: "other",
   });
   assert.deepEqual(Object.keys(forward.failureDetails?.[0] ?? {}).sort(), [
     "bucket",
     "errorCode",
+    "errorMessage",
     "id",
     "toolName",
   ]);
@@ -470,6 +481,9 @@ test("normalization maps the three native event shapes and rejects the rest", ()
       toolName: "create_file",
       ok: false,
       errorCode: "execution_failed",
+      // The message rides in the same `error` object as the code, so keeping it
+      // costs no new observation — it was only ever being discarded.
+      errorMessage: "boom",
     },
   );
   // Non-tool traces and unusable events say nothing about a call.
@@ -591,4 +605,313 @@ test("the acceptance projection passes unknown through as null", () => {
     toolCallsIntentionalNoOp: null,
     refusalBuckets: null,
   });
+});
+
+/**
+ * The cohort-ending failure, replayed through the REAL derivation path.
+ *
+ * A qualification cohort died on
+ * `failures=[{"errorCode":"project_idea_brief_invalid", ...}]`. That code is
+ * raised from eight places in src/tools/projectIdeaBriefTool.ts, each naming a
+ * different broken rule, and teardown deletes the run note that held the
+ * message — so the retained record could not say which rule broke, and the only
+ * way to find out was another twelve-minute lane run.
+ *
+ * These are the two native shapes AgentRunner emits for one failed call
+ * (`onToolDone` and the `:result` trace), verbatim in structure, so this test
+ * exercises `normalizeMissionToolEventV1` and the fold rather than a hand-built
+ * detail object.
+ */
+const COHORT_KILLING_RULE =
+  "Web grounding references must be absolute HTTP(S) URLs without credentials.";
+
+function cohortKillingEvents(): ToolCallOutcomeEventV1[] {
+  const id = "run-2f8c1a:2:0:create_project_idea_brief";
+  const error = {
+    code: "project_idea_brief_invalid",
+    message: COHORT_KILLING_RULE,
+  };
+  return [
+    normalizeMissionToolEventV1(
+      {
+        id: `${id}:start`,
+        kind: "tool_start",
+        step: 2,
+        toolName: "create_project_idea_brief",
+        message: "Running create_project_idea_brief",
+      },
+      "trace",
+    )!,
+    normalizeMissionToolEventV1(
+      {
+        id,
+        name: "create_project_idea_brief",
+        step: 2,
+        ok: false,
+        message: "create_project_idea_brief failed",
+        output: { attempted: true },
+        error,
+      },
+      "tool_done",
+    )!,
+    normalizeMissionToolEventV1(
+      {
+        id: `${id}:result`,
+        kind: "tool_result",
+        step: 2,
+        toolName: "create_project_idea_brief",
+        message: "create_project_idea_brief failed",
+        outputPreview: { truncated: true },
+        error,
+      },
+      "trace",
+    )!,
+  ];
+}
+
+test("a failure detail names the broken rule, not just the error code family", () => {
+  const counts = foldToolCallOutcomesV1(cohortKillingEvents());
+
+  assert.equal(counts.coverage, "complete");
+  assert.equal(counts.failed, 1);
+  assert.deepEqual(counts.failureDetails, [
+    {
+      id: "run-2f8c1a:2:0:create_project_idea_brief",
+      toolName: "create_project_idea_brief",
+      errorCode: "project_idea_brief_invalid",
+      errorMessage: COHORT_KILLING_RULE,
+      bucket: "other",
+    },
+  ]);
+  // The assertion that ends a cohort interpolates this list, so the rule has to
+  // survive JSON.stringify — that string IS the diagnosis.
+  assert.match(
+    JSON.stringify(counts.failureDetails),
+    /absolute HTTP\(S\) URLs without credentials/u,
+  );
+});
+
+test("every project_idea_brief rule survives redaction and the bound intact", () => {
+  // The eight sentences the cohort-killing code can carry. If redaction or
+  // bounding mangled one of them, this field would name the wrong rule — which
+  // is worse than naming none.
+  for (const rule of [
+    "groundingReferences must contain at most 50 entries.",
+    "Grounding reference 1 does not match its closed contract.",
+    "Grounding reference 1 has an unsupported kind.",
+    "Grounding reference 1 must name a host-observed reference.",
+    "Web grounding references must be absolute HTTP(S) URLs without credentials.",
+    "Vault grounding references must be safe vault-relative Markdown paths.",
+    "User grounding may reference only the host-owned original_mission input.",
+    "Project idea arguments do not match the closed native tool contract.",
+  ]) {
+    assert.equal(projectToolFailureMessageV1(rule), rule);
+    assert.ok(rule.length <= TOOL_CALL_FAILURE_MESSAGE_CAP);
+  }
+});
+
+test("a message nobody reported stays null, and the capture stays complete", () => {
+  const normalized = normalizeMissionToolEventV1(
+    {
+      id: "1:0:create_file",
+      name: "create_file",
+      step: 1,
+      ok: false,
+      // A typed cause with no sentence beside it. The runner emits this shape
+      // whenever a refusal carries a code only.
+      error: { code: "tool_not_allowed" },
+    },
+    "tool_done",
+  );
+  assert.deepEqual(normalized, {
+    kind: "tool_done",
+    id: "1:0:create_file",
+    toolName: "create_file",
+    ok: false,
+    errorCode: "tool_not_allowed",
+    errorMessage: null,
+  });
+
+  const counts = foldToolCallOutcomesV1([normalized!]);
+  // Unobserved is null, never "": an empty string would read as "the product
+  // named the rule and the rule was blank".
+  assert.equal(counts.failureDetails?.[0]?.errorMessage, null);
+  assert.notEqual(counts.failureDetails?.[0]?.errorMessage, "");
+  // And an absent message must not make a complete observation look lossy.
+  assert.equal(counts.coverage, "complete");
+  assert.equal(counts.failed, 1);
+  assert.equal(counts.atLeast, null);
+
+  // Whitespace-only and non-string messages are the same non-observation.
+  for (const empty of [undefined, null, "", "   ", 42, {}]) {
+    assert.equal(projectToolFailureMessageV1(empty), null);
+  }
+});
+
+test("a retained message is bounded, and says so when it was cut", () => {
+  const long = `The brief is invalid because ${"reason ".repeat(200)}`;
+  const projected = projectToolFailureMessageV1(long)!;
+
+  assert.equal(projected.length, TOOL_CALL_FAILURE_MESSAGE_CAP);
+  assert.ok(projected.endsWith("..."), "a cut message must admit it was cut");
+  assert.ok(projected.startsWith("The brief is invalid because reason"));
+  // Idempotent: the fold re-projects whatever a foreign producer hands it, and
+  // that second pass must not keep shaving the message.
+  assert.equal(projectToolFailureMessageV1(projected), projected);
+
+  const counts = foldToolCallOutcomesV1([
+    {
+      kind: "tool_rejected",
+      id: "4:0:create_project_idea_brief",
+      toolName: "create_project_idea_brief",
+      errorCode: "project_idea_brief_invalid",
+      // Unbounded, exactly as a page-side collector that never learned the cap
+      // would hand it over.
+      errorMessage: long,
+    },
+  ]);
+  assert.equal(
+    counts.failureDetails?.[0]?.errorMessage?.length,
+    TOOL_CALL_FAILURE_MESSAGE_CAP,
+  );
+});
+
+test("no credential, path or URL reaches a retained failure message", () => {
+  // Every class the product provably interpolates into `error.message`:
+  // AgentRunner forwards arbitrary caught errors verbatim, atomicVaultWrite
+  // names the vault path, and GitHubRestClient scrubs a token out of this very
+  // field before building it.
+  const poison = {
+    bearer: "Authorization failed: Bearer sk-live-DEADBEEF-must-not-escape",
+    flag: "python3 /home/user/secrets/run_payroll.py --token abc123 failed",
+    assignment: "request rejected (api_key=AKIAIOSFODNN7EXAMPLE)",
+    vaultPath:
+      "The note changed during preparation: Research/Private Client Note.md.",
+    url: "GET https://api.example.com/v1/issues?access_token=s3cr3tvalue returned 401",
+    opaque: "signature mismatch for ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+  } as const;
+  const secrets = [
+    "sk-live-DEADBEEF-must-not-escape",
+    "abc123",
+    "AKIAIOSFODNN7EXAMPLE",
+    "Research/Private Client Note.md",
+    "/home/user/secrets/run_payroll.py",
+    "https://api.example.com/v1/issues?access_token=s3cr3tvalue",
+    "s3cr3tvalue",
+    "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+  ];
+
+  const counts = foldToolCallOutcomesV1(
+    Object.entries(poison).map(
+      (entry, index) =>
+        normalizeMissionToolEventV1(
+          {
+            id: `9:${index}:leaky_tool`,
+            name: "leaky_tool",
+            step: 9,
+            ok: false,
+            error: { code: "execution_failed", message: entry[1] },
+          },
+          "tool_done",
+        )!,
+    ),
+  );
+  const retained = JSON.stringify(counts.failureDetails);
+
+  for (const secret of secrets) {
+    assert.ok(
+      !retained.includes(secret),
+      `${secret} must never reach a retained failure message`,
+    );
+  }
+  // The positive half: a projection that returned nothing would satisfy every
+  // rule above and be worthless. The non-secret words of each sentence — the
+  // part that names what broke — are still there.
+  assert.equal(counts.failed, Object.keys(poison).length);
+  for (const kept of [
+    "Authorization failed",
+    "python3",
+    "request rejected",
+    "The note changed during preparation",
+    "returned 401",
+    "signature mismatch for",
+  ]) {
+    assert.ok(retained.includes(kept), `${kept} must survive redaction`);
+  }
+});
+
+test("the code and the message of one call come from the SAME report", () => {
+  // One logical call reported failed on two streams with different causes: the
+  // `ok:false` done arrives first, then its `tool_rejected` twin. Pairing the
+  // done's code with the rejection's sentence would name a rule that never
+  // broke, which is the only outcome worse than naming none.
+  const counts = foldToolCallOutcomesV1([
+    {
+      kind: "tool_done",
+      id: "5:0:create_project_idea_brief",
+      toolName: "create_project_idea_brief",
+      ok: false,
+      errorCode: "project_idea_brief_invalid",
+      errorMessage: "Grounding reference 1 has an unsupported kind.",
+    },
+    {
+      kind: "tool_rejected",
+      id: "5:0:create_project_idea_brief:graph-rejected",
+      toolName: "create_project_idea_brief",
+      errorCode: "mission_graph_authority_blocked",
+      errorMessage: "The mission graph offered no node for this tool.",
+    },
+  ]);
+
+  assert.equal(counts.failed, 1, "two reports, one logical call");
+  assert.deepEqual(counts.failureDetails?.[0], {
+    id: "5:0:create_project_idea_brief",
+    toolName: "create_project_idea_brief",
+    errorCode: "project_idea_brief_invalid",
+    errorMessage: "Grounding reference 1 has an unsupported kind.",
+    bucket: "other",
+  });
+});
+
+test("a sentence with no typed code beside it is still the only cause we have", () => {
+  const counts = foldToolCallOutcomesV1([
+    {
+      kind: "tool_rejected",
+      id: "6:0:mystery_tool",
+      toolName: "mystery_tool",
+      errorCode: null,
+      errorMessage: "The host withdrew the tool before it could run.",
+    },
+  ]);
+
+  assert.deepEqual(counts.failureDetails?.[0], {
+    id: "6:0:mystery_tool",
+    toolName: "mystery_tool",
+    errorCode: null,
+    errorMessage: "The host withdrew the tool before it could run.",
+    bucket: "other",
+  });
+});
+
+test("merged segments keep each failure's message beside its code", () => {
+  const left = foldToolCallOutcomesV1(cohortKillingEvents());
+  const right = foldToolCallOutcomesV1([
+    {
+      kind: "tool_rejected",
+      id: "7:0:github_create_pull_request",
+      toolName: "github_create_pull_request",
+      errorCode: "tool_not_allowed",
+      errorMessage: "The frontier narrowed before this call was issued.",
+    },
+  ]);
+
+  assert.deepEqual(
+    mergeToolCallOutcomeCountsV1(left, right).failureDetails?.map(
+      (detail) => detail.errorMessage,
+    ),
+    [
+      COHORT_KILLING_RULE,
+      "The frontier narrowed before this call was issued.",
+    ],
+  );
 });

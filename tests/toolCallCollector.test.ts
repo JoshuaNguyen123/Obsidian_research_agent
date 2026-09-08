@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   TOOL_CALL_COLLECTOR_EVENT_CAP,
+  TOOL_CALL_COLLECTOR_SLOT,
   armToolCallCollector,
   collectedToolCallCountsForTestV1,
   harvestToolCallCollector,
@@ -18,9 +19,11 @@ import {
 } from "../e2e/fixtures/toolCallCollector";
 import {
   foldToolCallOutcomesV1,
+  projectToolFailureMessageV1,
   unknownToolCallOutcomeCountsV1,
   type ToolCallOutcomeEventV1,
   RECEIPT_IDENTITY_DIGEST,
+  TOOL_CALL_FAILURE_MESSAGE_CAP,
 } from "../e2e/fixtures/toolCallOutcomes";
 
 const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -356,6 +359,9 @@ test("collector diagnostics expose only bounded event metadata", async () => {
       id: "2:0:append_to_current_file",
       toolName: "append_to_current_file",
       errorCode: "mission_graph_authority_blocked",
+      // This producer reported no message, which is unknown — the diagnostic
+      // says so rather than inventing an empty observation.
+      errorMessage: null,
       ok: false,
       operation: null,
     },
@@ -365,6 +371,7 @@ test("collector diagnostics expose only bounded event metadata", async () => {
       id: null,
       toolName: "append_to_current_file",
       errorCode: null,
+      errorMessage: null,
       ok: null,
       operation: "append",
     },
@@ -413,5 +420,425 @@ test("harvests are keyed per test, so no spec can inherit another spec's counts"
   assert.ok(
     /harvestsByTest\.delete\(key\)/u.test(collector),
     "the recorder must consume its own entry so a retry cannot double count",
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The PAGE-SIDE PRODUCER, driven directly.
+ *
+ * Every test above hands the fold events a TEST built, which says nothing about
+ * the only question a dead cohort needed answered: does the real producer ever
+ * build an event carrying a failure MESSAGE? A 504-run qualification cohort
+ * ended on `errorCode: "project_idea_brief_invalid"` — a code eight different
+ * broken rules raise, each with its own sentence — and the retained record could
+ * not name which rule broke, so the answer cost another twelve-minute lane run.
+ *
+ * The producer on the live path is NOT `normalizeMissionToolEventV1` (nothing
+ * outside tests calls it). It is the function Playwright serializes into the
+ * renderer inside `armToolCallCollector`, and it projected the code alone. So
+ * these tests install a fake window, arm the REAL collector against it, and fire
+ * realistic mission events at the handlers it actually subscribed with: a
+ * hand-built `ToolCallOutcomeEventV1` would re-prove the fold and re-miss the
+ * boundary, which is the shape this repo has already shipped twice.
+ * ---------------------------------------------------------------------------
+ */
+
+interface FakeMissionHandlers {
+  onStatus?: (message: unknown) => void;
+  onTrace?: (event: unknown) => void;
+  onToolDone?: (event: unknown) => void;
+  onReceipt?: (receipt: unknown) => void;
+  onMetric?: (event: unknown) => void;
+}
+
+interface FakeRenderer {
+  page: any;
+  handlers: FakeMissionHandlers;
+  /** Raw page-side events, exactly as the producer pushed them. */
+  events: () => any[];
+  /** The free-form status/trace ring, which no failure message may reach. */
+  recent: () => string[];
+}
+
+/**
+ * Install a fake Obsidian window, arm the real collector against it, and return
+ * the handlers it subscribed with. `evaluate` really invokes the function it is
+ * handed, so the code under test is the code that runs in the renderer.
+ */
+async function armAgainstFakeRenderer(): Promise<FakeRenderer> {
+  const captured: { handlers: FakeMissionHandlers } = { handlers: {} };
+  (globalThis as Record<string, unknown>).window = {
+    app: {
+      plugins: {
+        plugins: {
+          "agentic-researcher": {
+            getMissionRunSnapshot: () => ({
+              isRunning: false,
+              runId: "run-1",
+              droppedEventCount: 0,
+              providerUsageScopeId: "scope-1",
+            }),
+            subscribeMissionEvents: (handlers: FakeMissionHandlers) => {
+              captured.handlers = handlers;
+              return () => undefined;
+            },
+          },
+        },
+      },
+    },
+  };
+  const pageErrors: unknown[] = [];
+  const page = {
+    isClosed: () => false,
+    evaluate: async (fn: (arg: any) => unknown, arg: unknown) => {
+      try {
+        return await fn(arg as any);
+      } catch (error) {
+        // `armToolCallCollector` swallows page failures on purpose, so without
+        // this a broken page-side projection would present as "no events".
+        pageErrors.push(error);
+        throw error;
+      }
+    },
+  } as any;
+  await armToolCallCollector(page);
+  assert.deepEqual(pageErrors, [], "the page-side collector threw while arming");
+  const slot = (): any => (globalThis as any).window?.[TOOL_CALL_COLLECTOR_SLOT];
+  assert.ok(slot(), "arming must install the page-side collector slot");
+  assert.ok(
+    typeof captured.handlers.onToolDone === "function",
+    "arming must subscribe the mission-event handlers under test",
+  );
+  return {
+    page,
+    handlers: captured.handlers,
+    events: () => slot().segments[0].events,
+    recent: () => slot().recent,
+  };
+}
+
+function releaseFakeRenderer(): void {
+  delete (globalThis as Record<string, unknown>).window;
+  resetToolCallCollectorStateForTestsV1();
+}
+
+test("the page-side producer carries the failure MESSAGE beside the code, in both shapes", async () => {
+  const renderer = await armAgainstFakeRenderer();
+  try {
+    // The `onTrace` shape: a tool_result whose error names the broken rule.
+    renderer.handlers.onTrace?.({
+      kind: "tool_result",
+      id: "3:0:create_project_idea_brief:result",
+      toolName: "create_project_idea_brief",
+      error: {
+        code: "project_idea_brief_invalid",
+        message: "acceptance criterion 2 does not name a measurable check",
+      },
+    });
+    // The `onToolDone` shape: ok:false plus the same error object.
+    renderer.handlers.onToolDone?.({
+      id: "3:1:code_run",
+      name: "code_run",
+      step: 3,
+      ok: false,
+      error: {
+        code: "sandbox_prepare_rejected",
+        message: "workspace name is already owned by another run",
+      },
+    });
+    // The third failure-bearing kind, a standalone refusal.
+    renderer.handlers.onTrace?.({
+      kind: "tool_rejected",
+      id: "3:2:append_to_current_file",
+      toolName: "append_to_current_file",
+      error: {
+        code: "mission_graph_authority_blocked",
+        message: "no graph-ready slot authorizes an append here",
+      },
+    });
+
+    assert.deepEqual(
+      renderer
+        .events()
+        .map((event) => [event.kind, event.errorCode, event.errorMessage]),
+      [
+        [
+          "tool_result",
+          "project_idea_brief_invalid",
+          "acceptance criterion 2 does not name a measurable check",
+        ],
+        [
+          "tool_done",
+          "sandbox_prepare_rejected",
+          "workspace name is already owned by another run",
+        ],
+        [
+          "tool_rejected",
+          "mission_graph_authority_blocked",
+          "no graph-ready slot authorizes an append here",
+        ],
+      ],
+    );
+
+    // The message goes into the event object and NOWHERE else. The recent ring
+    // is free-form text the harness prints when a coordinator fails to settle;
+    // a message that can carry a forwarded credential must not land there.
+    const ring = renderer.recent().join("\n");
+    for (const sentence of [
+      "does not name a measurable check",
+      "already owned by another run",
+      "no graph-ready slot",
+    ]) {
+      assert.ok(
+        !ring.includes(sentence),
+        `a failure message must never be logged into the status ring (${sentence})`,
+      );
+    }
+  } finally {
+    releaseFakeRenderer();
+  }
+});
+
+test("a page-side failure message survives the whole path to failureDetails", async () => {
+  const renderer = await armAgainstFakeRenderer();
+  try {
+    const sentence = "acceptance criterion 2 does not name a measurable check";
+    renderer.handlers.onTrace?.({
+      kind: "tool_start",
+      id: "3:0:create_project_idea_brief:start",
+      toolName: "create_project_idea_brief",
+    });
+    renderer.handlers.onTrace?.({
+      kind: "tool_result",
+      id: "3:0:create_project_idea_brief:result",
+      toolName: "create_project_idea_brief",
+      error: { code: "project_idea_brief_invalid", message: sentence },
+    });
+    renderer.handlers.onTrace?.({
+      kind: "tool_start",
+      id: "3:1:web_search:start",
+      toolName: "web_search",
+    });
+    renderer.handlers.onToolDone?.({
+      id: "3:1:web_search",
+      name: "web_search",
+      ok: true,
+    });
+
+    // The live diagnosis path...
+    const peeked = await peekToolCallCollector(renderer.page);
+    assert.equal(peeked.failureDetails?.length, 1);
+    assert.equal(peeked.failureDetails?.[0]?.errorMessage, sentence);
+    const diagnostics = await peekToolCallCollectorDiagnosticsV1(renderer.page);
+    assert.equal(
+      diagnostics.find((entry) => entry.errorCode === "project_idea_brief_invalid")
+        ?.errorMessage,
+      sentence,
+    );
+
+    // ...and the durable-record path, which is what a cohort keeps.
+    const counts = await harvestToolCallCollector(renderer.page);
+    assert.equal(counts.coverage, "complete");
+    assert.equal(counts.attempted, 2);
+    assert.equal(counts.failed, 1);
+    assert.equal(counts.succeeded, 1);
+    const detail = counts.failureDetails?.[0];
+    assert.equal(detail?.id, "3:0:create_project_idea_brief");
+    assert.equal(detail?.toolName, "create_project_idea_brief");
+    assert.equal(detail?.errorCode, "project_idea_brief_invalid");
+    assert.equal(
+      detail?.errorMessage,
+      sentence,
+      "the cohort-ending code must arrive with the sentence that names its rule",
+    );
+    // The end of the path is the assertion string a lane actually prints.
+    assert.match(
+      JSON.stringify(counts.failureDetails),
+      /does not name a measurable check/u,
+    );
+  } finally {
+    releaseFakeRenderer();
+  }
+});
+
+/**
+ * Probes chosen for what each one PROVES, not for coverage: a rule sentence
+ * that must survive whole, prose that merely contains the word "token" and must
+ * not be mangled into noise, and the four shapes a message can smuggle across
+ * the renderer boundary — a vault path, a shell command with a flag-named
+ * secret, a bearer credential, a URL with a key in it — plus a stack trace that
+ * must be bounded and a blank message that must read as unobserved.
+ */
+const MESSAGE_PROBES = [
+  "acceptance criterion 2 does not name a measurable check",
+  "the authority grant token is invalid",
+  "failed writing Research/Private Client Note.md",
+  "python3 /home/user/secrets/run_payroll.py --token abc123",
+  "provider rejected Bearer sk-live-0123456789abcdef",
+  "fetch failed for https://api.example.com/v1/items?api_key=abcdef123456",
+  `boom\n    at Object.<anonymous>\n${"    at frame (deep stack) ".repeat(20)}`,
+  "   \n\t  ",
+  "",
+];
+
+test("the page-side projection is behaviorally identical to the module's projector", async () => {
+  const renderer = await armAgainstFakeRenderer();
+  try {
+    MESSAGE_PROBES.forEach((probe, index) => {
+      renderer.handlers.onToolDone?.({
+        id: `9:${index}:code_run`,
+        name: "code_run",
+        ok: false,
+        error: { code: "execution_failed", message: probe },
+      });
+    });
+    const projected: (string | null)[] = renderer
+      .events()
+      .map((event) => event.errorMessage);
+
+    // The pin: the page-side copy and the module that owns it must agree on
+    // every probe. Equality alone could be satisfied by two matching mistakes,
+    // so the properties that matter are named individually below.
+    assert.deepEqual(
+      projected,
+      MESSAGE_PROBES.map((probe) => projectToolFailureMessageV1(probe)),
+      "the page-side copy has drifted from projectToolFailureMessageV1",
+    );
+
+    const [rule, grant, notePath, command, bearer, url, stack, blank, empty] =
+      projected;
+    assert.equal(rule, MESSAGE_PROBES[0], "a rule sentence must survive whole");
+    assert.equal(
+      grant,
+      MESSAGE_PROBES[1],
+      "prose that merely says 'token' must not be mangled into noise",
+    );
+    assert.ok(
+      !String(notePath).includes("Private Client Note") &&
+        !String(notePath).includes(".md"),
+      "a vault path must not cross the renderer boundary",
+    );
+    assert.ok(
+      !String(command).includes("/home/user/secrets") &&
+        !String(command).includes("abc123"),
+      "a command path and its flag-named secret must not cross",
+    );
+    assert.ok(
+      !String(bearer).includes("sk-live-0123456789abcdef"),
+      "a bearer credential must not cross",
+    );
+    assert.ok(
+      !String(url).includes("api.example.com") &&
+        !String(url).includes("abcdef123456"),
+      "a URL and the key inside it must not cross",
+    );
+    // Positive proof the redactor did not simply blank everything: each of
+    // those four still names its failure.
+    for (const [label, value] of [
+      ["path", notePath],
+      ["command", command],
+      ["bearer", bearer],
+      ["url", url],
+    ] as const) {
+      assert.ok(
+        String(value).length > 0 && /[a-z]{4,}/u.test(String(value)),
+        `the redacted ${label} message must still say something`,
+      );
+    }
+    assert.ok(
+      String(stack).length <= TOOL_CALL_FAILURE_MESSAGE_CAP,
+      "an echoed stack trace must be bounded before it crosses",
+    );
+    assert.ok(!String(stack).includes("\n"), "the message must be single-line");
+    assert.equal(blank, null, "a whitespace-only message is unobserved");
+    assert.equal(empty, null, "an empty message is unobserved");
+  } finally {
+    releaseFakeRenderer();
+  }
+});
+
+test("an error with no message reads as unobserved, never as an empty observation", async () => {
+  const renderer = await armAgainstFakeRenderer();
+  try {
+    // No `message` at all: the common shape for a typed refusal.
+    renderer.handlers.onToolDone?.({
+      id: "4:0:web_search",
+      name: "web_search",
+      ok: false,
+      error: { code: "execution_failed" },
+    });
+    // A message that redacts away to nothing must land in the same place.
+    renderer.handlers.onTrace?.({
+      kind: "tool_result",
+      id: "4:1:web_fetch:result",
+      toolName: "web_fetch",
+      error: { code: "execution_failed", message: "   \n  " },
+    });
+    renderer.handlers.onToolDone?.({
+      id: "4:2:append_to_current_file",
+      name: "append_to_current_file",
+      ok: true,
+    });
+
+    for (const event of renderer.events()) {
+      assert.ok(
+        "errorMessage" in event,
+        "the field must be emitted explicitly, so null survives JSON.stringify",
+      );
+      assert.equal(event.errorMessage, null);
+      assert.notEqual(event.errorMessage, "", "empty string is an observation");
+    }
+
+    // An unobserved message must not make an otherwise complete capture look
+    // lossy, and must not cost the observation a single count.
+    const counts = await harvestToolCallCollector(renderer.page);
+    assert.equal(counts.coverage, "complete");
+    assert.equal(counts.attempted, 3);
+    assert.equal(counts.failed, 2);
+    assert.equal(counts.succeeded, 1);
+    assert.deepEqual(
+      counts.failureDetails?.map((entry) => entry.errorMessage),
+      [null, null],
+    );
+    assert.deepEqual(
+      counts.failureDetails?.map((entry) => entry.errorCode),
+      ["execution_failed", "execution_failed"],
+    );
+  } finally {
+    releaseFakeRenderer();
+  }
+});
+
+test("the page-side redaction copy is pinned to the module that owns it", () => {
+  const collector = readRepoFile("e2e/fixtures/toolCallCollector.ts");
+  const outcomes = readRepoFile("e2e/fixtures/toolCallOutcomes.ts");
+  const start = collector.indexOf("const messageRedactions");
+  const end = collector.indexOf("const push =", start);
+  assert.ok(
+    start > 0 && end > start,
+    "the page-side message projection must exist between codeOf and push",
+  );
+  // Line comments go first: this block explains the redaction in prose, and a
+  // lexical check that cannot tell prose from code would fire on the
+  // explanation — a trap this repo has already sprung twice.
+  const pageSide = collector.slice(start, end).replace(/^[ \t]*\/\/.*$/gmu, "");
+  const literals =
+    pageSide.match(/\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])+\/[gimsuy]*/gu) ?? [];
+  // Non-vacuity: an extraction that found nothing would satisfy the loop below
+  // and prove nothing. Eight redaction rules plus the whitespace collapse.
+  assert.ok(
+    literals.length >= 9,
+    `expected the redaction table and the collapse, extracted ${literals.length}`,
+  );
+  for (const literal of literals) {
+    assert.ok(
+      outcomes.includes(literal),
+      `page-side ${literal} is not a verbatim copy of a rule in toolCallOutcomes.ts`,
+    );
+  }
+  assert.ok(
+    pageSide.includes(`const messageCap = ${TOOL_CALL_FAILURE_MESSAGE_CAP};`),
+    "the page-side cap must equal TOOL_CALL_FAILURE_MESSAGE_CAP",
   );
 });

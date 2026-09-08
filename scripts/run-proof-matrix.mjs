@@ -562,6 +562,24 @@ function safeCount(value) {
 // unknown-preserving count arithmetic. Do not re-inline it here.
 
 /**
+ * Bound on the failed-call details ONE attempt's roll-up retains, mirroring
+ * TOOL_CALL_FAILURE_DETAIL_CAP in e2e/fixtures/toolCallOutcomes.ts.
+ *
+ * The value is carried verbatim rather than imported because this module runs
+ * under plain `node` and that fixture is TypeScript whose own imports carry no
+ * extensions, so node cannot resolve it. That is the same arrangement the
+ * page-side collector uses for RECEIPT_IDENTITY_DIGEST, and it carries the same
+ * duty: a source test pins the two numbers equal so they cannot drift apart.
+ *
+ * A cap is needed HERE because this roll-up merges records. Each of an
+ * attempt's run-summary records may carry up to that many details of its own,
+ * and their sum is written into the manifest and interpolated into one console
+ * line. mergeToolCallOutcomeCountsV1 bounds the identical merge to the identical
+ * number, so a rolled-up list can never grow past what one fold could produce.
+ */
+export const PROOF_MATRIX_FAILURE_DETAIL_CAP = 32;
+
+/**
  * Sum the tool-call counters across a daily-use run summary's records. The
  * caller guarantees freshness (the summary was written during THIS attempt),
  * so every record belongs to the attempt window. Failed and vacuous sums are
@@ -592,10 +610,15 @@ export function summaryToolEventTotals(summary) {
     // buckets came from a complete fold contributes all keys with explicit
     // zeros, so those rows still make the whole vocabulary known.
     buckets: null,
-    // Content-free failed-call identity from the shared collector. The
-    // reporter carries this inside toolCallOutcomes, so it survives the
-    // passing lane's mandatory cleanup that deletes run-owned graphs.
+    // Content-free failed-call identity AND CAUSE from the shared collector.
+    // The reporter carries this inside toolCallOutcomes, so it survives the
+    // passing lane's mandatory cleanup that deletes run-owned graphs. Both the
+    // typed errorCode and the product's own errorMessage travel: a code names a
+    // family of rules and the message names which one broke, and a cohort that
+    // dies is read from this roll-up rather than from a second lane run.
     failureDetails: null,
+    // Null until some record spoke; true once details were dropped, either by
+    // the record's own fold or by this roll-up's cap below.
     failureDetailsTruncated: null,
   };
   for (const record of records) {
@@ -630,6 +653,11 @@ export function summaryToolEventTotals(summary) {
     if (Array.isArray(failureDetails)) {
       totals.failureDetails ??= [];
       for (const detail of failureDetails) {
+        // Identity shape only. `errorMessage` is checked where it is read, not
+        // here, because it is ADDITIVE: a record written by a reporter that
+        // predates the field carries none at all, and dropping the whole detail
+        // over a missing or malformed message would throw away the id, code and
+        // bucket that did arrive — losing more diagnosis than it protects.
         if (
           !detail ||
           typeof detail !== "object" ||
@@ -651,6 +679,26 @@ export function summaryToolEventTotals(summary) {
           id: detail.id,
           toolName: detail.toolName,
           errorCode: detail.errorCode,
+          // The product's own sentence for this failure, and the whole reason a
+          // dead cohort is diagnosable from the manifest alone. A code names a
+          // FAMILY — `project_idea_brief_invalid` is raised from eight places,
+          // each naming a different broken rule — so a roll-up that kept only
+          // the code cost a twelve-minute lane re-run to learn which rule broke.
+          // Emitted explicitly, so `null` reaches the manifest as itself rather
+          // than disappearing the way an `undefined` property would.
+          //
+          // Deliberately NOT re-redacted here. The value arriving in this
+          // roll-up has already been through projectToolFailureMessageV1 inside
+          // foldToolCallOutcomesV1 — the one redactor, which itself re-projects
+          // whatever the foreign page-side collector hands it — and this module
+          // cannot import that function, because it runs under plain `node`. A
+          // hand-written second denylist in this file could only drift from the
+          // first and start disagreeing about what is safe to keep. So the check
+          // is the one `errorCode` already gets: a non-empty string or nothing.
+          errorMessage:
+            typeof detail.errorMessage === "string" && detail.errorMessage.length > 0
+              ? detail.errorMessage
+              : null,
           bucket: detail.bucket,
         });
       }
@@ -658,6 +706,22 @@ export function summaryToolEventTotals(summary) {
         totals.failureDetailsTruncated === true ||
         record?.toolCallOutcomes?.failureDetailsTruncated === true;
     }
+  }
+  // Bound the MERGED list, the way mergeToolCallOutcomeCountsV1 bounds its own
+  // merge of two folds. Until this existed the roll-up was the one stage with no
+  // cap: each record contributed up to a full fold's worth of details and the
+  // concatenation went into the manifest unbounded. Truncating is acceptable;
+  // truncating SILENTLY is not, so the same flag the reader already prints is
+  // raised here, which is what turns a short list into a stated sample.
+  if (
+    totals.failureDetails !== null &&
+    totals.failureDetails.length > PROOF_MATRIX_FAILURE_DETAIL_CAP
+  ) {
+    totals.failureDetails = totals.failureDetails.slice(
+      0,
+      PROOF_MATRIX_FAILURE_DETAIL_CAP,
+    );
+    totals.failureDetailsTruncated = true;
   }
   return totals;
 }
@@ -2518,7 +2582,14 @@ async function main() {
           `proof-matrix[${stage}]: mission outcome may still be green, but ` +
             `${toolEvents.failed}/${toolEvents.observed ?? "?"} tool calls failed; ` +
             `content-free failure details=${details}` +
-            (toolEvents.failureDetailsTruncated === true ? " (truncated)" : ""),
+            // Say WHAT was cut and to what, not merely that something was. A
+            // reader comparing this list against the failed count above has to
+            // know the shortfall is a cap and not a disagreement between two
+            // counters, or the list reads as evidence that the rest succeeded.
+            (toolEvents.failureDetailsTruncated === true
+              ? ` (list capped at ${PROOF_MATRIX_FAILURE_DETAIL_CAP} details — the` +
+                " remaining failed calls were dropped, so read this as a sample)"
+              : ""),
         );
       }
       const acceptance = summarizeAttemptAcceptance(

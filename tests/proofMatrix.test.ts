@@ -58,6 +58,7 @@ import {
   LEGACY_MANIFEST_RELATIVE_PATH,
   MAX_CONSECUTIVE_HARNESS_FAILURES,
   PROOF_MATRIX_ATTEMPT_LOG_RELATIVE_DIR,
+  PROOF_MATRIX_FAILURE_DETAIL_CAP,
   PROOF_MATRIX_MANIFEST_RELATIVE_PATH,
   PROOF_MATRIX_STATE_RELATIVE_DIR,
   RENDERER_DEATH_FAILURE_CLASS,
@@ -87,6 +88,11 @@ import {
 } from "../scripts/run-proof-matrix.mjs";
 import { TOOL_REFUSAL_MARKER_BUCKETS } from "../e2e/reporters/dailyUseReporter";
 import { composeMandatoryCleanupError } from "../e2e/fixtures/externalCleanup";
+import {
+  TOOL_CALL_FAILURE_DETAIL_CAP,
+  foldToolCallOutcomesV1,
+  normalizeMissionToolEventV1,
+} from "../e2e/fixtures/toolCallOutcomes";
 
 function manifestWith(attempts: ProofMatrixAttempt[]): ProofMatrixManifest {
   return { attempts, productClassCounts: {} };
@@ -931,12 +937,16 @@ test("a fresh run summary outranks graph mining as the tool-event source", () =>
 });
 
 test("fresh summaries preserve bounded failed-call identity after graph cleanup", () => {
+  // Deliberately a PRE-FIELD detail: no errorMessage key at all, the shape a
+  // record written by a reporter that predates the field still has. It must
+  // survive whole, with the message reported as unobserved.
   const detail = {
     id: "2:1:read_current_file",
     toolName: "read_current_file",
     errorCode: null,
     bucket: "other",
   };
+  const unobserved = { ...detail, errorMessage: null };
   const summary = {
     records: [
       {
@@ -950,7 +960,9 @@ test("fresh summaries preserve bounded failed-call identity after graph cleanup"
     ],
   };
   const totals = summaryToolEventTotals(summary);
-  assert.deepEqual(totals?.failureDetails, [detail]);
+  assert.deepEqual(totals?.failureDetails, [unobserved]);
+  // An unobserved message must not make an otherwise complete record look
+  // lossy: nothing was dropped, so nothing claims a truncation.
   assert.equal(totals?.failureDetailsTruncated, false);
 
   const events = resolveAttemptToolEvents({
@@ -958,7 +970,7 @@ test("fresh summaries preserve bounded failed-call identity after graph cleanup"
     summaryFresh: true,
     minedCounts: { observed: 0, failed: 0, buckets: null },
   });
-  assert.deepEqual(events.failureDetails, [detail]);
+  assert.deepEqual(events.failureDetails, [unobserved]);
   assert.equal(events.failureDetailsTruncated, false);
 
   const stale = resolveAttemptToolEvents({
@@ -968,6 +980,205 @@ test("fresh summaries preserve bounded failed-call identity after graph cleanup"
   });
   assert.equal(stale.failureDetails, null, "graphs cannot recover per-call failure identity");
   assert.equal(stale.failureDetailsTruncated, null);
+});
+
+/**
+ * Build the record a run summary really holds for one failed call, by driving
+ * the PRODUCERS rather than writing the shape out by hand: raw native events
+ * through normalizeMissionToolEventV1, the fold, and the JSON round-trip the
+ * annotation and the summary file both perform. The defect this pins is that
+ * the roll-up never wrote `errorMessage` at all, so a fixture that simply
+ * asserts a hand-made object into the roll-up proves nothing about the producer.
+ */
+function summaryRecordForFailedCall(input: {
+  code: string | null;
+  message?: string;
+}): Record<string, unknown> {
+  const events = [
+    { kind: "tool_start", id: "3:0:project_idea_brief", toolName: "project_idea_brief" },
+    {
+      kind: "tool_result",
+      id: "3:0:project_idea_brief:result",
+      toolName: "project_idea_brief",
+      error: {
+        ...(input.code === null ? {} : { code: input.code }),
+        ...(input.message === undefined ? {} : { message: input.message }),
+      },
+    },
+    { kind: "tool_start", id: "3:1:append_to_note", toolName: "append_to_note" },
+    { kind: "tool_result", id: "3:1:append_to_note:result", toolName: "append_to_note" },
+  ].map((event) => normalizeMissionToolEventV1(event, "trace")!);
+  const counts = foldToolCallOutcomesV1(events);
+  // The round-trip is not decoration: the summary reaches the roll-up as text
+  // on disk, and an `undefined` field would not survive it.
+  return JSON.parse(
+    JSON.stringify({
+      scenarioId: "DU-06",
+      toolCallsAttempted: counts.attempted,
+      toolCallsFailed: counts.failed,
+      toolCallOutcomes: counts,
+    }),
+  ) as Record<string, unknown>;
+}
+
+test("a failed call's CAUSE, not just its code, reaches the manifest on disk", () => {
+  // One of the eight sentences behind `project_idea_brief_invalid` — the code
+  // that killed a 504-run cohort while naming a family instead of a rule.
+  const raised = "project idea brief must name at least one acceptance criterion";
+  const record = summaryRecordForFailedCall({
+    code: "project_idea_brief_invalid",
+    message: raised,
+  });
+  // The fixture is realistic only if the real fold actually carries the
+  // sentence; assert that before asking the roll-up to preserve it.
+  const folded = record.toolCallOutcomes as { failureDetails: { errorMessage: string }[] };
+  assert.equal(folded.failureDetails[0]?.errorMessage, raised);
+
+  const summary = { records: [record] };
+  const totals = summaryToolEventTotals(summary);
+  assert.equal(totals?.failureDetails?.length, 1);
+  assert.equal(totals?.failureDetails?.[0]?.errorCode, "project_idea_brief_invalid");
+  assert.equal(
+    totals?.failureDetails?.[0]?.errorMessage,
+    raised,
+    "the roll-up must keep the sentence that names WHICH rule broke",
+  );
+
+  const toolEvents = resolveAttemptToolEvents({
+    summary,
+    summaryFresh: true,
+    minedCounts: { observed: 0, failed: 0, buckets: null },
+  });
+  assert.equal(toolEvents.failureDetails?.[0]?.errorMessage, raised);
+
+  // ...and all the way onto disk, because the manifest — not the run summary,
+  // which the next attempt's Playwright wipe deletes — is the artifact a dead
+  // cohort is diagnosed from.
+  const gate = resolveReliabilityGate("qualification99");
+  const cohort = buildQualificationCohort({
+    gate,
+    cells: CELLS,
+    seed: "failure-message-seed",
+  });
+  const occurrence = cohort.occurrences[0];
+  const declaration = { ...cohort, cohortId: "cohort-under-test" };
+  const manifest = {
+    model: PROOF_MATRIX_MODEL,
+    expectedHead: "0".repeat(40),
+    attempts: [
+      {
+        cell: occurrence.workflow,
+        occurrenceId: occurrence.occurrenceId,
+        cohortId: declaration.cohortId,
+        workflow: occurrence.workflow,
+        model: PROOF_MATRIX_MODEL,
+        headSha: "0".repeat(40),
+        launched: true,
+        green: false,
+        failureClass: "product:tool_call_failed",
+        durationS: 240,
+        toolEvents,
+        acceptance: null,
+      },
+    ],
+  };
+  const dir = tempDir();
+  try {
+    const target = path.join(dir, "proof-matrix-manifest.json");
+    writeJsonAtomic(target, manifest);
+    const onDisk = readFileSync(target, "utf8");
+    assert.ok(
+      onDisk.includes(raised),
+      "the retained manifest must spell out the broken rule, not only its code",
+    );
+    const parsed = JSON.parse(onDisk) as {
+      attempts: { toolEvents: { failureDetails: { errorMessage: string | null }[] } }[];
+    };
+    assert.equal(parsed.attempts[0].toolEvents.failureDetails[0].errorMessage, raised);
+
+    // The cohort projection copies toolEvents wholesale; pin that it keeps
+    // doing so, since a field-by-field rebuild there would make the fix inert.
+    // Read through a local widening: qualification-cohort.d.mts declares a
+    // narrower toolEvents than the record actually carries.
+    const derived = deriveQualificationRecords(parsed, declaration);
+    const kept = derived.records.find(
+      (entry) => entry.occurrenceId === occurrence.occurrenceId,
+    ) as unknown as
+      | { toolEvents?: { failureDetails?: { errorMessage?: string | null }[] } | null }
+      | undefined;
+    assert.equal(kept?.toolEvents?.failureDetails?.[0]?.errorMessage, raised);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unobserved failure message is null, and does not make a record look lossy", () => {
+  // A refusal with a typed code and no sentence at all — the honest shape when
+  // the product raised no message. Null must mean UNOBSERVED here, exactly as
+  // it does in the fold, so a reader cannot mistake "" for "the rule was blank".
+  const record = summaryRecordForFailedCall({ code: "mission_graph_authority_blocked" });
+  const totals = summaryToolEventTotals({ records: [record] });
+  const detail = totals?.failureDetails?.[0];
+  assert.equal(detail?.errorCode, "mission_graph_authority_blocked");
+  assert.equal(detail?.errorMessage, null);
+  assert.notEqual(detail?.errorMessage, "");
+  // Explicitly PRESENT, not merely absent: an `undefined` property would vanish
+  // through JSON.stringify and the manifest could not tell "nobody observed a
+  // message" from "this roll-up forgot the field again".
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(detail ?? {}, "errorMessage"),
+    "errorMessage must be emitted explicitly so null survives serialization",
+  );
+  assert.deepEqual(Object.keys(detail ?? {}).sort(), [
+    "bucket",
+    "errorCode",
+    "errorMessage",
+    "id",
+    "toolName",
+  ]);
+  // Nothing about a missing message is lossy: the rest of the record is intact
+  // and the counters are untouched.
+  assert.equal(totals?.failureDetailsTruncated, false);
+  assert.equal(totals?.observed, 2);
+  assert.equal(totals?.failed, 1);
+  assert.equal(detail?.toolName, "project_idea_brief");
+});
+
+test("the rolled-up failure list is capped, and says so when it caps", () => {
+  // The roll-up MERGES records, so an attempt with several run summaries could
+  // hand the manifest an unbounded list. The cap is the sibling fold's, and a
+  // truncated list has to admit it — a short list read as complete is a worse
+  // diagnosis than no list at all.
+  assert.equal(
+    PROOF_MATRIX_FAILURE_DETAIL_CAP,
+    TOOL_CALL_FAILURE_DETAIL_CAP,
+    "the roll-up's cap must equal the fold's; the copy exists only because " +
+      "this module runs under plain node and cannot import the TypeScript one",
+  );
+  const records = Array.from({ length: PROOF_MATRIX_FAILURE_DETAIL_CAP + 4 }, (_, index) =>
+    summaryRecordForFailedCall({
+      code: "project_idea_brief_invalid",
+      message: `rule ${index} was broken`,
+    }),
+  );
+  const totals = summaryToolEventTotals({ records });
+  assert.equal(totals?.failureDetails?.length, PROOF_MATRIX_FAILURE_DETAIL_CAP);
+  assert.equal(
+    totals?.failureDetailsTruncated,
+    true,
+    "a capped list must be reported as capped, not passed off as complete",
+  );
+  // Every retained entry still carries its cause; the cap drops whole details,
+  // it does not hollow them out.
+  assert.ok(
+    totals?.failureDetails?.every((entry) => typeof entry.errorMessage === "string"),
+  );
+  // A list that fits is NOT flagged — the flag has to mean something.
+  const fits = summaryToolEventTotals({
+    records: records.slice(0, 2),
+  });
+  assert.equal(fits?.failureDetails?.length, 2);
+  assert.equal(fits?.failureDetailsTruncated, false);
 });
 
 test("unknown is never collapsed into zero: explicit summary zeros vs no source at all", () => {

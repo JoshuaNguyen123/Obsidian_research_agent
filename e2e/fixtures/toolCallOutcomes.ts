@@ -41,7 +41,19 @@ import {
  *   second classifier and no second bucket vocabulary in this file.
  */
 
-/** Normalized, JSON-safe mission event. Collectors emit only these. */
+/**
+ * Normalized, JSON-safe mission event. Collectors emit only these.
+ *
+ * `errorMessage` is OPTIONAL on the three failure-bearing kinds, and it is the
+ * one field in this union that may be absent. The page-side collector cannot
+ * import this module — it constructs these objects by hand inside
+ * `page.evaluate` — so a producer that does not project a message has to read
+ * as UNOBSERVED, never as "observed empty", and must not make an otherwise
+ * complete capture look lossy. This module's own producer
+ * (`normalizeMissionToolEventV1`) always emits the field explicitly, so absence
+ * only ever means "that producer had nothing to say". See
+ * `projectToolFailureMessageV1` for what a message must survive to be kept.
+ */
 export type ToolCallOutcomeEventV1 =
   | {
       kind: "tool_start";
@@ -54,18 +66,21 @@ export type ToolCallOutcomeEventV1 =
       toolName: string | null;
       ok: boolean | null;
       errorCode: string | null;
+      errorMessage?: string | null;
     }
   | {
       kind: "tool_result";
       id: string;
       toolName: string | null;
       errorCode: string | null;
+      errorMessage?: string | null;
     }
   | {
       kind: "tool_rejected";
       id: string;
       toolName: string | null;
       errorCode: string | null;
+      errorMessage?: string | null;
     }
   | {
       kind: "receipt";
@@ -138,10 +153,13 @@ export interface ToolCallOutcomeCountsV1 {
    */
   failureBuckets: Record<string, number> | null;
   /**
-   * Bounded, content-free identity for each failed logical call. This keeps a
-   * green mission that recovered from a failed call diagnosable after the
-   * native harness deletes its run-owned graph: no arguments, paths, output,
-   * note text, or provider payloads are retained.
+   * Bounded, content-free identity and CAUSE for each failed logical call. This
+   * keeps a green mission that recovered from a failed call diagnosable after
+   * the native harness deletes its run-owned graph: no arguments, paths,
+   * output, note text, or provider payloads are retained — the product's own
+   * failure sentence is, after `projectToolFailureMessageV1` has redacted the
+   * paths, URLs and credentials such a sentence can interpolate and bounded it
+   * to TOOL_CALL_FAILURE_MESSAGE_CAP.
    *
    * Null means the capture was unobserved/lossy (unknown); an empty array is
    * an explicit complete observation with no failed calls.
@@ -190,11 +208,43 @@ export interface ToolCallFailureDetailV1 {
   id: string;
   toolName: string | null;
   errorCode: string | null;
+  /**
+   * The product's own sentence for this failure, redacted and bounded by
+   * `projectToolFailureMessageV1`, or null when no producer observed one.
+   *
+   * WHY IT IS HERE. A qualification cohort died on
+   * `failures=[{"errorCode":"project_idea_brief_invalid", ...}]`, and that code
+   * is raised from EIGHT places in src/tools/projectIdeaBriefTool.ts, each
+   * naming a different broken rule in its message. The code alone therefore
+   * names a family, not a cause, and teardown deletes the run note that held
+   * the message — so the only way to learn which rule broke was another
+   * twelve-minute lane run. The message already rides in
+   * `AgentTraceEvent.error` / `AgentToolRunEvent.error` beside the code we
+   * kept; it was simply being thrown away.
+   *
+   * It is taken from the SAME error object that supplied `errorCode`, so the
+   * two can never describe different failures of one call.
+   */
+  errorMessage: string | null;
   bucket: string;
 }
 
 /** Keep summaries useful without allowing a pathological run to grow them. */
 export const TOOL_CALL_FAILURE_DETAIL_CAP = 32;
+
+/**
+ * Bound on ONE retained failure message.
+ *
+ * Chosen in the spirit of the detail cap beside it: the whole list is
+ * interpolated into a Playwright assertion string, so the worst case a reader
+ * has to scan is TOOL_CALL_FAILURE_DETAIL_CAP x this, about 6 KB — long enough
+ * to page through, short enough that no single message can bury the other 31.
+ * It is also chosen against the messages this exists FOR: every one of the
+ * eight `project_idea_brief_invalid` sentences is under 100 characters, so a
+ * real rule survives whole and only a message that has stopped being a rule
+ * name — a stack trace, a provider body echoed back — is cut.
+ */
+export const TOOL_CALL_FAILURE_MESSAGE_CAP = 200;
 
 /** Failure bucket for an error code that matches no known refusal marker. */
 export const TOOL_CALL_FAILURE_BUCKET_OTHER = "other";
@@ -234,6 +284,110 @@ function asText(value: unknown): string | null {
 function errorCodeOf(value: unknown): string | null {
   if (!value || typeof value !== "object") return null;
   return asText((value as { code?: unknown }).code);
+}
+
+/**
+ * Substitutions applied to a failure message before it is retained, in order.
+ *
+ * A REDACTION IS NEEDED HERE, and this is not theoretical. `error.message` is
+ * free-form product text: `AgentRunner` forwards arbitrary caught errors into
+ * it verbatim (`getUnknownErrorMessage`), `projectIdeaBriefTool` forwards the
+ * message of a schema failure over the model's own arguments, and
+ * `atomicVaultWrite` interpolates a vault path into its own sentence. The
+ * product already treats these messages as credential-bearing at its other
+ * seams — `GitHubRestClient.redactSecret` scrubs a token out of exactly this
+ * field before building it — so this is the last scrub before the value is
+ * embedded in a public assertion string and a retained record.
+ *
+ * PATHS AND URLS GO TOO, beyond the credentials asked for. The evidence-lane
+ * privacy contract (tests/evidenceProjectionPrivacy.test.ts) is that no vault
+ * content, path, command or payload crosses this boundary, and its own poison
+ * fixtures prove `error.message` carries both a vault path and a shell command.
+ * Keeping the message without redacting those would have quietly widened a
+ * release-blocking contract.
+ *
+ * The list is a denylist, matching every other redactor in this repo
+ * (CompanionClient, GitHubRestClient, runCoordinator). Its residual is stated
+ * honestly on `projectToolFailureMessageV1`. Order matters: the more specific
+ * credential shapes run before the generic path rule, which would otherwise
+ * swallow a URL and hide what was in it.
+ */
+const FAILURE_MESSAGE_REDACTIONS: readonly (readonly [RegExp, string])[] = [
+  [/Bearer\s+\S+/giu, "Bearer [redacted]"],
+  // `--token abc123`: a flag names its own value, so whitespace is enough.
+  [
+    /(--?(?:api[_-]?key|token|key|secret|password|auth|bearer)\b)[\s=:]+\S+/giu,
+    "$1=[redacted]",
+  ],
+  // A bare word needs an EXPLICIT assignment separator. Accepting whitespace
+  // here would rewrite "the authority grant token is invalid" into noise, and
+  // mangling real rule sentences is the failure this whole field exists to fix.
+  [
+    /\b(api[_-]?key|token|secret|password|passwd|authorization|credential)\b\s*[=:]\s*\S+/giu,
+    "$1=[redacted]",
+  ],
+  [
+    /\b(?:gh[pousr]_|github_pat_|sk-|xox[abprs]-|lin_api_)[A-Za-z0-9_-]{8,}/gu,
+    "[redacted-credential]",
+  ],
+  [/\b(?:https?|file|ftp|ws|wss):\/\/\S+/giu, "[redacted-url]"],
+  // Anything holding a separator is a path or a URL remnant, never a rule name.
+  [/\S*[\\/]\S*/gu, "[redacted-path]"],
+  // A bare filename keeps a note's title, which is vault content on its own.
+  [
+    /\b[\w .()-]{0,64}\.(?:md|markdown|txt|json|jsonl|ya?ml|tsx?|jsx?|mjs|cjs|py|sh|ps1|csv|pdf|png|jpe?g|gif|log|html?)\b/giu,
+    "[redacted-path]",
+  ],
+  // Nothing this long and this opaque is an English word; it is a key, a token
+  // or a digest. Deliberately last, so the labelled shapes above win.
+  [/\b[A-Za-z0-9_-]{32,}\b/gu, "[redacted-opaque]"],
+];
+
+/**
+ * Project one raw `error.message` down to a retainable failure sentence, or
+ * null when there is nothing to retain.
+ *
+ * The SAME observation rules as `errorCodeOf`: a value that is not a non-empty
+ * string is null — unobserved — and an empty result after redaction is null
+ * too, never `""`. A message we cannot keep must look exactly like a message
+ * nobody reported, because both are "this detail cannot name the rule".
+ *
+ * Idempotent by construction, so it can run at the normalizing boundary AND
+ * again in the fold: every substitution leaves text no substitution matches
+ * differently on a second pass, and truncation is a no-op once under the cap.
+ * That matters because the page-side collector is a foreign producer — the
+ * fold must be able to bound whatever it is handed rather than trusting it.
+ *
+ * RESIDUAL, stated plainly: a denylist cannot catch prose. A tool that chose to
+ * echo note text into its own error sentence would still be retained. The
+ * product's convention is that an error message names a RULE and interpolates
+ * identifiers and paths, which is what these rules target; a tool that starts
+ * quoting content belongs on this list, not in this comment.
+ */
+export function projectToolFailureMessageV1(value: unknown): string | null {
+  const raw = asText(value);
+  if (raw === null) return null;
+  let redacted = raw;
+  for (const [pattern, replacement] of FAILURE_MESSAGE_REDACTIONS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  // A pasted stack trace or a wrapped provider body arrives full of newlines,
+  // and the assertion that reads this is a single line.
+  const collapsed = redacted.replace(/\s+/gu, " ").trim();
+  if (collapsed.length === 0) return null;
+  return collapsed.length > TOOL_CALL_FAILURE_MESSAGE_CAP
+    ? `${collapsed.slice(0, TOOL_CALL_FAILURE_MESSAGE_CAP - 3)}...`
+    : collapsed;
+}
+
+/**
+ * The message beside the code, read off the SAME error object `errorCodeOf`
+ * reads. Pairing them at the source is what stops a detail from reporting one
+ * failure's code with another failure's sentence.
+ */
+function errorMessageOf(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  return projectToolFailureMessageV1((value as { message?: unknown }).message);
 }
 
 /**
@@ -323,6 +477,7 @@ export function normalizeMissionToolEventV1(
       toolName: asText(event.name) ?? asText(event.toolName),
       ok: typeof event.ok === "boolean" ? event.ok : null,
       errorCode: errorCodeOf(event.error),
+      errorMessage: errorMessageOf(event.error),
     };
   }
 
@@ -373,6 +528,7 @@ export function normalizeMissionToolEventV1(
       id,
       toolName,
       errorCode: errorCodeOf(event.error),
+      errorMessage: errorMessageOf(event.error),
     };
   }
   if (kind === "tool_rejected") {
@@ -381,6 +537,7 @@ export function normalizeMissionToolEventV1(
       id,
       toolName,
       errorCode: errorCodeOf(event.error),
+      errorMessage: errorMessageOf(event.error),
     };
   }
   return null;
@@ -400,13 +557,25 @@ function baseCallKey(id: string): string {
   return id;
 }
 
+/**
+ * One report that a call failed. Code and message are kept TOGETHER rather than
+ * in two parallel lists, because a call can be reported failed on more than one
+ * stream (an `ok:false` done and its `tool_rejected` twin) and a detail that
+ * paired one stream's code with another stream's sentence would name a rule
+ * that never broke.
+ */
+interface CallFailureReport {
+  code: string | null;
+  message: string | null;
+}
+
 interface CallAccumulator {
   id: string;
   toolName: string | null;
   started: boolean;
   terminalOk: boolean;
   terminalFailed: boolean;
-  failureCodes: (string | null)[];
+  failures: CallFailureReport[];
 }
 
 function emptyCall(id: string): CallAccumulator {
@@ -416,7 +585,27 @@ function emptyCall(id: string): CallAccumulator {
     started: false,
     terminalOk: false,
     terminalFailed: false,
-    failureCodes: [],
+    failures: [],
+  };
+}
+
+/**
+ * Read one failure report off an event that says a call failed.
+ *
+ * The message is re-projected here rather than trusted, because the page-side
+ * collector is a foreign producer that cannot import this module: whatever it
+ * hands over must still be redacted and bounded before it is retained.
+ * `projectToolFailureMessageV1` is idempotent, so a message this module already
+ * projected in `normalizeMissionToolEventV1` passes through unchanged, and an
+ * absent one stays null instead of becoming an empty observation.
+ */
+function failureReportOf(event: {
+  errorCode: string | null;
+  errorMessage?: string | null;
+}): CallFailureReport {
+  return {
+    code: event.errorCode,
+    message: projectToolFailureMessageV1(event.errorMessage),
   };
 }
 
@@ -603,6 +792,7 @@ export function foldToolCallOutcomesV1(
     id: string;
     toolName: string | null;
     errorCode: string | null;
+    errorMessage: string | null;
   }[] = [];
   const receipts: VacuousDetectableReceipt[] = [];
   const seenReceiptIds = new Set<string>();
@@ -649,6 +839,7 @@ export function foldToolCallOutcomesV1(
         id: event.id,
         toolName: event.toolName,
         errorCode: event.errorCode,
+        errorMessage: failureReportOf(event).message,
       });
       continue;
     }
@@ -662,7 +853,7 @@ export function foldToolCallOutcomesV1(
       call.toolName ??= event.toolName;
       if (event.ok === false) {
         call.terminalFailed = true;
-        call.failureCodes.push(event.errorCode);
+        call.failures.push(failureReportOf(event));
       } else if (event.ok === true) {
         call.terminalOk = true;
       }
@@ -674,8 +865,10 @@ export function foldToolCallOutcomesV1(
     call.toolName ??= event.toolName;
     if (event.errorCode) {
       call.terminalFailed = true;
-      call.failureCodes.push(event.errorCode);
+      call.failures.push(failureReportOf(event));
     } else {
+      // A successful result may still carry a message; it describes what the
+      // tool DID, not a broken rule, so it is not a failure report.
       call.terminalOk = true;
     }
   }
@@ -691,7 +884,10 @@ export function foldToolCallOutcomesV1(
     call.toolName ??= rejection.toolName;
     call.terminalFailed = true;
     call.terminalOk = false;
-    call.failureCodes.push(rejection.errorCode);
+    call.failures.push({
+      code: rejection.errorCode,
+      message: rejection.errorMessage,
+    });
   }
 
   let succeeded = 0;
@@ -705,14 +901,23 @@ export function foldToolCallOutcomesV1(
     if (call.terminalFailed) {
       failed += 1;
       // One call is one failure, whatever how many streams reported it; the
-      // bucket comes from the first code that named a reason.
-      const code = call.failureCodes.find((value) => value !== null) ?? null;
+      // bucket comes from the first report that named a reason. The message is
+      // taken from THAT SAME report so the two agree, falling back to the first
+      // report that said anything at all — a stream may carry a sentence
+      // without a typed code, and that sentence is still the only cause we
+      // have. Both are null when nothing named the failure.
+      const reported =
+        call.failures.find((entry) => entry.code !== null) ??
+        call.failures.find((entry) => entry.message !== null) ??
+        null;
+      const code = reported?.code ?? null;
       const bucket = classifyToolFailureBucketV1(code);
       failureBuckets[bucket] += 1;
       allFailureDetails.push({
         id: call.id,
         toolName: call.toolName,
         errorCode: code,
+        errorMessage: reported?.message ?? null,
         bucket,
       });
     } else if (call.terminalOk) {
