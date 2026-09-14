@@ -1542,9 +1542,7 @@ export const createTemplateTool: AgentTool = {
     const content = getString(args, "content");
     const createFolders = getOptionalBoolean(args, "createFolders") ?? true;
 
-    if (getAbstractPath(context, path)) {
-      throw new Error(`Path already exists: ${path}`);
-    }
+    assertVaultPathAvailable(context, path, "Path already exists");
 
     await ensureParentFolder(context, path, createFolders);
     await context.app.vault.create(path, content);
@@ -1685,9 +1683,7 @@ export const fillTemplateTool: AgentTool = {
         : desiredTargetPath;
     const createFolders = getOptionalBoolean(args, "createFolders") ?? true;
 
-    if (getAbstractPath(context, targetPath)) {
-      throw new Error(`Path already exists: ${targetPath}`);
-    }
+    assertVaultPathAvailable(context, targetPath, "Path already exists");
 
     if (previewOnly) {
       return {
@@ -1892,9 +1888,11 @@ export const createResearchPackTool: AgentTool = {
       for (const artifactId of plan.createOrder) {
         const artifact = plan.artifacts.find((item) => item.id === artifactId);
         if (!artifact) throw new Error(`Research pack artifact is missing: ${artifactId}`);
-        if (getAbstractPath(context, artifact.path)) {
-          throw new Error(`Research pack path already exists: ${artifact.path}`);
-        }
+        assertVaultPathAvailable(
+          context,
+          artifact.path,
+          "Research pack path already exists",
+        );
         await ensureParentFolder(context, artifact.path, true);
         await context.app.vault.create(artifact.path, artifact.content);
         createdPaths.push(artifact.path);
@@ -1986,9 +1984,7 @@ export const createFolderTool: AgentTool = {
       throw new Error("create_folder requires a folder path, not a markdown file path.");
     }
 
-    if (getAbstractPath(context, path)) {
-      throw new Error(`Path already exists: ${path}`);
-    }
+    assertVaultPathAvailable(context, path, "Path already exists");
 
     const createdFolders = await ensureFolderPath(context, path);
     return {
@@ -2036,9 +2032,7 @@ export const createFileTool: AgentTool = {
     const content = getString(args, "content");
     const createFolders = getOptionalBoolean(args, "createFolders") ?? false;
 
-    if (getAbstractPath(context, path)) {
-      throw new Error(`Path already exists: ${path}`);
-    }
+    assertVaultPathAvailable(context, path, "Path already exists");
 
     await ensureParentFolder(context, path, createFolders);
     const file = await context.app.vault.create(path, content);
@@ -2178,9 +2172,11 @@ export const movePathTool: AgentTool = {
       throw new Error(`Path not found: ${fromPath}`);
     }
 
-    if (getAbstractPath(context, toPath)) {
-      throw new Error(`Destination already exists: ${toPath}`);
-    }
+    assertVaultPathAvailable(context, toPath, "Destination already exists", {
+      // A case-only rename names its own source; that is the move, not a
+      // collision with a second file.
+      allowPath: fromPath,
+    });
 
     if (getPathType(target) === "file" && getEntryExtension(target) === "md") {
       normalizeVaultPath(toPath, { requireMarkdown: true });
@@ -2404,9 +2400,11 @@ export const renameCurrentFileTool: AgentTool = {
     }
 
     const toPath = normalizeVaultPath(suggested.to, { requireMarkdown: true });
-    if (getAbstractPath(context, toPath)) {
-      throw new Error(`Destination already exists: ${toPath}`);
-    }
+    // A title-derived rename routinely differs from the current filename only
+    // in case; that is this tool's job, not a collision.
+    assertVaultPathAvailable(context, toPath, "Destination already exists", {
+      allowPath: file.path,
+    });
 
     await ensureParentFolder(context, toPath, false);
     await renameVaultPath(context, file, toPath);
@@ -3878,6 +3876,66 @@ function getMarkdownFileByPath(context: ToolExecutionContext, path: string): TFi
   }
 
   return file;
+}
+
+/**
+ * An existing vault path that differs from `path` only in letter case, or
+ * null.
+ *
+ * Obsidian's file map is keyed by exact path, so `getAbstractFileByPath`
+ * answers "no such file" for `Notes/Report.md` while `notes/report.md` sits on
+ * disk. On Windows and macOS — where this plugin overwhelmingly runs — those
+ * are one file, so the create that follows a negative lookup writes over a
+ * note the user still has, and create paths take no backup because they are
+ * supposed to be creating something new.
+ *
+ * The check is deliberately not "is this filesystem case-insensitive": that
+ * cannot be answered from inside the vault API, and guessing wrong loses data
+ * in one direction and refuses valid work in the other. Refusing the ambiguous
+ * create is the conservative half — the model can pick another name, and the
+ * message names the path it collided with.
+ */
+export function findVaultPathCaseVariantV1(
+  existingPaths: readonly string[],
+  path: string,
+): string | null {
+  const target = path.toLowerCase();
+  for (const existing of existingPaths) {
+    if (existing !== path && existing.toLowerCase() === target) return existing;
+  }
+  return null;
+}
+
+/**
+ * Throw unless `path` can be created without overwriting anything, counting a
+ * case-only difference as a collision.
+ *
+ * `allowPath` is the one path a caller may collide with: a case-only rename
+ * (`note.md` -> `Note.md`) names its own source, and refusing that would break
+ * the rename the user asked for.
+ */
+function assertVaultPathAvailable(
+  context: ToolExecutionContext,
+  path: string,
+  label: string,
+  options: { allowPath?: string } = {},
+): void {
+  if (getAbstractPath(context, path)) {
+    throw new Error(`${label}: ${path}`);
+  }
+  const variant = findVaultPathCaseVariantV1(
+    getVaultEntries(context).map((entry) => entry.path),
+    path,
+  );
+  if (variant && variant !== options.allowPath) {
+    throw new ToolExecutionError(
+      "unsafe_path",
+      `${label}: ${variant} already exists and differs only in letter case. ` +
+        "On Windows and macOS that is the same file, so this write could " +
+        "replace it. Use that exact path, or choose a different name.",
+      { mutationState: "not_applied" },
+    );
+  }
 }
 
 function getVaultEntries(context: ToolExecutionContext): VaultEntryLike[] {
