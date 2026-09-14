@@ -15,6 +15,11 @@ import { getRequestedResearchCatalogReadTools, hasOwnPriorThinkingRecallIntent }
 // 2026-08-26: the word-count copy answered FALSE to "how many words is this
 // note?" while the route answered TRUE, so the route offered `count_words` and
 // this planner planted no node to call it with.
+import {
+  DEFAULT_MIN_FETCHED_SOURCES_V1,
+  groundedToolStepBudgetForSourcesV1,
+  parseExplicitResearchSourceCount,
+} from "./explicitResearchRequirements";
 import { hasLongResearchIntent } from "./researchDepthIntent";
 import { hasWordCountIntent } from "./wordCountIntent";
 import type { RunBudgetProfile, RunBudgetRoute } from "./runBudget";
@@ -197,16 +202,37 @@ function getRequestedToolBudget({
     return 3;
   }
 
-  if (generated.requiresTextQuotes) {
-    return 7;
-  }
-
   if (hasLongResearchIntent(prompt)) {
     return Math.max(1, hardCap - finalizationReserve);
   }
 
-  if (generated.requiresGrounding || expectedTools.length > 0) {
-    return 5;
+  // A grounded mission is sized by the sources it owes, not by a flat number.
+  //
+  // These three branches used to return 7 and 5 no matter how much evidence the
+  // request asked for, and the only way past them was the phrase "deep
+  // research", which jumps to the hard cap — a cliff with nothing in between.
+  // A three-source cited summary owes a discovery search, then a fetch, a
+  // section read and a verification per source, then the write: eleven calls
+  // before a word is written, against a budget of five. Both missions in the
+  // 2026-09-14 real-web lane died at their step cap with nothing appended.
+  //
+  // The count comes from the same parser the research planner uses, so the
+  // budget and the source contract cannot disagree.
+  //
+  // A count in the prompt is itself proof the mission owes evidence, even when
+  // the output classifier does not flag grounding: "a cited brief using 3
+  // distinct source domains" reads as neither quote-bearing nor grounded and
+  // fell all the way through to the 4-step floor.
+  const explicitSources = parseExplicitResearchSourceCount(prompt);
+  const owesSourceEvidence =
+    generated.requiresTextQuotes ||
+    generated.requiresGrounding ||
+    expectedTools.length > 0 ||
+    (explicitSources !== null && route === "grounded_workflow");
+  if (owesSourceEvidence) {
+    return groundedToolStepBudgetForSourcesV1(
+      explicitSources ?? DEFAULT_MIN_FETCHED_SOURCES_V1,
+    );
   }
 
   if (generated.wordTarget && generated.wordTarget.target >= 1000) {

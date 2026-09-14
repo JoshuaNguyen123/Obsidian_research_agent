@@ -22,6 +22,11 @@ import {
 // "evidence ledger for W") and narrower on "serious research". The shared
 // predicate now carries the union, so the research MODE this file selects and
 // the tools the route offers are decided by the same words.
+import {
+  DEFAULT_MIN_FETCHED_SOURCES_V1,
+  parseExplicitResearchDomainCount,
+  parseExplicitResearchSourceCount,
+} from "./explicitResearchRequirements";
 import { hasDeepResearchIntent } from "./researchDepthIntent";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "./replaceIntent";
 import { hasExplicitNoVaultReadIntent } from "./missionScope";
@@ -51,6 +56,14 @@ export type ResearchEvidenceType = "web_source" | "vault_note" | "either";
 export interface ResearchSourceRequirements {
   minFetchedSources: number;
   minDistinctDomains: number;
+  /**
+   * The domain count the request named, when it named one. Kept on the plan
+   * because `assignResearchEffort` re-derives the floor whenever the tier
+   * changes and does not have the prompt to re-read; without it a tier
+   * escalation would silently overwrite the user's number. Absent on plans
+   * persisted before this field existed, which fall back to the tier floor.
+   */
+  explicitMinDistinctDomains?: number | null;
 }
 
 export interface ResearchCoverageRequirements {
@@ -211,15 +224,26 @@ export function createResearchPlan({
   const minFetchedSources =
     mode === "deep_vault"
       ? 0
-      : (explicitSourceCount ?? semanticFloor ?? configuredFloor ?? 3);
+      : (explicitSourceCount ??
+        semanticFloor ??
+        configuredFloor ??
+        DEFAULT_MIN_FETCHED_SOURCES_V1);
   // The distinct-domain floor is tier-dependent (deep/extended raise it to
-  // three); assignResearchEffort sets the final value once the tier is known.
+  // three) unless the request named its own count, which outranks the tier;
+  // assignResearchEffort sets the final value once the tier is known.
+  const explicitDomainCount = parseExplicitResearchDomainCount(prompt);
   const sourceRequirements: ResearchSourceRequirements = {
     minFetchedSources,
     minDistinctDomains: minDistinctDomainsForEffort({
       mode,
       minFetchedSources,
+      explicitDomains: explicitDomainCount,
     }),
+    // Recorded only when the request named a number, so plans for the ordinary
+    // case keep the shape (and the persisted bytes) they have always had.
+    ...(explicitDomainCount === null
+      ? {}
+      : { explicitMinDistinctDomains: explicitDomainCount }),
   };
   const coverageRequirements: ResearchCoverageRequirements = {
     minVaultCoverageConfidence: mode === "deep_web" ? "medium" : "medium",
@@ -290,18 +314,38 @@ export function minEvidenceForSubquestion(input: {
  * rest on three pages of one site, so its floor rises to three (still bounded
  * by the fetched-source count); quick/standard keep two.
  */
+/**
+ * The distinct-domain floor.
+ *
+ * `explicitDomains` is the count the request named for itself, and it wins
+ * outright — the same precedence sources already get ("a user who names a
+ * number means it"). Without it the floor is tier-derived: deep and extended
+ * missions want three domains, everything else two, never more than the number
+ * of sources the mission owes.
+ *
+ * Letting the tier outrank the request is what broke the 2026-09-14 real-web
+ * lane: "at least 3 sources from at least 2 domains" was planned as three
+ * domains, the mission fetched three sources across two, and it burned its
+ * remaining budget chasing a domain nobody had asked for.
+ */
 export function minDistinctDomainsForEffort(input: {
   mode: ResearchMode;
   tier?: ResearchEffortTier;
   minFetchedSources: number;
+  explicitDomains?: number | null;
 }): number {
   if (input.mode === "deep_vault") {
     return 0;
   }
-  return Math.min(
-    isDeepOrExtendedTier(input.tier) ? 3 : 2,
-    Math.max(0, input.minFetchedSources),
-  );
+  const sourceCeiling = Math.max(0, input.minFetchedSources);
+  if (
+    typeof input.explicitDomains === "number" &&
+    Number.isFinite(input.explicitDomains) &&
+    input.explicitDomains > 0
+  ) {
+    return Math.min(Math.trunc(input.explicitDomains), sourceCeiling);
+  }
+  return Math.min(isDeepOrExtendedTier(input.tier) ? 3 : 2, sourceCeiling);
 }
 
 function isDeepOrExtendedTier(tier: ResearchEffortTier | undefined): boolean {
@@ -325,6 +369,7 @@ function assignResearchEffort(
       mode: plan.mode,
       tier: effort.tier,
       minFetchedSources: plan.sourceRequirements.minFetchedSources,
+      explicitDomains: plan.sourceRequirements.explicitMinDistinctDomains,
     }),
   };
   plan.subquestions = allocateWebEvidenceMinima(
@@ -647,31 +692,14 @@ async function runResearchModeAssist(
   }
 }
 
-export function parseExplicitResearchSourceCount(prompt: string): number | null {
-  const normalized = prompt.replace(/\s+/g, " ").trim().toLowerCase();
-  if (!normalized) return null;
-  if (/\bboth\s+(?:returned\s+|fetched\s+|owned\s+)*(?:sources?|passages?)\b/u.test(normalized)) {
-    return 2;
-  }
-  const match = /\b(?:exactly\s+|at\s+least\s+|use(?:\s+and\s+fetch)?\s+|fetch\s+|from\s+)?(one|two|three|four|five|six|seven|eight|\d{1,2})\s+(?:distinct\s+|independent\s+|returned\s+|fetched\s+|owned\s+|focused\s+|web\s+)*(?:sources?(?:\s+domains?)?|passages?)\b/u.exec(
-    normalized,
-  );
-  if (!match?.[1]) return null;
-  const words: Record<string, number> = {
-    one: 1,
-    two: 2,
-    three: 3,
-    four: 4,
-    five: 5,
-    six: 6,
-    seven: 7,
-    eight: 8,
-  };
-  const parsed = words[match[1]] ?? Number(match[1]);
-  return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 8
-    ? parsed
-    : null;
-}
+// The explicit-requirement parsers live in `explicitResearchRequirements.ts` so
+// the loop budget can read the same numbers this planner does without importing
+// the planner. Re-exported here because every existing caller imports it from
+// this module.
+export {
+  parseExplicitResearchSourceCount,
+  parseExplicitResearchDomainCount,
+} from "./explicitResearchRequirements";
 
 /**
  * THE shape a web-evidence ladder takes: one search that discovers candidate
@@ -1106,6 +1134,15 @@ export function normalizeResearchPlan(value: unknown): ResearchPlan | undefined 
     sourceRequirements: {
       minFetchedSources: getNumber(source.minFetchedSources) ?? 0,
       minDistinctDomains: getNumber(source.minDistinctDomains) ?? 0,
+      // Carried across a resume so a tier change cannot overwrite the count the
+      // request named. Older persisted plans simply lack it.
+      ...(getNumber(source.explicitMinDistinctDomains) === undefined
+        ? {}
+        : {
+            explicitMinDistinctDomains: getNumber(
+              source.explicitMinDistinctDomains,
+            ),
+          }),
     },
     coverageRequirements: {
       minVaultCoverageConfidence:
