@@ -14,9 +14,14 @@ import { MAX_AGENT_STEPS } from "../tools/constants";
 import { normalizeEmbeddingDimSettingV1 } from "../embeddings/embeddingModelCatalogV1";
 import {
   DEFAULT_SEMANTIC_RERANK_MODEL,
-  DEFAULT_SEMANTIC_RERANK_TOP_K,
+  isSemanticRerankModeV1,
   normalizeSemanticRerankTopKV1,
+  type SemanticRerankModeV1,
 } from "../embeddings/semanticRerank";
+import {
+  NEW_INSTALL_SEMANTIC_PROFILE,
+  SEMANTIC_PROFILE_PRESETS,
+} from "./semanticProfile";
 
 export const SETTINGS_SCHEMA_VERSION = 5;
 
@@ -165,7 +170,7 @@ export interface NormalizableAgentSettings {
    * because a silently-ignored accelerator setting is worse than none.
    */
   semanticOnnxProviders?: string;
-  semanticRerankMode?: "off" | "cross_encoder";
+  semanticRerankMode?: SemanticRerankModeV1;
   semanticRerankModel?: string;
   semanticRerankTopK?: number;
 
@@ -246,23 +251,20 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   agenticReflexDiagnosticsEnabled: true,
   speechActSemanticRescueMode: "off",
   semanticSearchEnabled: true,
-  semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
-  semanticEmbeddingDim: 512,
-  semanticChunkMinTokens: 300,
-  semanticChunkTargetTokens: 500,
-  semanticChunkMaxTokens: 700,
-  semanticChunkOverlapTokens: 80,
+  semanticProfile: NEW_INSTALL_SEMANTIC_PROFILE,
+  // The shipped new-install profile, from the same table DEFAULT_SETTINGS
+  // spreads. Restating its field values here is how these two default tables
+  // drifted a whole profile apart: this one still described the retired
+  // "balanced" tuning (nomic, 500-token chunks, reranking off) while the
+  // plugin shipped "fast" (jina-v2-small, 256-token chunks, research rerank).
+  // "Reset settings to defaults" then landed the user on the old profile and
+  // silently rebuilt their index with the slower model.
+  ...SEMANTIC_PROFILE_PRESETS[NEW_INSTALL_SEMANTIC_PROFILE],
   semanticPythonCommand: "",
   semanticModelCacheDir: "",
   semanticIndexEnabled: true,
   semanticIndexFolder: "Agent Memory",
-  semanticIndexDebounceMs: 3000,
-  semanticIndexMaxFiles: 10000,
-  semanticIndexPersistVectors: true,
   semanticOnnxProviders: "",
-  semanticRerankMode: "off",
-  semanticRerankModel: DEFAULT_SEMANTIC_RERANK_MODEL,
-  semanticRerankTopK: DEFAULT_SEMANTIC_RERANK_TOP_K,
   temperature: null,
   topK: null,
   topP: null,
@@ -322,9 +324,14 @@ export function normalizeAgentSettings(
   );
   // An unreadable rerank setting must land on "off": the accuracy stage is
   // opt-in, and a typo in stored data cannot be allowed to spend a second of
-  // CPU on every search.
-  merged.semanticRerankMode =
-    merged.semanticRerankMode === "cross_encoder" ? "cross_encoder" : "off";
+  // CPU on every search. But the vocabulary has to be the product's whole
+  // vocabulary — this accepted two of the three modes, so "research", which is
+  // what the shipped profile sets, was normalized away to "off" and the
+  // second retrieval stage quietly stopped existing for anyone whose settings
+  // passed through here.
+  merged.semanticRerankMode = isSemanticRerankModeV1(merged.semanticRerankMode)
+    ? merged.semanticRerankMode
+    : "off";
   merged.semanticRerankModel =
     typeof merged.semanticRerankModel === "string" &&
     merged.semanticRerankModel.trim()
