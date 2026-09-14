@@ -18,12 +18,15 @@ export function scoreCandidateActions(
     .map((action) => {
       const baseScore = scoreByIntentAndState(action, intent, input);
       const rawOutcomePenalty =
-        action.toolName && input.toolOutcomeMemory
+        action.toolName && input.outcomeMemory
           ? outcomePenaltyForAction(
-              input.toolOutcomeMemory,
+              input.outcomeMemory.memory,
               action.toolName,
               classifyToolTargetKind(action.toolName),
-              input.outcomeMemoryNow ?? new Date(),
+              // No wall-clock fallback: the instant arrives with the history
+              // it weights, so scoring can never depend on the date the
+              // process happens to run on.
+              input.outcomeMemory.now,
             )
           : 0;
       const outcomePenalty = round3(

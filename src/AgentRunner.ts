@@ -3952,7 +3952,10 @@ export async function runAgentMission({
     receipts: writeReceipts,
     settings: runToolContext.settings,
     embeddingProvider: runToolContext.semanticEmbeddingProvider,
-    toolOutcomeMemory,
+    outcomeMemory: {
+      memory: toolOutcomeMemory,
+      now: runToolContext.now?.() ?? new Date(),
+    },
   });
   emitOutcomeRankingDiagnostic(capabilityAwareReflexOutput);
   reflexOutput = reflexIntentApplication.applied
@@ -6501,7 +6504,10 @@ export async function runAgentMission({
       receipts: writeReceipts,
       settings: runToolContext.settings,
       embeddingProvider: runToolContext.semanticEmbeddingProvider,
-      toolOutcomeMemory,
+      outcomeMemory: {
+        memory: toolOutcomeMemory,
+        now: runToolContext.now?.() ?? new Date(),
+      },
     });
     emitOutcomeRankingDiagnostic(capabilityAwarePromptPageReflexOutput);
     reflexOutput = promptPageReflexIntentApplication.applied
@@ -17434,7 +17440,10 @@ export async function runAgentMission({
       receipts: writeReceipts,
       settings: runToolContext.settings,
       embeddingProvider: runToolContext.semanticEmbeddingProvider,
-      toolOutcomeMemory,
+      outcomeMemory: {
+        memory: toolOutcomeMemory,
+        now: runToolContext.now?.() ?? new Date(),
+      },
       checkpoint: "material_context_change",
       frontierFingerprint:
         (missionGraphSession?.graph ?? missionGraph)?.capabilityEnvelope
@@ -22257,7 +22266,10 @@ export async function runAgentMission({
         receipts: writeReceipts,
         settings: runToolContext.settings,
         embeddingProvider: runToolContext.semanticEmbeddingProvider,
-        toolOutcomeMemory,
+        outcomeMemory: {
+          memory: toolOutcomeMemory,
+          now: runToolContext.now?.() ?? new Date(),
+        },
       });
       emitOutcomeRankingDiagnostic(reflexOutput, step);
       if (

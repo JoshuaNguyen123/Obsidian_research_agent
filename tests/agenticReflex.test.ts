@@ -149,8 +149,10 @@ test("repeated matching failures down-rank a tool without removing it", async ()
     // Outcome history is recency-weighted, so the read instant is pinned next to
     // the fixture rather than left to drift with the wall clock.
     input({
-      toolOutcomeMemory: memory,
-      outcomeMemoryNow: new Date("2026-07-24T01:00:00.000Z"),
+      outcomeMemory: {
+        memory,
+        now: new Date("2026-07-24T01:00:00.000Z"),
+      },
     }),
   );
   const semantic = output.actionScores.find(
@@ -190,7 +192,10 @@ test("generic graph candidates use their tool-derived target kind for learned ra
         "get_note_graph_context",
         "list_markdown_files",
       ]),
-      toolOutcomeMemory: memory,
+      outcomeMemory: {
+        memory,
+        now: new Date("2026-07-24T01:00:00.000Z"),
+      },
     }),
   );
   const graph = output.actionScores.find(
@@ -200,6 +205,36 @@ test("generic graph candidates use their tool-derived target kind for learned ra
   assert.equal(graph.action.kind, "use_tool");
   assert.ok(graph.outcomePenalty > 0);
   assert.ok(graph.score < graph.baseScore);
+});
+
+test("learned ranking reads the instant it is given, never the wall clock", async () => {
+  let memory = createToolOutcomeMemory();
+  for (let index = 0; index < 3; index += 1) {
+    memory = recordToolOutcome(memory, {
+      toolName: "semantic_search_notes",
+      ok: false,
+      errorCode: "semantic_helper_unavailable",
+      targetKind: "vault_note",
+      observedAt: `2026-07-24T00:00:0${index}.000Z`,
+    });
+  }
+  const penaltyAt = async (now: Date): Promise<number> => {
+    const output = await new AgenticReflexController().evaluate(
+      input({ outcomeMemory: { memory, now } }),
+    );
+    const semantic = output.actionScores.find(
+      (item) => item.action.toolName === "semantic_search_notes",
+    );
+    assert.ok(semantic);
+    return semantic.outcomePenalty;
+  };
+
+  // Same ledger, two supplied instants: the penalty must follow the argument.
+  // Five half-lives on, the failures are noise and the penalty is gone. Before
+  // the instant travelled with the history, this fixture read `new Date()` and
+  // its verdict changed with the date the suite happened to run on.
+  assert.ok((await penaltyAt(new Date("2026-07-24T01:00:00.000Z"))) > 0);
+  assert.equal(await penaltyAt(new Date("2026-12-20T00:00:00.000Z")), 0);
 });
 
 test("one failure is noise and a different target kind does not affect ranking", async () => {
@@ -223,7 +258,12 @@ test("one failure is noise and a different target kind does not affect ranking",
 
   for (const memory of [once, differentTarget]) {
     const output = await new AgenticReflexController().evaluate(
-      input({ toolOutcomeMemory: memory }),
+      input({
+        outcomeMemory: {
+          memory,
+          now: new Date("2026-07-24T01:00:00.000Z"),
+        },
+      }),
     );
     const semantic = output.actionScores.find(
       (item) => item.action.toolName === "semantic_search_notes",
