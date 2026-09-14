@@ -1,3 +1,4 @@
+import { redactedErrorMessageV1 } from "../agent/secretRedaction";
 import {
   sha256Fingerprint,
   verifyPreparedActionFingerprint,
@@ -651,7 +652,5 @@ function possiblyApplied(code: string, message: string): ToolExecutionError {
 }
 
 function safeError(error: unknown): string {
-  return (error instanceof Error ? error.message : "Queue vault operation failed.")
-    .replace(/(token|secret|password)\s*[=:]\s*[^\s,;}]+/giu, "$1=[REDACTED]")
-    .slice(0, 1_000);
+  return redactedErrorMessageV1(error, "Queue vault operation failed.", 1_000);
 }

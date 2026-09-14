@@ -11,8 +11,9 @@
  * latest resumable run, and `initialize_bundled_capabilities` kicks off the
  * fire-and-forget sandbox boundary probe (a child process on hosts with a
  * provisioned provider). Only the template library, workspace cleanup, the
- * Agent Runs retention sweep, the semantic-index flush, durable resume, and
- * companion reconciliation wait for workspace layout-ready.
+ * Agent Runs, `.agent-backups/` and expired-source-cache sweeps, the
+ * semantic-index flush, durable resume, and companion reconciliation wait for
+ * workspace layout-ready.
  */
 export type OnloadSchedulePhase = "immediate" | "layout_ready";
 
@@ -36,6 +37,8 @@ export const ONLOAD_STARTUP_TASKS = {
   initialize_template_library: "layout_ready",
   cleanup_old_workspaces: "layout_ready",
   sweep_agent_runs_retention: "layout_ready",
+  sweep_agent_backups_retention: "layout_ready",
+  sweep_expired_source_cache: "layout_ready",
   schedule_semantic_index_flush: "layout_ready",
   resume_latest_durable_mission: "layout_ready",
   schedule_companion_mission_reconciliation: "layout_ready",

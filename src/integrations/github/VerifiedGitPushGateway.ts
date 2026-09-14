@@ -1,3 +1,4 @@
+import { redactSecretsV1 } from "../../agent/secretRedaction";
 import {
   isAgentGitCommitIdentityV1,
   type AgentGitCommitIdentityV1,
@@ -1050,9 +1051,10 @@ function safeGitDiagnostic(result: VerifiedGitCommandResultV1): string {
 /** Scrub credential material. Runs on the whole string so a secret is redacted
  * regardless of position; bounding is the caller's concern. */
 function redactGitDiagnostic(value: unknown): string {
-  return (value instanceof Error ? value.message : String(value))
-    .replace(/https:\/\/[^\s/@]+@github\.com/giu, "https://[REDACTED]@github.com")
-    .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
+  // The shared redactor covers every credential shape; the trailing rule keeps
+  // this seat's own `credential=` labelling, which git-failure classification
+  // and its regression pin both read.
+  return redactSecretsV1(value instanceof Error ? value.message : String(value))
     .replace(/(?:token|password|secret|authorization|credential)\s*[=:]\s*\S+/giu, "credential=[REDACTED]");
 }
 

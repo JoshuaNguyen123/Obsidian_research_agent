@@ -57,7 +57,12 @@ import {
 import { createDocumentExtractProvider } from "./documentExtract";
 import { inferSourceSignals } from "../agent/sourceSignals";
 import { scoreSourceCandidate } from "../orchestrator/sourceCandidateLedger";
+import { normalizePublicFetchUrlV1 } from "./fetchHostPolicy";
 import { requestWithRetry } from "./httpRetry";
+import {
+  htmlToReadableTextV1,
+  isReadableTextContentTypeV1,
+} from "./htmlReadableText";
 import { resolveRetrievalCachePolicy, type ResolvedRetrievalCachePolicy } from "./retrievalCachePolicy";
 
 export function createWebTools(): AgentTool[] {
@@ -419,42 +424,70 @@ export const webFetchTool: AgentTool = {
     }
 
     const baseUrl = normalizeOllamaBaseUrl(context.settings.ollamaBaseUrl);
-
-    if (isOllamaCloudBaseUrl(baseUrl) && !context.settings.ollamaApiKey.trim()) {
-      throw new Error(
-        "Ollama web_fetch requires an API key. Add one in Agentic Researcher settings.",
-      );
-    }
-
-    const request: HttpRequest = {
-      url: `${baseUrl}/web_fetch`,
-      method: "POST",
-      contentType: "application/json",
-      headers: buildHeaders(context),
-      throw: false,
-      timeoutMs: getOperationTimeoutMs(context),
-      abortSignal: context.abortSignal,
-      body: JSON.stringify({ url }),
-    };
-
-    const response = await requestWithRetry(context.httpTransport, request);
-    if (response.status >= 400) {
-      return await retrieveWebFetchSubstituteV1({
-        args,
-        context,
-        query,
-        url,
-        maxAgeMs,
-        cachePolicy,
-        failureCode: "source_http_error",
-        failureSummary: `web_fetch could not retrieve ${url} (${getHttpErrorMessage(response, "web_fetch")})`,
-      });
-    }
-
-    const normalized = normalizeWebFetchResponse(
-      response.json ?? parseJsonText(response.text),
-      url,
+    // The retrieval endpoint belongs to Ollama Cloud. A cloud base URL with no
+    // key cannot be called at all, and a local Ollama does not serve
+    // /web_fetch — both used to end the fetch outright, which left BYOK and
+    // local-model users with search (it already falls back to the keyless
+    // providers) and no way to read any page: no quotes, no verification, no
+    // citations.
+    //
+    // Only the first case is decidable in advance. Any other configured base
+    // URL may be a proxy that does serve the route, so it is still tried
+    // first and the direct read is the fallback when it fails.
+    const canUseOllamaFetch = !(
+      isOllamaCloudBaseUrl(baseUrl) && !context.settings.ollamaApiKey.trim()
     );
+
+    let normalized: NormalizedWebFetchV1 | null = null;
+    if (canUseOllamaFetch) {
+      const request: HttpRequest = {
+        url: `${baseUrl}/web_fetch`,
+        method: "POST",
+        contentType: "application/json",
+        headers: buildHeaders(context),
+        throw: false,
+        timeoutMs: getOperationTimeoutMs(context),
+        abortSignal: context.abortSignal,
+        body: JSON.stringify({ url }),
+      };
+      const response = await requestWithRetry(context.httpTransport, request);
+      if (response.status < 400) {
+        normalized = normalizeWebFetchResponse(
+          response.json ?? parseJsonText(response.text),
+          url,
+        );
+      } else {
+        // A failing retrieval endpoint is not a failing page. Read it
+        // directly before giving up on this URL and looking for another.
+        normalized = await directFetchReadableSourceV1(context, url);
+        if (!normalized) {
+          return await retrieveWebFetchSubstituteV1({
+            args,
+            context,
+            query,
+            url,
+            maxAgeMs,
+            cachePolicy,
+            failureCode: "source_http_error",
+            failureSummary: `web_fetch could not retrieve ${url} (${getHttpErrorMessage(response, "web_fetch")})`,
+          });
+        }
+      }
+    } else {
+      normalized = await directFetchReadableSourceV1(context, url);
+      if (!normalized) {
+        return await retrieveWebFetchSubstituteV1({
+          args,
+          context,
+          query,
+          url,
+          maxAgeMs,
+          cachePolicy,
+          failureCode: "source_http_error",
+          failureSummary: `web_fetch could not retrieve ${url} directly.`,
+        });
+      }
+    }
     const sourceUsability = evaluateSourceUsability({
       content: normalized.fullContent,
       sourceLocator: url,
@@ -692,6 +725,97 @@ function emptySearchResult() {
     url: "",
     snippet: "",
   };
+}
+
+/**
+ * Identify the client honestly when reading a page directly. Several of the
+ * scholarly APIs this project already talks to ask for exactly that, and a
+ * site that wants to refuse an agent should be able to.
+ */
+const DIRECT_FETCH_USER_AGENT_V1 =
+  "AgenticResearcher/0.4 (+https://github.com/JoshuaNguyen123/Obsidian_research_agent)";
+
+export interface NormalizedWebFetchV1 {
+  title: string;
+  url: string;
+  content: string;
+  fullContent: string;
+  parserStatus: Exclude<SourceParserStatus, "legacy_unknown">;
+  links: string[];
+}
+
+/**
+ * Read a page with the plugin's own transport and turn it into source text.
+ *
+ * The URL has already been through the shared host policy, so this cannot be
+ * pointed at the loopback interface or a private range. Non-text responses are
+ * refused rather than stringified: a PDF belongs to `extract_document`, which
+ * has a parser for it.
+ *
+ * One limit worth stating: Obsidian's `requestUrl` follows redirects itself
+ * and does not report the final URL, so a public page redirecting to a private
+ * address cannot be re-checked here. The retrieval endpoint never had that
+ * exposure because the fetch happened on the provider's machine. This is the
+ * same residual shape as DNS rebinding, and closing it needs a transport that
+ * reports or refuses redirects.
+ *
+ * Returns null when the page could not be read at all, which is the caller's
+ * signal to look for a substitute source instead.
+ */
+async function directFetchReadableSourceV1(
+  context: ToolExecutionContext,
+  url: string,
+): Promise<NormalizedWebFetchV1 | null> {
+  let response;
+  try {
+    response = await requestWithRetry(context.httpTransport, {
+      url,
+      method: "GET",
+      headers: {
+        Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+        "User-Agent": DIRECT_FETCH_USER_AGENT_V1,
+      },
+      throw: false,
+      timeoutMs: getOperationTimeoutMs(context),
+      abortSignal: context.abortSignal,
+    });
+  } catch {
+    return null;
+  }
+  if (response.status >= 400) return null;
+  if (!isReadableTextContentTypeV1(response.headers?.["content-type"] ?? response.headers?.["Content-Type"])) {
+    return null;
+  }
+  const body = typeof response.text === "string" && response.text
+    ? response.text
+    : response.json !== undefined
+      ? JSON.stringify(response.json, null, 2)
+      : "";
+  if (!body.trim()) return null;
+  const readable = /<\s*(?:html|body|div|p|article|main)\b/iu.test(body)
+    ? htmlToReadableTextV1(body, { baseUrl: url })
+    : { title: "", text: body, links: [] as string[] };
+  const fullContent = readable.text.trim();
+  return {
+    title: readable.title || documentTitleFromUrlV1(url),
+    url,
+    content: truncateText(fullContent, MAX_WEB_FETCH_CHARS),
+    fullContent,
+    parserStatus: fullContent ? "parsed" : "empty",
+    links: readable.links,
+  };
+}
+
+/** A last-resort title so a cached source note is never nameless. */
+function documentTitleFromUrlV1(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const last = parsed.pathname.split("/").filter(Boolean).pop();
+    return decodeURIComponent(last ?? parsed.hostname).replace(/[-_]+/gu, " ").trim() ||
+      parsed.hostname;
+  } catch {
+    return url;
+  }
 }
 
 function normalizeWebFetchResponse(body: unknown, url: string) {
@@ -944,76 +1068,20 @@ function getEvidenceQuery(
 }
 
 function normalizeWebFetchUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
-  if (!trimmed) {
+  if (!rawUrl.trim()) {
     throw new Error("web_fetch URL cannot be empty.");
   }
-
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
-    ? trimmed
-    : `https://${trimmed}`;
-  let url: URL;
-
-  try {
-    url = new URL(withScheme);
-  } catch {
-    throw new Error("web_fetch URL is invalid.");
-  }
-
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("web_fetch only supports HTTP and HTTPS URLs.");
-  }
-
-  if (url.username || url.password) {
-    throw new Error("web_fetch URLs with credentials are not allowed.");
-  }
-
-  if (isUnsafeHost(url.hostname)) {
-    throw new Error("web_fetch cannot fetch local or private network URLs.");
-  }
-
-  url.hash = "";
-  return url.toString();
-}
-
-function isUnsafeHost(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-
-  if (
-    normalized === "localhost" ||
-    normalized.endsWith(".localhost") ||
-    normalized.endsWith(".local") ||
-    normalized === "::1" ||
-    normalized === "0:0:0:0:0:0:0:1"
-  ) {
-    return true;
-  }
-
-  if (
-    normalized.includes(":") &&
-    (/^(fc|fd)/.test(normalized) || normalized.startsWith("fe80:"))
-  ) {
-    return true;
-  }
-
-  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(normalized);
-  if (!ipv4) {
-    return false;
-  }
-
-  const octets = ipv4.slice(1).map(Number);
-  if (octets.some((octet) => octet < 0 || octet > 255)) {
-    return true;
-  }
-
-  const [first, second] = octets;
-  return (
-    first === 0 ||
-    first === 10 ||
-    first === 127 ||
-    first === 169 && second === 254 ||
-    first === 172 && second >= 16 && second <= 31 ||
-    first === 192 && second === 168
+  return normalizePublicFetchUrlV1(
+    rawUrl,
+    {
+      invalid: "web_fetch URL is invalid.",
+      scheme: "web_fetch only supports HTTP and HTTPS URLs.",
+      credentials: "web_fetch URLs with credentials are not allowed.",
+      privateHost: "web_fetch cannot fetch local or private network URLs.",
+    },
+    (message) => {
+      throw new Error(message);
+    },
   );
 }
 

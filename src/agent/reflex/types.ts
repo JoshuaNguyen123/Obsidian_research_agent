@@ -6,6 +6,12 @@ import type { ToolOutcomeMemoryV1 } from "../outcomeMemory";
 import type { WriteReceiptLike } from "../editOrganizeIntent";
 import type { SetLooseDeliveryReceiptLikeV1 } from "../setLooseCompoundAutonomy";
 
+/** Cross-run tool history bound to the instant it is scored at. */
+export interface ReflexToolOutcomeMemoryInputV1 {
+  memory: ToolOutcomeMemoryV1;
+  now: Date;
+}
+
 export type ReflexLabel =
   | "chat_answer"
   | "current_note_write"
@@ -177,14 +183,21 @@ export interface AgenticReflexInput {
   receipts: ReflexReceiptLike[];
   settings?: AgentSettings;
   embeddingProvider?: SemanticEmbeddingProvider;
-  /** Optional cross-run tool history. Absent preserves pre-memory scoring. */
-  toolOutcomeMemory?: ToolOutcomeMemoryV1;
   /**
-   * Instant the ledger is read at. Outcome history is recency-weighted, so a
-   * score depends on *when* it is computed; injecting the clock keeps scoring
-   * deterministic under test instead of drifting with the wall clock.
+   * Optional cross-run tool history *and* the instant to weight it at. Absent
+   * preserves pre-memory scoring.
+   *
+   * The two travel as one field on purpose. Outcome history is
+   * recency-weighted, so a score depends on *when* it is computed; while the
+   * instant was a separate optional field with a `new Date()` fallback, a
+   * caller could supply history and silently inherit the wall clock. That is
+   * the exact trap `outcomeMemory.ts` documents ("every reader takes an
+   * explicit `now`, with no default"), and it recurred here: a scoring test
+   * pinned to failures dated 2026-07-24 passed for seven weeks and then went
+   * red when those failures decayed below the penalty-free threshold. Pairing
+   * them makes supplying history without an instant a compile error.
    */
-  outcomeMemoryNow?: Date;
+  outcomeMemory?: ReflexToolOutcomeMemoryInputV1;
   checkpoint?: ReflexCheckpointKind;
   frontierFingerprint?: string | null;
   /**

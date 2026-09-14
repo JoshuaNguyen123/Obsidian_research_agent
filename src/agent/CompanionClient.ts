@@ -1,3 +1,4 @@
+import { redactSecretsV1 } from "./secretRedaction";
 import {
   BrowserClickInput,
   BrowserExtractMarkdownInput,
@@ -351,9 +352,5 @@ function headersToRecord(headers: HeadersInit | undefined): Record<string, strin
 }
 
 function sanitizeCompanionError(value: string): string {
-  return value
-    .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(/(token|secret|password)\s*[=:]\s*[^\s,;}]+/gi, "$1=[REDACTED]")
-    .replace(/\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]{16,}\b/g, "[REDACTED]")
-    .slice(0, 4_096);
+  return redactSecretsV1(value).slice(0, 4_096);
 }

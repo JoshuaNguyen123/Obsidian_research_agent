@@ -1,3 +1,4 @@
+import { redactedErrorMessageV1 } from "./secretRedaction";
 import {
   buildBackgroundAuthorizationV1,
   type BackgroundAuthorizationV1,
@@ -253,11 +254,5 @@ function capabilityGrantId(graph: MissionGraphV3): string {
 }
 
 function safeError(error: unknown): string {
-  return (error instanceof Error ? error.message : "Background dispatch failed.")
-    .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(
-      /(token|secret|password|api[_-]?key)\s*[=:]\s*[^\s,;}]+/gi,
-      "$1=[REDACTED]",
-    )
-    .slice(0, 4_096);
+  return redactedErrorMessageV1(error, "Background dispatch failed.", 4_096);
 }

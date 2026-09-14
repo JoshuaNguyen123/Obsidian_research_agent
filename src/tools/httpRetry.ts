@@ -1,3 +1,4 @@
+import { parseRetryAfterMs } from "../model/retry";
 import type { HttpRequest, HttpResponse, HttpTransport } from "../model/types";
 
 /**
@@ -11,16 +12,32 @@ import type { HttpRequest, HttpResponse, HttpTransport } from "../model/types";
  * the "temporarily unavailable" status they sit beside, and every caller is a
  * read. Thrown transport failures (DNS, reset, hang-up) use the same
  * `[400, 1200]` budget. AbortError is never retried.
+ *
+ * `Retry-After` is obeyed when the server sends it. The tool layer talks to
+ * Crossref, OpenAlex, arXiv, PubMed and the Ollama retrieval endpoints, all of
+ * which answer a burst with 429 and a wait — and every one of those 429s used
+ * to consume the 400 ms and 1.2 s delays and then surface as a failed search,
+ * because the waits were shorter than the wait the server asked for. The model
+ * layer has honored the header since rate-limit budgets landed there
+ * (`DEFAULT_MODEL_RETRY_POLICY`); this is the same rule at the other seat,
+ * reading through the same parser rather than a second copy of it.
  */
+export const MAX_TOOL_RETRY_AFTER_MS = 15_000;
+
 export async function requestWithRetry(
   transport: HttpTransport,
   request: HttpRequest,
-  options?: { retryDelaysMs?: number[]; retryStatuses?: number[] },
+  options?: {
+    retryDelaysMs?: number[];
+    retryStatuses?: number[];
+    maxRetryAfterMs?: number;
+  },
 ): Promise<HttpResponse> {
   const delays = options?.retryDelaysMs ?? [400, 1200];
   const retryStatuses = new Set(
     options?.retryStatuses ?? [429, 500, 502, 503, 504],
   );
+  const maxRetryAfterMs = options?.maxRetryAfterMs ?? MAX_TOOL_RETRY_AFTER_MS;
   let attempt = 0;
   for (;;) {
     try {
@@ -31,7 +48,18 @@ export async function requestWithRetry(
       if (request.abortSignal?.aborted) {
         return response;
       }
-      await sleep(delays[attempt]!, request.abortSignal);
+      const waitMs = resolveRetryDelayMs(
+        delays[attempt]!,
+        response,
+        maxRetryAfterMs,
+      );
+      if (waitMs === null) {
+        // The server asked for longer than this seat is willing to hold a
+        // mission step. Returning its answer now beats sleeping past the
+        // caller's own deadline and then retrying anyway.
+        return response;
+      }
+      await sleep(waitMs, request.abortSignal);
       attempt += 1;
     } catch (error) {
       // Cancellation is sacred: never convert a user abort into a retry.
@@ -48,6 +76,22 @@ export async function requestWithRetry(
       attempt += 1;
     }
   }
+}
+
+/**
+ * How long to wait before the next attempt: the backoff delay, or the server's
+ * own `Retry-After` when that is longer. Null means "do not retry" — the
+ * server named a wait past the cap.
+ */
+export function resolveRetryDelayMs(
+  backoffMs: number,
+  response: Pick<HttpResponse, "headers">,
+  maxRetryAfterMs: number,
+): number | null {
+  const retryAfterMs = parseRetryAfterMs(response.headers);
+  if (retryAfterMs === undefined) return backoffMs;
+  if (retryAfterMs > maxRetryAfterMs) return null;
+  return Math.max(backoffMs, retryAfterMs);
 }
 
 export function isAbortError(error: unknown): boolean {

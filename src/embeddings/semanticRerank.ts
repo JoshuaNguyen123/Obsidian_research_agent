@@ -149,6 +149,28 @@ export interface ResolvedSemanticRerankV1 {
  */
 export type SemanticRerankModeV1 = "off" | "research" | "cross_encoder";
 
+export const SEMANTIC_RERANK_MODES_V1: readonly SemanticRerankModeV1[] = [
+  "off",
+  "research",
+  "cross_encoder",
+];
+
+/**
+ * The one place that answers "is this a rerank mode?".
+ *
+ * Settings normalization used to answer it with its own two-value list, so
+ * "research" — the mode the shipped profile sets — normalized to "off" and the
+ * second retrieval stage disappeared wherever normalization ran.
+ */
+export function isSemanticRerankModeV1(
+  value: unknown,
+): value is SemanticRerankModeV1 {
+  return (
+    typeof value === "string" &&
+    (SEMANTIC_RERANK_MODES_V1 as readonly string[]).includes(value)
+  );
+}
+
 /**
  * Read the three settings as one decision. Anything unreadable resolves to
  * "off": the accuracy stage costs CPU on every search, so it is never inferred.

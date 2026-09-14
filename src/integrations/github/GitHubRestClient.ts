@@ -1,3 +1,4 @@
+import { redactSecretsV1 } from "../../agent/secretRedaction";
 import type { HttpResponse, HttpTransport } from "../../model/types";
 import type { RepositoryVisibility } from "./RepositoryVisibility";
 
@@ -2258,12 +2259,7 @@ function safeApiMessage(value: unknown): string {
 }
 
 function redactSecret(message: string, token: string): string {
-  let redacted = message.slice(0, 500);
-  if (token) redacted = redacted.split(token).join("[REDACTED]");
-  return redacted
-    .replace(/Bearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
-    .replace(/github_pat_[A-Za-z0-9_]+/g, "[REDACTED]")
-    .replace(/gh[pousr]_[A-Za-z0-9]+/g, "[REDACTED]");
+  return redactSecretsV1(message.slice(0, 500), { knownSecrets: [token] });
 }
 
 function requiredString(value: unknown, field: string): string {

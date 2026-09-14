@@ -1,3 +1,4 @@
+import { redactSecretsV1 } from "../../agent/secretRedaction";
 import type {
   SecretLeaseV1,
   SecretStoreV1,
@@ -775,15 +776,7 @@ function containsOpaqueGitHubSecretMaterial(value: string): boolean {
 }
 
 function redactLeasedCredentialDiagnostic(value: string): string {
-  return value
-    .replace(
-      /github_pat_[A-Za-z0-9_-]{20,500}/gu,
-      "github_pat_[REDACTED]",
-    )
-    .replace(/gh[pousr]_[A-Za-z0-9]{20,500}/gu, "gh_[REDACTED]")
-    .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
-    .replace(/https:\/\/[^/\s]+@github\.com/giu, "https://[REDACTED]@github.com")
-    .slice(0, 1_000);
+  return redactSecretsV1(value).slice(0, 1_000);
 }
 
 export function parseGitHubCredentialV1(value: unknown): GitHubCredentialV1 {

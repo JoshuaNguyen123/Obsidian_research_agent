@@ -1,3 +1,4 @@
+import { redactSecretsV1 } from "../../agent/secretRedaction";
 import type { Server as HttpServer } from "node:http";
 
 import type { SecretStoreV1 } from "../../../packages/core-api/src/secretStoreV1";
@@ -868,8 +869,7 @@ function boundedInteger(value: number, min: number, max: number, label: string):
 }
 
 function redactSecret(value: string, secret: string | undefined): string {
-  if (!secret) return value;
-  return value.split(secret).join("[REDACTED]");
+  return redactSecretsV1(value, { knownSecrets: [secret] });
 }
 
 function containsSecret(value: unknown, secret: string): boolean {

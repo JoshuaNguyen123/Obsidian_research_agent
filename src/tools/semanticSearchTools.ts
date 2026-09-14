@@ -20,7 +20,10 @@ import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
 import { resolveEmbeddingPrefixesV1 } from "../embeddings/embeddingPrefixes";
 import { resolveEffectiveEmbeddingDimV1 } from "../embeddings/embeddingModelCatalogV1";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
-import { isVaultPathExcluded } from "./vaultExclusions";
+import {
+  isVaultPathExcluded,
+  vaultExclusionRootsFromSettingsV1,
+} from "./vaultExclusions";
 import { resolveSemanticSearchCapsForCompoundRun } from "../agent/setLooseCompoundAutonomy";
 import type { AutonomyProfile } from "../agent/autonomyEffectClass";
 import { NEW_INSTALL_SEMANTIC_EMBEDDING_MODEL } from "../agent/semanticProfile";
@@ -715,10 +718,11 @@ async function buildSemanticChunkProfiles(
   options: { cap?: number } = {},
 ): Promise<SemanticChunkProfile[]> {
   const cap = options.cap ?? MAX_LISTED_FILES;
+  const extraRoots = vaultExclusionRootsFromSettingsV1(context.settings);
   const files = context.app.vault
     .getFiles()
     .filter((file) => file.extension === "md")
-    .filter((file) => !isVaultPathExcluded(file.path))
+    .filter((file) => !isVaultPathExcluded(file.path, { extraRoots }))
     .filter((file) => isFileInFolder(file.path, folder))
     .slice(0, Number.isFinite(cap) ? cap : undefined);
   const chunks: SemanticChunkProfile[] = [];

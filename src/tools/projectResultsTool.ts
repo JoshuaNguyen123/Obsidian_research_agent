@@ -1,4 +1,5 @@
 import type { TFile } from "obsidian";
+import { redactedErrorMessageV1 } from "../agent/secretRedaction";
 import {
   parseVerifiedCodeReflectionExamplesV1,
   type VerifiedCodeReflectionExamplesV1,
@@ -975,10 +976,7 @@ function cloneJson<T>(value: T): JsonValue & T {
 }
 
 function safeErrorMessage(error: unknown): string {
-  return (error instanceof Error ? error.message : "Unknown Results error.")
-    .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
-    .replace(/(token|secret|password)\s*[=:]\s*[^\s,;}]+/giu, "$1=[REDACTED]")
-    .slice(0, 2_000);
+  return redactedErrorMessageV1(error, "Unknown Results error.", 2_000);
 }
 
 function invalidPrepared(message: string): ToolExecutionError {

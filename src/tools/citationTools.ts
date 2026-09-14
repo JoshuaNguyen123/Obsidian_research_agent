@@ -8,6 +8,7 @@ import {
   normalizeForMatch,
 } from "../agent/quoteMatch";
 import { collapseWhitespace, stripJats, xmlText } from "./atomText";
+import { requestWithRetry } from "./httpRetry";
 import { readSourceSection } from "./sourceCache";
 import {
   getOptionalInteger,
@@ -581,7 +582,10 @@ async function request(
     timeoutMs: Math.min(context.settings.requestTimeoutMs, 30_000),
     abortSignal: context.abortSignal,
   };
-  const response = await context.httpTransport(httpRequest);
+  // Crossref, arXiv and the NCBI endpoints answer a burst with 429 and a
+  // Retry-After measured in a second or two. Handing that straight back ended
+  // a citation lookup that one short wait would have completed.
+  const response = await requestWithRetry(context.httpTransport, httpRequest);
   if (response.status === 404) {
     throw new Error("The citation provider has no record for this identifier.");
   }

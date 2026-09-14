@@ -1,3 +1,4 @@
+import { redactSecretsV1 } from "../../agent/secretRedaction";
 import type { HttpResponse, HttpTransport } from "../../model/types";
 import {
   getLinearOperationDefinition,
@@ -278,19 +279,7 @@ export async function parseLinearResponse(
 }
 
 export function redactLinearSecrets(value: string, secrets: string[] = []): string {
-  let output = value;
-  for (const secret of secrets) {
-    if (secret) {
-      output = output.split(secret).join("[REDACTED]");
-    }
-  }
-  return output
-    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
-    .replace(/\blin_api_[A-Za-z0-9_-]+\b/g, "[REDACTED]")
-    .replace(
-      /(authorization|api[_-]?key)(["'\s:=]+)[^\s,"'}]+/gi,
-      "$1$2[REDACTED]",
-    );
+  return redactSecretsV1(value, { knownSecrets: secrets });
 }
 
 export function stableLinearJson(value: unknown): string {
