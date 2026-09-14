@@ -752,6 +752,13 @@ export interface NormalizedWebFetchV1 {
  * refused rather than stringified: a PDF belongs to `extract_document`, which
  * has a parser for it.
  *
+ * One limit worth stating: Obsidian's `requestUrl` follows redirects itself
+ * and does not report the final URL, so a public page redirecting to a private
+ * address cannot be re-checked here. The retrieval endpoint never had that
+ * exposure because the fetch happened on the provider's machine. This is the
+ * same residual shape as DNS rebinding, and closing it needs a transport that
+ * reports or refuses redirects.
+ *
  * Returns null when the page could not be read at all, which is the caller's
  * signal to look for a substitute source instead.
  */
