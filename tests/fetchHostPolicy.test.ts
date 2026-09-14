@@ -73,6 +73,67 @@ test("ordinary public hosts stay fetchable", () => {
   }
 });
 
+/**
+ * The spelling the guard is actually handed at runtime.
+ *
+ * No tool passes a hostname the model typed; every seat reads `url.hostname`
+ * off a parsed URL, and the parser rewrites as it goes — `::ffff:127.0.0.1`
+ * becomes `::ffff:7f00:1`, `127.1` becomes `127.0.0.1`. Asserting only on the
+ * human spelling is how `http://[::ffff:127.0.0.1]/` stayed reachable after
+ * the policy claimed to cover it: the dotted-quad branch matched a string the
+ * product never receives. These cases re-run the whole corpus through `new
+ * URL()` so the guard is judged on its real input.
+ */
+function urlParserHostname(host: string): string {
+  return new URL(`http://${host}/`).hostname;
+}
+
+const FETCH_POLICY_ERRORS_V1 = {
+  invalid: "invalid",
+  scheme: "scheme",
+  credentials: "credentials",
+  privateHost: "private",
+};
+
+test("refusals survive the rewriting the URL parser does", () => {
+  for (const host of [...LOOPBACK_SPELLINGS_V1, ...PRIVATE_SPELLINGS_V1]) {
+    const emitted = urlParserHostname(host);
+    assert.ok(
+      isUnsafeFetchHostV1(emitted),
+      `${host} is handed to the guard as ${emitted}, which must still be refused`,
+    );
+  }
+});
+
+test("public hosts stay allowed after the URL parser rewrites them", () => {
+  for (const host of PUBLIC_HOSTS_V1) {
+    const emitted = urlParserHostname(host);
+    assert.ok(
+      !isUnsafeFetchHostV1(emitted),
+      `${host} is handed to the guard as ${emitted}, which must stay allowed`,
+    );
+  }
+});
+
+test("normalizePublicFetchUrlV1 refuses the mapped loopback end to end", () => {
+  // The exact URL a page can put in a link and a model can choose.
+  for (const url of [
+    "http://[::ffff:127.0.0.1]/",
+    "http://[::ffff:169.254.169.254]/latest/meta-data/",
+    "http://[64:ff9b::127.0.0.1]/",
+    "http://[0:0:0:0:0:ffff:10.0.0.5]/",
+  ]) {
+    assert.throws(
+      () =>
+        normalizePublicFetchUrlV1(url, FETCH_POLICY_ERRORS_V1, (message) => {
+          throw new Error(message);
+        }),
+      /private/u,
+      `${url} must be refused`,
+    );
+  }
+});
+
 test("IPv4 literals parse the way a resolver reads them", () => {
   assert.equal(parseIpv4LiteralV1("127.0.0.1"), 0x7f000001);
   assert.equal(parseIpv4LiteralV1("127.1"), 0x7f000001);

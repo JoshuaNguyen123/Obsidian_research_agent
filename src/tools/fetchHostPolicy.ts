@@ -20,6 +20,15 @@
  *   that is not an IP literal is allowed — it is a DNS name, and this guard
  *   cannot resolve it — but any literal the parser cannot make sense of is
  *   refused rather than waved through.
+ * - **Judge the spelling the URL parser emits, not the one a human types.**
+ *   The first version of this guard matched an IPv4-mapped IPv6 address by its
+ *   dotted-quad tail, and its tests passed that spelling in by hand. `new
+ *   URL()` rewrites `::ffff:127.0.0.1` to `::ffff:7f00:1` before any tool sees
+ *   the hostname, so that branch could never fire in production and
+ *   `http://[::ffff:127.0.0.1]/` stayed reachable. Both IPv6 and IPv4 literals
+ *   are now decoded to the address they name; the tests drive every case
+ *   through `new URL()` so no spelling can be asserted that the product never
+ *   receives.
  *
  * This deliberately does not defend against DNS rebinding or a public name
  * that resolves to a private address: both need resolution the plugin does not
@@ -102,6 +111,100 @@ function isPrivateIpv4Address(address: number): boolean {
 }
 
 /**
+ * An IPv6 literal as its eight 16-bit groups, or null when the host is not a
+ * well-formed IPv6 literal.
+ *
+ * Handles `::` elision, an optional trailing dotted-quad (`::ffff:127.0.0.1`),
+ * and a zone suffix (`%eth0`). The dotted-quad tail is parsed strictly here —
+ * inside an IPv6 literal only the four-part decimal form is legal, so the
+ * inet_aton shapes `parseIpv4LiteralV1` accepts are rejected rather than
+ * silently reinterpreted.
+ */
+export function parseIpv6LiteralV1(hostname: string): number[] | null {
+  const literal = hostname
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/gu, "")
+    .replace(/%.*$/u, "");
+  if (!literal || !literal.includes(":")) return null;
+  if (!/^[0-9a-f:.]+$/u.test(literal)) return null;
+
+  const halves = literal.split("::");
+  if (halves.length > 2) return null;
+
+  const expand = (half: string): number[] | null => {
+    if (!half) return [];
+    const parts = half.split(":");
+    const groups: number[] = [];
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index]!;
+      if (part.includes(".")) {
+        // A dotted quad is only legal as the final 32 bits.
+        if (index !== parts.length - 1) return null;
+        const quad = part.split(".");
+        if (quad.length !== 4) return null;
+        const octets: number[] = [];
+        for (const octet of quad) {
+          if (!/^[0-9]{1,3}$/u.test(octet)) return null;
+          const value = Number.parseInt(octet, 10);
+          if (value > 0xff) return null;
+          octets.push(value);
+        }
+        groups.push((octets[0]! << 8) | octets[1]!);
+        groups.push((octets[2]! << 8) | octets[3]!);
+        continue;
+      }
+      if (!/^[0-9a-f]{1,4}$/u.test(part)) return null;
+      groups.push(Number.parseInt(part, 16));
+    }
+    return groups;
+  };
+
+  const head = expand(halves[0] ?? "");
+  const tail = halves.length === 2 ? expand(halves[1] ?? "") : [];
+  if (head === null || tail === null) return null;
+
+  if (halves.length === 1) {
+    return head.length === 8 ? head : null;
+  }
+  const missing = 8 - (head.length + tail.length);
+  if (missing < 1) return null;
+  return [...head, ...new Array<number>(missing).fill(0), ...tail];
+}
+
+/**
+ * True when an IPv6 address does not name a public host.
+ *
+ * IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible (`::/96`) and the NAT64
+ * well-known prefix (`64:ff9b::/96`) all reach an IPv4 destination, so the
+ * embedded address is judged by the same IPv4 rules rather than by a second
+ * table that could drift from them.
+ */
+function isPrivateIpv6Address(groups: number[]): boolean {
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups as [
+    number, number, number, number, number, number, number, number,
+  ];
+  const embeddedIpv4 = (((g6 << 16) | g7) >>> 0);
+  const topFiveZero = g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0;
+
+  if (topFiveZero && g5 === 0) {
+    // :: (unspecified) and ::1 (loopback) are never public; anything else in
+    // ::/96 is an IPv4-compatible address.
+    if (embeddedIpv4 === 0 || embeddedIpv4 === 1) return true;
+    return isPrivateIpv4Address(embeddedIpv4);
+  }
+  if (topFiveZero && g5 === 0xffff) return isPrivateIpv4Address(embeddedIpv4);
+  if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+    return isPrivateIpv4Address(embeddedIpv4);
+  }
+
+  if ((g0 & 0xfe00) === 0xfc00) return true; // unique local fc00::/7
+  if ((g0 & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+  if ((g0 & 0xffc0) === 0xfec0) return true; // deprecated site-local fec0::/10
+  return false;
+}
+
+/**
  * True when this host must not be fetched: a loopback, link-local, private, or
  * otherwise non-public address in any literal spelling, or a name that always
  * resolves to one.
@@ -115,27 +218,14 @@ export function isUnsafeFetchHostV1(hostname: string): boolean {
   }
 
   if (normalized.includes(":")) {
-    // An IPv4-mapped or IPv4-compatible IPv6 address carries a dotted-quad
-    // tail: judge it by the address it actually reaches.
-    const mapped = /(?:^|:)((?:\d{1,3}\.){3}\d{1,3})$/u.exec(normalized);
-    if (mapped) {
-      const address = parseIpv4LiteralV1(mapped[1]!);
-      if (address === null || isPrivateIpv4Address(address)) return true;
-      // A mapped public address is still only reachable as IPv6; allow it.
-      return false;
-    }
-    const compact = normalized.replace(/%.*$/u, "");
-    if (
-      compact === "::" ||
-      compact === "::1" ||
-      /^0*:(?:0*:)*0*1?$/u.test(compact) ||
-      /^f[cd][0-9a-f]{0,2}:/u.test(compact) || // unique local fc00::/7
-      /^fe[89ab][0-9a-f]?:/u.test(compact) // link-local fe80::/10
-    ) {
-      return true;
-    }
-    // Anything else with a colon must at least look like an IPv6 literal.
-    return !/^[0-9a-f:]+$/u.test(compact);
+    // Judge the address, never its spelling. `new URL()` rewrites
+    // `::ffff:127.0.0.1` to `::ffff:7f00:1` before any tool sees it, so a
+    // guard that looks for a dotted-quad tail never fires in production.
+    const groups = parseIpv6LiteralV1(normalized);
+    // A colon can only appear in a hostname as an IPv6 literal; one the
+    // parser cannot make sense of is refused rather than waved through.
+    if (!groups) return true;
+    return isPrivateIpv6Address(groups);
   }
 
   const ipv4 = parseIpv4LiteralV1(normalized);
