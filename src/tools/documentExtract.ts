@@ -8,6 +8,7 @@ import type {
   ResearchRetrievalProvider,
 } from "../orchestrator/researchProvider";
 import type { ActionReceipt, ToolDescriptor } from "../agent/actions";
+import { normalizePublicFetchUrlV1 } from "./fetchHostPolicy";
 import { requestWithRetry } from "./httpRetry";
 import { writeSourceCacheNote } from "./sourceCache";
 import {
@@ -304,81 +305,27 @@ function encodeBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/**
- * The same public-HTTP(S) shape `web_fetch` requires of a source URL. It is
- * restated here rather than imported because `webTools.ts` keeps its
- * normalizer module-private.
- */
 function normalizeDocumentUrl(rawUrl: string): string {
-  const trimmed = (rawUrl ?? "").trim();
-  if (!trimmed) {
+  if (!(rawUrl ?? "").trim()) {
     throw new ToolExecutionError(
       "invalid_arguments",
       "document_extract URL cannot be empty.",
     );
   }
-  let url: URL;
-  try {
-    url = new URL(
-      /^[a-z][a-z0-9+.-]*:\/\//iu.test(trimmed) ? trimmed : `https://${trimmed}`,
-    );
-  } catch {
-    throw new ToolExecutionError(
-      "invalid_arguments",
-      "document_extract URL is invalid.",
-    );
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new ToolExecutionError(
-      "invalid_arguments",
-      "document_extract only supports HTTP and HTTPS URLs.",
-    );
-  }
-  if (url.username || url.password) {
-    throw new ToolExecutionError(
-      "invalid_arguments",
-      "document_extract URLs with credentials are not allowed.",
-    );
-  }
-  if (isUnsafeDocumentHost(url.hostname)) {
-    throw new ToolExecutionError(
-      "invalid_arguments",
-      "document_extract cannot fetch local or private network URLs.",
-    );
-  }
-  url.hash = "";
-  return url.toString();
-}
-
-function isUnsafeDocumentHost(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/gu, "");
-  if (
-    normalized === "localhost" ||
-    normalized.endsWith(".localhost") ||
-    normalized.endsWith(".local") ||
-    normalized === "::1" ||
-    normalized === "0:0:0:0:0:0:0:1"
-  ) {
-    return true;
-  }
-  if (
-    normalized.includes(":") &&
-    (/^(fc|fd)/u.test(normalized) || normalized.startsWith("fe80:"))
-  ) {
-    return true;
-  }
-  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u.exec(normalized);
-  if (!ipv4) return false;
-  const octets = ipv4.slice(1).map(Number);
-  if (octets.some((octet) => octet < 0 || octet > 255)) return true;
-  const [first, second] = octets as [number, number, number, number];
-  return (
-    first === 0 ||
-    first === 10 ||
-    first === 127 ||
-    (first === 169 && second === 254) ||
-    (first === 172 && second >= 16 && second <= 31) ||
-    (first === 192 && second === 168)
+  // The same shared host policy web_fetch applies. This seat fetches from the
+  // user's own machine, so a private-network literal in any spelling is the
+  // one that matters most here.
+  return normalizePublicFetchUrlV1(
+    rawUrl,
+    {
+      invalid: "document_extract URL is invalid.",
+      scheme: "document_extract only supports HTTP and HTTPS URLs.",
+      credentials: "document_extract URLs with credentials are not allowed.",
+      privateHost: "document_extract cannot fetch local or private network URLs.",
+    },
+    (message) => {
+      throw new ToolExecutionError("invalid_arguments", message);
+    },
   );
 }
 

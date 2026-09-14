@@ -57,6 +57,7 @@ import {
 import { createDocumentExtractProvider } from "./documentExtract";
 import { inferSourceSignals } from "../agent/sourceSignals";
 import { scoreSourceCandidate } from "../orchestrator/sourceCandidateLedger";
+import { normalizePublicFetchUrlV1 } from "./fetchHostPolicy";
 import { requestWithRetry } from "./httpRetry";
 import { resolveRetrievalCachePolicy, type ResolvedRetrievalCachePolicy } from "./retrievalCachePolicy";
 
@@ -944,76 +945,20 @@ function getEvidenceQuery(
 }
 
 function normalizeWebFetchUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
-  if (!trimmed) {
+  if (!rawUrl.trim()) {
     throw new Error("web_fetch URL cannot be empty.");
   }
-
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
-    ? trimmed
-    : `https://${trimmed}`;
-  let url: URL;
-
-  try {
-    url = new URL(withScheme);
-  } catch {
-    throw new Error("web_fetch URL is invalid.");
-  }
-
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("web_fetch only supports HTTP and HTTPS URLs.");
-  }
-
-  if (url.username || url.password) {
-    throw new Error("web_fetch URLs with credentials are not allowed.");
-  }
-
-  if (isUnsafeHost(url.hostname)) {
-    throw new Error("web_fetch cannot fetch local or private network URLs.");
-  }
-
-  url.hash = "";
-  return url.toString();
-}
-
-function isUnsafeHost(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-
-  if (
-    normalized === "localhost" ||
-    normalized.endsWith(".localhost") ||
-    normalized.endsWith(".local") ||
-    normalized === "::1" ||
-    normalized === "0:0:0:0:0:0:0:1"
-  ) {
-    return true;
-  }
-
-  if (
-    normalized.includes(":") &&
-    (/^(fc|fd)/.test(normalized) || normalized.startsWith("fe80:"))
-  ) {
-    return true;
-  }
-
-  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(normalized);
-  if (!ipv4) {
-    return false;
-  }
-
-  const octets = ipv4.slice(1).map(Number);
-  if (octets.some((octet) => octet < 0 || octet > 255)) {
-    return true;
-  }
-
-  const [first, second] = octets;
-  return (
-    first === 0 ||
-    first === 10 ||
-    first === 127 ||
-    first === 169 && second === 254 ||
-    first === 172 && second >= 16 && second <= 31 ||
-    first === 192 && second === 168
+  return normalizePublicFetchUrlV1(
+    rawUrl,
+    {
+      invalid: "web_fetch URL is invalid.",
+      scheme: "web_fetch only supports HTTP and HTTPS URLs.",
+      credentials: "web_fetch URLs with credentials are not allowed.",
+      privateHost: "web_fetch cannot fetch local or private network URLs.",
+    },
+    (message) => {
+      throw new Error(message);
+    },
   );
 }
 
