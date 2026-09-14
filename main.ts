@@ -180,6 +180,7 @@ import {
   sweepAgentRunsRetentionBestEffort,
 } from "./src/agent/runRetentionPolicy";
 import { sweepAgentBackupsRetentionBestEffortV1 } from "./src/agent/backupRetentionPolicy";
+import { sweepExpiredSourceCacheBestEffortV1 } from "./src/tools/sourceCacheRetention";
 import {
   onloadTasksForPhase,
   type OnloadStartupTaskId,
@@ -1435,6 +1436,13 @@ export default class AgenticResearcherPlugin extends Plugin {
           task,
           startedAt,
           sweepAgentBackupsRetentionBestEffortV1({ vault: this.app.vault }),
+        );
+        return;
+      case "sweep_expired_source_cache":
+        this.observeDeferredOnloadTask(
+          task,
+          startedAt,
+          sweepExpiredSourceCacheBestEffortV1({ vault: this.app.vault }),
         );
         return;
       case "schedule_semantic_index_flush":

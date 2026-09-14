@@ -14,13 +14,14 @@ const DEFERRED_TASKS = [
   "cleanup_old_workspaces",
   "sweep_agent_runs_retention",
   "sweep_agent_backups_retention",
+  "sweep_expired_source_cache",
   "schedule_semantic_index_flush",
   "resume_latest_durable_mission",
   "schedule_companion_mission_reconciliation",
 ] as const;
 
-test("onload schedule defers seven disk and companion tasks", () => {
-  assert.equal(countOnloadTasks("layout_ready"), 7);
+test("onload schedule defers eight disk and companion tasks", () => {
+  assert.equal(countOnloadTasks("layout_ready"), 8);
   assert.deepEqual(onloadTasksForPhase("layout_ready"), [...DEFERRED_TASKS]);
   for (const task of DEFERRED_TASKS) {
     assert.equal(onloadSchedulePhaseFor(task), "layout_ready");
