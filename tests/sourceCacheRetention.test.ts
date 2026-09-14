@@ -17,7 +17,6 @@ function entry(overrides: Partial<CachedSource> & { normalizedUrl: string }): Ca
   return {
     vaultPath: `Agent Sources/${overrides.normalizedUrl.replace(/\W+/gu, "-")}.md`,
     url: `https://${overrides.normalizedUrl}`,
-    normalizedUrl: overrides.normalizedUrl,
     urlHash: "sha256:abc",
     title: "Cached source",
     fetchedAt: new Date(NOW.getTime() - 1_000).toISOString(),

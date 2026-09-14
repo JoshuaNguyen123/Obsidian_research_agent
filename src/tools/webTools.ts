@@ -424,14 +424,19 @@ export const webFetchTool: AgentTool = {
     }
 
     const baseUrl = normalizeOllamaBaseUrl(context.settings.ollamaBaseUrl);
-    // The retrieval endpoint is Ollama Cloud's, not a model server's: a local
-    // Ollama does not serve /web_fetch, and a cloud base URL without a key
-    // cannot be called. Both used to end the fetch outright, which left
-    // BYOK and local-model users with search (it already falls back to the
-    // keyless providers) but no way to read any page — no quotes, no
-    // verification, no citations.
-    const canUseOllamaFetch =
-      isOllamaCloudBaseUrl(baseUrl) && Boolean(context.settings.ollamaApiKey.trim());
+    // The retrieval endpoint belongs to Ollama Cloud. A cloud base URL with no
+    // key cannot be called at all, and a local Ollama does not serve
+    // /web_fetch — both used to end the fetch outright, which left BYOK and
+    // local-model users with search (it already falls back to the keyless
+    // providers) and no way to read any page: no quotes, no verification, no
+    // citations.
+    //
+    // Only the first case is decidable in advance. Any other configured base
+    // URL may be a proxy that does serve the route, so it is still tried
+    // first and the direct read is the fallback when it fails.
+    const canUseOllamaFetch = !(
+      isOllamaCloudBaseUrl(baseUrl) && !context.settings.ollamaApiKey.trim()
+    );
 
     let normalized: NormalizedWebFetchV1 | null = null;
     if (canUseOllamaFetch) {

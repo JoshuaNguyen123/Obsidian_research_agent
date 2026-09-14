@@ -92,7 +92,11 @@ function createFetchTransport(
     if (request.url.endsWith("/web_search")) {
       return { status: 404, headers: {}, json: { error: "no search" } };
     }
-    const url = requestedUrl(request);
+    // Two shapes reach this stub: the retrieval endpoint, which names its
+    // target in the POST body, and the direct read, which is a GET of the page
+    // itself. Reading only the body made every direct read look like a request
+    // for the empty URL, so a page this fixture calls dead answered 200.
+    const url = requestedUrl(request) || request.url;
     fetched.push(url);
     const status = statusFor(url);
     return status >= 400

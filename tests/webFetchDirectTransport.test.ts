@@ -33,7 +33,7 @@ type FetchOutput = {
   parserStatus?: string;
 };
 
-test("a vault with no Ollama key still reads the page directly", async () => {
+test("a cloud vault with no key reads the page directly instead of failing", async () => {
   const harness = createHarness({ ollamaApiKey: "" });
   const result = (await webFetchTool.execute(
     { url: "https://batteries.example/solid-state", query: "solid-state batteries" },
@@ -51,17 +51,38 @@ test("a vault with no Ollama key still reads the page directly", async () => {
   assert.ok(result.cachedPath, "the page is cached like any other source");
 });
 
-test("a local Ollama base URL reads directly rather than posting to a route it does not serve", async () => {
+test("a local Ollama that does not serve the route falls back to reading the page", async () => {
+  // A non-cloud base URL may be a proxy that does serve /web_fetch, so it is
+  // still tried first; only its failure routes to the direct read.
   const harness = createHarness({
     ollamaApiKey: "",
     ollamaBaseUrl: "http://localhost:11434",
+    endpointStatus: 404,
   });
   const result = (await webFetchTool.execute(
     { url: "https://batteries.example/solid-state", query: "solid-state batteries" },
     harness.context,
   )) as FetchOutput;
   assert.match(result.content, /Manufacturing remains the constraint/u);
-  assert.deepEqual(harness.requestedUrls, ["https://batteries.example/solid-state"]);
+  assert.deepEqual(harness.requestedUrls, [
+    "http://localhost:11434/web_fetch",
+    "https://batteries.example/solid-state",
+  ]);
+});
+
+test("a configured proxy that does serve the route keeps its answer", async () => {
+  const harness = createHarness({
+    ollamaApiKey: "",
+    ollamaBaseUrl: "https://proxy.internal.example/api",
+  });
+  const result = (await webFetchTool.execute(
+    { url: "https://batteries.example/solid-state", query: "solid-state batteries" },
+    harness.context,
+  )) as FetchOutput;
+  assert.match(result.content, /Endpoint passage about solid-state batteries/u);
+  assert.deepEqual(harness.requestedUrls, [
+    "https://proxy.internal.example/api/web_fetch",
+  ]);
 });
 
 test("a configured cloud key still uses the retrieval endpoint", async () => {

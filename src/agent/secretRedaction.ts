@@ -29,10 +29,13 @@ export const REDACTED_PLACEHOLDER_V1 = "[REDACTED]";
  *
  * A prefix list is not a guess about entropy: each of these is issued by a
  * provider this codebase authenticates against, so a match is a credential,
- * never prose.
+ * never prose. The suffix is therefore unbounded rather than length-gated — a
+ * short or placeholder-looking tail is still the shape of a secret, and a
+ * minimum length only means the redactor misses the tokens nobody anticipated.
+ * `sk-` keeps a floor, because two letters and a hyphen do occur in prose.
  */
 const PREFIXED_CREDENTIAL_PATTERN_V1 =
-  /\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|lin_api_[A-Za-z0-9_-]{8,}|lin_oauth_[A-Za-z0-9_-]{8,}|sk-(?:ant-|proj-|or-)?[A-Za-z0-9_-]{12,}|xox[bpasr]-[A-Za-z0-9-]{8,})/gu;
+  /\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_-]+|lin_oauth_[A-Za-z0-9_-]+|sk-(?:ant-|proj-|or-)?[A-Za-z0-9_-]{12,}|xox[bpasr]-[A-Za-z0-9-]+)/gu;
 
 /** `Authorization: Bearer <token>` in any casing, header or prose. */
 const BEARER_PATTERN_V1 = /Bearer\s+\S+/giu;
