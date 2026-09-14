@@ -115,10 +115,67 @@ export function selectPrunableBackupsV1(
 }
 
 export interface BackupRetentionVaultV1 {
-  getFiles(): Array<{ path: string; stat?: { mtime?: number } }>;
+  /**
+   * Obsidian's indexed files. Deliberately not the enumeration this sweep
+   * relies on: the app does not index dot-prefixed folders, so
+   * `.agent-backups/` never appears here. Kept as a fallback for hosts that do
+   * index it, and because the test adapters in this project expose it.
+   */
+  getFiles?(): Array<{ path: string; stat?: { mtime?: number } }>;
   getFileByPath?(path: string): unknown;
   getAbstractFileByPath?(path: string): unknown;
   trash?(file: unknown, system: boolean): Promise<void>;
+  /**
+   * The filesystem adapter. `list` + `stat` are how a hidden folder is read at
+   * all, which is what `findLatestBackupPathForCurrentFile` already does, and
+   * `trashLocal` moves a file the vault never indexed into the vault's own
+   * `.trash`.
+   */
+  adapter?: {
+    list?(path: string): Promise<{ files: string[]; folders: string[] }>;
+    stat?(path: string): Promise<{ mtime?: number; type?: string } | null>;
+    trashLocal?(path: string): Promise<void>;
+  };
+}
+
+/**
+ * Every backup the host can see, with its modification time.
+ *
+ * The adapter is the authority: Obsidian does not index dot-prefixed folders,
+ * so `vault.getFiles()` returns nothing under `.agent-backups/` in a real
+ * vault. A sweep built on it alone reads as a no-op that unit tests cannot
+ * catch, because a mock vault happily lists whatever it was given — which is
+ * exactly what happened here, and what the installed offline lane caught.
+ */
+export async function listBackupArtifactsV1(
+  vault: BackupRetentionVaultV1,
+): Promise<BackupArtifactV1[]> {
+  const byPath = new Map<string, BackupArtifactV1>();
+  for (const file of vault.getFiles?.() ?? []) {
+    if (!isAgentBackupPathV1(file.path)) continue;
+    byPath.set(file.path, { path: file.path, mtimeMs: file.stat?.mtime ?? 0 });
+  }
+  const adapter = vault.adapter;
+  if (typeof adapter?.list === "function") {
+    try {
+      const listed = await adapter.list(BACKUP_FOLDER);
+      for (const raw of listed?.files ?? []) {
+        const filePath = raw.replace(/\\/gu, "/");
+        if (!isAgentBackupPathV1(filePath) || byPath.has(filePath)) continue;
+        let mtimeMs = 0;
+        try {
+          mtimeMs = (await adapter.stat?.(filePath))?.mtime ?? 0;
+        } catch {
+          // An unreadable stat reads as epoch, which the age rule treats as
+          // old; the keep-newest rule still protects the five most recent.
+        }
+        byPath.set(filePath, { path: filePath, mtimeMs });
+      }
+    } catch {
+      // No backup folder yet, or an adapter that refuses hidden folders.
+    }
+  }
+  return [...byPath.values()];
 }
 
 /**
@@ -135,18 +192,15 @@ export async function sweepAgentBackupsRetentionBestEffortV1(input: {
   const trashed: string[] = [];
   try {
     const policy = input.policy ?? DEFAULT_BACKUP_RETENTION_POLICY_V1;
-    if (typeof input.vault.getFiles !== "function") return { trashed };
-    if (typeof input.vault.trash !== "function") return { trashed };
-    const files = input.vault
-      .getFiles()
-      .filter((file) => isAgentBackupPathV1(file.path));
+    const canTrash =
+      typeof input.vault.trash === "function" ||
+      typeof input.vault.adapter?.trashLocal === "function";
+    if (!canTrash) return { trashed };
+    const files = await listBackupArtifactsV1(input.vault);
     if (files.length === 0) return { trashed };
 
     const selected = selectPrunableBackupsV1(
-      files.map((file) => ({
-        path: file.path,
-        mtimeMs: file.stat?.mtime ?? 0,
-      })),
+      files,
       policy,
       input.now ?? new Date(),
       { protectedPaths: input.protectedPaths },
@@ -160,12 +214,19 @@ export async function sweepAgentBackupsRetentionBestEffortV1(input: {
     );
     for (const path of selected.slice(0, limit)) {
       try {
-        const file =
+        const indexed =
           input.vault.getFileByPath?.(path) ??
           input.vault.getAbstractFileByPath?.(path) ??
-          files.find((candidate) => candidate.path === path);
-        if (!file) continue;
-        await input.vault.trash(file, false);
+          null;
+        if (indexed && typeof input.vault.trash === "function") {
+          await input.vault.trash(indexed, false);
+        } else if (typeof input.vault.adapter?.trashLocal === "function") {
+          // A file the vault never indexed still goes to the vault's trash,
+          // never to an unlink.
+          await input.vault.adapter.trashLocal(path);
+        } else {
+          continue;
+        }
         trashed.push(path);
       } catch {
         // Best effort: one failed trash must not stop the rest.

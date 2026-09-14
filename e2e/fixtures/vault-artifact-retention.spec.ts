@@ -33,9 +33,12 @@ test("installed startup ages out its own backups and keeps the recent ones", asy
   test.setTimeout(240_000);
 
   const identity = await readOfflineBuildIdentity();
-  const proof = beginOfflineAttempt(identity, "vault-artifact-retention");
-  proof.observations = [];
-  await saveOfflineProbe(proof);
+  // A probe, not an application attempt: this lane drives no mission and
+  // scores no scenario, so it must not add a row to the attempt summary the
+  // offline gate reconciles against its required scenario list.
+  const attempt = beginOfflineAttempt(identity, "vault-artifact-retention");
+  attempt.observations = [];
+  await saveOfflineProbe(attempt);
 
   const vaultRoot =
     process.env.OBSIDIAN_VAULT ??
@@ -46,11 +49,12 @@ test("installed startup ages out its own backups and keeps the recent ones", asy
       "test_vault_obsidian_ai",
     );
   const backupsRoot = path.join(vaultRoot, ".agent-backups");
-  const probe = `RetentionProbe${proof.attemptId}`.replace(/[^A-Za-z0-9]/gu, "");
+  const probe = `RetentionProbe${attempt.attemptId}`.replace(/[^A-Za-z0-9]/gu, "");
 
   // Seven aged copies of one note plus one written today. The policy keeps the
-  // five newest of each note at any age and everything under 30 days old, so
-  // exactly the two oldest aged copies may go.
+  // five newest copies of a note at any age and everything under 30 days old,
+  // so the five survivors are today's copy and the four newest aged ones, and
+  // the three oldest go.
   const aged = [] as string[];
   await mkdir(backupsRoot, { recursive: true });
   for (let index = 0; index < 7; index += 1) {
@@ -100,26 +104,39 @@ test("installed startup ages out its own backups and keeps the recent ones", asy
       (await readdir(backupsRoot)).filter((name) => name.includes(probe));
     await expect
       .poll(async () => (await remaining()).length, { timeout: 60_000 })
-      .toBe(6);
+      .toBe(5);
 
     const survivors = await remaining();
-    proof.observations.push({
+    attempt.observations.push({
       label: "backup-retention",
       seeded: [...aged, freshName],
       survivors,
     });
-    await saveOfflineProbe(proof);
 
-    // The two oldest went; the five newest aged copies and today's copy stayed.
-    expect(survivors).not.toContain(aged[0]);
-    expect(survivors).not.toContain(aged[1]);
-    for (const name of aged.slice(2)) expect(survivors).toContain(name);
+    // The three oldest went; today's copy and the four newest aged ones stayed.
+    for (const name of aged.slice(0, 3)) expect(survivors).not.toContain(name);
+    for (const name of aged.slice(3)) expect(survivors).toContain(name);
     expect(survivors).toContain(freshName);
 
     // Trashed, never hard-deleted: Obsidian's own trash holds the copies.
     const trashRoot = path.join(vaultRoot, ".trash");
     const trashed = await readdir(trashRoot).catch(() => [] as string[]);
     expect(trashed.some((name) => name.includes(probe))).toBe(true);
+
+    await saveOfflineProbe({
+      ...attempt,
+      status: "passed",
+      failureClass: "none",
+      failureDetail: "",
+      artifactReadbacks: survivors.map((name) => `backup:${name}`),
+    });
+  } catch (error) {
+    await saveOfflineProbe({
+      ...attempt,
+      failureClass: "product:backup_retention_not_applied",
+      failureDetail: String(error).slice(0, 500),
+    });
+    throw error;
   } finally {
     await harness?.close();
   }

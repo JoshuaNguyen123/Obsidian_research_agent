@@ -104,38 +104,65 @@ test("a disabled policy sweeps nothing", () => {
   );
 });
 
-test("the sweep trashes aged copies and leaves everything else alone", async () => {
-  const files = [
-    ...Array.from({ length: 7 }, (_, index) => ({
-      path: notePath(index),
-      stat: { mtime: daysAgo(500 - index) },
-    })),
-    { path: "Notes/Note.md", stat: { mtime: daysAgo(500) } },
-  ];
+/**
+ * A vault that behaves like Obsidian: `.agent-backups/` is dot-prefixed, so
+ * the app never indexes it and `getFiles()` cannot see a single backup. The
+ * adapter is the only way in, and `trashLocal` the only way out. The first
+ * version of this sweep read `getFiles()` alone, passed against a mock that
+ * volunteered the paths, and did nothing at all in the installed plugin.
+ */
+function createHiddenFolderVault(
+  backups: ReadonlyArray<{ path: string; mtimeMs: number }>,
+  options: { indexedFiles?: ReadonlyArray<{ path: string; stat: { mtime: number } }> } = {},
+) {
+  const present = new Map(backups.map((item) => [item.path, item.mtimeMs]));
   const trashed: string[] = [];
-  const result = await sweepAgentBackupsRetentionBestEffortV1({
+  return {
+    trashed,
+    present,
     vault: {
-      getFiles: () => files,
-      getFileByPath: (path: string) =>
-        files.find((file) => file.path === path) ?? null,
-      trash: async (file: unknown) => {
-        trashed.push((file as { path: string }).path);
+      // Only user-visible notes, exactly as Obsidian reports them.
+      getFiles: () => [...(options.indexedFiles ?? [])],
+      getFileByPath: () => null,
+      adapter: {
+        list: async () => ({ files: [...present.keys()], folders: [] }),
+        stat: async (path: string) =>
+          present.has(path) ? { mtime: present.get(path)!, type: "file" } : null,
+        trashLocal: async (path: string) => {
+          if (path === "LOCKED") throw new Error("locked");
+          present.delete(path);
+          trashed.push(path);
+        },
       },
     },
+  };
+}
+
+test("the sweep reads the hidden folder through the adapter and trashes there", async () => {
+  const harness = createHiddenFolderVault(
+    Array.from({ length: 7 }, (_, index) => ({
+      path: notePath(index),
+      mtimeMs: daysAgo(500 - index),
+    })),
+    { indexedFiles: [{ path: "Notes/Note.md", stat: { mtime: daysAgo(500) } }] },
+  );
+  const result = await sweepAgentBackupsRetentionBestEffortV1({
+    vault: harness.vault,
     now: NOW,
   });
-  assert.deepEqual(result.trashed, trashed);
-  assert.equal(trashed.length, 2);
-  assert.ok(trashed.every((path) => path.startsWith(".agent-backups/")));
-  assert.ok(!trashed.includes("Notes/Note.md"));
+  assert.deepEqual(result.trashed, harness.trashed);
+  assert.equal(harness.trashed.length, 2);
+  assert.ok(harness.trashed.every((path) => path.startsWith(".agent-backups/")));
+  assert.ok(!harness.trashed.includes("Notes/Note.md"));
 });
 
-test("a vault without trash support is left untouched", async () => {
+test("a vault that offers no way to trash is left untouched", async () => {
   const result = await sweepAgentBackupsRetentionBestEffortV1({
     vault: {
-      getFiles: () => [
-        { path: ".agent-backups/17262720000-Note.md", stat: { mtime: daysAgo(900) } },
-      ],
+      adapter: {
+        list: async () => ({ files: [notePath(0)], folders: [] }),
+        stat: async () => ({ mtime: daysAgo(900), type: "file" }),
+      },
     },
     now: NOW,
   });
@@ -143,25 +170,58 @@ test("a vault without trash support is left untouched", async () => {
 });
 
 test("one failing trash does not stop the rest of the sweep", async () => {
-  const files = Array.from({ length: 8 }, (_, index) => ({
+  const harness = createHiddenFolderVault(
+    Array.from({ length: 8 }, (_, index) => ({
+      path: notePath(index),
+      mtimeMs: daysAgo(500 - index),
+    })),
+  );
+  const oldest = notePath(0);
+  const vault = {
+    ...harness.vault,
+    adapter: {
+      ...harness.vault.adapter,
+      trashLocal: async (path: string) => {
+        if (path === oldest) throw new Error("locked");
+        harness.present.delete(path);
+        harness.trashed.push(path);
+      },
+    },
+  };
+  const result = await sweepAgentBackupsRetentionBestEffortV1({ vault, now: NOW });
+  // Three copies are prunable; the oldest throws and the other two still go.
+  assert.equal(result.trashed.length, 2);
+  assert.ok(!result.trashed.includes(oldest));
+});
+
+test("an indexed backup is trashed through the vault API, not the adapter", async () => {
+  // Some hosts do index the folder. Prefer the vault's own trash there so the
+  // file leaves the index with it.
+  const path = notePath(0);
+  const trashedFiles: string[] = [];
+  const adapterTrashed: string[] = [];
+  const files = Array.from({ length: 7 }, (_, index) => ({
     path: notePath(index),
     stat: { mtime: daysAgo(500 - index) },
   }));
-  const trashed: string[] = [];
   const result = await sweepAgentBackupsRetentionBestEffortV1({
     vault: {
       getFiles: () => files,
-      getFileByPath: (path: string) =>
-        files.find((file) => file.path === path) ?? null,
+      getFileByPath: (candidate: string) =>
+        files.find((file) => file.path === candidate) ?? null,
       trash: async (file: unknown) => {
-        const { path } = file as { path: string };
-        if (path === notePath(0)) throw new Error("locked");
-        trashed.push(path);
+        trashedFiles.push((file as { path: string }).path);
+      },
+      adapter: {
+        list: async () => ({ files: [], folders: [] }),
+        trashLocal: async (candidate: string) => {
+          adapterTrashed.push(candidate);
+        },
       },
     },
     now: NOW,
   });
-  // Three copies are prunable; the oldest throws and the other two still go.
-  assert.equal(result.trashed.length, 2);
-  assert.deepEqual(result.trashed, trashed);
+  assert.ok(result.trashed.includes(path));
+  assert.deepEqual(adapterTrashed, []);
+  assert.equal(trashedFiles.length, 2);
 });
