@@ -9,6 +9,7 @@ import type {
   AgentRunReceipt,
   AgentRunStopReason,
 } from "../AgentRunner";
+import { redactSecretsV1 } from "./secretRedaction";
 import { sameReceiptIdentity } from "./receiptIdentity";
 import {
   mergeModelUsageAggregatesV1,
@@ -1012,14 +1013,12 @@ function buildTerminalErrorDiagnostic(error: unknown): {
 }
 
 function sanitizeTerminalDiagnostic(value: string, maxChars: number): string {
-  return value
-    .replace(
-      /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
-      "[REDACTED]",
-    )
+  // A terminal diagnostic leaves the run and is read back by people and by
+  // models, so this seat also takes the unprefixed-opaque-run pass that the
+  // shared redactor leaves off by default.
+  return redactSecretsV1(value, { redactOpaqueRuns: true })
     .replace(/\b[A-Za-z]:[\\/][^\r\n\t"']+/gu, "[LOCAL_PATH]")
     .replace(/\\\\[^\s"']+/gu, "[NETWORK_PATH]")
-    .replace(/([?&](?:token|key|secret|code|state)=)[^&\s]+/giu, "$1[REDACTED]")
     .replace(/[\r\n\t]+/gu, " ")
     .trim()
     .slice(0, maxChars);

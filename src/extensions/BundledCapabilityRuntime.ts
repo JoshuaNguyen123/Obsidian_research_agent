@@ -1,3 +1,4 @@
+import { redactedErrorMessageV1 } from "../agent/secretRedaction";
 import { Notice, type Plugin } from "obsidian";
 import {
   AGENTIC_RESEARCHER_COMPANION_RECONCILE_EVENT,
@@ -1060,11 +1061,5 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function safeNoticeError(error: unknown): string {
-  return (error instanceof Error ? error.message : "Unknown error.")
-    .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
-    .replace(
-      /(token|secret|password)\s*[=:]\s*[^\s,;}]+/giu,
-      "$1=[REDACTED]",
-    )
-    .slice(0, 1_000);
+  return redactedErrorMessageV1(error, "Unknown error.", 1_000);
 }
