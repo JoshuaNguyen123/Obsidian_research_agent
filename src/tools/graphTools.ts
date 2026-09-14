@@ -1,7 +1,10 @@
 import type { TFile } from "obsidian";
 import { BACKUP_FOLDER, MAX_LISTED_FILES } from "./constants";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
-import { isVaultPathExcluded } from "./vaultExclusions";
+import {
+  isVaultPathExcluded,
+  vaultExclusionRootsFromSettingsV1,
+} from "./vaultExclusions";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { resolveCurrentNoteFile } from "./currentNote";
 import {
@@ -418,11 +421,12 @@ async function mergeSemanticRelatedHits({
   if (!search.ok) {
     return false;
   }
+  const extraRoots = vaultExclusionRootsFromSettingsV1(context.settings);
   for (const hit of search.results) {
     if (baseProfile && hit.path === baseProfile.path) {
       continue;
     }
-    if (isVaultPathExcluded(hit.path)) {
+    if (isVaultPathExcluded(hit.path, { extraRoots })) {
       continue;
     }
     const boost = Math.round((hit.semanticScore > 0 ? hit.semanticScore : hit.score) * 80);
@@ -611,9 +615,13 @@ async function buildVaultProfiles(
   }
 
   const profiles = new Map<string, NoteProfile>();
+  const extraRoots = vaultExclusionRootsFromSettingsV1(context.settings);
   const candidates = context.app.vault
     .getFiles()
-    .filter((file) => file.extension === "md" && !isVaultPathExcluded(file.path));
+    .filter(
+      (file) =>
+        file.extension === "md" && !isVaultPathExcluded(file.path, { extraRoots }),
+    );
   // Most-recently-modified first, so that when the cap bites the sample is at
   // least principled rather than an accident of vault iteration order.
   const files = [...candidates]

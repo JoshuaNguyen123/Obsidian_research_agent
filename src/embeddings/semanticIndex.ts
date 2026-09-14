@@ -19,7 +19,11 @@ import {
   type SemanticChunkingOptions,
 } from "../tools/semanticSearchTools";
 import { normalizeVaultPath } from "../tools/validation";
-import { isPathUnderVaultFolder, isVaultPathExcluded } from "../tools/vaultExclusions";
+import {
+  isPathUnderVaultFolder,
+  isVaultPathExcluded,
+  vaultExclusionRootsFromSettingsV1,
+} from "../tools/vaultExclusions";
 import { mapWithBoundedConcurrency } from "../utils/boundedConcurrency";
 import type { SemanticEmbeddingPriority, SemanticEmbeddingProvider } from "./types";
 import {
@@ -216,7 +220,9 @@ export function shouldSemanticIndexTrackPath(
   return (
     normalized !== markdownPath &&
     normalized !== jsonPath &&
-    !isVaultPathExcluded(normalized) &&
+    !isVaultPathExcluded(normalized, {
+      extraRoots: vaultExclusionRootsFromSettingsV1(settings),
+    }) &&
     !isPathUnderVaultFolder(normalized, folder)
   );
 }
