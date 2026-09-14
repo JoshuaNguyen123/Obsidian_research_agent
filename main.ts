@@ -179,6 +179,7 @@ import {
   resolveRunRetentionPolicy,
   sweepAgentRunsRetentionBestEffort,
 } from "./src/agent/runRetentionPolicy";
+import { sweepAgentBackupsRetentionBestEffortV1 } from "./src/agent/backupRetentionPolicy";
 import {
   onloadTasksForPhase,
   type OnloadStartupTaskId,
@@ -1427,6 +1428,13 @@ export default class AgenticResearcherPlugin extends Plugin {
             },
           ),
           }),
+        );
+        return;
+      case "sweep_agent_backups_retention":
+        this.observeDeferredOnloadTask(
+          task,
+          startedAt,
+          sweepAgentBackupsRetentionBestEffortV1({ vault: this.app.vault }),
         );
         return;
       case "schedule_semantic_index_flush":
