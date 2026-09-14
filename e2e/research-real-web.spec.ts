@@ -64,7 +64,13 @@ function sourceHostname(url: unknown): string | null {
 }
 
 test.describe("Real-web research quality lane", () => {
-  test.describe.configure({ mode: "default", timeout: 900_000, retries: 0 });
+  // Sized to the step budget the product actually grants. A three-source cited
+  // summary is funded for 14 tool steps plus a finalization reserve, and the
+  // 2026-09-14 run measured ~49 s per step, so a mission that spends most of
+  // its budget needs roughly a quarter hour. The previous 720 s mission
+  // timeout was sized to the old five-step budget and would have cut off a
+  // mission that was still making progress.
+  test.describe.configure({ mode: "default", timeout: 1_500_000, retries: 0 });
 
   for (const scenario of REAL_WEB_PROMPTS) {
     test(`RESEARCH-WEB-01 ${scenario.label} cited summary from the live web`, async ({}, testInfo) => {
@@ -74,7 +80,7 @@ test.describe("Real-web research quality lane", () => {
         // Deliberately NO installOwnedWebBackend: the plugin's own transport
         // reaches the real provider search and fetch endpoints.
         const before = await readFile(harness.noteFilePath, "utf8");
-        await harness.submitMission(scenario.prompt, { timeoutMs: 720_000 });
+        await harness.submitMission(scenario.prompt, { timeoutMs: 1_200_000 });
         const after = await readFile(harness.noteFilePath, "utf8");
         const appended = after.slice(before.length);
 
