@@ -11094,7 +11094,21 @@ export async function runAgentMission({
             .filter(Boolean)
             .join(";") || "step_budget"
         : effectiveStopReason === "error"
-          ? nextAction?.trim() || null
+          ? // An error used to record only `nextAction`, and most of the sites
+            // that end a run this way pass none — so the detail arrived empty
+            // and was backfilled with an unrelated continuation reason. A
+            // terminal error is the one stop that most needs to say what it
+            // was, so it now carries the same evidence the budget stop does:
+            // what acceptance still wanted, and whether the graph agreed.
+            [
+              nextAction?.trim() || null,
+              acceptanceMissingForStop.length > 0
+                ? acceptanceMissingForStop.join(",")
+                : null,
+              !graphComplete ? "mission_graph_incomplete" : null,
+            ]
+              .filter(Boolean)
+              .join(";") || "unreported_terminal_error"
           : null;
     // Both halves of the mission's wall clock, side by side. Provider latency
     // is not ours to optimise; tool latency is. Without the split, a slow run
@@ -22045,7 +22059,7 @@ export async function runAgentMission({
           recordLedgerBlocker(
             "Required read tools were not requested before writeback.",
           );
-          await finishRun("error", lastStep, stepLimit);
+          await finishRun("error", lastStep, stepLimit, message);
           return;
         }
         if (await stopIfRequested(step)) {
@@ -22208,7 +22222,7 @@ export async function runAgentMission({
         recordLedgerBlocker(
           "Required web research tools were not requested before final answer.",
         );
-        await finishRun("error", lastStep, stepLimit);
+        await finishRun("error", lastStep, stepLimit, message);
         return;
       }
 
@@ -22249,7 +22263,7 @@ export async function runAgentMission({
           recordLedgerBlocker(
             "Vault traversal tools were not requested before final answer.",
           );
-          await finishRun("error", lastStep, stepLimit);
+          await finishRun("error", lastStep, stepLimit, message);
           return;
         }
       }
@@ -22417,7 +22431,7 @@ export async function runAgentMission({
           const message = `I could not complete the mission because required evidence is missing: ${reflexOutput.completion.missing.join(", ")}. No additional vault files were changed.`;
           emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
           recordLedgerBlocker(message);
-          await finishRun("error", lastStep, stepLimit);
+          await finishRun("error", lastStep, stepLimit, message);
           return;
         }
       }
@@ -38608,6 +38622,30 @@ export function shouldInspectAutoContinuationGrant(
   return stopReason === "budget" && !suppressAutoContinuation;
 }
 
+/**
+ * The detail a completion event carries about why the run stopped.
+ *
+ * `not_budget` is the auto-continuation decision saying "this stop is not a
+ * budget pause". It explains nothing about why the run ended, and using it as a
+ * fallback made a terminal error report `stopDetail: "not_budget"` — a string
+ * that reads like a cause and is not one. On 2026-09-14 a real-web mission
+ * stopped at step 11 of 18 with exactly that and nothing else, after fifteen
+ * successful tool calls, and the run could not be diagnosed from its artifacts.
+ *
+ * An absent detail now stays absent, so it is visible as absent.
+ */
+export function resolveRunStopDetailV1(
+  stopDetail: string | null | undefined,
+  autoContinuationReason: string | undefined,
+): string | null {
+  const explicit = stopDetail?.trim();
+  if (explicit) return explicit;
+  if (!autoContinuationReason || autoContinuationReason === "not_budget") {
+    return null;
+  }
+  return autoContinuationReason;
+}
+
 function completeRun(
   events: AgentRunEvents,
   stopReason: AgentRunStopReason,
@@ -38626,11 +38664,15 @@ function completeRun(
       ? "stopped"
       : "done",
   );
+  const resolvedStopDetail = resolveRunStopDetailV1(
+    stopDetail,
+    autoContinuation?.reason,
+  );
   events.onRunComplete?.({
     step,
     maxSteps,
     stopReason,
-    stopDetail: stopDetail ?? autoContinuation?.reason ?? null,
+    stopDetail: resolvedStopDetail,
     ...(autoContinuation
       ? {
           autoContinueRecommended: autoContinuation.recommended,
@@ -38652,7 +38694,7 @@ function completeRun(
       step,
       maxSteps,
       stopReason,
-      stopDetail: stopDetail ?? autoContinuation?.reason ?? null,
+      stopDetail: resolvedStopDetail,
       autoContinueRecommended: autoContinuation?.recommended ?? false,
       autoContinueReason: autoContinuation?.reason ?? "not_budget",
       ...(autoContinuation?.suppressionReason
