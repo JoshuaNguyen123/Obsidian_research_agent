@@ -472,3 +472,45 @@ test("source cache sanitizes hostile titles and urls into safe vault paths", asy
   assert.ok(!cached.vaultPath.includes("\\"));
   assert.match(cached.vaultPath, /\.md$/);
 });
+
+test("a section read waits for a queued rewrite of the same source instead of reading it torn", async () => {
+  // A desktop vault.modify truncates then writes. The writers were queued per
+  // path but the readers were not, so a section read that overlapped a refresh
+  // of the same source parsed a half-written note and threw "Cached source
+  // note is invalid." — which, on a required tool, suppressed auto-continue.
+  const now = new Date("2026-07-07T12:00:00.000Z");
+  const { context, content } = createCacheContext(now);
+  const url = "https://example.com/torn-read";
+  const first = await writeSourceCacheNote(context, {
+    url,
+    title: "Torn read",
+    content: "Original body about solid electrolytes and interface stability.",
+  });
+
+  const vault = (context.app as unknown as { vault: Record<string, unknown> }).vault;
+  const settledModify = vault.modify as (file: { path: string }, data: string) => Promise<void>;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let signalStarted!: () => void;
+  const started = new Promise<void>((resolve) => (signalStarted = resolve));
+  vault.modify = async (file: { path: string }, data: string) => {
+    content.set(file.path, "");
+    signalStarted();
+    await gate;
+    await settledModify(file, data);
+  };
+
+  const rewrite = writeSourceCacheNote(context, {
+    url,
+    title: "Torn read",
+    content: "Refreshed body about solid electrolytes and manufacturing at scale.",
+  });
+  await started;
+  const reading = readSourceSection(context, { path: first.vaultPath }, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  release();
+
+  const section = await reading;
+  await rewrite;
+  assert.match(section.content, /Refreshed body about solid electrolytes/u);
+});
