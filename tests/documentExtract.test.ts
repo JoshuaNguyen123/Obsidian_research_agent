@@ -618,3 +618,63 @@ test("extract_document accepts a vault-relative .pdf path through normalizeVault
     disconnect();
   }
 });
+
+test("a document URL that redirects to the companion is refused before the redirect is followed", async () => {
+  // document_extract downloads on the user's machine, where the companion
+  // listens on loopback. requestUrl followed this redirect out of the host
+  // policy's sight; the hop transport hands it back to be judged instead.
+  const disconnect = connectCompanion();
+  const hops: string[] = [];
+  try {
+    const context = {
+      ...contextFor(companionJson({ ok: true, status: "parsed", text: "never" })),
+      publicFetchTransport: async (request: { url: string }) => {
+        hops.push(request.url);
+        return {
+          status: 302,
+          headers: { location: `${BASE_URL}/v1/health` },
+          bytes: new Uint8Array(0),
+          truncated: false,
+        };
+      },
+    } as unknown as ToolExecutionContext;
+    const provider = createDocumentExtractProvider(context);
+    await assert.rejects(
+      () => provider.retrieve({ id: "primary-9", url: PDF_URL, strategy: "document_extract" }),
+      (error: unknown) =>
+        error instanceof ToolExecutionError &&
+        error.message.includes("redirected to a local or private network address"),
+    );
+    assert.deepEqual(hops, [PDF_URL]);
+  } finally {
+    disconnect();
+  }
+});
+
+test("an oversized document is refused after one byte past the limit, not after the whole download", async () => {
+  const disconnect = connectCompanion();
+  let requestedCap = 0;
+  try {
+    const context = {
+      ...contextFor(companionJson({ ok: true, status: "parsed", text: "never" })),
+      publicFetchTransport: async (request: { maxBytes: number }) => {
+        requestedCap = request.maxBytes;
+        return {
+          status: 200,
+          headers: { "content-type": "application/pdf" },
+          bytes: new Uint8Array(request.maxBytes),
+          truncated: true,
+        };
+      },
+    } as unknown as ToolExecutionContext;
+    const provider = createDocumentExtractProvider(context);
+    await assert.rejects(
+      () => provider.retrieve({ id: "primary-10", url: PDF_URL, strategy: "document_extract" }),
+      (error: unknown) =>
+        error instanceof ToolExecutionError && /will not send a document over/u.test(error.message),
+    );
+    assert.equal(requestedCap, MAX_DOCUMENT_BYTES + 1);
+  } finally {
+    disconnect();
+  }
+});

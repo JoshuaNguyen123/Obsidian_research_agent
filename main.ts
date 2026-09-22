@@ -205,6 +205,8 @@ import {
 } from "./src/agent/runRetentionPolicy";
 import { sweepAgentBackupsRetentionBestEffortV1 } from "./src/agent/backupRetentionPolicy";
 import { sweepExpiredSourceCacheBestEffortV1 } from "./src/tools/sourceCacheRetention";
+import { createNodePublicFetchTransportV1 } from "./src/tools/nodePublicFetchTransport";
+import type { PublicFetchHopTransportV1 } from "./src/tools/publicFetch";
 import {
   onloadTasksForPhase,
   type OnloadStartupTaskId,
@@ -16517,12 +16519,21 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
   }
 
+  private publicFetchTransport: PublicFetchHopTransportV1 | null = null;
+
+  /** One Node hop transport per plugin instance; it holds no connections. */
+  private getPublicFetchTransport(): PublicFetchHopTransportV1 {
+    this.publicFetchTransport ??= createNodePublicFetchTransportV1();
+    return this.publicFetchTransport;
+  }
+
   createToolExecutionContext(originalPrompt: string): ToolExecutionContext {
     return {
       app: this.app,
       settings: this.settings,
       originalPrompt,
       httpTransport: requestUrlTransport,
+      publicFetchTransport: this.getPublicFetchTransport(),
       getCurrentMarkdownFile: () => this.getCurrentMarkdownFile(),
       getCurrentMarkdownContent: (file) => this.getCurrentMarkdownContent(file),
       setCurrentMarkdownContent: (file, content, options) =>

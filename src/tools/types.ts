@@ -8,6 +8,7 @@ import type {
   ModelToolDefinition,
 } from "../model/types";
 import type { AutonomyScope } from "../agent/missionScope";
+import type { PublicFetchHopTransportV1 } from "./publicFetch";
 import type { SemanticEmbeddingProvider } from "../embeddings/types";
 import type { SemanticIndexService } from "../embeddings/semanticIndexTypes";
 import type {
@@ -161,6 +162,16 @@ export interface ToolExecutionContext {
   /** Absolute Unix timestamp in milliseconds after which the operation should stop. */
   deadlineAt?: number;
   httpTransport: HttpTransport;
+  /**
+   * One-hop transport for URLs the model chose (`web_fetch` direct read,
+   * `document_extract` download). It never follows redirects, so
+   * `fetchPublicUrlV1` can re-check every hop against the host policy, and the
+   * desktop implementation refuses names that resolve to private addresses.
+   * Absent means those tools fall back to `httpTransport`, which follows
+   * redirects out of sight; the fetch result then reports
+   * `redirectsChecked: false`.
+   */
+  publicFetchTransport?: PublicFetchHopTransportV1;
   runtimeCache?: AgentRuntimeCache;
   /**
    * Full tool payloads compaction set aside in this run. Absent means nothing
