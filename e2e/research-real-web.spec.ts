@@ -53,16 +53,6 @@ const REAL_WEB_PROMPTS: ReadonlyArray<{ label: string; prompt: string }> = [
   },
 ];
 
-/** Hostname of a fetched source, or null for an unparseable locator. */
-function sourceHostname(url: unknown): string | null {
-  if (typeof url !== "string" || !url.trim()) return null;
-  try {
-    return new URL(url).hostname.toLowerCase().replace(/^www\./u, "");
-  } catch {
-    return null;
-  }
-}
-
 test.describe("Real-web research quality lane", () => {
   // Sized to the step budget the product actually grants. A three-source cited
   // summary is funded for 14 tool steps plus a finalization reserve, and the
@@ -99,9 +89,15 @@ test.describe("Real-web research quality lane", () => {
         const fetchedPassageIds = new Set<string>(
           fetchedEvidence.flatMap((item: any) => item.passageIds),
         );
+        // The attestation carries a hostname, never a URL; it is computed by
+        // the same function the product's distinct-domain check uses.
         const fetchedDomains = new Set(
           fetchedEvidence
-            .map((item: any) => sourceHostname(item.url))
+            .map((item: any) =>
+              typeof item.sourceDomain === "string" && item.sourceDomain
+                ? item.sourceDomain
+                : null,
+            )
             .filter((host: string | null): host is string => Boolean(host)),
         );
         const citedPassageIds = [

@@ -1580,12 +1580,20 @@ export interface AgentRunCompleteEvent {
 /**
  * Redacted durable-evidence projection for runtime attestation. It deliberately
  * excludes titles, summaries, paths, URLs, passage text, and provider payloads.
+ *
+ * `sourceDomain` is the one exception, and it is a hostname, not a URL. The
+ * research acceptance check counts distinct domains, and without this field
+ * nothing reading the projection could count them: the real-web lane derived
+ * domains from a `url` the projection never carried, so its distinct-domain
+ * assertion started from an empty set and could not pass.
  */
 export interface MissionEvidenceAttestationV1 {
   schemaVersion: 1;
   id: string;
   kind: MissionEvidence["kind"];
   sourceId?: string;
+  /** Hostname the research acceptance check counts (`getUrlHostname`). */
+  sourceDomain?: string;
   passageIds: string[];
   usableSource?: boolean;
   parserStatus?: MissionEvidence["parserStatus"];
