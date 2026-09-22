@@ -9,6 +9,7 @@
  */
 
 import type { ApprovalRequest } from "../agent/approvalBroker";
+import type { CompletionFollowupV1 } from "../agent/autoFollowups";
 import type { ClarificationRequest } from "../agent/clarificationBroker";
 import { formatApprovalCardModelV1 } from "./approvalCardModel";
 import { chatApprovalAttentionTitle } from "./agentViewCopy";
@@ -180,5 +181,63 @@ export function renderClarificationCard(
     settle(() => handlers.skip());
   });
   input.focus();
+  return card;
+}
+
+export interface ChatFollowupsCardHandlersV1 {
+  /** Submits the chip's fixed prompt through the ordinary composer path. */
+  submit: (prompt: string) => void;
+}
+
+/**
+ * The mission finished and the host has concrete next steps. Chips only: a
+ * click submits a real mission the user can read first (the full prompt is
+ * the chip's tooltip); nothing runs on its own and no authority is granted.
+ */
+export function renderChatFollowupsCard(
+  banner: HTMLElement,
+  followups: readonly CompletionFollowupV1[],
+  handlers: ChatFollowupsCardHandlersV1,
+): HTMLElement | null {
+  if (followups.length === 0) {
+    clearChatAttentionCard(banner, "followups");
+    return null;
+  }
+  const card = upsertChatAttentionCard(banner, "followups");
+  card.addClass("is-followups");
+  card.setAttribute("data-testid", "chat-followups");
+  card.createDiv({
+    text: "Next, I could:",
+    cls: "agentic-researcher-chat-attention-title",
+  });
+  const controls = card.createDiv({
+    cls: "agentic-researcher-chat-attention-controls",
+  });
+  for (const [index, followup] of followups.entries()) {
+    const chip = controls.createEl("button", {
+      text: followup.label,
+      cls: "agentic-researcher-secondary-action agentic-researcher-clarification-chip",
+      attr: {
+        type: "button",
+        title: followup.prompt,
+        "data-testid": `chat-followup-chip-${index}`,
+        "data-followup-id": followup.id,
+      },
+    });
+    chip.addEventListener("click", (event) => {
+      event.preventDefault();
+      clearChatAttentionCard(banner, "followups");
+      handlers.submit(followup.prompt);
+    });
+  }
+  const dismiss = controls.createEl("button", {
+    text: "Dismiss",
+    cls: "agentic-researcher-secondary-action",
+    attr: { type: "button", "data-testid": "chat-followups-dismiss" },
+  });
+  dismiss.addEventListener("click", (event) => {
+    event.preventDefault();
+    clearChatAttentionCard(banner, "followups");
+  });
   return card;
 }

@@ -103,23 +103,33 @@ export function normalizeAssistantResult(value) {
 }
 
 async function streamCompletion({ response, backend, body, requestId, signal }) {
+  // Ask the backend for its FIRST event before committing a 200. A backend
+  // that fails before producing anything must reach the client as the HTTP
+  // error it raised (a 503 stays a 503), which is what a cloud provider sends
+  // for an outage. Writing the event-stream header first made that failure
+  // an empty 200 stream that ended without [DONE]: the client read it as "the
+  // model returned no content", so the transient retry policy never ran and
+  // a host recovery had no provider error to recover from.
+  const source = typeof backend.stream === "function"
+    ? backend.stream(body, { signal, requestId })
+    : singleResultStream(await backend.complete(body, { signal, requestId }));
+  const iterator = source[Symbol.asyncIterator]();
+  let step = await iterator.next();
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
     connection: "keep-alive",
   });
-  const source = typeof backend.stream === "function"
-    ? backend.stream(body, { signal, requestId })
-    : singleResultStream(await backend.complete(body, { signal, requestId }));
   let index = 0;
-  for await (const event of source) {
+  while (!step.done) {
     if (signal.aborted) throw new Error("Request aborted.");
-    const normalized = normalizeStreamEvent(event, index++);
+    const normalized = normalizeStreamEvent(step.value, index++);
     await writeWithBackpressure(
       response,
       `data: ${JSON.stringify(openAIStreamChunk(normalized, requestId, body.model))}\n\n`,
       signal,
     );
+    step = await iterator.next();
   }
   await writeWithBackpressure(response, "data: [DONE]\n\n", signal);
   response.end();

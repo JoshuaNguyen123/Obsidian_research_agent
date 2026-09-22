@@ -243,6 +243,30 @@ export function conversationalBlockerCopy(input: {
  * Rewrite recovery/status jargon into a plain Chat system line when recognized.
  * Unknown messages pass through unchanged.
  */
+/**
+ * Runner heartbeat copy while one model call is still pending. The runner
+ * formats it and the live-run card parses it back into its own "waiting"
+ * line, so both sides share one shape instead of a regex in each.
+ */
+export const MODEL_WAIT_STATUS_PREFIX = "Still waiting for ";
+
+export function formatModelWaitStatusLine(
+  label: string,
+  elapsedSeconds: number,
+): string {
+  return `${MODEL_WAIT_STATUS_PREFIX}${label} (${Math.max(0, Math.round(elapsedSeconds))}s elapsed)...`;
+}
+
+export function parseModelWaitStatusLine(
+  message: string,
+): { label: string; elapsedSeconds: number } | null {
+  const text = message.replace(/\s+/g, " ").trim();
+  if (!text.startsWith(MODEL_WAIT_STATUS_PREFIX)) return null;
+  const match = /^Still waiting for (.+?) \((\d+)s elapsed\)\.{3}$/.exec(text);
+  if (!match) return null;
+  return { label: match[1], elapsedSeconds: Number(match[2]) };
+}
+
 export function conversationalStatusLine(message: string): string {
   const text = message.replace(/\s+/g, " ").trim();
   if (!text) return text;

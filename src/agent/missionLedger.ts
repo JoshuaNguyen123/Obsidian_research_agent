@@ -4,6 +4,10 @@ import {
   readRunNoteStatusFromMetadataCache,
 } from "./runNoteStatus";
 import { observeHostWorkV1 } from "./hostWork";
+import {
+  buildMissionCompletionSummaryV1,
+  formatMissionCompletionSummaryBulletsV1,
+} from "./missionCompletionSummary";
 import type { TFile } from "obsidian";
 import type { LoopBudgetPlan } from "./loopPlanner";
 import {
@@ -1475,8 +1479,45 @@ export function formatMissionLedgerBlock(ledger: MissionLedger): string {
     `- Progress score: ${ledger.progressScore ?? ledger.missionPlan?.progress.score ?? 0}`,
     `- Stalled count: ${ledger.stalledCount ?? ledger.missionPlan?.progress.stalledCount ?? 0}`,
     `- Iterations: ${ledger.iterationCount ?? 0}`,
+    // Plain prose for the human who opens this note, rendered as single-line
+    // bullets so GENERATED_MISSION_SUMMARY_PATTERN still owns the whole
+    // section and each checkpoint replaces rather than accumulates it.
+    ...formatMissionCompletionSummaryBulletsV1(
+      buildMissionCompletionSummaryV1({
+        ledgerStatus: ledger.status,
+        receiptCount: ledger.receipts.length,
+        evidenceCount: ledger.evidence.length,
+        tools: summarizeMilestoneToolCalls(ledger.milestones),
+        milestones: ledger.milestones
+          .slice(-2)
+          .map((milestone) => milestone.summary)
+          .filter((summary) => summary.trim()),
+        acceptance: ledger.acceptance
+          ? {
+              status: ledger.acceptance.status,
+              missing: ledger.acceptance.missing,
+            }
+          : null,
+        blockers: ledger.blockers,
+        remainingActions: ledger.remainingActions,
+      }),
+    ),
     "",
   ].join("\n");
+}
+
+function summarizeMilestoneToolCalls(
+  milestones: readonly MissionMilestone[],
+): { name: string; ok: number; failed: number }[] {
+  const counts = new Map<string, number>();
+  for (const milestone of milestones) {
+    for (const toolName of milestone.toolCalls ?? []) {
+      const name = toolName.trim();
+      if (!name) continue;
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+  }
+  return Array.from(counts, ([name, ok]) => ({ name, ok, failed: 0 }));
 }
 
 export function getMissionLedgerPath(runId: string): string {

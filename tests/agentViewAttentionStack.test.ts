@@ -5,6 +5,7 @@ import type { ApprovalRequest } from "../src/agent/approvalBroker";
 import type { ClarificationRequest } from "../src/agent/clarificationBroker";
 import {
   renderChatApprovalCard,
+  renderChatFollowupsCard,
   renderClarificationCard,
 } from "../src/ui/chatAttentionCards";
 import {
@@ -329,6 +330,7 @@ test("a refused decision keeps the card so the user can retry", () => {
 test("cards keep display order regardless of arrival order and re-render in place", () => {
   const banner = createBanner();
   const bannerEl = asElement(banner);
+  upsertChatAttentionCard(bannerEl, "followups");
   upsertChatAttentionCard(bannerEl, "clarification").setText("q1");
   upsertChatAttentionCard(bannerEl, "readiness");
   upsertChatAttentionCard(bannerEl, "approval");
@@ -339,7 +341,7 @@ test("cards keep display order regardless of arrival order and re-render in plac
   upsertChatAttentionCard(bannerEl, "clarification").setText("q2");
   assert.deepEqual(listChatAttentionKeys(bannerEl), [...CHAT_ATTENTION_CARD_ORDER]);
   assert.equal(findChatAttentionCard(bannerEl, "clarification")?.textContent, "q2");
-  assert.equal(banner.children.length, 4);
+  assert.equal(banner.children.length, CHAT_ATTENTION_CARD_ORDER.length);
 });
 
 test("the readiness card occupies the readiness slot with its pinned selectors", () => {
@@ -424,4 +426,61 @@ test("AgentView clears by key on the settle paths and clears everything only wit
   );
   assert.doesNotMatch(readinessSource, /banner\.empty\(\)/u);
   assert.match(readinessSource, /upsertChatAttentionCard\(banner, "readiness"\)/u);
+  // A new submission drops last run's next-step chips before anything else.
+  assert.match(viewSource, /this\.clearChatAttentionCard\("followups"\)/u);
+});
+
+test("next-step chips sit last, submit their fixed prompt on click, and clear themselves", () => {
+  const banner = createBanner();
+  renderClarificationCard(asElement(banner), clarificationRequest, {
+    answer: () => true,
+    skip: () => true,
+  });
+  const submitted: string[] = [];
+  const card = renderChatFollowupsCard(
+    asElement(banner),
+    [
+      {
+        id: "link_related_notes",
+        label: "Link this note to related notes",
+        prompt: "Find the notes most related to Notes/Plan.md and append wiki-links.",
+      },
+      {
+        id: "draft_linear_issue",
+        label: "Draft a Linear issue from this note",
+        prompt: "Draft a Linear issue from the note Notes/Plan.md.",
+      },
+    ],
+    { submit: (prompt) => submitted.push(prompt) },
+  );
+  assert.ok(card);
+  assert.equal(CHAT_ATTENTION_CARD_ORDER[CHAT_ATTENTION_CARD_ORDER.length - 1], "followups");
+  assert.deepEqual(listChatAttentionKeys(asElement(banner)), [
+    "clarification",
+    "followups",
+  ]);
+  const chip = testId(banner, "chat-followup-chip-1");
+  assert.ok(chip);
+  // The full prompt is readable before the click.
+  assert.equal(chip?.getAttribute("title"), "Draft a Linear issue from the note Notes/Plan.md.");
+  chip?.dispatch("click");
+  assert.deepEqual(submitted, ["Draft a Linear issue from the note Notes/Plan.md."]);
+  // The chips are gone; the unrelated clarification card still stands.
+  assert.equal(findChatAttentionCard(asElement(banner), "followups"), null);
+  assert.deepEqual(listChatAttentionKeys(asElement(banner)), ["clarification"]);
+
+  // Dismiss clears without submitting anything.
+  renderChatFollowupsCard(
+    asElement(banner),
+    [{ id: "link_related_notes", label: "Link", prompt: "p" }],
+    { submit: (prompt) => submitted.push(prompt) },
+  );
+  testId(banner, "chat-followups-dismiss")?.dispatch("click");
+  assert.deepEqual(submitted, ["Draft a Linear issue from the note Notes/Plan.md."]);
+  assert.equal(findChatAttentionCard(asElement(banner), "followups"), null);
+  // An empty plan renders nothing and clears any stale card.
+  assert.equal(
+    renderChatFollowupsCard(asElement(banner), [], { submit: () => {} }),
+    null,
+  );
 });

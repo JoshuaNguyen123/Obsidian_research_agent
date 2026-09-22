@@ -126,8 +126,11 @@ export function isTransientAgentRunError(
     return false;
   }
   const text = `${error.code} ${error.message}`.toLowerCase();
+  // Authentication and authorization failures are never transient, however
+  // the message is phrased: "401 unauthorized from provider" used to count as
+  // transient because "provider" matched below.
   if (
-    /\b(?:auth|credential|api[_ -]?key|permission|approval|unsafe|reconcile|invalid[_ -]?(?:path|request|response)|not[_ -]?found)\b/.test(
+    /\b(?:auth|credential|api[_ -]?key|permission|approval|unsafe|reconcile|invalid[_ -]?(?:path|request|response)|not[_ -]?found|unauthori[sz]ed|forbidden|401|403)\b/.test(
       text,
     )
   ) {

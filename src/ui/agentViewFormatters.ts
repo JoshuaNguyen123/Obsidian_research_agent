@@ -185,3 +185,81 @@ export function formatStepMetric(
 ): string {
   return `${step} used (max ${maxSteps})`;
 }
+
+/** Longest tool target the live-run card shows; longer values are clipped. */
+export const MAX_TOOL_TARGET_CHARS = 40;
+
+/**
+ * A bounded, human-sized "what is this tool pointed at" for the live-run
+ * card: the note basename, the source hostname, or the first words of a
+ * query. Derived from the redacted `tool_start` trace only, so nothing the
+ * runner already refused to show can leak through here.
+ */
+export function formatToolTargetV1(trace: {
+  path?: string;
+  toPath?: string;
+  inputPreview?: unknown;
+}): string {
+  const preview =
+    trace.inputPreview && typeof trace.inputPreview === "object"
+      ? (trace.inputPreview as Record<string, unknown>)
+      : null;
+  const pathValue =
+    firstString(trace.path, trace.toPath) ??
+    firstString(preview?.path, preview?.targetPath, preview?.cachedPath);
+  if (pathValue) {
+    return clipTarget(basename(pathValue));
+  }
+  const urlValue = firstString(preview?.url);
+  if (urlValue) {
+    try {
+      return clipTarget(new URL(urlValue).hostname);
+    } catch {
+      return clipTarget(urlValue);
+    }
+  }
+  const textValue = firstString(
+    preview?.query,
+    preview?.title,
+    preview?.heading,
+    preview?.section,
+    preview?.id,
+  );
+  return textValue ? clipTarget(textValue) : "";
+}
+
+export function formatLiveRunToolLabel(name: string, target: string): string {
+  const trimmedName = name.trim();
+  if (!trimmedName) return "—";
+  const trimmedTarget = target.trim();
+  return trimmedTarget ? `${trimmedName} · ${trimmedTarget}` : trimmedName;
+}
+
+export function formatLiveRunProofLabel(
+  receipts: number,
+  sources: number,
+): string {
+  const receiptCount = Math.max(0, Math.trunc(receipts));
+  const sourceCount = Math.max(0, Math.trunc(sources));
+  return `${receiptCount} ${receiptCount === 1 ? "receipt" : "receipts"} · ${sourceCount} ${sourceCount === 1 ? "source" : "sources"}`;
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return null;
+}
+
+function basename(value: string): string {
+  const segments = value.replace(/\\/g, "/").split("/").filter(Boolean);
+  return segments.length > 0 ? segments[segments.length - 1] : value;
+}
+
+function clipTarget(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length <= MAX_TOOL_TARGET_CHARS
+    ? normalized
+    : `${normalized.slice(0, MAX_TOOL_TARGET_CHARS - 1)}…`;
+}

@@ -4,6 +4,7 @@ import {
   DEFAULT_ENDPOINT_BREAKER_FAILURE_THRESHOLD,
   isCircuitOpenError,
   isEndpointBreakerCountedFailure,
+  longestModelEndpointBreakerRetryAfterMs,
   ModelEndpointBreaker,
   resetModelEndpointBreakersForTests,
   resolveModelEndpointBreaker,
@@ -219,4 +220,33 @@ test("the registry hands out one breaker per endpoint identity", () => {
   assert.notEqual(first, other);
   resetModelEndpointBreakersForTests();
   assert.notEqual(resolveModelEndpointBreaker("ollama|https://ollama.com/api|glm"), first);
+});
+
+test("the registry reports the longest wait any open endpoint still demands", () => {
+  // A host that continues a mission on its own after an outage reads this
+  // before it continues; a continuation started inside the cooldown fails
+  // fast on the same breaker without reaching the provider.
+  resetModelEndpointBreakersForTests();
+  assert.equal(longestModelEndpointBreakerRetryAfterMs(), 0);
+  let now = 1_000;
+  const lead = resolveModelEndpointBreaker("lead", {
+    failureThreshold: 2,
+    cooldownMs: 30_000,
+    now: () => now,
+  });
+  const specialist = resolveModelEndpointBreaker("specialist", {
+    failureThreshold: 2,
+    cooldownMs: 30_000,
+    now: () => now,
+  });
+  lead.recordFailure(outage());
+  lead.recordFailure(outage());
+  assert.equal(lead.snapshot().state, "open");
+  assert.equal(specialist.snapshot().state, "closed");
+  assert.equal(longestModelEndpointBreakerRetryAfterMs(), 30_000);
+  now += 10_000;
+  assert.equal(longestModelEndpointBreakerRetryAfterMs(), 20_000);
+  now += 30_000;
+  assert.equal(longestModelEndpointBreakerRetryAfterMs(), 0);
+  resetModelEndpointBreakersForTests();
 });

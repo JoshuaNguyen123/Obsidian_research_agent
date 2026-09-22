@@ -15,6 +15,8 @@ export type MissionStopReason =
   | "orchestration_deadlock"
   | "graph_blocked"
   | "approval_denied"
+  /** An approval expired unanswered; the run is parked and resumable. */
+  | "approval_pending"
   | "relevance_rejected"
   | "provider_error"
   | "repeated_tool_no_progress"
@@ -102,6 +104,8 @@ export function stopReasonChatLine(
         : "Blocked: the run did not retain a concrete blocker. Retry the mission to regenerate diagnostics; no mutation will be replayed automatically.";
     case "approval_denied":
       return `Approval denied.${suffix}`;
+    case "approval_pending":
+      return `Parked: an approval expired before anyone answered. Nothing was changed. Continue to be asked again.${suffix}`;
     case "relevance_rejected":
       return `Stopped: output failed the relevance check.${suffix}`;
     case "provider_error":
@@ -142,6 +146,8 @@ export function formatStopReasonLabel(reason: MissionStopReason): string {
       return "Blocked";
     case "approval_denied":
       return "Approval denied";
+    case "approval_pending":
+      return "Approval pending";
     case "relevance_rejected":
       return "Relevance rejected";
     case "provider_error":
@@ -173,6 +179,11 @@ function classifyErrorDetail(detail?: string | null): MissionStopReason {
 
 function classifyBudgetDetail(detail?: string | null): MissionStopReason {
   const text = (detail ?? "").toLowerCase();
+  // A parked approval rides a budget stop so the ledger stays resumable; it
+  // must win over every other budget word in the same detail string.
+  if (/\bapproval_pending\b/.test(text)) {
+    return "approval_pending";
+  }
   if (/policy_deferral_repeated|orchestration_deadlock/.test(text)) {
     return "orchestration_deadlock";
   }

@@ -387,6 +387,17 @@ export async function parseOllamaChatStream(
 
   processLine(buffer);
 
+  if (chunks.length === 0 && skippedCorruptLines === 0) {
+    // Same rule as the OpenAI-compatible parser: a 200 whose body closed
+    // before a single line is a transport failure, not an empty answer. An
+    // Ollama chat stream always ends with a `done: true` line.
+    throw new ModelClientError(
+      "network",
+      "Ollama closed the stream before sending any chunk.",
+      { details: { chunks: 0 } },
+    );
+  }
+
   const toolCalls = [
     ...[...toolCallsByIndex.entries()]
       .sort(([left], [right]) => left - right)

@@ -1,4 +1,5 @@
 import { canonicalJson, type PreparedAction } from "./actions";
+import { DEFAULT_APPROVAL_TIMEOUT_MS } from "../model/requestTimeoutDefaults";
 
 export interface ApprovalRequest {
   id: string;
@@ -38,6 +39,9 @@ export function isBundledApprovalRequest(
 
 export type ApprovalDecision = "approved" | "denied" | "expired" | "aborted";
 
+/** Re-exported so broker callers need not know where the default lives. */
+export { DEFAULT_APPROVAL_TIMEOUT_MS };
+
 interface PendingApproval {
   request: ApprovalRequest;
   resolve: (decision: ApprovalDecision) => void;
@@ -58,7 +62,10 @@ export class ApprovalBroker {
     } = {},
   ): Promise<ApprovalDecision> {
     validateRequestBinding(request);
-    const timeoutMs = Math.max(1, options.timeoutMs ?? 120_000);
+    const timeoutMs = Math.max(
+      1,
+      options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS,
+    );
     const id = `approval-${request.runId}-${++this.sequence}`;
     const approvalRequest = cloneApprovalRequest({
       ...normalizeRequest(request),

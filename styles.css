@@ -1537,6 +1537,12 @@
   border-radius: var(--agent-radius-full);
 }
 
+/* Post-run next steps: an offer, quieter than a question and never an alarm. */
+.agentic-researcher-chat-attention-card.is-followups {
+  border-left: 2px solid var(--agent-rule-strong);
+  padding-left: var(--agent-space-3);
+}
+
 .agentic-researcher-clarification-input {
   display: flex;
   flex-wrap: wrap;
@@ -1669,6 +1675,17 @@
   color: var(--agent-text);
   font-size: var(--agent-type-body);
   overflow-wrap: anywhere;
+}
+
+/* Model-wait heartbeat: quiet, on its own line, gone the moment work resumes. */
+.agentic-researcher-live-run-waiting {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
+}
+
+.agentic-researcher-live-run-waiting[hidden],
+.agentic-researcher-live-run-waiting.is-hidden {
+  display: none;
 }
 
 .agentic-researcher-composer-options {

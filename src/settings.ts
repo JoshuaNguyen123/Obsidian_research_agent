@@ -32,7 +32,11 @@ import {
   type CloudProviderPresetId,
 } from "./model/cloudProviderPresets";
 import { MAX_AGENT_STEPS, MAX_CODE_RUNS_PER_MISSION } from "./tools/constants";
-import { DEFAULT_STREAM_REQUEST_TIMEOUT_MS } from "./model/requestTimeoutDefaults";
+import {
+  clampApprovalTimeoutMs,
+  DEFAULT_APPROVAL_TIMEOUT_MS,
+  DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
+} from "./model/requestTimeoutDefaults";
 import {
   SAFETY_CEILING_PRESETS,
   applySafetyCeilingPreset,
@@ -238,6 +242,18 @@ export interface AgentSettings {
    */
   showUnfinishedRunBannerOnOpen?: boolean;
   /**
+   * Default off. When on, a note whose frontmatter carries `agent_mission`
+   * with `agent_mission_status: pending` launches that prompt against itself
+   * as the current note, without the chat panel. Attended only: the trigger
+   * must be recent and the user present.
+   */
+  vaultTriggersEnabled?: boolean;
+  /**
+   * How long an in-run approval card waits before the run parks itself as
+   * resumable (never fails). Milliseconds; default two minutes.
+   */
+  approvalTimeoutMs?: number;
+  /**
    * Days to keep finished Agent Runs notes. 0 disables the time sweep.
    * Resumable missions are never pruned.
    */
@@ -411,8 +427,13 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   researchEffortCeiling: "extended",
   defaultMinFetchedSources: 3,
   overnightRunsEnabled: true,
+  // Opt-in by design: the community install promises no background resume
+  // without consent (tests/communityInstallHonesty.test.ts). The normalizer's
+  // table must say the same; tests/settingsDefaultsParity.test.ts pins both.
   autoResumeOvernightRuns: false,
   showUnfinishedRunBannerOnOpen: true,
+  vaultTriggersEnabled: false,
+  approvalTimeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS,
   runRetentionDays: 30,
   runRetentionMaxRuns: 200,
   modelFallbackEnabled: true,
@@ -2014,6 +2035,44 @@ export class AgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.autoResumeOvernightRuns === true)
           .onChange(async (value) => {
             this.plugin.settings.autoResumeOvernightRuns = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Run missions from note frontmatter")
+      .setDesc(
+        "Off by default. When on, a note whose frontmatter has agent_mission: <prompt> and agent_mission_status: pending runs that prompt against itself as the current note. The status flips to running, then done, blocked, or failed; set it back to pending to run again. Only recent edits made while you are present launch anything.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.vaultTriggersEnabled === true)
+          .onChange(async (value) => {
+            this.plugin.settings.vaultTriggersEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Approval wait (seconds)")
+      .setDesc(
+        "How long an approval card waits for an answer. When it expires the run parks as resumable and Continue asks again; nothing is denied and nothing runs. Default 120; 1 to 1800.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_APPROVAL_TIMEOUT_MS / 1000))
+          .setValue(
+            String(
+              Math.round(
+                clampApprovalTimeoutMs(this.plugin.settings.approvalTimeoutMs) / 1000,
+              ),
+            ),
+          )
+          .onChange(async (value) => {
+            const seconds = Number.parseInt(value.trim(), 10);
+            this.plugin.settings.approvalTimeoutMs = clampApprovalTimeoutMs(
+              Number.isFinite(seconds) ? seconds * 1000 : Number.NaN,
+            );
             await this.plugin.saveSettings();
           }),
       );

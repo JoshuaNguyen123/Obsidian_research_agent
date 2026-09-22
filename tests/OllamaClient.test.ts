@@ -373,6 +373,25 @@ test("streams chat through streaming transport with stream true", async () => {
   assert.deepEqual(body.options, { temperature: 0.1 });
 });
 
+test("a stream that closes before any line is a transient transport failure, not an empty answer", async () => {
+  // Same rule as the OpenAI-compatible parser, so the two clients cannot
+  // disagree about what a body with zero chunks means: an Ollama chat stream
+  // always ends with a `done: true` line.
+  await assert.rejects(
+    parseOllamaChatStream(chunks([])),
+    (error: unknown) =>
+      error instanceof ModelClientError &&
+      error.category === "network" &&
+      /before sending any chunk/u.test(error.message),
+  );
+  // A single done line with no content is still a (legitimately empty) answer.
+  const empty = await parseOllamaChatStream(
+    chunks(['{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}\n']),
+  );
+  assert.equal(empty.message.content, "");
+  assert.equal(empty.doneReason, "stop");
+});
+
 async function* chunks(values: string[]): AsyncIterable<string> {
   for (const value of values) {
     yield value;

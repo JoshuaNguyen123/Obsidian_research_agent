@@ -459,6 +459,73 @@ test("installed fresh ordered appends preserve note scope with native heading me
   }
 });
 
+test("OFFLINE-12 an expired approval parks the run and Continue asks again", async () => {
+  test.skip(process.env.E2E_PLAYWRIGHT_LANE !== "offline-expand" || process.env.E2E_OFFLINE_AI !== "1", "Requires the offline-expand lane.");
+  test.setTimeout(360_000);
+  // A whole-note replace needs an approval. Nobody answers it here; the card
+  // expires after the configured timeout and the run must PARK as resumable
+  // (nothing changed), not fail. Continue then asks again and the approval
+  // completes the replace with its backup.
+  const scenario = OFFLINE_EXPAND_SCENARIOS.find((entry) => entry.id === "current_note_replace_with_backup");
+  expect(scenario).toBeTruthy();
+  const backend = createOfflineAgentBackendV1();
+  const { createAgentBridgeServer } = await importNativeEsm<{
+    createAgentBridgeServer(options: { token: string; backend: typeof backend }): Server;
+  }>(pathToFileURL(path.resolve("scripts", "agent-bridge.mjs")).href);
+  const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
+  const cloudModelRequests: string[] = [];
+  let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+  try {
+    await listen(bridge, 7331);
+    harness = await startRealAiHarness("offline-approval-park", {
+      baseUrl: OFFLINE_BASE_URL, model: "offline-scripted-v1",
+      missionTimeoutMs: 120_000, firstChunkTimeoutMs: 30_000, completionTimeoutMs: 120_000,
+    }, {
+      modelRouterEnabled: false, modelRouterMode: "off", semanticIndexEnabled: false,
+      enableStreaming: true, streamWritebackMode: "all_current_note_content_writes",
+      workingMode: "automatic", maxAgentSteps: 8, autoTitleOnWrite: true,
+      approvalTimeoutMs: 5_000,
+    });
+    harness.page.on("request", (request) => {
+      if (isKnownCloudModelUrl(request.url())) cloudModelRequests.push(request.url());
+    });
+    await observeOfflineTools(harness.page);
+    const marker = `${scenario!.markerPrefix}_${harness.marker.replace(/[^A-Z0-9_]/giu, "_").toUpperCase()}`;
+    const original = `# Original\n\nKEEP_UNTIL_REPLACE_${harness.marker}\n`;
+    await harness.seedNote(harness.notePath, original, true);
+    await harness.submitMission(renderOfflineExpandPrompt(scenario!, marker), {
+      timeoutMs: 120_000,
+      waitForCompletion: false,
+    });
+    // The approval card appears, and nobody clicks it.
+    await expect(harness.page.getByTestId("chat-approval-approve")).toBeVisible({ timeout: 90_000 });
+    const parkedContinue = harness.page.getByTestId("chat-blocked-continue");
+    await expect(parkedContinue, "the run did not park after the approval expired").toBeVisible({ timeout: 90_000 });
+    await expect(parkedContinue).toBeEnabled({ timeout: 30_000 });
+    await expect(
+      harness.page.locator(".agentic-researcher-chat-attention-title").filter({ hasText: "Approval expired, run parked" }),
+    ).toBeVisible();
+    expect(await harness.readNote(), "parking must leave the note untouched").toBe(original);
+    await parkedContinue.click();
+    // Asked again; this time the approval is granted and the replace lands.
+    await harness.approveUntilMissionComplete(180_000);
+    const after = await harness.readNote();
+    expect(after.includes(marker), after).toBe(true);
+    expect(after.includes(`KEEP_UNTIL_REPLACE_${harness.marker}`)).toBe(false);
+    const snapshot = await harness.attestProductionRun();
+    const receipts = Array.isArray(snapshot.lastReceipts) ? snapshot.lastReceipts : [];
+    expect(
+      receipts.some((receipt: { backupPath?: string }) =>
+        typeof receipt.backupPath === "string" && receipt.backupPath.startsWith(".agent-backups/")),
+      JSON.stringify(receipts),
+    ).toBe(true);
+    assertCompletedLedgerAcceptance(snapshot);
+    expect(cloudModelRequests).toEqual([]);
+  } finally {
+    try { await harness?.close(); } finally { await close(bridge); }
+  }
+});
+
 for (const memoryEnabled of [false, true]) test(memoryEnabled
   ? "installed host-planned research memory obtains exact authority after cited research"
   : "OFFLINE-11 verifies a corrected citation draft before requesting more tools", async () => {

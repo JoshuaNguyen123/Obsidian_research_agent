@@ -61,6 +61,7 @@ import {
   formatAcceptanceFailureCopy,
   formatFailureCopy,
   formatModelFailureCopy,
+  formatModelWaitStatusLine,
   formatWebFetchToolFailureCopy,
   modelTimeoutFailureCopy,
   phaseGateFailureCopy,
@@ -663,6 +664,7 @@ import {
   type ApprovalDecision,
   type ApprovalRequest,
 } from "./agent/approvalBroker";
+import { clampApprovalTimeoutMs } from "./model/requestTimeoutDefaults";
 import {
   createRunContextBudget,
   resolveRunContextBudgetSource,
@@ -10607,7 +10609,7 @@ export async function runAgentMission({
             reason:
               "Approve the exact initiating-note hash and completion-reflection bytes; target drift invalidates this approval.",
             policyTags: ["vault_write", "completion_reflection", "exact"],
-            timeoutMs: 120_000,
+            timeoutMs: configuredApprovalTimeoutMs,
             preparedAction,
             confirmationIndex: 1,
             requiredConfirmations: 1,
@@ -12029,6 +12031,25 @@ export async function runAgentMission({
         throw error;
       }
       const decision = code.slice("approval_".length) || "not granted";
+      if (decision === "expired" && interactiveApprovals) {
+        // Nobody answered; nobody refused. Park as resumable so Continue
+        // re-asks instead of the user having to restart the whole mission.
+        const parkedMessage =
+          "Replacement approval expired before anyone answered. The current note and backup tree were left unchanged; the run is parked and can continue.";
+        // This seat finishes the run itself; the step-boundary park must not
+        // finish it a second time.
+        expiredInteractiveApproval = null;
+        lastFinalOutput = parkedMessage;
+        events.onStatus?.(parkedMessage);
+        await finishRun(
+          "budget",
+          step,
+          maxSteps,
+          "approval_pending:replace_current_file; Approve the replacement when Chat asks again, then continue.",
+          true,
+        );
+        return null;
+      }
       const message =
         `Replacement approval was ${decision}. The current note and backup tree were left unchanged.`;
       lastFinalOutput = message;
@@ -12217,7 +12238,9 @@ export async function runAgentMission({
             : {}),
         },
         {
-          timeoutMs,
+          // Callers that name no timeout get the user's setting, so every
+          // approval card in a run expires on the same clock.
+          timeoutMs: timeoutMs ?? configuredApprovalTimeoutMs,
           abortSignal,
           onRequest: async (request) => {
             emittedRequest = request;
@@ -12273,6 +12296,9 @@ export async function runAgentMission({
           : {}),
       };
     await events.onApprovalResolved?.({ request, decision });
+    // One seat for every caller: an unanswered interactive approval parks the
+    // run at the next step boundary instead of failing it.
+    noteExpiredInteractiveApproval(request, decision);
     if (decision === "approved") {
       recordApproval(autonomyRunStats, effectClassForTool(toolCall.name));
     }
@@ -12379,6 +12405,24 @@ export async function runAgentMission({
       receipt,
     ]);
   };
+  /**
+   * An interactive approval that expired unanswered. The tool result still
+   * reads `approval_expired` for the model, but at the next step boundary the
+   * run parks itself as a resumable budget stop instead of burning steps or
+   * failing: a user who stepped away for two minutes has not said no.
+   */
+  let expiredInteractiveApproval: ApprovalRequest | null = null;
+  const noteExpiredInteractiveApproval = (
+    request: ApprovalRequest,
+    decision: ApprovalDecision,
+  ): void => {
+    if (decision === "expired" && interactiveApprovals) {
+      expiredInteractiveApproval = request;
+    }
+  };
+  const configuredApprovalTimeoutMs = clampApprovalTimeoutMs(
+    runToolContext.settings?.approvalTimeoutMs,
+  );
   const buildApprovalDeniedResult = (
     toolCall: ModelToolCall,
     request: ApprovalRequest,
@@ -13179,7 +13223,7 @@ export async function runAgentMission({
               action: preparedAction.preview.summary,
               reason: preparedPolicyDecision.reason,
               policyTags: preparedPolicyDecision.tags,
-              timeoutMs: 120000,
+              timeoutMs: configuredApprovalTimeoutMs,
               preparedAction,
               confirmationIndex,
               requiredConfirmations,
@@ -13506,7 +13550,7 @@ export async function runAgentMission({
         action: `${toolCall.name} (${policyDecision.tags.join(", ") || "policy"})`,
         reason: policyDecision.reason,
         policyTags: policyDecision.tags,
-        timeoutMs: 120000,
+        timeoutMs: configuredApprovalTimeoutMs,
         missionGraphExecution,
       });
       if (decision !== "approved") {
@@ -13541,7 +13585,13 @@ export async function runAgentMission({
       action: approvalInfo.action,
       reason: approvalInfo.reason,
       policyTags: approvalInfo.policyTags,
-      timeoutMs: approvalInfo.timeoutMs,
+      // A tool's own expiry bounds how long its prepared payload stays valid;
+      // the user's setting bounds how long a card may wait. The card honours
+      // whichever ends first.
+      timeoutMs: Math.min(
+        approvalInfo.timeoutMs ?? Number.POSITIVE_INFINITY,
+        configuredApprovalTimeoutMs,
+      ),
       missionGraphExecution,
     });
     if (decision !== "approved") {
@@ -18647,6 +18697,37 @@ export async function runAgentMission({
   };
 
   /**
+   * Park the run after an interactive approval expired unanswered. A budget
+   * stop keeps the ledger resumable; `suppressAutoContinuation` keeps the
+   * host from re-running it on its own, so the next thing that happens is a
+   * human clicking Continue and being asked again. No ledger blocker: nothing
+   * is wrong with the mission, someone just was not at the keyboard.
+   */
+  const parkRunForExpiredApproval = async (
+    request: ApprovalRequest,
+    step: number,
+    maxSteps: number,
+  ): Promise<void> => {
+    expiredInteractiveApproval = null;
+    const message = `Approval for ${request.toolName} expired before anyone answered. Nothing ran; the mission is parked and can continue.`;
+    events.onStatus?.(message);
+    events.onTrace?.({
+      id: `approval-parked-${step}`,
+      kind: "status",
+      step,
+      message,
+      outputPreview: { approvalId: request.id, toolName: request.toolName },
+    });
+    await finishRun(
+      "budget",
+      step,
+      maxSteps,
+      `approval_pending:${request.id}; Approve ${request.toolName} when Chat asks again, then continue.`,
+      true,
+    );
+  };
+
+  /**
    * When set-loose delivery is unpaid and the model stalls on workspace
    * create/read (or leaves GitHub Soft-union tools unused), host-call create /
    * publish_draft / note reflection from durable bindings.
@@ -19027,6 +19108,12 @@ export async function runAgentMission({
       events.onStatus?.(
         `Long run continuing past step ${LONG_RUN_STEP_WARN_AT}; checkpoints save every ${CHECKPOINT_EVERY_STEPS} steps when vault access is available.`,
       );
+    }
+    // Same boundary as steering: an approval that expired during the previous
+    // step parks the run here, before another request is assembled.
+    if (expiredInteractiveApproval) {
+      await parkRunForExpiredApproval(expiredInteractiveApproval, step, stepLimit);
+      return;
     }
     events.onPlanningStart?.(step);
     // Mid-run steering applies here and only here: at a step boundary, after
@@ -28170,9 +28257,7 @@ async function withModelWaitStatus<T>(
   let heartbeats = 0;
   const interval = setInterval(() => {
     const elapsedSeconds = Math.max(30, Math.round(elapsedMs(startedAt) / 1000));
-    events.onStatus?.(
-      `Still waiting for ${label} (${elapsedSeconds}s elapsed)...`,
-    );
+    events.onStatus?.(formatModelWaitStatusLine(label, elapsedSeconds));
     // Status lines are ephemeral. A step that waits for minutes must also
     // leave an attested diagnostic, or a stalled provider looks like an idle
     // run in Run Details and in E2E snapshots.

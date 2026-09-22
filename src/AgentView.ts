@@ -42,7 +42,14 @@ import {
   conversationalStatusLine,
   formatFailureCopy,
   formatModelFailureCopy,
+  parseModelWaitStatusLine,
 } from "./agent/failureCopy";
+import {
+  buildMissionCompletionSummaryV1,
+  formatMissionCompletionSummaryProseV1,
+  type MissionCompletionSummaryV1,
+} from "./agent/missionCompletionSummary";
+import { planCompletionFollowupsV1 } from "./agent/autoFollowups";
 import { evaluateCloudConnectionGate } from "./agent/cloudModelReadiness";
 import { formatModelClientError, ModelClientError } from "./model/types";
 import { renderSandboxedHtmlPreview } from "./ui/htmlPreview";
@@ -132,12 +139,15 @@ import {
   PROMPT_PREFIX_REUSE_METRIC_NAME,
   formatAgentMetric,
   formatChars,
+  formatLiveRunProofLabel,
+  formatLiveRunToolLabel,
   formatOptionalNumber,
   formatReceiptOperationLabel,
   formatBoundedList,
   formatScopeList,
   formatStepMetric,
   formatStreamLifecycleLabel,
+  formatToolTargetV1,
 } from "./ui/agentViewFormatters";
 import {
   buildMissionReadinessCardModelV1,
@@ -151,6 +161,7 @@ import {
 } from "./ui/chatAttentionStack";
 import {
   renderChatApprovalCard,
+  renderChatFollowupsCard,
   renderClarificationCard,
 } from "./ui/chatAttentionCards";
 import type { AutonomyRunStatsV1 } from "./agent/autonomyRunStats";
@@ -303,6 +314,28 @@ export class AgentView extends ItemView {
   private liveRunElapsedEl: HTMLElement | null = null;
   private liveRunBudgetEl: HTMLElement | null = null;
   private liveRunDestinationEl: HTMLElement | null = null;
+  private liveRunStepEl: HTMLElement | null = null;
+  private liveRunToolEl: HTMLElement | null = null;
+  private liveRunProofEl: HTMLElement | null = null;
+  private liveRunWaitingEl: HTMLElement | null = null;
+  /** Receipts and distinct evidence sources seen on the live run; card-only counters. */
+  private liveRunReceiptCount = 0;
+  private readonly liveRunSourceIds = new Set<string>();
+  /** Per-tool outcome tally for the completion summary; never persisted. */
+  private readonly liveRunToolOutcomes = new Map<
+    string,
+    { ok: number; failed: number }
+  >();
+  /** The prompt the user last submitted; drives post-run follow-up chips. */
+  private lastSubmittedMissionPrompt: string | null = null;
+  /**
+   * The last completion's Chat rows (stop line + prose summary). They are
+   * system rows, never persisted, and the host rebuilds the log from history
+   * right after it persists the assistant message — so they are re-appended
+   * on rebuild rather than lost the moment the run ends.
+   */
+  private lastCompletionRows: { stopLine: string; summary: string } | null =
+    null;
   private liveRunStartedAt: number | null = null;
   private liveRunTimer: number | null = null;
   private liveRunModelCalls = 0;
@@ -730,6 +763,10 @@ export class AgentView extends ItemView {
     this.liveRunElapsedEl = null;
     this.liveRunBudgetEl = null;
     this.liveRunDestinationEl = null;
+    this.liveRunStepEl = null;
+    this.liveRunToolEl = null;
+    this.liveRunProofEl = null;
+    this.liveRunWaitingEl = null;
     this.effortValueEl = null;
     this.elapsedValueEl = null;
     this.budgetValueEl = null;
@@ -888,6 +925,14 @@ export class AgentView extends ItemView {
       text: "Preparing mission",
       cls: "agentic-researcher-run-status-text",
     });
+    // The header line is overwritten by every status event, so a "still
+    // waiting on the model" heartbeat vanished the moment a metric row
+    // arrived. Waiting gets its own line that only the heartbeat writes.
+    this.liveRunWaitingEl = this.runStatusEl.createDiv({
+      cls: "agentic-researcher-live-run-waiting is-hidden",
+      attr: { "data-testid": "live-run-waiting" },
+    });
+    this.liveRunWaitingEl.hidden = true;
     this.lifecycleStageStripEl = this.runStatusEl.createDiv({
       cls: "agentic-researcher-lifecycle-strip is-hidden",
       attr: {
@@ -908,6 +953,19 @@ export class AgentView extends ItemView {
       "Destination",
       "Resolving",
     );
+    // What the agent is doing right now, not only how much it has spent: the
+    // step it is on, the tool it is running and what that tool is pointed at,
+    // and the proof it has banked so far.
+    this.liveRunStepEl = this.createLiveRunMetric(liveRunMetricsEl, "Step", "—");
+    this.liveRunStepEl.setAttribute("data-testid", "live-run-step");
+    this.liveRunToolEl = this.createLiveRunMetric(liveRunMetricsEl, "Tool", "—");
+    this.liveRunToolEl.setAttribute("data-testid", "live-run-tool");
+    this.liveRunProofEl = this.createLiveRunMetric(
+      liveRunMetricsEl,
+      "Proof",
+      formatLiveRunProofLabel(0, 0),
+    );
+    this.liveRunProofEl.setAttribute("data-testid", "live-run-proof");
     const liveRunActionsEl = this.runStatusEl.createDiv({
       cls: "agentic-researcher-live-run-actions",
     });
@@ -1267,8 +1325,23 @@ export class AgentView extends ItemView {
         this.createConversationLogItem(message);
       }
     }
+    // The last completion's stop line and prose summary follow the history
+    // they describe; a rebuild must not erase what the run just reported.
+    if (!this.isRunning) {
+      this.appendCompletionRows();
+    }
     // Active work is summarized by the one live-run card outside conversation.
     // Full tool and status streams remain available in Run Details.
+  }
+
+  private appendCompletionRows(): void {
+    const rows = this.lastCompletionRows;
+    if (!rows || !this.logEl) return;
+    this.appendLog("system", rows.stopLine);
+    if (rows.summary) {
+      const summaryRow = this.appendLog("system", rows.summary);
+      summaryRow?.setAttribute("data-testid", "chat-mission-summary");
+    }
   }
 
   private renderChatEmptyState(): void {
@@ -1728,6 +1801,122 @@ export class AgentView extends ItemView {
     this.setMetric(this.budgetValueEl, label);
   }
 
+  private refreshLiveRunProof(): void {
+    this.liveRunProofEl?.setText(
+      formatLiveRunProofLabel(
+        this.liveRunReceiptCount,
+        this.liveRunSourceIds.size,
+      ),
+    );
+  }
+
+  private setLiveRunWaiting(text: string | null): void {
+    const el = this.liveRunWaitingEl;
+    if (!el) return;
+    if (!text) {
+      el.setText("");
+      el.classList.add("is-hidden");
+      el.hidden = true;
+      return;
+    }
+    el.setText(text);
+    el.classList.remove("is-hidden");
+    el.hidden = false;
+  }
+
+  /**
+   * The `tool_start` trace is the only live event that carries the redacted
+   * tool arguments, so it is where the card learns what a tool is pointed at.
+   * Any trace after that is progress, which ends a model wait.
+   */
+  private observeLiveRunTrace(event: AgentTraceEvent): void {
+    if (event.kind === "tool_start" && event.toolName) {
+      const target = formatToolTargetV1(event);
+      if (target) {
+        this.liveRunToolEl?.setText(
+          formatLiveRunToolLabel(event.toolName, target),
+        );
+      }
+      this.setLiveRunWaiting(null);
+      return;
+    }
+    if (event.kind === "tool_result" || event.kind === "planning") {
+      this.setLiveRunWaiting(null);
+    }
+  }
+
+  private recordLiveRunToolOutcome(name: string, ok: boolean): void {
+    const tally = this.liveRunToolOutcomes.get(name) ?? { ok: 0, failed: 0 };
+    if (ok) tally.ok += 1;
+    else tally.failed += 1;
+    this.liveRunToolOutcomes.set(name, tally);
+  }
+
+  /**
+   * The completion summary is assembled from what this view observed on the
+   * live run (receipts, tool outcomes, sources) plus the coordinator's ledger
+   * summary when it belongs to the same run. Nothing here is model prose.
+   */
+  private buildLiveRunCompletionSummary(
+    missionStop: ReturnType<typeof fromAgentRunStopReason>,
+    stopDetail?: string | null,
+  ): MissionCompletionSummaryV1 {
+    const ledger = this.plugin.getMissionRunSnapshot().lastMissionLedger;
+    const ledgerMatchesRun =
+      ledger !== null &&
+      (this.runConfig === null ||
+        ledger.runId === this.runConfig.runId ||
+        ledger.runId === this.runConfig.rootRunId);
+    return buildMissionCompletionSummaryV1({
+      stopReason: missionStop,
+      stopDetail,
+      receipts: this.displayedReceipts,
+      evidenceCount: Math.max(
+        this.liveRunSourceIds.size,
+        ledgerMatchesRun ? ledger.evidenceCount : 0,
+      ),
+      tools: Array.from(this.liveRunToolOutcomes, ([name, tally]) => ({
+        name,
+        ...tally,
+      })),
+      acceptance:
+        ledgerMatchesRun && ledger.acceptance
+          ? {
+              status: ledger.acceptance.status,
+              missing: ledger.acceptance.missing,
+            }
+          : null,
+      remainingActions: ledgerMatchesRun ? ledger.remainingActions : [],
+    });
+  }
+
+  /**
+   * After a finished mission, offer up to three host-templated next steps as
+   * chips. A click submits that fixed prompt through the ordinary composer
+   * path; nothing executes on its own.
+   */
+  private renderCompletionFollowups(
+    missionStop: ReturnType<typeof fromAgentRunStopReason>,
+  ): void {
+    const banner = this.chatAttentionEl;
+    if (!banner) return;
+    const followups = planCompletionFollowupsV1({
+      mission: this.lastSubmittedMissionPrompt ?? "",
+      receipts: this.displayedReceipts,
+      finalOutput: this.pendingAssistantContent,
+      linearEnabled: this.plugin.settings.linearEnabled === true,
+      missionComplete:
+        missionStop === "verified_complete" ||
+        missionStop === "write_completed",
+    });
+    if (followups.length === 0) return;
+    renderChatFollowupsCard(banner, followups, {
+      submit: (prompt) => {
+        void this.submitMissionPrompt(prompt);
+      },
+    });
+  }
+
   private createMetric(
     container: HTMLElement,
     label: string,
@@ -1924,6 +2113,11 @@ export class AgentView extends ItemView {
       this.promptEl?.focus();
       return null;
     }
+    this.lastSubmittedMissionPrompt = prompt;
+    // Last run's "next, I could" chips and completion rows describe a mission
+    // that is now over.
+    this.clearChatAttentionCard("followups");
+    this.lastCompletionRows = null;
 
     const connectionGate = this.getCloudConnectionGate();
     if (!connectionGate.ok) {
@@ -2101,7 +2295,16 @@ export class AgentView extends ItemView {
         // panel has no log element, and a blocked run must not lose its
         // evidence because the view was not mounted.
         this.recordRunFailureEvidence(event);
+        this.observeLiveRunTrace(event);
         this.appendTraceEvent(event);
+      },
+      onMissionEvidence: (attestation) => {
+        // Redacted by contract (no titles, paths, or URLs); the card only
+        // counts distinct sources it has seen.
+        if (attestation.usableSource === false) return;
+        if (this.liveRunSourceIds.has(attestation.id)) return;
+        this.liveRunSourceIds.add(attestation.id);
+        this.refreshLiveRunProof();
       },
       onMissionGraphUpdate: (graph) => {
         this.missionGraphProjection = projectMissionGraphRunDetails(graph);
@@ -2311,6 +2514,7 @@ export class AgentView extends ItemView {
       // "Blocked" banner beside current successful output.
       this.clearChatAttention();
       this.setRunDetailsNeedsAttention(false);
+      this.lastCompletionRows = null;
       this.renderConversationLog();
       this.appendLog("system", clearChatDoneCopy());
       new Notice("Chat cleared. Notes, backups, and settings unchanged.");
@@ -2393,6 +2597,13 @@ export class AgentView extends ItemView {
     this.liveRunEffortEl?.setText("Selecting");
     this.liveRunBudgetEl?.setText("Pending");
     this.liveRunDestinationEl?.setText("Resolving");
+    this.liveRunReceiptCount = 0;
+    this.liveRunSourceIds.clear();
+    this.liveRunToolOutcomes.clear();
+    this.liveRunStepEl?.setText("—");
+    this.liveRunToolEl?.setText("—");
+    this.refreshLiveRunProof();
+    this.setLiveRunWaiting(null);
     this.setMetric(this.effortValueEl, "Not selected");
     this.setMetric(this.budgetValueEl, "Pending");
     this.setMetric(this.destinationValueEl, "None");
@@ -2512,6 +2723,12 @@ export class AgentView extends ItemView {
     if (kind === "status") {
       this.updateChatLoader(display);
       this.updateTeamStripFromStatus(display);
+      const wait = parseModelWaitStatusLine(message);
+      if (wait) {
+        this.setLiveRunWaiting(
+          `Waiting on ${wait.label} for ${wait.elapsedSeconds}s`,
+        );
+      }
     }
     if (!duplicate) this.appendTrace(kind, display);
   }
@@ -2526,10 +2743,13 @@ export class AgentView extends ItemView {
   }
 
   private startPlanningStream(step: number) {
-    this.setMetric(
-      this.stepValueEl,
-      formatStepMetric(step, this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS),
+    const stepLabel = formatStepMetric(
+      step,
+      this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS,
     );
+    this.setMetric(this.stepValueEl, stepLabel);
+    this.liveRunStepEl?.setText(stepLabel);
+    this.setLiveRunWaiting(null);
 
     if (!this.planningStreamEl) {
       return;
@@ -2574,6 +2794,14 @@ export class AgentView extends ItemView {
     );
     this.setMetric(this.activeToolValueEl, event.name);
     this.updateChatLoader(`RUN> ${event.name}`);
+    this.liveRunStepEl?.setText(
+      formatStepMetric(
+        event.step,
+        this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS,
+      ),
+    );
+    this.liveRunToolEl?.setText(formatLiveRunToolLabel(event.name, ""));
+    this.setLiveRunWaiting(null);
 
     const itemEl = this.ensureToolTimelineItem(event);
     itemEl.removeClass("is-complete");
@@ -2661,6 +2889,8 @@ export class AgentView extends ItemView {
     this.renderToolPreview(event);
     this.setMetric(this.activeToolValueEl, "None");
     this.updateChatLoader(event.message ?? `${event.name} complete`);
+    this.liveRunToolEl?.setText("—");
+    if (!skipped) this.recordLiveRunToolOutcome(event.name, ok);
     this.appendTrace(
       ok || skipped ? "tool" : "error",
       event.message ?? `${event.name} ${ok ? "complete" : skipped ? "skipped" : "error"}`,
@@ -2895,12 +3125,23 @@ export class AgentView extends ItemView {
     this.setMetric(this.activeToolValueEl, "None");
     this.appendTrace("complete", formatStopReasonLabel(missionStop));
     const stopLine = stopReasonChatLine(missionStop, event.stopDetail);
-    this.appendLog("system", stopLine);
+    // One plain-prose account per mission — what ran, what changed, what is
+    // still owed — built from the run's own receipts and acceptance record.
+    // System rows, so they never enter conversation history.
+    const summary =
+      missionStop !== "clarifying_question" && missionStop !== "user_aborted"
+        ? formatMissionCompletionSummaryProseV1(
+            this.buildLiveRunCompletionSummary(missionStop, event.stopDetail),
+          )
+        : "";
+    this.lastCompletionRows = { stopLine, summary };
+    this.appendCompletionRows();
     if (
       missionStop === "provider_error" ||
       missionStop === "orchestration_deadlock" ||
       missionStop === "graph_blocked" ||
       missionStop === "approval_denied" ||
+      missionStop === "approval_pending" ||
       missionStop === "required_tools_failed"
     ) {
       const writeInterrupted = isPartialWritebackStopDetail(event.stopDetail);
@@ -2913,7 +3154,8 @@ export class AgentView extends ItemView {
           }
         : conversationalBlockerCopy({
             kind:
-              missionStop === "approval_denied"
+              missionStop === "approval_denied" ||
+              missionStop === "approval_pending"
                 ? "approval"
                 : missionStop === "provider_error"
                   ? /api key|credential|auth|missing_api_key/i.test(detail)
@@ -2926,7 +3168,11 @@ export class AgentView extends ItemView {
                     : "generic",
             why: detail,
             approvalDecision:
-              missionStop === "approval_denied" ? "denied" : undefined,
+              missionStop === "approval_denied"
+                ? "denied"
+                : missionStop === "approval_pending"
+                  ? "expired"
+                  : undefined,
           });
         this.stopRequested = false;
       this.setRunning(false);
@@ -2941,7 +3187,9 @@ export class AgentView extends ItemView {
             ? chatWriteInterruptedTitle()
             : missionStop === "approval_denied"
               ? "Approval blocked"
-              : chatProviderBlockerTitle(),
+              : missionStop === "approval_pending"
+                ? "Approval expired, run parked"
+                : chatProviderBlockerTitle(),
         {
           allowOpenSettings:
             missionStop === "provider_error" &&
@@ -2982,6 +3230,7 @@ export class AgentView extends ItemView {
     this.stopRequested = false;
     this.setRunning(false);
     this.currentRunChatId = null;
+    this.renderCompletionFollowups(missionStop);
     // Budget/resumable Idle must expose Chat Continue after the running flag
     // clears (setRunning → renderModelConfig refreshes the control). Event
     // fan-out order between the coordinator tap, config events, and this
@@ -3223,6 +3472,15 @@ export class AgentView extends ItemView {
 
     this.appendStatus(parts.join(" "));
     this.updateChatLoader(event.message);
+    // A host-owned stream is work too: on the direct-writeback route no tool
+    // ever starts, so the card names the stream instead of staying blank.
+    if (event.kind === "first_note_write" || streamLabel === "note_stream") {
+      this.liveRunToolEl?.setText("writing note");
+      this.setLiveRunWaiting(null);
+    } else if (event.kind === "first_visible_content") {
+      this.liveRunToolEl?.setText("composing answer");
+      this.setLiveRunWaiting(null);
+    }
     if (
       (event.kind === "first_note_write" || streamLabel === "note_stream") &&
       !this.noteStreamingAnnounced
@@ -3360,6 +3618,10 @@ export class AgentView extends ItemView {
       return;
     }
     this.displayedReceipts.push({ ...receipt });
+    if (this.isRunning) {
+      this.liveRunReceiptCount += 1;
+      this.refreshLiveRunProof();
+    }
     if (this.displayedReceipts.length > MAX_RECEIPT_ROWS) {
       this.displayedReceipts.splice(
         0,
@@ -3610,6 +3872,11 @@ export class AgentView extends ItemView {
         : "Resolved by run";
     this.liveRunEffortEl?.setText(effortLabel);
     this.liveRunDestinationEl?.setText(destination);
+    // The step ceiling is known the moment the run is configured; a
+    // direct-writeback run may never emit a planning step at all.
+    if (this.liveRunStepEl?.textContent?.trim() === "—") {
+      this.liveRunStepEl.setText(formatStepMetric(0, event.maxStepsForRun));
+    }
     this.setMetric(this.effortValueEl, effortLabel);
     this.setMetric(this.destinationValueEl, destination);
     this.refreshLiveRunBudget();

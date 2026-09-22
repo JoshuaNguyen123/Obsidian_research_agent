@@ -1,8 +1,114 @@
+import { UNVERIFIED_CLAIM_MARKER_V1 } from "./degradedDelivery";
 import {
   extractVaultSearchResultPathsV1,
   isVaultSearchToolNameV1,
   normalizeVaultPathV1,
 } from "./researchRetrievalGate";
+
+/**
+ * One cap for every host-planned follow-up: the in-run read-only planner and
+ * the post-run chip planner both stop at this many.
+ */
+export const MAX_AUTO_FOLLOWUPS = 3;
+
+export type CompletionFollowupIdV1 =
+  | "cite_unverified_claims"
+  | "link_related_notes"
+  | "draft_linear_issue";
+
+export interface CompletionFollowupV1 {
+  id: CompletionFollowupIdV1;
+  /** Chip label, sentence case, no trailing period. */
+  label: string;
+  /** The exact mission a click submits through the normal composer path. */
+  prompt: string;
+}
+
+export interface CompletionFollowupInputV1 {
+  /** The mission the user just ran; used only to avoid offering what it already did. */
+  mission: string;
+  receipts: readonly {
+    toolName: string;
+    operation: string;
+    path?: string;
+    toPath?: string;
+  }[];
+  /** The final assistant text; counted for unverified-claim markers. */
+  finalOutput?: string;
+  linearEnabled: boolean;
+  /** Only a finished mission earns next steps; a blocked one owes a Continue instead. */
+  missionComplete: boolean;
+}
+
+/**
+ * Host-templated next steps offered as chips after a mission finishes. They
+ * are proposals only: nothing here executes, grants authority, or carries
+ * model prose — each prompt is a fixed string the user can read before
+ * clicking, and a click goes through the same policy and approval path as a
+ * typed mission.
+ */
+export function planCompletionFollowupsV1(
+  input: CompletionFollowupInputV1,
+): CompletionFollowupV1[] {
+  if (!input.missionComplete) return [];
+  const mission = input.mission.toLowerCase();
+  const notePath = firstWrittenMarkdownPathV1(input.receipts);
+  const noteRef = notePath ?? "the current note";
+  const followups: CompletionFollowupV1[] = [];
+
+  const unverified = countUnverifiedClaimMarkersV1(input.finalOutput ?? "");
+  if (unverified > 0) {
+    followups.push({
+      id: "cite_unverified_claims",
+      label: `Cite ${unverified} unverified ${unverified === 1 ? "claim" : "claims"}`,
+      prompt:
+        `Find sources for the ${unverified} ${unverified === 1 ? "claim" : "claims"} marked "${UNVERIFIED_CLAIM_MARKER_V1}" in ${noteRef}, verify each against a cited passage, and replace each marker with its citation. Do not change any other content.`,
+    });
+  }
+
+  if (
+    notePath &&
+    !/\b(?:link|links|linking|linked|connect|related notes?|backlinks?)\b/.test(
+      mission,
+    )
+  ) {
+    followups.push({
+      id: "link_related_notes",
+      label: "Link this note to related notes",
+      prompt:
+        `Find the notes in my vault most related to ${notePath} and append wiki-links to the best ones at the end of that note. Append only; do not rewrite existing content.`,
+    });
+  }
+
+  if (notePath && input.linearEnabled && !/\blinear\b/.test(mission)) {
+    followups.push({
+      id: "draft_linear_issue",
+      label: "Draft a Linear issue from this note",
+      prompt:
+        `Draft a Linear issue from the note ${notePath} using the Linear issue template, and show me the exact issue for approval before publishing.`,
+    });
+  }
+
+  return followups.slice(0, MAX_AUTO_FOLLOWUPS);
+}
+
+export function countUnverifiedClaimMarkersV1(text: string): number {
+  if (!text) return 0;
+  return text.split(UNVERIFIED_CLAIM_MARKER_V1).length - 1;
+}
+
+function firstWrittenMarkdownPathV1(
+  receipts: CompletionFollowupInputV1["receipts"],
+): string | null {
+  for (const receipt of receipts) {
+    if (!/^(?:append|create|replace|edit|retitle|move)$/.test(receipt.operation)) {
+      continue;
+    }
+    const path = (receipt.toPath ?? receipt.path ?? "").trim();
+    if (path.toLowerCase().endsWith(".md")) return path;
+  }
+  return null;
+}
 
 export interface AutoFollowupInput {
   mission: string;
@@ -37,7 +143,10 @@ export interface AutoFollowupRequest {
 }
 
 export function planReadOnlyFollowups(input: AutoFollowupInput): AutoFollowupRequest[] {
-  const maxFollowups = Math.max(0, Math.min(3, Math.trunc(input.maxFollowups)));
+  const maxFollowups = Math.max(
+    0,
+    Math.min(MAX_AUTO_FOLLOWUPS, Math.trunc(input.maxFollowups)),
+  );
   if (maxFollowups === 0) {
     return [];
   }

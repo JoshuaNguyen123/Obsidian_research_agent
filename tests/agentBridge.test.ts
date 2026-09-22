@@ -124,6 +124,44 @@ test("SSE streams content, tool calls, finish reason, and DONE through backpress
   });
 });
 
+test("a backend that fails before its first stream event reaches the client as its HTTP error, not an empty 200 stream", async () => {
+  // A cloud provider under load answers a streaming request with a 503
+  // status line, never with a 200 whose body is empty. The bridge used to
+  // commit the event-stream header before asking the backend, so the same
+  // outage arrived as zero chunks and no [DONE] — "no content" instead of
+  // "unavailable" — and the production client's transient retry never ran.
+  const outage = Object.assign(
+    new Error("The backend is temporarily unavailable (HTTP 503)."),
+    { bridgeCode: "upstream_unavailable", status: 503 },
+  );
+  await withBridge({
+    complete: async () => {
+      throw outage;
+    },
+  }, async (baseUrl) => {
+    const response = await request(baseUrl, { model: "agent", messages: [], stream: true });
+    assert.equal(response.status, 503);
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/u);
+    const body = await response.json() as { error: { code: string; message: string } };
+    assert.equal(body.error.code, "upstream_unavailable");
+    assert.match(body.error.message, /HTTP 503/u);
+  });
+  // The same rule for a streaming backend that throws before its first yield.
+  await withBridge({
+    complete: async () => ({ content: "unreachable" }),
+    stream: async function* () {
+      throw outage;
+      // eslint-disable-next-line no-unreachable
+      yield { content: "unreachable" };
+    },
+  }, async (baseUrl) => {
+    const response = await request(baseUrl, { model: "agent", messages: [], stream: true });
+    assert.equal(response.status, 503);
+    const body = await response.json() as { error: { code: string } };
+    assert.equal(body.error.code, "upstream_unavailable");
+  });
+});
+
 test("malformed backend responses and invalid JSON return secret-free diagnostics", async () => {
   const diagnostics: Array<Record<string, unknown>> = [];
   const secret = "vault-note-secret-that-must-not-escape";

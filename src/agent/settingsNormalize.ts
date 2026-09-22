@@ -8,7 +8,11 @@ import { normalizeScheduledMissions } from "./missionScheduler";
 import type { AutonomyProfile, OutputProfile } from "./noteOutputPolicy";
 import { deriveOutputProfileFromLegacy } from "./noteOutputPolicy";
 import { repairOllamaCloudBaseUrl } from "../model/cloudProviderPresets";
-import { DEFAULT_STREAM_REQUEST_TIMEOUT_MS } from "../model/requestTimeoutDefaults";
+import {
+  clampApprovalTimeoutMs,
+  DEFAULT_APPROVAL_TIMEOUT_MS,
+  DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
+} from "../model/requestTimeoutDefaults";
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import { normalizeEmbeddingDimSettingV1 } from "../embeddings/embeddingModelCatalogV1";
@@ -109,6 +113,8 @@ export interface NormalizableAgentSettings {
   overnightMaxSegments?: number;
   autoResumeOvernightRuns?: boolean;
   showUnfinishedRunBannerOnOpen?: boolean;
+  vaultTriggersEnabled?: boolean;
+  approvalTimeoutMs?: number;
   /** Days to keep Agent Runs. 0 disables the time sweep. */
   runRetentionDays?: number;
   /** Max Agent Runs to keep. 0 disables the cap. */
@@ -224,8 +230,13 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   overnightRunsEnabled: true,
   overnightRunHours: 10,
   overnightMaxSegments: 24,
-  autoResumeOvernightRuns: true,
+  // Opt-in, matching DEFAULT_SETTINGS: this table once said `true` while the
+  // shipped table said `false`, and the host's behavior depended on which
+  // table it spread last. Pinned by tests/settingsDefaultsParity.test.ts.
+  autoResumeOvernightRuns: false,
   showUnfinishedRunBannerOnOpen: true,
+  vaultTriggersEnabled: false,
+  approvalTimeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS,
   runRetentionDays: 30,
   runRetentionMaxRuns: 200,
   modelFallbackEnabled: true,
@@ -371,7 +382,9 @@ export function normalizeAgentSettings(
   );
   merged.showUnfinishedRunBannerOnOpen =
     merged.showUnfinishedRunBannerOnOpen !== false;
-  merged.autoResumeOvernightRuns = merged.autoResumeOvernightRuns !== false;
+  merged.autoResumeOvernightRuns = merged.autoResumeOvernightRuns === true;
+  merged.vaultTriggersEnabled = merged.vaultTriggersEnabled === true;
+  merged.approvalTimeoutMs = clampApprovalTimeoutMs(merged.approvalTimeoutMs);
   merged.modelFallbackEnabled = merged.modelFallbackEnabled === true;
   merged.runRetentionDays = coerceNonNegativeInteger(
     merged.runRetentionDays,

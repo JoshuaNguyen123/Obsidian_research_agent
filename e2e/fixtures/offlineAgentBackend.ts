@@ -15,6 +15,8 @@ export interface OfflineAgentBackendMetricsV1 {
   offeredToolsByRequest: string[][];
   citationRepair?: { unverifiedDrafts: number; correctedDrafts: number };
   citationCriticReviews?: number;
+  /** Completions refused with an injected 503 (see `injectTransientOutage`). */
+  outageFailuresServed?: number;
   citationRepairRequests?: {
     offeredTools: string[];
     lastMessages: { role: unknown; name: unknown; content: string }[];
@@ -24,6 +26,18 @@ export interface OfflineAgentBackendMetricsV1 {
 export interface OfflineAgentBackendV1 extends AgentBackend {
   snapshot(): OfflineAgentBackendMetricsV1;
   setCatalogNotePath(path: string): void;
+  /**
+   * Fail the next `failures` completions with HTTP 503 through the bridge,
+   * then serve normally. With `whenTranscriptIncludes`, only requests whose
+   * transcript carries that text are refused, so a connection probe or an
+   * unrelated call is never caught by an outage meant for one mission.
+   * Proves the host recovers from a transient provider outage on its own;
+   * no cloud is involved.
+   */
+  injectTransientOutage(
+    failures: number,
+    options?: { whenTranscriptIncludes?: string },
+  ): void;
 }
 
 /**
@@ -43,10 +57,27 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
     offeredToolsByRequest: [],
   };
 
+  let outageRemaining = 0;
+  let outageTranscriptFilter: string | null = null;
   const complete = async (
     request: Record<string, unknown>,
   ): Promise<AgentBackendResult> => {
     metrics.requestCount += 1;
+    if (outageRemaining > 0) {
+      const requestTranscript = (Array.isArray(request.messages) ? request.messages : [])
+        .flatMap((message) => isRecord(message) && typeof message.content === "string"
+          ? [message.content]
+          : [])
+        .join("\n");
+      if (!outageTranscriptFilter || requestTranscript.includes(outageTranscriptFilter)) {
+        outageRemaining -= 1;
+        metrics.outageFailuresServed = (metrics.outageFailuresServed ?? 0) + 1;
+        throw Object.assign(
+          new Error("Injected transient outage: the offline backend is temporarily unavailable (HTTP 503)."),
+          { bridgeCode: "upstream_unavailable", status: 503 },
+        );
+      }
+    }
     const messages = Array.isArray(request.messages) ? request.messages : [];
     const tools = Array.isArray(request.tools) ? request.tools : [];
     if (tools.length > 0) metrics.toolFrontierObservations += 1;
@@ -324,6 +355,10 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
       yield result;
     },
     snapshot: () => structuredClone(metrics),
+    injectTransientOutage: (failures, options) => {
+      outageRemaining = Math.max(0, Math.trunc(failures));
+      outageTranscriptFilter = options?.whenTranscriptIncludes?.trim() || null;
+    },
   };
 }
 

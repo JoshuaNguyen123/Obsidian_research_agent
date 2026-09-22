@@ -264,3 +264,18 @@ export function resolveModelEndpointBreaker(
 export function resetModelEndpointBreakersForTests(): void {
   registry.clear();
 }
+
+/**
+ * The longest wait any registered endpoint still demands before it admits a
+ * probe; 0 when no breaker is open. A host that means to continue a mission
+ * on its own after a provider outage reads this before it continues: a
+ * continuation started inside the cooldown fails fast on the same breaker
+ * and spends a recovery in milliseconds without ever reaching the provider.
+ */
+export function longestModelEndpointBreakerRetryAfterMs(): number {
+  let longest = 0;
+  for (const breaker of registry.values()) {
+    longest = Math.max(longest, breaker.snapshot().retryAfterMs);
+  }
+  return longest;
+}

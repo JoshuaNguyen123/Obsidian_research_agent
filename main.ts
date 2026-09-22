@@ -7,7 +7,31 @@ import {
   type StartupTimer,
 } from "./src/pluginStartupTiming";
 import {
+  buildMissionCompletionSummaryV1,
+  missionCompletionHeadlineV1,
+} from "./src/agent/missionCompletionSummary";
+import { fromAgentRunStopReason } from "./src/agent/missionStopReason";
+import {
+  decideAutoRecovery,
+  describeAutoRecoveryReasonV1,
+  MAX_AUTO_RECOVERIES_PER_MISSION,
+  planAutoRecoveryWaitMsV1,
+  type AutoRecoveryDecision,
+} from "./src/agent/autoRecovery";
+import { longestModelEndpointBreakerRetryAfterMs } from "./src/model/endpointBreaker";
+import {
+  readVaultTrigger,
+  shouldDispatchVaultTrigger,
+  VAULT_TRIGGER_DEBOUNCE_MS,
+  VAULT_TRIGGER_RUN_ID_KEY,
+  VAULT_TRIGGER_STATUS_KEY,
+  vaultTriggerStatusFromStopReason,
+  type VaultTriggerStatus,
+} from "./src/agent/vaultTrigger";
+import { vaultExclusionRootsFromSettingsV1 } from "./src/tools/vaultExclusions";
+import {
   Notice,
+  Platform,
   Plugin,
   TAbstractFile,
   TFile,
@@ -190,6 +214,7 @@ import {
   runAgentMission,
   type AgentRunCompleteEvent,
   type AgentRunConfigEvent,
+  type AgentRunIdentityEvent,
   type AgentRunEvents,
   type AgentRunReceipt,
   type AgentToolRunEvent,
@@ -843,6 +868,8 @@ export default class AgenticResearcherPlugin extends Plugin {
   embeddingProbeInFlight = false;
   private semanticIndexService: SemanticIndexService | null = null;
   private activeAgentView: AgentView | null = null;
+  /** Ambient mission state in Obsidian's status bar; desktop only. */
+  private missionStatusBarEl: HTMLElement | null = null;
   private agentSettingTab: AgentSettingTab | null = null;
   private pendingCapabilityResume: PendingCapabilityResume | null = null;
   private modelSetupOpenedFromEmptyState = false;
@@ -867,6 +894,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   private scheduledRunActive = false;
   private semanticIndexQueuedPaths = new Set<string>();
   private semanticIndexTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Per-note debounce for frontmatter mission triggers. */
+  private readonly vaultTriggerTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private vaultTriggerDispatchInFlight = false;
   private semanticIndexFlushPromise: Promise<void> | null = null;
   private semanticIndexNeedsBootstrap = false;
   private semanticIndexConsecutiveFailures = 0;
@@ -1253,9 +1283,32 @@ export default class AgenticResearcherPlugin extends Plugin {
       }),
     );
 
+    // Vault-native launch: a note with `agent_mission` + `agent_mission_status:
+    // pending` in its frontmatter runs that prompt against itself. Obsidian's
+    // parsed cache is the only reader, so no YAML is parsed here.
+    this.registerEvent(
+      this.app.metadataCache.on("changed", (file, _data, cache) => {
+        this.queueVaultTrigger(file, cache?.frontmatter);
+      }),
+    );
+
     this.addRibbonIcon("bot", "Open Agentic Researcher", () => {
       void this.activateView();
     });
+
+    // A mission's outcome must reach a user who is in another note or another
+    // window. The status bar carries the last outcome; a Notice fires when
+    // the agent pane is not visible or the window is not focused.
+    if (Platform.isDesktopApp) {
+      this.missionStatusBarEl = this.addStatusBarItem();
+      this.missionStatusBarEl.addClass("agentic-researcher-status-bar-item");
+      this.missionStatusBarEl.setAttribute("data-testid", "agentic-status-bar");
+      this.missionStatusBarEl.setAttribute("aria-label", "Agentic Researcher mission status");
+      this.missionStatusBarEl.addEventListener("click", () => {
+        void this.activateView();
+      });
+      this.setMissionStatusBarText("");
+    }
 
     this.addCommand({
       id: "open-agentic-researcher",
@@ -1467,6 +1520,7 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   onunload() {
     this.projectMemoryReload.cancel();
+    this.clearVaultTriggerTimers();
     // Parsed shards and their decoded vectors are module-level; a disabled
     // plugin must not keep an index's worth of Float32Arrays alive.
     clearSemanticShardReadCache();
@@ -2707,8 +2761,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       24,
       DEFAULT_SETTINGS.overnightMaxSegments ?? 24,
     );
+    // Opt-in: only a persisted explicit `true` resumes without consent.
     settings.autoResumeOvernightRuns =
-      settings.autoResumeOvernightRuns !== false;
+      settings.autoResumeOvernightRuns === true;
     // Default on: unfinished-run Chat banner when a resumable run exists.
     // Persisted explicit false stays off; dismiss is per-run via the mission ledger.
     settings.showUnfinishedRunBannerOnOpen =
@@ -9244,6 +9299,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       );
     }
     let assistantContent = "";
+    this.setMissionStatusBarText("Agent: running");
     const overnightIntent = classifyOvernightMissionIntent(
       prompt,
       this.settings.overnightRunHours,
@@ -9521,9 +9577,25 @@ export default class AgenticResearcherPlugin extends Plugin {
           // (the vault-backed source cache only covered part of that).
           let segmentRuntimeCache = createCarriedRuntimeCacheV1(null);
 
-          for (let segmentIndex = 0; segmentIndex < maxSegments; segmentIndex += 1) {
+          // Transient provider failures (a 5xx, a rate limit, a timeout) used
+          // to end the mission and wait for a click. Each recovery is one
+          // extra continuation segment, so the loop bound grows with the
+          // recoveries used, up to MAX_AUTO_RECOVERIES_PER_MISSION.
+          let recoveriesUsed = 0;
+          for (
+            let segmentIndex = 0;
+            segmentIndex < maxSegments + recoveriesUsed;
+            segmentIndex += 1
+          ) {
             let segmentRunId: string | null = null;
             let shouldContinue = false;
+            // One holder object rather than two `let`s: TypeScript narrows a
+            // `let` that is only assigned inside callbacks to its initializer.
+            const segmentObservation: {
+              lastError: { code: string; message: string } | null;
+              recovery: AutoRecoveryDecision | null;
+              finishedThenThrew: string | null;
+            } = { lastError: null, recovery: null, finishedThenThrew: null };
             const segmentEvents = createSegmentEventProxy(events, {
               bufferAssistantUntilComplete:
                 autoContinueLongRun && segmentIndex + 1 < maxSegments,
@@ -9531,15 +9603,70 @@ export default class AgenticResearcherPlugin extends Plugin {
                 segmentRunId = event.runId;
                 events.onRunConfig?.(event);
               },
+              observeRunIdentity: (event) => {
+                // Identity only; config still owns everything else. It is what
+                // lets a segment that died on its first model call recover.
+                segmentRunId ??= event.runId;
+              },
+              observeTrace: (event) => {
+                if (event.kind === "error") {
+                  segmentObservation.lastError = event.error ?? {
+                    code: "segment_error",
+                    message: event.message,
+                  };
+                }
+              },
               onRunComplete: (event) => {
-                shouldContinue =
+                const budgetContinue =
                   autoContinueLongRun &&
                   event.stopReason === "budget" &&
                   event.autoContinueRecommended === true &&
                   segmentIndex + 1 < maxSegments &&
                   !abortSignal.aborted &&
                   Boolean(segmentRunId);
-                return shouldContinue;
+                if (budgetContinue) {
+                  shouldContinue = true;
+                  return true;
+                }
+                const recovery = decideAutoRecovery({
+                  stopReason: event.stopReason,
+                  stopDetail: event.stopDetail,
+                  lastError: segmentObservation.lastError,
+                  recoveriesUsed,
+                  maxRecoveries: MAX_AUTO_RECOVERIES_PER_MISSION,
+                  abortRequested: abortSignal.aborted,
+                  runId: segmentRunId,
+                  // The endpoint breaker fails fast for its whole cooldown; a
+                  // continuation started inside it never reaches the provider.
+                  providerRetryAfterMs: longestModelEndpointBreakerRetryAfterMs(),
+                });
+                if (recovery.recommended) {
+                  recoveriesUsed += 1;
+                  segmentObservation.recovery = recovery;
+                  shouldContinue = true;
+                  return true;
+                }
+                if (event.stopReason === "error") {
+                  // The run is about to stop for a click. Say why the host
+                  // did not continue on its own, before the completion lands,
+                  // so Run Details carries the reason with the stop.
+                  events.onTrace?.({
+                    id: `auto-recovery-declined-${segmentIndex + 1}`,
+                    kind: "status",
+                    message: `No automatic recovery: ${describeAutoRecoveryReasonV1(recovery.reason)}.`,
+                    outputPreview: {
+                      reason: recovery.reason,
+                      stopReason: event.stopReason,
+                      stopDetail: event.stopDetail ?? null,
+                      errorCode: segmentObservation.lastError?.code ?? null,
+                      errorMessage: segmentObservation.lastError?.message ?? null,
+                      runId: segmentRunId,
+                      recoveriesUsed,
+                    },
+                  });
+                }
+                shouldContinue = false;
+                return false;
               },
             });
 
@@ -9564,10 +9691,76 @@ export default class AgenticResearcherPlugin extends Plugin {
                   }
                 : {}),
               events: segmentEvents,
+            }).catch((error: unknown) => {
+              // The direct-writeback route finishes the run as a resumable
+              // error (completion emitted, ledger and runtime snapshot saved)
+              // and THEN rethrows the provider failure so callers that only
+              // await the promise still see it. When the completion
+              // interceptor has already chosen to recover, that throw is the
+              // same fact the completion carried, and letting it unwind this
+              // loop would turn "continue on its own" into a coordinator
+              // terminal error with no detail. Anything thrown before a
+              // recovery was decided still propagates unchanged.
+              if (!(shouldContinue && segmentObservation.recovery && segmentRunId)) {
+                throw error;
+              }
+              segmentObservation.finishedThenThrew =
+                error instanceof Error ? error.message : String(error);
             });
 
             if (!shouldContinue || !segmentRunId) {
               return;
+            }
+            if (segmentObservation.recovery) {
+              // Wait for the endpoint breaker's probe window (or a small
+              // backoff when no breaker is open) before continuing. The first
+              // live outage lane spent both recoveries in seconds: each
+              // continuation started inside the breaker's cooldown and failed
+              // fast without a single request reaching the provider.
+              const providerRetryAfterMs = longestModelEndpointBreakerRetryAfterMs();
+              const waitMs = planAutoRecoveryWaitMsV1({
+                recovery: recoveriesUsed,
+                providerRetryAfterMs,
+              });
+              const recoveryMessage = `Recovering from a transient provider error (${recoveriesUsed}/${MAX_AUTO_RECOVERIES_PER_MISSION}); waiting ${Math.ceil(waitMs / 1000)} s${providerRetryAfterMs > 0 ? " for the provider endpoint to admit a probe" : ""}, then continuing the mission from its durable snapshot...`;
+              events.onStatus?.(recoveryMessage);
+              events.onTrace?.({
+                id: `auto-recovery-${recoveriesUsed}`,
+                kind: "status",
+                message: recoveryMessage,
+                outputPreview: {
+                  recovery: recoveriesUsed,
+                  maxRecoveries: MAX_AUTO_RECOVERIES_PER_MISSION,
+                  reason: segmentObservation.recovery.reason,
+                  errorCode: segmentObservation.lastError?.code ?? null,
+                  finishedThenThrew: segmentObservation.finishedThenThrew,
+                  providerRetryAfterMs,
+                  waitMs,
+                  continuationCommand: `continue run ${segmentRunId}`,
+                },
+              });
+              // Abortable: Stop during the wait ends it at once, and the next
+              // segment then stops on the aborted signal with a proper
+              // completion instead of this loop inventing one.
+              await new Promise<void>((resolve) => {
+                if (waitMs <= 0 || abortSignal.aborted) {
+                  resolve();
+                  return;
+                }
+                const timer = setTimeout(() => {
+                  abortSignal.removeEventListener("abort", onAbort);
+                  resolve();
+                }, waitMs);
+                function onAbort() {
+                  clearTimeout(timer);
+                  resolve();
+                }
+                abortSignal.addEventListener("abort", onAbort, { once: true });
+              });
+              segmentPrompt = `continue run ${segmentRunId}`;
+              segmentHistory = [];
+              segmentRuntimeCache = createCarriedRuntimeCacheV1(segmentRuntimeCache);
+              continue;
             }
             events.onStatus?.(
               completionDrivenLoops
@@ -9614,6 +9807,72 @@ export default class AgenticResearcherPlugin extends Plugin {
           console.warn("Unable to persist the completed assistant message.", error);
         }
       }
+      this.announceMissionCompletionV1();
+    }
+  }
+
+  private setMissionStatusBarText(text: string): void {
+    const el = this.missionStatusBarEl;
+    if (!el) return;
+    el.setText(text);
+    el.toggleClass("is-hidden", text.trim().length === 0);
+  }
+
+  /**
+   * Tell a user who walked away that the mission settled. Built from the
+   * coordinator's own terminal record and receipts (never model prose), it
+   * updates the status bar always and raises a Notice only when the agent
+   * pane is not visible or the window is not focused — the cases where the
+   * Chat completion row cannot be seen.
+   */
+  private announceMissionCompletionV1(): void {
+    const snapshot = this.runCoordinator.getSnapshot();
+    const complete = snapshot.lastComplete;
+    if (!complete) {
+      this.setMissionStatusBarText("");
+      return;
+    }
+    if (
+      complete.stopReason === "user_stopped" ||
+      complete.stopReason === "clarifying_question"
+    ) {
+      this.setMissionStatusBarText(
+        complete.stopReason === "clarifying_question"
+          ? "Agent: needs an answer"
+          : "Agent: stopped",
+      );
+      return;
+    }
+    const stopReason = fromAgentRunStopReason(
+      complete.stopReason,
+      complete.stopDetail ?? complete.autoContinueReason,
+    );
+    const ledger = snapshot.lastMissionLedger;
+    const summary = buildMissionCompletionSummaryV1({
+      stopReason,
+      stopDetail: complete.stopDetail,
+      receipts: snapshot.lastReceipts,
+      receiptCount: ledger?.receiptCount,
+      evidenceCount: ledger?.evidenceCount,
+      acceptance: ledger?.acceptance
+        ? {
+            status: ledger.acceptance.status,
+            missing: ledger.acceptance.missing,
+          }
+        : null,
+      remainingActions: ledger?.remainingActions,
+    });
+    const headline = missionCompletionHeadlineV1(summary, stopReason);
+    this.setMissionStatusBarText(headline.replace(/^Mission /, "Agent: "));
+    const paneVisible =
+      this.activeAgentView?.containerEl?.isShown?.() === true;
+    const windowFocused =
+      typeof document !== "undefined" &&
+      typeof document.hasFocus === "function"
+        ? document.hasFocus()
+        : true;
+    if (!paneVisible || !windowFocused) {
+      new Notice(headline, 8_000);
     }
   }
 
@@ -16523,6 +16782,107 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.scheduleSemanticIndexFlush();
   }
 
+  private queueVaultTrigger(file: TFile, frontmatter: unknown): void {
+    if (this.settings.vaultTriggersEnabled !== true) return;
+    if (file.extension !== "md" || readVaultTrigger(frontmatter) === null) return;
+    const existing = this.vaultTriggerTimers.get(file.path);
+    if (existing) clearTimeout(existing);
+    this.vaultTriggerTimers.set(
+      file.path,
+      setTimeout(() => {
+        this.vaultTriggerTimers.delete(file.path);
+        void this.dispatchVaultTrigger(file.path);
+      }, VAULT_TRIGGER_DEBOUNCE_MS),
+    );
+  }
+
+  private clearVaultTriggerTimers(): void {
+    for (const timer of this.vaultTriggerTimers.values()) clearTimeout(timer);
+    this.vaultTriggerTimers.clear();
+  }
+
+  /**
+   * Launch a note's frontmatter mission. The status is flipped to `running`
+   * BEFORE the launch, so the change event that flip produces (and every
+   * write the agent makes to the note) sees a non-pending status and does
+   * nothing. The decision itself lives in `shouldDispatchVaultTrigger`.
+   */
+  private async dispatchVaultTrigger(path: string): Promise<void> {
+    const file = this.app.vault.getFileByPath(path);
+    if (!file) return;
+    const cache = this.app.metadataCache.getFileCache(file);
+    const decision = shouldDispatchVaultTrigger({
+      path,
+      frontmatter: cache?.frontmatter,
+      enabled: this.settings.vaultTriggersEnabled === true,
+      exclusionRoots: vaultExclusionRootsFromSettingsV1(this.settings),
+      running: this.isMissionRunning() || this.vaultTriggerDispatchInFlight,
+      modifiedAtMs: file.stat?.mtime ?? null,
+      nowMs: Date.now(),
+      noteIsActive: this.app.workspace.getActiveFile()?.path === path,
+      windowFocused:
+        typeof document !== "undefined" &&
+        typeof document.hasFocus === "function" &&
+        document.hasFocus(),
+    });
+    if (!decision.dispatch) return;
+    this.vaultTriggerDispatchInFlight = true;
+    try {
+      await this.writeVaultTriggerStatus(file, "running", null);
+      // Make the note the current markdown target, exactly as the selection
+      // launcher does, so current-note writes land on it.
+      this.updateLastActiveMarkdownFile(file);
+      const markdownLeaf =
+        this.app.workspace
+          .getLeavesOfType("markdown")
+          .find((leaf) => getMarkdownFileFromLeaf(leaf)?.path === file.path) ??
+        this.app.workspace.getMostRecentLeaf();
+      if (markdownLeaf) {
+        await markdownLeaf.openFile(file);
+      }
+      await this.activateView();
+      let view =
+        this.activeAgentView ??
+        (this.app.workspace.getLeavesOfType(AGENT_VIEW_TYPE)[0]?.view instanceof
+        AgentView
+          ? (this.app.workspace.getLeavesOfType(AGENT_VIEW_TYPE)[0].view as AgentView)
+          : null);
+      if (!view) {
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+        view = this.activeAgentView;
+      }
+      if (!view) {
+        await this.writeVaultTriggerStatus(file, "failed", null);
+        return;
+      }
+      new Notice(`Running the mission from ${file.basename}.`);
+      const outcome = await view.submitMissionPrompt(decision.prompt);
+      await this.writeVaultTriggerStatus(
+        file,
+        vaultTriggerStatusFromStopReason(outcome?.stopReason ?? null),
+        outcome?.runId ?? null,
+      );
+    } catch (error) {
+      console.warn("Vault-triggered mission failed to launch.", error);
+      await this.writeVaultTriggerStatus(file, "failed", null).catch(() => undefined);
+    } finally {
+      this.vaultTriggerDispatchInFlight = false;
+    }
+  }
+
+  private async writeVaultTriggerStatus(
+    file: TFile,
+    status: VaultTriggerStatus,
+    runId: string | null,
+  ): Promise<void> {
+    await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+      frontmatter[VAULT_TRIGGER_STATUS_KEY] = status;
+      if (runId) {
+        frontmatter[VAULT_TRIGGER_RUN_ID_KEY] = runId;
+      }
+    });
+  }
+
   private scheduleSemanticIndexFlush(
     delayMs = this.settings.semanticIndexDebounceMs,
   ) {
@@ -17443,6 +17803,12 @@ function createSegmentEventProxy(
     bufferAssistantUntilComplete: boolean;
     onRunConfig: (event: AgentRunConfigEvent) => void;
     onRunComplete: (event: AgentRunCompleteEvent) => boolean;
+    /**
+     * The identity-only announcement that precedes every model call. A
+     * segment that dies before its config event (a provider outage on the
+     * very first call) is still addressable through this id.
+     */
+    observeRunIdentity?: (event: AgentRunIdentityEvent) => void;
     observeToolStart?: (event: AgentToolRunEvent) => void;
     observeTrace?: (event: AgentTraceEvent) => void;
     observeApprovalRequest?: (request: ApprovalRequest) => void | Promise<void>;
@@ -17491,6 +17857,12 @@ function createSegmentEventProxy(
       }
       if (property === "onRunConfig") {
         return interceptors.onRunConfig;
+      }
+      if (property === "onRunIdentity" && interceptors.observeRunIdentity) {
+        return (event: AgentRunIdentityEvent) => {
+          interceptors.observeRunIdentity?.(event);
+          forward("onRunIdentity", [event]);
+        };
       }
       if (property === "onToolStart" && interceptors.observeToolStart) {
         return (event: AgentToolRunEvent) => {

@@ -223,6 +223,25 @@ test("OpenAI-compatible client sends auth and maps errors", async () => {
   assert.equal(captured?.headers?.Authorization, "Bearer sk-test");
 });
 
+test("a stream that closes before any chunk is a transient transport failure, not an empty answer", async () => {
+  // A loopback bridge that had already committed a 200 header ended the body
+  // with zero events when its backend failed; the parser reported an empty
+  // assistant message, the streamed writeback said "no writable content",
+  // and neither the retry policy nor the host's recovery saw a provider
+  // failure. A completion always carries at least one chunk or a [DONE].
+  await assert.rejects(
+    parseOpenAIChatStream(asyncIterable([])),
+    (error: unknown) =>
+      error instanceof ModelClientError &&
+      error.category === "network" &&
+      /before sending any chunk/u.test(error.message),
+  );
+  // [DONE] with no content is still a (legitimately empty) answer.
+  const empty = await parseOpenAIChatStream(asyncIterable(["data: [DONE]\n\n"]));
+  assert.equal(empty.message.content, "");
+  assert.deepEqual(empty.toolCalls, []);
+});
+
 async function* asyncIterable(values: string[]): AsyncIterable<string> {
   for (const value of values) {
     yield value;

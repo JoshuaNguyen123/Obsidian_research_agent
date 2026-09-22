@@ -17,14 +17,19 @@ export type ChatAttentionKey =
   | "readiness"
   | "blocked"
   | "approval"
-  | "clarification";
+  | "clarification"
+  | "followups";
 
-/** Display order, top to bottom. Pre-run gates first, live prompts last. */
+/**
+ * Display order, top to bottom. Pre-run gates first, live prompts next, and
+ * the post-run "next, I could" chips last because they never block anything.
+ */
 export const CHAT_ATTENTION_CARD_ORDER: readonly ChatAttentionKey[] = [
   "readiness",
   "blocked",
   "approval",
   "clarification",
+  "followups",
 ];
 
 export const CHAT_ATTENTION_CARD_CLASS = "agentic-researcher-chat-attention-card";

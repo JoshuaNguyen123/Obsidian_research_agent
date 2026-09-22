@@ -272,8 +272,10 @@ export async function parseOpenAIChatStream(
   const degenerateDetector = createDegenerateStreamDetector();
   let content = "";
   let doneReason: string | undefined;
+  let sawEvent = false;
 
   for await (const event of parseSseStream(stream)) {
+    sawEvent = true;
     if (event === "[DONE]") {
       break;
     }
@@ -311,6 +313,19 @@ export async function parseOpenAIChatStream(
       }
       accumulateOpenAIStreamToolCalls(delta.tool_calls, toolCallAccumulators);
     }
+  }
+
+  if (!sawEvent) {
+    // A 200 whose body closed before a single SSE event is a transport
+    // failure, not an empty answer: a chat completion always carries at least
+    // one chunk or a [DONE]. Reporting it as empty content sent the streamed
+    // writeback down its "no writable content" path, where no retry policy
+    // and no host recovery could see that the provider had gone away.
+    throw new ModelClientError(
+      "network",
+      "OpenAI-compatible API closed the stream before sending any chunk.",
+      { details: { chunks: 0 } },
+    );
   }
 
   const toolCalls = finalizeOpenAIStreamToolCalls(toolCallAccumulators);
