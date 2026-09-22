@@ -206,6 +206,11 @@ import {
 import { sweepAgentBackupsRetentionBestEffortV1 } from "./src/agent/backupRetentionPolicy";
 import { sweepExpiredSourceCacheBestEffortV1 } from "./src/tools/sourceCacheRetention";
 import { createNodePublicFetchTransportV1 } from "./src/tools/nodePublicFetchTransport";
+import {
+  approvalNotificationV1,
+  isWindowFocusedV1,
+  raiseDesktopNotificationV1,
+} from "./src/ui/desktopNotifications";
 import type { PublicFetchHopTransportV1 } from "./src/tools/publicFetch";
 import {
   onloadTasksForPhase,
@@ -1144,6 +1149,16 @@ export default class AgenticResearcherPlugin extends Plugin {
       value: "agentic-researcher:v1",
       enumerable: false,
     });
+    // Tell a user who is in another app that an approval card started its
+    // clock. One observer covers every seat that raises an approval.
+    this.register(
+      this.approvalBroker.observe((request) => {
+        void raiseDesktopNotificationV1(
+          approvalNotificationV1({ ...request, nowMs: Date.now() }),
+          this.desktopNotificationEnvV1(),
+        );
+      }),
+    );
     try {
       this.registerView(AGENT_VIEW_TYPE, viewCreator);
     } catch (error) {
@@ -9876,6 +9891,27 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (!paneVisible || !windowFocused) {
       new Notice(headline, 8_000);
     }
+    // The Notice is drawn inside the Obsidian window; a user in another app
+    // never sees it. The system notification is the channel for that case.
+    void raiseDesktopNotificationV1(
+      {
+        title: "Agentic Researcher",
+        body: headline,
+        tag: "agentic-researcher-mission",
+      },
+      this.desktopNotificationEnvV1(),
+    );
+  }
+
+  private desktopNotificationEnvV1() {
+    return {
+      enabled: this.settings.desktopNotificationsEnabled !== false,
+      windowFocused: isWindowFocusedV1(),
+      onClick: () => {
+        window.focus();
+        void this.activateView();
+      },
+    };
   }
 
   /**
