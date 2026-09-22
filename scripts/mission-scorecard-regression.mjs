@@ -120,7 +120,26 @@ export const NO_RUN_SUMMARY_SKIP_MESSAGE =
   "mission-scorecards: NO RUN SUMMARY — regression comparison skipped (baseline structure validated only)";
 
 export function parseMissionScorecardCliArgs(argv = process.argv.slice(2)) {
-  return { requireSummary: argv.includes("--require-summary"), baselineOnly: argv.includes("--baseline-only") };
+  return {
+    requireSummary: argv.includes("--require-summary"),
+    baselineOnly: argv.includes("--baseline-only"),
+    allowSkip: argv.includes("--allow-skip"),
+  };
+}
+
+/**
+ * The CLI's exit code. A comparison that compared nothing used to exit 0, so
+ * "regression gate skipped: no baselined records were selected" and "passed"
+ * were the same answer to every caller that reads the exit code — including
+ * the proof matrix, which runs this right after a harvest precisely to prove
+ * the new baseline is compared against. A skip is now a failure unless the
+ * caller says a skip is acceptable (`--allow-skip`), or asked only for the
+ * baseline's structure (`--baseline-only`).
+ */
+export function missionScorecardCliExitCode(result, options = {}) {
+  if (result?.reason === "baseline_only") return 0;
+  if (result?.skipped && !options.allowSkip) return 1;
+  return 0;
 }
 
 export function formatMissionScorecardCliResult(result) {
@@ -580,6 +599,14 @@ if (
   void assertMissionScorecardSummaryFile(options)
     .then((result) => {
       console.log(formatMissionScorecardCliResult(result));
+      const exitCode = missionScorecardCliExitCode(result, options);
+      if (exitCode !== 0) {
+        console.error(
+          "mission-scorecards: nothing was compared, so this is not a pass. " +
+            "Run and harvest a scored lane first, or pass --allow-skip if a skip is acceptable here.",
+        );
+        process.exitCode = exitCode;
+      }
     })
     .catch((error) => {
       console.error(error instanceof Error ? error.message : String(error));
