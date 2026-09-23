@@ -211,6 +211,7 @@ export async function findFreshCachedSource(
     if (!isSourceCachePath(file.path) || file.extension !== "md") {
       continue;
     }
+    await awaitPendingSourceWrite(ctx, file.path);
     const parsed = parseCachedSourceNote(file.path, await ctx.app.vault.read(file));
     if (!parsed || parsed.normalizedUrl !== normalizedUrl) {
       continue;
@@ -318,6 +319,7 @@ async function readCachedSourcePayload(
   ctx: ToolExecutionContext,
   file: TFile,
 ): Promise<{ parsed: CachedSource; sourceContent: string }> {
+  await awaitPendingSourceWrite(ctx, file.path);
   const stamp = sourceFileStamp(file);
   const key = getVaultQueueKey(ctx);
   const cache = sourceSectionReadCaches.get(key);
@@ -718,6 +720,29 @@ async function enqueueSourceWrite(
     if (queues.size === 0) {
       sourceWriteQueues.delete(key);
     }
+  }
+}
+
+/**
+ * Wait for any queued write to this source note before reading it.
+ *
+ * Writes to one note are serialised through `enqueueSourceWrite`, but the
+ * readers went straight to `vault.read`. A desktop `vault.modify` is a
+ * truncate-then-write, so a read that lands mid-write sees a partial note.
+ * `parseCachedSourceNote` then returns null, `read_source_section` throws
+ * "Cached source note is invalid.", and because that tool is often required,
+ * the failure suppresses auto-continuation. Read-only tool batches run
+ * concurrently, so a `web_fetch` refreshing a source and a section read of
+ * the same source can overlap. The manifest readers already wait on their
+ * queue (`readSourceCacheManifest`); this gives the note readers the same rule.
+ */
+async function awaitPendingSourceWrite(
+  ctx: ToolExecutionContext,
+  path: string,
+): Promise<void> {
+  const pending = sourceWriteQueues.get(getVaultQueueKey(ctx))?.get(path);
+  if (pending) {
+    await pending.catch(() => undefined);
   }
 }
 

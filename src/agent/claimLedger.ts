@@ -4,6 +4,10 @@ import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import { hasWordCountIntent } from "./wordCountIntent";
 import { UNVERIFIED_CLAIM_MARKER_V1 } from "./degradedDelivery";
 import {
+  isReceiptBackedClaimSentenceV1,
+  type ClaimReceiptAnchorsV1,
+} from "./receiptBackedClaims";
+import {
   createQuotedSpanPattern,
   findQuoteRawOffset,
   findQuoteRawSpan,
@@ -132,6 +136,12 @@ export interface BuildClaimLedgerInput {
   /** When true, run claim grounding even if prompt/mode heuristics would skip. */
   forceRequire?: boolean;
   maxClaims?: number;
+  /**
+   * What the run's receipts record. A sentence that only reports one of them
+   * ("Created Linear issue APP-507") is exempt: a receipt grounds it and no
+   * web passage ever could. See receiptBackedClaims.ts.
+   */
+  receiptAnchors?: ClaimReceiptAnchorsV1;
 }
 
 /**
@@ -342,7 +352,7 @@ export function shouldRequireQuoteSpans(promptOrMode: string): boolean {
 
 export function extractClaimsFromDraft(
   draft: string,
-  options: { maxClaims?: number } = {},
+  options: { maxClaims?: number; receiptAnchors?: ClaimReceiptAnchorsV1 } = {},
 ): ResearchClaim[] {
   const maxClaims = clampInteger(
     options.maxClaims ?? MAX_RESEARCH_CLAIMS,
@@ -374,7 +384,9 @@ export function extractClaimsFromDraft(
       id: occurrence === 1 ? baseId : `${baseId}-${occurrence}`,
       text,
       status:
-        sentence.epistemicSection || isExemptLimitationSentence(text)
+        sentence.epistemicSection ||
+        isExemptLimitationSentence(text) ||
+        isReceiptBackedClaimSentenceV1(text, options.receiptAnchors)
           ? "exempt"
           : "ungrounded",
       passageIds: [],
@@ -736,7 +748,13 @@ export function buildClaimLedger(input: BuildClaimLedgerInput): ClaimLedger {
   );
   const extracted = extractClaimsFromDraft(input.draft, {
     maxClaims: input.maxClaims,
+    receiptAnchors: input.receiptAnchors,
   });
+  const receiptBackedCount = extracted.filter(
+    (claim) =>
+      claim.status === "exempt" &&
+      isReceiptBackedClaimSentenceV1(claim.text, input.receiptAnchors),
+  ).length;
   const bound = bindClaimsToPassages(extracted, input.draft, passages, {
     knownPassageIds,
     verifiedQuotes,
@@ -755,7 +773,11 @@ export function buildClaimLedger(input: BuildClaimLedgerInput): ClaimLedger {
     claims: validated.claims,
     knownPassageIds,
     missing: validated.missing,
-    reasons: validated.reasons,
+    // Named, so an exemption is visible in Run Details and never silent.
+    reasons:
+      receiptBackedCount > 0
+        ? [...validated.reasons, `receipt_backed_claims:${receiptBackedCount}`]
+        : validated.reasons,
     ...(validated.nextAction ? { nextAction: validated.nextAction } : {}),
     requireQuoteSpans,
     verifyQuoteSpans,

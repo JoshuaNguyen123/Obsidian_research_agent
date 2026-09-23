@@ -2,6 +2,28 @@
 
 All notable changes to Agentic Researcher are documented here.
 
+## [Unreleased] — verified ROI wave (2026-09-22)
+
+### Security
+- **A page can no longer redirect a fetch onto your machine or network.**
+  - `web_fetch`'s direct read and `extract_document` followed redirects out of the host check's sight. A public URL answering `302` to `127.0.0.1` (the companion) or `169.254.169.254` was fetched and cached as a source.
+  - Fetches now go one hop at a time, and every redirect target is checked before it is followed.
+  - Host names are checked after DNS resolution, so a public name that points at a private address is refused, and so is DNS rebinding.
+  - Bodies are capped while they download: 5 MB for pages, and oversized documents stop one byte past the limit instead of downloading in full.
+  - A timed-out request is really cancelled.
+  - An unlabelled binary body is refused.
+  - Known cost: the direct read does not use a system proxy.
+
+### Added
+- **Notifications when you are away.** While the Obsidian window is not focused, a system notification appears when an approval card starts waiting (before the run parks) and when a mission finishes, pauses or gets blocked. "Notify me when I am away" is on by default.
+
+### Fixed
+- **Sentences reporting the agent's own work no longer demand a web citation.** "Created Linear issue APP-507" or "Appended 4,217 bytes to …" is grounded by the run's receipt. The claim checker used to send the mission back to fetch pages that could never ground it, until it ran out of continuations. The exemption is narrow: a factual claim riding on a receipt still needs a source.
+- **"Cached source note is invalid" from reading a source while it was being rewritten.** Readers now wait for a pending write to the same source.
+- **A code mission that hit an existing file can repair it.** The hash-bound read → write repair was refused in every real mission because the write tool's capability differs from the create tool's. It is now allowed when the mission already grants the write tool.
+- **When a page cannot be fetched, the error says why.** If both the retrieval endpoint and the direct read fail, the message names both failures.
+- **`check:mission-scorecards` no longer reports success after comparing nothing.** A skipped comparison exits 1. `--allow-skip` restores the old behavior.
+
 ## [Unreleased] — hands-off wave (2026-09-14)
 
 ### Added

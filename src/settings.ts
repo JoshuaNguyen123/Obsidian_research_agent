@@ -249,6 +249,12 @@ export interface AgentSettings {
    */
   vaultTriggersEnabled?: boolean;
   /**
+   * Default on. While the Obsidian window is not focused, raise a system
+   * notification when an approval card starts waiting and when a mission
+   * settles. A focused window never gets one.
+   */
+  desktopNotificationsEnabled?: boolean;
+  /**
    * How long an in-run approval card waits before the run parks itself as
    * resumable (never fails). Milliseconds; default two minutes.
    */
@@ -433,6 +439,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   autoResumeOvernightRuns: false,
   showUnfinishedRunBannerOnOpen: true,
   vaultTriggersEnabled: false,
+  desktopNotificationsEnabled: true,
   approvalTimeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS,
   runRetentionDays: 30,
   runRetentionMaxRuns: 200,
@@ -2049,6 +2056,20 @@ export class AgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.vaultTriggersEnabled === true)
           .onChange(async (value) => {
             this.plugin.settings.vaultTriggersEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Notify me when I am away")
+      .setDesc(
+        "When the Obsidian window is not focused, show a system notification when an approval is waiting and when a mission finishes, pauses or gets blocked.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.desktopNotificationsEnabled !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.desktopNotificationsEnabled = value;
             await this.plugin.saveSettings();
           }),
       );

@@ -2118,6 +2118,17 @@ function contribution(name: CodeWorkspaceToolNameV2, runtime: WorkspaceToolRunti
   };
 }
 
+/**
+ * The descriptor a workspace tool is registered with. Exported so graph tests
+ * build missions from the real capability actions: a synthetic descriptor that
+ * gave every tool the same action hid that create_file carries `create` while
+ * write_expected carries `update`, and that difference is what refused every
+ * create-collision repair in production.
+ */
+export function codeWorkspaceToolDescriptorV2(name: CodeWorkspaceToolNameV2): ToolDescriptorV1 {
+  return toolDescriptor(name, isReadWorkspaceTool(name) ? "none" : "required");
+}
+
 function isReadWorkspaceTool(name: CodeWorkspaceToolNameV2): boolean {
   return [
     "code_workspace_status",

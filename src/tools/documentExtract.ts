@@ -9,6 +9,12 @@ import type {
 } from "../orchestrator/researchProvider";
 import type { ActionReceipt, ToolDescriptor } from "../agent/actions";
 import { normalizePublicFetchUrlV1 } from "./fetchHostPolicy";
+import {
+  describePublicFetchFailureV1,
+  fetchPublicUrlV1,
+  headerValue,
+  PublicFetchErrorV1,
+} from "./publicFetch";
 import { requestWithRetry } from "./httpRetry";
 import { writeSourceCacheNote } from "./sourceCache";
 import {
@@ -59,8 +65,8 @@ export interface DocumentBytesV1 {
 export interface DocumentExtractProviderOptionsV1 {
   /**
    * Overrides how the document bytes are obtained. The default reads the URL
-   * through `context.httpTransport` behind the same public-host filter
-   * `web_fetch` applies. It is injectable because the companion deliberately
+   * through `fetchPublicUrlV1` (one hop at a time, every redirect re-checked)
+   * behind the same public-host filter `web_fetch` applies. It is injectable because the companion deliberately
    * does not fetch (see `companion/schemas.py:DocumentExtractRequest`), so the
    * download happens host-side and a caller with a stricter, address-pinned
    * fetcher should be able to supply it without touching this provider.
@@ -163,34 +169,51 @@ async function downloadDocument(
   url: string,
   signal: AbortSignal | undefined,
 ): Promise<DocumentBytesV1> {
-  const response = await requestWithRetry(context.httpTransport, {
-    url,
-    method: "GET",
-    headers: { Accept: "application/pdf,application/octet-stream;q=0.9,*/*;q=0.5" },
-    throw: false,
-    timeoutMs: getDocumentTimeoutMs(context),
-    abortSignal: signal,
-  });
+  let response;
+  try {
+    response = await fetchPublicUrlV1({
+      url,
+      hopTransport: context.publicFetchTransport,
+      httpTransport: context.httpTransport,
+      headers: { Accept: "application/pdf,application/octet-stream;q=0.9,*/*;q=0.5" },
+      timeoutMs: getDocumentTimeoutMs(context),
+      abortSignal: signal,
+      // One byte past the limit is enough to know the document is too big
+      // without downloading the rest of it.
+      maxBytes: MAX_DOCUMENT_BYTES + 1,
+    });
+  } catch (error) {
+    if (error instanceof PublicFetchErrorV1) {
+      throw new ToolExecutionError(
+        "source_unusable",
+        `document_extract will not download ${url}: ${describePublicFetchFailureV1(error)}.`,
+      );
+    }
+    throw error;
+  }
   if (response.status >= 400) {
     throw new ToolExecutionError(
       "source_unusable",
       `document_extract could not download ${url} (HTTP ${response.status}).`,
     );
   }
-  const bytes = response.arrayBuffer;
-  if (!bytes || bytes.byteLength === 0) {
+  if (response.bytes.byteLength === 0) {
     throw new ToolExecutionError(
       "source_unusable",
       `document_extract received no document bytes from ${url}.`,
     );
   }
-  if (bytes.byteLength > MAX_DOCUMENT_BYTES) {
+  if (response.truncated || response.bytes.byteLength > MAX_DOCUMENT_BYTES) {
     throw new ToolExecutionError(
       "source_unusable",
-      `document_extract will not send a ${bytes.byteLength}-byte document to the companion; the limit is ${MAX_DOCUMENT_BYTES} bytes.`,
+      `document_extract will not send a document over ${MAX_DOCUMENT_BYTES} bytes to the companion.`,
     );
   }
-  return { bytes, contentType: response.headers?.["content-type"] };
+  const bytes = response.bytes.buffer.slice(
+    response.bytes.byteOffset,
+    response.bytes.byteOffset + response.bytes.byteLength,
+  ) as ArrayBuffer;
+  return { bytes, contentType: headerValue(response.headers, "content-type") };
 }
 
 async function requestDocumentExtract(

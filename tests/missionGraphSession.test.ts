@@ -46,6 +46,7 @@ import {
   type MissionReceiptRefV1,
 } from "../src/agent/missionGraphV3";
 import { descriptorFor } from "../src/tools/toolDescriptors";
+import { codeWorkspaceToolDescriptorV2 } from "../extensions/code/workspaceTools";
 import type { ToolExecutionContext, ToolRegistry } from "../src/tools/types";
 
 const GRAPH_TIME = new Date("2026-07-11T18:00:00.000Z");
@@ -2001,6 +2002,103 @@ test("a composite code lifecycle resumes after bounded create collision repair",
   assert.doesNotThrow(() => validateMissionGraphV3(repaired));
 });
 
+test("a create collision repair opens with the code extension's real capability actions", async () => {
+  // Live 2026-09-06: every create collision ended create_file_collision_unrepairable
+  // with "Patch cannot add new mutation, execution, or external authority for
+  // node repair-write-7-lifecycle-code_execution". The code extension registers
+  // create_file as a `create` capability and write_expected as `update`; the
+  // fixture above gives every tool the same action, so it never saw the
+  // repair's capability fall outside the origin's.
+  const harness = createVaultHarness();
+  const graph = await compositeCodeCollisionGraphFor(
+    "session-composite-real-descriptors",
+    realCodeToolDescriptor,
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  for (const toolName of ["code_sandbox_status", "code_workspace_create"]) {
+    const execution = requireExecution(await session.beginToolExecution(toolName));
+    await session.finishToolExecution(
+      execution,
+      lifecycleProofFor(
+        session.graph.nodes[execution.nodeId]!,
+        toolName === "code_sandbox_status" ? "0" : "1",
+        harness.nextTimestamp(),
+      ),
+    );
+  }
+  const create = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file"),
+  );
+  await session.finishToolExecution(create, {
+    ok: false,
+    failureFingerprint: fp("2"),
+    failureMessage: "path_exists",
+  });
+  await session.scheduleCreateFileCollisionRepair(create, "main.py");
+
+  const read = requireExecution(await session.beginToolExecution("code_workspace_read"));
+  await session.finishToolExecution(read, {
+    ok: true,
+    evidence: evidenceFor(session.graph.nodes[read.nodeId]!, "3", harness.nextTimestamp()),
+  });
+  const write = requireExecution(
+    await session.beginToolExecution("code_workspace_write_expected"),
+  );
+  const writeNode = session.graph.nodes[write.nodeId]!;
+  const repaired = await session.finishToolExecution(write, {
+    ok: true,
+    evidence: evidenceFor(writeNode, "4", harness.nextTimestamp()),
+    receipt: receiptFor(writeNode, "5", harness.nextTimestamp()),
+  });
+  assert.equal(repaired.nodes[create.nodeId]!.status, "ready");
+  assert.doesNotThrow(() => validateMissionGraphV3(repaired));
+});
+
+test("the repair still cannot open when the envelope never granted write_expected", async () => {
+  const harness = createVaultHarness();
+  // write_expected registered as a read: the envelope holds no mutation
+  // grant for it, so the repair must not borrow one.
+  const graph = await compositeCodeCollisionGraphFor(
+    "session-composite-no-write-grant",
+    (name) =>
+      name === "code_workspace_write_expected"
+        ? { ...realCodeToolDescriptor(name), effect: "read" as const }
+        : realCodeToolDescriptor(name),
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  for (const toolName of ["code_sandbox_status", "code_workspace_create"]) {
+    const execution = requireExecution(await session.beginToolExecution(toolName));
+    await session.finishToolExecution(
+      execution,
+      lifecycleProofFor(
+        session.graph.nodes[execution.nodeId]!,
+        toolName === "code_sandbox_status" ? "0" : "1",
+        harness.nextTimestamp(),
+      ),
+    );
+  }
+  const create = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file"),
+  );
+  await session.finishToolExecution(create, {
+    ok: false,
+    failureFingerprint: fp("2"),
+    failureMessage: "path_exists",
+  });
+  await assert.rejects(
+    () => session.scheduleCreateFileCollisionRepair(create, "main.py"),
+    // Refused either by the session (no mutation-effect grant to preserve) or
+    // by the graph authority check; both mean nothing was borrowed.
+    /collision repair cannot preserve|cannot add new mutation, execution, or external authority/u,
+  );
+});
+
 test("a host-verified terminal domain outcome blocks on its first attempt", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({
@@ -3757,6 +3855,7 @@ async function workspaceCollisionGraphFor(
 
 async function compositeCodeCollisionGraphFor(
   missionId: string,
+  descriptorOf: (name: string) => ToolDescriptor = workspaceFileDescriptor,
 ): Promise<MissionGraphV3> {
   const planned = [
     "code_sandbox_status",
@@ -3773,7 +3872,7 @@ async function compositeCodeCollisionGraphFor(
     "code_workspace_read",
     "code_workspace_write_expected",
   ];
-  const descriptors = allowed.map(workspaceFileDescriptor);
+  const descriptors = allowed.map(descriptorOf);
   const byName = new Map(
     descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
   );
@@ -4253,4 +4352,12 @@ function createVaultHarness(): {
 
 function fp(character: string): string {
   return `sha256:${character.repeat(64)}`;
+}
+
+/** The code extension's registered descriptors; the sandbox probe is a read. */
+function realCodeToolDescriptor(name: string): ToolDescriptor {
+  if (name === "code_sandbox_status") return workspaceFileDescriptor(name);
+  return codeWorkspaceToolDescriptorV2(
+    name as Parameters<typeof codeWorkspaceToolDescriptorV2>[0],
+  ) as unknown as ToolDescriptor;
 }

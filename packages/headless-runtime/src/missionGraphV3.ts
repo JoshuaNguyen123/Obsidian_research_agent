@@ -2521,14 +2521,35 @@ function isExactCreateCollisionRepairNode(
     candidate.resourceLocks.length === 1 &&
     candidate.resourceLocks[0]?.bindingId === bindingId &&
     candidate.resourceLocks[0]?.mode === "exclusive";
+  // The repair's capability is write_expected's own, which is not the
+  // create_file capability the origin holds: the code extension registers
+  // create_file as `create` and write_expected as `update`. Requiring the
+  // repair's capabilities to be a subset of the origin's therefore refused
+  // every real collision repair (the test fixture gave both tools the same
+  // action and never saw it). The repair may carry write_expected's grant
+  // only when the host-built envelope already grants that tool with mutation
+  // authority on this same binding kind, which is the same rule the resume
+  // writeback heal applies. The narrowing that makes it safe is unchanged:
+  // one exact selector, one exclusive lock, a hash-bound write that depends on
+  // a graph-owned exact read.
+  const writeGrant = graph.capabilityEnvelope.tools.code_workspace_write_expected;
+  const binding = graph.capabilityEnvelope.bindings[bindingId];
+  const envelopeGrantsWrite =
+    !!writeGrant &&
+    writeGrant.effect !== "read" &&
+    !!binding &&
+    binding.allowedEffects.includes(candidate.effect) &&
+    (writeGrant.bindingKinds.length === 0 || writeGrant.bindingKinds.includes(binding.kind));
   return (
     originHasExactLock &&
     candidateHasOnlyExactLock &&
     candidate.executorId === origin.executorId &&
     candidate.executionHost === origin.executionHost &&
     candidate.effect === origin.effect &&
-    candidate.requiredCapabilities.every((capabilityId) =>
-      origin.requiredCapabilities.includes(capabilityId),
+    candidate.requiredCapabilities.every(
+      (capabilityId) =>
+        origin.requiredCapabilities.includes(capabilityId) ||
+        (envelopeGrantsWrite && writeGrant!.capabilityIds.includes(capabilityId)),
     )
   );
 }

@@ -60,6 +60,13 @@ import { scoreSourceCandidate } from "../orchestrator/sourceCandidateLedger";
 import { normalizePublicFetchUrlV1 } from "./fetchHostPolicy";
 import { requestWithRetry } from "./httpRetry";
 import {
+  decodePublicFetchText,
+  describePublicFetchFailureV1,
+  fetchPublicUrlV1,
+  headerValue,
+  looksBinaryV1,
+} from "./publicFetch";
+import {
   htmlToReadableTextV1,
   isReadableTextContentTypeV1,
 } from "./htmlReadableText";
@@ -459,8 +466,10 @@ export const webFetchTool: AgentTool = {
       } else {
         // A failing retrieval endpoint is not a failing page. Read it
         // directly before giving up on this URL and looking for another.
-        normalized = await directFetchReadableSourceV1(context, url);
-        if (!normalized) {
+        const direct = await directFetchReadableSourceV1(context, url);
+        if (!direct.ok) {
+          // Name both failures. Reporting only the endpoint's hid whether the
+          // direct read was even tried, and why it failed when it was.
           return await retrieveWebFetchSubstituteV1({
             args,
             context,
@@ -469,13 +478,14 @@ export const webFetchTool: AgentTool = {
             maxAgeMs,
             cachePolicy,
             failureCode: "source_http_error",
-            failureSummary: `web_fetch could not retrieve ${url} (${getHttpErrorMessage(response, "web_fetch")})`,
+            failureSummary: `web_fetch could not retrieve ${url} (${getHttpErrorMessage(response, "web_fetch")}; direct read failed: ${direct.reason})`,
           });
         }
+        normalized = direct.value;
       }
     } else {
-      normalized = await directFetchReadableSourceV1(context, url);
-      if (!normalized) {
+      const direct = await directFetchReadableSourceV1(context, url);
+      if (!direct.ok) {
         return await retrieveWebFetchSubstituteV1({
           args,
           context,
@@ -484,9 +494,10 @@ export const webFetchTool: AgentTool = {
           maxAgeMs,
           cachePolicy,
           failureCode: "source_http_error",
-          failureSummary: `web_fetch could not retrieve ${url} directly.`,
+          failureSummary: `web_fetch could not retrieve ${url} directly: ${direct.reason}.`,
         });
       }
+      normalized = direct.value;
     }
     const sourceUsability = evaluateSourceUsability({
       content: normalized.fullContent,
@@ -728,6 +739,13 @@ function emptySearchResult() {
 }
 
 /**
+ * Largest page body the direct read downloads. `requestUrl` buffered a whole
+ * response of any size; the source cache keeps a bounded prefix anyway, so
+ * anything past this is truncated while it streams rather than downloaded.
+ */
+const MAX_DIRECT_FETCH_BYTES_V1 = 5 * 1024 * 1024;
+
+/**
  * Identify the client honestly when reading a page directly. Several of the
  * scholarly APIs this project already talks to ask for exactly that, and a
  * site that wants to refuse an agent should be able to.
@@ -752,57 +770,63 @@ export interface NormalizedWebFetchV1 {
  * refused rather than stringified: a PDF belongs to `extract_document`, which
  * has a parser for it.
  *
- * One limit worth stating: Obsidian's `requestUrl` follows redirects itself
- * and does not report the final URL, so a public page redirecting to a private
- * address cannot be re-checked here. The retrieval endpoint never had that
- * exposure because the fetch happened on the provider's machine. This is the
- * same residual shape as DNS rebinding, and closing it needs a transport that
- * reports or refuses redirects.
+ * Every hop goes through `fetchPublicUrlV1`: the transport never follows a
+ * redirect itself, so a public page redirecting to a private address is
+ * refused at the redirect, and the desktop transport also refuses a name that
+ * resolves to one. The body is capped while it streams.
  *
- * Returns null when the page could not be read at all, which is the caller's
- * signal to look for a substitute source instead.
+ * A failure returns the reason rather than a bare null, because the caller's
+ * error used to name only the retrieval endpoint's failure and never said
+ * whether the direct read was tried or why it failed.
  */
 async function directFetchReadableSourceV1(
   context: ToolExecutionContext,
   url: string,
-): Promise<NormalizedWebFetchV1 | null> {
+): Promise<{ ok: true; value: NormalizedWebFetchV1 } | { ok: false; reason: string }> {
   let response;
   try {
-    response = await requestWithRetry(context.httpTransport, {
+    response = await fetchPublicUrlV1({
       url,
-      method: "GET",
+      hopTransport: context.publicFetchTransport,
+      httpTransport: context.httpTransport,
       headers: {
         Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
         "User-Agent": DIRECT_FETCH_USER_AGENT_V1,
       },
-      throw: false,
       timeoutMs: getOperationTimeoutMs(context),
       abortSignal: context.abortSignal,
+      maxBytes: MAX_DIRECT_FETCH_BYTES_V1,
     });
-  } catch {
-    return null;
+  } catch (error) {
+    return { ok: false, reason: describePublicFetchFailureV1(error) };
   }
-  if (response.status >= 400) return null;
-  if (!isReadableTextContentTypeV1(response.headers?.["content-type"] ?? response.headers?.["Content-Type"])) {
-    return null;
+  if (response.status >= 400) {
+    return { ok: false, reason: `HTTP ${response.status}` };
   }
-  const body = typeof response.text === "string" && response.text
-    ? response.text
-    : response.json !== undefined
-      ? JSON.stringify(response.json, null, 2)
-      : "";
-  if (!body.trim()) return null;
+  const contentType = headerValue(response.headers, "content-type");
+  if (!isReadableTextContentTypeV1(contentType)) {
+    return { ok: false, reason: `not a text document (${contentType})` };
+  }
+  // An unlabelled body used to be read as text whatever it was.
+  if (!contentType && looksBinaryV1(response.bytes)) {
+    return { ok: false, reason: "unlabelled binary content" };
+  }
+  const body = decodePublicFetchText(response.bytes, contentType);
+  if (!body.trim()) return { ok: false, reason: "the page was empty" };
   const readable = /<\s*(?:html|body|div|p|article|main)\b/iu.test(body)
     ? htmlToReadableTextV1(body, { baseUrl: url })
     : { title: "", text: body, links: [] as string[] };
   const fullContent = readable.text.trim();
   return {
-    title: readable.title || documentTitleFromUrlV1(url),
-    url,
-    content: truncateText(fullContent, MAX_WEB_FETCH_CHARS),
-    fullContent,
-    parserStatus: fullContent ? "parsed" : "empty",
-    links: readable.links,
+    ok: true,
+    value: {
+      title: readable.title || documentTitleFromUrlV1(url),
+      url,
+      content: truncateText(fullContent, MAX_WEB_FETCH_CHARS),
+      fullContent,
+      parserStatus: fullContent ? "parsed" : "empty",
+      links: readable.links,
+    },
   };
 }
 

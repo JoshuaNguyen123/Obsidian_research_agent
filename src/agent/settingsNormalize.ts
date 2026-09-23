@@ -114,6 +114,7 @@ export interface NormalizableAgentSettings {
   autoResumeOvernightRuns?: boolean;
   showUnfinishedRunBannerOnOpen?: boolean;
   vaultTriggersEnabled?: boolean;
+  desktopNotificationsEnabled?: boolean;
   approvalTimeoutMs?: number;
   /** Days to keep Agent Runs. 0 disables the time sweep. */
   runRetentionDays?: number;
@@ -236,6 +237,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   autoResumeOvernightRuns: false,
   showUnfinishedRunBannerOnOpen: true,
   vaultTriggersEnabled: false,
+  desktopNotificationsEnabled: true,
   approvalTimeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS,
   runRetentionDays: 30,
   runRetentionMaxRuns: 200,
@@ -384,6 +386,7 @@ export function normalizeAgentSettings(
     merged.showUnfinishedRunBannerOnOpen !== false;
   merged.autoResumeOvernightRuns = merged.autoResumeOvernightRuns === true;
   merged.vaultTriggersEnabled = merged.vaultTriggersEnabled === true;
+  merged.desktopNotificationsEnabled = merged.desktopNotificationsEnabled !== false;
   merged.approvalTimeoutMs = clampApprovalTimeoutMs(merged.approvalTimeoutMs);
   merged.modelFallbackEnabled = merged.modelFallbackEnabled === true;
   merged.runRetentionDays = coerceNonNegativeInteger(

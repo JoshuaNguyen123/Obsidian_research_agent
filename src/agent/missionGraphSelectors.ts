@@ -16,6 +16,7 @@ import { type MissionAcceptanceResult } from "./missionAcceptance";
 import { collectRequiredDependencyIds, isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority, isOptionalMissionGraphNodeId, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
 import { type MissionEvidence } from "./missionLedger";
 import { getString, isRecord } from "./recordUtils";
+import { getUrlHostname } from "./sourceSignals";
 import type { MissionEvidenceAttestationV1 } from "../AgentRunner";
 
 /**
@@ -101,11 +102,15 @@ export function toMissionEvidenceAttestation(
     ...(evidence.passageId ? [evidence.passageId] : []),
     ...(evidence.passageIds ?? []),
   ];
+  // The same hostname function the distinct-domain acceptance check counts
+  // with, so a reader of this projection cannot count domains differently.
+  const sourceDomain = evidence.url ? getUrlHostname(evidence.url) : null;
   return {
     schemaVersion: 1,
     id: evidence.id,
     kind: evidence.kind,
     ...(evidence.sourceId ? { sourceId: evidence.sourceId } : {}),
+    ...(sourceDomain ? { sourceDomain } : {}),
     passageIds: [...new Set(passageIds)],
     ...(evidence.usableSource === undefined
       ? {}

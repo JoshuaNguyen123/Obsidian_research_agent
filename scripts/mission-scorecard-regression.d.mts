@@ -36,7 +36,13 @@ export const NO_RUN_SUMMARY_SKIP_MESSAGE: string;
 export function parseMissionScorecardCliArgs(argv?: string[]): {
   requireSummary: boolean;
   baselineOnly: boolean;
+  allowSkip: boolean;
 };
+
+export function missionScorecardCliExitCode(
+  result: MissionScorecardRegressionResult,
+  options?: { allowSkip?: boolean },
+): number;
 
 export function formatMissionScorecardCliResult(
   result: MissionScorecardRegressionResult,

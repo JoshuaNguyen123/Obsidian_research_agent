@@ -30,10 +30,12 @@
  *   through `new URL()` so no spelling can be asserted that the product never
  *   receives.
  *
- * This deliberately does not defend against DNS rebinding or a public name
- * that resolves to a private address: both need resolution the plugin does not
- * perform. The guard covers the literal forms, which is what a link in a page
- * can carry.
+ * This function judges a hostname as written; it performs no resolution. Two
+ * callers carry the rest: `fetchPublicUrlV1` (publicFetch.ts) runs it on every
+ * redirect target before following it, and the desktop hop transport
+ * (nodePublicFetchTransport.ts) runs it on each address a name resolves to,
+ * inside the resolver hook the connection itself uses, which covers a public
+ * name pointing at a private address and DNS rebinding.
  */
 
 /** Suffixes that never name a public host. */

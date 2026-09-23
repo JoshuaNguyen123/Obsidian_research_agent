@@ -51,7 +51,21 @@ interface PendingApproval {
 
 export class ApprovalBroker {
   private readonly pending = new Map<string, PendingApproval>();
+  private readonly observers = new Set<(request: ApprovalRequest) => void>();
   private sequence = 0;
+
+  /**
+   * Hear about every approval request, whichever seat raised it. The runner
+   * raises approvals from several call sites, each with its own `onRequest`;
+   * a host that only needs to know a card is waiting (to tell an absent user)
+   * observes here once instead of threading a callback through all of them.
+   * Observers cannot delay, approve or deny anything, and a throwing observer
+   * is ignored.
+   */
+  observe(listener: (request: ApprovalRequest) => void): () => void {
+    this.observers.add(listener);
+    return () => this.observers.delete(listener);
+  }
 
   async request(
     request: Omit<ApprovalRequest, "id" | "expiresAtMs">,
@@ -105,6 +119,16 @@ export class ApprovalBroker {
         settleDecision("aborted");
       }
     });
+
+    if (!options.abortSignal?.aborted) {
+      for (const observer of this.observers) {
+        try {
+          observer(cloneApprovalRequest(approvalRequest));
+        } catch {
+          // An observer is a courtesy channel; it never affects the decision.
+        }
+      }
+    }
 
     if (!options.abortSignal?.aborted) {
       try {

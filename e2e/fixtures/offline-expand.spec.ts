@@ -526,6 +526,72 @@ test("OFFLINE-12 an expired approval parks the run and Continue asks again", asy
   }
 });
 
+test("OFFLINE-13 the installed direct-read transport refuses a name that resolves to loopback", async () => {
+  test.skip(process.env.E2E_PLAYWRIGHT_LANE !== "offline-expand" || process.env.E2E_OFFLINE_AI !== "1", "Requires the offline-expand lane.");
+  test.setTimeout(240_000);
+  // The unit tests prove the lookup hook with Node's own http module. What
+  // only the installed plugin can prove is that the SAME hook holds inside
+  // Obsidian's Electron renderer, through the bundle, from the tool context
+  // main.ts actually builds. "localhost" is a name, not a literal, at the hop
+  // layer, so the connection's own DNS answer (127.0.0.1) is what refuses it.
+  const backend = createOfflineAgentBackendV1();
+  const { createAgentBridgeServer } = await importNativeEsm<{
+    createAgentBridgeServer(options: { token: string; backend: typeof backend }): Server;
+  }>(pathToFileURL(path.resolve("scripts", "agent-bridge.mjs")).href);
+  const bridge = createAgentBridgeServer({ token: OFFLINE_TOKEN, backend });
+  const { createServer } = await import("node:http");
+  let loopbackHits = 0;
+  const loopback = createServer((_request, response) => {
+    loopbackHits += 1;
+    response.end("loopback service that must never be read");
+  });
+  let harness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+  try {
+    await listen(bridge, 7331);
+    await new Promise<void>((resolve) => loopback.listen(0, "127.0.0.1", resolve));
+    const port = (loopback.address() as { port: number }).port;
+    harness = await startRealAiHarness("offline-public-fetch-guard", {
+      baseUrl: OFFLINE_BASE_URL, model: "offline-scripted-v1",
+      missionTimeoutMs: 120_000, firstChunkTimeoutMs: 30_000, completionTimeoutMs: 120_000,
+    }, { modelRouterEnabled: false, semanticIndexEnabled: false });
+    const probe = await harness.page.evaluate(async (loopbackPort) => {
+      const plugin = (window as any).app.plugins.plugins["agentic-researcher"];
+      const ctx = plugin.createToolExecutionContext("public fetch guard probe");
+      const hop = ctx.publicFetchTransport;
+      if (typeof hop !== "function") return { wired: false };
+      try {
+        await hop({
+          url: `http://localhost:${loopbackPort}/`,
+          headers: {},
+          timeoutMs: 10_000,
+          maxBytes: 1_000,
+        });
+        return { wired: true, refused: false };
+      } catch (error) {
+        return {
+          wired: true,
+          refused: true,
+          code: (error as { code?: string }).code ?? null,
+          message: String((error as Error).message ?? error),
+        };
+      }
+    }, port);
+    expect(probe.wired, "main.ts must hand tools the Node hop transport").toBe(true);
+    expect(probe, JSON.stringify(probe)).toMatchObject({ refused: true, code: "resolved_private_address" });
+    expect(loopbackHits, "the loopback server must never receive the request").toBe(0);
+
+    const notificationsDefault = await harness.page.evaluate(
+      () => (window as any).app.plugins.plugins["agentic-researcher"].settings.desktopNotificationsEnabled,
+    );
+    expect(notificationsDefault, "away notifications default on in the installed plugin").toBe(true);
+  } finally {
+    try { await harness?.close(); } finally {
+      await close(bridge);
+      await close(loopback as unknown as Server);
+    }
+  }
+});
+
 for (const memoryEnabled of [false, true]) test(memoryEnabled
   ? "installed host-planned research memory obtains exact authority after cited research"
   : "OFFLINE-11 verifies a corrected citation draft before requesting more tools", async () => {

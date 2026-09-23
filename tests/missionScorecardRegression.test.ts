@@ -7,6 +7,7 @@ import {
   assertMissionScorecardRegressions,
   assertMissionScorecardSummaryFile,
   formatMissionScorecardCliResult,
+  missionScorecardCliExitCode,
   missionScorecardRecordKey,
   parseMissionScorecardCliArgs,
 } from "../scripts/mission-scorecard-regression.mjs";
@@ -529,11 +530,40 @@ test("missing run summary is a loud skip unless --require-summary is set", async
 });
 
 test("scorecard CLI treats --require-summary as a fail-closed flag", () => {
-  assert.deepEqual(parseMissionScorecardCliArgs([]), { requireSummary: false, baselineOnly: false });
+  assert.deepEqual(parseMissionScorecardCliArgs([]), {
+    requireSummary: false,
+    baselineOnly: false,
+    allowSkip: false,
+  });
   assert.deepEqual(parseMissionScorecardCliArgs(["--require-summary"]), {
     requireSummary: true,
     baselineOnly: false,
+    allowSkip: false,
   });
+});
+
+test("scorecard CLI does not exit 0 on a comparison that compared nothing", () => {
+  // "skipped: no baselined records were selected" used to share exit 0 with
+  // "passed", so every caller reading the exit code heard a pass.
+  assert.equal(missionScorecardCliExitCode({ checkedRecords: 3, skipped: false }), 0);
+  assert.equal(missionScorecardCliExitCode({ checkedRecords: 0, skipped: true }), 1);
+  assert.equal(
+    missionScorecardCliExitCode({ checkedRecords: 0, skipped: true, reason: "empty_baseline" }),
+    1,
+  );
+  assert.equal(
+    missionScorecardCliExitCode({ checkedRecords: 0, skipped: true, reason: "no_run_summary" }),
+    1,
+  );
+  assert.equal(
+    missionScorecardCliExitCode({ checkedRecords: 0, skipped: true }, { allowSkip: true }),
+    0,
+  );
+  assert.equal(
+    missionScorecardCliExitCode({ checkedRecords: 2, skipped: false, reason: "baseline_only" }),
+    0,
+  );
+  assert.equal(parseMissionScorecardCliArgs(["--allow-skip"]).allowSkip, true);
 });
 
 test("baseline-only CLI validates structure and rejects conflicting runtime flags", async () => {

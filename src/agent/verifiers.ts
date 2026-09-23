@@ -30,6 +30,7 @@ import {
   type MissionPlanTask,
 } from "./missionPlan";
 import { isOptionalMissionGraphNodeId } from "./missionGraphAuthority";
+import { buildClaimReceiptAnchorsV1 } from "./receiptBackedClaims";
 
 export type VerifierKind =
   | "proof_contract"
@@ -149,6 +150,7 @@ export function runMissionVerifiers({
       finalOutput,
       plan,
       evidence: evidenceList,
+      receipts: receiptList,
       prompt,
       researchMode,
       passages,
@@ -481,6 +483,7 @@ function verifyClaimGrounding(input: {
   finalOutput: string;
   plan?: MissionPlan | null;
   evidence: MissionEvidence[];
+  receipts: AgentRunReceipt[];
   prompt?: string;
   researchMode?: string;
   passages?: ClaimPassageRef[];
@@ -519,6 +522,7 @@ function verifyClaimGrounding(input: {
     requireQuoteSpans: input.requireQuoteSpans,
     verifyQuoteSpans: input.verifyQuoteSpans,
     forceRequire: true,
+    receiptAnchors: buildClaimReceiptAnchorsV1(input.receipts),
   });
 
   if (ledger.status === "skipped") {
