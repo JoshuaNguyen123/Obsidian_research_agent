@@ -51,9 +51,9 @@ export const DECISION_PROMOTION_MANIFEST_V1: Readonly<
   claim_support: Object.freeze({
     promoted: true,
     evaluatedAt: "2026-09-28",
-    report: "docs/eval/decisions/live-heldout-2026-09-28T19-23-56-585Z.md",
+    report: "docs/eval/decisions/live-heldout-2026-09-28T19-23-56-585Z.md; docs/eval/decisions/live-e2e-comparison-2026-09-28.md",
     reason:
-      "Passed the frozen held-out gates on typesafe/jev-1.13: 11/11 failing claims caught, 0/8 supported claims held.",
+      "Passed the frozen held-out gates on typesafe/jev-1.13 (11/11 failing claims caught, 0/8 supported claims held) and an end-to-end comparison on real missions (7/7 flags correct, no false holds, one repair fixed all four it was asked to).",
   }),
 });
 
