@@ -2042,7 +2042,7 @@ function hasBroadVaultSynthesisIntent(prompt: string): boolean {
  * citations" and "expand this page across my vault" are unaffected — only a
  * self-contained revision of the current note opts out.
  */
-function isCurrentNoteRevisionWithoutExternalResearch(prompt: string): boolean {
+export function isCurrentNoteRevisionWithoutExternalResearch(prompt: string): boolean {
   return (
     hasAuthorizedCurrentNoteReplaceIntent(prompt) &&
     !hasExplicitWebSignal(prompt) &&

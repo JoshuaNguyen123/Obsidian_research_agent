@@ -22,6 +22,8 @@ export type ModelCallPhase =
   | "streaming"
   | "retry"
   | "worker"
+  /** A bounded judgment from the decision model (never chat generation). */
+  | "decision"
   | "unknown";
 
 export type ModelClientErrorCategory =

@@ -45,6 +45,14 @@ const INTENTIONALLY_NOT_USER_FACING: ReadonlyMap<string, string> = new Map([
   ["specialistConnectionVerifiedBaseUrl", "evidence from a connection test"],
   ["specialistConnectionVerifiedMode", "evidence from a connection test"],
   ["e2eHarnessAttestationEnabled", "harness attestation, never a user choice"],
+  [
+    "decisionEndpointOverride",
+    "loopback test double for the decision model; a user control would invite pointing the credential elsewhere",
+  ],
+  [
+    "decisionE2EHarnessPromotion",
+    "harness-only promotion override, honored only with the harness attestation flag",
+  ],
   ["utilityApiKey", "schema-4 alias mirroring specialistApiKey"],
   ["researchMemoryEnabled", "derived from the memory mode dropdown"],
   ["experienceMemoryEnabled", "derived from the memory mode dropdown"],

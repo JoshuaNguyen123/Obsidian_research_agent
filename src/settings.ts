@@ -54,6 +54,11 @@ import {
 } from "./agent/missionScheduler";
 import type { ModelRouterMode } from "./agent/missionRouter";
 import { normalizeModelRouterMode } from "./agent/missionRouter";
+import {
+  DECISION_PROMOTION_MANIFEST_V1,
+  normalizeDecisionModelModeV1,
+  type DecisionModelModeV1,
+} from "./decisions/decisionSettings";
 import { runDependencyPreflight } from "./agent/dependencyPreflight";
 import type { MissionDependencyStatus } from "./agent/missionLedger";
 import {
@@ -177,6 +182,20 @@ export interface AgentSettings {
   modelRouterEnabled?: boolean;
   /** Automatic uses authority; Conservative uses off; Custom may choose any mode. */
   modelRouterMode?: ModelRouterMode;
+  /**
+   * Jev decision model (OpenRouter, pinned typesafe/jev-1.13). "off" (the
+   * default for new and existing installs) makes no requests; "shadow"
+   * records comparisons without changing routing, research plans, or
+   * writeback; "enabled" applies each component that passed its promotion
+   * gate and keeps every other component in shadow.
+   */
+  decisionModelMode?: DecisionModelModeV1;
+  /** Runtime-only; persisted through a decision-specific SecretStorage reference. */
+  decisionApiKey?: string;
+  /** Hidden: a loopback-only endpoint for local test doubles. */
+  decisionEndpointOverride?: string;
+  /** Hidden: honored only with e2eHarnessAttestationEnabled in a disposable vault. */
+  decisionE2EHarnessPromotion?: boolean;
   enableStreaming: boolean;
   requestTimeoutMs: number;
   /**
@@ -419,6 +438,8 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   specialistApiKey: "",
   modelRouterEnabled: true,
   modelRouterMode: "authority",
+  decisionModelMode: "off",
+  decisionApiKey: "",
   enableStreaming: true,
   requestTimeoutMs: DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
   safetyCeiling: "balanced",
@@ -1428,6 +1449,79 @@ export class AgentSettingTab extends PluginSettingTab {
     return details;
   }
 
+  /**
+   * The Jev decision model: one three-way setting and its own OpenRouter
+   * credential, independent of the main model's provider. Enabled acts only
+   * for components that passed their promotion gate; the description says
+   * which ones are still held in Shadow so the setting never overstates what
+   * it does.
+   */
+  private renderDecisionModelSettings(section: HTMLElement): void {
+    const held = (
+      Object.entries(DECISION_PROMOTION_MANIFEST_V1) as Array<
+        [string, { promoted: boolean }]
+      >
+    )
+      .filter(([, entry]) => !entry.promoted)
+      .map(([component]) =>
+        component === "mission_routing" ? "routing and research decisions" : "claim checks",
+      );
+    new Setting(section)
+      .setName("Jev decisions")
+      .setDesc(
+        [
+          "Bounded judgments from typesafe/jev-1.13 on OpenRouter: mission routing, evidence needs, research depth, and claim support before research writeback.",
+          "Off makes no requests. Shadow records comparisons in Run Details without changing anything.",
+          held.length > 0
+            ? `Enabled applies only components that passed their evaluation gate; ${held.join(" and ")} still run in Shadow.`
+            : "Enabled applies its judgments; uncertain or unavailable answers fall back to the existing checks.",
+        ].join(" "),
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("off", "Off")
+          .addOption("shadow", "Shadow (record only)")
+          .addOption("enabled", "Enabled")
+          .setValue(normalizeDecisionModelModeV1(this.plugin.settings.decisionModelMode))
+          .onChange(async (value) => {
+            this.plugin.settings.decisionModelMode = normalizeDecisionModelModeV1(value);
+            await this.plugin.saveSettings();
+          }),
+      );
+    const keySetting = new Setting(section)
+      .setName("OpenRouter key for Jev")
+      .setDesc(
+        "Used only for Jev decisions, never for the main model. Stored in Obsidian SecretStorage.",
+      )
+      .addText((text) => {
+        text
+          .setPlaceholder(
+            this.plugin.settings.decisionApiKey
+              ? "Saved securely; enter a replacement"
+              : "sk-or-...",
+          )
+          .setValue("")
+          .onChange(async (value) => {
+            const next = value.trim();
+            if (!next) return;
+            this.plugin.settings.decisionApiKey = next;
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.type = "password";
+        text.inputEl.addClass("agentic-settings-decision-key");
+      });
+    keySetting.addButton((button) =>
+      button
+        .setButtonText("Clear key")
+        .setDisabled(!this.plugin.settings.decisionApiKey)
+        .onClick(async () => {
+          this.plugin.settings.decisionApiKey = "";
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+    );
+  }
+
   private renderAdvancedModelRouting(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
@@ -1460,6 +1554,8 @@ export class AgentSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    this.renderDecisionModelSettings(section);
 
     new Setting(section)
       .setName("Thinking mode")

@@ -78,6 +78,29 @@ export interface ObservableModelClient {
   client: ModelClient;
   getUsage(): ModelUsageAggregateV1;
   updateBudget(budget: ModelExecutionBudgetV1): void;
+  /**
+   * Admit one provider call that does not travel through `client` — a
+   * decision-model judgment — against the same call/token/wall-clock budget.
+   * Returns null (and records `budget_exhausted` evidence) when the budget has
+   * no room; otherwise the call is counted now and settled by the ticket.
+   */
+  reserveExternalCall?(label: {
+    phase: ModelCallPhase;
+    model: string;
+    provider: ModelClientDescriptor["provider"];
+  }): ExternalModelCallTicketV1 | null;
+}
+
+export interface ExternalModelCallTicketV1 {
+  settle(outcome: {
+    success: boolean;
+    durationMs: number;
+    promptTokens: number | null;
+    completionTokens: number | null;
+    /** Serialized request+response size, used only when tokens are unreported. */
+    payloadChars: number;
+    errorCategory?: string;
+  }): void;
 }
 
 /**
@@ -472,6 +495,75 @@ export function createObservableModelClient({
     }),
     updateBudget: (next) => {
       activeBudget = normalizeBudget(next);
+    },
+    reserveExternalCall: (label) => {
+      const callStartedAt = now();
+      const callId = `model-call-${++sequence}`;
+      const externalDescriptor: ModelClientDescriptor = {
+        provider: label.provider,
+        model: label.model,
+        endpointCategory: "custom",
+        transportKind: descriptor.transportKind,
+      };
+      const elapsedBeforeCall = Math.max(0, callStartedAt - startedAt);
+      if (
+        usage.modelCallCount >= activeBudget.maxCalls ||
+        usage.reportedTokens + usage.estimatedTokens >= activeBudget.maxTokens ||
+        elapsedBeforeCall >= activeBudget.maxWallClockMs
+      ) {
+        onEvidence?.(
+          buildEvidence({
+            callId,
+            phase: label.phase,
+            descriptor: externalDescriptor,
+            model: label.model,
+            durationMs: 0,
+            clientInvoked: false,
+            outcome: "budget_exhausted",
+            errorCategory: "provider_budget_exhausted",
+          }),
+        );
+        return null;
+      }
+      usage.modelCallCount += 1;
+      let settled = false;
+      return {
+        settle: (outcome) => {
+          if (settled) return;
+          settled = true;
+          const reported =
+            outcome.promptTokens !== null && outcome.completionTokens !== null;
+          const promptTokens = outcome.promptTokens ?? 0;
+          const completionTokens = outcome.completionTokens ?? 0;
+          if (outcome.success) {
+            usage.successfulCallCount += 1;
+          } else {
+            usage.failedCallCount += 1;
+          }
+          if (reported) {
+            usage.reportedTokens += promptTokens + completionTokens;
+          } else {
+            usage.estimatedTokens += Math.max(1, Math.ceil(outcome.payloadChars / 4));
+          }
+          usage.wallClockMs = Math.max(usage.wallClockMs, now() - startedAt);
+          onEvidence?.(
+            buildEvidence({
+              callId,
+              phase: label.phase,
+              descriptor: externalDescriptor,
+              model: label.model,
+              durationMs: Math.max(0, outcome.durationMs),
+              clientInvoked: true,
+              outcome: outcome.success ? "success" : "error",
+              promptTokens,
+              completionTokens,
+              totalTokens: promptTokens + completionTokens,
+              reported,
+              ...(outcome.errorCategory ? { errorCategory: outcome.errorCategory } : {}),
+            }),
+          );
+        },
+      };
     },
   };
 }

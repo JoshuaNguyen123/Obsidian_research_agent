@@ -127,6 +127,8 @@ import {
   parseSupportedSettingsSchemaVersion,
 } from "./src/agent/settingsNormalize";
 import { normalizeModelRouterMode } from "./src/agent/missionRouter";
+import { normalizeDecisionModelModeV1 } from "./src/decisions/decisionSettings";
+import { DecisionCredentialStoreV1 } from "./src/decisions/decisionCredentialStore";
 import { createCarriedRuntimeCacheV1 } from "./src/agent/runtimeCacheCarry";
 import {
   buildProjectMemorySignatureV1,
@@ -936,6 +938,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     null;
   /** Model keys live only in memory; plugin data contains opaque SecretStorage references. */
   private modelCredentialStore: ModelCredentialStoreV1 | null = null;
+  /** The Jev decision credential: its own SecretStorage reference, never a model key. */
+  private decisionCredentialStore: DecisionCredentialStoreV1 | null = null;
   /** Session-only fallback; plaintext is never written to data.json or tool settings. */
   private linearApiKey = "";
   private linearCredentialReference: SecretDescriptionV1 | null = null;
@@ -2514,6 +2518,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       specialistApiKey: rawSpecialistApiKey,
       utilityApiKey: rawUtilityApiKey,
       modelCredentialReferences: rawModelCredentialReferences,
+      decisionApiKey: rawDecisionApiKey,
+      decisionCredentialReference: rawDecisionCredentialReference,
       linearApiKey: rawLinearApiKey,
       linearCredentialReference: rawLinearCredentialReference,
       linearOAuthRuntimeState: rawLinearOAuthRuntimeState,
@@ -2899,6 +2905,19 @@ export default class AgenticResearcherPlugin extends Plugin {
     settings.openAiCompatibleApiKey =
       loadedModelCredentials.values.openAiCompatible;
     settings.specialistApiKey = loadedModelCredentials.values.specialist;
+    // The decision model's credential has its own SecretStorage entry and is
+    // never borrowed from, or lent to, the main model's provider.
+    this.decisionCredentialStore = new DecisionCredentialStoreV1(
+      this.createObsidianSecretStore(),
+    );
+    const loadedDecisionCredential = await this.decisionCredentialStore.load(
+      rawDecisionCredentialReference,
+      rawDecisionApiKey,
+    );
+    settings.decisionApiKey = loadedDecisionCredential.value;
+    settings.decisionModelMode = normalizeDecisionModelModeV1(
+      settings.decisionModelMode,
+    );
 
     const normalizedProfiles = normalizeAgentSettings(
       persistedSettingsData,
@@ -3245,9 +3264,20 @@ export default class AgenticResearcherPlugin extends Plugin {
             })
           : null)
       : [];
+    this.settings.decisionModelMode = normalizeDecisionModelModeV1(
+      this.settings.decisionModelMode,
+    );
+    const retiredDecisionCredentialReferences = this.decisionCredentialStore
+      ? await this.decisionCredentialStore.synchronize(
+          this.settings.decisionApiKey ?? "",
+        )
+      : [];
     await this.savePluginData();
     await this.modelCredentialStore?.removeRetired(
       retiredModelCredentialReferences,
+    );
+    await this.decisionCredentialStore?.removeRetired(
+      retiredDecisionCredentialReferences,
     );
     void this.restartLinearQueueRuntime(false).catch((error) =>
       console.warn("Unable to refresh the Linear queue runtime.", error),
@@ -8576,6 +8606,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           utilityModel: _utilityModel,
           utilityModelProvider: _utilityModelProvider,
           utilityBaseUrl: _utilityBaseUrl,
+          decisionApiKey: _decisionApiKey,
           ...persistableSettings
         } = this.settings;
         void _ollamaApiKey;
@@ -8585,6 +8616,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         void _utilityModel;
         void _utilityModelProvider;
         void _utilityBaseUrl;
+        void _decisionApiKey;
         await withPluginDataLock(this, async () => {
           const persistedBefore = await this.loadData();
           const extensionOwnedData =
@@ -8597,6 +8629,8 @@ export default class AgenticResearcherPlugin extends Plugin {
               modelCredentialReferences:
                 this.modelCredentialStore?.snapshot() ??
                 emptyModelCredentialReferencesV1(),
+              decisionCredentialReference:
+                this.decisionCredentialStore?.snapshot() ?? null,
               linearCredentialReference: this.linearCredentialReference,
               linearOAuthRuntimeState: this.linearOAuthRuntimeState,
               githubCredential: this.githubCredential,

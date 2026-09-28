@@ -4,6 +4,7 @@
  */
 
 import { normalizeModelRouterMode } from "./missionRouter";
+import { normalizeDecisionModelModeV1 } from "../decisions/decisionSettings";
 import { normalizeScheduledMissions } from "./missionScheduler";
 import type { AutonomyProfile, OutputProfile } from "./noteOutputPolicy";
 import { deriveOutputProfileFromLegacy } from "./noteOutputPolicy";
@@ -100,6 +101,7 @@ export interface NormalizableAgentSettings {
   utilityApiKey?: string;
   modelRouterEnabled?: boolean;
   modelRouterMode?: "off" | "shadow" | "authority";
+  decisionModelMode?: "off" | "shadow" | "enabled";
   enableStreaming: boolean;
   requestTimeoutMs: number;
   maxAgentSteps: number;
@@ -220,6 +222,9 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   specialistBaseUrl: "",
   modelRouterEnabled: true,
   modelRouterMode: "authority",
+  // Off for new and existing installs alike: a vault that never chose the
+  // decision model never sends it anything.
+  decisionModelMode: "off",
   enableStreaming: true,
   requestTimeoutMs: DEFAULT_STREAM_REQUEST_TIMEOUT_MS,
   maxAgentSteps: MAX_AGENT_STEPS,
@@ -363,6 +368,7 @@ export function normalizeAgentSettings(
       (merged.modelRouterEnabled === true ? "shadow" : "off"),
   );
   merged.modelRouterEnabled = merged.modelRouterMode !== "off";
+  merged.decisionModelMode = normalizeDecisionModelModeV1(merged.decisionModelMode);
   merged.speechActSemanticRescueMode =
     merged.speechActSemanticRescueMode === "shadow" ||
     merged.speechActSemanticRescueMode === "authority"
@@ -792,6 +798,9 @@ export const CONNECTION_SETTING_KEYS_V1 = [
   "utilityModelProvider",
   "utilityBaseUrl",
   "utilityApiKey",
+  // The decision model's own credential is a connection; its mode is a
+  // preference and returns to Off with the rest.
+  "decisionApiKey",
   "companionBaseUrl",
   "linearOAuthClientId",
   "githubOAuthClientId",

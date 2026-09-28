@@ -41422,6 +41422,25 @@ function measureSerializedChars(value: unknown): number {
 }
 
 /**
+ * The utility-model research assists exactly as the runner builds them, for
+ * the decision evaluation's baseline (scripts/decision-eval.ts). Not used by
+ * the runner itself.
+ */
+export function buildResearchModeAssistForEval(
+  modelClient: ModelClient,
+  utilityModel: string | undefined,
+): ResearchModeAssist | undefined {
+  return buildResearchModeAssist(modelClient, utilityModel);
+}
+
+export function buildResearchEffortAssistForEval(
+  modelClient: ModelClient,
+  utilityModel: string | undefined,
+): ResearchEffortAssist | undefined {
+  return buildResearchEffortAssist(modelClient, utilityModel);
+}
+
+/**
  * Dedicated utility-model assist for research subquestions. Returns null when
  * no utility model is configured so createResearchPlanWithAssist stays deterministic.
  */
