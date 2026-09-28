@@ -66,6 +66,25 @@ test("legacy plaintext is migrated into SecretStorage", async () => {
   assert.match(credential.snapshot()?.referenceId ?? "", /^secret-obsidian-/u);
 });
 
+test("legacy plaintext SecretStorage refuses is usable but not reported as migrated", async () => {
+  const credential = new DecisionCredentialStoreV1(
+    new ObsidianSecretStoreV1(
+      {
+        getSecret: () => null,
+        setSecret: () => {
+          throw new Error("SecretStorage unavailable");
+        },
+      },
+      { now: () => new Date("2026-09-28T12:00:00.000Z"), randomId: () => "decision-credential-01" },
+    ),
+  );
+  assert.deepEqual(await credential.load(undefined, "sk-or-legacy"), {
+    value: "sk-or-legacy",
+    migrated: false,
+  });
+  assert.equal(credential.snapshot(), null);
+});
+
 test("a reference that cannot be leased reads as no credential and is never overwritten by an empty save", async () => {
   const { store, storage } = secureStore();
   const first = new DecisionCredentialStoreV1(store);

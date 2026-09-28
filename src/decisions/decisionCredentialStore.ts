@@ -57,8 +57,10 @@ export class DecisionCredentialStoreV1 {
       this.knownDigest = await digest(legacy);
       return { value: legacy, migrated: true };
     } catch {
-      this.knownDigest = await digest(legacy);
-      return { value: legacy, migrated: true };
+      // SecretStorage refused it: usable for this session, but not migrated,
+      // so the load must not rewrite data.json as if it had been.
+      this.knownDigest = null;
+      return { value: legacy, migrated: false };
     }
   }
 

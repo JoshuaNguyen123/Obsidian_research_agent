@@ -3202,7 +3202,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       bundledImport.imported.length > 0 ||
       hadLegacyLinearPlaintext ||
       hadLegacyModelPlaintext ||
-      loadedModelCredentials.migrated
+      loadedModelCredentials.migrated ||
+      loadedDecisionCredential.migrated
     ) {
       await this.savePluginData();
     }

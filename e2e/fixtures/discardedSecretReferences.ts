@@ -45,6 +45,10 @@ export function discardedSecretReferencesV1(
       if (isRecord(reference)) candidates.push(reference.referenceId);
     }
   }
+  // The decision model's own credential (src/decisions/decisionCredentialStore.ts).
+  if (isRecord(current.decisionCredentialReference)) {
+    candidates.push(current.decisionCredentialReference.referenceId);
+  }
   if (!options.preserveGitHub && isRecord(current.githubCredential)) {
     candidates.push(current.githubCredential.tokenReferenceId);
   }

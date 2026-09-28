@@ -66,6 +66,27 @@ test("secrets a lane created and the restore forgets are discarded; the baseline
   assert.ok(!discarded.includes(ID_BASELINE_OLLAMA));
 });
 
+test("a decision credential a lane created is discarded; the baseline's own is kept", () => {
+  const ID_LANE_DECISION = "secret-obsidian-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  const ID_BASELINE_DECISION = "secret-obsidian-ffffffffffffffffffffffffffffffffffff";
+  const withDecision = (id: string | null) =>
+    JSON.stringify({ ...JSON.parse(baseline), decisionCredentialReference: id ? reference(id) : null });
+  assert.deepEqual(
+    discardedSecretReferencesV1(baseline, withDecision(ID_LANE_DECISION), {
+      preserveLinear: true,
+      preserveGitHub: true,
+    }),
+    [ID_LANE_DECISION],
+  );
+  assert.deepEqual(
+    discardedSecretReferencesV1(withDecision(ID_BASELINE_DECISION), withDecision(ID_BASELINE_DECISION), {
+      preserveLinear: false,
+      preserveGitHub: false,
+    }),
+    [],
+  );
+});
+
 test("a preserved Linear or GitHub record keeps every secret it references", () => {
   assert.deepEqual(
     discardedSecretReferencesV1(baseline, afterLane, { preserveLinear: true, preserveGitHub: true }),
