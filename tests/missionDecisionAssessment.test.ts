@@ -16,6 +16,8 @@ import {
 import { DECISION_LIMITS_V1, checkDecisionRequestBoundsV1, type DecisionResultV1 } from "../src/decisions/decisionClient";
 import {
   applyDefaultActiveNoteWriteback,
+  decisionLexicalEvidenceNeedsV1,
+  decisionMutationFootprintV1,
   classifyMissionIntent,
   getAllowedToolNamesForTests,
 } from "../src/AgentRunner";
@@ -374,6 +376,43 @@ test("a vault clause that would turn a note-writing mission into a chat answer i
   assert.equal(decision.reason, "changed_mutation");
   assert.equal(decision.contract, null);
   assert.equal(decision.prompt, prompt);
+});
+
+test("a vault request on a read-only answer adds vault reading and changes nothing it may write", () => {
+  // The runner's own footprint (mode and speech act included). The one mode
+  // change a clause may make is chat_only -> vault_context_answer: both write
+  // nothing, and the change is the evidence request reaching tool exposure.
+  const prompt =
+    "Go through everything I wrote down last month about the garden project and turn it into a plan.";
+  assert.equal(classifyMissionIntent(prompt, { hasActiveMarkdownNote: true }).mode, "chat_only");
+  const decision = decideEvidenceContractV1({
+    prompt,
+    assessment: assessmentFor({ vault_evidence: { type: "noul", noul: 0.97 } }),
+    lexical: decisionLexicalEvidenceNeedsV1(prompt, true),
+    mutationFootprint: (candidate) => decisionMutationFootprintV1(candidate, true),
+  });
+  assert.equal(decision.reason, "applied");
+  const after = classifyMissionIntent(decision.prompt, { hasActiveMarkdownNote: true });
+  assert.equal(after.mode, "vault_context_answer");
+  assert.equal(after.allowAutonomousWrite, false);
+  assert.equal(after.noteOutput, false);
+  assert.deepEqual(
+    after.autonomyScope.write,
+    classifyMissionIntent(prompt, { hasActiveMarkdownNote: true }).autonomyScope.write,
+  );
+  assert.equal(decisionLexicalEvidenceNeedsV1(decision.prompt, true).vault, true);
+
+  // The reverse — or any change that touches a write field — stays refused.
+  const writing = "Pull together what I've already jotted down about sleep hygiene into a summary.";
+  assert.equal(
+    decideEvidenceContractV1({
+      prompt: writing,
+      assessment: assessmentFor({ vault_evidence: { type: "noul", noul: 0.97 } }),
+      lexical: decisionLexicalEvidenceNeedsV1(writing, true),
+      mutationFootprint: (candidate) => decisionMutationFootprintV1(candidate, true),
+    }).reason,
+    "changed_mutation",
+  );
 });
 
 test("explicit constraints always outrank a semantic evidence request", () => {

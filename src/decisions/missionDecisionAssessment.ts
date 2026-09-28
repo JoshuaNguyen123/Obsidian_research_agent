@@ -401,9 +401,12 @@ export function describeAssessmentV1(
 /* ------------------------------------------------------------------------ */
 
 export const DECISION_EVIDENCE_CLAUSES_V1 = Object.freeze({
-  web: "Evidence requested: research this with fetched public web sources and cite them.",
+  // Chosen by measurement over the evaluation set: each is recognized by the
+  // lexical detectors and leaves the mutation classification of every
+  // eligible case unchanged, except where a refusal below catches it.
+  web: "Evidence requested: cite fetched web sources for the claims.",
   vault: "Evidence requested: search my notes in the vault and ground the result in them.",
-  both: "Evidence requested: search my notes in the vault and research fetched public web sources, and cite them.",
+  both: "Evidence requested: search my notes in the vault and cite fetched web sources for the claims.",
 });
 
 export interface DecisionEvidenceContractV1 {
@@ -447,6 +450,10 @@ export interface MutationFootprintV1 {
   noteOutput: boolean;
   write: unknown;
   destructive: unknown;
+  /** The intent mode (note_output, chat_only, ...), when the host supplies it. */
+  mode?: unknown;
+  /** The speech act and execution tier, when the host supplies them. */
+  speech?: unknown;
 }
 
 /**
@@ -521,9 +528,37 @@ export function decideEvidenceContractV1(input: {
   };
 }
 
+/**
+ * The target-only write fast path is chosen because the lexical detectors saw
+ * no evidence request — which is exactly what they miss when the request is
+ * paraphrased. Asking on every fast-path write would slow all of them, so the
+ * decision model is asked only when the wording carries an evidence-adjacent
+ * cue. This decides whether to ASK, never what the answer is: a cue alone
+ * creates no research requirement.
+ */
+export function mayCarrySemanticEvidenceRequestV1(prompt: string): boolean {
+  return /\bback(?:ed|s|ing)?\b[\s\S]{0,40}\bup\b|\b(?:claims?|trust(?:worthy|ed)?|published|stud(?:y|ies)|trials?|evidence(?:[-\s]based)?|proof|prove|receipts?|traceable|verif(?:y|ied|iable)|accura(?:te|cy)|factual(?:ly)?|reliable|according\s+to|experts?|official|papers?|statistics?)\b|\bout\s+there\b|\bcomes?\s+from\b|\bcame\s+from\b|\blook(?:ed|ing)?\s+(?:it\s+|this\s+|that\s+)?up\b|\bcheck(?:ed|ing)?\s+(?:what|that|whether|if|it|this|the\s+facts?)\b|\bfrom\s+memory\b/iu.test(
+    prompt,
+  );
+}
+
 /** True when the prompt already carries a host evidence clause (continuations). */
 export function hasDecisionEvidenceClauseV1(prompt: string): boolean {
   return Object.values(DECISION_EVIDENCE_CLAUSES_V1).some((clause) => prompt.includes(clause));
+}
+
+/**
+ * The one mode change a clause may make: a read-only chat answer becoming a
+ * read-only answer grounded in the vault. Both write nothing (every write
+ * field is compared separately); the change is the vault evidence request
+ * itself, reaching tool exposure.
+ */
+function sameOrEvidenceOnlyMode(
+  left: MutationFootprintV1["mode"],
+  right: MutationFootprintV1["mode"],
+): boolean {
+  if ((left ?? null) === (right ?? null)) return true;
+  return left === "chat_only" && right === "vault_context_answer";
 }
 
 function sameFootprint(left: MutationFootprintV1, right: MutationFootprintV1): boolean {
@@ -534,7 +569,9 @@ function sameFootprint(left: MutationFootprintV1, right: MutationFootprintV1): b
     left.requireWriteCompletion === right.requireWriteCompletion &&
     left.noteOutput === right.noteOutput &&
     JSON.stringify(left.write) === JSON.stringify(right.write) &&
-    JSON.stringify(left.destructive) === JSON.stringify(right.destructive)
+    JSON.stringify(left.destructive) === JSON.stringify(right.destructive) &&
+    sameOrEvidenceOnlyMode(left.mode, right.mode) &&
+    JSON.stringify(left.speech ?? null) === JSON.stringify(right.speech ?? null)
   );
 }
 

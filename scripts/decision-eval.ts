@@ -21,6 +21,9 @@ import {
   buildResearchEffortAssistForEval,
   buildResearchModeAssistForEval,
   classifyMissionIntent,
+  decisionLexicalEvidenceNeedsV1,
+  decisionMutationFootprintV1,
+  isDecisionEligibleRoutingPromptV1,
 } from "../src/AgentRunner";
 import { deriveRoutedIntentFallback } from "../src/agent/policyEngine";
 import { classifyMissionWithModelDetailed } from "../src/agent/missionRouter";
@@ -97,17 +100,9 @@ interface MissionDecisionSet {
   route: string;
 }
 
+/** The exact footprint the runner compares before applying a clause. */
 function footprint(prompt: string): MutationFootprintV1 {
-  const intent = classifyMissionIntent(prompt, { hasActiveMarkdownNote: true });
-  return {
-    allowAutonomousWrite: intent.allowAutonomousWrite,
-    explicitMutation: intent.explicitMutation,
-    explicitDelete: intent.explicitDelete,
-    requireWriteCompletion: intent.requireWriteCompletion,
-    noteOutput: intent.noteOutput,
-    write: intent.autonomyScope.write,
-    destructive: intent.autonomyScope.destructive,
-  };
+  return decisionMutationFootprintV1(prompt, true);
 }
 
 /** Today's deterministic path: what the host decides with no model at all. */
@@ -133,19 +128,30 @@ function baselineDecisions(prompt: string): MissionDecisionSet {
 }
 
 /**
+ * Whether the runner would ask about this prompt at all: the same rule
+ * (`isDecisionEligibleRoutingPromptV1`) the runner applies, so direct chat and
+ * the cue-less target-only write fast path stay at zero calls here too.
+ */
+function wouldAsk(prompt: string): boolean {
+  return isDecisionEligibleRoutingPromptV1(prompt);
+}
+
+/**
  * The combined system with the decision model Enabled: decided fields act
  * (through the same evidence contract the runner applies), abstained or
- * unavailable fields keep the baseline decision.
+ * unavailable fields keep the baseline decision. A prompt the runner would
+ * not ask about keeps the baseline in full.
  */
 function combinedDecisions(
   prompt: string,
-  assessment: MissionDecisionAssessmentV1,
-): MissionDecisionSet & { contractReason: string } {
+  assessment: MissionDecisionAssessmentV1 | null,
+): MissionDecisionSet & { contractReason: string; effectivePrompt: string } {
   const base = baselineDecisions(prompt);
+  if (!assessment) return { ...base, contractReason: "not_asked", effectivePrompt: prompt };
   const contract = decideEvidenceContractV1({
     prompt,
     assessment,
-    lexical: { web: base.web, vault: base.vault },
+    lexical: decisionLexicalEvidenceNeedsV1(prompt, true),
     mutationFootprint: footprint,
   });
   const effectivePrompt = contract.prompt;
@@ -155,7 +161,44 @@ function combinedDecisions(
       ? assessment.researchMode.value!
       : after.researchMode;
   const route = assessment.route.status === "decided" ? assessment.route.value! : after.route;
-  return { ...after, researchMode, route, contractReason: contract.reason };
+  return { ...after, researchMode, route, contractReason: contract.reason, effectivePrompt };
+}
+
+/**
+ * A perfect decision model's answer for a labeled case, at confident
+ * probabilities. Used only for the offline ceiling: it measures what the
+ * host's application path (eligibility, evidence clause, constraint and
+ * mutation refusals) can deliver, never what Jev delivers.
+ */
+function oracleAssessment(item: MissionDecisionEvalCaseV1): MissionDecisionAssessmentV1 {
+  const noul = (yes: boolean) => ({ type: "noul" as const, noul: yes ? 0.99 : 0.01 });
+  const choice = (value: string) => ({
+    type: "choice" as const,
+    choice: value,
+    confidence: 0.97,
+    probabilities: { [value]: 0.97, other: 0.03 },
+  });
+  return interpretMissionDecisionV1({
+    status: "answered",
+    purpose: "mission_assessment",
+    templateVersion: MISSION_DECISION_TEMPLATE_VERSION_V1,
+    inputFingerprint: `oracle:${item.id}`,
+    requestedModel: JEV_DECISION_MODEL_V1,
+    reportedModel: JEV_DECISION_MODEL_V1,
+    responseId: null,
+    answers: {
+      route: item.labels.route ? choice(item.labels.route) : null,
+      web_evidence: noul(item.labels.webEvidence),
+      vault_evidence: noul(item.labels.vaultEvidence),
+      research_mode: choice(item.labels.researchMode),
+      effort_tier: null,
+      risk: null,
+      freshness: null,
+    },
+    invalidAnswers: [],
+    usage: null,
+    durationMs: 0,
+  } as never);
 }
 
 /**
@@ -192,6 +235,7 @@ function constraintViolations(
   item: MissionDecisionEvalCaseV1,
   decided: MissionDecisionSet,
   contractReason: string,
+  effectivePrompt: string = item.prompt,
 ): string[] {
   const violations: string[] = [];
   for (const constraint of item.constraints ?? []) {
@@ -202,11 +246,10 @@ function constraintViolations(
     if (constraint === "literary_primary_text" && hasPrimaryTextCitationIntent(item.prompt) && decided.web) violations.push("literary_primary_text");
     if (constraint === "no_new_evidence" && contractReason === "applied") violations.push("no_new_evidence");
   }
-  if (
-    item.labels.exactSourceCount !== undefined &&
-    parseExplicitResearchSourceCount(item.prompt) !== item.labels.exactSourceCount
-  ) {
-    violations.push("exact_source_count_parser");
+  // Source counts stay with the deterministic parser: whatever the decision
+  // model said, the prompt every stage reads must parse to the same count.
+  if (parseExplicitResearchSourceCount(effectivePrompt) !== parseExplicitResearchSourceCount(item.prompt)) {
+    violations.push("exact_source_count_changed");
   }
   return violations;
 }
@@ -331,7 +374,39 @@ async function main() {
   report.missionBaseline = {
     ordinary: summarize(baselineRows, "ordinary"),
     challenge: summarize(baselineRows, "challenge"),
+    // Deterministic parser misses the decision model never touches.
+    sourceCountParserMisses: MISSION_DECISION_EVAL_SET_V1.filter(
+      (item) =>
+        item.labels.exactSourceCount !== undefined &&
+        parseExplicitResearchSourceCount(item.prompt) !== item.labels.exactSourceCount,
+    ).map((item) => item.id),
     rows: baselineRows,
+  };
+  // Reach and ceiling: which cases the runner would ask about at all, and the
+  // best the application path could do with a perfect answer on each.
+  const ceilingRows = MISSION_DECISION_EVAL_SET_V1.map((item) => {
+    const asked = wouldAsk(item.prompt);
+    const combined = combinedDecisions(item.prompt, asked ? oracleAssessment(item) : null);
+    return {
+      id: item.id,
+      split: item.split,
+      family: item.family,
+      asked,
+      contractReason: combined.contractReason,
+      errors: missionErrors(item, combined),
+      violations: constraintViolations(item, combined, combined.contractReason, combined.effectivePrompt),
+    };
+  });
+  report.missionCeiling = {
+    note: "A perfect decision model on every case the runner asks about. Measures the host's application path, not Jev.",
+    asked: {
+      ordinary: ceilingRows.filter((row) => row.family === "ordinary" && row.asked).length,
+      challenge: ceilingRows.filter((row) => row.family === "challenge" && row.asked).length,
+    },
+    ordinary: summarize(ceilingRows, "ordinary"),
+    challenge: summarize(ceilingRows, "challenge"),
+    violations: ceilingRows.flatMap((row) => row.violations.map((violation) => `${row.id}:${violation}`)),
+    rows: ceilingRows,
   };
   // The deterministic verifier accepts every claim in the set: each cites a
   // real fetched passage and quotes nothing it does not contain. So its
@@ -363,19 +438,24 @@ async function main() {
     const secondary = { existing: 0, combined: 0, n: 0 };
     const existingRouterDurations: number[] = [];
     const baselineModel = args.get("baseline-model") === "true" ? createBaselineModelClient() : null;
+    let notAsked = 0;
     for (const item of missionItems) {
-      const result = await client.decide(
-        buildMissionDecisionRequestV1({ mission: item.prompt, hasActiveNote: true }),
-        { timeoutMs: DECISION_CLASSIFICATION_TIMEOUT_MS_V1 * 5 },
-      );
-      durations.push(result.durationMs);
-      if (result.status !== "answered") unavailable += 1;
-      const assessment = interpretMissionDecisionV1(result);
+      const asked = wouldAsk(item.prompt);
+      const result = asked
+        ? await client.decide(
+            buildMissionDecisionRequestV1({ mission: item.prompt, hasActiveNote: true }),
+            { timeoutMs: DECISION_CLASSIFICATION_TIMEOUT_MS_V1 * 5 },
+          )
+        : null;
+      if (!result) notAsked += 1;
+      if (result) durations.push(result.durationMs);
+      if (result && result.status !== "answered") unavailable += 1;
+      const assessment = result ? interpretMissionDecisionV1(result) : null;
       const baseline = baselineDecisions(item.prompt);
       const combined = combinedDecisions(item.prompt, assessment);
       const baseErrors = missionErrors(item, baseline);
       const combinedErrors = missionErrors(item, combined);
-      const caseViolations = constraintViolations(item, combined, combined.contractReason);
+      const caseViolations = constraintViolations(item, combined, combined.contractReason, combined.effectivePrompt);
       violations.push(...caseViolations.map((violation) => `${item.id}:${violation}`));
       const family = byFamily[item.family];
       family.n += 1;
@@ -388,11 +468,11 @@ async function main() {
         : null;
       const jevSecondary = secondaryErrors(item, {
         researchMode:
-          assessment.researchMode.status === "decided"
+          assessment?.researchMode.status === "decided"
             ? assessment.researchMode.value!
             : (existing?.researchMode ?? combined.researchMode),
         route:
-          assessment.route.status === "decided"
+          assessment?.route.status === "decided"
             ? assessment.route.value!
             : (existing?.route ?? combined.route),
       });
@@ -437,6 +517,7 @@ async function main() {
       byFamily,
       challengeReduction,
       unavailable,
+      notAsked,
       violations,
       gates: routingGates,
       rows: missionRows,
@@ -520,8 +601,32 @@ function renderMarkdown(report: Record<string, unknown>): string {
   lines.push("", "## Baseline (deterministic classifiers, no model)", "");
   lines.push(`- Ordinary missions: ${baseline.ordinary.casesWithError}/${baseline.ordinary.cases} with an evidence-decision error.`);
   lines.push(`- Challenge missions: ${baseline.challenge.casesWithError}/${baseline.challenge.cases} with an evidence-decision error.`);
+  const parserMisses = (report.missionBaseline as { sourceCountParserMisses: string[] }).sourceCountParserMisses;
+  if (parserMisses.length > 0) {
+    lines.push(`- Source-count parser misses (deterministic, untouched by the decision model): ${parserMisses.join(", ")}.`);
+  }
   const claimBaseline = report.claimBaseline as { clearFindings: number; supported: number };
   lines.push(`- Claims: the deterministic verifier accepts all ${claimBaseline.clearFindings + claimBaseline.supported}; it detects 0/${claimBaseline.clearFindings} unsupported or contradicted claims that cite a real passage.`);
+  const ceiling = report.missionCeiling as {
+    asked: { ordinary: number; challenge: number };
+    ordinary: { cases: number; casesWithError: number };
+    challenge: { cases: number; casesWithError: number };
+    violations: string[];
+    rows: Array<{ id: string; asked: boolean; contractReason: string; errors: string[] }>;
+  };
+  lines.push("", "## Ceiling (a perfect answer on every case the runner asks about)", "");
+  lines.push("Not a measurement of Jev: this is what the host's application path — eligibility, the evidence clause, and the constraint and mutation refusals — can deliver at best.", "");
+  lines.push(`- Asked about: ${ceiling.asked.ordinary}/${ceiling.ordinary.cases} ordinary, ${ceiling.asked.challenge}/${ceiling.challenge.cases} challenge.`);
+  lines.push(`- Ordinary missions: ${ceiling.ordinary.casesWithError}/${ceiling.ordinary.cases} with an evidence-decision error.`);
+  lines.push(`- Challenge missions: ${ceiling.challenge.casesWithError}/${ceiling.challenge.cases} with an evidence-decision error.`);
+  lines.push(`- Constraint violations: ${ceiling.violations.length === 0 ? "none" : ceiling.violations.join(", ")}.`);
+  const residual = ceiling.rows.filter((row) => row.errors.length > 0);
+  if (residual.length > 0) {
+    lines.push("", "| case | asked | clause | still wrong |", "| --- | --- | --- | --- |");
+    for (const row of residual) {
+      lines.push(`| ${row.id} | ${row.asked ? "yes" : "no"} | ${row.contractReason} | ${row.errors.join(", ")} |`);
+    }
+  }
   if (report.missionLive) {
     const missionLive = report.missionLive as { split: string; byFamily: Record<string, { base: number; combined: number; n: number }>; challengeReduction: number | null; violations: string[]; gates: Record<string, unknown>; unavailable: number };
     lines.push("", `## Live: missions (${missionLive.split})`, "");

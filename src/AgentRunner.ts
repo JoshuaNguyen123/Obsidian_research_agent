@@ -843,8 +843,20 @@ import {
   hasExplicitPublicWebSignal,
   hasPrimaryTextCitationIntent,
   isLiteraryPrimaryTextWriteMission,
+  requiresVaultEvidenceProof,
   requiresWebEvidenceProof,
 } from "./agent/evidenceIntent";
+import { createDecisionRuntimeV1, describeDecisionCallRecordV1 } from "./decisions/decisionRuntime";
+import { createMissionDecisionControllerV1 } from "./decisions/missionDecisionController";
+import { mergeDecisionLedgerV1 } from "./decisions/decisionLedger";
+import {
+  mayCarrySemanticEvidenceRequestV1,
+  type MutationFootprintV1,
+} from "./decisions/missionDecisionAssessment";
+import {
+  normalizeClaimSupportLedgerV1,
+  type ClaimSupportLedgerV1,
+} from "./decisions/claimSupportAssessment";
 import {
   mergeVerificationIntoAcceptance,
   runMissionVerifiers,
@@ -2395,12 +2407,112 @@ export async function runAgentMission({
     } else if (prePlanningAnchorLedger) {
       prePlanningAnchorLedger.providerUsage = providerUsage;
     }
+    syncMissionLedgerDecisions();
     return providerUsage;
+  };
+  /**
+   * The run record's decision section: call records, the mission contract a
+   * continuation reuses, shadow comparisons, and claim-support state. Absent
+   * whenever the decision model was never asked, so records stay unchanged.
+   */
+  const syncMissionLedgerDecisions = () => {
+    const decisions = mergeDecisionLedgerV1(
+      missionDecisions.ledger(),
+      claimSupportLedger,
+    );
+    if (!decisions) return;
+    if (missionLedger) {
+      missionLedger.decisions = decisions;
+    } else if (prePlanningAnchorLedger) {
+      prePlanningAnchorLedger.decisions = decisions;
+    }
   };
   const updateModelExecutionBudget = (next: ModelExecutionBudgetV1) => {
     modelExecutionBudget = { ...next, schemaVersion: 1 };
     observableModel.updateBudget(modelExecutionBudget);
   };
+  // Jev decisions. Off — the default — constructs no client and sends
+  // nothing. Calls go through the host's own HTTP transport and are charged to
+  // this run's call/token/wall-clock budget; each is recorded for Run Details.
+  const decisionRuntime = createDecisionRuntimeV1({
+    settings: toolContext.settings,
+    transport: toolContext.httpTransport,
+    budget: observableModel,
+    onRecord: (record) => {
+      events.onTrace?.({
+        id: `decision-call-${record.id}`,
+        kind: "mission_intent",
+        message: describeDecisionCallRecordV1(record),
+        outputPreview: record,
+      });
+      syncMissionLedgerDecisions();
+    },
+  });
+  const missionDecisions = createMissionDecisionControllerV1({
+    runtime: decisionRuntime,
+    getAbortSignal: () => abortSignal,
+    onTrace: (event) => events.onTrace?.(event),
+    onLedgerChange: () => syncMissionLedgerDecisions(),
+  });
+  /** Claim-support state for staged research drafts; survives Continue. */
+  let claimSupportLedger: ClaimSupportLedgerV1 | null = null;
+  /**
+   * Ask (or, in Shadow, start asking) about one routing prompt and apply the
+   * evidence contract when Enabled finds one. Returns the routing prompt every
+   * later stage reads: the same prompt, or the prompt plus one fixed host
+   * sentence naming the evidence the user asked for in other words.
+   */
+  const assessMissionForDecisionsV1 = async (
+    routingPrompt: string,
+    context: { hasActiveNote: boolean; recentAssistant?: string | null },
+  ): Promise<string> => {
+    await missionDecisions.assessForRouting({
+      prompt: routingPrompt,
+      hasActiveNote: context.hasActiveNote,
+      recentAssistant: context.recentAssistant ?? null,
+    });
+    const evidence = missionDecisions.applyEvidenceContract({
+      prompt: routingPrompt,
+      lexical: decisionLexicalEvidenceNeedsV1(routingPrompt, context.hasActiveNote),
+      mutationFootprint: (candidate) =>
+        decisionMutationFootprintV1(candidate, context.hasActiveNote),
+    });
+    return evidence.contract ? evidence.prompt : routingPrompt;
+  };
+  /**
+   * The research planner's assists. The utility model still plans generative
+   * subquestions; the research-mode and effort judgments go through the Jev
+   * assessment when it is Enabled and clear, and fall back to the utility
+   * model, then the deterministic heuristics, field by field. Off and Shadow
+   * return exactly the utility-model assists the planner always had.
+   */
+  const researchPlanAssists = (settings: AgentSettings | undefined) => {
+    const utilityModel = settings?.utilityModel?.trim() || undefined;
+    const assists = missionDecisions.researchAssists(
+      {
+        modeAssist: buildResearchModeAssist(modelClient, utilityModel),
+        effortAssist: buildResearchEffortAssist(modelClient, utilityModel),
+      },
+      // A Lead consuming a Specialist handoff already holds provider-observed
+      // research; the semantic assist must not manufacture new research debt
+      // that the delegated retrieval can never satisfy. Deterministic
+      // research intent still plans.
+      { allowModeAssist: !orchestratorContext?.trim() },
+    );
+    return {
+      utilityModelConfigured: Boolean(utilityModel) || assists.answersWithoutUtilityModel,
+      assist: buildResearchSubquestionAssist(modelClient, utilityModel),
+      effortAssist: assists.effortAssist,
+      ...(assists.modeAssist ? { modeAssist: assists.modeAssist } : {}),
+    };
+  };
+  if (missionDecisions.heldInShadowBecause) {
+    events.onTrace?.({
+      id: "decision-mode-held-in-shadow",
+      kind: "config",
+      message: `Jev decisions are set to Enabled; routing and research decisions run in Shadow: ${missionDecisions.heldInShadowBecause}`,
+    });
+  }
   modelClient = observableModel.client;
   // Built once and kept for the whole run: recovery uses the same one Adaptive
   // Specialist identity as research/planning/code stages, never a third agent.
@@ -2561,6 +2673,27 @@ export async function runAgentMission({
   const shouldForceCurrentPromptChatOnly = () =>
     forceChatOnly ||
     speechActClassification.executionTier === "direct_chat";
+  // Jev mission assessment: one bounded question per routing prompt, asked
+  // before the deterministic intent is classified, so an evidence contract it
+  // finds reaches tool exposure, the research plan, graph prerequisites, and
+  // acceptance through the one routing prompt they all read. Direct chat,
+  // the target-only write and prompt-on-page fast paths, continuations
+  // (which reuse the persisted contract), and orchestrator handoffs never ask.
+  if (
+    missionDecisions.mode !== "off" &&
+    !shouldForceCurrentPromptChatOnly() &&
+    !orchestratorContext?.trim() &&
+    !hasCheckpointResumeIntent(prompt) &&
+    !hasCheckpointResumeIntent(activeIntentPrompt) &&
+    isDecisionEligibleRoutingPromptV1(activeIntentPrompt)
+  ) {
+    activeIntentPrompt = await assessMissionForDecisionsV1(activeIntentPrompt, {
+      hasActiveNote: hasActiveCurrentMarkdownFile(toolContext),
+      recentAssistant: conversationHistory
+        .filter((message) => message.role === "assistant")
+        .slice(-1)[0]?.content,
+    });
+  }
   let missionIntent = classifyMissionIntent(activeIntentPrompt, {
     hasActiveMarkdownNote: hasActiveCurrentMarkdownFile(toolContext),
   });
@@ -2763,34 +2896,56 @@ export async function runAgentMission({
       // one-call direct-chat path even when the ordinary router is authoritative.
       toolContext.settings?.speechActSemanticRescueMode === "authority")
   ) {
-    events.onStatus?.("Classifying mission with structured router...");
     let routedClassification;
-    try {
-      routedClassification = await classifyMissionWithModelDetailed({
-        client: modelClient,
+    // A clear Jev route replaces the structured router's model call; the
+    // router's own Off/Shadow/Authority handling below is unchanged, and the
+    // routed intent carries the deterministic write scope and execution.
+    const decisionRoutedIntent = missionDecisions.routedIntent({
+      prompt: activeIntentPrompt,
+      regexIntent: deriveRoutedIntentFallback({
+        missionIntent,
+        writeAutonomy: missionIntent.allowAutonomousWrite,
+        writeToolExposed: false,
         prompt: activeIntentPrompt,
-        timeoutMs: structuredPlanningTimeoutMs,
-        abortSignal,
-        recentAssistant: conversationHistory
-          .filter((message) => message.role === "assistant")
-          .slice(-1)[0]?.content,
-      });
-    } catch (error) {
-      if (abortSignal?.aborted) {
-        // The router is intentionally ahead of the full ledger. Preserve the
-        // already-invoked call count in the durable anchor before propagating
-        // the coordinator cancellation to the host.
-        await persistPrePlanningAnchorUsageAfterAbort();
-        // Preserve the established graceful-stop path: downstream setup is
-        // deterministic and the first stop boundary emits user_stopped only
-        // after every terminal callback dependency has been initialized.
-        routedClassification = {
-          intent: null,
-          failureReason: null,
-          attempts: 1,
-        };
-      } else {
-        throw error;
+      }),
+      wordTarget: analyzeGeneratedOutputPrompt(activeIntentPrompt).wordTarget?.target ?? null,
+    });
+    if (decisionRoutedIntent) {
+      events.onStatus?.("Classified mission with Jev decisions.");
+      routedClassification = {
+        intent: decisionRoutedIntent,
+        failureReason: null,
+        attempts: 0,
+      };
+    } else {
+      events.onStatus?.("Classifying mission with structured router...");
+      try {
+        routedClassification = await classifyMissionWithModelDetailed({
+          client: modelClient,
+          prompt: activeIntentPrompt,
+          timeoutMs: structuredPlanningTimeoutMs,
+          abortSignal,
+          recentAssistant: conversationHistory
+            .filter((message) => message.role === "assistant")
+            .slice(-1)[0]?.content,
+        });
+      } catch (error) {
+        if (abortSignal?.aborted) {
+          // The router is intentionally ahead of the full ledger. Preserve the
+          // already-invoked call count in the durable anchor before propagating
+          // the coordinator cancellation to the host.
+          await persistPrePlanningAnchorUsageAfterAbort();
+          // Preserve the established graceful-stop path: downstream setup is
+          // deterministic and the first stop boundary emits user_stopped only
+          // after every terminal callback dependency has been initialized.
+          routedClassification = {
+            intent: null,
+            failureReason: null,
+            attempts: 1,
+          };
+        } else {
+          throw error;
+        }
       }
     }
     routedModelIntent = routedClassification.intent;
@@ -2830,6 +2985,7 @@ export async function runAgentMission({
         outputPreview: {
           mode: modelRouterMode,
           source: earlyResolved.source,
+          classifier: decisionRoutedIntent ? "jev_decisions" : "structured_router",
           fallbackReason: earlyResolved.fallbackReason,
           modelFailureReason: routedModelFailureReason,
           modelIntent: routedModelIntent,
@@ -3194,6 +3350,10 @@ export async function runAgentMission({
       // client invocation starts it belongs to this run's accounting scope.
       await pending;
     }
+    // Jev shadow work (at most one bounded question, aborted with the run)
+    // lands in the record before it closes; it never extends a run past the
+    // classification timeout.
+    await missionDecisions.settle();
     syncMissionLedgerProviderUsage();
   };
   const completeRunAfterShadow = async (
@@ -4152,6 +4312,16 @@ export async function runAgentMission({
   }
   const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
   const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
+  if (resumeLedger) {
+    // A continuation reuses the persisted decision contract instead of
+    // asking again, and inherits claim-support findings and the spent repair
+    // allowance, so Continue can never silently reset either.
+    missionDecisions.restore(resumeLedger.decisions, resumeLedger.mission ?? null);
+    const restoredClaimSupport = normalizeClaimSupportLedgerV1(
+      resumeLedger.decisions?.claimSupport,
+    );
+    if (restoredClaimSupport) claimSupportLedger = restoredClaimSupport;
+  }
   inheritedProviderUsage = resumeLedger?.providerUsage
     ? { ...resumeLedger.providerUsage }
     : null;
@@ -5060,29 +5230,7 @@ export async function runAgentMission({
               prompt: activeIntentPrompt,
               missionIntent,
               runPlan,
-              utilityModelConfigured: Boolean(
-                runToolContext.settings?.utilityModel?.trim(),
-              ),
-              assist: buildResearchSubquestionAssist(
-                modelClient,
-                runToolContext.settings?.utilityModel?.trim() || undefined,
-              ),
-              effortAssist: buildResearchEffortAssist(
-                modelClient,
-                runToolContext.settings?.utilityModel?.trim() || undefined,
-              ),
-              // A Lead consuming a Specialist handoff already holds
-              // provider-observed research; the semantic assist must not
-              // manufacture new research debt that the delegated retrieval
-              // can never satisfy. Deterministic research intent still plans.
-              ...(orchestratorContext?.trim()
-                ? {}
-                : {
-                    modeAssist: buildResearchModeAssist(
-                      modelClient,
-                      runToolContext.settings?.utilityModel?.trim() || undefined,
-                    ),
-                  }),
+              ...researchPlanAssists(runToolContext.settings),
               ...researchPlanSettingOverrides(runToolContext.settings),
             });
         bootstrapResearchPlanCache = bootstrapResearchPlan;
@@ -6335,6 +6483,18 @@ export async function runAgentMission({
   );
   if (promptOnPageRoutingPrompt !== null) {
     activeIntentPrompt = promptOnPageRoutingPrompt;
+    // Prompt-on-page: the extracted instruction is the mission, so it is the
+    // one routing prompt the decision model is asked about — once.
+    if (
+      missionDecisions.mode !== "off" &&
+      !forceChatOnly &&
+      !orchestratorContext?.trim() &&
+      !checkpointContinuationRequested
+    ) {
+      activeIntentPrompt = await assessMissionForDecisionsV1(activeIntentPrompt, {
+        hasActiveNote: hasActiveCurrentMarkdownFile(runToolContext),
+      });
+    }
     runToolContext.retrievalCacheDefaults = retrievalCacheDefaultsForMission(promptOnPageRoutingPrompt);
     // The structured router classified the outer "prompt on page" request, not
     // the newly extracted note prompt. Do not carry that proposal across the
@@ -6763,29 +6923,7 @@ export async function runAgentMission({
         prompt: activeIntentPrompt,
         missionIntent,
         runPlan,
-        utilityModelConfigured: Boolean(
-          runToolContext.settings?.utilityModel?.trim(),
-        ),
-        assist: buildResearchSubquestionAssist(
-          modelClient,
-          runToolContext.settings?.utilityModel?.trim() || undefined,
-        ),
-        effortAssist: buildResearchEffortAssist(
-          modelClient,
-          runToolContext.settings?.utilityModel?.trim() || undefined,
-        ),
-        // A Lead consuming a Specialist handoff already holds
-        // provider-observed research; the semantic assist must not
-        // manufacture new research debt that the delegated retrieval
-        // can never satisfy. Deterministic research intent still plans.
-        ...(orchestratorContext?.trim()
-          ? {}
-          : {
-              modeAssist: buildResearchModeAssist(
-                modelClient,
-                runToolContext.settings?.utilityModel?.trim() || undefined,
-              ),
-            }),
+        ...researchPlanAssists(runToolContext.settings),
         ...researchPlanSettingOverrides(runToolContext.settings),
       }));
   const restoredResearchPlan =
@@ -6796,6 +6934,25 @@ export async function runAgentMission({
   ) {
     researchPlan = JSON.parse(JSON.stringify(restoredResearchPlan)) as ResearchPlan;
   }
+  // Shadow: compare the Jev assessment with what the existing path decided,
+  // once both are known. Enabled and Off record nothing here.
+  missionDecisions.recordBaseline(activeIntentPrompt, {
+    routerMode: modelRouterMode,
+    route:
+      (routedMissionIntent ?? routedModelIntent)?.mode ??
+      deriveRoutedIntentFallback({
+        missionIntent,
+        writeAutonomy: missionIntent.allowAutonomousWrite,
+        writeToolExposed: false,
+        prompt: activeIntentPrompt,
+      }).mode,
+    lexicalWeb: requiresWebEvidenceProof(activeIntentPrompt, missionIntent),
+    lexicalVault: requiresVaultEvidenceProof(activeIntentPrompt, missionIntent),
+    researchMode: researchPlan?.mode ?? "none",
+    effortTier: researchPlan?.effort?.tier ?? null,
+    risk: null,
+    freshness: null,
+  });
   if (researchPlan) {
     // The effort profile was chosen from prompt regexes before planning ran.
     // If planning (including its model-based assists) attached a research
@@ -41419,6 +41576,64 @@ function measureSerializedChars(value: unknown): number {
   } catch {
     return 0;
   }
+}
+
+/**
+ * Whether a routing prompt gets a Jev assessment at all. Direct chat and
+ * prompt-on-page outer requests never do (prompt-on-page asks about the
+ * extracted instruction instead). The target-only write fast path keeps its
+ * zero-call shape unless the wording carries an evidence-adjacent cue — the
+ * one case where the fast path may exist only because a paraphrased evidence
+ * request went unrecognized.
+ */
+export function isDecisionEligibleRoutingPromptV1(prompt: string): boolean {
+  const preloop = resolveStructuredPreloopDecision({ prompt });
+  if (!preloop.skipClassifyAndPlan) return true;
+  return (
+    preloop.reason === "target_only_write" && mayCarrySemanticEvidenceRequestV1(prompt)
+  );
+}
+
+/** What the lexical evidence detectors already require for a routing prompt. */
+export function decisionLexicalEvidenceNeedsV1(
+  prompt: string,
+  hasActiveMarkdownNote: boolean,
+): { web: boolean; vault: boolean } {
+  const intent = classifyMissionIntent(prompt, { hasActiveMarkdownNote });
+  return {
+    web: requiresWebEvidenceProof(prompt, intent),
+    vault: requiresVaultEvidenceProof(prompt, intent),
+  };
+}
+
+/**
+ * Everything about a routing prompt's classification that bears on what the
+ * run may change: the intent's write and destructive scope, its mode, and the
+ * speech act and tier. A Jev evidence clause is applied only when this is
+ * identical with and without it, so the clause can add research debt but can
+ * never widen — or narrow — what the mission may mutate.
+ */
+export function decisionMutationFootprintV1(
+  prompt: string,
+  hasActiveMarkdownNote: boolean,
+): MutationFootprintV1 {
+  const intent = classifyMissionIntent(prompt, { hasActiveMarkdownNote });
+  const speech = classifyMissionSpeechAct(prompt);
+  return {
+    allowAutonomousWrite: intent.allowAutonomousWrite,
+    explicitMutation: intent.explicitMutation,
+    explicitDelete: intent.explicitDelete,
+    requireWriteCompletion: intent.requireWriteCompletion,
+    noteOutput: intent.noteOutput,
+    write: intent.autonomyScope.write,
+    destructive: intent.autonomyScope.destructive,
+    mode: intent.mode,
+    speech: {
+      speechAct: speech.speechAct,
+      executionTier: speech.executionTier,
+      explicitChatOnly: speech.explicitChatOnly,
+    },
+  };
 }
 
 /**

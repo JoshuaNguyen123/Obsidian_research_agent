@@ -79,6 +79,18 @@ function normalizeContract(value: unknown): PersistedMissionDecisionContractV1 |
   };
 }
 
+/** Combine the mission part and the claim-support part; null when both are empty. */
+export function mergeDecisionLedgerV1(
+  mission: DecisionLedgerV1 | null,
+  claimSupport: unknown | null,
+): DecisionLedgerV1 | null {
+  if (!mission && !claimSupport) return null;
+  return {
+    ...(mission ?? { version: 1 as const, records: [] }),
+    ...(claimSupport ? { claimSupport } : {}),
+  };
+}
+
 export function appendShadowComparisonV1(
   ledger: DecisionLedgerV1,
   comparison: unknown,

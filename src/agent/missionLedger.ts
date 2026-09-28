@@ -11,6 +11,10 @@ import {
 import type { TFile } from "obsidian";
 import type { LoopBudgetPlan } from "./loopPlanner";
 import {
+  normalizeDecisionLedgerV1,
+  type DecisionLedgerV1,
+} from "../decisions/decisionLedger";
+import {
   normalizeClaimLedger,
   type ClaimLedger,
   type ClaimPassageRef,
@@ -229,6 +233,12 @@ export interface MissionLedger {
   claimPassages?: ClaimPassageRef[];
   /** First-class evidence conflicts (open / resolved / acknowledged_limitation). */
   evidenceConflicts?: EvidenceConflict[];
+  /**
+   * Jev decision metadata: call records, the mission contract a continuation
+   * reuses, shadow comparisons, and claim-support findings. Additive; absent
+   * on runs that never asked the decision model.
+   */
+  decisions?: DecisionLedgerV1;
   iterationCount: number;
   progressScore: number;
   stalledCount: number;
@@ -1633,10 +1643,12 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
       const claimLedger = normalizeClaimLedger(value.claimLedger);
       const claimPassages = normalizeClaimPassages(value.claimPassages);
       const evidenceConflicts = normalizeEvidenceConflicts(value.evidenceConflicts);
+      const decisions = normalizeDecisionLedgerV1(value.decisions);
       return {
         ...(claimLedger ? { claimLedger } : {}),
         ...(claimPassages ? { claimPassages } : {}),
         ...(evidenceConflicts.length > 0 ? { evidenceConflicts } : {}),
+        ...(decisions ? { decisions } : {}),
       };
     })(),
     iterationCount: getNumber(value.iterationCount) ?? getNumber(value.lastSafeStep) ?? 0,

@@ -118,6 +118,9 @@ export function createDecisionRuntimeV1(input: {
   const cache = new Map<string, Promise<DecisionResultV1>>();
   const records: DecisionCallRecordV1[] = [];
   let sequence = 0;
+  // Ids stay unique across the segments of one continued mission, whose
+  // records share a run record.
+  const segmentTag = now().getTime().toString(36);
   let consecutiveTransientFailures = 0;
   let fatalReason: DecisionUnavailableReasonV1 | null = null;
 
@@ -133,7 +136,7 @@ export function createDecisionRuntimeV1(input: {
     const paid = outcome !== "cache_hit" && result?.status === "answered" ? result : null;
     const entry: DecisionCallRecordV1 = {
       version: 1,
-      id: `decision-${++sequence}`,
+      id: `decision-${segmentTag}-${++sequence}`,
       component,
       purpose: request.purpose,
       mode,
@@ -340,6 +343,22 @@ export function normalizeDecisionCallRecordsV1(value: unknown): DecisionCallReco
     });
   }
   return out;
+}
+
+/** One Run Details line per call, from record fields only. */
+export function describeDecisionCallRecordV1(record: DecisionCallRecordV1): string {
+  const what = record.purpose === "claim_support" ? "claim check" : "mission assessment";
+  const cost = record.cost === null ? "" : `, $${record.cost.toFixed(6)}`;
+  switch (record.outcome) {
+    case "answered":
+      return `Jev ${what} answered in ${record.durationMs} ms (${record.mode}${cost}).`;
+    case "cache_hit":
+      return `Jev ${what} reused from this run (${record.mode}).`;
+    case "cancelled":
+      return `Jev ${what} cancelled with the mission.`;
+    default:
+      return `Jev ${what} unavailable: ${record.fallbackReason ?? "unknown"}; the existing checks decide (${record.mode}).`;
+  }
 }
 
 /** Totals for the one-line Run Details summary. */
