@@ -17455,8 +17455,11 @@ async function runSourcedNoteWithClaimSupport(options: {
   draftClaim: string;
   /** What the claim-scoped repair answers with, per claim id; null repeats the draft. */
   repairClaim?: string | null;
-  /** `append`: the verified final append; `streamed`: the staged streamed writeback. */
-  path?: "append" | "streamed";
+  /**
+   * `append`: the verified final append; `streamed`: the staged streamed
+   * writeback; `tool`: the model calls append_to_current_file itself.
+   */
+  path?: "append" | "streamed" | "tool";
 }) {
   const prompt = "Write a short note on The Grapes of Wrath with passage citations to its sources.";
   const vault = createRunnerVaultContext({ prompt, content: "Essay prompt" });
@@ -17549,7 +17552,15 @@ async function runSourcedNoteWithClaimSupport(options: {
       () => responseWithToolCall("web_fetch", { url: "https://example.com/grapes" }),
       ...(options.path === "streamed"
         ? [() => responseWithContent(""), () => responseWithContent("")]
-        : [respond, respond, respond, respond]),
+        : options.path === "tool"
+          ? [
+              (request: ModelChatRequest) =>
+                responseWithToolCall("append_to_current_file", { text: draftFor(request) }),
+              () => responseWithContent("Appended the sourced summary."),
+              respond,
+              respond,
+            ]
+          : [respond, respond, respond, respond]),
     ],
     streamResponders: [respond, respond, respond, respond, respond],
   });
@@ -17673,6 +17684,57 @@ test("claim support Enabled holds a draft the one repair did not fix and writes 
     (run.persistedLedger?.decisions?.records ?? []).some((record) => record.component === "claim_support"),
     "the decision calls are on the record",
   );
+});
+
+test("claim support Shadow records a model's own append and writes it unchanged", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "shadow",
+    path: "tool",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+  });
+  assert.ok(run.note.includes(CLAIM_CONTRADICTED), run.note);
+  assert.equal(run.repairInstructions.length, 0);
+  const shadow = run.claimTraces.find((event) => event.id.endsWith(":shadow"));
+  assert.ok(shadow, JSON.stringify(run.traces.map((event) => event.id)));
+  assert.equal(shadow.toolName, "append_to_current_file");
+});
+
+test("claim support Enabled checks a model's own append before it runs, and one repair fixes it", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "enabled",
+    path: "tool",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+    repairClaim: CLAIM_SUPPORTED,
+  });
+  assert.equal(run.repairInstructions.length, 1, JSON.stringify(run.claimTraces.map((event) => event.message)));
+  assert.ok(run.note.includes(CLAIM_SUPPORTED), run.note);
+  assert.ok(!run.note.includes(CLAIM_CONTRADICTED), run.note);
+  const append = run.executedCalls.find((call) => call.name === "append_to_current_file");
+  assert.ok(append, "the model's own append ran, with the repaired text");
+  assert.ok(String(append.arguments.text).includes(CLAIM_SUPPORTED));
+  const rounds = run.claimTraces.filter((event) => /:round-\d+$/u.test(event.id));
+  assert.deepEqual(
+    rounds.map((event) => (event.outputPreview as { action: string }).action),
+    ["repair", "accept"],
+  );
+});
+
+test("claim support Enabled holds a model's own append the one repair did not fix", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "enabled",
+    path: "tool",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+    repairClaim: null,
+  });
+  assert.equal(run.repairInstructions.length, 1, "exactly one Jev-triggered repair");
+  assert.equal(run.note, "Essay prompt", "the note is unchanged");
+  assert.ok(!run.executedCalls.some((call) => call.name === "append_to_current_file"));
+  assert.ok(run.claimTraces.some((event) => event.id.endsWith(":held")), JSON.stringify(run.claimTraces.map((event) => event.id)));
+  assert.ok(run.answers.join("").includes("The note is unchanged."));
+  assert.equal(run.completions.at(-1)?.stopReason, "budget");
 });
 
 test("claim support outage before any finding records a skipped check and keeps the existing verification", async () => {

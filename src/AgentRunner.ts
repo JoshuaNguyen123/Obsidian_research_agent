@@ -24652,7 +24652,7 @@ export async function runAgentMission({
         durablePreWriteProofSatisfied,
         blockingPreWriteMissing,
       });
-      const proposedWriteAcceptance =
+      let proposedWriteAcceptance =
         proofGatedCurrentNoteTool &&
         requiresVerifiedFinalOutput(
           missionPlan,
@@ -24678,7 +24678,7 @@ export async function runAgentMission({
       // valid direct append is re-evaluated against the durable, still-open
       // conflicts and is indefinitely blocked in analyze before its receipt
       // can make the acknowledgement durable.
-      const projectedDirectWriteConflicts =
+      let projectedDirectWriteConflicts =
         proofGatedCurrentNoteTool &&
         proposedWriteAcceptance?.status === "pass" &&
         proposedWriteText.trim()
@@ -24775,6 +24775,66 @@ export async function runAgentMission({
         // would keep telling the model its write tool is held after it no
         // longer is.
         lastProofGatedHoldToolName = null;
+      }
+      if (
+        proofGatedCurrentNoteTool &&
+        proposedWriteAcceptance?.status === "pass" &&
+        proposedWriteText.trim()
+      ) {
+        // The same claim check the staged writeback and the verified final
+        // append run, after the same deterministic proofs. A model's own
+        // write-tool call is the path live missions take most often; without
+        // this it reached the note unchecked (found on the first live
+        // end-to-end comparison, 2026-09-28).
+        const writeTextKey =
+          typeof toolCall.arguments.text === "string" ? "text" : "content";
+        const gated = await gateStagedClaimSupport({
+          candidate: proposedWriteText,
+          acceptance: proposedWriteAcceptance,
+          step,
+          maxSteps: stepLimit,
+          toolName: toolCall.name,
+          writer: {
+            modelClient,
+            messages,
+            events,
+            relevancePrompt: finalAnswerRelevancePrompt,
+            think: writebackThink(),
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+          },
+          reevaluate: (text) =>
+            requireAcceptedPassageCitationCoverage(
+              getProofGatedWritebackCandidateAcceptance(
+                evaluateCurrentAcceptance(text),
+                requiredWriteTools,
+              ),
+              text,
+              acceptedWritebackPassageIds,
+              researchPlan,
+              activeIntentPrompt,
+            ),
+          constrain: (text) =>
+            hasClosedPassageCitationScope(researchPlan, acceptedWritebackPassageIds)
+              ? constrainPassageCitationScope(text, acceptedWritebackPassageIds).content
+              : text,
+        });
+        if (!gated) {
+          return;
+        }
+        if (gated.candidate !== proposedWriteText) {
+          proposedWriteText = gated.candidate;
+          proposedWriteAcceptance = gated.acceptance;
+          toolCall.arguments = {
+            ...toolCall.arguments,
+            [writeTextKey]: gated.candidate,
+          };
+          projectedDirectWriteConflicts = projectEvidenceConflictAcknowledgements(
+            ignoreSoftEvidenceConflicts ? [] : lastEvidenceConflicts,
+            gated.candidate,
+          );
+        }
       }
 
       if (
