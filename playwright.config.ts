@@ -79,6 +79,7 @@ export default defineConfig({
         /offline-expand\.spec\.ts/u,
         /conversation-persistence\.spec\.ts/u,
         /vault-artifact-retention\.spec\.ts/u,
+        /offline-decisions\.spec\.ts/u,
       ],
       retries: 0,
       timeout: 900_000,

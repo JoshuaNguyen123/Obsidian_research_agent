@@ -4,6 +4,14 @@ import type {
 } from "../../scripts/agent-bridge.mjs";
 import { UNVERIFIED_CLAIM_MARKER_V1 } from "../../src/agent/degradedDelivery";
 
+/**
+ * The claim the claim-check fixture's first draft makes: nearly every word of
+ * its cited passage, so deterministic grounding accepts it, but "proprietary
+ * closed" where the passage says "standard" — what only a semantic check sees.
+ */
+export const OFFLINE_CONTRADICTED_CLAIM_V1 =
+  "MCP servers expose tools and resources through a proprietary closed protocol";
+
 export interface OfflineAgentBackendMetricsV1 {
   version: 1;
   requestCount: number;
@@ -15,6 +23,8 @@ export interface OfflineAgentBackendMetricsV1 {
   offeredToolsByRequest: string[][];
   citationRepair?: { unverifiedDrafts: number; correctedDrafts: number };
   citationCriticReviews?: number;
+  /** Jev claim-check fixture: cited drafts written, claim-scoped repairs answered. */
+  claimCheck?: { drafts: number; repairs: number };
   /** Completions refused with an injected 503 (see `injectTransientOutage`). */
   outageFailuresServed?: number;
   citationRepairRequests?: {
@@ -159,6 +169,66 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
       }
       metrics.citationRepair.correctedDrafts += 1;
       return { content: `MCP servers expose tools and resources through a standard protocol [${ids[0]}]. Clients discover the approved server capabilities [${ids[1]}]. ${UNVERIFIED_CLAIM_MARKER_V1}${reportScope}` };
+    }
+
+    // Jev claim check (e2e/fixtures/offline-decisions.spec.ts): one search,
+    // then a cited draft for the current note whose first sentence the cited
+    // passage contradicts. `_FIX` answers the claim-scoped repair with a
+    // supported sentence; `_HOLD` repeats the contradicted one.
+    const claimMarker = transcript.match(/OFFLINE_CLAIMCHECK_(FIX|HOLD|OUTAGE)_[a-f0-9]{32}/u);
+    if (claimMarker) {
+      const instructions = messages.filter(isRecord)
+        .filter((message) => message.role === "system")
+        .map((message) => typeof message.content === "string" ? message.content : "").join("\n");
+      if (instructions.includes("This request already contains explicit evidence intent.")) {
+        return { content: JSON.stringify({ mode: "deep_web", sourceFloor: 2, rationale: "The fixture explicitly requests two public sources." }) };
+      }
+      if (instructions.includes("Judge how much research effort a mission truly deserves.")) {
+        return { content: JSON.stringify({ tier: "standard", risk: "low", freshness: "none", rationale: "Two bounded source passages and a short cited note." }) };
+      }
+      if (instructions.includes("You are an independent critic reviewing a completed research mission.")) {
+        return { content: JSON.stringify({ verdict: "pass", missing: [], summary: "The fixture note matches its two source passages." }) };
+      }
+      metrics.claimCheck ??= { drafts: 0, repairs: 0 };
+      if (!toolNameObserved(messages, "web_search") && toolNames.has("web_search")) {
+        metrics.emittedToolCalls += 1;
+        return { toolCalls: [{ name: "web_search", arguments: { query: `MCP servers ${claimMarker[0]}` } }], finishReason: "tool_calls" };
+      }
+      const ids = [...new Set(transcript.match(/source:[a-z0-9]+:passage:\d+-\d+/giu) ?? [])];
+      if (ids.length < 2) throw new Error("Claim-check fixture requires both persisted source passages.");
+      const last = messages.filter(isRecord).map((message) => typeof message.content === "string" ? message.content : "").at(-1) ?? "";
+      if (/Repair ONLY the failing claim sentences/u.test(last)) {
+        metrics.claimCheck.repairs += 1;
+        const claimIds = [...last.matchAll(/^Claim (\S+)$/gmu)].map((match) => match[1]);
+        const sentence = claimMarker[1] === "FIX"
+          ? `MCP servers expose tools and resources through a standard protocol [${ids[0]}].`
+          : `${OFFLINE_CONTRADICTED_CLAIM_V1} [${ids[0]}].`;
+        return { content: claimIds.map((id) => `${id}: ${sentence}`).join("\n") };
+      }
+      metrics.claimCheck.drafts += 1;
+      return {
+        content: `${OFFLINE_CONTRADICTED_CLAIM_V1} [${ids[0]}]. Clients discover the approved server capabilities [${ids[1]}].` +
+          "\n\n## Limitations\nThis brief is limited to the cited source passages.\n\n## Confidence\nHigh confidence in these passage-supported statements.",
+      };
+    }
+
+    // Jev routing: a paraphrased evidence request. Searches only when the
+    // host offered web tools; otherwise it writes an unsourced note, which is
+    // what the target-only fast path does with this wording today.
+    const routeMarker = transcript.match(/OFFLINE_JEVROUTE_[a-f0-9]{32}/u)?.[0];
+    if (routeMarker) {
+      if (toolNames.has("web_search") && !toolNameObserved(messages, "web_search")) {
+        metrics.emittedToolCalls += 1;
+        return { toolCalls: [{ name: "web_search", arguments: { query: `why the Western Roman Empire fell ${routeMarker}` } }], finishReason: "tool_calls" };
+      }
+      const ids = [...new Set(transcript.match(/source:[a-z0-9]+:passage:\d+-\d+/giu) ?? [])];
+      if (ids.length >= 2) {
+        return {
+          content: `Economic strain from debasement weakened the late empire [${ids[0]}]. The Western Roman Empire ended in 476 when Odoacer deposed Romulus Augustulus [${ids[1]}].` +
+            "\n\n## Limitations\nThis note is limited to the cited source passages.\n\n## Confidence\nHigh confidence in these passage-supported statements.",
+        };
+      }
+      return { content: "The Roman Empire fell for many reasons, including economic strain and invasions." };
     }
 
     const catalogMarker = transcript.match(/OFFLINE_CATALOG_[A-Z0-9_]+/u)?.[0];
