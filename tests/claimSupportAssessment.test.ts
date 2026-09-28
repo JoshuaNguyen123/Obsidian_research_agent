@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { ClaimPassageRef, ResearchClaim } from "../src/agent/claimLedger";
 import {
   CLAIM_SUPPORT_LIMITS_V1,
+  CLAIM_SUPPORT_THRESHOLDS_V1,
   CLAIM_SUPPORT_TEMPLATE_VERSION_V1,
   batchClaimSupportChecksV1,
   buildClaimSupportRequestV1,
@@ -116,6 +117,10 @@ test("the request is one bounded question per claim over data marked untrusted",
   );
 });
 
+function choice(pick: string, probabilities: { supported: number; contradicted: number; insufficient: number }) {
+  return { type: "choice", choice: pick, confidence: probabilities[pick as keyof typeof probabilities], probabilities };
+}
+
 test("failure verdicts need more certainty than support; anything under its threshold abstains", () => {
   const checks: ClaimSupportCheckV1[] = ["a", "b", "c", "d", "e"].map((id) => ({
     claimId: id,
@@ -126,9 +131,9 @@ test("failure verdicts need more certainty than support; anything under its thre
   const findings = interpretClaimSupportAnswersV1(
     answered({
       claim_1: verdict("supported", 0.72),
-      claim_2: verdict("contradicted", 0.8),
+      claim_2: choice("contradicted", { supported: 0.2, contradicted: 0.8, insufficient: 0 }),
       claim_3: verdict("contradicted", 0.9),
-      claim_4: verdict("insufficient", 0.88),
+      claim_4: choice("insufficient", { supported: 0.12, contradicted: 0, insufficient: 0.88 }),
       claim_5: { type: "noul", noul: 0.9 },
     }),
     questionFor,
@@ -140,6 +145,33 @@ test("failure verdicts need more certainty than support; anything under its thre
   assert.equal(findings.get("d")?.status, "abstained");
   assert.equal(findings.get("e")?.status, "unavailable");
   assert.equal(findings.get("e")?.fallbackReason, "invalid_answer");
+});
+
+test("a failure split between contradicted and insufficient is decided when its combined mass is certain", () => {
+  // Calibration (2026-09-28): the live model put all of a failing claim's
+  // mass on "not supported" but split it, so neither verdict cleared its own
+  // bar. Both act the same way, so the larger of the two is the verdict.
+  const checks: ClaimSupportCheckV1[] = ["a", "b", "c", "d"].map((id) => ({
+    claimId: id,
+    claimText: `Claim ${id}.`,
+    passages: [PASSAGES[0]!],
+  }));
+  const { questionFor } = buildClaimSupportRequestV1(checks);
+  const findings = interpretClaimSupportAnswersV1(
+    answered({
+      claim_1: choice("contradicted", { supported: 0, contradicted: 0.57, insufficient: 0.43 }),
+      claim_2: choice("insufficient", { supported: 0, contradicted: 0.21, insufficient: 0.79 }),
+      claim_3: choice("supported", { supported: 0.64, contradicted: 0.1, insufficient: 0.26 }),
+      claim_4: choice("contradicted", { supported: 0.15, contradicted: 0.6, insufficient: 0.25 }),
+    }),
+    questionFor,
+  );
+  assert.equal(findings.get("a")?.verdict, "contradicted");
+  assert.equal(findings.get("b")?.verdict, "insufficient");
+  assert.equal(findings.get("c")?.status, "abstained", "an uncertain support is never turned into a hold");
+  assert.equal(findings.get("d")?.status, "abstained", "0.85 not supported is under the bar");
+  assert.equal(CLAIM_SUPPORT_THRESHOLDS_V1.notSupported, 0.9);
+  assert.equal(CLAIM_SUPPORT_THRESHOLDS_V1.calibratedAt, "2026-09-28");
 });
 
 test("findings become claim-scoped tokens the existing repair can address", () => {

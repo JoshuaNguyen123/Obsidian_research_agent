@@ -31,14 +31,24 @@ export const CLAIM_SUPPORT_LIMITS_V1 = Object.freeze({
 /**
  * A finding acts only when its verdict is this probable. Holds are expensive
  * (a false hold blocks a correct note), so failure verdicts need more
- * certainty than "supported". Provisional until calibrated, then frozen.
+ * certainty than "supported". Calibrated on the calibration split, then
+ * frozen for the held-out split.
  */
 export const CLAIM_SUPPORT_THRESHOLDS_V1 = Object.freeze({
-  version: "claim-thresholds.provisional.v1",
-  calibratedAt: null as string | null,
+  version: "claim-thresholds.calibrated.v1",
+  calibratedAt: "2026-09-28" as string | null,
   supported: 0.7,
   contradicted: 0.85,
   insufficient: 0.9,
+  /**
+   * Added by calibration. On the live calibration split, every failing
+   * claim the provisional rule missed put all its mass on "not supported",
+   * but split it between contradicted and insufficient, so neither cleared
+   * its own bar. Both verdicts act the same way (one repair, then a hold),
+   * so a claim whose combined failure mass reaches this bar is decided as
+   * the larger of the two. Supported claims there carried at most 0.36.
+   */
+  notSupported: 0.9,
 });
 
 export type ClaimSupportVerdictV1 = "supported" | "contradicted" | "insufficient";
@@ -271,13 +281,15 @@ export function interpretClaimSupportAnswersV1(
         }
       : null;
     const probability = probabilities ? probabilities[proposed] : answer.confidence;
-    const threshold = thresholds[proposed];
-    const decided = probability !== null && probability >= threshold;
+    let verdict: ClaimSupportVerdictV1 | null = probability !== null && probability >= thresholds[proposed] ? proposed : null;
+    if (!verdict && probabilities && probabilities.contradicted + probabilities.insufficient >= thresholds.notSupported) {
+      verdict = probabilities.contradicted >= probabilities.insufficient ? "contradicted" : "insufficient";
+    }
     findings.set(check.claimId, {
       claimId: check.claimId,
       passageIds,
-      status: decided ? "decided" : "abstained",
-      verdict: decided ? proposed : null,
+      status: verdict ? "decided" : "abstained",
+      verdict,
       proposed,
       probabilities,
     });
