@@ -25,6 +25,8 @@ export interface OfflineAgentBackendMetricsV1 {
   citationCriticReviews?: number;
   /** Jev claim-check fixture: cited drafts written, claim-scoped repairs answered. */
   claimCheck?: { drafts: number; repairs: number };
+  /** Jev routing fixture: the passage ids and result URLs each draft turn saw. */
+  jevRouteDrafts?: { ids: string[]; resultUrls: string[]; offered: string[] }[];
   /** Completions refused with an injected 503 (see `injectTransientOutage`). */
   outageFailuresServed?: number;
   citationRepairRequests?: {
@@ -222,10 +224,30 @@ export function createOfflineAgentBackendV1(): OfflineAgentBackendV1 {
         return { toolCalls: [{ name: "web_search", arguments: { query: `why the Western Roman Empire fell ${routeMarker}` } }], finishReason: "tool_calls" };
       }
       const ids = [...new Set(transcript.match(/source:[a-z0-9]+:passage:\d+-\d+/giu) ?? [])];
-      if (ids.length >= 2) {
+      // The wording names no source count, so nothing fetches for the model:
+      // read both results before drafting, as a researching model would.
+      const resultUrls = [...new Set(transcript.match(/https:\/\/(?:one|two|three)\.example\/jev\/[a-f0-9-]+/gu) ?? [])];
+      if (ids.length < resultUrls.length && toolNames.has("web_fetch") && !toolNameObserved(messages, "web_fetch") && resultUrls.length > 0) {
+        metrics.emittedToolCalls += Math.min(3, resultUrls.length);
+        return { toolCalls: resultUrls.slice(0, 3).map((url) => ({ name: "web_fetch", arguments: { url } })), finishReason: "tool_calls" };
+      }
+      metrics.jevRouteDrafts ??= [];
+      metrics.jevRouteDrafts.push({ ids, resultUrls, offered: [...toolNames] });
+      // Cite each passage by its own id, as a careful model does. Each fixture
+      // passage is a whole page, so its id ends at the passage's length.
+      const idForPassage = (passage: string) =>
+        ids.find((id) => id.endsWith(`:passage:0-${passage.length}`)) ?? null;
+      const strainId = idForPassage("Economic strain from debasement of the currency weakened the late empire.");
+      const endId = idForPassage("The Western Roman Empire ended in 476 when Odoacer deposed Romulus Augustulus.");
+      if (strainId && endId) {
         return {
-          content: `Economic strain from debasement weakened the late empire [${ids[0]}]. The Western Roman Empire ended in 476 when Odoacer deposed Romulus Augustulus [${ids[1]}].` +
-            "\n\n## Limitations\nThis note is limited to the cited source passages.\n\n## Confidence\nHigh confidence in these passage-supported statements.",
+          content: [
+            `Economic strain from debasement of the currency weakened the late empire [${strainId}]. ` +
+              `The Western Roman Empire ended in 476 when Odoacer deposed Romulus Augustulus [${endId}].`,
+            `Sources: ${resultUrls.join(" ")}`,
+            "## Limitations\nThis note is limited to the cited source passages.",
+            "## Confidence\nHigh confidence in these passage-supported statements.",
+          ].join("\n\n"),
         };
       }
       return { content: "The Roman Empire fell for many reasons, including economic strain and invasions." };

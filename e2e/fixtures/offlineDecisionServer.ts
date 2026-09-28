@@ -26,6 +26,21 @@ export interface OfflineDecisionServerV1 {
 
 export const OFFLINE_DECISION_TOKEN_V1 = "offline-e2e-decision-token";
 
+/**
+ * A well-formed answer to every mission question with no clear winner: every
+ * field abstains, so the existing classifiers decide. (An empty `answers`
+ * object is malformed and reads as `invalid_response`, an outage path.)
+ */
+const ABSTAINING_MISSION_ANSWERS = {
+  route: { type: "choice", choice: "vault_write", confidence: 0.4, probabilities: { vault_write: 0.4, chat_answer: 0.35, web_research: 0.25 } },
+  web_evidence: { type: "noul", noul: 0.5 },
+  vault_evidence: { type: "noul", noul: 0.5 },
+  research_mode: { type: "choice", choice: "none", confidence: 0.4, probabilities: { none: 0.4, deep_web: 0.35, deep_vault: 0.25 } },
+  effort_tier: { type: "choice", choice: "standard", confidence: 0.4, probabilities: { standard: 0.4, quick: 0.35, deep: 0.25 } },
+  risk: { type: "choice", choice: "low", confidence: 0.4, probabilities: { low: 0.4, medium: 0.35, high: 0.25 } },
+  freshness: { type: "choice", choice: "none", confidence: 0.4, probabilities: { none: 0.4, helpful: 0.35, required: 0.25 } },
+};
+
 export async function startOfflineDecisionServerV1(port: number): Promise<OfflineDecisionServerV1> {
   let current: OfflineDecisionScriptV1 = {
     mission: "abstain",
@@ -64,7 +79,7 @@ export async function startOfflineDecisionServerV1(port: number): Promise<Offlin
                 web_evidence: { type: "noul", noul: 0.97 },
                 vault_evidence: { type: "noul", noul: 0.03 },
               }
-            : {},
+            : ABSTAINING_MISSION_ANSWERS,
         usage: { input_tokens: 420, output_tokens: 14, cost: 0.00002 },
       });
       return;

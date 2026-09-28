@@ -125,7 +125,8 @@ async function runJevJourney(input: {
     await harness.page.evaluate(({ fixtureId, passages }) => {
       const plugin = (window as any).app.plugins.plugins["agentic-researcher"];
       const original = plugin.createToolExecutionContext;
-      const urls = [`https://one.example/jev/${fixtureId}`, `https://two.example/jev/${fixtureId}`];
+      const hosts = ["one", "two", "three"];
+      const urls = passages.map((_: string, index: number) => `https://${hosts[index]}.example/jev/${fixtureId}`);
       plugin.createToolExecutionContext = function (...args: any[]) {
         const context = original.apply(this, args);
         const transport = context.httpTransport;
@@ -193,6 +194,17 @@ async function runJevJourney(input: {
       decisionTraces: result.traces
         .filter((event) => /^(?:decision-|claim-support-)/u.test(event.id))
         .map((event) => ({ id: event.id, message: event.message })),
+      // For diagnosis: the verification and status tail, bounded.
+      traceTail: result.traces
+        .filter((event) => /verification|acceptance|status|tool_rejected|mission_intent/u.test(event.kind))
+        .slice(-60)
+        .map((event) => ({
+          id: event.id,
+          kind: event.kind,
+          message: event.message.slice(0, 400),
+          missing: (event.outputPreview?.acceptance?.missing ?? event.outputPreview?.missing ?? null) as string[] | null,
+        })),
+      acceptance: result.ledger?.acceptance ?? null,
       claimSupport: result.ledger?.decisions?.claimSupport ?? null,
       decisionRecords: result.ledger?.decisions?.records ?? [],
       backend: result.backend,
@@ -264,7 +276,7 @@ test.describe("zero-cloud Jev decisions", () => {
     expect(enabled.traces.some((event) => /Jev found a request for web evidence the wording did not name/u.test(event.message))).toBe(true);
     expect(enabled.backend.offeredToolNames).toContain("web_search");
     expect(enabled.note).not.toContain("The Roman Empire fell for many reasons");
-    expect(enabled.note).toContain("Economic strain from debasement weakened the late empire");
+    expect(enabled.note).toContain("Economic strain from debasement of the currency weakened the late empire");
     expect(enabled.receipts).toContain("append_to_current_file");
     const records = enabled.ledger?.decisions?.records ?? [];
     expect(records.some((record: any) => record.component === "mission_routing" && record.outcome === "answered")).toBe(true);
@@ -283,6 +295,10 @@ test.describe("zero-cloud Jev decisions", () => {
       passages: MCP_PASSAGES,
       seedNote: "MCP note.",
     });
+    // The mission assessment answered with no clear field, so routing stayed
+    // with the existing classifiers.
+    expect(result.traces.some((event) => /^Jev mission assessment answered in \d+ ms/u.test(event.message))).toBe(true);
+    expect(result.traces.some((event) => /Jev found a request for/u.test(event.message))).toBe(false);
     const rounds = claimTraces(result).filter((event) => /:round-\d+$/u.test(event.id));
     expect(rounds.map((event) => event.outputPreview?.action)).toEqual(["repair", "accept"]);
     expect(result.backend.claimCheck?.repairs).toBe(1);
