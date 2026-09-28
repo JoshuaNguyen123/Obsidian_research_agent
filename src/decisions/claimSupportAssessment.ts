@@ -359,8 +359,17 @@ export async function assessClaimSupportV1(input: {
   const assessed = answered.filter((finding) => finding.status === "decided" || finding.status === "abstained").length;
   const decided = answered.filter((finding) => finding.status === "decided").length;
   const unassessed = eligible - decided;
-  const status: ClaimSupportAssessmentV1["status"] =
-    assessed === 0 ? "unavailable" : unassessed === 0 ? "complete" : "partial";
+  // Nothing sent because every eligible claim was excluded is partial
+  // coverage, not an outage: the reason is on each excluded finding.
+  const nothingSent = batched.batches.length === 0;
+  if (nothingSent) fallbackReason ??= "all_claims_excluded";
+  const status: ClaimSupportAssessmentV1["status"] = nothingSent
+    ? "partial"
+    : assessed === 0
+      ? "unavailable"
+      : unassessed === 0
+        ? "complete"
+        : "partial";
   return {
     version: 1,
     templateVersion: CLAIM_SUPPORT_TEMPLATE_VERSION_V1,
@@ -470,7 +479,7 @@ export function emptyClaimSupportLedgerV1(mode: "shadow" | "enabled"): ClaimSupp
 export function claimFingerprintV1(claimText: string, passageIds: readonly string[]): string {
   return fingerprintCanonicalJson({
     claim: claimText.replace(/\s+/gu, " ").trim().toLowerCase(),
-    passages: [...passageIds].sort(),
+    passages: [...new Set(passageIds)].sort(),
   });
 }
 
@@ -571,10 +580,13 @@ export function claimSupportBlockerV1(rejections: readonly ClaimSupportRejection
     contradicted > 0 ? `${contradicted} ${contradicted === 1 ? "claim contradicts" : "claims contradict"} its cited source` : "",
     insufficient > 0 ? `${insufficient} ${insufficient === 1 ? "claim is" : "claims are"} not supported by its cited source` : "",
   ].filter(Boolean);
-  const first = rejections[0];
+  // The chat names the sentence, not its citation ids; those stay in Run Details.
+  const firstText = (rejections[0]?.claimExcerpt ?? "")
+    .replace(/\s*\[(?:source:[^\]]+)\]/gu, "")
+    .trim();
   return [
     `Held the draft: ${parts.join(" and ")}, and one repair did not fix it.`,
-    first ? `First: "${first.claimExcerpt.slice(0, 140)}${first.claimExcerpt.length > 140 ? "…" : ""}"` : "",
+    firstText ? `First: "${firstText.slice(0, 140)}${firstText.length > 140 ? "…" : ""}"` : "",
     "The note is unchanged. Edit or remove those sentences, or Continue to gather better sources.",
   ]
     .filter(Boolean)
@@ -620,7 +632,12 @@ export function normalizeClaimSupportLedgerV1(value: unknown): ClaimSupportLedge
   return {
     version: 1,
     mode,
-    repairAllowance: count(value.repairAllowance, CLAIM_SUPPORT_REPAIR_ALLOWANCE_V1),
+    // A record can lower its allowance (a repair already spent) but never
+    // raise it past the one repair a mission gets.
+    repairAllowance: Math.min(
+      count(value.repairAllowance, CLAIM_SUPPORT_REPAIR_ALLOWANCE_V1),
+      CLAIM_SUPPORT_REPAIR_ALLOWANCE_V1,
+    ),
     repairsUsed: count(value.repairsUsed, 0),
     rejections: rejections.slice(-48),
     lastAssessment: isRecord(value.lastAssessment)

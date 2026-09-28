@@ -410,10 +410,13 @@ export function extractClaimsFromDraft(
  * mintable shape and fails on an unclassified newcomer.
  */
 export function claimIdFromGroundingToken(token: string): string | null {
+  // `claim_support:<verdict>:<id>` is the decision model's finding on a
+  // grounded claim (src/decisions/claimSupportAssessment.ts); it addresses a
+  // claim the same way, so the same claim-scoped repair can fix it.
   const match =
     /^claim_grounding:(?:ungrounded|fabricated|quote_mismatch|quote_passage):(.+)$/u.exec(
       token,
-    );
+    ) ?? /^claim_support:(?:contradicted|insufficient):(.+)$/u.exec(token);
   const id = match?.[1]?.trim();
   if (!id) {
     return null;

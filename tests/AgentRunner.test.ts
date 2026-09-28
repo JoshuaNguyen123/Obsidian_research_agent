@@ -1,4 +1,5 @@
 import test from "node:test";
+import { normalizeClaimSupportLedgerV1 } from "../src/decisions/claimSupportAssessment";
 import { getRequiredLiteralAnchorsMissingFromTextV1 } from "../src/agent/missionPlan";
 import { MISSION_ROUTER_SYSTEM_PROMPT } from "../src/agent/missionRouter";
 import assert from "node:assert/strict";
@@ -17427,6 +17428,305 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
     vault.content.get("Current.md"),
     `Essay prompt\n${verifiedEssayDraft}`,
   );
+});
+
+/*
+ * Jev claim support inside a real sourced writeback: the staged draft passes
+ * the deterministic citation and quote checks, then is judged against the
+ * passage text its claims cite. The decision endpoint is served by the same
+ * mocked HTTP transport as the web tools, routed by URL.
+ */
+const CLAIM_SOURCE_TEXT =
+  "Steinbeck frames solidarity through the Joad family as the novel's answer to displacement. Migrant camps in the novel organize their own committees.";
+const CLAIM_SUPPORTED = "Steinbeck frames solidarity through the Joad family as the answer to displacement";
+const CLAIM_CONTRADICTED = "Steinbeck frames individual ambition as the answer to displacement";
+const CLAIM_PROMOTED = {
+  decisionApiKey: "sk-or-test-claims",
+  e2eHarnessAttestationEnabled: true,
+  decisionE2EHarnessPromotion: true,
+} as Partial<AgentSettings>;
+
+type ClaimJudge = (claimText: string) => { verdict: string; p: number } | "outage";
+
+async function runSourcedNoteWithClaimSupport(options: {
+  mode: "off" | "shadow" | "enabled";
+  judge: ClaimJudge;
+  /** The first draft's claim sentence. */
+  draftClaim: string;
+  /** What the claim-scoped repair answers with, per claim id; null repeats the draft. */
+  repairClaim?: string | null;
+  /** `append`: the verified final append; `streamed`: the staged streamed writeback. */
+  path?: "append" | "streamed";
+}) {
+  const prompt = "Write a short note on The Grapes of Wrath with passage citations to its sources.";
+  const vault = createRunnerVaultContext({ prompt, content: "Essay prompt" });
+  vault.context.settings = createRunnerSettings({
+    maxAgentSteps: 6,
+    streamWritebackMode: "all_current_note_content_writes",
+    modelRouterMode: "off",
+    decisionModelMode: options.mode,
+    ...CLAIM_PROMOTED,
+  } as Partial<AgentSettings>);
+  const decisionBodies: Array<Record<string, unknown>> = [];
+  vault.context.httpTransport = async (request) => {
+    if (request.url.includes("/decisions")) {
+      const body = JSON.parse(String(request.body)) as {
+        questions: Record<string, unknown>;
+        state: { claims?: Array<{ key: string; text: string }> };
+      };
+      decisionBodies.push(body as unknown as Record<string, unknown>);
+      if (!body.state.claims) {
+        // Mission assessment: abstain everywhere, so routing is unchanged.
+        return { status: 200, headers: {}, json: { id: "gen-m", model: "typesafe/jev-1.13", answers: {} } };
+      }
+      const answers: Record<string, unknown> = {};
+      for (const claim of body.state.claims) {
+        const judged = options.judge(claim.text);
+        if (judged === "outage") {
+          return { status: 503, headers: {}, text: "unavailable" };
+        }
+        const rest = (1 - judged.p) / 2;
+        answers[claim.key] = {
+          type: "choice",
+          choice: judged.verdict,
+          confidence: judged.p,
+          probabilities: {
+            supported: judged.verdict === "supported" ? judged.p : rest,
+            contradicted: judged.verdict === "contradicted" ? judged.p : rest,
+            insufficient: judged.verdict === "insufficient" ? judged.p : rest,
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { id: "gen-c", model: "typesafe/jev-1.13", answers, usage: { input_tokens: 400, output_tokens: 12, cost: 0.00002 } },
+      };
+    }
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: { results: [{ title: "Grapes source", url: "https://example.com/grapes", snippet: CLAIM_SOURCE_TEXT }] },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: { title: "Grapes source", url: "https://example.com/grapes", content: CLAIM_SOURCE_TEXT, links: [] },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const answers: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const repairInstructions: string[] = [];
+  const draftFor = (request: ModelChatRequest) => {
+    const passageId = getPassageCitationIds(request)[0] ?? "";
+    return `${options.draftClaim} [${passageId}]. Migrant camps in the novel organize their own committees [${passageId}]. Source: https://example.com/grapes`;
+  };
+  const respond = (request: ModelChatRequest) => {
+    const last = request.messages.at(-1)?.content ?? "";
+    if (/Repair ONLY the failing claim sentences/u.test(last)) {
+      repairInstructions.push(last);
+      const passageId = getPassageCitationIds(request)[0] ?? "";
+      const lines = [...last.matchAll(/^Claim (\S+)$/gmu)].map(
+        (match) => `${match[1]}: ${options.repairClaim ?? options.draftClaim} [${passageId}].`,
+      );
+      return responseWithContent(lines.join("\n"));
+    }
+    return responseWithContent(draftFor(request));
+  };
+  const chatRequests: ModelChatRequest[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "Grapes of Wrath solidarity" }),
+      () => responseWithToolCall("web_fetch", { url: "https://example.com/grapes" }),
+      ...(options.path === "streamed"
+        ? [() => responseWithContent(""), () => responseWithContent("")]
+        : [respond, respond, respond, respond]),
+    ],
+    streamResponders: [respond, respond, respond, respond, respond],
+  });
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traces.push(event),
+      onFinalDelta: (delta) => answers.push(delta),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+  const persistedLedger = [...vault.content.values()]
+    .map((markdown) => parseMissionLedgerFromMarkdown(markdown))
+    .find((ledger) => ledger?.mission.includes("The Grapes of Wrath"));
+  return {
+    note: vault.content.get("Current.md") ?? "",
+    persistedLedger,
+    stagedPaths: [
+      ...new Set(
+        traces
+          .map((event) => /^(proof-gated-writeback|verified-final-append)-/u.exec(event.id)?.[1])
+          .filter((name): name is string => Boolean(name)),
+      ),
+    ],
+    executedCalls,
+    statuses,
+    traces,
+    answers,
+    completions,
+    repairInstructions,
+    claimRequests: decisionBodies.filter((body) => (body.state as { claims?: unknown }).claims),
+    claimTraces: traces.filter((event) => event.id.startsWith("claim-support-")),
+  };
+}
+
+test("claim support Off sends nothing and the sourced note commits as before", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "off",
+    judge: () => ({ verdict: "contradicted", p: 0.99 }),
+    draftClaim: CLAIM_CONTRADICTED,
+  });
+  assert.equal(run.claimRequests.length, 0);
+  assert.equal(run.claimTraces.length, 0);
+  assert.ok(run.note.includes(CLAIM_CONTRADICTED), JSON.stringify({ note: run.note, statuses: run.statuses }));
+});
+
+const judgeClaimsBySolidarity: ClaimJudge = (text) =>
+  /individual ambition/u.test(text)
+    ? { verdict: "contradicted", p: 0.97 }
+    : { verdict: "supported", p: 0.95 };
+
+test("claim support Shadow records its finding and commits the draft unchanged", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "shadow",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+  });
+  assert.ok(run.claimRequests.length >= 1, JSON.stringify(run.traces.map((event) => event.id)));
+  assert.ok(run.note.includes(CLAIM_CONTRADICTED), "Shadow never changes the writeback");
+  assert.equal(run.repairInstructions.length, 0);
+  const shadow = run.claimTraces.find((event) => event.id.endsWith(":shadow"));
+  assert.ok(shadow, JSON.stringify(run.claimTraces));
+  assert.match(shadow.message ?? "", /Jev claim check \(shadow, writeback unchanged\): all 2 claims decided; 1 contradicted\./u);
+});
+
+test("claim support Enabled repairs a contradicted claim once, rechecks it, and commits the repair", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "enabled",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+    repairClaim: CLAIM_SUPPORTED,
+  });
+  assert.deepEqual(run.stagedPaths, ["verified-final-append"]);
+  assert.equal(run.repairInstructions.length, 1, JSON.stringify(run.claimTraces.map((event) => event.message)));
+  assert.match(run.repairInstructions[0]!, /claim_support:contradicted:/u);
+  assert.match(run.repairInstructions[0]!, /Cited passage \S+ reads: "Steinbeck frames solidarity/u);
+  assert.ok(run.note.includes(CLAIM_SUPPORTED), run.note);
+  assert.ok(!run.note.includes(CLAIM_CONTRADICTED), run.note);
+  assert.ok(run.note.includes("Migrant camps in the novel organize their own committees"), "untouched sentences survive");
+  const rounds = run.claimTraces.filter((event) => /:round-\d+$/u.test(event.id));
+  assert.equal(rounds.length, 2, "checked, repaired, checked again");
+  assert.equal((rounds[0]!.outputPreview as { action: string }).action, "repair");
+  assert.equal((rounds[1]!.outputPreview as { action: string }).action, "accept");
+});
+
+test("claim support Enabled holds a draft the one repair did not fix and writes nothing", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "enabled",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+    repairClaim: null,
+  });
+  assert.equal(run.repairInstructions.length, 1, "exactly one Jev-triggered repair");
+  assert.equal(run.note, "Essay prompt", "the note is unchanged");
+  assert.ok(!run.executedCalls.some((call) => call.name === "append_to_current_file"));
+  const held = run.claimTraces.find((event) => event.id.endsWith(":held"));
+  assert.ok(held, JSON.stringify(run.claimTraces.map((event) => event.id)));
+  assert.match(held.message ?? "", /^Held the draft: 1 claim contradicts its cited source, and one repair did not fix it\./u);
+  assert.ok(run.answers.join("").includes("The note is unchanged."), "the user is told, briefly, in chat");
+  assert.ok(
+    !run.answers.join("").includes("claim_support:"),
+    "raw tokens stay in Run Details",
+  );
+  assert.equal(run.completions.at(-1)?.stopReason, "budget");
+  // The run record keeps the held draft, the finding and the spent repair,
+  // so a Continue can neither lose the draft nor earn a second repair.
+  const claimSupport = normalizeClaimSupportLedgerV1(run.persistedLedger?.decisions?.claimSupport);
+  assert.ok(claimSupport, JSON.stringify(run.persistedLedger?.decisions ?? null));
+  assert.equal(claimSupport.mode, "enabled");
+  assert.equal(claimSupport.repairsUsed, 1);
+  assert.equal(claimSupport.rejections.length, 1);
+  assert.equal(claimSupport.rejections[0]?.verdict, "contradicted");
+  assert.ok(claimSupport.heldCandidate?.text.includes(CLAIM_CONTRADICTED));
+  assert.match(claimSupport.heldCandidate?.blocker ?? "", /^Held the draft/u);
+  assert.ok(
+    (run.persistedLedger?.decisions?.records ?? []).some((record) => record.component === "claim_support"),
+    "the decision calls are on the record",
+  );
+});
+
+test("claim support outage before any finding records a skipped check and keeps the existing verification", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "enabled",
+    judge: () => "outage",
+    draftClaim: CLAIM_CONTRADICTED,
+  });
+  assert.ok(run.claimRequests.length >= 1);
+  assert.ok(run.note.includes(CLAIM_CONTRADICTED), "an outage never blocks a draft that passed verification");
+  const round = run.claimTraces.find((event) => /:round-1$/u.test(event.id));
+  assert.ok(round);
+  assert.match(round.message ?? "", /unavailable \(provider_unavailable\); the existing verification decides/u);
+  assert.equal((round.outputPreview as { reason: string }).reason, "unavailable");
+  const decisionCalls = run.traces.filter((event) => event.id.startsWith("decision-call-"));
+  assert.ok(decisionCalls.some((event) => /unavailable: provider_unavailable/u.test(event.message ?? "")));
+  assert.ok(!run.traces.some((event) => event.kind === "tool_result" && /decision/u.test(event.toolName ?? "")),
+    "decision failures are never tool failures");
+});
+
+test("claim support Enabled repairs a contradicted claim in the staged streamed writeback too", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "enabled",
+    path: "streamed",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+    repairClaim: CLAIM_SUPPORTED,
+  });
+  assert.deepEqual(run.stagedPaths, ["proof-gated-writeback"], JSON.stringify(run.statuses));
+  assert.equal(run.repairInstructions.length, 1, JSON.stringify(run.claimTraces.map((event) => event.message)));
+  assert.ok(run.note.includes(CLAIM_SUPPORTED), run.note);
+  assert.ok(!run.note.includes(CLAIM_CONTRADICTED), run.note);
+});
+
+test("claim support Enabled holds an unfixable staged streamed draft and writes nothing", async () => {
+  const run = await runSourcedNoteWithClaimSupport({
+    mode: "enabled",
+    path: "streamed",
+    judge: judgeClaimsBySolidarity,
+    draftClaim: CLAIM_CONTRADICTED,
+    repairClaim: null,
+  });
+  assert.deepEqual(run.stagedPaths, ["proof-gated-writeback"]);
+  assert.equal(run.note, "Essay prompt");
+  assert.ok(!run.executedCalls.some((call) => call.name === "append_to_current_file"));
+  assert.ok(run.claimTraces.some((event) => event.id.endsWith(":held")));
+  // Chat gets the blocker alone: it names the failing sentence without its
+  // citation ids, and none of the held draft's other text.
+  const chat = run.answers.join("");
+  assert.match(chat, /^Held the draft: 1 claim contradicts its cited source/u, chat);
+  assert.ok(chat.includes(`First: "${CLAIM_CONTRADICTED}."`), chat);
+  assert.doesNotMatch(chat, /source:[a-z0-9]+:passage/u);
+  assert.doesNotMatch(chat, /Migrant camps/u);
+  assert.equal(run.completions.at(-1)?.stopReason, "budget");
 });
 
 test("explicit stream-to-page essay uses live writeback instead of append tool", async () => {

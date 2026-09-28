@@ -1,6 +1,7 @@
 import { processTestVaultFile } from "./helpers/atomicTestVault";
 import { promptPrefixReuseAverageV1 } from "../src/model/modelCallEvidence";
 import test from "node:test";
+import { claimFingerprintV1 } from "../src/decisions/claimSupportAssessment";
 import assert from "node:assert/strict";
 import {
   runAgentMission,
@@ -881,6 +882,232 @@ test("resumed sourced writeback uses durable read proof and commits exactly once
   assert.equal(
     finalSnapshot.operationJournal[0].receipt?.toolName,
     "append_to_current_file",
+  );
+});
+
+/*
+ * Jev claim support across Continue: the finding and the spent repair are in
+ * the run record, so a continuation can neither reset the repair allowance
+ * nor clear a rejection by reaching an unreachable decision model.
+ */
+async function continueHeldClaimSupportRun(draftClaim: string) {
+  const vault = createVaultHarness();
+  vault.context.settings.enableStreaming = true;
+  vault.context.settings.streamWritebackMode = "all_current_note_content_writes";
+  Object.assign(vault.context.settings, {
+    decisionModelMode: "enabled",
+    decisionApiKey: "sk-or-test-resume",
+    e2eHarnessAttestationEnabled: true,
+    decisionE2EHarnessPromotion: true,
+  });
+  const decisionRequests: string[] = [];
+  vault.context.httpTransport = async (request) => {
+    if (request.url.includes("/decisions")) {
+      decisionRequests.push(String(request.body));
+      return { status: 503, headers: {}, text: "unavailable" };
+    }
+    return { status: 404, headers: {}, text: "not mocked" };
+  };
+  const seedRunId = "run-claim-support-held-seed";
+  const originalMission =
+    "Research MCP server transports on the web and append a concise cited summary to the current note.";
+  const passageId = "source:claimhold:passage:0-88";
+  const rejectedClaim = `MCP servers only support a single proprietary transport [${passageId}].`;
+  const evidence: MissionEvidence = {
+    id: "web:claimhold",
+    kind: "web_source",
+    title: "MCP transport source",
+    url: "https://example.com/mcp-transport",
+    sourceId: "source:claimhold",
+    passageId,
+    passageIds: [passageId],
+    summary: "MCP servers expose tools and resources over transports defined by the protocol.",
+    confidence: "high",
+  };
+  const priorPlan: MissionPlan = {
+    version: 1,
+    runId: seedRunId,
+    status: "in_progress",
+    activeTaskId: "task-act",
+    tasks: [
+      {
+        id: "task-research-web",
+        title: "Gather fetched MCP transport sources",
+        status: "complete",
+        allowedTools: ["web_search", "web_fetch"],
+        dependencies: [],
+        evidenceIds: [evidence.id],
+        receiptIds: [],
+        completionContract: {
+          requiredProof: ["web_evidence"],
+          citationMode: "passage",
+          minEvidenceCount: 1,
+          minDistinctDomains: 1,
+        },
+      },
+      {
+        id: "task-act",
+        title: "Append the cited MCP transport summary",
+        status: "in_progress",
+        allowedTools: ["append_to_current_file"],
+        dependencies: ["task-research-web"],
+        evidenceIds: [],
+        receiptIds: [],
+        completionContract: { requiredProof: ["write_receipt"] },
+      },
+    ],
+    progress: {
+      score: 0.5,
+      completedTasks: 1,
+      totalTasks: 2,
+      remainingTasks: 1,
+      stalledCount: 0,
+      lastMeaningfulAction: "tool:web_fetch",
+    },
+    nextAction: {
+      kind: "write",
+      summary: "Append the cited MCP transport summary.",
+      toolName: "append_to_current_file",
+      taskId: "task-act",
+    },
+    createdAt: "2026-07-10T12:00:00.000Z",
+    updatedAt: "2026-07-10T12:05:00.000Z",
+  };
+  const ledger = createMissionLedger({
+    runId: seedRunId,
+    mission: originalMission,
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 12,
+      toolStepBudget: 8,
+      finalizationReserve: 4,
+      expectedTools: ["web_search", "web_fetch"],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-07-10T12:00:00.000Z"),
+  });
+  ledger.status = "blocked";
+  ledger.evidence = [evidence];
+  // What the held segment left behind: one confident rejection, the one
+  // repair already spent, and the draft it held.
+  ledger.decisions = {
+    version: 1,
+    records: [],
+    claimSupport: {
+      version: 1,
+      mode: "enabled",
+      repairAllowance: 1,
+      repairsUsed: 1,
+      rejections: [
+        {
+          claimFingerprint: claimFingerprintV1(rejectedClaim, [passageId]),
+          claimId: "claim-1",
+          verdict: "contradicted",
+          passageIds: [passageId],
+          probability: 0.96,
+          claimExcerpt: rejectedClaim,
+          at: "2026-07-10T12:04:00.000Z",
+        },
+      ],
+      lastAssessment: null,
+      skipped: [],
+      heldCandidate: {
+        candidateFingerprint: "sha256:held",
+        text: rejectedClaim,
+        truncated: false,
+        heldAt: "2026-07-10T12:04:30.000Z",
+        blocker: "Held the draft: 1 claim contradicts its cited source, and one repair did not fix it.",
+      },
+    },
+  };
+  setLedgerMissionPlan(ledger, priorPlan, new Date("2026-07-10T12:05:00.000Z"));
+  await writeMissionLedger(vault.context, ledger);
+  await writeMissionRuntimeSnapshot(
+    vault.context,
+    createMissionRuntimeSnapshot({
+      runId: seedRunId,
+      originalMission,
+      currentNotePath: "Current.md",
+      status: "paused",
+      missionPlan: priorPlan,
+      evidence: [evidence],
+      operationGoals: { web_search: "done", web_fetch: "done", current_note_content: "pending" },
+      lastSafeStep: 6,
+      createdAt: new Date("2026-07-10T12:00:00.000Z"),
+      updatedAt: new Date("2026-07-10T12:05:00.000Z"),
+    }),
+  );
+
+  const receipts: AgentRunReceipt[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const statuses: string[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const repairRequests: string[] = [];
+  const candidate = `${draftClaim.replace("PASSAGE", passageId)} Source: https://example.com/mcp-transport`;
+  const client: ModelClient = {
+    async chat() {
+      return responseWithContent("The durable source proof is ready for writeback.");
+    },
+    async streamChat(request, events = {}) {
+      if (request.tools?.length) {
+        return responseWithContent("The durable source proof is ready for writeback.");
+      }
+      const last = request.messages.at(-1)?.content ?? "";
+      if (/Repair ONLY the failing claim sentences/u.test(last)) repairRequests.push(last);
+      events.onContentDelta?.(candidate);
+      return responseWithContent(candidate);
+    },
+  };
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+  return {
+    vault,
+    rejectedClaim,
+    candidate,
+    receipts,
+    completions,
+    statuses,
+    repairRequests,
+    decisionRequests,
+    claimTraces: traces.filter((event) => event.id.startsWith("claim-support-")),
+  };
+}
+
+test("Continue with the decision model unreachable keeps a recorded rejection and never earns a second repair", async () => {
+  const run = await continueHeldClaimSupportRun(
+    "MCP servers only support a single proprietary transport [PASSAGE].",
+  );
+  assert.equal(run.repairRequests.length, 0, "the spent repair is not granted again");
+  assert.equal(run.receipts.length, 0, JSON.stringify({ statuses: run.statuses, traces: run.claimTraces.map((event) => event.message) }));
+  assert.equal(run.vault.files.get("Current.md"), "Initial note", "the note is unchanged");
+  assert.ok(run.claimTraces.some((event) => event.id.endsWith(":held")), JSON.stringify(run.claimTraces.map((event) => event.id)));
+});
+
+test("Continue with a changed sentence clears nothing on record, and a draft it cannot assess still commits on verification", async () => {
+  const run = await continueHeldClaimSupportRun(
+    "MCP servers expose tools and resources over protocol-defined transports [PASSAGE].",
+  );
+  assert.equal(run.repairRequests.length, 0);
+  assert.ok(
+    run.receipts.some((receipt) => receipt.toolName === "append_to_current_file"),
+    JSON.stringify({ receipts: run.receipts.map((receipt) => receipt.toolName), traces: run.claimTraces.map((event) => event.message) }),
+  );
+  assert.ok((run.vault.files.get("Current.md") ?? "").includes("protocol-defined transports"));
+  assert.ok(!run.claimTraces.some((event) => event.id.endsWith(":held")));
+  assert.ok(
+    run.claimTraces.some((event) => /passage text unavailable/u.test(event.message ?? "")),
+    JSON.stringify(run.claimTraces.map((event) => event.message)),
   );
 });
 

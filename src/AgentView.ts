@@ -2938,6 +2938,10 @@ export class AgentView extends ItemView {
       this.renderEvidenceConflictsVerification(event.outputPreview, event.id);
       return;
     }
+    if (kind === "claim_support") {
+      this.renderClaimSupportVerification(event.outputPreview, event);
+      return;
+    }
     if (kind !== "claim_grounding") {
       return;
     }
@@ -2993,6 +2997,39 @@ export class AgentView extends ItemView {
     });
     rowEl.createSpan({
       text: summary,
+      cls: "agentic-researcher-verification-message",
+    });
+    this.trimRows(
+      this.verificationEl,
+      ".agentic-researcher-verification-row",
+      MAX_VERIFICATION_ROWS,
+    );
+  }
+
+  /**
+   * The Jev claim check on a staged draft: coverage and what it found, from
+   * the host's own description. Findings, probabilities and claim ids stay in
+   * the trace payload; the row says what happened in words.
+   */
+  private renderClaimSupportVerification(
+    preview: Record<string, unknown>,
+    event: AgentTraceEvent,
+  ) {
+    if (!this.verificationEl) {
+      return;
+    }
+    const action = typeof preview.action === "string" ? preview.action : "none";
+    this.clearPlaceholder(this.verificationEl);
+    const rowEl = this.verificationEl.createDiv({
+      cls: `agentic-researcher-verification-row agentic-researcher-claim-support-row is-${action}`,
+    });
+    rowEl.dataset.verificationId = event.id;
+    rowEl.createSpan({
+      text: preview.mode === "shadow" ? "claim_support (shadow)" : "claim_support",
+      cls: "agentic-researcher-verification-kind",
+    });
+    rowEl.createSpan({
+      text: event.message ?? "",
       cls: "agentic-researcher-verification-message",
     });
     this.trimRows(
@@ -5376,6 +5413,12 @@ export class AgentView extends ItemView {
 
     if (event.kind === "verification") {
       this.renderClaimGroundingVerification(event);
+    }
+
+    // Jev decision calls and assessments are routing milestones: what was
+    // asked, what it cost, and whether it acted or the existing checks did.
+    if (event.kind === "mission_intent" && /^decision-/u.test(event.id)) {
+      this.appendDetailLine(this.milestonesDetailsEl, event);
     }
 
     if (toolName.startsWith("browser_")) {
