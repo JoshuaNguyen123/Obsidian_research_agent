@@ -49,11 +49,11 @@ export const DECISION_PROMOTION_MANIFEST_V1: Readonly<
       "No held-out comparison against a live decision model has passed the routing and evidence gates yet.",
   }),
   claim_support: Object.freeze({
-    promoted: false,
-    evaluatedAt: null,
-    report: null,
+    promoted: true,
+    evaluatedAt: "2026-09-28",
+    report: "docs/eval/decisions/live-heldout-2026-09-28T19-23-56-585Z.md",
     reason:
-      "No held-out comparison against a live decision model has passed the claim-support detection and false-hold gates yet.",
+      "Passed the frozen held-out gates on typesafe/jev-1.13: 11/11 failing claims caught, 0/8 supported claims held.",
   }),
 });
 
