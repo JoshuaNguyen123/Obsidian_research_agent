@@ -509,7 +509,15 @@ test.describe("zero-cloud installed production client", () => {
           async (notePath: string) => (window as any).app.vault.adapter.read(notePath),
           triggerPath,
         );
-      const after = await readTrigger();
+      // The frontmatter status is written back a moment after the
+      // mission-complete event, so a single read can still see "running".
+      // Poll until the note says done with a run id, and keep that read.
+      let after = "";
+      await expect(async () => {
+        after = await readTrigger();
+        expect(after).toMatch(/agent_mission_status: done/u);
+        expect(after).toMatch(/agent_mission_run_id: /u);
+      }, "the trigger note's frontmatter never reached done with a run id").toPass({ timeout: 15_000 });
       // The prompt in the frontmatter names the marker too; the body must
       // carry it exactly once.
       const body = after.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/u, "");
