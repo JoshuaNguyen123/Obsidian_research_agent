@@ -113,9 +113,10 @@ test("an unpromoted component configured Enabled runs in Shadow and says why", (
   assert.equal(routing.effective, "shadow");
   assert.match(routing.heldInShadowBecause ?? "", /gates/u);
   assert.equal(DECISION_PROMOTION_MANIFEST_V1.mission_routing.promoted, false);
-  // Claim support passed its held-out gates (2026-09-28) and acts when Enabled.
-  assert.equal(DECISION_PROMOTION_MANIFEST_V1.claim_support.promoted, true);
-  assert.equal(resolveDecisionComponentModeV1("enabled", "claim_support").effective, "enabled");
+  // Claim support passed its held-out gates (2026-09-28) but held a good
+  // note over a limitations sentence end to end, so it stays in Shadow.
+  assert.equal(DECISION_PROMOTION_MANIFEST_V1.claim_support.promoted, false);
+  assert.equal(resolveDecisionComponentModeV1("enabled", "claim_support").effective, "shadow");
   assert.equal(resolveDecisionComponentModeV1("enabled", "claim_support", PROMOTED).effective, "enabled");
   assert.equal(resolveDecisionComponentModeV1("shadow", "claim_support", PROMOTED).effective, "shadow");
   assert.equal(resolveDecisionComponentModeV1("off", "claim_support", PROMOTED).effective, "off");

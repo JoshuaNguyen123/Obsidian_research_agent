@@ -49,11 +49,11 @@ export const DECISION_PROMOTION_MANIFEST_V1: Readonly<
       "No held-out comparison against a live decision model has passed the routing and evidence gates yet.",
   }),
   claim_support: Object.freeze({
-    promoted: true,
+    promoted: false,
     evaluatedAt: "2026-09-28",
     report: "docs/eval/decisions/live-heldout-2026-09-28T19-23-56-585Z.md; docs/eval/decisions/live-e2e-comparison-2026-09-28.md",
     reason:
-      "Passed the frozen held-out gates on typesafe/jev-1.13 (11/11 failing claims caught, 0/8 supported claims held) and an end-to-end comparison on real missions (7/7 flags correct, no false holds, one repair fixed all four it was asked to).",
+      "Passed the frozen held-out gates, but in the end-to-end comparison one of two Enabled drafts that reached the check was held over the note's own limitations sentence (\"Could not verify: …\"). Held in Shadow until limitation and process sentences cannot hold a draft.",
   }),
 });
 
