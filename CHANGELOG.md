@@ -2,6 +2,13 @@
 
 All notable changes to Agentic Researcher are documented here.
 
+## [Unreleased] — sourced notes get written (2026-09-28)
+
+### Fixed
+- **A research mission no longer dies checking its citations before it writes.** When the note draft was held for citation checks, some models read and re-checked sources several at a time. Once the mission's tool budget was spent, the next batch ended the whole run with "Tool execution failed: … cannot be added within the graph budget", even though the note write still had its own reserved slot. That refusal now only turns the extra reads away, and the run goes on to the write.
+- **Reads the mission can no longer afford are no longer offered.** Once the tool budget is spent, the model is only offered what can still run, which includes the pending note write. Before, it could spend its remaining steps on reads that were each refused.
+- **A model that keeps re-sending a held note append gets its note written.** When a model keeps calling the same held append (a third time) instead of returning the corrected note, Agentic Researcher now finishes the write itself. It asks for the corrected note with the accepted source passages in view, checks it the same way, and commits it once. A draft that still fails is handled as before: delivered with its unverified claims marked where that rule applies, otherwise the note is left unchanged. Replacements and section edits are never taken over this way.
+
 ## [Unreleased] — verified ROI wave (2026-09-22)
 
 ### Security

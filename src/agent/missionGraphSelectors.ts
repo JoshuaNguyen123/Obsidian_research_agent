@@ -224,13 +224,26 @@ export function readyMissionGraphFrontierToolNamesV1(
  *     the mission's own plan authored.
  *   - The node it permits is bounded: one tool call, zero external actions,
  *     envelope-derived wall clock, envelope retry ceiling.
+ *
+ * And it answers no once the envelope has refused a dynamic node. Every
+ * dynamic read asks for the same bounded budget and a graph never gets budget
+ * back, so after one `budget_exhausted` refusal the authority refuses them all.
+ * The menu kept offering them anyway: on 2026-09-28 live sourced-note missions
+ * spent their remaining steps on reads the graph could not admit while the
+ * append node waited with its own reserved slot.
  */
 export function missionGraphRunAdmitsDynamicReadContinuationV1(input: {
   /** AgentRunner's `missionGraphUsesExactPlannedFrontier`. */
   usesExactPlannedFrontier: boolean;
   /** AgentRunner's `setLooseCompoundEnabled`. */
   setLooseCompoundEnabled: boolean;
+  /**
+   * AgentRunner's `missionGraphCapacityExhausted`: the envelope has already
+   * refused a node for want of budget.
+   */
+  envelopeExhausted?: boolean;
 }): boolean {
+  if (input.envelopeExhausted === true) return false;
   // A non-exact plan has always materialized bounded dynamic reads.
   if (input.usesExactPlannedFrontier !== true) return true;
   // An exact planned frontier admits them only on the set-loose compound runs

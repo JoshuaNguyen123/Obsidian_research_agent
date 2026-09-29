@@ -84,6 +84,8 @@ import {
   restrictCompoundResearchClosureToolsV1,
   containProofGateRejectedWriteToolsV1,
   PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
+  HELD_WRITE_HOST_FINALIZATION_THRESHOLD,
+  shouldHandHeldWriteToHostV1,
   canonicalRequiredLiteralWriteContentV1,
   repairOrderedCurrentNoteAppendFrontierToolCallsV1,
   validateRequiredLiteralWriteArguments,
@@ -20839,6 +20841,358 @@ test("parallel research reads reserve normalized URLs before graph execution", a
       node.status === "complete" && node.allowedTools.includes("web_fetch"),
   );
   assert.equal(completedFetchNodes.length, 3);
+});
+
+/**
+ * The 2026-09-28 live comparison's sourced-note mission, scripted. Found on
+ * glm-5.3-flash through RAP's liveJevClaims journey: the proof gate held the
+ * model's first append, the model then read source sections several at a
+ * time, and the mission graph's envelope ran out in the middle of one of those
+ * parallel batches. The batch rethrew the graph's refusal, so the whole run
+ * ended as "Tool execution failed: … cannot be added within the graph budget"
+ * with the append node still ready and holding its own reserved slot.
+ */
+const CRISIS_SOURCES_V1: Record<string, { title: string; content: string }> = {
+  "https://alpha.example/crisis-causes": {
+    title: "Origins of the 2008 financial crisis",
+    content: [
+      "The 2008 financial crisis grew out of a housing boom financed by subprime mortgages that many borrowers could not repay.",
+      "Lenders relaxed underwriting standards, and mortgage brokers were paid on volume rather than on the quality of the loans they originated.",
+      "Investment banks pooled those subprime mortgages into mortgage-backed securities and sold them to investors around the world.",
+      "Credit rating agencies assigned top ratings to many of those securities, which hid how much default risk they carried.",
+      "When house prices began to fall in 2006 and 2007, delinquencies on subprime mortgages rose quickly and the securities lost value.",
+      "Because the losses were spread through the financial system, no institution could be sure which counterparties were solvent.",
+    ].join(" "),
+  },
+  "https://beta.example/crisis-leverage": {
+    title: "Leverage and the collapse of Lehman Brothers",
+    content: [
+      "Large financial firms had borrowed heavily, and leverage ratios above thirty to one left them little capital to absorb losses.",
+      "Much of that borrowing was short-term funding in the repo market, which could disappear overnight when lenders lost confidence.",
+      "Bear Stearns was rescued in March 2008, but Lehman Brothers filed for bankruptcy on 15 September 2008 without a rescue.",
+      "The Lehman failure froze interbank lending, because banks refused to lend to each other while losses remained unknown.",
+      "Money market funds that held Lehman debt broke the buck, and investors withdrew funds from them at a rapid pace.",
+      "The run on short-term funding turned losses on housing securities into a global liquidity crisis within a few weeks.",
+    ].join(" "),
+  },
+  "https://gamma.example/crisis-regulation": {
+    title: "Regulatory gaps behind the 2008 crisis",
+    content: [
+      "Regulators left large parts of the shadow banking system outside the rules that applied to deposit-taking banks.",
+      "Over-the-counter derivatives such as credit default swaps were largely unregulated and were traded without central clearing.",
+      "The insurer AIG sold credit default swaps on mortgage securities without holding enough capital to pay the claims.",
+      "When the securities fell in value, AIG faced collateral calls it could not meet and required a government rescue.",
+      "The Financial Crisis Inquiry Commission concluded that the crisis was avoidable and blamed failures of regulation and risk management.",
+      "Congress later passed the Dodd-Frank Act in 2010 to regulate derivatives and to supervise systemically important firms.",
+    ].join(" "),
+  },
+};
+
+function createCrisisSourceTransportV1() {
+  const fetchedUrls: string[] = [];
+  const transport = async (request: {
+    url: string;
+    body?: unknown;
+  }) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          query: "causes of the 2008 financial crisis",
+          results: Object.entries(CRISIS_SOURCES_V1).map(([url, source]) => ({
+            title: source.title,
+            url,
+            snippet: source.content.slice(0, 160),
+          })),
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      const body = JSON.parse(
+        typeof request.body === "string" ? request.body : "{}",
+      ) as { url?: string };
+      const url = String(body.url ?? "");
+      const source = CRISIS_SOURCES_V1[url];
+      if (!source) throw new Error(`Unexpected fetch: ${url}`);
+      fetchedUrls.push(url);
+      return {
+        status: 200,
+        headers: {},
+        json: { title: source.title, url, content: source.content, links: [] },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+  return { transport, fetchedUrls };
+}
+
+/** A draft that cites every passage id the model has been shown, one sentence each. */
+function citeEveryShownPassageV1(request: ModelChatRequest): string {
+  const ids = getPassageCitationIds(request);
+  const sentences = Object.values(CRISIS_SOURCES_V1).flatMap((source) =>
+    source.content.split(/(?<=\.)\s+/u),
+  );
+  return [
+    "## Causes of the 2008 financial crisis",
+    "",
+    ...ids.map((id, index) => `${sentences[index % sentences.length]} [${id}]`),
+    "",
+    "## Limitations",
+    "",
+    "The sources differ in emphasis: one stresses subprime lending, another leverage and short-term funding, and the third regulatory gaps; this summary does not resolve which mattered most.",
+  ].join("\n");
+}
+
+test("a parallel read past the graph budget is refused softly and the reserved append still commits", async () => {
+  const prompt =
+    "Research the causes of the 2008 financial crisis on the web using three sources and append a concise summary with passage citations to this note.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const statuses: string[] = [];
+  const traceErrors: string[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# The 2008 financial crisis\n",
+    streamWritebackMode: "off",
+  });
+  vault.context.settings.modelRouterMode = "off";
+  vault.context.settings.researchMemoryEnabled = false;
+  const { transport, fetchedUrls } = createCrisisSourceTransportV1();
+  vault.context.httpTransport = transport;
+  const urls = Object.keys(CRISIS_SOURCES_V1);
+  let readTurns = 0;
+  let appendTurns = 0;
+  const responder: ChatResponder = (request) => {
+    const sawTool = (name: string) =>
+      request.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          (message.toolCalls ?? []).some((call) => call.name === name),
+      );
+    if (!sawTool("web_search")) {
+      return responseWithToolCall("web_search", {
+        query: "causes of the 2008 financial crisis",
+      });
+    }
+    if (!sawTool("web_fetch")) {
+      return responseWithToolCalls(
+        urls.map((url) => ({ name: "web_fetch", arguments: { url } })),
+      );
+    }
+    const unfetched = urls.find((url) => !fetchedUrls.includes(url));
+    if (unfetched) {
+      return responseWithToolCall("web_fetch", { url: unfetched });
+    }
+    if (appendTurns === 0) {
+      appendTurns += 1;
+      return responseWithToolCall("append_to_current_file", {
+        text:
+          "## Causes of the 2008 financial crisis\n\nSubprime lending, high leverage, and weak regulation caused the crisis.",
+      });
+    }
+    // The live model answered the hold by reading sections several at a
+    // time, until the graph could admit no more nodes. This one stops when
+    // the menu stops offering the read.
+    const offered = (name: string) =>
+      (request.tools ?? []).some((tool) => tool.function.name === name);
+    if (readTurns < 6 && offered("read_source_section")) {
+      readTurns += 1;
+      return responseWithToolCalls(
+        [1, 2].flatMap((section) =>
+          urls.map((url) => ({
+            name: "read_source_section",
+            arguments: { url, section: section + readTurns },
+          })),
+        ),
+      );
+    }
+    return responseWithContent(citeEveryShownPassageV1(request));
+  };
+  const client = createClient({
+    chatRequests,
+    chatResponders: Array.from({ length: 40 }, () => responder),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    // The live envelope on 2026-09-28 was 24 tool calls.
+    maxToolCalls: 24,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => {
+        if (event.error?.message) traceErrors.push(event.error.message);
+      },
+    },
+  });
+
+  // Once the graph refused a read, no later turn was offered one.
+  const offeredReadsAfterRefusal = chatRequests.filter(
+    (request) =>
+      request.messages.some((message) =>
+        /cannot be added within the graph budget/u.test(message.content),
+      ) &&
+      (request.tools ?? []).some(
+        (tool) => tool.function.name === "read_source_section",
+      ),
+  );
+  assert.equal(offeredReadsAfterRefusal.length, 0);
+  assert.ok(
+    traceErrors.some((message) =>
+      /cannot be added within the graph budget/u.test(message),
+    ),
+    "the scenario must actually exhaust the envelope",
+  );
+  const completion = completions.at(-1);
+  assert.doesNotMatch(
+    completion?.stopDetail ?? "",
+    /cannot be added within the graph budget/u,
+    JSON.stringify({ completion, executed: executedCalls.map((call) => call.name) }),
+  );
+  assert.notEqual(completion?.stopReason, "error", JSON.stringify(completion));
+  assert.equal(
+    completion?.stopReason,
+    "write_completed",
+    JSON.stringify({ completion, statuses: statuses.slice(-8) }),
+  );
+  assert.equal(
+    receipts.filter((receipt) => receipt.toolName === "append_to_current_file")
+      .length,
+    1,
+  );
+  assert.match(vault.content.get("Current.md") ?? "", /subprime mortgages/u);
+});
+
+test("a model that keeps calling the held append is handed to host-owned finalization and the note is written", async () => {
+  // The other 2026-09-28 failure: after the proof gate held the append and
+  // told the model to return the corrected note as its final answer, the
+  // model called the same append again, nine times in a row, until the step
+  // budget ended the run with the note unwritten.
+  const prompt =
+    "Research the causes of the 2008 financial crisis on the web using three sources and append a concise summary with passage citations to this note.";
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const statuses: string[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# The 2008 financial crisis\n",
+    streamWritebackMode: "off",
+  });
+  vault.context.settings.modelRouterMode = "off";
+  vault.context.settings.researchMemoryEnabled = false;
+  const { transport, fetchedUrls } = createCrisisSourceTransportV1();
+  vault.context.httpTransport = transport;
+  const urls = Object.keys(CRISIS_SOURCES_V1);
+  const uncitedDraft =
+    "## Causes of the 2008 financial crisis\n\nSubprime lending, high leverage, and weak regulation caused the crisis.";
+  let modelAppendCalls = 0;
+  let toollessDrafts = 0;
+  const responder: ChatResponder = (request) => {
+    if (!request.tools?.length) {
+      // The host's own finalization asks with no tools offered.
+      toollessDrafts += 1;
+      return responseWithContent(citeEveryShownPassageV1(request));
+    }
+    const sawTool = (name: string) =>
+      request.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          (message.toolCalls ?? []).some((call) => call.name === name),
+      );
+    if (!sawTool("web_search")) {
+      return responseWithToolCall("web_search", {
+        query: "causes of the 2008 financial crisis",
+      });
+    }
+    if (!sawTool("web_fetch")) {
+      return responseWithToolCalls(
+        urls.map((url) => ({ name: "web_fetch", arguments: { url } })),
+      );
+    }
+    const unfetched = urls.find((url) => !fetchedUrls.includes(url));
+    if (unfetched) {
+      return responseWithToolCall("web_fetch", { url: unfetched });
+    }
+    modelAppendCalls += 1;
+    return responseWithToolCall("append_to_current_file", { text: uncitedDraft });
+  };
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: Array.from({ length: 40 }, () => responder),
+    streamResponders: Array.from({ length: 10 }, () => responder),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxToolCalls: 24,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  const completion = completions.at(-1);
+  const detail = JSON.stringify({
+    completion,
+    modelAppendCalls,
+    toollessDrafts,
+    statuses: statuses.filter((message) => /Held|host-owned|Writeback|verification|correction/iu.test(message)),
+  });
+  assert.equal(completion?.stopReason, "write_completed", detail);
+  // The third hold handed the write over; the model was never asked for a
+  // fourth tool-mode append.
+  assert.equal(modelAppendCalls, HELD_WRITE_HOST_FINALIZATION_THRESHOLD, detail);
+  assert.ok(toollessDrafts >= 1, detail);
+  assert.ok(
+    statuses.some((message) => /finishing it with host-owned verification/u.test(message)),
+    detail,
+  );
+  assert.equal(
+    receipts.filter((receipt) => receipt.toolName === "append_to_current_file").length,
+    1,
+    detail,
+  );
+  assert.equal(
+    vault.operations.filter((item) => item === "modify:Current.md").length,
+    1,
+  );
+  const note = vault.content.get("Current.md") ?? "";
+  assert.match(note, /^# The 2008 financial crisis\n/u);
+  assert.match(note, /subprime mortgages/u);
+  // The uncited draft the gate held twice never reached the note.
+  assert.doesNotMatch(note, /Subprime lending, high leverage, and weak regulation caused the crisis\./u);
+});
+
+test("only a held append, three times or with the envelope spent, goes to the host", () => {
+  const decide = (heldToolName: string, heldCount: number, envelopeExhausted = false) =>
+    shouldHandHeldWriteToHostV1({ heldToolName, heldCount, envelopeExhausted });
+  // The first two holds go back to the model, which usually follows them.
+  assert.equal(decide("append_to_current_file", 1), false);
+  assert.equal(decide("append_to_current_file", 2), false);
+  assert.equal(decide("append_to_current_file", 3), true);
+  // With the envelope spent there is nothing left for the model to do but write.
+  assert.equal(decide("append_to_current_file", 1, true), true);
+  // A replacement needs its own approval and a section edit its prepared
+  // target; neither is handed over.
+  assert.equal(decide("replace_current_file", 5, true), false);
+  assert.equal(decide("edit_current_section", 5, true), false);
 });
 
 test("multi-step CRUD mission continues after the first mutation", async () => {

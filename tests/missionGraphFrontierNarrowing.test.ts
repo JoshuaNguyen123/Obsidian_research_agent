@@ -873,6 +873,66 @@ test("the dynamic-read predicate answers for both seats at once", () => {
   );
 });
 
+test("a spent envelope admits no dynamic read on any plan", () => {
+  // After one `budget_exhausted` refusal the authority refuses every further
+  // dynamic read (each asks for the same budget and none ever comes back), so
+  // the menu must stop offering them too. On 2026-09-28 it did not, and live
+  // sourced-note missions spent their last steps on refused reads.
+  for (const usesExactPlannedFrontier of [true, false]) {
+    for (const setLooseCompoundEnabled of [true, false]) {
+      assert.equal(
+        missionGraphRunAdmitsDynamicReadContinuationV1({
+          usesExactPlannedFrontier,
+          setLooseCompoundEnabled,
+          envelopeExhausted: true,
+        }),
+        false,
+      );
+    }
+  }
+  // Not yet refused: the plan's own answer stands.
+  assert.equal(
+    missionGraphRunAdmitsDynamicReadContinuationV1({
+      usesExactPlannedFrontier: false,
+      setLooseCompoundEnabled: false,
+      envelopeExhausted: false,
+    }),
+    true,
+  );
+  // With the envelope spent the offered menu keeps only the ready nodes: the
+  // pending append stays, the capability reads go.
+  const graph = {
+    nodes: {
+      "tool-05-append_to_current_file": {
+        id: "tool-05-append_to_current_file",
+        status: "ready",
+        allowedTools: ["append_to_current_file"],
+        inputs: {},
+        outputs: {},
+      },
+      final: { id: "final", status: "queued", allowedTools: [], inputs: {}, outputs: {} },
+    },
+    capabilityEnvelope: {
+      tools: {
+        read_source_section: { effect: "read" },
+        verify_citation: { effect: "read" },
+        web_fetch: { effect: "read" },
+      },
+    },
+  } as any;
+  const admits = missionGraphRunAdmitsDynamicReadContinuationV1({
+    usesExactPlannedFrontier: false,
+    setLooseCompoundEnabled: false,
+    envelopeExhausted: true,
+  });
+  const names = constrainToolsToMissionGraphFrontier(
+    ["append_to_current_file", "read_source_section", "verify_citation", "web_fetch"].map(tool),
+    graph,
+    { includeCapabilityReads: admits, allowDynamicReadContinuation: admits },
+  ).map((definition) => definition.function.name);
+  assert.deepEqual(names, ["append_to_current_file"]);
+});
+
 test("the offered menu and the authority read the same predicate", () => {
   // The end state the two booleans must reach: whatever the predicate says,
   // `includeCapabilityReads` and `allowDynamicReadContinuation` agree, so the

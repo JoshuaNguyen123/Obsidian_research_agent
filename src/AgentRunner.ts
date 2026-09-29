@@ -3917,6 +3917,15 @@ export async function runAgentMission({
    */
   const proofGateWriteRejectionCountsByTool = new Map<string, number>();
   /**
+   * Per-tool count of holds on the OTHER arm: the evidence is complete and
+   * only the draft failed verification, so the hold told the model to return
+   * the corrected note as its final answer. A model that calls the same write
+   * again, and again (live glm-5.3-flash did it nine times in a row on
+   * 2026-09-28), is handed to host-owned finalization — see
+   * `shouldHandHeldWriteToHostV1`.
+   */
+  const verifiedFinalHoldCountsByTool = new Map<string, number>();
+  /**
    * Offered-menu history for this run: tool name -> the most recent step whose
    * offered menu carried it.
    *
@@ -6164,6 +6173,7 @@ export async function runAgentMission({
     missionGraphRunAdmitsDynamicReadContinuationV1({
       usesExactPlannedFrontier: missionGraphUsesExactPlannedFrontier,
       setLooseCompoundEnabled,
+      envelopeExhausted: missionGraphCapacityExhausted,
     });
 
   const beginMissionGraphTool = async (
@@ -20400,6 +20410,26 @@ export async function runAgentMission({
         });
       }
     }
+    if (missionGraphCapacityExhausted) {
+      // Say why the reads left the menu, so a model that still names one is
+      // told the envelope is spent rather than that it picked a wrong name.
+      const envelopeTools =
+        (missionGraphSession?.graph ?? stepGraph)?.capabilityEnvelope.tools ??
+        {};
+      for (const tool of tools) {
+        const name = tool.function.name;
+        if (
+          envelopeTools[name]?.effect === "read" &&
+          !stepTools.some((offered) => offered.function.name === name)
+        ) {
+          toolMenuWithholdReasonByTool.set(
+            name,
+            "graph_capacity: the mission graph has no budget left for another read; " +
+              "the ready nodes, including a pending note write, keep their reserved slots",
+          );
+        }
+      }
+    }
     const stepAllowedToolNames = new Set(
       stepTools.map((tool) => tool.function.name),
     );
@@ -23581,6 +23611,7 @@ export async function runAgentMission({
     let shouldReplanAfterUnavailableTool = false;
     let lastUnavailableToolName: string | null = null;
     let shouldReplanAfterProofGatedWriteTool = false;
+    let handHeldAppendToHostFinalization = false;
     let shouldReplanAfterLiteralWrite = false;
     let lifecycleStageMutationAttemptedThisResponse = false;
     let workspaceCorrectionAttemptedThisResponse = false;
@@ -24715,6 +24746,19 @@ export async function runAgentMission({
           // held so frontier rejections stop advising the same name while
           // the hold stands.
           lastProofGatedHoldToolName = hold.heldWriteToolName;
+          const heldCount =
+            (verifiedFinalHoldCountsByTool.get(hold.heldWriteToolName) ?? 0) +
+            1;
+          verifiedFinalHoldCountsByTool.set(hold.heldWriteToolName, heldCount);
+          if (
+            shouldHandHeldWriteToHostV1({
+              heldToolName: hold.heldWriteToolName,
+              heldCount,
+              envelopeExhausted: missionGraphCapacityExhausted,
+            })
+          ) {
+            handHeldAppendToHostFinalization = true;
+          }
         }
         if (hold.narrowsOfferedFrontier) {
           // Evidence-incomplete arm: repeated re-tries of the same held tool
@@ -24838,6 +24882,9 @@ export async function runAgentMission({
       }
 
       if (
+        // Once the envelope has refused a node, every further read takes the
+        // sequential path, which answers the graph's refusal softly.
+        !missionGraphCapacityExhausted &&
         isDescriptorApprovedParallelRead(
           toolRegistry.getDescriptor?.(toolCall.name),
         )
@@ -24912,13 +24959,26 @@ export async function runAgentMission({
             const graphExecutions: Array<MissionGraphToolExecution | null> = [];
             try {
               for (const item of batch) {
-                graphExecutions.push(
-                  await beginMissionGraphTool(item.call.name, {
+                let execution: MissionGraphToolExecution | null;
+                try {
+                  execution = await beginMissionGraphTool(item.call.name, {
                     // Every call in this barrier is deliberately in flight.
                     // A same-name running node is not an abandoned execution.
                     recoverOrphanedRunning: false,
-                  }),
-                );
+                  });
+                } catch (error) {
+                  // The envelope has no room for another node. That is the
+                  // graph's answer to this one call, not a failed tool: the
+                  // sequential path answers it softly and the run goes on.
+                  // Rethrowing it here ended live sourced-note missions as
+                  // "Tool execution failed" while their append node still
+                  // held its own reserved slot (2026-09-28). Run the
+                  // admitted prefix; the rest take the sequential path.
+                  if (!isMissionGraphCapacityError(error)) throw error;
+                  batch.splice(graphExecutions.length);
+                  break;
+                }
+                graphExecutions.push(execution);
               }
             } catch (error) {
               for (let index = 0; index < graphExecutions.length; index += 1) {
@@ -24988,8 +25048,12 @@ export async function runAgentMission({
             await finishErroredRunFromException(error, step, stepLimit, "tool");
             return;
           }
-          toolIndex += batch.length;
-          continue;
+          // An empty batch means the graph admitted none of it: this call
+          // falls through to the sequential path, which refuses it softly.
+          if (batch.length > 0) {
+            toolIndex += batch.length;
+            continue;
+          }
         }
       }
 
@@ -25218,6 +25282,78 @@ export async function runAgentMission({
         role: "system" as const,
         content:
           "The exact note write completed with a receipt. Continue only with remaining operation goals.",
+      });
+      continue;
+    }
+
+    if (
+      // No `step < stepLimit`: the host path spends no loop step (its model
+      // calls are bounded by its own corrections), so a second hold on the
+      // last step still gets its write.
+      handHeldAppendToHostFinalization &&
+      !setLooseCompoundEnabled &&
+      isPendingRequiredWriteReady(
+        "append_to_current_file",
+        getPendingRequiredWriteToolNames(operationGoals, requiredWriteTools),
+      )
+    ) {
+      // `shouldHandHeldWriteToHostV1`: the model was told to return the
+      // corrected note and called the held append again instead (or the
+      // envelope is spent). The host drafts, verifies and commits it through
+      // the same gate, with the accepted passages in front of the model.
+      events.onStatus?.(
+        "The proof gate held the same note append again; finishing it with host-owned verification from the accepted sources...",
+      );
+      let receipt: AgentRunReceipt;
+      try {
+        const committedReceipt = await runProofGatedCurrentNoteWriteback(
+          {
+            kind: "append",
+            preparedSectionEdit: preparedStreamingSectionEdit,
+            modelClient,
+            messages: [
+              ...messages,
+              {
+                role: "system" as const,
+                content:
+                  "The research is complete. Do not request tools. Return only the complete sourced markdown to append to the current note, citing the accepted passage ids; the host will verify it and commit it once.",
+              },
+            ],
+            events,
+            toolContext: runToolContext,
+            knownToolNames,
+            relevancePrompt: finalAnswerRelevancePrompt,
+            think: resolveWritebackThink(runToolContext.settings),
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+          },
+          step,
+          stepLimit,
+        );
+        if (!committedReceipt) {
+          return;
+        }
+        receipt = committedReceipt;
+      } catch (error) {
+        if (await stopIfRequested(step)) {
+          return;
+        }
+        await finishErroredRunFromException(error, step, stepLimit, "model");
+        return;
+      }
+      markStreamingWritebackGoalDone(operationGoals, "append");
+      writeReceipts.push(receipt);
+      events.onReceipt?.(receipt);
+      await recordLedgerReceipt(receipt);
+      if (!hasPendingOperationGoals(operationGoals)) {
+        await finishRun("write_completed", step, stepLimit);
+        return;
+      }
+      messages.push({
+        role: "system" as const,
+        content:
+          "The note append completed with a receipt. Continue only with remaining operation goals.",
       });
       continue;
     }
@@ -27586,6 +27722,48 @@ export type CompoundResearchToolCallGateV1 =
  * one tool the frontier stops offering it until the proofs clear.
  */
 export const PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD = 2;
+
+/**
+ * Holds of one current-note append, on the verified-final arm, after which
+ * the host finishes the write itself.
+ */
+export const HELD_WRITE_HOST_FINALIZATION_THRESHOLD = 3;
+
+/**
+ * Should a write the proof gate just held on the verified-final arm (the
+ * evidence is complete, only the draft failed verification) be finished by
+ * host-owned finalization rather than handed back to the model?
+ *
+ * The hold asks the model to return the corrected note as its final answer.
+ * On the 2026-09-28 live comparison glm-5.3-flash mostly did not: it called
+ * the same append again (nine times in a row in one run) or went reading
+ * sources to verify its own citations, one mission-graph node per read,
+ * until the step budget or the graph's envelope ran out and the note was
+ * never written. `runProofGatedCurrentNoteWriteback` is the path that owns
+ * this case: it hands the model the accepted passages, drafts with no tools
+ * offered, applies the same verification, bounded corrections and claim
+ * checks, and commits through the append node's own reserved slot. Nothing
+ * about what may be written changes; only who drives the last step.
+ *
+ * Only the append is handed over: a replacement needs its own approval and
+ * a section edit a prepared target, which the model's call carries and this
+ * path would not. The first two holds still go back to the model: a model
+ * that sends a premature draft twice and then returns the corrected note
+ * (pinned by "a phase-deferred conflicting-source append recovers and commits
+ * exactly once") keeps its own turn. With the envelope already spent the
+ * model has nothing left to do but write, so the first hold hands over.
+ */
+export function shouldHandHeldWriteToHostV1(input: {
+  heldToolName: string;
+  heldCount: number;
+  envelopeExhausted: boolean;
+}): boolean {
+  if (input.heldToolName !== "append_to_current_file") return false;
+  return (
+    input.envelopeExhausted ||
+    input.heldCount >= HELD_WRITE_HOST_FINALIZATION_THRESHOLD
+  );
+}
 
 /**
  * Drop tools that repeatedly hit `proof_gated_writeback_required` while
