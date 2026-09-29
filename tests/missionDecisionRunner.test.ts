@@ -290,12 +290,15 @@ test("a decision outage is recorded as unavailable and never as a tool failure",
   assert.ok(!modelText(h).includes(DECISION_EVIDENCE_CLAUSES_V1.web));
 });
 
-test("an Enabled setting on an unpromoted component runs in Shadow and says so", async () => {
+test("routing is promoted: an Enabled setting acts with no harness switch", async () => {
+  // Mission routing passed its held-out gates and the owner switched it on
+  // (2026-09-28). An unpromoted component still runs in Shadow; that
+  // resolution is pinned in decisionRuntime.test.ts with claim support.
   const h = harness({ settings: { decisionModelMode: "enabled" } });
   await runUntilFirstModelCall(h, PARAPHRASE);
   assert.equal(h.decisionRequests.length, 1);
-  assert.ok(!modelText(h).includes(DECISION_EVIDENCE_CLAUSES_V1.web));
-  assert.ok(h.traces.some((trace) => trace.id === "decision-mode-held-in-shadow"));
+  assert.ok(modelText(h).includes(DECISION_EVIDENCE_CLAUSES_V1.web), "the model sees the contract");
+  assert.ok(!h.traces.some((trace) => trace.id === "decision-mode-held-in-shadow"));
 });
 
 function baseSettings(): AgentSettings {

@@ -109,14 +109,17 @@ test("Off constructs no runtime and so can make no request", async () => {
 });
 
 test("an unpromoted component configured Enabled runs in Shadow and says why", () => {
-  const routing = resolveDecisionComponentModeV1("enabled", "mission_routing");
-  assert.equal(routing.effective, "shadow");
-  assert.match(routing.heldInShadowBecause ?? "", /gates/u);
-  assert.equal(DECISION_PROMOTION_MANIFEST_V1.mission_routing.promoted, false);
   // Claim support passed its held-out gates (2026-09-28) but held a good
   // note over a limitations sentence end to end, so it stays in Shadow.
+  const claims = resolveDecisionComponentModeV1("enabled", "claim_support");
+  assert.equal(claims.effective, "shadow");
+  assert.match(claims.heldInShadowBecause ?? "", /Shadow|limitations/u);
   assert.equal(DECISION_PROMOTION_MANIFEST_V1.claim_support.promoted, false);
-  assert.equal(resolveDecisionComponentModeV1("enabled", "claim_support").effective, "shadow");
+  // Mission routing passed every held-out gate and the owner switched it on.
+  assert.equal(DECISION_PROMOTION_MANIFEST_V1.mission_routing.promoted, true);
+  assert.equal(resolveDecisionComponentModeV1("enabled", "mission_routing").effective, "enabled");
+  assert.equal(resolveDecisionComponentModeV1("shadow", "mission_routing").effective, "shadow");
+  assert.equal(resolveDecisionComponentModeV1("off", "mission_routing").effective, "off");
   assert.equal(resolveDecisionComponentModeV1("enabled", "claim_support", PROMOTED).effective, "enabled");
   assert.equal(resolveDecisionComponentModeV1("shadow", "claim_support", PROMOTED).effective, "shadow");
   assert.equal(resolveDecisionComponentModeV1("off", "claim_support", PROMOTED).effective, "off");
