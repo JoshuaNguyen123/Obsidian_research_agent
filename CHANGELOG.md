@@ -2,6 +2,12 @@
 
 All notable changes to Agentic Researcher are documented here.
 
+## [Unreleased] — sourced notes get written before time runs out (2026-09-29)
+
+### Fixed
+- **A held note append is written before the time limit, not after it.** On a slow model the mission could spend its tool budget, leave the held note write as the only thing to do, and then ask the model for one more turn. That turn (almost four minutes on a live run) ran into the mission's time limit, and the note was never written. Once a draft has been held, Agentic Researcher now finishes the write itself instead of asking again, in two cases: when the tool budget is spent, or when too little time is left for both another turn and the finishing draft. The checks are the same ones the model's own write would have met.
+- **The model's commentary on a correction no longer lands in the note.** Answering a citation correction, a model sometimes wrote a long paragraph about which claim the checker had flagged, then "Here is the corrected note content:", before the note itself. Short lead-ins like that were already removed, but a long one was written into the note verbatim. It is now removed too, but only when it ends in such a lead-in and talks about the verification. A long introduction that belongs to the note is kept.
+
 ## [Unreleased] — sourced notes get written (2026-09-28)
 
 ### Fixed

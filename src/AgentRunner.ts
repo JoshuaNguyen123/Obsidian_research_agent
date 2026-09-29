@@ -3926,6 +3926,13 @@ export async function runAgentMission({
    */
   const verifiedFinalHoldCountsByTool = new Map<string, number>();
   /**
+   * The longest single model turn of this run so far. With a held note
+   * append ready, `shouldFinalizeHeldAppendBeforeNextTurnV1` reads it to ask
+   * whether one more tool turn and the host's own draft would both still fit
+   * before the wall-clock deadline.
+   */
+  let longestModelTurnMs = 0;
+  /**
    * Offered-menu history for this run: tool name -> the most recent step whose
    * offered menu carried it.
    *
@@ -19592,6 +19599,78 @@ export async function runAgentMission({
     }
   }
 
+  const isHeldAppendReadyForHost = () =>
+    !setLooseCompoundEnabled &&
+    isPendingRequiredWriteReady(
+      "append_to_current_file",
+      getPendingRequiredWriteToolNames(operationGoals, requiredWriteTools),
+    );
+  /**
+   * Host-owned finalization of a held note append: the host drafts with the
+   * accepted passages and no tools, verifies, corrects within its own bound
+   * and commits through the append node's reserved slot. "ended" means the
+   * run is over (written, stopped or failed); "continue" means the append
+   * landed and other operation goals remain.
+   */
+  const finishHeldAppendThroughHost = async (
+    step: number,
+    status: string,
+  ): Promise<"ended" | "continue"> => {
+    events.onStatus?.(status);
+    let receipt: AgentRunReceipt;
+    try {
+      const committedReceipt = await runProofGatedCurrentNoteWriteback(
+        {
+          kind: "append",
+          preparedSectionEdit: preparedStreamingSectionEdit,
+          modelClient,
+          messages: [
+            ...messages,
+            {
+              role: "system" as const,
+              content:
+                "The research is complete. Do not request tools. Return only the complete sourced markdown to append to the current note, citing the accepted passage ids; the host will verify it and commit it once.",
+            },
+          ],
+          events,
+          toolContext: runToolContext,
+          knownToolNames,
+          relevancePrompt: finalAnswerRelevancePrompt,
+          think: resolveWritebackThink(runToolContext.settings),
+          options: modelOptions,
+          abortSignal,
+          onThinkingUnsupported: disableThinkingForRun,
+        },
+        step,
+        stepLimit,
+      );
+      if (!committedReceipt) {
+        return "ended";
+      }
+      receipt = committedReceipt;
+    } catch (error) {
+      if (await stopIfRequested(step)) {
+        return "ended";
+      }
+      await finishErroredRunFromException(error, step, stepLimit, "model");
+      return "ended";
+    }
+    markStreamingWritebackGoalDone(operationGoals, "append");
+    writeReceipts.push(receipt);
+    events.onReceipt?.(receipt);
+    await recordLedgerReceipt(receipt);
+    if (!hasPendingOperationGoals(operationGoals)) {
+      await finishRun("write_completed", step, stepLimit);
+      return "ended";
+    }
+    messages.push({
+      role: "system" as const,
+      content:
+        "The note append completed with a receipt. Continue only with remaining operation goals.",
+    });
+    return "continue";
+  };
+
   for (let step = 1; step <= stepLimit + finalRetryExtraSteps; step += 1) {
     // The previous step's deferred ledger persist lands before the next
     // model wait, so a kill mid-call cannot leave the ledger a tool behind.
@@ -19633,6 +19712,43 @@ export async function runAgentMission({
       );
       await finishRun("budget", Math.max(lastStep, step), stepLimit, message);
       return;
+    }
+
+    if (
+      isHeldAppendReadyForHost() &&
+      shouldFinalizeHeldAppendBeforeNextTurnV1({
+        heldCount:
+          verifiedFinalHoldCountsByTool.get("append_to_current_file") ?? 0,
+        envelopeExhausted: missionGraphCapacityExhausted,
+        remainingWallClockMs:
+          maxRunMs === null ? null : maxRunMs - (nowMs() - runStartedAt),
+        longestModelTurnMs,
+      })
+    ) {
+      events.onTrace?.({
+        id: `held-append-finalize-now:${step}`,
+        kind: "status",
+        step,
+        message:
+          "The held note append goes to host-owned finalization before another model turn.",
+        outputPreview: {
+          envelopeExhausted: missionGraphCapacityExhausted,
+          remainingWallClockMs:
+            maxRunMs === null
+              ? null
+              : Math.round(maxRunMs - (nowMs() - runStartedAt)),
+          longestModelTurnMs: Math.round(longestModelTurnMs),
+        },
+      });
+      if (
+        (await finishHeldAppendThroughHost(
+          step,
+          "The note is ready to write and another model turn would not help; finishing it with host-owned verification from the accepted sources...",
+        )) === "ended"
+      ) {
+        return;
+      }
+      continue;
     }
 
     lastStep = step;
@@ -21122,6 +21238,7 @@ export async function runAgentMission({
         );
       }
       previousStepRequestMessages = stepChatRequestBuilt.messages;
+      const modelTurnStartedAt = nowMs();
       response = await chatForAgentStep(
         modelClient,
         stepChatRequestBuilt,
@@ -21129,6 +21246,10 @@ export async function runAgentMission({
         step,
         disableThinkingForRun,
         enableStreaming,
+      );
+      longestModelTurnMs = Math.max(
+        longestModelTurnMs,
+        nowMs() - modelTurnStartedAt,
       );
     } catch (error) {
       if (await stopIfRequested(step)) {
@@ -25291,70 +25412,20 @@ export async function runAgentMission({
       // calls are bounded by its own corrections), so a second hold on the
       // last step still gets its write.
       handHeldAppendToHostFinalization &&
-      !setLooseCompoundEnabled &&
-      isPendingRequiredWriteReady(
-        "append_to_current_file",
-        getPendingRequiredWriteToolNames(operationGoals, requiredWriteTools),
-      )
+      isHeldAppendReadyForHost()
     ) {
       // `shouldHandHeldWriteToHostV1`: the model was told to return the
       // corrected note and called the held append again instead (or the
       // envelope is spent). The host drafts, verifies and commits it through
       // the same gate, with the accepted passages in front of the model.
-      events.onStatus?.(
-        "The proof gate held the same note append again; finishing it with host-owned verification from the accepted sources...",
-      );
-      let receipt: AgentRunReceipt;
-      try {
-        const committedReceipt = await runProofGatedCurrentNoteWriteback(
-          {
-            kind: "append",
-            preparedSectionEdit: preparedStreamingSectionEdit,
-            modelClient,
-            messages: [
-              ...messages,
-              {
-                role: "system" as const,
-                content:
-                  "The research is complete. Do not request tools. Return only the complete sourced markdown to append to the current note, citing the accepted passage ids; the host will verify it and commit it once.",
-              },
-            ],
-            events,
-            toolContext: runToolContext,
-            knownToolNames,
-            relevancePrompt: finalAnswerRelevancePrompt,
-            think: resolveWritebackThink(runToolContext.settings),
-            options: modelOptions,
-            abortSignal,
-            onThinkingUnsupported: disableThinkingForRun,
-          },
+      if (
+        (await finishHeldAppendThroughHost(
           step,
-          stepLimit,
-        );
-        if (!committedReceipt) {
-          return;
-        }
-        receipt = committedReceipt;
-      } catch (error) {
-        if (await stopIfRequested(step)) {
-          return;
-        }
-        await finishErroredRunFromException(error, step, stepLimit, "model");
+          "The proof gate held the same note append again; finishing it with host-owned verification from the accepted sources...",
+        )) === "ended"
+      ) {
         return;
       }
-      markStreamingWritebackGoalDone(operationGoals, "append");
-      writeReceipts.push(receipt);
-      events.onReceipt?.(receipt);
-      await recordLedgerReceipt(receipt);
-      if (!hasPendingOperationGoals(operationGoals)) {
-        await finishRun("write_completed", step, stepLimit);
-        return;
-      }
-      messages.push({
-        role: "system" as const,
-        content:
-          "The note append completed with a receipt. Continue only with remaining operation goals.",
-      });
       continue;
     }
 
@@ -27763,6 +27834,42 @@ export function shouldHandHeldWriteToHostV1(input: {
     input.envelopeExhausted ||
     input.heldCount >= HELD_WRITE_HOST_FINALIZATION_THRESHOLD
   );
+}
+
+/**
+ * Before the next model turn: should a note append the proof gate has already
+ * held go straight to host-owned finalization?
+ *
+ * `shouldHandHeldWriteToHostV1` fires only when the model calls the held
+ * append again, so it costs one more model turn. On the 2026-09-29 live
+ * re-run (glm-5.3-flash, about 100 s a turn) the graph's envelope was spent
+ * at 670 s, the only thing left on the menu was the held append, and the
+ * model thought for 229 s before choosing it; the 905 s wall-clock deadline
+ * aborted that turn and the note was never written.
+ *
+ * So, once the append has been held at least once:
+ * - with the envelope spent, the model's only move is that same append (or a
+ *   read the graph will refuse), so the turn is skipped;
+ * - with less wall-clock time left than two of this run's longest model
+ *   turns, one more tool turn and the host's own draft cannot both fit, so
+ *   the draft goes first.
+ * An append never held keeps the model's own first draft, and a run with no
+ * deadline or no measured turn is never cut short here. The gate, the
+ * citation contract and the corrections are the same ones the model's call
+ * would have met.
+ */
+export function shouldFinalizeHeldAppendBeforeNextTurnV1(input: {
+  heldCount: number;
+  envelopeExhausted: boolean;
+  remainingWallClockMs: number | null;
+  longestModelTurnMs: number;
+}): boolean {
+  if (input.heldCount < 1) return false;
+  if (input.envelopeExhausted) return true;
+  if (input.remainingWallClockMs === null || input.longestModelTurnMs <= 0) {
+    return false;
+  }
+  return input.remainingWallClockMs < 2 * input.longestModelTurnMs;
 }
 
 /**

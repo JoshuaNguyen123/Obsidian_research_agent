@@ -85,6 +85,7 @@ import {
   containProofGateRejectedWriteToolsV1,
   PROOF_GATE_FRONTIER_CONTAINMENT_THRESHOLD,
   HELD_WRITE_HOST_FINALIZATION_THRESHOLD,
+  shouldFinalizeHeldAppendBeforeNextTurnV1,
   shouldHandHeldWriteToHostV1,
   canonicalRequiredLiteralWriteContentV1,
   repairOrderedCurrentNoteAppendFrontierToolCallsV1,
@@ -21193,6 +21194,161 @@ test("only a held append, three times or with the envelope spent, goes to the ho
   // target; neither is handed over.
   assert.equal(decide("replace_current_file", 5, true), false);
   assert.equal(decide("edit_current_section", 5, true), false);
+});
+
+test("a held append with the envelope spent is finalized by the host before another model turn", async () => {
+  // The 2026-09-29 live re-run: the envelope was spent at 670 s with the held
+  // append the only move left, and the model's next turn ran into the
+  // wall-clock deadline before it chose it. The host no longer asks.
+  const prompt =
+    "Research the causes of the 2008 financial crisis on the web using three sources and append a concise summary with passage citations to this note.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const traces: Array<{ id: string; error?: string }> = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# The 2008 financial crisis\n",
+    streamWritebackMode: "off",
+  });
+  vault.context.settings.modelRouterMode = "off";
+  vault.context.settings.researchMemoryEnabled = false;
+  const { transport, fetchedUrls } = createCrisisSourceTransportV1();
+  vault.context.httpTransport = transport;
+  const urls = Object.keys(CRISIS_SOURCES_V1);
+  let appendTurns = 0;
+  let readTurns = 0;
+  const toolTurnsAfterRefusal: string[][] = [];
+  const responder: ChatResponder = (request) => {
+    if (!request.tools?.length) {
+      return responseWithContent(citeEveryShownPassageV1(request));
+    }
+    if (traces.some((trace) => /cannot be added within the graph budget/u.test(trace.error ?? ""))) {
+      toolTurnsAfterRefusal.push((request.tools ?? []).map((tool) => tool.function.name));
+    }
+    const sawTool = (name: string) =>
+      request.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          (message.toolCalls ?? []).some((call) => call.name === name),
+      );
+    if (!sawTool("web_search")) {
+      return responseWithToolCall("web_search", {
+        query: "causes of the 2008 financial crisis",
+      });
+    }
+    if (!sawTool("web_fetch")) {
+      return responseWithToolCalls(
+        urls.map((url) => ({ name: "web_fetch", arguments: { url } })),
+      );
+    }
+    const unfetched = urls.find((url) => !fetchedUrls.includes(url));
+    if (unfetched) {
+      return responseWithToolCall("web_fetch", { url: unfetched });
+    }
+    if (appendTurns === 0) {
+      appendTurns += 1;
+      return responseWithToolCall("append_to_current_file", {
+        text:
+          "## Causes of the 2008 financial crisis\n\nSubprime lending, high leverage, and weak regulation caused the crisis.",
+      });
+    }
+    const offered = (name: string) =>
+      (request.tools ?? []).some((tool) => tool.function.name === name);
+    if (readTurns < 8 && offered("read_source_section")) {
+      readTurns += 1;
+      return responseWithToolCalls(
+        [1, 2].flatMap((section) =>
+          urls.map((url) => ({
+            name: "read_source_section",
+            arguments: { url, section: section + readTurns },
+          })),
+        ),
+      );
+    }
+    appendTurns += 1;
+    return responseWithToolCall("append_to_current_file", {
+      text:
+        "## Causes of the 2008 financial crisis\n\nSubprime lending, high leverage, and weak regulation caused the crisis.",
+    });
+  };
+  const client = createClient({
+    chatRequests,
+    chatResponders: Array.from({ length: 40 }, () => responder),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxToolCalls: 24,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
+      onTrace: (event) => traces.push({ id: event.id, error: event.error?.message }),
+    },
+  });
+
+  const completion = completions.at(-1);
+  const detail = JSON.stringify({
+    completion,
+    appendTurns,
+    readTurns,
+    toolTurnsAfterRefusal,
+    traces: traces.map((trace) => trace.id).filter((id) => /held|hold|finalize|capacity/iu.test(id)),
+  });
+  assert.ok(
+    traces.some((trace) => /cannot be added within the graph budget/u.test(trace.error ?? "")),
+    `the scenario must actually exhaust the envelope: ${detail}`,
+  );
+  assert.ok(
+    traces.some((trace) => trace.id.startsWith("held-append-finalize-now:")),
+    detail,
+  );
+  // Once the graph had refused a read, the model was never asked for another
+  // tool turn: the host drafted with no tools and committed.
+  assert.deepEqual(toolTurnsAfterRefusal, [], detail);
+  assert.equal(appendTurns, 1, detail);
+  assert.equal(completion?.stopReason, "write_completed", detail);
+  assert.equal(
+    receipts.filter((receipt) => receipt.toolName === "append_to_current_file").length,
+    1,
+    detail,
+  );
+  const note = vault.content.get("Current.md") ?? "";
+  assert.match(note, /^# The 2008 financial crisis\n/u);
+  assert.match(note, /subprime mortgages/u);
+  assert.doesNotMatch(note, /Subprime lending, high leverage, and weak regulation caused the crisis\./u);
+});
+
+test("a held append skips the next model turn only with the envelope spent or too little time for two turns", () => {
+  const decide = (
+    heldCount: number,
+    envelopeExhausted: boolean,
+    remainingWallClockMs: number | null,
+    longestModelTurnMs: number,
+  ) =>
+    shouldFinalizeHeldAppendBeforeNextTurnV1({
+      heldCount,
+      envelopeExhausted,
+      remainingWallClockMs,
+      longestModelTurnMs,
+    });
+  // Never held: the model's own first draft always gets its turn.
+  assert.equal(decide(0, true, 1_000, 200_000), false);
+  // Held, envelope spent: the only move left is the same append.
+  assert.equal(decide(1, true, null, 0), true);
+  // The live re-run at step 9 (558 s of 905 s gone, turns up to 189 s):
+  // another turn and the host's draft no longer both fit.
+  assert.equal(decide(2, false, 346_000, 189_000), true);
+  // Plenty of time for both.
+  assert.equal(decide(2, false, 600_000, 189_000), false);
+  // No deadline, or nothing measured yet: never cut short.
+  assert.equal(decide(2, false, null, 189_000), false);
+  assert.equal(decide(2, false, 1_000, 0), false);
 });
 
 test("multi-step CRUD mission continues after the first mutation", async () => {

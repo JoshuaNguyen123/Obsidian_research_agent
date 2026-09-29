@@ -84,6 +84,37 @@ test("a lead-in line ending with a colon is stripped even without a first-person
   assert.equal(result.content, note);
 });
 
+test("a long verifier preamble ending in a lead-in is stripped (live correction round, 2026-09-29)", () => {
+  const note =
+    "# Causes of the 2008 Financial Crisis\n\n- Housing losses triggered it. [source:zk80m0:passage:1536-2236]\n";
+  const preamble =
+    "The most recent verification flags claim `s-dd3328bb45`, which corresponds to the Blanchard bullet " +
+    "(source:1np7caa:passage:4333-5033) asserting a combination of developments in macro policy and financial " +
+    "intermediation. That is the one bullet whose text I could not verify against its passage window; the other " +
+    "bullet sentences rest on quoted or strongly anchored passage terms. Removing or reformulating ungrounded " +
+    "claims is required, and every accepted identifier must appear at least once.\n\n" +
+    "Here is the corrected note content:\n\n";
+  assert.ok(preamble.length > 400, "the case is the one the length cap let through");
+  const result = stripWritebackDialoguePreamble(preamble + note);
+  assert.equal(result.content, note);
+  assert.match(result.strippedPreamble ?? "", /verification flags claim/u);
+});
+
+test("a long introduction that ends in a lead-in but says nothing of verification is kept", () => {
+  const candidate =
+    "The 2008 crisis grew out of a decade of rising house prices, loosening mortgage standards and a " +
+    "securitization chain that spread housing risk across the banking system. When prices turned, losses " +
+    "surfaced in places regulators had not been watching, and short-term funding markets froze. Economists " +
+    "still weigh these causes differently, and this note keeps their disagreements visible rather than " +
+    "settling them; each section names the source that makes its case.\n\n" +
+    "Here is how the sources divide the causes:\n\n" +
+    "## Triggers\n\nHousing losses.\n";
+  assert.ok(candidate.indexOf("## Triggers") > 400);
+  const result = stripWritebackDialoguePreamble(candidate);
+  assert.equal(result.content, candidate);
+  assert.equal(result.strippedPreamble, null);
+});
+
 test("a candidate opening with YAML frontmatter is never touched", () => {
   const candidate = "---\ntitle: x\n---\n\nHere is a phrase:\n\n# Heading\n";
   const result = stripWritebackDialoguePreamble(candidate);

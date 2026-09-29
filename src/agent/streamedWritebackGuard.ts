@@ -216,6 +216,8 @@ const PREAMBLE_MAX_CHARS = 400;
 const PREAMBLE_MAX_LINES = 4;
 const PREAMBLE_DIALOGUE_OPENER =
   /^(?:here(?:'|’)?s\b|here is\b|below is\b|sure\b|certainly\b|of course\b|okay\b|ok[,.!]|as requested\b|i(?:'|’)?ve\b|i have\b|i (?:corrected|updated|revised|rewrote|fixed|addressed)\b|this is the\b|the (?:corrected|revised|updated) \b)/iu;
+const PREAMBLE_VERIFIER_TALK =
+  /\b(?:verif(?:y|ied|ies|ier|ication)|flag(?:s|ged)?|ungrounded|accepted (?:passage )?id(?:entifier)?s?|claim `?s-[0-9a-f]{6,})/iu;
 
 /**
  * Drop conversational dialogue the model emitted above the note's opening
@@ -232,7 +234,9 @@ const PREAMBLE_DIALOGUE_OPENER =
  * it is dialogue: the candidate does not open with YAML frontmatter, a `#`
  * heading appears early, the prefix is short plain prose with no markdown
  * structure of its own, and it either opens with a dialogue phrase or ends
- * with the colon of a lead-in. Anything ambiguous is kept verbatim.
+ * with the colon of a lead-in. A prefix past the length cap is removed only
+ * when its last line is a dialogue lead-in and it talks about verification.
+ * Anything ambiguous is kept verbatim.
  */
 export function stripWritebackDialoguePreamble(
   candidate: string,
@@ -254,12 +258,23 @@ export function stripWritebackDialoguePreamble(
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-  if (
-    prefixLines.length === 0 ||
-    prefixLines.length > PREAMBLE_MAX_LINES ||
-    prefix.trim().length > PREAMBLE_MAX_CHARS
-  ) {
+  if (prefixLines.length === 0 || prefixLines.length > PREAMBLE_MAX_LINES) {
     return keep;
+  }
+  if (prefix.trim().length > PREAMBLE_MAX_CHARS) {
+    // A longer prefix is dialogue only when its last line is itself the
+    // lead-in ("Here is the corrected note content:") and it talks about the
+    // verification exchange: a live correction round on 2026-09-29 opened
+    // with 620 characters about which claim the verifier had flagged, and the
+    // cap alone let all of it into the note.
+    const leadIn = prefixLines[prefixLines.length - 1];
+    if (
+      !PREAMBLE_DIALOGUE_OPENER.test(leadIn) ||
+      !/:\s*$/u.test(leadIn) ||
+      !PREAMBLE_VERIFIER_TALK.test(prefix)
+    ) {
+      return keep;
+    }
   }
   const hasMarkdownStructure = prefixLines.some((line) =>
     /^(?:#{1,6} |[-*+] |\d+[.)] |> |```|\||---)/u.test(line),
