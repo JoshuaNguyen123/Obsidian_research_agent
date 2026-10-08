@@ -802,7 +802,13 @@ export class CompanionCoordinatorClientV1 {
       const readOnly = init.method === "GET" && ["/health", "/status"].includes(path);
       const remaining = deadline - Date.now();
       if (!readOnly || !transient || init.signal?.aborted || remaining <= 0) throw error;
-      opened = await this.openResponse(path, init, remaining);
+      // A single bounded read retry should not immediately hammer an unavailable
+      // service. Leave the same overall deadline in place during the backoff.
+      const delayMs = Math.min(75, Math.floor(remaining / 4));
+      await waitForReadRetry(delayMs, init.signal);
+      const retryBudget = deadline - Date.now();
+      if (retryBudget <= 0) throw error;
+      opened = await this.openResponse(path, init, retryBudget);
     }
     try {
       const text = await readBoundedText(opened.response, this.maxResponseBytes);
@@ -904,6 +910,15 @@ export class CompanionCoordinatorClientV1 {
     }
     return serialized;
   }
+}
+
+function waitForReadRetry(delayMs: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); reject(signal?.reason ?? new DOMException("Aborted", "AbortError")); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, delayMs);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 export class CompanionCoordinatorClientErrorV1 extends Error {
