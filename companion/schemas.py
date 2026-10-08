@@ -35,6 +35,7 @@ class HealthResponse(BaseModel):
     ok: bool = True
     service: str = "obsidian-research-companion"
     browserReady: bool
+    pdfReady: bool = True
     memoryReady: bool
     coordinatorReady: bool = False
     secureStorePersistent: bool = False

@@ -170,6 +170,8 @@ export class CompanionExtensionCoordinatorV1 {
   private runtimeState: CompanionRuntimeStateV1 = defaultRuntimeState();
   private persistChain = Promise.resolve();
   private coordinationTail = Promise.resolve();
+  private sessionGeneration = 0;
+  private healthFlight: Promise<CompanionCoordinatorSnapshotV1> | null = null;
 
   configurePersistence(persistence: CompanionLineagePersistenceV1): void {
     this.persistence = persistence;
@@ -206,6 +208,8 @@ export class CompanionExtensionCoordinatorV1 {
   }
 
   clearSession(): void {
+    this.sessionGeneration += 1;
+    this.healthFlight = null;
     if (this.disconnectSession) {
       this.disconnectSession();
     } else if (this.baseUrl) {
@@ -230,22 +234,28 @@ export class CompanionExtensionCoordinatorV1 {
     };
   }
 
-  async refreshHealth(): Promise<CompanionCoordinatorSnapshotV1> {
+  refreshHealth(): Promise<CompanionCoordinatorSnapshotV1> {
     if (!this.client) {
       this.lastError =
         "Companion session is not connected. Install or connect the authenticated local service.";
       this.checkedAt = new Date().toISOString();
+      return Promise.resolve(this.snapshot());
+    }
+    if (this.healthFlight) return this.healthFlight;
+    const client = this.client, generation = this.sessionGeneration;
+    const flight = (async () => {
+      try {
+        const health = await client.health();
+        if (generation === this.sessionGeneration && client === this.client) { this.health = health; this.lastError = null; }
+      } catch (error) {
+        if (generation === this.sessionGeneration && client === this.client) { this.health = null; this.lastError = safeError(error); }
+      }
+      if (generation === this.sessionGeneration && client === this.client) this.checkedAt = new Date().toISOString();
       return this.snapshot();
-    }
-    try {
-      this.health = await this.client.health();
-      this.lastError = null;
-    } catch (error) {
-      this.health = null;
-      this.lastError = safeError(error);
-    }
-    this.checkedAt = new Date().toISOString();
-    return this.snapshot();
+    })();
+    this.healthFlight = flight;
+    void flight.finally(() => { if (this.healthFlight === flight) this.healthFlight = null; });
+    return flight;
   }
 
   async describeHostApprovalSigner(): Promise<CompanionHostApprovalSignerDescriptionV1> {

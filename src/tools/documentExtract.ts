@@ -140,6 +140,7 @@ export function createDocumentExtractProvider(
             candidate.title?.trim() ||
             documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
           content,
+          evidence: { route: "companion-pdf", originalBytes: new Uint8Array(document.bytes), pageCount: extracted.pageCount, pagesExtracted: extracted.pagesExtracted, pagesSkipped: extracted.pagesSkipped, truncated: extracted.truncated, extractedChars: extracted.text.length },
         });
       }
       return {
@@ -483,7 +484,7 @@ async function readVaultPdf(
 
 async function cacheExtractedSource(
   context: ToolExecutionContext,
-  source: { url: string; title: string; content: string },
+  source: { url: string; title: string; content: string; evidence?: unknown },
 ): Promise<import("./sourceCache").CachedSource | undefined> {
   if (!context.app?.vault || !source.content.trim()) {
     return;
@@ -493,6 +494,7 @@ async function cacheExtractedSource(
       url: source.url,
       title: source.title,
       content: source.content,
+      ...(source.evidence ? { evidence: source.evidence } : {}),
       parserStatus: "parsed",
     });
   } catch {
