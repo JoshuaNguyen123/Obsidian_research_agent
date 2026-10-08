@@ -100,6 +100,7 @@ export function evidenceFromToolResult(
       sourceLocator,
       parserStatus: getString(result.output.parserStatus),
       baseOffset: getNumber(result.output.sourceStartChar),
+      sourceVersion: getString(result.output.snapshotSha256),
     });
     if (!sourceUsability.usable) {
       return null;
@@ -231,6 +232,7 @@ export function evidenceFromToolResult(
       content,
       sourceLocator: url || title,
       parserStatus: content.trim() ? "parsed" : "empty",
+      sourceVersion: getString(result.output.snapshotSha256),
     });
     if (!url || !sourceUsability.usable) {
       return null;
@@ -474,6 +476,7 @@ export function claimPassagesFromToolResult(
         sourceLocator,
         parserStatus: getString(output.parserStatus),
         baseOffset: getNumber(output.sourceStartChar),
+        sourceVersion: getString(output.snapshotSha256),
       }).usable
     ) {
       return [];
@@ -482,6 +485,7 @@ export function claimPassagesFromToolResult(
       query: getString(output.query),
       sourceLocator,
       baseOffset: getNumber(output.sourceStartChar),
+      sourceVersion: getString(output.snapshotSha256),
     });
     return claimPassageRefsFromEvidencePassages(
       bundle.passages,

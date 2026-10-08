@@ -23,6 +23,7 @@ import {
 } from "../../core-api/src/hostApprovalReceiptV1";
 
 export interface CompanionServiceHealthV1 {
+  pdfReady?: boolean;
   ok: boolean;
   service: string;
   browserReady: boolean;
@@ -793,7 +794,16 @@ export class CompanionCoordinatorClientV1 {
     path: string,
     init: RequestInit,
   ): Promise<TResponse> {
-    const opened = await this.openResponse(path, init, this.timeoutMs);
+    const deadline = Date.now() + this.timeoutMs;
+    let opened: Awaited<ReturnType<CompanionCoordinatorClientV1["openResponse"]>>;
+    try { opened = await this.openResponse(path, init, this.timeoutMs); }
+    catch (error) {
+      const transient = error instanceof TypeError || error instanceof CompanionCoordinatorClientErrorV1 && [502, 503, 504].includes(error.status ?? 0);
+      const readOnly = init.method === "GET" && ["/health", "/status"].includes(path);
+      const remaining = deadline - Date.now();
+      if (!readOnly || !transient || init.signal?.aborted || remaining <= 0) throw error;
+      opened = await this.openResponse(path, init, remaining);
+    }
     try {
       const text = await readBoundedText(opened.response, this.maxResponseBytes);
       try {
@@ -834,6 +844,7 @@ export class CompanionCoordinatorClientV1 {
     const controller = new AbortController();
     const callerSignal = init.signal;
     const abort = () => controller.abort(callerSignal?.reason);
+    if (callerSignal?.aborted) abort();
     callerSignal?.addEventListener("abort", abort, { once: true });
     const timer =
       timeoutMs > 0

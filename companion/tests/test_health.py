@@ -18,6 +18,7 @@ def test_health_and_status_require_authentication(companion_client):
         "ok": True,
         "service": "obsidian-research-companion",
         "browserReady": False,
+        "pdfReady": True,
         "memoryReady": True,
         "coordinatorReady": True,
         "secureStorePersistent": False,

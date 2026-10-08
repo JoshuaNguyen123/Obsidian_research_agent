@@ -132,13 +132,15 @@ export function createDocumentExtractProvider(
         signal: abortSignal,
       });
       const content = extracted.status === "parsed" ? extracted.text : "";
+      let cachedSource;
       if (content.trim()) {
-        await cacheExtractedSource(context, {
+        cachedSource = await cacheExtractedSource(context, {
           url: locator.cacheUrl,
           title:
             candidate.title?.trim() ||
             documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
           content,
+          evidence: { route: "companion-pdf", originalBytes: new Uint8Array(document.bytes), pageCount: extracted.pageCount, pagesExtracted: extracted.pagesExtracted, pagesSkipped: extracted.pagesSkipped, truncated: extracted.truncated, extractedChars: extracted.text.length },
         });
       }
       return {
@@ -147,6 +149,7 @@ export function createDocumentExtractProvider(
           documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
         url: locator.cacheUrl,
         content,
+        ...(cachedSource ? { cachedSource, ...(cachedSource.snapshotSha256 ? { snapshotSha256: cachedSource.snapshotSha256 } : {}) } : {}),
         // The empty/parsed split is the whole point: an unreadable PDF must not
         // look like a parsed source with nothing to say.
         parserStatus: content.trim() ? "parsed" : "empty",
@@ -481,16 +484,17 @@ async function readVaultPdf(
 
 async function cacheExtractedSource(
   context: ToolExecutionContext,
-  source: { url: string; title: string; content: string },
-): Promise<void> {
+  source: { url: string; title: string; content: string; evidence?: unknown },
+): Promise<import("./sourceCache").CachedSource | undefined> {
   if (!context.app?.vault || !source.content.trim()) {
     return;
   }
   try {
-    await writeSourceCacheNote(context, {
+    return await writeSourceCacheNote(context, {
       url: source.url,
       title: source.title,
       content: source.content,
+      ...(source.evidence ? { evidence: source.evidence } : {}),
       parserStatus: "parsed",
     });
   } catch {
