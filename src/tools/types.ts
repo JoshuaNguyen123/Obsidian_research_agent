@@ -218,6 +218,9 @@ export interface ToolExecutionContext {
    */
   plannedNoteOutputPath?: string;
   now?: () => Date;
+  /** Optional host-owned immutable source storage. Mint a version only after durable readback. */
+  captureSourceSnapshot?: (source: { url: string; title: string; content: string; evidence?: unknown }, signal?: AbortSignal) => Promise<{ snapshotSha256: string }>;
+  readSourceSnapshot?: (version: string) => Promise<{ snapshotSha256: string; sourceId: string; locator: string; title: string; content: string; capturedAt: string }>;
   /**
    * Host-side work observer. The run-note and mission-graph writers report
    * how long each durable write took (serialization wait included) and the

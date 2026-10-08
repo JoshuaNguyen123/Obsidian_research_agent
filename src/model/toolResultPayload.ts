@@ -293,6 +293,7 @@ function slimOutputForModel(
     "totalChars",
     "sourceChars",
     "contentHash",
+    "snapshotSha256",
     "sha256",
     "beforeSha256",
     "afterSha256",
@@ -500,6 +501,7 @@ function slimOutputForModel(
       }
     } else {
       keep.contentEvidence = extractEvidencePassages(output.content, {
+        sourceVersion: getEvidenceSourceVersion(output),
         query: getEvidenceQuery(output),
         sourceLocator: getEvidenceSourceLocator(output),
         baseOffset: getEvidenceBaseOffset(output),
@@ -735,6 +737,7 @@ function summarizeFileItem(item: unknown, query?: string): unknown {
   }
   if (typeof item.content === "string") {
     output.contentEvidence = extractEvidencePassages(item.content, {
+      sourceVersion: getEvidenceSourceVersion(item),
       query,
       sourceLocator: getEvidenceSourceLocator(item),
       baseOffset: getEvidenceBaseOffset(item),
@@ -754,6 +757,10 @@ function getEvidenceQuery(output: Record<string, unknown>): string | undefined {
     }
   }
   return undefined;
+}
+
+function getEvidenceSourceVersion(output: Record<string, unknown>): string | undefined {
+  return typeof output.snapshotSha256 === "string" && /^[a-f0-9]{64}$/.test(output.snapshotSha256) ? output.snapshotSha256 : undefined;
 }
 
 function getEvidenceSourceLocator(

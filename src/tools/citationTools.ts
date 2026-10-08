@@ -130,6 +130,7 @@ const verifyCitationTool: AgentTool = {
         type: "string",
         description: "Alternatively, the vault path of the cached source note.",
       },
+      version: { type: "string", description: "Exact immutable source snapshot SHA-256 from a versioned passage." },
       max_sections: {
         type: "integer",
         description: `Bounded number of cached sections to scan (default ${MAX_SECTIONS_TO_SCAN}).`,
@@ -144,6 +145,7 @@ const verifyCitationTool: AgentTool = {
     }
     const url = getOptionalString(args, "url")?.trim();
     const path = getOptionalString(args, "path")?.trim();
+    const version = getOptionalString(args, "version")?.trim();
     if (!url && !path) {
       throw new Error("verify_citation requires url or path.");
     }
@@ -155,11 +157,12 @@ const verifyCitationTool: AgentTool = {
 
     let first;
     try {
-      first = await readSourceSection(context, { url, path }, 1);
+      first = await readSourceSection(context, { url, path, ...(version ? { version } : {}) }, 1);
     } catch {
       return {
         status: "unverifiable",
-        message:
+        verificationScope: "quote-occurrence", semanticAssessed: false,
+        message: version ? "The exact immutable evidence version is unavailable or does not match this source. No newer copy was substituted." :
           "No cached source for this reference. Fetch it with web_fetch or extract_document first, then verify.",
       };
     }
@@ -168,7 +171,7 @@ const verifyCitationTool: AgentTool = {
       const cached =
         section === 1
           ? first
-          : await readSourceSection(context, { url, path }, section);
+          : await readSourceSection(context, { url, path, ...(version ? { version } : {}) }, section);
       if (normalizeForMatch(cached.content).includes(needle)) {
         // A section index into our own cached copy is useless to a reader
         // holding a different edition. Where the source carries a real
@@ -181,6 +184,10 @@ const verifyCitationTool: AgentTool = {
         );
         return {
           status: "supported",
+          verificationScope: "quote-occurrence",
+          semanticAssessed: false,
+          binding: version ? "immutable-version" : "legacy-unbound",
+          ...(first.snapshotSha256 ? { snapshotSha256: first.snapshotSha256 } : {}),
           section,
           sectionCount: first.sectionCount,
           sourcePath: cached.vaultPath,
@@ -198,7 +205,10 @@ const verifyCitationTool: AgentTool = {
       }
     }
     return {
-      status: "unsupported",
+      status: first.sectionCount > sections ? "unverifiable" : "unsupported",
+      verificationScope: "quote-occurrence", semanticAssessed: false,
+      binding: version ? "immutable-version" : "legacy-unbound",
+      assessmentCoverage: sections === first.sectionCount ? "complete" : "partial",
       scannedSections: sections,
       sectionCount: first.sectionCount,
       message:

@@ -68,6 +68,7 @@ export interface EvidencePassageOptions {
   query?: string;
   /** Stable URL/path used to make passage ids source-scoped and citable. */
   sourceLocator?: string;
+  sourceVersion?: string;
   /** Offset of this content window within the complete source. */
   baseOffset?: number;
   maxPassages?: number;
@@ -167,6 +168,7 @@ export function extractEvidencePassages(
             options.sourceLocator,
             absoluteStart,
             absoluteEnd,
+            options.sourceVersion,
           )
         : `p${passages.length + 1}`,
       startChar: absoluteStart,
@@ -211,13 +213,15 @@ export function createSourceScopedPassageId(
   sourceLocator: string,
   startChar: number,
   endChar: number,
+  sourceVersion?: string,
 ): string {
   const sourceId = createEvidenceSourceId(sourceLocator);
   const range = `${Math.max(0, Math.trunc(startChar))}-${Math.max(
     0,
     Math.trunc(endChar),
   )}`;
-  return `${sourceId}:passage:${range}`;
+  if (sourceVersion !== undefined && !/^[a-f0-9]{64}$/.test(sourceVersion)) throw new Error("Malformed evidence source version.");
+  return `${sourceId}${sourceVersion ? `:version:${sourceVersion}` : ""}:passage:${range}`;
 }
 
 function hashLocator(value: string): string {
