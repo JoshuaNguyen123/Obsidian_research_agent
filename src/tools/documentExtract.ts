@@ -363,21 +363,28 @@ function readDocumentExtractResponse(value: unknown): DocumentExtractResponseV1 
       "document_extract received an unreadable companion response.",
     );
   }
+  const pageCount = readCount(value.pageCount);
+  const pagesExtracted = readCount(value.pagesExtracted);
+  const pagesSkipped = readCount(value.pagesSkipped);
+  if (typeof value.truncated !== "boolean" || pagesExtracted > pageCount || pagesSkipped > pageCount - pagesExtracted) {
+    throw new ToolExecutionError("source_unusable", "document_extract received invalid companion coverage fields.");
+  }
   return {
     status: value.status,
     reason: typeof value.reason === "string" ? value.reason : null,
     text: typeof value.text === "string" ? value.text : "",
-    pageCount: readCount(value.pageCount),
-    pagesExtracted: readCount(value.pagesExtracted),
-    pagesSkipped: readCount(value.pagesSkipped),
-    truncated: value.truncated === true,
+    pageCount,
+    pagesExtracted,
+    pagesSkipped,
+    truncated: value.truncated,
   };
 }
 
 function readCount(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : 0;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new ToolExecutionError("source_unusable", "document_extract received invalid companion page counts.");
+  }
+  return value;
 }
 
 function parseJsonText(text: string | undefined): unknown {
