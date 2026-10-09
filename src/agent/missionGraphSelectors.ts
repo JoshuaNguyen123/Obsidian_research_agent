@@ -13,7 +13,7 @@ import {
   type MissionGraphV3,
 } from "../../packages/headless-runtime/src/missionGraphV3";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
-import { collectRequiredDependencyIds, isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority, isOptionalMissionGraphNodeId, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
+import { findFinalMissionGraphNode, partitionGraphNodes, collectRequiredDependencyIds, isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority, isOptionalMissionGraphNodeId, missionGraphNodeIsTerminalV1 } from "./missionGraphAuthority";
 import { type MissionEvidence } from "./missionLedger";
 import { getString, isRecord } from "./recordUtils";
 import { getUrlHostname } from "./sourceSignals";
@@ -672,4 +672,20 @@ export function getMissionGraphNodeSelector(
     typeof resource.selector === "string"
     ? resource.selector
     : null;
+}
+
+/** Dependent same-name reads cannot claim synthetic retry nodes in a batch. */
+export function missionGraphHasQueuedToolDependencyV1(graph: MissionGraphV3, toolName: string): boolean {
+  if (!["read_file", "read_markdown_files", "read_current_file"].includes(toolName)) return false;
+  return Object.values(graph.nodes).some(node => node.status === "queued" && node.allowedTools.includes(toolName));
+}
+
+/** Name-level expected-tool success cannot pay a different required source node. */
+export function missionGraphHasRequiredToolDebtV1(graph: MissionGraphV3 | null | undefined): boolean {
+  if (!graph) return false;
+  const final = findFinalMissionGraphNode(graph);
+  const required = final
+    ? [...collectRequiredDependencyIds(graph, final.id)].map(id => graph.nodes[id])
+    : partitionGraphNodes(graph).required.map(item => item.node);
+  return required.some(node => node && node.allowedTools.length > 0 && node.status !== "complete");
 }

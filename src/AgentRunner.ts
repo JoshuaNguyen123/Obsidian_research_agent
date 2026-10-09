@@ -477,6 +477,8 @@ import {
   // would quietly reacquire its own answer.
   authoritativeRefusalFrontierToolNamesV1,
   countReadyMissionGraphToolSlots,
+  missionGraphHasQueuedToolDependencyV1,
+  missionGraphHasRequiredToolDebtV1,
   findExactGraphBoundToolCallIndex,
   findReadyMissionGraphToolNodes,
   getMissionGraphFrontierDestinationSelector,
@@ -25047,7 +25049,8 @@ export async function runAgentMission({
             // rejection path handles the duplicate without paying proof.
             break;
           }
-          if (missionGraphUsesExactPlannedFrontier && batchGraph) {
+          if (batchGraph && (missionGraphUsesExactPlannedFrontier ||
+            missionGraphHasQueuedToolDependencyV1(batchGraph, candidate.name))) {
             const readySlots =
               exactReadySlotsByTool.get(candidate.name) ??
               countReadyMissionGraphToolSlots(batchGraph, candidate.name);
@@ -25854,6 +25857,7 @@ export async function runAgentMission({
           requiredLoopToolsSatisfied &&
           !setLooseDeliveryStillUnpaid
         : undefined,
+      planHasPendingTool: missionGraphHasRequiredToolDebtV1(loopDecisionMissionGraph),
       planNeedsVerification:
         getActiveMissionPlanTask(missionPlan)?.status === "needs_verification",
       planHasBlocker:
