@@ -8,6 +8,7 @@ import type {
   ResearchRetrievalProvider,
 } from "../orchestrator/researchProvider";
 import type { ActionReceipt, ToolDescriptor } from "../agent/actions";
+import { sha256Fingerprint } from "../agent/actions";
 import { normalizePublicFetchUrlV1 } from "./fetchHostPolicy";
 import {
   describePublicFetchFailureV1,
@@ -85,6 +86,44 @@ interface DocumentExtractResponseV1 {
   pagesExtracted: number;
   pagesSkipped: number;
   truncated: boolean;
+}
+
+// Derived text only: never durable, shared across neither vaults nor live
+// bootstrap sessions. Reconnect/engine restart acquires a new session; local
+// host/core upgrades start a new process. Source bytes are still checked on
+// every call so a changed file at the same locator cannot reuse old text.
+const documentExtractCaches = new WeakMap<CompanionBootstrapSessionV1, WeakMap<object, {
+  entries: Map<string, { value: DocumentExtractResponseV1; size: number }>;
+  retained: number;
+}>>();
+const DOCUMENT_DERIVED_CACHE_BYTES = 8 * 1024 * 1024;
+
+function documentExtractConfiguration(context: ToolExecutionContext): string {
+  return JSON.stringify({
+    origin: context.settings.companionBaseUrl.trim().replace(/\/+$/u, ""),
+    timeout: context.settings.requestTimeoutMs,
+    build: context.pluginVersion ?? "",
+    maxPages: DEFAULT_DOCUMENT_EXTRACT_PAGES,
+    maxChars: DEFAULT_DOCUMENT_EXTRACT_CHARS,
+    policy: "companion-complete-text-v1",
+  });
+}
+
+function assertDocumentExtractGeneration(context: ToolExecutionContext, signal: AbortSignal | undefined, session: CompanionBootstrapSessionV1, configuration: string): void {
+  assertDocumentOperationActive(context, signal);
+  if (documentExtractConfiguration(context) !== configuration ||
+      resolveCompanionBootstrapSessionV1(session.baseUrl) !== session) {
+    throw new ToolExecutionError("invalid_state", "Document extraction session or configuration changed; stale response was discarded.");
+  }
+}
+
+function documentExtractCache(session: CompanionBootstrapSessionV1, context: ToolExecutionContext) {
+  let owners = documentExtractCaches.get(session);
+  if (!owners) { owners = new WeakMap(); documentExtractCaches.set(session, owners); }
+  const owner = context.app?.vault ?? context.httpTransport ?? context;
+  let cache = owners.get(owner);
+  if (!cache) { cache = { entries: new Map(), retained: 0 }; owners.set(owner, cache); }
+  return cache;
 }
 
 /**
@@ -250,8 +289,10 @@ async function requestDocumentExtract(
       "document_extract requires an authenticated companion session.",
     );
   }
+  const configuration = documentExtractConfiguration(context);
+  const contentBase64 = encodeBase64(new Uint8Array(input.document.bytes));
   const body = JSON.stringify({
-    contentBase64: encodeBase64(new Uint8Array(input.document.bytes)),
+    contentBase64,
     sourceUrl: input.url,
     title: input.title?.trim() || null,
     maxPages: DEFAULT_DOCUMENT_EXTRACT_PAGES,
@@ -262,6 +303,17 @@ async function requestDocumentExtract(
       "source_unusable",
       `document_extract companion body is ${body.length} bytes; the limit is ${COMPANION_DEFAULT_MAX_BODY_BYTES} bytes.`,
     );
+  }
+  // Current auth, path/URL policy, byte/body limits and deadline are checked
+  // before reuse. The digest excludes title/locator: these belong to each
+  // call's source capture below, not to the document parser's text result.
+  const key = await sha256Fingerprint({ contentBase64, configuration });
+  assertDocumentExtractGeneration(context, input.signal, session!, configuration);
+  const cache = documentExtractCache(session!, context);
+  const previous = cache.entries.get(key);
+  if (previous) {
+    cache.entries.delete(key); cache.entries.set(key, previous);
+    return { ...previous.value };
   }
   const response = await credential.withToken((token) =>
     requestWithRetry(context.httpTransport, {
@@ -284,7 +336,24 @@ async function requestDocumentExtract(
       `document_extract failed on the companion (HTTP ${response.status}).`,
     );
   }
-  return readDocumentExtractResponse(response.json ?? parseJsonText(response.text));
+  const extracted = readDocumentExtractResponse(response.json ?? parseJsonText(response.text));
+  assertDocumentExtractGeneration(context, input.signal, session!, configuration);
+  // Failures, empty results and unknown/partial coverage must be retried.
+  if (extracted.status === "parsed" && extracted.text.trim() && extracted.pageCount > 0 &&
+      extracted.pagesExtracted === extracted.pageCount && extracted.pagesSkipped === 0 && !extracted.truncated) {
+    const size = new TextEncoder().encode(JSON.stringify(extracted)).byteLength;
+    if (size <= DOCUMENT_DERIVED_CACHE_BYTES) {
+      const concurrent = cache.entries.get(key);
+      if (concurrent) { cache.retained -= concurrent.size; cache.entries.delete(key); }
+      while (cache.retained + size > DOCUMENT_DERIVED_CACHE_BYTES || cache.entries.size >= 32) {
+        const oldest = cache.entries.keys().next().value;
+        if (oldest === undefined) break;
+        cache.retained -= cache.entries.get(oldest)!.size; cache.entries.delete(oldest);
+      }
+      cache.entries.set(key, { value: { ...extracted }, size }); cache.retained += size;
+    }
+  }
+  return extracted;
 }
 
 function readDocumentExtractResponse(value: unknown): DocumentExtractResponseV1 {
