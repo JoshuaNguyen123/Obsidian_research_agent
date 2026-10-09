@@ -1,6 +1,8 @@
 import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { readSourceSection, writeSourceCacheNote } from "../src/tools/sourceCache";
 
 import {
   clearCompanionBootstrapSessionV1,
@@ -619,6 +621,100 @@ test("extract_document accepts a vault-relative .pdf path through normalizeVault
   }
 });
 
+test("local root PDF identity cannot be mistaken for a bare web domain", async () => {
+  const disconnect = connectCompanion(), recorded: Recorded = { requests: [] };
+  try {
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Exact local content.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }), { vaultFiles: { "study.pdf": pdfBytes() } });
+    const transport = context.httpTransport!;
+    context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+    const captures: string[] = [];
+    context.captureSourceSnapshot = async source => { captures.push(source.url); return { snapshotSha256: "a".repeat(64) }; };
+    const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf" }, context);
+    assert.equal(result.ok, true);
+    assert.equal((result.output as { url: string }).url, "vault://study.pdf");
+    assert.equal((result.output as { title: string }).title, "study.pdf");
+    assert.equal(result.receipt?.resource.id, "vault://study.pdf");
+    assert.deepEqual(captures, ["vault://study.pdf"]);
+    assert.equal(recorded.requests.length, 1, "local bytes must not trigger an external download");
+    assert.equal(JSON.parse(String(recorded.requests[0]!.body)).sourceUrl, null);
+  } finally { disconnect(); }
+});
+
+test("nested, spaced and Unicode vault paths retain their own identity and path guards", async () => {
+  const disconnect = connectCompanion();
+  try {
+    for (const path of ["Papers/study.pdf", "Papers/My study.pdf", "ç ”ç©¶.pdf"]) {
+      const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Exact local content.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }), { vaultFiles: { [path]: pdfBytes() } });
+      const captures: string[] = [];
+      context.captureSourceSnapshot = async source => { captures.push(source.url); return { snapshotSha256: "b".repeat(64) }; };
+      const result = await createDocumentExtractTools()[0]!.executeResult!({ path }, context);
+      assert.equal(result.ok, true);
+      assert.equal((result.output as { url: string }).url, `vault://${path}`);
+      assert.equal((result.output as { path: string }).path, path);
+      assert.deepEqual(captures, [new URL(`vault://${path}`).toString()]);
+    }
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Never read." }));
+    for (const path of ["../study.pdf", "/study.pdf", "C:/study.pdf", ".obsidian/study.pdf", "Papers\\study.pdf"]) {
+      await assert.rejects(() => createDocumentExtractTools()[0]!.executeResult!({ path }, context), /Unsafe path/u);
+    }
+  } finally { disconnect(); }
+});
+
+test("explicit URL attribution with a vault path retains public URL policy and remote identity", async () => {
+  const disconnect = connectCompanion(), recorded: Recorded = { requests: [] };
+  try {
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Attributed local bytes.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }), { vaultFiles: { "study.pdf": pdfBytes() } });
+    const transport = context.httpTransport!;
+    context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+    const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf", url: PDF_URL }, context);
+    assert.equal((result.output as { url: string }).url, PDF_URL);
+    assert.equal(result.receipt?.resource.id, PDF_URL);
+    assert.equal(recorded.requests.length, 1);
+    assert.equal(JSON.parse(String(recorded.requests[0]!.body)).sourceUrl, PDF_URL);
+    await assert.rejects(() => createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf", url: "http://127.0.0.1/report.pdf" }, context), /local or private network/u);
+  } finally { disconnect(); }
+});
+
+test("bare public document domains and explicit web URLs keep existing download behavior", async () => {
+  const disconnect = connectCompanion();
+  try {
+    for (const input of ["reports.example/study.pdf", "https://reports.example/study.pdf"]) {
+      const recorded: Recorded = { requests: [] };
+      const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Web content.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }));
+      const transport = context.httpTransport!;
+      context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+      const result = await createDocumentExtractTools()[0]!.executeResult!({ url: input }, context);
+      assert.equal((result.output as { url: string }).url, "https://reports.example/study.pdf");
+      assert.equal(recorded.requests.length, 2);
+      assert.equal(recorded.requests[0]!.url, "https://reports.example/study.pdf");
+      assert.equal(JSON.parse(String(recorded.requests[1]!.body)).sourceUrl, "https://reports.example/study.pdf");
+    }
+  } finally { disconnect(); }
+});
+
+test("canonical local extraction cannot rewrite legacy cache notes or old immutable versions", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Current local value is 0.95 mg/L.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }), { vaultFiles: { "study.pdf": pdfBytes() } });
+    const oldVersion = "c".repeat(64);
+    const old = { snapshotSha256: oldVersion, sourceId: "legacy-source-id", locator: "https://study.pdf/", title: "Legacy study", content: "Old value is 0.05 mg/L.", capturedAt: "2026-09-04T00:00:00Z" };
+    const original = JSON.stringify(old), captures: string[] = [];
+    context.readSourceSnapshot = async version => { assert.equal(version, oldVersion); return old; };
+    context.captureSourceSnapshot = async source => { captures.push(source.url); return { snapshotSha256: createHash("sha256").update(source.url).update(source.content).digest("hex") }; };
+    const cached = await writeSourceCacheNote(context, { url: old.locator, title: old.title, content: old.content });
+    const legacyBytes = await context.app.vault.read(context.app.vault.getFileByPath(cached.vaultPath)!);
+    const current = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf" }, context);
+    assert.equal((current.output as { url: string }).url, "vault://study.pdf");
+    assert.deepEqual(captures, ["https://study.pdf/", "vault://study.pdf"]);
+    assert.equal(await context.app.vault.read(context.app.vault.getFileByPath(cached.vaultPath)!), legacyBytes);
+    assert.equal((await readSourceSection(context, { url: old.locator, version: oldVersion }, 1)).content, old.content);
+    assert.equal(JSON.stringify(old), original);
+    await assert.rejects(readSourceSection(context, { url: "vault://study.pdf", version: oldVersion }, 1), /identity mismatch/u);
+    const provider = createDocumentExtractProvider(context, { fetchDocument: async () => ({ bytes: pdfBytes(), contentType: "application/pdf" }) });
+    assert.equal((await provider.retrieve({ id: "legacy", url: "Papers/legacy.pdf", strategy: "document_extract" }))?.url, "Papers/legacy.pdf");
+  } finally { disconnect(); }
+});
+
 test("a document URL that redirects to the companion is refused before the redirect is followed", async () => {
   // document_extract downloads on the user's machine, where the companion
   // listens on loopback. requestUrl followed this redirect out of the host
@@ -677,4 +773,151 @@ test("an oversized document is refused after one byte past the limit, not after 
   } finally {
     disconnect();
   }
+});
+
+const completeExtract = () => companionJson({ status: "parsed", text: "## Page 1\n\nExact measured value -0.05 mg/L.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false });
+
+test("derived reuse skips a second parse across tools while preserving each locator title and capture", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes(), "two.pdf": pdfBytes() } });
+    let posts = 0, reads = 0; const transport = context.httpTransport!, read = context.app.vault.readBinary!;
+    context.httpTransport = request => { posts++; return transport(request); };
+    context.app.vault.readBinary = async file => { reads++; return read(file); };
+    const captures: Array<{url: string; title: string}> = [];
+    context.captureSourceSnapshot = async source => { captures.push({ url: source.url, title: source.title }); return { snapshotSha256: "a".repeat(64) }; };
+    const first = await createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf", title: "First report" }, context);
+    (first.output as { content: string }).content = "Caller mutation";
+    const second = await createDocumentExtractTools()[0]!.executeResult!({ path: "two.pdf", title: "Second report" }, context);
+    assert.equal(posts, 1); assert.equal(reads, 2, "current bytes still checked for replacement");
+    assert.equal((second.output as { url: string }).url, "vault://two.pdf");
+    assert.match((second.output as { content: string }).content, /-0\.05 mg\/L/u);
+    assert.deepEqual(captures, [{ url: "vault://one.pdf", title: "First report" }, { url: "vault://two.pdf", title: "Second report" }]);
+    const isolated = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
+    let isolatedPosts = 0; const otherTransport = isolated.httpTransport!;
+    isolated.httpTransport = request => { isolatedPosts++; return otherTransport(request); };
+    await createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, isolated);
+    assert.equal(isolatedPosts, 1, "no reuse across vault owners");
+  } finally { disconnect(); }
+});
+
+test("derived reuse binds current bytes including equal-length replacement", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
+    let posts = 0; const transport = context.httpTransport!;
+    context.httpTransport = request => { posts++; return transport(request); };
+    let current = pdfBytes("%PDF-1.4 value -0.05"); context.app.vault.readBinary = async () => current;
+    const tool = createDocumentExtractTools()[0]!;
+    await tool.executeResult!({ path: "one.pdf" }, context); await tool.executeResult!({ path: "one.pdf" }, context);
+    assert.equal(posts, 1);
+    current = pdfBytes("%PDF-1.4 value -0.95"); await tool.executeResult!({ path: "one.pdf" }, context);
+    assert.equal(posts, 2);
+  } finally { disconnect(); }
+});
+
+test("derived reuse invalidates on timeout build or live session identity and refuses disposed authorization", async () => {
+  let disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
+    let posts = 0; const transport = context.httpTransport!;
+    context.httpTransport = request => { posts++; return transport(request); };
+    const run = () => createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context);
+    await run(); await run(); assert.equal(posts, 1);
+    context.settings.requestTimeoutMs = 17_000; await run(); assert.equal(posts, 2);
+    context.pluginVersion = "different-build"; await run(); assert.equal(posts, 3);
+    disconnect(); disconnect = connectCompanion(); await run(); assert.equal(posts, 4);
+    disconnect(); const absent = await run(); assert.equal(absent.ok, false); assert.equal(posts, 4);
+  } finally { disconnect(); }
+});
+
+test("derived cache hits cannot bypass abort deadline unsafe URL or current body limits", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
+    let posts = 0; const transport = context.httpTransport!;
+    context.httpTransport = request => { posts++; return transport(request); };
+    const run = (args: Record<string, unknown> = { path: "one.pdf" }) => createDocumentExtractTools()[0]!.executeResult!(args, context);
+    await run();
+    const controller = new AbortController(); controller.abort(); context.abortSignal = controller.signal;
+    await assert.rejects(run(), /cancel|abort/iu); context.abortSignal = undefined;
+    context.deadlineAt = Date.now() - 1; await assert.rejects(run(), /deadline/iu); context.deadlineAt = undefined;
+    await assert.rejects(run({ path: "one.pdf", url: "http://127.0.0.1/one.pdf" }), /private network/u);
+    context.app.vault.readBinary = async () => new Uint8Array(MAX_DOCUMENT_BYTES + 1).buffer;
+    await assert.rejects(run(), /limit/u); assert.equal(posts, 1);
+  } finally { disconnect(); }
+});
+
+test("late extract responses after config session or cancellation changes never populate derived cache or capture", async () => {
+  let disconnect = connectCompanion();
+  try {
+    for (const change of ["config", "session", "abort"] as const) {
+      const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
+      let posts = 0, captures = 0, release: ((value: HttpResponse) => void) | undefined;
+      context.captureSourceSnapshot = async () => { captures++; return { snapshotSha256: "a".repeat(64) }; };
+      context.httpTransport = async () => { posts++; if (posts === 1) return new Promise<HttpResponse>(resolve => { release = resolve; }); return completeExtract(); };
+      const controller = new AbortController(); context.abortSignal = controller.signal;
+      const run = () => createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context);
+      const pending = run(); while (!release) await new Promise(resolve => setTimeout(resolve, 0));
+      if (change === "config") context.settings.requestTimeoutMs = 15_000;
+      if (change === "session") { disconnect(); disconnect = connectCompanion(); }
+      if (change === "abort") controller.abort();
+      release(completeExtract()); await assert.rejects(pending, /changed|stale|cancel|abort/iu); assert.equal(captures, 0);
+      context.abortSignal = undefined; await run(); await run(); assert.equal(posts, 2); assert.equal(captures, 2);
+    }
+  } finally { disconnect(); }
+});
+
+test("empty partial failed and over-budget extracts are retried instead of retained", async () => {
+  const disconnect = connectCompanion();
+  try {
+    for (const response of [companionJson({ status: "empty", text: "", pageCount: 1, pagesExtracted: 0, pagesSkipped: 0, truncated: false }), companionJson({ status: "parsed", text: "Partial.", pageCount: 2, pagesExtracted: 1, pagesSkipped: 1, truncated: false }), { status: 400, headers: {} }, companionJson({ status: "parsed", text: "x".repeat(8 * 1024 * 1024 + 1), pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false })]) {
+      const context = contextFor(response); let posts = 0;
+      context.httpTransport = async () => { posts++; return response; };
+      const provider = createDocumentExtractProvider(context, { fetchDocument: async () => ({ bytes: pdfBytes() }) });
+      const run = () => provider.retrieve({ id: "one", url: PDF_URL, strategy: "document_extract" });
+      for (let index = 0; index < 2; index++) { if (response.status >= 400) await assert.rejects(run()); else await run(); }
+      assert.equal(posts, 2);
+    }
+  } finally { disconnect(); }
+});
+
+
+const malformedCoverageCases: Array<[string, Record<string, unknown>]> = [
+  ...[1.5, "1", -1, Number.MAX_SAFE_INTEGER + 1, undefined, null].map((value, index) => [`pageCount-${index}`, { pageCount: value }] as [string, Record<string, unknown>]),
+  ...[1.5, "1", -1, Number.MAX_SAFE_INTEGER + 1, undefined].map((value, index) => [`pagesExtracted-${index}`, { pagesExtracted: value }] as [string, Record<string, unknown>]),
+  ...[0.5, "0", -1, Number.MAX_SAFE_INTEGER + 1, undefined].map((value, index) => [`pagesSkipped-${index}`, { pagesSkipped: value }] as [string, Record<string, unknown>]),
+  ...["false", undefined, null].map((value, index) => [`truncated-${index}`, { truncated: value }] as [string, Record<string, unknown>]),
+  ["extracted-exceeds-total", { pagesExtracted: 2 }],
+  ["combined-counts-exceed-total", { pagesSkipped: 1 }],
+];
+for (const [name, changes] of malformedCoverageCases) {
+  test(`malformed coverage ${name} is refused without capture or derived retention`, async () => {
+    const disconnect = connectCompanion();
+    try {
+      const payload = { ...(completeExtract().json as Record<string, unknown>), ...changes };
+      const response = { status: 200, headers: {}, json: payload };
+      const context = createExtractVaultContext(response, { vaultFiles: { "one.pdf": pdfBytes() } });
+      let posts = 0, captures = 0; context.httpTransport = async () => { posts++; return response; };
+      context.captureSourceSnapshot = async () => { captures++; return { snapshotSha256: "a".repeat(64) }; };
+      for (let index = 0; index < 2; index++) {
+        await assert.rejects(createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context), (error: unknown) => error instanceof ToolExecutionError && error.code === "source_unusable");
+      }
+      assert.equal(posts, 2); assert.equal(captures, 0);
+    } finally { disconnect(); }
+  });
+}
+test("strict response coverage retains a valid zero-page empty result without caching it", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const response = companionJson({ status: "empty", text: "", reason: "unreadable", pageCount: 0, pagesExtracted: 0, pagesSkipped: 0, truncated: false });
+    const context = createExtractVaultContext(response, { vaultFiles: { "one.pdf": pdfBytes() } });
+    let posts = 0, captures = 0; context.httpTransport = async () => { posts++; return response; };
+    context.captureSourceSnapshot = async () => { captures++; return { snapshotSha256: "a".repeat(64) }; };
+    for (let index = 0; index < 2; index++) {
+      const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context);
+      assert.equal((result.output as {parserStatus: string}).parserStatus, "empty");
+    }
+    assert.equal(posts, 2); assert.equal(captures, 0);
+  } finally { disconnect(); }
 });

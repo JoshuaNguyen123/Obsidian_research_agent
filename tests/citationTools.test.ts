@@ -50,6 +50,22 @@ const CROSSREF_WORK = {
   },
 };
 
+test("a quote match is occurrence only and a bounded negative scan remains unassessed", async () => {
+  const context = contextWith({ status: 500, headers: {} } as never), version = "a".repeat(64);
+  let content = "x".repeat(7_000) + "A correlation does not establish causation.";
+  context.readSourceSnapshot = async () => ({ snapshotSha256: version, sourceId: "source:test", locator: "https://example.test/paper", title: "Paper", content, capturedAt: new Date(0).toISOString() });
+  const partial = await verifyCitation.execute({ url: "https://example.test/paper", version, quote: "A correlation does not establish causation.", max_sections: 1 }, context) as Record<string, unknown>;
+  assert.equal(partial.status, "unverifiable"); assert.equal(partial.assessmentCoverage, "partial"); assert.equal(partial.semanticAssessed, false);
+  const exact = await verifyCitation.execute({ url: "https://example.test/paper", version, quote: "A correlation does not establish causation." }, context) as Record<string, unknown>;
+  assert.equal(exact.status, "supported"); assert.equal(exact.verificationScope, "quote-occurrence"); assert.equal(exact.semanticAssessed, false); assert.equal(exact.binding, "immutable-version");
+  content = "No conclusion was established.";
+  const missing = await verifyCitation.execute({ url: "https://example.test/paper", version, quote: "A correlation establishes causation." }, context) as Record<string, unknown>;
+  assert.equal(missing.status, "unsupported"); assert.equal(missing.assessmentCoverage, "complete");
+  context.readSourceSnapshot = async () => { throw new Error("version missing"); };
+  const unavailable = await verifyCitation.execute({ url: "https://example.test/paper", version, quote: "No conclusion was established." }, context) as Record<string, unknown>;
+  assert.equal(unavailable.status, "unverifiable"); assert.match(String(unavailable.message), /No newer copy was substituted/);
+});
+
 test("identifier extraction handles DOI and arXiv forms", () => {
   assert.equal(extractDoi("10.1000/xyz123"), "10.1000/xyz123");
   assert.equal(extractDoi("https://doi.org/10.1000/xyz123?ref=1"), "10.1000/xyz123");

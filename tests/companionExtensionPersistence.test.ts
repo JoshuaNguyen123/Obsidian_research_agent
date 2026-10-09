@@ -369,6 +369,39 @@ test("failed worker preflight creates neither core attempt callback nor extensio
   coordinator.clearSession();
 });
 
+test("a retired session cannot reconcile a late job read or save adopted authority", async () => {
+  const coordinator = new CompanionExtensionCoordinatorV1();
+  const initial = stateFixture();
+  let saved = 0, release!: (response: Response) => void, entered!: () => void;
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  coordinator.configurePersistence({ load: async () => initial, save: async () => { saved++; } });
+  await coordinator.hydratePersistence();
+  coordinator.configureSession({ baseUrl: "http://127.0.0.1:18789", credential: effectfulCredential(),
+    fetchImpl: async () => { entered(); return new Promise<Response>((resolve) => { release = resolve; }); } });
+  const before = coordinator.getRuntimeState();
+  const pending = coordinator.reconcilePersistedJobs();
+  await reading;
+  coordinator.clearSession(); release(json(remoteJob()));
+  await assert.rejects(pending, /session changed/u);
+  assert.deepEqual(coordinator.getRuntimeState(), before);
+  assert.equal(saved, 0);
+});
+
+test("retiring authority during health or core preparation prevents an effectful dispatch", async () => {
+  const fixture = await effectfulFixture();
+  const coordinator = new CompanionExtensionCoordinatorV1();
+  let posts = 0, release!: (response: Response) => void, entered!: () => void;
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  coordinator.configureSession({ baseUrl: "http://127.0.0.1:18790", credential: effectfulCredential(),
+    fetchImpl: async (_input, init) => { if (init?.method === "POST") posts++; entered(); return new Promise<Response>((resolve) => { release = resolve; }); } });
+  const pending = coordinator.submitAuthorizedNode(fixture);
+  await reading; coordinator.clearSession(); release(json(healthyCompanion()));
+  await assert.rejects(pending, /session changed/u); assert.equal(posts, 0); assert.deepEqual(coordinator.getRuntimeState().jobs, {});
+  coordinator.configureSession({ baseUrl: "http://127.0.0.1:18790", credential: effectfulCredential(), fetchImpl: effectfulFetch(new Map(), () => { posts++; }) });
+  await assert.rejects(coordinator.submitAuthorizedNode({ ...fixture, beforeSubmit: async () => coordinator.clearSession() }), /session changed/u);
+  assert.equal(posts, 0); assert.deepEqual(coordinator.getRuntimeState().jobs, {});
+});
+
 function stateFixture(): CompanionRuntimeStateV1 {
   return {
     version: 1,

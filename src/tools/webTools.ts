@@ -397,7 +397,7 @@ export const webFetchTool: AgentTool = {
     if (cached) {
       const section = await readSourceSection(
         context,
-        { path: cached.vaultPath },
+        { path: cached.vaultPath, ...(cached.snapshotSha256 ? { version: cached.snapshotSha256 } : {}) },
         1,
       );
       const cachedUsability = evaluateSourceUsability({
@@ -405,6 +405,7 @@ export const webFetchTool: AgentTool = {
         sourceLocator: cached.normalizedUrl || url,
         query,
         parserStatus: cached.parserStatus,
+        sourceVersion: cached.snapshotSha256,
       });
       if (cachedUsability.usable) return {
         title: cached.title,
@@ -422,6 +423,7 @@ export const webFetchTool: AgentTool = {
         sourceChars: cached.sourceChars,
         totalChars: cached.totalChars,
         contentHash: cached.contentHash,
+        ...(cached.snapshotSha256 ? { snapshotSha256: cached.snapshotSha256 } : {}),
         truncated: cached.truncated,
         parserStatus: cached.parserStatus,
         cacheMaxAgeMs: maxAgeMs,
@@ -539,6 +541,7 @@ export const webFetchTool: AgentTool = {
       sourceChars: cache.sourceChars,
       totalChars: cache.totalChars,
       contentHash: cache.contentHash,
+      ...(cache.snapshotSha256 ? { snapshotSha256: cache.snapshotSha256 } : {}),
       truncated: cache.truncated,
       parserStatus: cache.parserStatus,
       cacheMaxAgeMs: maxAgeMs,
@@ -628,6 +631,7 @@ async function retrieveWebFetchSubstituteV1(input: {
     sourceChars: fallbackCache.sourceChars,
     totalChars: fallbackCache.totalChars,
     contentHash: fallbackCache.contentHash,
+    ...(fallbackCache.snapshotSha256 ? { snapshotSha256: fallbackCache.snapshotSha256 } : {}),
     truncated: fallbackCache.truncated,
     parserStatus: fallbackCache.parserStatus,
     cacheMaxAgeMs: maxAgeMs,
@@ -649,6 +653,7 @@ export const readSourceSectionTool: AgentTool = {
     properties: {
       url: { type: "string" },
       path: { type: "string" },
+      version: { type: "string", description: "Exact immutable snapshot SHA-256, when a versioned passage names one." },
       section: {
         type: "integer",
         description: "One-based section number.",
@@ -670,7 +675,8 @@ export const readSourceSectionTool: AgentTool = {
     }
     const section = Math.max(1, getOptionalInteger(args, "section") ?? 1);
     const query = getEvidenceQuery(args, context.originalPrompt);
-    const result = await readSourceSection(context, { url, path }, section);
+    const version = getOptionalString(args, "version");
+    const result = await readSourceSection(context, { url, path, ...(version ? { version } : {}) }, section);
     return {
       status: "ok",
       path,

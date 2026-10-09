@@ -23,6 +23,7 @@ import {
 } from "../../core-api/src/hostApprovalReceiptV1";
 
 export interface CompanionServiceHealthV1 {
+  pdfReady?: boolean;
   ok: boolean;
   service: string;
   browserReady: boolean;
@@ -793,7 +794,22 @@ export class CompanionCoordinatorClientV1 {
     path: string,
     init: RequestInit,
   ): Promise<TResponse> {
-    const opened = await this.openResponse(path, init, this.timeoutMs);
+    const deadline = Date.now() + this.timeoutMs;
+    let opened: Awaited<ReturnType<CompanionCoordinatorClientV1["openResponse"]>>;
+    try { opened = await this.openResponse(path, init, this.timeoutMs); }
+    catch (error) {
+      const transient = error instanceof TypeError || error instanceof CompanionCoordinatorClientErrorV1 && [502, 503, 504].includes(error.status ?? 0);
+      const readOnly = init.method === "GET" && ["/health", "/status"].includes(path);
+      const remaining = deadline - Date.now();
+      if (!readOnly || !transient || init.signal?.aborted || remaining <= 0) throw error;
+      // A single bounded read retry should not immediately hammer an unavailable
+      // service. Leave the same overall deadline in place during the backoff.
+      const delayMs = Math.min(75, Math.floor(remaining / 4));
+      await waitForReadRetry(delayMs, init.signal);
+      const retryBudget = deadline - Date.now();
+      if (retryBudget <= 0) throw error;
+      opened = await this.openResponse(path, init, retryBudget);
+    }
     try {
       const text = await readBoundedText(opened.response, this.maxResponseBytes);
       try {
@@ -834,6 +850,7 @@ export class CompanionCoordinatorClientV1 {
     const controller = new AbortController();
     const callerSignal = init.signal;
     const abort = () => controller.abort(callerSignal?.reason);
+    if (callerSignal?.aborted) abort();
     callerSignal?.addEventListener("abort", abort, { once: true });
     const timer =
       timeoutMs > 0
@@ -893,6 +910,15 @@ export class CompanionCoordinatorClientV1 {
     }
     return serialized;
   }
+}
+
+function waitForReadRetry(delayMs: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); reject(signal?.reason ?? new DOMException("Aborted", "AbortError")); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, delayMs);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 export class CompanionCoordinatorClientErrorV1 extends Error {

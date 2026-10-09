@@ -26,6 +26,7 @@ export function evaluateSourceUsability(input: {
   query?: string;
   parserStatus?: string;
   baseOffset?: number;
+  sourceVersion?: string;
 }): SourceUsabilityResult {
   const parserStatus = normalizeSourceParserStatus(input.parserStatus);
   if (parserStatus === "empty" || parserStatus === "missing_content") {
@@ -41,6 +42,7 @@ export function evaluateSourceUsability(input: {
     query: input.query,
     sourceLocator: input.sourceLocator,
     baseOffset: input.baseOffset,
+    sourceVersion: input.sourceVersion,
   }).passages.filter((passage) => passage.text.trim().length > 0);
   if (passages.length === 0) {
     return { usable: false, reason: "no_evidence_passages", passageIds: [] };

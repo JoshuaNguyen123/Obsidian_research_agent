@@ -23,6 +23,7 @@ export interface ResearchRetrievalOutput {
   providerMetadata?: Record<string, unknown>;
   /** Host cache provenance. Only populated when the provider read stored bytes. */
   cachedSource?: import("../tools/sourceCache").CachedSource;
+  snapshotSha256?: string;
 }
 
 export interface ResearchRetrievalProvider {

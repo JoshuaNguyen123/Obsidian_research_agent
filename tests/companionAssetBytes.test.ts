@@ -32,3 +32,10 @@ test("the shipped artifact carries the canonical bytes", async () => {
     `${COMPANION_ASSETS_ARTIFACT} was built from a checkout with non-canonical line endings`,
   );
 });
+
+test("the shipped Python runtime includes current document and approval modules", async () => {
+  const artifact = JSON.parse(await readFile(path.join(repoRoot, COMPANION_ASSETS_ARTIFACT), "utf8")) as { files: Record<string, string> };
+  for (const filename of ["pdf_extract.py", "host_approval_signer.py", "server.py", "schemas.py"]) {
+    assert.equal(artifact.files[filename], await readFile(path.join(repoRoot, "companion", filename), "utf8"), `${filename} must match its approved source`);
+  }
+});

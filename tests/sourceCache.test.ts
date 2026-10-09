@@ -1,5 +1,7 @@
 import { processTestVaultFile } from "./helpers/atomicTestVault";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { createEvidenceSourceId, extractEvidencePassages } from "../src/agent/researchDossier";
 import assert from "node:assert/strict";
 import {
   SOURCE_CACHE_FOLDER,
@@ -80,6 +82,30 @@ function createCacheContext(now: Date) {
 
   return { context, content, folders, readCounts };
 }
+
+test("optional snapshots bind passages to exact persisted content through equal-length refresh", async () => {
+  const { context } = createCacheContext(new Date("2026-10-08T00:00:00Z"));
+  const snapshots = new Map<string, any>();
+  context.captureSourceSnapshot = async (source) => {
+    const snapshotSha256 = createHash("sha256").update(source.content).digest("hex");
+    snapshots.set(snapshotSha256, { ...source, sourceId: createEvidenceSourceId(source.url), locator: source.url,
+      capturedAt: "2026-10-08T00:00:00Z", snapshotSha256 });
+    return { snapshotSha256 };
+  };
+  context.readSourceSnapshot = async (version) => { const snapshot = snapshots.get(version); if (!snapshot) throw new Error("missing snapshot"); return snapshot; };
+  const url = "https://example.com/report", a = await writeSourceCacheNote(context, { url, title: "Dose", content: "Dose A is 0.05 mg/L." });
+  const b = await writeSourceCacheNote(context, { url, title: "Dose", content: "Dose B is 0.05 mg/L." });
+  assert.notEqual(a.snapshotSha256, b.snapshotSha256);
+  const old = await readSourceSection(context, { url, version: a.snapshotSha256 }, 1);
+  assert.equal(old.content, "Dose A is 0.05 mg/L.");
+  const bundle = extractEvidencePassages(old.content, { sourceLocator: url, sourceVersion: old.snapshotSha256 });
+  assert.ok(bundle.passages.every((passage) => passage.id.includes(`:version:${a.snapshotSha256}:passage:`)));
+  await assert.rejects(readSourceSection(context, { url, version: a.snapshotSha256 }, 2), /out of range/);
+  await assert.rejects(readSourceSection(context, { url: "https://example.com/other", version: a.snapshotSha256 }, 1), /identity mismatch/);
+  snapshots.delete(a.snapshotSha256!);
+  await assert.rejects(readSourceSection(context, { url, version: a.snapshotSha256 }, 1), /missing snapshot/);
+  assert.throws(() => extractEvidencePassages(old.content, { sourceLocator: url, sourceVersion: "bad" }), /Malformed/);
+});
 
 test("writeSourceCacheNote writes a sectioned frontmatter note under Agent Sources", async () => {
   const now = new Date("2026-07-07T12:00:00.000Z");

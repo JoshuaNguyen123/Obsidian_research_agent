@@ -36,6 +36,7 @@ export interface CachedSource {
    * and so never satisfy a refresh.
    */
   fetchedForMission?: string;
+  snapshotSha256?: string;
 }
 
 export interface SourceCacheReadOptions {
@@ -100,6 +101,7 @@ export async function writeSourceCacheNote(
     title: string;
     content: string;
     parserStatus?: Exclude<SourceParserStatus, "legacy_unknown">;
+    evidence?: unknown;
   },
 ): Promise<CachedSource> {
   const fetchedAt = (ctx.now?.() ?? new Date()).toISOString();
@@ -113,6 +115,11 @@ export async function writeSourceCacheNote(
     source.content.trim() ? "parsed" : "empty"
   );
   const contentHash = await sha256Fingerprint(content);
+  ctx.abortSignal?.throwIfAborted();
+  const snapshot = ctx.captureSourceSnapshot ? await ctx.captureSourceSnapshot({ url: normalizedUrl, title, content, ...(source.evidence ? { evidence: source.evidence } : {}) }, ctx.abortSignal) : undefined;
+  const snapshotSha256 = snapshot?.snapshotSha256;
+  if (snapshotSha256 !== undefined && !/^[a-f0-9]{64}$/.test(snapshotSha256)) throw new Error("Malformed evidence source version.");
+  ctx.abortSignal?.throwIfAborted();
   const readableBody = [`# ${title}`, "", content].join("\n");
   const sectionCount = Math.max(
     1,
@@ -133,6 +140,7 @@ export async function writeSourceCacheNote(
     `sourceChars: ${sourceChars}`,
     `totalChars: ${content.length}`,
     `contentHash: ${JSON.stringify(contentHash)}`,
+    ...(snapshotSha256 ? [`snapshotSha256: ${JSON.stringify(snapshotSha256)}`] : []),
     `truncated: ${truncated}`,
     `parserStatus: ${JSON.stringify(parserStatus)}`,
     `sectionCount: ${sectionCount}`,
@@ -163,6 +171,7 @@ export async function writeSourceCacheNote(
     sourceChars,
     totalChars: content.length,
     contentHash,
+    ...(snapshotSha256 ? { snapshotSha256 } : {}),
     truncated,
     parserStatus,
     sectionCount,
@@ -232,9 +241,21 @@ export async function findFreshCachedSource(
 
 export async function readSourceSection(
   ctx: ToolExecutionContext,
-  ref: { url?: string; path?: string },
+  ref: { url?: string; path?: string; version?: string },
   section: number,
 ): Promise<CachedSourceSection> {
+  if (ref.version !== undefined) {
+    if (!/^[a-f0-9]{64}$/.test(ref.version) || !ctx.readSourceSnapshot) throw new Error("Immutable evidence version unavailable.");
+    const snapshot = await ctx.readSourceSnapshot(ref.version);
+    if (snapshot.snapshotSha256 !== ref.version || (ref.url && normalizeSourceUrl(ref.url) !== normalizeSourceUrl(snapshot.locator))) throw new Error("Immutable evidence identity mismatch.");
+    const sectionCount = Math.max(1, Math.ceil(snapshot.content.length / SOURCE_CACHE_SECTION_CHARS));
+    if (!Number.isSafeInteger(section) || section < 1 || section > sectionCount) throw new Error("Evidence section out of range.");
+    const sourceStartChar = (section - 1) * SOURCE_CACHE_SECTION_CHARS, normalizedUrl = normalizeSourceUrl(snapshot.locator);
+    return { vaultPath: ref.path ?? "", url: snapshot.locator, normalizedUrl, urlHash: hashSourceText(normalizedUrl), title: snapshot.title,
+      fetchedAt: snapshot.capturedAt, sourceChars: snapshot.content.length, totalChars: snapshot.content.length,
+      contentHash: await sha256Fingerprint(snapshot.content), truncated: false, parserStatus: "parsed", sectionCount,
+      snapshotSha256: snapshot.snapshotSha256, section, sourceStartChar, content: snapshot.content.slice(sourceStartChar, sourceStartChar + SOURCE_CACHE_SECTION_CHARS) };
+  }
   const file = ref.path
     ? ctx.app.vault.getFileByPath(normalizeVaultPath(ref.path, { requireMarkdown: true }))
     : await findCachedFileByUrl(ctx, ref.url ?? "");
@@ -542,6 +563,7 @@ function parseCachedSourceNote(path: string, markdown: string): CachedSource | n
     sourceChars: parsedSourceChars,
     totalChars,
     contentHash: fields.get("contentHash") ?? "",
+    ...(fields.get("snapshotSha256")?.match(/^[a-f0-9]{64}$/) ? { snapshotSha256: fields.get("snapshotSha256") } : {}),
     truncated:
       parseBoolean(fields.get("truncated")) ?? parsedSourceChars > totalChars,
     parserStatus: parseParserStatus(fields.get("parserStatus")),
@@ -597,6 +619,7 @@ function normalizeCachedSourceRecord(value: unknown): CachedSource | null {
     sourceChars,
     totalChars: value.totalChars,
     contentHash: typeof value.contentHash === "string" ? value.contentHash : "",
+    ...(typeof value.snapshotSha256 === "string" && /^[a-f0-9]{64}$/.test(value.snapshotSha256) ? { snapshotSha256: value.snapshotSha256 } : {}),
     truncated: typeof value.truncated === "boolean"
       ? value.truncated
       : sourceChars > value.totalChars,

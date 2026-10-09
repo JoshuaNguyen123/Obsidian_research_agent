@@ -8,6 +8,7 @@ import type {
   ResearchRetrievalProvider,
 } from "../orchestrator/researchProvider";
 import type { ActionReceipt, ToolDescriptor } from "../agent/actions";
+import { sha256Fingerprint } from "../agent/actions";
 import { normalizePublicFetchUrlV1 } from "./fetchHostPolicy";
 import {
   describePublicFetchFailureV1,
@@ -87,6 +88,44 @@ interface DocumentExtractResponseV1 {
   truncated: boolean;
 }
 
+// Derived text only: never durable, shared across neither vaults nor live
+// bootstrap sessions. Reconnect/engine restart acquires a new session; local
+// host/core upgrades start a new process. Source bytes are still checked on
+// every call so a changed file at the same locator cannot reuse old text.
+const documentExtractCaches = new WeakMap<CompanionBootstrapSessionV1, WeakMap<object, {
+  entries: Map<string, { value: DocumentExtractResponseV1; size: number }>;
+  retained: number;
+}>>();
+const DOCUMENT_DERIVED_CACHE_BYTES = 8 * 1024 * 1024;
+
+function documentExtractConfiguration(context: ToolExecutionContext): string {
+  return JSON.stringify({
+    origin: context.settings.companionBaseUrl.trim().replace(/\/+$/u, ""),
+    timeout: context.settings.requestTimeoutMs,
+    build: context.pluginVersion ?? "",
+    maxPages: DEFAULT_DOCUMENT_EXTRACT_PAGES,
+    maxChars: DEFAULT_DOCUMENT_EXTRACT_CHARS,
+    policy: "companion-complete-text-v1",
+  });
+}
+
+function assertDocumentExtractGeneration(context: ToolExecutionContext, signal: AbortSignal | undefined, session: CompanionBootstrapSessionV1, configuration: string): void {
+  assertDocumentOperationActive(context, signal);
+  if (documentExtractConfiguration(context) !== configuration ||
+      resolveCompanionBootstrapSessionV1(session.baseUrl) !== session) {
+    throw new ToolExecutionError("invalid_state", "Document extraction session or configuration changed; stale response was discarded.");
+  }
+}
+
+function documentExtractCache(session: CompanionBootstrapSessionV1, context: ToolExecutionContext) {
+  let owners = documentExtractCaches.get(session);
+  if (!owners) { owners = new WeakMap(); documentExtractCaches.set(session, owners); }
+  const owner = context.app?.vault ?? context.httpTransport ?? context;
+  let cache = owners.get(owner);
+  if (!cache) { cache = { entries: new Map(), retained: 0 }; owners.set(owner, cache); }
+  return cache;
+}
+
 /**
  * Retrieval provider for PDFs and other document-like sources.
  *
@@ -132,13 +171,15 @@ export function createDocumentExtractProvider(
         signal: abortSignal,
       });
       const content = extracted.status === "parsed" ? extracted.text : "";
+      let cachedSource;
       if (content.trim()) {
-        await cacheExtractedSource(context, {
+        cachedSource = await cacheExtractedSource(context, {
           url: locator.cacheUrl,
           title:
             candidate.title?.trim() ||
             documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
           content,
+          evidence: { route: "companion-pdf", originalBytes: new Uint8Array(document.bytes), pageCount: extracted.pageCount, pagesExtracted: extracted.pagesExtracted, pagesSkipped: extracted.pagesSkipped, truncated: extracted.truncated, extractedChars: extracted.text.length },
         });
       }
       return {
@@ -147,6 +188,7 @@ export function createDocumentExtractProvider(
           documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
         url: locator.cacheUrl,
         content,
+        ...(cachedSource ? { cachedSource, ...(cachedSource.snapshotSha256 ? { snapshotSha256: cachedSource.snapshotSha256 } : {}) } : {}),
         // The empty/parsed split is the whole point: an unreadable PDF must not
         // look like a parsed source with nothing to say.
         parserStatus: content.trim() ? "parsed" : "empty",
@@ -247,8 +289,10 @@ async function requestDocumentExtract(
       "document_extract requires an authenticated companion session.",
     );
   }
+  const configuration = documentExtractConfiguration(context);
+  const contentBase64 = encodeBase64(new Uint8Array(input.document.bytes));
   const body = JSON.stringify({
-    contentBase64: encodeBase64(new Uint8Array(input.document.bytes)),
+    contentBase64,
     sourceUrl: input.url,
     title: input.title?.trim() || null,
     maxPages: DEFAULT_DOCUMENT_EXTRACT_PAGES,
@@ -259,6 +303,17 @@ async function requestDocumentExtract(
       "source_unusable",
       `document_extract companion body is ${body.length} bytes; the limit is ${COMPANION_DEFAULT_MAX_BODY_BYTES} bytes.`,
     );
+  }
+  // Current auth, path/URL policy, byte/body limits and deadline are checked
+  // before reuse. The digest excludes title/locator: these belong to each
+  // call's source capture below, not to the document parser's text result.
+  const key = await sha256Fingerprint({ contentBase64, configuration });
+  assertDocumentExtractGeneration(context, input.signal, session!, configuration);
+  const cache = documentExtractCache(session!, context);
+  const previous = cache.entries.get(key);
+  if (previous) {
+    cache.entries.delete(key); cache.entries.set(key, previous);
+    return { ...previous.value };
   }
   const response = await credential.withToken((token) =>
     requestWithRetry(context.httpTransport, {
@@ -281,7 +336,24 @@ async function requestDocumentExtract(
       `document_extract failed on the companion (HTTP ${response.status}).`,
     );
   }
-  return readDocumentExtractResponse(response.json ?? parseJsonText(response.text));
+  const extracted = readDocumentExtractResponse(response.json ?? parseJsonText(response.text));
+  assertDocumentExtractGeneration(context, input.signal, session!, configuration);
+  // Failures, empty results and unknown/partial coverage must be retried.
+  if (extracted.status === "parsed" && extracted.text.trim() && extracted.pageCount > 0 &&
+      extracted.pagesExtracted === extracted.pageCount && extracted.pagesSkipped === 0 && !extracted.truncated) {
+    const size = new TextEncoder().encode(JSON.stringify(extracted)).byteLength;
+    if (size <= DOCUMENT_DERIVED_CACHE_BYTES) {
+      const concurrent = cache.entries.get(key);
+      if (concurrent) { cache.retained -= concurrent.size; cache.entries.delete(key); }
+      while (cache.retained + size > DOCUMENT_DERIVED_CACHE_BYTES || cache.entries.size >= 32) {
+        const oldest = cache.entries.keys().next().value;
+        if (oldest === undefined) break;
+        cache.retained -= cache.entries.get(oldest)!.size; cache.entries.delete(oldest);
+      }
+      cache.entries.set(key, { value: { ...extracted }, size }); cache.retained += size;
+    }
+  }
+  return extracted;
 }
 
 function readDocumentExtractResponse(value: unknown): DocumentExtractResponseV1 {
@@ -291,21 +363,28 @@ function readDocumentExtractResponse(value: unknown): DocumentExtractResponseV1 
       "document_extract received an unreadable companion response.",
     );
   }
+  const pageCount = readCount(value.pageCount);
+  const pagesExtracted = readCount(value.pagesExtracted);
+  const pagesSkipped = readCount(value.pagesSkipped);
+  if (typeof value.truncated !== "boolean" || pagesExtracted > pageCount || pagesSkipped > pageCount - pagesExtracted) {
+    throw new ToolExecutionError("source_unusable", "document_extract received invalid companion coverage fields.");
+  }
   return {
     status: value.status,
     reason: typeof value.reason === "string" ? value.reason : null,
     text: typeof value.text === "string" ? value.text : "",
-    pageCount: readCount(value.pageCount),
-    pagesExtracted: readCount(value.pagesExtracted),
-    pagesSkipped: readCount(value.pagesSkipped),
-    truncated: value.truncated === true,
+    pageCount,
+    pagesExtracted,
+    pagesSkipped,
+    truncated: value.truncated,
   };
 }
 
 function readCount(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : 0;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new ToolExecutionError("source_unusable", "document_extract received invalid companion page counts.");
+  }
+  return value;
 }
 
 function parseJsonText(text: string | undefined): unknown {
@@ -418,10 +497,10 @@ async function resolveExtractDocumentSource(
     const document = await readVaultPdf(context, vaultPath);
     const cacheUrl = input.url?.trim()
       ? normalizeDocumentUrl(input.url)
-      : vaultPath;
+      : `vault://${vaultPath}`;
     return {
       cacheUrl,
-      title: documentNameFromUrl(cacheUrl),
+      title: documentNameFromUrl(input.url?.trim() ? cacheUrl : vaultPath),
       document,
       vaultPath,
     };
@@ -481,16 +560,17 @@ async function readVaultPdf(
 
 async function cacheExtractedSource(
   context: ToolExecutionContext,
-  source: { url: string; title: string; content: string },
-): Promise<void> {
+  source: { url: string; title: string; content: string; evidence?: unknown },
+): Promise<import("./sourceCache").CachedSource | undefined> {
   if (!context.app?.vault || !source.content.trim()) {
     return;
   }
   try {
-    await writeSourceCacheNote(context, {
+    return await writeSourceCacheNote(context, {
       url: source.url,
       title: source.title,
       content: source.content,
+      ...(source.evidence ? { evidence: source.evidence } : {}),
       parserStatus: "parsed",
     });
   } catch {

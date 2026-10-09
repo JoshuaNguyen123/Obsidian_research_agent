@@ -170,6 +170,8 @@ export class CompanionExtensionCoordinatorV1 {
   private runtimeState: CompanionRuntimeStateV1 = defaultRuntimeState();
   private persistChain = Promise.resolve();
   private coordinationTail = Promise.resolve();
+  private sessionGeneration = 0;
+  private healthFlight: Promise<CompanionCoordinatorSnapshotV1> | null = null;
 
   configurePersistence(persistence: CompanionLineagePersistenceV1): void {
     this.persistence = persistence;
@@ -206,6 +208,8 @@ export class CompanionExtensionCoordinatorV1 {
   }
 
   clearSession(): void {
+    this.sessionGeneration += 1;
+    this.healthFlight = null;
     if (this.disconnectSession) {
       this.disconnectSession();
     } else if (this.baseUrl) {
@@ -230,22 +234,28 @@ export class CompanionExtensionCoordinatorV1 {
     };
   }
 
-  async refreshHealth(): Promise<CompanionCoordinatorSnapshotV1> {
+  refreshHealth(): Promise<CompanionCoordinatorSnapshotV1> {
     if (!this.client) {
       this.lastError =
         "Companion session is not connected. Install or connect the authenticated local service.";
       this.checkedAt = new Date().toISOString();
+      return Promise.resolve(this.snapshot());
+    }
+    if (this.healthFlight) return this.healthFlight;
+    const client = this.client, generation = this.sessionGeneration;
+    const flight = (async () => {
+      try {
+        const health = await client.health();
+        if (generation === this.sessionGeneration && client === this.client) { this.health = health; this.lastError = null; }
+      } catch (error) {
+        if (generation === this.sessionGeneration && client === this.client) { this.health = null; this.lastError = safeError(error); }
+      }
+      if (generation === this.sessionGeneration && client === this.client) this.checkedAt = new Date().toISOString();
       return this.snapshot();
-    }
-    try {
-      this.health = await this.client.health();
-      this.lastError = null;
-    } catch (error) {
-      this.health = null;
-      this.lastError = safeError(error);
-    }
-    this.checkedAt = new Date().toISOString();
-    return this.snapshot();
+    })();
+    this.healthFlight = flight;
+    void flight.finally(() => { if (this.healthFlight === flight) this.healthFlight = null; });
+    return flight;
   }
 
   async describeHostApprovalSigner(): Promise<CompanionHostApprovalSignerDescriptionV1> {
@@ -597,7 +607,10 @@ export class CompanionExtensionCoordinatorV1 {
   private async submitAuthorizedNodeUnlocked(
     input: CompanionAuthorizedNodeSubmissionV1,
   ): Promise<CompanionNodeDispatchResultV1> {
+    const client = this.client, generation = this.sessionGeneration;
+    const assertSession = () => this.assertCurrentSession(client, generation);
     const prepared = await prepareCompanionJobV1(input);
+    assertSession();
     if (prepared.status === "waiting_obsidian") {
       this.lastWaitingObsidianNodeId = prepared.nodeId;
       return prepared;
@@ -624,7 +637,7 @@ export class CompanionExtensionCoordinatorV1 {
           "Resume from the originating Obsidian run so core can bind the exact runtime lineage.",
       };
     }
-    if (!this.client) {
+    if (!client) {
       return {
         status: "blocked",
         nodeId: input.nodeId,
@@ -663,15 +676,19 @@ export class CompanionExtensionCoordinatorV1 {
         };
       }
       try {
-        const job = await this.client.getJob(existing.jobId);
+        const job = await client.getJob(existing.jobId);
+        assertSession();
         // A confirmed remote job may execute independently. Bind the exact core
         // attempt before adopting or returning that lineage.
         await input.beforeSubmit?.(prepared.job);
+        assertSession();
         assertLineageMatches(existing, job);
         adoptRemoteLineage(existing, job);
         await this.persistRuntimeState();
+        assertSession();
         return { status: "submitted", job };
       } catch (error) {
+        assertSession();
         if (existing.state === "prepared" && isDefinitiveJobMissing(error)) {
           // A prepared-only lineage has never had a confirmed remote effect.
           // A definitive 404 permits the one deterministic create below. Run
@@ -680,10 +697,12 @@ export class CompanionExtensionCoordinatorV1 {
           // Ambiguous readback cannot prove the remote job absent. Bind the core
           // attempt before persisting reconcile_required.
           await input.beforeSubmit?.(prepared.job);
+          assertSession();
           existing.reconcileStatus = "reconcile_required";
           existing.reconcileError = safeError(error);
           existing.updatedAt = new Date().toISOString();
           await this.persistRuntimeState();
+          assertSession();
           return {
             status: "blocked",
             nodeId: input.nodeId,
@@ -697,6 +716,7 @@ export class CompanionExtensionCoordinatorV1 {
       }
     }
     const snapshot = await this.refreshHealth();
+    assertSession();
     if (!snapshot.health?.coordinatorReady) {
       return {
         status: "blocked",
@@ -744,6 +764,7 @@ export class CompanionExtensionCoordinatorV1 {
     // consumes and persists the exact remote attempt. From this point onward
     // the extension WAL and POST /jobs are the only remaining steps.
     await input.beforeSubmit?.(prepared.job);
+    assertSession();
     if (!existing) {
       existing = lineageFromPreparedJob(prepared.job, hostRuntimeRunId);
       this.runtimeState.jobs[prepared.job.id] = existing;
@@ -755,20 +776,26 @@ export class CompanionExtensionCoordinatorV1 {
     // This lineage is the extension-side WAL. It must be durable before the
     // first POST /jobs so a remote commit can always be adopted after restart.
     await this.persistRuntimeState();
+    assertSession();
     let job: CompanionRemoteJobV1;
     try {
-      job = await this.client.submit(prepared.job);
+      job = await client.submit(prepared.job);
+      assertSession();
     } catch (dispatchError) {
+      assertSession();
       // Job creation is idempotent, but a transport failure after commit is
       // ambiguous. Reconcile by deterministic job-id readback only; never
       // redispatch from this call.
       try {
-        job = await this.client.getJob(prepared.job.id);
+        job = await client.getJob(prepared.job.id);
+        assertSession();
       } catch (readbackError) {
+        assertSession();
         existing.reconcileStatus = "reconcile_required";
         existing.reconcileError = safeError(readbackError);
         existing.updatedAt = new Date().toISOString();
         await this.persistRuntimeState();
+        assertSession();
         return {
           status: "blocked",
           nodeId: input.nodeId,
@@ -783,6 +810,7 @@ export class CompanionExtensionCoordinatorV1 {
     assertLineageMatches(existing, job);
     adoptRemoteLineage(existing, job);
     await this.persistRuntimeState();
+    assertSession();
     return { status: "submitted", job };
   }
 
@@ -794,7 +822,9 @@ export class CompanionExtensionCoordinatorV1 {
     if (!this.client) {
       throw new Error("The authenticated companion session is not connected.");
     }
-    const events = await this.client.replayEvents({ jobId, afterSequence, signal });
+    const client = this.client, generation = this.sessionGeneration;
+    const events = await client.replayEvents({ jobId, afterSequence, signal });
+    this.assertCurrentSession(client, generation);
     const lineage = this.runtimeState.jobs[jobId];
     if (lineage && events.length > 0) {
       lineage.lastObservedEventSequence = Math.max(
@@ -803,6 +833,7 @@ export class CompanionExtensionCoordinatorV1 {
       );
       lineage.updatedAt = new Date().toISOString();
       await this.persistRuntimeState();
+      this.assertCurrentSession(client, generation);
     }
     return events;
   }
@@ -887,20 +918,24 @@ export class CompanionExtensionCoordinatorV1 {
     signal?: AbortSignal,
   ): Promise<CompanionReconciledLineageV1[]> {
     if (!this.client) throw new Error("The authenticated companion session is not connected.");
+    const client = this.client, generation = this.sessionGeneration;
+    const assertSession = () => this.assertCurrentSession(client, generation);
     const results: CompanionReconciledLineageV1[] = [];
     for (const lineage of Object.values(this.runtimeState.jobs)) {
       if (signal?.aborted) break;
       try {
-        const job = await this.client.getJob(lineage.jobId);
+        const job = await client.getJob(lineage.jobId);
+        assertSession();
         assertLineageMatches(lineage, job);
-        adoptRemoteLineage(lineage, job);
         const projected = remoteJobToCompanionJob(job);
-        const events = await this.client.replayEvents({
+        const events = await client.replayEvents({
           jobId: job.id,
           afterSequence: lineage.lastAppliedEventSequence,
           signal,
         });
-        const receipts = await this.client.listReceipts(job.id);
+        assertSession();
+        const receipts = await client.listReceipts(job.id);
+        assertSession();
         for (const receipt of receipts) {
           const expected = await companionReceiptFingerprintV1({
             job: projected,
@@ -909,10 +944,12 @@ export class CompanionExtensionCoordinatorV1 {
             status: receipt.status,
             payload: receipt.payload,
           });
+          assertSession();
           if (expected !== receipt.fingerprint) {
             throw new Error(`Receipt ${receipt.id} fingerprint drifted.`);
           }
         }
+        adoptRemoteLineage(lineage, job);
         lineage.state = job.state;
         lineage.lastObservedEventSequence = Math.max(
           lineage.lastObservedEventSequence,
@@ -934,13 +971,22 @@ export class CompanionExtensionCoordinatorV1 {
         refreshChatResumeSummary(lineage, projected, job, receipts);
         results.push({ lineage: { ...lineage }, job, events, receipts });
       } catch (error) {
+        assertSession();
         lineage.reconcileStatus = "reconcile_required";
         lineage.reconcileError = safeError(error);
         lineage.updatedAt = new Date().toISOString();
       }
     }
+    assertSession();
     await this.persistRuntimeState();
+    assertSession();
     return results;
+  }
+
+  private assertCurrentSession(client: CompanionCoordinatorClientV1 | null, generation: number): void {
+    if (client !== this.client || generation !== this.sessionGeneration) {
+      throw new Error("Companion session changed during job operation; reconnect and reconcile the persisted identity.");
+    }
   }
 
   private async withCoordinationLock<T>(operation: () => Promise<T>): Promise<T> {

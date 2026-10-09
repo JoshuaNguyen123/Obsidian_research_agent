@@ -150,11 +150,11 @@ export interface BuildClaimLedgerInput {
  * token shape is how a citation gets verified here and missed there.
  */
 export const SOURCE_SCOPED_PASSAGE_ID_PATTERN =
-  /\bsource:[a-z0-9]+:passage:\d+-\d+\b/gi;
+  /\bsource:[a-z0-9]+(?::version:[a-f0-9]{64})?:passage:\d+-\d+\b/gi;
 const PASSAGE_ID_PATTERN = SOURCE_SCOPED_PASSAGE_ID_PATTERN;
 /** Legacy/simple passage markers that are not nested inside source-scoped ids. */
 const SIMPLE_PASSAGE_ID_PATTERN =
-  /(?<!source:[a-z0-9]+:)\bpassage:[a-z0-9][a-z0-9:_-]*\b/gi;
+  /(?<!:)\bpassage:[a-z0-9][a-z0-9:_-]*\b/gi;
 const QUOTE_PATTERN = createQuotedSpanPattern();
 
 const CLAIM_STOP_TERMS = new Set([
