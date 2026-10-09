@@ -20,6 +20,8 @@ export interface LoopLedger {
   writeCompleted: boolean;
   wallClockExpired?: boolean;
   planComplete?: boolean;
+  /** A required graph tool node still lacks its own durable proof. */
+  planHasPendingTool?: boolean;
   planNeedsVerification?: boolean;
   planHasBlocker?: boolean;
   shouldReplan?: boolean;
@@ -99,7 +101,7 @@ export function decideNextLoopAction(
     return { action: "verify_active_task", reason: "mission_plan_needs_verification" };
   }
 
-  if (ledger.requiredToolsSatisfied && !ledger.citationGatherStillUnpaid) {
+  if (ledger.requiredToolsSatisfied && !ledger.citationGatherStillUnpaid && !ledger.planHasPendingTool) {
     // Every required proof already exists, so repetition is wandering, not
     // missing progress: steer to the final answer instead of dying on the
     // repeat counter with a complete graph and an unwritten synthesis.
@@ -130,7 +132,8 @@ export function decideNextLoopAction(
     budget.toolStepBudget > 0 &&
     ledger.successfulTools.length >= budget.toolStepBudget &&
     ledger.successfulTools.length > 0 &&
-    !ledger.citationGatherStillUnpaid
+    !ledger.citationGatherStillUnpaid &&
+    !ledger.planHasPendingTool
   ) {
     return {
       action: "force_final_no_tools",
