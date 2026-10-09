@@ -222,5 +222,5 @@ export function hasExplicitPublicWebSignal(prompt: string): boolean {
 export function hasExplicitNoWebIntent(prompt: string): boolean {
   return /\b(?:do\s+not|don't|never)\s+(?:use|search|browse|access|consult)\s+(?:the\s+)?(?:web|internet|online)\b|\b(?:do\s+not|don't|never)\b[^.!?\r\n]{0,120}\bor\s+(?:use|search|browse|access|consult)\s+(?:the\s+)?(?:web|internet|online)\b|\b(?:no|without)\s+(?:public\s+)?(?:web|internet|online)(?:\s+(?:tools?|access|research|sources?))?\b|\b(?:vault|local|offline)[-\s]+only\b/iu.test(
     prompt,
-  );
+  ) || /\b(?:no|without)\s+network\s+(?:fetch(?:es|ing)?|requests?|access)\b/iu.test(prompt);
 }
