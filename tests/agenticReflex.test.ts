@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { AgenticReflexController } from "../src/agent/reflex/AgenticReflexController";
+import { requiresWebEvidenceProof } from "../src/agent/evidenceIntent";
 import { evaluateCompletion } from "../src/agent/reflex/completionEvaluator";
 import { evaluateProgress } from "../src/agent/reflex/progressMonitor";
 import { buildReflexCheckpointReceiptV1 } from "../src/agent/reflex/checkpointReceipt";
@@ -748,4 +749,40 @@ test("reflex asks a non-Matryoshka model for its native width whatever the setti
   assert.ok(dims.length >= 1);
   assert.ok(dims.every((dim) => dim === 384), JSON.stringify(dims));
   assert.ok(flags.every((flag) => flag === false));
+});
+
+
+test("closed local source analysis does not invent a web obligation", () => {
+  const prompt = "Read my vault files Inputs/paper.md and Inputs/notice.md; cite their exact source paths and passages. No network fetches, writes or external actions are authorized.";
+  const absent = evaluateCompletion(input({ prompt, allowedToolNames: new Set(["read_file"]) }));
+  assert.deepEqual(absent.missing, ["vault_evidence"]);
+  assert.equal(requiresWebEvidenceProof(prompt, missionIntent), false);
+  const read = evaluateCompletion(input({ prompt, allowedToolNames: new Set(["read_file"]),
+    evidence: [{ id: "local-notice", kind: "vault_note", title: "Authorized notice", summary: "Actual authorized notice read", confidence: "high" }] }));
+  assert.equal(read.complete, true);
+  assert.deepEqual(read.missing, []);
+});
+
+test("explicit network prohibition uses the shared completion predicate", () => {
+  for (const prohibition of ["No network fetches", "Without network requests", "No network access"]) {
+    const prompt = "Cite the local paper sources Inputs/paper.md. " + prohibition + ".";
+    assert.equal(requiresWebEvidenceProof(prompt, missionIntent), false);
+    assert.equal(evaluateCompletion(input({ prompt })).missing.includes("web_evidence"), false);
+  }
+});
+
+test("local read evidence cannot replace an explicitly requested web source", () => {
+  const prompt = "Verify this claim with current web sources and cite the publisher.";
+  const result = evaluateCompletion(input({ prompt, allowedToolNames: new Set(["web_fetch"]),
+    evidence: [{ id: "local-note", kind: "vault_note", title: "Local note", summary: "Local notes only", confidence: "high" }] }));
+  assert.equal(requiresWebEvidenceProof(prompt, missionIntent), true);
+  assert.equal(result.complete, false);
+  assert.ok(result.missing.includes("web_evidence"));
+  assert.equal(result.recommendedNextTool, "web_fetch");
+});
+
+test("unrelated negative wording does not suppress public research proof", () => {
+  const prompt = "Verify this with web citations. Do not infer missing data or invent results.";
+  assert.equal(requiresWebEvidenceProof(prompt, missionIntent), true);
+  assert.equal(evaluateCompletion(input({ prompt })).missing.includes("web_evidence"), true);
 });
