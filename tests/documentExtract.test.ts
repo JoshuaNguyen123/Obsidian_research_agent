@@ -1,6 +1,8 @@
 import { processTestVaultFile } from "./helpers/atomicTestVault";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { readSourceSection, writeSourceCacheNote } from "../src/tools/sourceCache";
 
 import {
   clearCompanionBootstrapSessionV1,
@@ -617,6 +619,100 @@ test("extract_document accepts a vault-relative .pdf path through normalizeVault
   } finally {
     disconnect();
   }
+});
+
+test("local root PDF identity cannot be mistaken for a bare web domain", async () => {
+  const disconnect = connectCompanion(), recorded: Recorded = { requests: [] };
+  try {
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Exact local content.", pageCount: 1, pagesExtracted: 1 }), { vaultFiles: { "study.pdf": pdfBytes() } });
+    const transport = context.httpTransport!;
+    context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+    const captures: string[] = [];
+    context.captureSourceSnapshot = async source => { captures.push(source.url); return { snapshotSha256: "a".repeat(64) }; };
+    const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf" }, context);
+    assert.equal(result.ok, true);
+    assert.equal((result.output as { url: string }).url, "vault://study.pdf");
+    assert.equal((result.output as { title: string }).title, "study.pdf");
+    assert.equal(result.receipt?.resource.id, "vault://study.pdf");
+    assert.deepEqual(captures, ["vault://study.pdf"]);
+    assert.equal(recorded.requests.length, 1, "local bytes must not trigger an external download");
+    assert.equal(JSON.parse(String(recorded.requests[0]!.body)).sourceUrl, null);
+  } finally { disconnect(); }
+});
+
+test("nested, spaced and Unicode vault paths retain their own identity and path guards", async () => {
+  const disconnect = connectCompanion();
+  try {
+    for (const path of ["Papers/study.pdf", "Papers/My study.pdf", "研究.pdf"]) {
+      const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Exact local content.", pageCount: 1, pagesExtracted: 1 }), { vaultFiles: { [path]: pdfBytes() } });
+      const captures: string[] = [];
+      context.captureSourceSnapshot = async source => { captures.push(source.url); return { snapshotSha256: "b".repeat(64) }; };
+      const result = await createDocumentExtractTools()[0]!.executeResult!({ path }, context);
+      assert.equal(result.ok, true);
+      assert.equal((result.output as { url: string }).url, `vault://${path}`);
+      assert.equal((result.output as { path: string }).path, path);
+      assert.deepEqual(captures, [new URL(`vault://${path}`).toString()]);
+    }
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Never read." }));
+    for (const path of ["../study.pdf", "/study.pdf", "C:/study.pdf", ".obsidian/study.pdf", "Papers\\study.pdf"]) {
+      await assert.rejects(() => createDocumentExtractTools()[0]!.executeResult!({ path }, context), /Unsafe path/u);
+    }
+  } finally { disconnect(); }
+});
+
+test("explicit URL attribution with a vault path retains public URL policy and remote identity", async () => {
+  const disconnect = connectCompanion(), recorded: Recorded = { requests: [] };
+  try {
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Attributed local bytes.", pageCount: 1, pagesExtracted: 1 }), { vaultFiles: { "study.pdf": pdfBytes() } });
+    const transport = context.httpTransport!;
+    context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+    const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf", url: PDF_URL }, context);
+    assert.equal((result.output as { url: string }).url, PDF_URL);
+    assert.equal(result.receipt?.resource.id, PDF_URL);
+    assert.equal(recorded.requests.length, 1);
+    assert.equal(JSON.parse(String(recorded.requests[0]!.body)).sourceUrl, PDF_URL);
+    await assert.rejects(() => createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf", url: "http://127.0.0.1/report.pdf" }, context), /local or private network/u);
+  } finally { disconnect(); }
+});
+
+test("bare public document domains and explicit web URLs keep existing download behavior", async () => {
+  const disconnect = connectCompanion();
+  try {
+    for (const input of ["reports.example/study.pdf", "https://reports.example/study.pdf"]) {
+      const recorded: Recorded = { requests: [] };
+      const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Web content.", pageCount: 1, pagesExtracted: 1 }));
+      const transport = context.httpTransport!;
+      context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+      const result = await createDocumentExtractTools()[0]!.executeResult!({ url: input }, context);
+      assert.equal((result.output as { url: string }).url, "https://reports.example/study.pdf");
+      assert.equal(recorded.requests.length, 2);
+      assert.equal(recorded.requests[0]!.url, "https://reports.example/study.pdf");
+      assert.equal(JSON.parse(String(recorded.requests[1]!.body)).sourceUrl, "https://reports.example/study.pdf");
+    }
+  } finally { disconnect(); }
+});
+
+test("canonical local extraction cannot rewrite legacy cache notes or old immutable versions", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Current local value is 0.95 mg/L.", pageCount: 1, pagesExtracted: 1 }), { vaultFiles: { "study.pdf": pdfBytes() } });
+    const oldVersion = "c".repeat(64);
+    const old = { snapshotSha256: oldVersion, sourceId: "legacy-source-id", locator: "https://study.pdf/", title: "Legacy study", content: "Old value is 0.05 mg/L.", capturedAt: "2026-09-04T00:00:00Z" };
+    const original = JSON.stringify(old), captures: string[] = [];
+    context.readSourceSnapshot = async version => { assert.equal(version, oldVersion); return old; };
+    context.captureSourceSnapshot = async source => { captures.push(source.url); return { snapshotSha256: createHash("sha256").update(source.url).update(source.content).digest("hex") }; };
+    const cached = await writeSourceCacheNote(context, { url: old.locator, title: old.title, content: old.content });
+    const legacyBytes = await context.app.vault.read(context.app.vault.getFileByPath(cached.vaultPath)!);
+    const current = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf" }, context);
+    assert.equal((current.output as { url: string }).url, "vault://study.pdf");
+    assert.deepEqual(captures, ["https://study.pdf/", "vault://study.pdf"]);
+    assert.equal(await context.app.vault.read(context.app.vault.getFileByPath(cached.vaultPath)!), legacyBytes);
+    assert.equal((await readSourceSection(context, { url: old.locator, version: oldVersion }, 1)).content, old.content);
+    assert.equal(JSON.stringify(old), original);
+    await assert.rejects(readSourceSection(context, { url: "vault://study.pdf", version: oldVersion }, 1), /identity mismatch/u);
+    const provider = createDocumentExtractProvider(context, { fetchDocument: async () => ({ bytes: pdfBytes(), contentType: "application/pdf" }) });
+    assert.equal((await provider.retrieve({ id: "legacy", url: "Papers/legacy.pdf", strategy: "document_extract" }))?.url, "Papers/legacy.pdf");
+  } finally { disconnect(); }
 });
 
 test("a document URL that redirects to the companion is refused before the redirect is followed", async () => {

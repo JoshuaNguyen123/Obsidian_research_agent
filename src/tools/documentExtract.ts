@@ -421,10 +421,10 @@ async function resolveExtractDocumentSource(
     const document = await readVaultPdf(context, vaultPath);
     const cacheUrl = input.url?.trim()
       ? normalizeDocumentUrl(input.url)
-      : vaultPath;
+      : `vault://${vaultPath}`;
     return {
       cacheUrl,
-      title: documentNameFromUrl(cacheUrl),
+      title: documentNameFromUrl(input.url?.trim() ? cacheUrl : vaultPath),
       document,
       vaultPath,
     };
