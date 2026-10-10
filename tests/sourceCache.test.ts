@@ -540,3 +540,20 @@ test("a section read waits for a queued rewrite of the same source instead of re
   await rewrite;
   assert.match(section.content, /Refreshed body about solid electrolytes/u);
 });
+
+test("cancellation during source-folder creation prevents note and manifest publication", async () => {
+  const { context, content } = createCacheContext(new Date("2026-10-10T00:00:00Z"));
+  const controller = new AbortController();
+  context.abortSignal = controller.signal;
+  const createFolder = context.app.vault.createFolder.bind(context.app.vault);
+  context.app.vault.createFolder = async path => {
+    const folder = await createFolder(path);
+    controller.abort(new DOMException("Cancelled during folder creation", "AbortError"));
+    return folder;
+  };
+  await assert.rejects(writeSourceCacheNote(context, {
+    url: "https://example.com/cancel-at-folder", title: "Cancelled source", content: "A complete passage.",
+  }), (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(content.size, 0, "Neither a source note nor a manifest may be published after cancellation.");
+});
