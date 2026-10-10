@@ -539,6 +539,10 @@ export const readMarkdownFilesTool: AgentTool = {
         items: { type: "string" },
         description: "Vault-relative markdown paths.",
       },
+      query: {
+        type: "string",
+        description: "Optional passage focus or exact quotation to locate in the read source. Defaults to the mission question; does not expand read authority or content bounds.",
+      },
       maxCharsPerFile: {
         type: "integer",
         description: "Optional maximum characters returned per file.",
@@ -595,6 +599,7 @@ export const readMarkdownFilesTool: AgentTool = {
     }
 
     return {
+      query: (getOptionalString(args, "query") ?? context.originalPrompt ?? "").replace(/\s+/g, " ").trim().slice(0, 500),
       requestedCount: requestedPaths.length,
       returnedCount: files.length,
       limit: MAX_BATCH_READ_FILES,
@@ -615,6 +620,10 @@ export const readFileTool: AgentTool = {
     type: "object",
     required: ["path"],
     properties: {
+      query: {
+        type: "string",
+        description: "Optional passage focus or exact quotation to locate in the read source. Defaults to the mission question; does not expand read authority or content bounds.",
+      },
       path: {
         type: "string",
         description: "Vault-relative markdown path, for example Projects/example.md.",
@@ -633,6 +642,7 @@ export const readFileTool: AgentTool = {
 
     const content = await context.app.vault.cachedRead(file);
     return {
+      query: (getOptionalString(args, "query") ?? context.originalPrompt ?? "").replace(/\s+/g, " ").trim().slice(0, 500),
       path: file.path,
       content: truncateText(content, MAX_FILE_READ_CHARS),
     };

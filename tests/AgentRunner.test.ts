@@ -30477,3 +30477,75 @@ test("local-only rejected quotation reopens evidence reads before accepting a co
   const ledger = [...vault.content.entries()].filter(([path]) => path.startsWith("Agent Runs/")).map(([,content]) => parseMissionLedgerFromMarkdown(content)).find(value => value !== null);
   assert.equal(ledger?.acceptance?.status, "pass", JSON.stringify({completion:completions.at(-1),acceptance:ledger?.acceptance}));
 });
+
+test("large local evidence read delivers a targeted source passage before quote repair", async () => {
+  const prompt = "Does this exact quotation about the observational intervention justify a causal conclusion, or only an association?\n\nUse only the public source files under Inputs/. Read the relevant actual evidence before answering; cite exact source paths and passages. Do not infer missing data or causes. Missing evidence is unresolved. No network fetches, code execution, writes or external actions are authorized.\n\nSource files:\n1. Inputs/Evidence.md\n2. Inputs/Claim.md";
+  const source = "The intervention was associated with improved outcomes in this observational cohort, which does not establish a causal effect.";
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings = createRunnerSettings({ maxAgentSteps: 8, modelRouterMode: "authority", model: "glm-5.3-flash:cloud", agenticReflexEnabled: false, researchMemoryEnabled: false });
+  vault.content.set("Inputs/Evidence.md", "Neutral auxiliary detail. ".repeat(380) + "\n\n" + source + "\n\n" + "Unrelated appendix material. ".repeat(1400));
+  vault.content.set("Inputs/Claim.md", "# Assessment question\n\nDoes an observational design establish a causal effect?");
+  const calls: ModelToolCall[] = [], requests: ModelChatRequest[] = [], completions: AgentRunCompleteEvent[] = [];
+  let draftRejected = false, repairReadOffered = false, quoteRejectionObserved = false, successfulSourceReads = 0, repairReturnedExactSource = false;
+  const diagnostics: unknown[] = [];
+  const respond: ChatResponder = request => {
+    if (isMissionRouterFormat(request)) return responseWithContent(JSON.stringify({
+      mode: "chat_answer", writeScope: "none", needsWebEvidence: false, needsVaultContext: true,
+      needsCodeExecution: false, wordTarget: null, confidence: 0.99, rationale: "Compare two local sources with exact passage grounding.",
+    }));
+    if (isMissionGraphPlannerFormat(request)) {
+      const catalog = parseMissionGraphHostCatalog(request);
+      return responseWithContent(JSON.stringify({ confidence: 0.99, nodes: catalog.filter(node => node.required && node.id !== "final").map(node => ({ id: node.id, objective: node.hostObjective, dependencyIds: [...node.hostDependencyIds] })) }));
+    }
+    const reads = successfulSourceReads;
+    if (reads === 1) {
+      const actualRead = request.messages.filter(message => message.role === "tool").at(-1);
+      assert.ok(actualRead?.content.includes(source), "the model must receive the decisive passage from the actual large source read");
+    }
+    const names = request.tools?.map(tool => tool.function.name) ?? [];
+    if (reads === 0) return responseWithToolCall("read_file", { path: "Inputs/Evidence.md" });
+    if (reads === 1 && !draftRejected) return responseWithToolCall("read_file", { path: "Inputs/Claim.md" });
+    if (draftRejected && quoteRejectionObserved && names.includes("read_file") && reads === 2) {
+      repairReadOffered = true;
+      assert.equal(names.includes("web_search"), false);
+      assert.equal(names.includes("web_fetch"), false);
+      assert.equal(names.some(name => /append|write|delete|execute/u.test(name)), false);
+      return responseWithToolCall("read_file", { path: "Inputs/Evidence.md" });
+    }
+    if (reads >= 3) {
+      const lastTool = request.messages.filter(message => message.role === "tool").at(-1);
+      assert.ok(lastTool?.content.includes(source), "successful local repair read must forward the exact authoritative text to the model");
+      repairReturnedExactSource = true;
+    }
+    const actualPassages = request.messages.filter(message => message.role === "tool").flatMap(message => {
+      try { return JSON.parse(message.content).output?.contentEvidence?.passages ?? []; } catch { return []; }
+    });
+    // Bind the rejected quotation to the relevant actually delivered source
+    // passage; a coverage filler passage tests missing grounding instead.
+    const passage = actualPassages.find((passage: any) => passage.text.includes(source))?.id ?? getPassageCitationIds(request)[0];
+    assert.ok(passage, "actual read evidence must produce an accepted passage identifier");
+    draftRejected = true;
+    return responseWithContent(reads >= 3
+      ? `The source states: "${source}" [${passage}]`
+      : `The source states: "The intervention caused improved outcomes in this randomized trial." [${passage}]`);
+  };
+  await runAgentMission({ prompt, modelClient: createClient({ chatRequests: requests, chatResponders: Array(30).fill(respond) }),
+    toolRegistry: createCollectingRegistry(calls), toolContext: vault.context, enableStreaming: false, forceChatOnly: true, interactiveApprovals: false, maxSteps: 8,
+    events: { onRunComplete: event => completions.push(event), onTrace: event => {
+      if (/quote_mismatch/u.test(JSON.stringify(event))) quoteRejectionObserved = true;
+      if (event.kind === "tool_result" && event.toolName === "read_file") {
+        assert.ok((event.outputPreview as any)?.content, "each counted logical read must have actual returned content");
+        successfulSourceReads += 1;
+      }
+      diagnostics.push(event);
+    }, onMissionGraphUpdate: graph => diagnostics.push({graph: Object.values(graph.nodes).map(node => ({id:node.id,status:node.status,allowedTools:node.allowedTools}))}) } });
+  if (process.env.RAP_LOCAL_REPAIR_PHASE) writeFileSync(new URL('../large-runtime-observation-'+process.env.RAP_LOCAL_REPAIR_PHASE+'.json',import.meta.url),JSON.stringify({quoteRejectionObserved,repairReadOffered,successfulSourceReads,repairReturnedExactSource,physicalToolExecutions:calls.length,calls,requests:requests.map(request=>({phase:request.evidencePhase,tools:request.tools?.map(tool=>tool.function.name)})),completions,diagnostics},null,2),{flag:'wx'});
+  assert.equal(quoteRejectionObserved, true, "the deliberately mismatched quote must be rejected before testing repair");
+  assert.equal(repairReadOffered, true, "unpaid quotation must offer an actual source reread before finalization");
+  assert.equal(successfulSourceReads, 3);
+  assert.equal(repairReturnedExactSource, true);
+  assert.ok(calls.filter(call => call.name === "read_file").length >= 2, "both distinct original source reads must execute");
+  assert.equal(calls.some(call => /web_search|web_fetch|append|write|delete|execute/u.test(call.name)), false);
+  const ledger = [...vault.content.entries()].filter(([path]) => path.startsWith("Agent Runs/")).map(([,content]) => parseMissionLedgerFromMarkdown(content)).find(value => value !== null);
+  assert.equal(ledger?.acceptance?.status, "pass", JSON.stringify({completion:completions.at(-1),acceptance:ledger?.acceptance}));
+});
