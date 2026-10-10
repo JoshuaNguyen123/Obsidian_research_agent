@@ -51,6 +51,20 @@ function pdfBytes(body = "%PDF-1.4 opinion bytes"): ArrayBuffer {
   ) as ArrayBuffer;
 }
 
+
+const ENGINE_IDENTITY = { schemaVersion: 1, generation: "a".repeat(32), loadedEngineSha256: "b".repeat(64),
+  effectiveConfigurationSha256: "c".repeat(64), status: "ready" };
+/** Source/extract counters retain their original meaning; each new health
+ * operation is separately held to its exact authenticated no-store contract. */
+function engineHealthResponse(request: HttpRequest): HttpResponse | null {
+  if (request.url !== BASE_URL + "/health") return null;
+  assert.equal(request.method, "GET");
+  assert.equal(request.headers?.Authorization, "Bearer " + BOOTSTRAP_TOKEN);
+  assert.equal(request.headers?.["Cache-Control"], "no-store");
+  return { status: 200, headers: { "cache-control": "no-store" }, json: {
+    ok: true, service: "obsidian-research-companion", pdfReady: true, documentExtractionIdentity: ENGINE_IDENTITY } };
+}
+
 function contextFor(
   companionResponse: HttpResponse,
   options: {
@@ -66,6 +80,7 @@ function contextFor(
   return {
     settings: { companionBaseUrl: BASE_URL, requestTimeoutMs: 30_000 },
     httpTransport: async (request: HttpRequest) => {
+      const health = engineHealthResponse(request); if (health) return health;
       options.recorded?.requests.push(request);
       return request.url.startsWith(BASE_URL) ? companionResponse : download;
     },
@@ -73,7 +88,7 @@ function contextFor(
 }
 
 function companionJson(payload: Record<string, unknown>): HttpResponse {
-  return { status: 200, headers: {}, json: payload };
+  return { status: 200, headers: { "cache-control": "no-store" }, json: { ...payload, documentExtractionIdentity: ENGINE_IDENTITY } };
 }
 
 test("the document provider serves exactly the document_extract strategy", () => {
@@ -626,7 +641,7 @@ test("local root PDF identity cannot be mistaken for a bare web domain", async (
   try {
     const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Exact local content.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }), { vaultFiles: { "study.pdf": pdfBytes() } });
     const transport = context.httpTransport!;
-    context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+    context.httpTransport = request => { if (!engineHealthResponse(request)) recorded.requests.push(request); return transport(request); };
     const captures: string[] = [];
     context.captureSourceSnapshot = async source => { captures.push(source.url); return { snapshotSha256: "a".repeat(64) }; };
     const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf" }, context);
@@ -665,7 +680,7 @@ test("explicit URL attribution with a vault path retains public URL policy and r
   try {
     const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Attributed local bytes.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }), { vaultFiles: { "study.pdf": pdfBytes() } });
     const transport = context.httpTransport!;
-    context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+    context.httpTransport = request => { if (!engineHealthResponse(request)) recorded.requests.push(request); return transport(request); };
     const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "study.pdf", url: PDF_URL }, context);
     assert.equal((result.output as { url: string }).url, PDF_URL);
     assert.equal(result.receipt?.resource.id, PDF_URL);
@@ -682,7 +697,7 @@ test("bare public document domains and explicit web URLs keep existing download 
       const recorded: Recorded = { requests: [] };
       const context = createExtractVaultContext(companionJson({ status: "parsed", text: "Web content.", pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false }));
       const transport = context.httpTransport!;
-      context.httpTransport = request => { recorded.requests.push(request); return transport(request); };
+      context.httpTransport = request => { if (!engineHealthResponse(request)) recorded.requests.push(request); return transport(request); };
       const result = await createDocumentExtractTools()[0]!.executeResult!({ url: input }, context);
       assert.equal((result.output as { url: string }).url, "https://reports.example/study.pdf");
       assert.equal(recorded.requests.length, 2);
@@ -782,7 +797,7 @@ test("derived reuse skips a second parse across tools while preserving each loca
   try {
     const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes(), "two.pdf": pdfBytes() } });
     let posts = 0, reads = 0; const transport = context.httpTransport!, read = context.app.vault.readBinary!;
-    context.httpTransport = request => { posts++; return transport(request); };
+    context.httpTransport = request => { if (!engineHealthResponse(request)) posts++; return transport(request); };
     context.app.vault.readBinary = async file => { reads++; return read(file); };
     const captures: Array<{url: string; title: string}> = [];
     context.captureSourceSnapshot = async source => { captures.push({ url: source.url, title: source.title }); return { snapshotSha256: "a".repeat(64) }; };
@@ -795,7 +810,7 @@ test("derived reuse skips a second parse across tools while preserving each loca
     assert.deepEqual(captures, [{ url: "vault://one.pdf", title: "First report" }, { url: "vault://two.pdf", title: "Second report" }]);
     const isolated = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
     let isolatedPosts = 0; const otherTransport = isolated.httpTransport!;
-    isolated.httpTransport = request => { isolatedPosts++; return otherTransport(request); };
+    isolated.httpTransport = request => { if (!engineHealthResponse(request)) isolatedPosts++; return otherTransport(request); };
     await createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, isolated);
     assert.equal(isolatedPosts, 1, "no reuse across vault owners");
   } finally { disconnect(); }
@@ -806,7 +821,7 @@ test("derived reuse binds current bytes including equal-length replacement", asy
   try {
     const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
     let posts = 0; const transport = context.httpTransport!;
-    context.httpTransport = request => { posts++; return transport(request); };
+    context.httpTransport = request => { if (!engineHealthResponse(request)) posts++; return transport(request); };
     let current = pdfBytes("%PDF-1.4 value -0.05"); context.app.vault.readBinary = async () => current;
     const tool = createDocumentExtractTools()[0]!;
     await tool.executeResult!({ path: "one.pdf" }, context); await tool.executeResult!({ path: "one.pdf" }, context);
@@ -821,7 +836,7 @@ test("derived reuse invalidates on timeout build or live session identity and re
   try {
     const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
     let posts = 0; const transport = context.httpTransport!;
-    context.httpTransport = request => { posts++; return transport(request); };
+    context.httpTransport = request => { if (!engineHealthResponse(request)) posts++; return transport(request); };
     const run = () => createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context);
     await run(); await run(); assert.equal(posts, 1);
     context.settings.requestTimeoutMs = 17_000; await run(); assert.equal(posts, 2);
@@ -836,7 +851,7 @@ test("derived cache hits cannot bypass abort deadline unsafe URL or current body
   try {
     const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
     let posts = 0; const transport = context.httpTransport!;
-    context.httpTransport = request => { posts++; return transport(request); };
+    context.httpTransport = request => { if (!engineHealthResponse(request)) posts++; return transport(request); };
     const run = (args: Record<string, unknown> = { path: "one.pdf" }) => createDocumentExtractTools()[0]!.executeResult!(args, context);
     await run();
     const controller = new AbortController(); controller.abort(); context.abortSignal = controller.signal;
@@ -855,7 +870,7 @@ test("late extract responses after config session or cancellation changes never 
       const context = createExtractVaultContext(completeExtract(), { vaultFiles: { "one.pdf": pdfBytes() } });
       let posts = 0, captures = 0, release: ((value: HttpResponse) => void) | undefined;
       context.captureSourceSnapshot = async () => { captures++; return { snapshotSha256: "a".repeat(64) }; };
-      context.httpTransport = async () => { posts++; if (posts === 1) return new Promise<HttpResponse>(resolve => { release = resolve; }); return completeExtract(); };
+      context.httpTransport = async (request) => { const health = engineHealthResponse(request); if (health) return health; posts++; if (posts === 1) return new Promise<HttpResponse>(resolve => { release = resolve; }); return completeExtract(); };
       const controller = new AbortController(); context.abortSignal = controller.signal;
       const run = () => createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context);
       const pending = run(); while (!release) await new Promise(resolve => setTimeout(resolve, 0));
@@ -873,7 +888,7 @@ test("empty partial failed and over-budget extracts are retried instead of retai
   try {
     for (const response of [companionJson({ status: "empty", text: "", pageCount: 1, pagesExtracted: 0, pagesSkipped: 0, truncated: false }), companionJson({ status: "parsed", text: "Partial.", pageCount: 2, pagesExtracted: 1, pagesSkipped: 1, truncated: false }), { status: 400, headers: {} }, companionJson({ status: "parsed", text: "x".repeat(8 * 1024 * 1024 + 1), pageCount: 1, pagesExtracted: 1, pagesSkipped: 0, truncated: false })]) {
       const context = contextFor(response); let posts = 0;
-      context.httpTransport = async () => { posts++; return response; };
+      context.httpTransport = async (request) => { const health = engineHealthResponse(request); if (health) return health; posts++; return response; };
       const provider = createDocumentExtractProvider(context, { fetchDocument: async () => ({ bytes: pdfBytes() }) });
       const run = () => provider.retrieve({ id: "one", url: PDF_URL, strategy: "document_extract" });
       for (let index = 0; index < 2; index++) { if (response.status >= 400) await assert.rejects(run()); else await run(); }
@@ -898,7 +913,7 @@ for (const [name, changes] of malformedCoverageCases) {
       const payload = { ...(completeExtract().json as Record<string, unknown>), ...changes };
       const response = { status: 200, headers: {}, json: payload };
       const context = createExtractVaultContext(response, { vaultFiles: { "one.pdf": pdfBytes() } });
-      let posts = 0, captures = 0; context.httpTransport = async () => { posts++; return response; };
+      let posts = 0, captures = 0; context.httpTransport = async (request) => { const health = engineHealthResponse(request); if (health) return health; posts++; return response; };
       context.captureSourceSnapshot = async () => { captures++; return { snapshotSha256: "a".repeat(64) }; };
       for (let index = 0; index < 2; index++) {
         await assert.rejects(createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context), (error: unknown) => error instanceof ToolExecutionError && error.code === "source_unusable");
@@ -912,7 +927,7 @@ test("strict response coverage retains a valid zero-page empty result without ca
   try {
     const response = companionJson({ status: "empty", text: "", reason: "unreadable", pageCount: 0, pagesExtracted: 0, pagesSkipped: 0, truncated: false });
     const context = createExtractVaultContext(response, { vaultFiles: { "one.pdf": pdfBytes() } });
-    let posts = 0, captures = 0; context.httpTransport = async () => { posts++; return response; };
+    let posts = 0, captures = 0; context.httpTransport = async (request) => { const health = engineHealthResponse(request); if (health) return health; posts++; return response; };
     context.captureSourceSnapshot = async () => { captures++; return { snapshotSha256: "a".repeat(64) }; };
     for (let index = 0; index < 2; index++) {
       const result = await createDocumentExtractTools()[0]!.executeResult!({ path: "one.pdf" }, context);

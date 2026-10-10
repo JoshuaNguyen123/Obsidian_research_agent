@@ -33,6 +33,7 @@ from coordinator_store import (
 from memory_store import MemoryStore
 from host_approval_signer import HostApprovalSigner, HostApprovalSignerError
 from pdf_extract import extract_pdf_text
+from document_engine import DocumentEngineIdentity
 from schemas import (
     BrowserClickRequest,
     BrowserExtractMarkdownRequest,
@@ -105,6 +106,7 @@ def create_app(
     installed_executor_domains: tuple[str, ...] = (),
     worker_diagnostic_provider: Callable[[], str | None] | None = None,
 ) -> FastAPI:
+    document_engine = DocumentEngineIdentity()
     selected = config or CompanionConfig.from_environment(DEFAULT_DATA_DIR)
     data_dir = selected.validate_data_boundary()
     browser_factory = browser_factory or (
@@ -206,7 +208,9 @@ def create_app(
         )
 
     @application.get("/health", response_model=HealthResponse)
-    async def health() -> HealthResponse:
+    async def health(response: Response) -> HealthResponse:
+        response.headers["Cache-Control"] = "no-store"
+        identity = await asyncio.to_thread(document_engine.observe)
         persistent = application.state.secrets.persistent
         worker = _worker_status(
             application, expected_worker_catalog_fingerprint, worker_diagnostic_provider
@@ -215,6 +219,8 @@ def create_app(
             selected.background_requested and persistent and worker["workerReady"]
         )
         return HealthResponse(
+            pdfReady=identity["status"] == "ready",
+            documentExtractionIdentity=identity,
             browserReady=application.state.browser.ready,
             memoryReady=application.state.memory.ready,
             coordinatorReady=application.state.coordinator.ready,
@@ -464,13 +470,20 @@ def create_app(
                 status_code=400,
                 detail="Document content must be valid base64.",
             ) from exc
+        identity = await asyncio.to_thread(document_engine.observe)
+        if identity["status"] != "ready":
+            raise HTTPException(status_code=503, detail="Document engine artifacts changed or identity is unavailable; restart the service.")
         extraction = await asyncio.to_thread(
             extract_pdf_text,
             content,
             max_pages=request.maxPages,
             max_chars=request.maxChars,
         )
+        after = await asyncio.to_thread(document_engine.observe)
+        if after != identity or after["status"] != "ready":
+            raise HTTPException(status_code=503, detail="Document engine changed during extraction; stale output discarded.")
         return DocumentExtractResponse(
+            documentExtractionIdentity=identity,
             status=extraction.status,
             reason=extraction.reason,
             url=request.sourceUrl,

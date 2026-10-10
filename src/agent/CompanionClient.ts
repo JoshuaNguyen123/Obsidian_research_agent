@@ -1,3 +1,4 @@
+import type { DocumentExtractionIdentityV1 } from "./documentEngineIdentity";
 import { redactSecretsV1 } from "./secretRedaction";
 import {
   BrowserClickInput,
@@ -28,6 +29,7 @@ import {
 import type { MissionJsonValueV1 } from "../../packages/headless-runtime/src/missionGraphV3";
 
 export interface CompanionHealth {
+  documentExtractionIdentity?: DocumentExtractionIdentityV1;
   ok: boolean;
   service: string;
   browserReady: boolean;

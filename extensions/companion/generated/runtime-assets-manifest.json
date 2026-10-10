@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "artifact": "companion-assets.json",
-  "bundleHash": "sha256:19e66037ab17b4b0bc5fa8dbcf5252657d61ae0c39e234f58ac1e3648c207fcf",
+  "bundleHash": "sha256:738c1a157f05e221037c9b0749e9ae9c6fa06b52a6fc240e4825d2cb7f59fe4c",
   "fileHashes": {
     "auth.py": "sha256:c9abcff89e48c201f2b45d202b34ccafdbad8c2a6266c4049c6040db32c7a74a",
     "browser_security.py": "sha256:a67824d73c04bd223c28af24cb9deda60947725c7d204a7d2c3e1316d51b0942",
@@ -9,6 +9,7 @@
     "companion_control.py": "sha256:f7d73637e8deb9402269ae51554167aae5fe1cce7c389734ac738058d5eba13e",
     "config.py": "sha256:1d907b1910c692004f2e0b3024b1f89f88b331ee9760a669219f784f4cc1916e",
     "coordinator_store.py": "sha256:61051c51d6a27023064408cc167397b8ad2a9393f47ef62a1f526f68c9f5b9fa",
+    "document_engine.py": "sha256:036e9b4303aec95bef831838556014cac2d1f9b7fdb9a6c754ab505bfc036685",
     "host_approval_signer.py": "sha256:b9e80474c81b563f31c7f865ce1ada306bc285d63acfef55c0a7c37fdd78696f",
     "memory_store.py": "sha256:1bacf1cd7b5a1f1532d3c7b244e15d0982ce83242edb738f45fd2aca4b89bd58",
     "pdf_extract.py": "sha256:4bde0b6a38b40163633fe17bab23ac618f478d047dedd717745362a0c313de2f",
@@ -16,9 +17,9 @@
     "requirements.txt": "sha256:c9db51deee8285e53240e2ae0be86154bfb7eb5a5808670eb3fa1bb62836b812",
     "runtime_preflight.py": "sha256:83080f2b136aefe84b7882aea6d9a943cfb52e604e038ba40656ba3c76bff0f6",
     "runtime-lock.json": "sha256:6d7e04e94cfd99ed9d0d165de28b9c27261a23d27382eeef90332dfbca3d6246",
-    "schemas.py": "sha256:f1e337723290b80b15ed2b90ccdfa0083816ebe6c8328f589c2eebcc7f59d393",
+    "schemas.py": "sha256:bb9dd3057a2923b033561a74a1c14cd2989338fb8d1dd26672c94e0b418846d4",
     "secure_store.py": "sha256:6dec17e160d45a869c6af81ed683832a92abd661d131b723427c6057a1d867a2",
-    "server.py": "sha256:46e91d116a565353cee4d28e0f096fd5f344075123d1cf03071f7cf3894714cc",
+    "server.py": "sha256:fb2659dab1f4ec17c7a4aabae4a288a677fc0a61c920ac1f5d3bed3d5ac4a032",
     "service_launcher.py": "sha256:a011db6c5eadc18f5d2542606d1a22429a41edc9f11b95b50b26148f044ba50c",
     "service_manager.py": "sha256:6aeccdb4b952924c78b185e399544fc199ab4cd00f6c31918b8d37833f221e30",
     "standalone-worker.cjs": "sha256:a54bf681cd4083cb5e92a1ec878ff51f178407eb57f93bc084512644946dc473",
