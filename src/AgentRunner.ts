@@ -344,6 +344,7 @@ import {
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
   missionGraphTerminalProjectionSealsToolFrontierV1,
   sealedFrontierShouldKeepCitationGatherV1,
+  sealedLocalCitationGatherToolNamesV1,
   unpaidProofRequiresCitationGatherV1,
   citationGatherUnpaidMissingV1,
 } from "./agent/missionGraphFrontier";
@@ -9411,8 +9412,7 @@ export async function runAgentMission({
         ? [...liveMissing]
         : [];
     }
-    if (
-      !sealedFrontierShouldKeepCitationGatherV1({
+    const gatherInput = {
         graph: missionGraphSession?.graph ?? missionGraph,
         sealForForcedFinal:
           sealFrontierAfterForcedFinal &&
@@ -9437,10 +9437,13 @@ export async function runAgentMission({
         explicitSingleWebFetchOnly:
           hasExplicitSingleWebFetchOnlyIntent(activeIntentPrompt),
         explicitNoWeb: hasExplicitNoWebIntent(activeIntentPrompt),
-      })
-    ) {
-      return [];
+    };
+    if (gatherInput.explicitNoWeb) {
+      return sealedLocalCitationGatherToolNamesV1({ ...gatherInput,
+        availableToolNames: toolRegistry.getDefinitions().map(tool => tool.function.name),
+      });
     }
+    if (!sealedFrontierShouldKeepCitationGatherV1(gatherInput)) return [];
     return [...CITATION_GROUNDING_GATHER_TOOL_NAMES];
   };
   const reconcileCommittedProofGatedWriteAcceptance = (
@@ -20420,6 +20423,7 @@ export async function runAgentMission({
                 sealForForcedFinal:
                   sealFrontierAfterForcedFinal &&
                   !setLooseDeliveryUnpaidThisTurn,
+                citationGatherToolNames: citationGatherCompanionToolNames(),
                 keepCitationGatherOnSealedFrontier:
                   citationGatherCompanions.length > 0,
               },
@@ -23869,7 +23873,8 @@ export async function runAgentMission({
                         proofs: setLooseDeliveryProofs,
                       }).unpaid.length > 0
                     ),
-                  keepCitationGatherOnSealedFrontier:
+                  citationGatherToolNames: citationGatherCompanionToolNames(),
+                keepCitationGatherOnSealedFrontier:
                     midResponseCitationGather.length > 0,
                 },
               ),
