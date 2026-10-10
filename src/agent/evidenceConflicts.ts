@@ -90,7 +90,7 @@ export function detectEvidenceConflicts(
   const usable = passages
     .map((passage) => ({
       id: passage.id.trim(),
-      text: passage.text.replace(/\s+/g, " ").trim(),
+      text: passage.text.replace(/[^\S\r\n]+/g, " ").trim(),
       sourceId: passage.sourceId?.trim() || undefined,
       claimIds: dedupe((passage.claimIds ?? []).filter(Boolean)),
     }))
@@ -119,18 +119,28 @@ export function detectEvidenceConflicts(
         continue;
       }
 
-      const sharedTerms = getSharedClaimTerms(left.text, right.text);
-      // Require three shared claim terms before polarity/numeric conflict fires.
-      // Two-term overlaps produced frequent false positives that stalled analyze.
-      if (sharedTerms.length < 3) {
-        continue;
+      // A shared topic across a long passage is not a shared proposition.
+      // Compare sentence-local claim terms and quantities before applying the
+      // original polarity/numeric rules. This keeps reporting checklists and
+      // causal-control caveats separate from observed outcome estimates.
+      let sharedTerms: string[] = [];
+      let polarityConflict = false;
+      let numericConflict = false;
+      for (const leftClaim of claimSentences(left.text)) {
+        for (const rightClaim of claimSentences(right.text)) {
+          const terms = getSharedClaimTerms(leftClaim, rightClaim);
+          if (terms.length < 3) continue;
+          const polarity = hasOpposingPolarity(leftClaim, rightClaim, terms);
+          const numeric = hasNumericDisagreement(leftClaim, rightClaim, terms);
+          if (!polarity && !numeric) continue;
+          sharedTerms = terms;
+          polarityConflict = polarity;
+          numericConflict = numeric;
+          break;
+        }
+        if (polarityConflict || numericConflict) break;
       }
-
-      const polarityConflict = hasOpposingPolarity(left.text, right.text, sharedTerms);
-      const numericConflict = hasNumericDisagreement(left.text, right.text, sharedTerms);
-      if (!polarityConflict && !numericConflict) {
-        continue;
-      }
+      if (!polarityConflict && !numericConflict) continue;
 
       seenPairs.add(pairKey);
       const claimIds = dedupe([...left.claimIds, ...right.claimIds]);
@@ -156,7 +166,7 @@ function evidenceSourceIdentity(passage: {
       ? passage.sourceId
       : `source:${passage.sourceId}`;
   }
-  const sourcePassage = /^(source:[^:]+):passage:/u.exec(passage.id);
+  const sourcePassage = /^(source:[^:]+(?::version:[^:]+)?):passage:/u.exec(passage.id);
   return sourcePassage?.[1] ?? `passage:${passage.id}`;
 }
 
@@ -388,6 +398,13 @@ export function mergeEvidenceConflicts(
   return merged;
 }
 
+function claimSentences(text: string): string[] {
+  // Keep decimal points and page abbreviations intact. Paragraph boundaries
+  // and sentence punctuation followed by prose delimit separate assertions.
+  return text.split(/[\r\n]+|(?<=[.!?;])\s+(?=[A-Z(])/u)
+    .map((part) => part.trim()).filter((part) => part.length >= 12);
+}
+
 function hasOpposingPolarity(
   leftText: string,
   rightText: string,
@@ -446,7 +463,7 @@ const QUANTITY_CUES =
   /\b(?:percent|pct|rate|rates|efficiency|ratio|score|dose|concentration|temperature|celsius|fahrenheit|years?|months?|weeks?|days?|hours?|minutes?|patients?|samples?|participants?|subjects?|trials?|studies|mg|kg|km|ms|ghz|mhz)\b|%/i;
 
 const INDEX_PREFIX =
-  /\b(?:note|page|section|chapter|item|file|scaled|line|step|index|id|#)\s*$/i;
+  /\b(?:note|page|pg\.?|section|chapter|item|file|scaled|line|step|index|id|#)\s*$/i;
 
 function extractContextualNumbers(
   text: string,
