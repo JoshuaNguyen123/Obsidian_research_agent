@@ -30549,3 +30549,37 @@ test("large local evidence read delivers a targeted source passage before quote 
   const ledger = [...vault.content.entries()].filter(([path]) => path.startsWith("Agent Runs/")).map(([,content]) => parseMissionLedgerFromMarkdown(content)).find(value => value !== null);
   assert.equal(ledger?.acceptance?.status, "pass", JSON.stringify({completion:completions.at(-1),acceptance:ledger?.acceptance}));
 });
+
+test("clipped local read allows a real targeted reread before forcing final synthesis", async () => {
+  const prompt = "Quote the local report's description of the table's upregulated crotonylated and succinylated sites.\n\nUse only Inputs/Evidence.md. Read the actual evidence and cite exact passages. No network fetches, code execution, writes or external actions are authorized.";
+  const source = "The table contains 44 upregulated crotonylated sites and 3 upregulated succinylated sites, giving a descriptive count ratio of 44/3.";
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings = createRunnerSettings({ maxAgentSteps: 8, modelRouterMode: "authority", model: "glm-5.3-flash:cloud", agenticReflexEnabled: false, researchMemoryEnabled: false });
+  vault.content.set("Inputs/Evidence.md", "Neutral auxiliary detail. ".repeat(380)+"\n\n"+source+"\n\n"+"Unrelated appendix material. ".repeat(1400));
+  const calls: ModelToolCall[] = [], requests: ModelChatRequest[] = [], completions: AgentRunCompleteEvent[] = [], diagnostics: unknown[] = [];
+  let reads=0, targeted=false, delivered=false;
+  const respond: ChatResponder = request => {
+    if (isMissionRouterFormat(request)) return responseWithContent(JSON.stringify({mode:"chat_answer",writeScope:"none",needsWebEvidence:false,needsVaultContext:true,needsCodeExecution:false,wordTarget:null,confidence:.99,rationale:"Read the local report with exact source grounding."}));
+    if (isMissionGraphPlannerFormat(request)) { const catalog=parseMissionGraphHostCatalog(request); return responseWithContent(JSON.stringify({confidence:.99,nodes:catalog.filter(node=>node.required&&node.id!=="final").map(node=>({id:node.id,objective:node.hostObjective,dependencyIds:[...node.hostDependencyIds]}))})); }
+    const names=request.tools?.map(tool=>tool.function.name)??[];
+    if(reads===0)return responseWithToolCall("read_file",{path:"Inputs/Evidence.md",query:"neutral auxiliary"});
+    if(reads===1){
+      assert.ok(names.includes("read_file"),"clipped source must be assessable with an actually admitted targeted reread");
+      assert.equal(names.some(name=>/web_search|web_fetch|append|write|delete|execute/u.test(name)),false);
+      const prior=request.messages.filter(message=>message.role==="tool").at(-1)!;
+      assert.equal(prior.content.includes(source),false,"initial generic source read must not already contain the decisive passage");
+      targeted=true;return responseWithToolCall("read_file",{path:"Inputs/Evidence.md",query:"crotonylated succinylated sites"});
+    }
+    const prior=request.messages.filter(message=>message.role==="tool").at(-1)!;
+    assert.ok(prior.content.includes(source),"targeted tool result must actually reach the model");delivered=true;
+    const passage=JSON.parse(prior.content).output.contentEvidence.passages.find((entry:any)=>entry.text.includes(source));
+    assert.ok(passage?.id);return responseWithContent(`The source states: "${source}" [${passage.id}]`);
+  };
+  await runAgentMission({prompt,modelClient:createClient({chatRequests:requests,chatResponders:Array(30).fill(respond)}),toolRegistry:createCollectingRegistry(calls),toolContext:vault.context,enableStreaming:false,forceChatOnly:true,interactiveApprovals:false,maxSteps:8,
+    events:{onRunComplete:event=>completions.push(event),onTrace:event=>{diagnostics.push(event);if(event.kind==="tool_result"&&event.toolName==="read_file"&&(event.outputPreview as any)?.content)reads++;}}});
+  if(process.env.RAP_LOCAL_REPAIR_PHASE)writeFileSync(new URL('../source-assessment-observation-'+process.env.RAP_LOCAL_REPAIR_PHASE+'.json',import.meta.url),JSON.stringify({targeted,delivered,reads,calls,completions,diagnostics},null,2),{flag:'wx'});
+  assert.equal(targeted,true);assert.equal(delivered,true);assert.equal(reads,2);
+  assert.equal(calls.filter(call=>call.name==="read_file").length,2,"both distinct queries must execute against the actual source");
+  const ledger=[...vault.content.entries()].filter(([file])=>file.startsWith("Agent Runs/")).map(([,content])=>parseMissionLedgerFromMarkdown(content)).find(value=>value!==null);
+  assert.equal(ledger?.acceptance?.status,"pass",JSON.stringify({completion:completions.at(-1),acceptance:ledger?.acceptance}));
+});

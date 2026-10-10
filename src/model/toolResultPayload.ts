@@ -906,3 +906,18 @@ function slimResearchOutcome(toolName: string, output: Record<string, unknown>):
   }
   return kept;
 }
+
+/** Whether the actual model-facing source projection needs an assessment turn.
+ * This grants no evidence, acceptance, mutation or network authority. */
+export function sourceReadResultNeedsAssessmentV1(result: ToolExecutionResult): boolean {
+  if (!result.ok || !["read_file", "read_markdown_files", "read_note_section", "read_source_section"].includes(result.toolName)) return false;
+  const projected = JSON.parse(serializeToolResultForModel(result)) as Record<string, unknown>;
+  const clipped = (value: unknown): boolean => {
+    if (!isRecord(value)) return false;
+    if (isRecord(value.contentEvidence) && value.contentEvidence.truncated === true &&
+        typeof value.contentEvidence.totalChars === "number" && typeof value.contentEvidence.includedChars === "number" &&
+        value.contentEvidence.totalChars > value.contentEvidence.includedChars) return true;
+    return [value.files, value.results].some(items => Array.isArray(items) && items.some(clipped));
+  };
+  return clipped(projected.output) || (projected.truncated === true && projected.output === undefined);
+}

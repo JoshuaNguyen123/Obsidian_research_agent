@@ -35,7 +35,7 @@ import {
   runCriticWorker,
 } from "./orchestrator/criticWorker";
 import { appendToolTranscript } from "./model/toolTranscript";
-import { serializeToolResultForModel } from "./model/toolResultPayload";
+import { serializeToolResultForModel, sourceReadResultNeedsAssessmentV1 } from "./model/toolResultPayload";
 import {
   isModelRequestTimeoutError,
   isTransientModelError,
@@ -4025,6 +4025,8 @@ export async function runAgentMission({
   let lastStep = 0;
   let lastFinalOutput = "";
   let lastHeldCitationGatherMissing: string[] = [];
+  let sourceReadAssessmentPending = false;
+  let sourceReadAssessmentReceivedThisTurn = false;
   /**
    * One reserved retry for a forced final answer that came back empty.
    *
@@ -9402,6 +9404,14 @@ export async function runAgentMission({
     return gateAcceptanceByResearchPhase(acceptance, phase);
   };
   const citationGatherCompanionToolNames = (): string[] => {
+    // A successful clipped read proves that a tool ran, not that its excerpts
+    // answer the question. Offer local reads for assessment before forcing a
+    // tools-free draft, using the same companion list for menu and authority.
+    if (sourceReadAssessmentPending && !missionGraphUsesExactPlannedFrontier &&
+        !missionGraphCapacityExhausted && hasExplicitNoWebIntent(activeIntentPrompt)) {
+      const available = new Set(toolRegistry.getDefinitions().map(tool => tool.function.name));
+      return ["read_file", "read_markdown_files", "read_note_section", "read_source_section", "recall_tool_result"].filter(name => available.has(name));
+    }
     const liveMissing = evaluateCurrentAcceptance(
       lastFinalOutput.trim() || undefined,
     ).missing;
@@ -16828,6 +16838,7 @@ export async function runAgentMission({
       });
     }
 
+    if (origin === "model" && sourceReadResultNeedsAssessmentV1(result)) sourceReadAssessmentReceivedThisTurn = true;
     executedModelTool = true;
     const researchPhaseDeferred = isResearchPhaseToolDeferral(result);
     const recordedToolCall = recordTranscript
@@ -19681,6 +19692,7 @@ export async function runAgentMission({
     // model wait, so a kill mid-call cannot leave the ledger a tool behind.
     await flushDeferredMissionLedger();
     hostWorkStep = step;
+    sourceReadAssessmentReceivedThisTurn = false;
     if (await stopIfRequested(step)) {
       return;
     }
@@ -21253,6 +21265,9 @@ export async function runAgentMission({
         disableThinkingForRun,
         enableStreaming,
       );
+      // A prose response assesses the prior excerpts. Tool responses keep
+      // the window live through execution so advertised reads remain admitted.
+      if (response.toolCalls.length === 0) sourceReadAssessmentPending = false;
       longestModelTurnMs = Math.max(
         longestModelTurnMs,
         nowMs() - modelTurnStartedAt,
@@ -25797,6 +25812,7 @@ export async function runAgentMission({
       }
     }
 
+    sourceReadAssessmentPending = sourceReadAssessmentReceivedThisTurn;
     const requiredLoopToolsSatisfied = areLoopRequiredToolsSatisfied(
       loopBudgetPlan.expectedTools,
       successfulToolNames,
