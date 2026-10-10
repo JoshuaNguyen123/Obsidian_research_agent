@@ -506,6 +506,22 @@ export function citationGatherUnpaidMissingV1(input: {
   ];
 }
 
+/** Local evidence repair has no network or mutation tools. Catalog presence
+ * authorizes only an offer; existing host and graph execution gates still apply. */
+export const LOCAL_CITATION_GATHER_TOOL_NAMES_V1 = [
+  "read_file", "read_markdown_files", "read_current_file", "read_note",
+  "read_note_section", "read_source_section", "verify_citation", "recall_tool_result",
+] as const;
+
+export function sealedLocalCitationGatherToolNamesV1(input: Parameters<typeof sealedFrontierShouldKeepCitationGatherV1>[0] & {
+  availableToolNames: readonly string[];
+}): string[] {
+  if (input.explicitNoWeb !== true) return [];
+  if (!sealedFrontierShouldKeepCitationGatherV1({ ...input, explicitNoWeb: false })) return [];
+  const available = new Set(input.availableToolNames);
+  return LOCAL_CITATION_GATHER_TOOL_NAMES_V1.filter(name => available.has(name));
+}
+
 export function isCitationGroundingGatherToolNameV1(toolName: string): boolean {
   return (CITATION_GROUNDING_GATHER_TOOL_NAMES as readonly string[]).includes(
     toolName.trim(),
@@ -514,10 +530,11 @@ export function isCitationGroundingGatherToolNameV1(toolName: string): boolean {
 
 export function injectCitationGroundingGatherToolsV1<
   T extends { function: { name: string } },
->(offered: readonly T[], catalog: readonly T[]): T[] {
+>(offered: readonly T[], catalog: readonly T[], gatherToolNames: readonly string[] = CITATION_GROUNDING_GATHER_TOOL_NAMES): T[] {
   const names = new Set(offered.map((tool) => tool.function.name));
   const extra: T[] = [];
-  for (const name of CITATION_GROUNDING_GATHER_TOOL_NAMES) {
+  for (const name of gatherToolNames) {
+    if (!(CITATION_GROUNDING_GATHER_TOOL_NAMES as readonly string[]).includes(name) && !(LOCAL_CITATION_GATHER_TOOL_NAMES_V1 as readonly string[]).includes(name)) continue;
     if (names.has(name)) continue;
     const schema = catalog.find((tool) => tool.function.name === name);
     if (schema) extra.push(schema);
@@ -964,6 +981,7 @@ export function constrainToolsToMissionGraphFrontier(
      * leftover Soft-union companions — those stay sealed.
      */
     keepCitationGatherOnSealedFrontier?: boolean;
+    citationGatherToolNames?: readonly string[];
   } = {},
 ): ModelToolDefinition[] {
   const applyEffectClass = (
@@ -1009,7 +1027,7 @@ export function constrainToolsToMissionGraphFrontier(
   const sealedTerminalFrontier = (): ModelToolDefinition[] => {
     if (!options.keepCitationGatherOnSealedFrontier) return [];
     return applyEffectClass(
-      injectCitationGroundingGatherToolsV1([], tools),
+      injectCitationGroundingGatherToolsV1([], tools, options.citationGatherToolNames),
       { respectMaxEffectClass: false },
     );
   };
