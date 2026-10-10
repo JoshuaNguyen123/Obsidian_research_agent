@@ -14,6 +14,13 @@ def test_health_and_status_require_authentication(companion_client):
     response = client.get("/health", headers=headers)
     assert response.status_code == 200
     body = response.json()
+    identity = body.pop("documentExtractionIdentity")
+    assert response.headers["cache-control"] == "no-store"
+    assert identity["schemaVersion"] == 1
+    assert identity["status"] == "ready"
+    assert len(identity["generation"]) == 32
+    assert len(identity["loadedEngineSha256"]) == 64
+    assert len(identity["effectiveConfigurationSha256"]) == 64
     assert body == {
         "ok": True,
         "service": "obsidian-research-companion",

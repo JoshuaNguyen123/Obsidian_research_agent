@@ -31,6 +31,14 @@ class ClosedModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class DocumentExtractionIdentity(ClosedModel):
+    schemaVersion: Literal[1] = 1
+    generation: str = Field(pattern=r"^[a-f0-9]{32}$")
+    loadedEngineSha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    effectiveConfigurationSha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    status: Literal["ready", "unavailable"]
+
+
 class HealthResponse(BaseModel):
     ok: bool = True
     service: str = "obsidian-research-companion"
@@ -48,6 +56,7 @@ class HealthResponse(BaseModel):
     )
     executorCatalogVersion: Literal[1] = 1
     version: str = "0.3.0"
+    documentExtractionIdentity: DocumentExtractionIdentity | None = None
 
 
 class CompanionStatusResponse(BaseModel):
@@ -198,6 +207,7 @@ class DocumentExtractRequest(ClosedModel):
 
 
 class DocumentExtractResponse(BaseModel):
+    documentExtractionIdentity: DocumentExtractionIdentity | None = None
     ok: bool = True
     status: Literal["parsed", "empty"]
     reason: str | None = None

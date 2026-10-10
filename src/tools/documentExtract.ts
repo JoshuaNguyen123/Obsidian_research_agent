@@ -1,3 +1,4 @@
+import { readDocumentExtractionIdentityV1, documentExtractionIdentityKeyV1, type DocumentExtractionIdentityV1 } from "../agent/documentEngineIdentity";
 import {
   resolveCompanionBootstrapSessionV1,
   type CompanionBootstrapSessionV1,
@@ -79,6 +80,7 @@ export interface DocumentExtractProviderOptionsV1 {
 }
 
 interface DocumentExtractResponseV1 {
+  documentExtractionIdentity?: DocumentExtractionIdentityV1;
   status: "parsed" | "empty";
   reason: string | null;
   text: string;
@@ -89,8 +91,9 @@ interface DocumentExtractResponseV1 {
 }
 
 // Derived text only: never durable, shared across neither vaults nor live
-// bootstrap sessions. Reconnect/engine restart acquires a new session; local
-// host/core upgrades start a new process. Source bytes are still checked on
+// bootstrap sessions. Each operation observes fresh authenticated engine identity
+// and requires the extraction response to echo that identity. Unknown legacy
+// engines parse afresh without derived reuse. Source bytes are still checked on
 // every call so a changed file at the same locator cannot reuse old text.
 const documentExtractCaches = new WeakMap<CompanionBootstrapSessionV1, WeakMap<object, {
   entries: Map<string, { value: DocumentExtractResponseV1; size: number }>;
@@ -179,7 +182,7 @@ export function createDocumentExtractProvider(
             candidate.title?.trim() ||
             documentNameFromUrl(locator.fetchUrl ?? locator.cacheUrl),
           content,
-          evidence: { route: "companion-pdf", originalBytes: new Uint8Array(document.bytes), pageCount: extracted.pageCount, pagesExtracted: extracted.pagesExtracted, pagesSkipped: extracted.pagesSkipped, truncated: extracted.truncated, extractedChars: extracted.text.length },
+          evidence: { route: "companion-pdf", originalBytes: new Uint8Array(document.bytes), pageCount: extracted.pageCount, pagesExtracted: extracted.pagesExtracted, pagesSkipped: extracted.pagesSkipped, truncated: extracted.truncated, extractedChars: extracted.text.length, ...(extracted.documentExtractionIdentity ? { documentExtractionIdentity: { ...extracted.documentExtractionIdentity } } : {}) },
         });
       }
       return {
@@ -307,11 +310,13 @@ async function requestDocumentExtract(
   // Current auth, path/URL policy, byte/body limits and deadline are checked
   // before reuse. The digest excludes title/locator: these belong to each
   // call's source capture below, not to the document parser's text result.
-  const key = await sha256Fingerprint({ contentBase64, configuration });
+  const engine = await freshDocumentEngineIdentity(context, input.signal, session!);
+  const engineKey = engine ? documentExtractionIdentityKeyV1(engine) : null;
+  const key = await sha256Fingerprint({ contentBase64, configuration, engineKey });
   assertDocumentExtractGeneration(context, input.signal, session!, configuration);
   const cache = documentExtractCache(session!, context);
   const previous = cache.entries.get(key);
-  if (previous) {
+  if (previous && engineKey) {
     cache.entries.delete(key); cache.entries.set(key, previous);
     return { ...previous.value };
   }
@@ -336,10 +341,16 @@ async function requestDocumentExtract(
       `document_extract failed on the companion (HTTP ${response.status}).`,
     );
   }
-  const extracted = readDocumentExtractResponse(response.json ?? parseJsonText(response.text));
+  const payload = response.json ?? parseJsonText(response.text);
+  const extracted = readDocumentExtractResponse(payload);
+  const echoed = isRecord(payload) ? readDocumentExtractionIdentityV1(payload.documentExtractionIdentity) : null;
+  if (engine && (!echoed || documentExtractionIdentityKeyV1(echoed) !== engineKey)) {
+    throw new ToolExecutionError("invalid_state", "Document engine identity changed or was not echoed; stale response was discarded.");
+  }
+  if (!engine) delete extracted.documentExtractionIdentity;
   assertDocumentExtractGeneration(context, input.signal, session!, configuration);
   // Failures, empty results and unknown/partial coverage must be retried.
-  if (extracted.status === "parsed" && extracted.text.trim() && extracted.pageCount > 0 &&
+  if (engineKey && extracted.status === "parsed" && extracted.text.trim() && extracted.pageCount > 0 &&
       extracted.pagesExtracted === extracted.pageCount && extracted.pagesSkipped === 0 && !extracted.truncated) {
     const size = new TextEncoder().encode(JSON.stringify(extracted)).byteLength;
     if (size <= DOCUMENT_DERIVED_CACHE_BYTES) {
@@ -354,6 +365,28 @@ async function requestDocumentExtract(
     }
   }
   return extracted;
+}
+
+async function freshDocumentEngineIdentity(context: ToolExecutionContext, signal: AbortSignal | undefined,
+  session: CompanionBootstrapSessionV1): Promise<DocumentExtractionIdentityV1 | null> {
+  assertDocumentOperationActive(context, signal);
+  const response = await session.credential.withToken(token => requestWithRetry(context.httpTransport, {
+    url: session.baseUrl.replace(/\/+$/u, "") + "/health", method: "GET", throw: false,
+    headers: { Authorization: "Bearer " + token, "Cache-Control": "no-store" },
+    timeoutMs: getDocumentTimeoutMs(context), abortSignal: signal,
+  }, { retryDelaysMs: [] }));
+  assertDocumentOperationActive(context, signal);
+  if (response.status === 401 || response.status === 403) {
+    throw new ToolExecutionError("invalid_state", "Document engine identity request was not authenticated.");
+  }
+  // Legacy/missing/unavailable identity cannot authorize reuse. Ordinary fresh
+  // extraction retains its existing authenticated authority and byte bounds.
+  const payload = response.json ?? parseJsonText(response.text);
+  const noStore = (headerValue(response.headers, "cache-control") ?? "").split(",").some(value => value.trim().toLowerCase() === "no-store");
+  if (response.status !== 200 || !noStore || !isRecord(payload) || payload.ok !== true ||
+      payload.service !== "obsidian-research-companion" || payload.pdfReady !== true) return null;
+  const identity = readDocumentExtractionIdentityV1(payload.documentExtractionIdentity);
+  return identity?.status === "ready" ? identity : null;
 }
 
 function readDocumentExtractResponse(value: unknown): DocumentExtractResponseV1 {
@@ -371,6 +404,7 @@ function readDocumentExtractResponse(value: unknown): DocumentExtractResponseV1 
   }
   return {
     status: value.status,
+    ...(readDocumentExtractionIdentityV1(value.documentExtractionIdentity) ? { documentExtractionIdentity: readDocumentExtractionIdentityV1(value.documentExtractionIdentity)! } : {}),
     reason: typeof value.reason === "string" ? value.reason : null,
     text: typeof value.text === "string" ? value.text : "",
     pageCount,

@@ -28,6 +28,7 @@ const ASSET_SOURCES = Object.freeze({
   "browser_service.py": "companion/browser_service.py",
   "browser_security.py": "companion/browser_security.py",
   "companion_control.py": "companion/companion_control.py",
+  "document_engine.py": "companion/document_engine.py",
   "config.py": "companion/config.py",
   "coordinator_store.py": "companion/coordinator_store.py",
   "host_approval_signer.py": "companion/host_approval_signer.py",
