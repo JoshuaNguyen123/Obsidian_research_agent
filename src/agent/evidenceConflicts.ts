@@ -38,6 +38,9 @@ const NEGATION_MARKERS =
   /\b(?:not|no|never|neither|nor|false|incorrect|untrue|denied|denies|refutes?|contradicts?|disproves?|unlikely|impossible|absent|lacking|without|fails?\s+to|did\s+not|does\s+not|do\s+not|cannot|can't|won't|isn't|aren't|wasn't|weren't)\b/i;
 
 const STOP_TERMS = new Set([
+  // Function words cannot establish a shared material claim. Counting them
+  // caused a measured-run passage to contradict an unmeasured-latency caveat.
+  "the", "are", "and", "for", "has", "had", "was", "can", "may", "will",
   "about",
   "after",
   "also",
