@@ -131,3 +131,29 @@ def test_artifact_change_during_actual_parse_discards_output(companion_client, m
     finally:
         file.write_bytes(content)
         os.utime(file, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+
+def test_inventory_preserves_nested_artifacts_and_detects_additions(tmp_path):
+    from document_engine import _scan_artifacts
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    selected = [tmp_path / "one.py", nested / "two.pyd"]
+    for file in selected:
+        file.write_bytes(b"artifact")
+    for index in range(200):
+        (nested / (str(index) + ".pyc")).write_bytes(b"irrelevant cache")
+    suffixes = {".py", ".pyd", ".so"}
+    original = sorted(file for file in tmp_path.rglob("*") if file.is_file() and file.suffix in suffixes)
+    assert _scan_artifacts(tmp_path, suffixes) == original == sorted(selected)
+    added = nested / "new.so"
+    added.write_bytes(b"new artifact")
+    assert added in _scan_artifacts(tmp_path, suffixes)
+
+
+def test_inventory_file_bound_refuses_overflow(tmp_path):
+    import pytest
+    from document_engine import _scan_artifacts, MAX_ARTIFACT_FILES
+    for index in range(MAX_ARTIFACT_FILES + 1):
+        (tmp_path / (str(index) + ".py")).write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="outside bounds"):
+        _scan_artifacts(tmp_path, {".py"})

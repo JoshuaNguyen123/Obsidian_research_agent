@@ -27,14 +27,38 @@ def _digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _scan_artifacts(root: Path, suffixes: set[str]) -> list[Path]:
+    # Directory-entry type information only selects the inventory. Every
+    # selected artifact is still byte-hashed on every observation; metadata
+    # never authorizes unchanged derived output. Avoid a separate stat of
+    # every irrelevant pyc/cache entry during deadline-sensitive health reads.
+    pending = [root]
+    files = []
+    directories = 0
+    while pending:
+        directory = pending.pop()
+        directories += 1
+        if directories > 2048:
+            raise RuntimeError("Engine artifact directories exceed bound")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif Path(entry.name).suffix in suffixes and entry.is_file():
+                    files.append(Path(entry.path))
+                    if len(files) > MAX_ARTIFACT_FILES:
+                        raise RuntimeError("Engine artifact inventory outside bounds")
+    return sorted(files)
+
+
 def _parser_artifacts() -> tuple[Path, ...]:
     package = Path(pypdf.__file__).resolve().parent
-    files = sorted(path for path in package.rglob("*") if path.is_file() and path.suffix in {".py", ".pyd", ".so"})
+    files = _scan_artifacts(package, {".py", ".pyd", ".so"})
     provider = pypdf._crypt_providers.crypt_provider[0]
     if provider in {"cryptography", "pycryptodome"}:
         dependency = importlib.import_module("cryptography" if provider == "cryptography" else "Crypto")
         root = Path(dependency.__file__).resolve().parent
-        files.extend(sorted(path for path in root.rglob("*") if path.is_file() and path.suffix in {".py", ".pyd", ".so", ".dll"}))
+        files.extend(_scan_artifacts(root, {".py", ".pyd", ".so", ".dll"}))
     for name in ("zlib", "struct", "re", "codecs", "encodings", "unicodedata", "io"):
         module = importlib.import_module(name)
         location = getattr(module, "__file__", None)
