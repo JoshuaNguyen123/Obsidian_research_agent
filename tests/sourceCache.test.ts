@@ -11,6 +11,7 @@ import {
   SOURCE_CACHE_SECTION_CHARS,
   findFreshCachedSource,
   readSourceCacheManifest,
+  readCachedSourceContent,
   readSourceSection,
   writeSourceCacheNote,
 } from "../src/tools/sourceCache";
@@ -556,4 +557,172 @@ test("cancellation during source-folder creation prevents note and manifest publ
   }), (error: unknown) => error instanceof DOMException && error.name === "AbortError");
   assert.equal(controller.signal.aborted, true);
   assert.equal(content.size, 0, "Neither a source note nor a manifest may be published after cancellation.");
+});
+
+// Prepared controls: run unchanged against baseline and candidate, never here.
+function snapshotReaderContext() {
+  const setup = createCacheContext(new Date("2026-10-08T00:00:00Z"));
+  type Snapshot = Awaited<ReturnType<NonNullable<ToolExecutionContext["readSourceSnapshot"]>>>;
+  const snapshots = new Map<string, Snapshot>();
+  setup.context.captureSourceSnapshot = async (source) => {
+    const snapshotSha256 = createHash("sha256").update(source.content).digest("hex");
+    snapshots.set(snapshotSha256, { snapshotSha256, sourceId: createEvidenceSourceId(source.url),
+      locator: source.url, title: source.title, content: source.content, capturedAt: "2026-10-08T00:00:00Z" });
+    return { snapshotSha256 };
+  };
+  setup.context.readSourceSnapshot = async (version) => {
+    const snapshot = snapshots.get(version);
+    if (!snapshot) throw new Error("missing snapshot");
+    return snapshot;
+  };
+  return { ...setup, snapshots };
+}
+
+const READER_TEXT = "Dose A is 0.05 mg/L. This is captured original evidence.";
+const READER_EDIT = "Dose B is 0.95 mg/L. This is captured original evidence.";
+
+test("snapshot-bearing unchanged section and whole-content readers agree", async () => {
+  const { context } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  const section = await readSourceSection(context, { path: source.vaultPath }, 1);
+  assert.equal(section.content, READER_TEXT);
+  assert.equal(section.snapshotSha256, source.snapshotSha256);
+  assert.equal(section.contentHash, source.contentHash);
+  assert.equal(await readCachedSourceContent(context, source.vaultPath), READER_TEXT);
+});
+
+test("same-length editable body cannot replace snapshot-selected section or whole content", async () => {
+  const { context } = snapshotReaderContext();
+  assert.equal(READER_TEXT.length, READER_EDIT.length);
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  const file = context.app.vault.getFileByPath(source.vaultPath); assert.ok(file);
+  const markdown = await context.app.vault.read(file);
+  await context.app.vault.modify(file, markdown.replace(READER_TEXT, READER_EDIT));
+  const section = await readSourceSection(context, { path: source.vaultPath }, 1);
+  assert.equal(section.content, READER_TEXT);
+  assert.equal(section.snapshotSha256, source.snapshotSha256);
+  assert.equal(await readCachedSourceContent(context, source.vaultPath), READER_TEXT);
+  assert.ok((await context.app.vault.read(file)).includes(READER_EDIT), "editing remains intact on disk");
+});
+
+test("presentation heading and frontmatter title edits do not falsely reject original evidence", async () => {
+  const { context } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  const file = context.app.vault.getFileByPath(source.vaultPath); assert.ok(file);
+  await context.app.vault.modify(file, (await context.app.vault.read(file)).replace('title: "Dose"', 'title: "My annotation"').replace("# Dose", "# My annotation"));
+  assert.equal((await readSourceSection(context, { path: source.vaultPath }, 1)).content, READER_TEXT);
+  assert.equal(await readCachedSourceContent(context, source.vaultPath), READER_TEXT);
+});
+
+test("explicit old version survives refresh and missing explicit version never falls back", async () => {
+  const { context, snapshots } = snapshotReaderContext();
+  const old = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_EDIT });
+  assert.equal((await readSourceSection(context, { path: old.vaultPath, version: old.snapshotSha256 }, 1)).content, READER_TEXT);
+  snapshots.delete(old.snapshotSha256!);
+  await assert.rejects(readSourceSection(context, { path: old.vaultPath, version: old.snapshotSha256 }, 1), /missing snapshot/);
+});
+
+test("missing snapshot refuses section and declines whole-note reuse without adopting edits", async () => {
+  const { context, snapshots } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  snapshots.clear();
+  await assert.rejects(readSourceSection(context, { path: source.vaultPath }, 1), /missing snapshot/);
+  assert.equal(await readCachedSourceContent(context, source.vaultPath), null);
+});
+
+test("missing immutable callback cannot coerce a snapshot-bearing note into a versioned success", async () => {
+  const { context } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  context.readSourceSnapshot = undefined;
+  await assert.rejects(readSourceSection(context, { path: source.vaultPath }, 1), /unavailable/);
+  assert.equal(await readCachedSourceContent(context, source.vaultPath), null);
+});
+
+test("hand-written unmanifested legacy note stays editable and unbound", async () => {
+  const { context } = snapshotReaderContext();
+  const body = "My deliberately edited ordinary source note.";
+  const path = "Agent Sources/manual.example.org/hand-note.md";
+  await context.app.vault.create(path, ["---", 'url: "https://manual.example.org/page"', 'normalizedUrl: "https://manual.example.org/page"',
+    'urlHash: "0123456789abcdef"', 'title: "Hand note"', 'fetchedAt: "2026-10-08T00:00:00Z"',
+    `sourceChars: ${body.length}`, `totalChars: ${body.length}`, `contentHash: "sha256:${"ab".repeat(32)}"`,
+    "truncated: false", 'parserStatus: "parsed"', "sectionCount: 1", "---", "", "# Hand note", "", body].join("\n"));
+  const section = await readSourceSection(context, { path }, 1);
+  assert.equal(section.content, body);
+  assert.equal(section.snapshotSha256, undefined);
+  assert.equal(await readCachedSourceContent(context, path), body);
+  assert.equal(context.app.vault.getFileByPath(SOURCE_CACHE_MANIFEST_PATH), null);
+});
+
+test("edited asserted digest cannot falsely bind captured text", async () => {
+  const { context } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  const file = context.app.vault.getFileByPath(source.vaultPath); assert.ok(file);
+  await context.app.vault.modify(file, (await context.app.vault.read(file)).replace(source.contentHash, `sha256:${"cd".repeat(32)}`));
+  await assert.rejects(readSourceSection(context, { path: source.vaultPath }, 1), /identity mismatch/);
+  assert.equal(await readCachedSourceContent(context, source.vaultPath), null);
+});
+
+test("late immutable reader result after cancellation is not an accepted section or whole-content return", async () => {
+  for (const whole of [false, true]) {
+    const { context, snapshots } = snapshotReaderContext();
+    const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+    const abort = new AbortController(); context.abortSignal = abort.signal;
+    context.readSourceSnapshot = async (version) => { abort.abort(new Error("reader cancelled")); return snapshots.get(version)!; };
+    await assert.rejects(whole ? readCachedSourceContent(context, source.vaultPath) : readSourceSection(context, { path: source.vaultPath }, 1), /reader cancelled/);
+  }
+});
+
+test("mount identity changed during immutable read cannot return a late accepted section", async () => {
+  const { context, snapshots } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  context.readSourceSnapshot = async (version) => { context.app = createCacheContext(new Date()).context.app; return snapshots.get(version)!; };
+  await assert.rejects(readSourceSection(context, { path: source.vaultPath }, 1), /mount changed/);
+});
+
+test("captured bounded text does not erase original truncation and source-size metadata", async () => {
+  const { context } = snapshotReaderContext();
+  const long = READER_TEXT.repeat(Math.ceil(SOURCE_CACHE_MAX_CHARS / READER_TEXT.length) + 2);
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: long });
+  const section = await readSourceSection(context, { path: source.vaultPath }, 1);
+  assert.equal(section.truncated, true);
+  assert.equal(section.sourceChars, long.length);
+  assert.equal(section.totalChars, source.totalChars);
+  assert.equal(section.parserStatus, source.parserStatus);
+  assert.equal((await readCachedSourceContent(context, source.vaultPath))?.length, source.totalChars);
+});
+
+test("foreign immutable locator, source id or returned version refuses selected evidence", async () => {
+  for (const mismatch of ["locator", "sourceId", "snapshotSha256"] as const) {
+    const { context, snapshots } = snapshotReaderContext();
+    const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+    context.readSourceSnapshot = async version => ({ ...snapshots.get(version)!, [mismatch]: mismatch === "snapshotSha256" ? "de".repeat(32) : "https://foreign.example/report" });
+    await assert.rejects(readSourceSection(context, { path: source.vaultPath }, 1), /identity mismatch/);
+    assert.equal(await readCachedSourceContent(context, source.vaultPath), null);
+  }
+});
+
+test("oversize immutable callback cannot widen the existing source-cache clipping budget", async () => {
+  const { context, snapshots } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  context.readSourceSnapshot = async version => ({ ...snapshots.get(version)!, content: "x".repeat(SOURCE_CACHE_MAX_CHARS + 1) });
+  await assert.rejects(readSourceSection(context, { path: source.vaultPath }, 1), /identity mismatch/);
+  assert.equal(await readCachedSourceContent(context, source.vaultPath), null);
+});
+
+test("deadline expiring during awaited snapshot read refuses late text", async () => {
+  const { context, snapshots } = snapshotReaderContext();
+  const source = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: READER_TEXT });
+  context.readSourceSnapshot = async version => { context.deadlineAt = 1; return snapshots.get(version)!; };
+  await assert.rejects(readSourceSection(context, { path: source.vaultPath }, 1), /deadline expired/);
+});
+
+test("clipped immutable section refuses falsely complete note metadata", async () => {
+  const { context } = snapshotReaderContext();
+  const long = READER_TEXT.repeat(Math.ceil(SOURCE_CACHE_MAX_CHARS / READER_TEXT.length) + 2);
+  const cached = await writeSourceCacheNote(context, { url: "https://example.com/reader", title: "Dose", content: long });
+  const file = context.app.vault.getFileByPath(cached.vaultPath); assert.ok(file);
+  await context.app.vault.modify(file, (await context.app.vault.read(file)).replace("truncated: true", "truncated: false"));
+  await assert.rejects(readSourceSection(context, { path: cached.vaultPath }, 1), /identity mismatch/);
+  assert.equal(await readCachedSourceContent(context, cached.vaultPath), null);
 });

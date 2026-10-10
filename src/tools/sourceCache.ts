@@ -1,6 +1,7 @@
 import type { TFile } from "obsidian";
 import type { ToolExecutionContext } from "./types";
 import { sha256Fingerprint } from "../agent/actions";
+import { createEvidenceSourceId } from "../agent/researchDossier";
 import { normalizeVaultPath, truncateText } from "./validation";
 import { isSourceCachePath } from "./vaultExclusions";
 
@@ -267,7 +268,7 @@ export async function readSourceSection(
     throw new Error("Cached source was not found.");
   }
   const payload = await readCachedSourcePayload(ctx, file);
-  const { parsed, sourceContent } = payload;
+  const { parsed, sourceContent } = await selectSnapshotPayload(ctx, payload);
   if (
     ref.url &&
     parsed.normalizedUrl !== normalizeSourceUrl(ref.url)
@@ -312,7 +313,47 @@ export async function readCachedSourceContent(
   }
   if (!file) return null;
   const payload = await readCachedSourcePayload(ctx, file).catch(() => null);
-  return payload?.sourceContent ?? null;
+  if (!payload) return null;
+  try {
+    return (await selectSnapshotPayload(ctx, payload)).sourceContent;
+  } catch {
+    ctx.abortSignal?.throwIfAborted();
+    return null;
+  }
+}
+
+/** A note can be edited; its retained snapshot identity still selects captured text. */
+async function selectSnapshotPayload(
+  ctx: ToolExecutionContext,
+  payload: { parsed: CachedSource; sourceContent: string },
+): Promise<{ parsed: CachedSource; sourceContent: string }> {
+  const { parsed } = payload;
+  if (!parsed.snapshotSha256) return payload;
+  ctx.abortSignal?.throwIfAborted();
+  if (!ctx.readSourceSnapshot) throw new Error("Immutable evidence version unavailable.");
+  if (typeof ctx.deadlineAt === "number" && Number.isFinite(ctx.deadlineAt) && Date.now() >= ctx.deadlineAt) throw new Error("Immutable evidence read deadline expired.");
+  const app = ctx.app, vault = app.vault;
+  const snapshot = await ctx.readSourceSnapshot(parsed.snapshotSha256);
+  ctx.abortSignal?.throwIfAborted();
+  if (ctx.app !== app || ctx.app.vault !== vault) throw new Error("Immutable evidence mount changed.");
+  const locator = normalizeSourceUrl(parsed.normalizedUrl || parsed.url);
+  // The existing writer retains the bounded source prefix plus its exact marker.
+  const clippingSuffix = truncateText("x", 0);
+  const boundedContent = snapshot.content.length <= SOURCE_CACHE_MAX_CHARS ||
+    (parsed.truncated && snapshot.content.length === SOURCE_CACHE_MAX_CHARS + clippingSuffix.length && snapshot.content.endsWith(clippingSuffix));
+  if (!boundedContent || snapshot.content.length !== parsed.totalChars ||
+      snapshot.snapshotSha256 !== parsed.snapshotSha256 ||
+      normalizeSourceUrl(snapshot.locator) !== locator ||
+      snapshot.sourceId !== createEvidenceSourceId(locator) ||
+      await sha256Fingerprint(snapshot.content) !== parsed.contentHash) {
+    throw new Error("Immutable evidence identity mismatch.");
+  }
+  ctx.abortSignal?.throwIfAborted();
+  if (ctx.app !== app || ctx.app.vault !== vault) throw new Error("Immutable evidence mount changed.");
+  if (typeof ctx.deadlineAt === "number" && Number.isFinite(ctx.deadlineAt) && Date.now() >= ctx.deadlineAt) throw new Error("Immutable evidence read deadline expired.");
+  // Preserve cache coverage/truncation metadata: immutable text is not proof
+  // that the complete original document was extracted.
+  return { parsed: { ...parsed, title: snapshot.title }, sourceContent: snapshot.content };
 }
 
 async function findCachedFileByUrl(ctx: ToolExecutionContext, url: string) {

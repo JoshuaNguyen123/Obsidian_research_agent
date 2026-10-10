@@ -1,3 +1,5 @@
+import { sha256Fingerprint } from "../agent/actions";
+import { createEvidenceSourceId } from "../agent/researchDossier";
 import {
   isOllamaCloudBaseUrl,
   normalizeOllamaBaseUrl,
@@ -24,6 +26,7 @@ import {
 } from "./validation";
 import {
   SOURCE_CACHE_MAX_AGE_MS,
+  SOURCE_CACHE_MAX_CHARS,
   findFreshCachedSource,
   readCachedSourceContent,
   readSourceSection,
@@ -890,10 +893,32 @@ function createRuntimeResearchProviders(
       // candidate; only a cache miss now costs a request.
       const substitute = await findFreshCachedSource(context, normalizedUrl, cachePolicy);
       if (substitute) {
-        const storedContent = await readCachedSourceContent(
-          context,
-          substitute.vaultPath,
-        );
+        // Select the cached record's version even if its note has since changed.
+        let storedContent: string | null;
+        if (substitute.snapshotSha256) {
+          assertOperationActive(context);
+          if (!context.readSourceSnapshot) throw new Error("Immutable evidence version unavailable.");
+          const app = context.app, vault = app.vault;
+          const snapshot = await context.readSourceSnapshot(substitute.snapshotSha256);
+          assertOperationActive(context);
+          if (context.app !== app || context.app.vault !== vault) throw new Error("Immutable evidence mount changed.");
+          // Match the existing cache writer: bounded prefix plus its exact marker.
+          const clippingSuffix = truncateText("x", 0);
+          const boundedContent = snapshot.content.length <= SOURCE_CACHE_MAX_CHARS ||
+            (substitute.truncated && snapshot.content.length === SOURCE_CACHE_MAX_CHARS + clippingSuffix.length && snapshot.content.endsWith(clippingSuffix));
+          if (!boundedContent || snapshot.content.length !== substitute.totalChars ||
+              snapshot.snapshotSha256 !== substitute.snapshotSha256 ||
+              normalizeWebFetchUrl(snapshot.locator) !== normalizedUrl ||
+              snapshot.sourceId !== createEvidenceSourceId(normalizedUrl) ||
+              await sha256Fingerprint(snapshot.content) !== substitute.contentHash) {
+            throw new Error("Immutable evidence identity mismatch.");
+          }
+          assertOperationActive(context);
+          if (context.app !== app || context.app.vault !== vault) throw new Error("Immutable evidence mount changed.");
+          storedContent = snapshot.content;
+        } else {
+          storedContent = await readCachedSourceContent(context, substitute.vaultPath);
+        }
         if (storedContent?.trim()) {
           return {
             title: substitute.title,
