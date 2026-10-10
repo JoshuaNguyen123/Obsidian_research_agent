@@ -936,3 +936,82 @@ test("strict response coverage retains a valid zero-page empty result without ca
     assert.equal(posts, 2); assert.equal(captures, 0);
   } finally { disconnect(); }
 });
+
+test("document retrieval propagates capture cancellation without returning a parsed source", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(completeExtract());
+    const controller = new AbortController();
+    context.abortSignal = controller.signal;
+    let captures = 0;
+    context.captureSourceSnapshot = async () => {
+      captures++;
+      controller.abort(new DOMException("Cancelled during capture", "AbortError"));
+      controller.signal.throwIfAborted();
+      throw new Error("Cancelled capture unexpectedly continued.");
+    };
+    const provider = createDocumentExtractProvider(context, { fetchDocument: async () => ({ bytes: pdfBytes() }) });
+    await assert.rejects(provider.retrieve({ id: "capture-cancel", url: PDF_URL, title: "Cancelled capture", strategy: "document_extract" }, controller.signal),
+      (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+    assert.equal(captures, 1);
+    assert.equal(context.app.vault.getFiles().length, 0, "Refused capture must not publish a cache note or manifest.");
+  } finally { disconnect(); }
+});
+
+test("an explicit retrieval signal controls cache admission independently of the context signal", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(completeExtract());
+    const contextController = new AbortController(), retrieveController = new AbortController();
+    context.abortSignal = contextController.signal;
+    const createFolder = context.app.vault.createFolder.bind(context.app.vault);
+    context.app.vault.createFolder = async path => {
+      const folder = await createFolder(path);
+      retrieveController.abort(new DOMException("Cancelled explicit retrieval", "AbortError"));
+      return folder;
+    };
+    const provider = createDocumentExtractProvider(context, { fetchDocument: async () => ({ bytes: pdfBytes() }) });
+    await assert.rejects(provider.retrieve({ id: "explicit-cancel", url: PDF_URL, title: "Explicit signal", strategy: "document_extract" }, retrieveController.signal),
+      (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+    assert.equal(retrieveController.signal.aborted, true);
+    assert.equal(contextController.signal.aborted, false);
+    assert.equal(context.abortSignal, contextController.signal, "Binding a selected signal must not mutate the original context.");
+    assert.equal(context.app.vault.getFiles().length, 0, "Selected-signal cancellation must prevent cache publication.");
+  } finally { disconnect(); }
+});
+
+test("concurrent retrievals with distinct signals preserve source serialization and all manifest entries", async () => {
+  const disconnect = connectCompanion();
+  try {
+    const context = createExtractVaultContext(completeExtract());
+    const contextController = new AbortController(), first = new AbortController(), second = new AbortController();
+    context.abortSignal = contextController.signal;
+    const vault = context.app.vault;
+    const active = new Map<string, number>(), maximum = new Map<string, number>();
+    async function duringWrite<T>(path: string, work: () => Promise<T>): Promise<T> {
+      const count = (active.get(path) ?? 0) + 1;
+      active.set(path, count); maximum.set(path, Math.max(maximum.get(path) ?? 0, count));
+      try { await new Promise<void>(resolve => setTimeout(resolve, 0)); return await work(); }
+      finally { active.set(path, (active.get(path) ?? 1) - 1); }
+    }
+    const create = vault.create.bind(vault), modify = vault.modify.bind(vault);
+    vault.create = (path, text, options) => duringWrite(path, () => create(path, text, options));
+    vault.modify = (file, text, options) => duringWrite(file.path, () => modify(file, text, options));
+    const provider = createDocumentExtractProvider(context, { fetchDocument: async () => ({ bytes: pdfBytes() }) });
+    const retrieve = (url: string, signal: AbortSignal) => provider.retrieve({ id: url, url, title: "Concurrent source", strategy: "document_extract" }, signal);
+    const same = await Promise.all([retrieve(PDF_URL, first.signal), retrieve(PDF_URL, second.signal)]);
+    assert(same.every(result => result?.parserStatus === "parsed"));
+    const urls = ["https://reports.example/signal-one.pdf", "https://reports.example/signal-two.pdf"];
+    const other = await Promise.all([retrieve(urls[0]!, first.signal), retrieve(urls[1]!, second.signal)]);
+    assert(other.every(result => result?.parserStatus === "parsed"));
+    assert.equal(context.abortSignal, contextController.signal);
+    assert.equal(first.signal.aborted || second.signal.aborted || contextController.signal.aborted, false);
+    assert(maximum.size >= 4, "Source and manifest writes must actually be exercised.");
+    assert([...maximum.values()].every(count => count === 1), "Writes to each source/manifest path must remain serialized.");
+    const manifestFile = vault.getFileByPath("Agent Sources/source-cache-manifest.json");
+    assert(manifestFile);
+    const manifest = JSON.parse(await vault.read(manifestFile)) as { entries: Array<{ normalizedUrl: string }> };
+    assert.equal(manifest.entries.length, 3);
+    assert.deepEqual(new Set(manifest.entries.map(entry => entry.normalizedUrl)), new Set([PDF_URL, ...urls]));
+  } finally { disconnect(); }
+});

@@ -17,7 +17,7 @@ import {
   headerValue,
   PublicFetchErrorV1,
 } from "./publicFetch";
-import { requestWithRetry } from "./httpRetry";
+import { requestWithRetry, isAbortError } from "./httpRetry";
 import { writeSourceCacheNote } from "./sourceCache";
 import {
   ToolExecutionError,
@@ -173,10 +173,11 @@ export function createDocumentExtractProvider(
         document,
         signal: abortSignal,
       });
+      assertDocumentOperationActive(context, abortSignal);
       const content = extracted.status === "parsed" ? extracted.text : "";
       let cachedSource;
       if (content.trim()) {
-        cachedSource = await cacheExtractedSource(context, {
+        cachedSource = await cacheExtractedSource({ ...context, abortSignal }, {
           url: locator.cacheUrl,
           title:
             candidate.title?.trim() ||
@@ -185,6 +186,7 @@ export function createDocumentExtractProvider(
           evidence: { route: "companion-pdf", originalBytes: new Uint8Array(document.bytes), pageCount: extracted.pageCount, pagesExtracted: extracted.pagesExtracted, pagesSkipped: extracted.pagesSkipped, truncated: extracted.truncated, extractedChars: extracted.text.length, ...(extracted.documentExtractionIdentity ? { documentExtractionIdentity: { ...extracted.documentExtractionIdentity } } : {}) },
         });
       }
+      assertDocumentOperationActive(context, abortSignal);
       return {
         title:
           candidate.title?.trim() ||
@@ -600,14 +602,18 @@ async function cacheExtractedSource(
     return;
   }
   try {
-    return await writeSourceCacheNote(context, {
+    const cached = await writeSourceCacheNote(context, {
       url: source.url,
       title: source.title,
       content: source.content,
       ...(source.evidence ? { evidence: source.evidence } : {}),
       parserStatus: "parsed",
     });
-  } catch {
+    context.abortSignal?.throwIfAborted();
+    return cached;
+  } catch (error) {
+    context.abortSignal?.throwIfAborted();
+    if (isAbortError(error)) throw error;
     // Cache is an accelerator for verify_citation, not a precondition of extract.
   }
 }

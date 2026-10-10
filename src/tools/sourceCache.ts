@@ -152,13 +152,16 @@ export async function writeSourceCacheNote(
     readableBody,
   ].join("\n");
   await ensureVaultFolderPath(ctx, parentPath(vaultPath));
+  ctx.abortSignal?.throwIfAborted();
   await enqueueSourceWrite(ctx, vaultPath, async () => {
+    ctx.abortSignal?.throwIfAborted();
     const file = ctx.app.vault.getFileByPath(vaultPath);
     if (file) {
       await ctx.app.vault.modify(file, note);
     } else {
       await ctx.app.vault.create(vaultPath, note);
     }
+    ctx.abortSignal?.throwIfAborted();
     invalidateSourceSectionReadCache(ctx, vaultPath);
   });
   const cached = {
@@ -178,6 +181,7 @@ export async function writeSourceCacheNote(
     ...(fetchedForMission ? { fetchedForMission } : {}),
   } satisfies CachedSource;
   await upsertSourceCacheManifest(ctx, cached, fetchedAt);
+  ctx.abortSignal?.throwIfAborted();
   return cached;
 }
 
@@ -395,7 +399,9 @@ async function upsertSourceCacheManifest(
   updatedAt: string,
 ) {
   await enqueueManifestWrite(ctx, async () => {
+    ctx.abortSignal?.throwIfAborted();
     const manifest = await readSourceCacheManifestUnlocked(ctx);
+    ctx.abortSignal?.throwIfAborted();
     const entries = [
       cached,
       ...manifest.entries.filter(
@@ -412,6 +418,7 @@ async function upsertSourceCacheManifest(
       entries,
     };
     await ensureVaultFolderPath(ctx, SOURCE_CACHE_FOLDER);
+    ctx.abortSignal?.throwIfAborted();
     const file = ctx.app.vault.getFileByPath(SOURCE_CACHE_MANIFEST_PATH);
     const text = `${JSON.stringify(next, null, 2)}\n`;
     if (file) {
