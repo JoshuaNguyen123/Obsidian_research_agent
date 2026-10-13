@@ -27372,9 +27372,9 @@ export function bindExactWorkspaceDestinationToolSchemas(
 /**
  * Red validation in set-loose mode is still an exact proof frontier. Once
  * bounded validator evidence selects an authored path, expose only a read of
- * that path and then only its SHA-bound full-file correction. Generic helper
- * creation, append, and patch tools cannot distract the provider or pay the
- * next validator gate.
+ * that path and then its hash-bound correction (or the already-planned
+ * prepared patch). Generic helper creation and append cannot distract the
+ * provider or pay the next validator gate.
  */
 export function constrainValidationRecoveryWorkspaceToolsV1(input: {
   tools: readonly ModelToolDefinition[];
@@ -27397,8 +27397,15 @@ export function constrainValidationRecoveryWorkspaceToolsV1(input: {
     exactPath,
     input.durableReceipts,
   );
+  // A patch-only plan cannot materialize a different mutation authority.
+  // Keep its completed prepared patch as the correction tool. Both paths
+  // require a fresh read; the normal prepared approval/readback checks remain.
+  const nodes = Object.values(input.graph?.nodes ?? {});
+  const completedPatch = nodes.some(node => node.status === "complete" &&
+    !getMissionCompositeLifecycleSpecV1(node) && node.allowedTools.includes("code_workspace_patch"));
+  const plannedExpectedWrite = nodes.some(node => node.allowedTools.includes("code_workspace_write_expected"));
   const requiredToolName = observation
-    ? "code_workspace_write_expected"
+    ? completedPatch && !plannedExpectedWrite ? "code_workspace_patch" : "code_workspace_write_expected"
     : "code_workspace_read";
   const tool = input.tools.find(
     (candidate) => candidate.function.name === requiredToolName,
@@ -40578,7 +40585,7 @@ export async function executePreparedToolWithMetrics({
       preparedAction.toolName,
       result,
     );
-    if (result.ok && preparedAction.toolName === "code_workspace_write_expected") {
+    if (result.ok && ["code_workspace_write_expected", "code_workspace_patch", "code_workspace_append", "code_workspace_create_file"].includes(preparedAction.toolName)) {
       forgetVerifiedWorkspaceReadObservation(
         toolContext.runtimeCache,
         getString(preparedAction.normalizedArgs.workspaceId),

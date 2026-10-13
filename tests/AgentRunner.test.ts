@@ -30583,3 +30583,45 @@ test("clipped local read allows a real targeted reread before forcing final synt
   const ledger=[...vault.content.entries()].filter(([file])=>file.startsWith("Agent Runs/")).map(([,content])=>parseMissionLedgerFromMarkdown(content)).find(value=>value!==null);
   assert.equal(ledger?.acceptance?.status,"pass",JSON.stringify({completion:completions.at(-1),acceptance:ledger?.acceptance}));
 });
+
+for (const toolName of ["code_workspace_patch", "code_workspace_write_expected", "code_workspace_append", "code_workspace_create_file"]) {
+  test(`prepared ${toolName} invalidates only its successfully changed workspace read`, async () => {
+    const key = (workspaceId: string, path: string) => JSON.stringify([workspaceId, path]);
+    const runtimeCache: AgentRuntimeCache = { toolResults: new Map(), verifiedWorkspaceReads: new Map() };
+    for (const [workspaceId, path] of [["one", "src/ticket.js"], ["two", "src/ticket.js"], ["one", "src/other.js"]]) {
+      runtimeCache.verifiedWorkspaceReads!.set(key(workspaceId, path), { workspaceId, path, sha256: `sha256:${"a".repeat(64)}`, content: "before", observedAt: "2026-10-13T00:00:00Z" } as any);
+    }
+    let ok = false;
+    const registry: ToolRegistry = { getDefinitions: () => [], execute: async () => ({ ok: false, toolName }), executePrepared: async () => ({ ok, toolName }) };
+    const input = { toolRegistry: registry, preparedAction: { toolName, normalizedArgs: { workspaceId: "one", path: "src/ticket.js" }, target: { path: "src/ticket.js" } } as unknown as PreparedAction, authorization: {} as AuthorizedActionContext, toolContext: { runtimeCache } as ToolExecutionContext, events: {} };
+    await executePreparedToolWithMetrics(input);
+    assert.equal(runtimeCache.verifiedWorkspaceReads!.size, 3, "refused writes preserve observations");
+    ok = true;
+    await executePreparedToolWithMetrics(input);
+    assert.equal(runtimeCache.verifiedWorkspaceReads!.has(key("one", "src/ticket.js")), false);
+    assert.equal(runtimeCache.verifiedWorkspaceReads!.size, 2, "other files and workspaces stay cached");
+  });
+}
+
+test("patch-only recovery rereads then offers its existing prepared mutation authority", () => {
+  const graph = { nodes: {
+    edit: { id: "edit", status: "complete", allowedTools: ["code_workspace_patch"], destination: { selector: "src/ticket.js" }, inputs: {}, outputs: {} },
+    fast: { id: "fast", status: "queued", allowedTools: ["code_validate_fast"], inputs: {}, outputs: {} },
+    repair: { id: "repair", status: "queued", allowedTools: ["code_repair_record_cycle"], inputs: {}, outputs: { validationRecovery: { status: "awaiting_correction", fastNodeId: "fast", repairNodeId: "repair" } } },
+  } } as unknown as MissionGraphV3;
+  const tools = ["code_workspace_read", "code_workspace_patch", "code_workspace_write_expected", "code_workspace_append"].map(name => ({ type: "function" as const, function: { name, parameters: { type: "object" as const, properties: { path: { type: "string" as const } } } } }));
+  const runtimeCache: AgentRuntimeCache = { toolResults: new Map(), verifiedWorkspaceReads: new Map() };
+  const before = `sha256:${"a".repeat(64)}`, after = `sha256:${"b".repeat(64)}`;
+  const durableReceipts = [
+    { toolName: "code_workspace_create", commitKind: "committed", readback: { status: "verified" }, resource: { system: "workspace", workspaceId: "one" }, output: { repositoryWriteScope: { projects: [{ allowedPaths: ["."] }] } } },
+    { toolName: "code_workspace_patch", path: "src/ticket.js", commitKind: "committed", readback: { status: "verified", observedRevision: after }, output: { path: "src/ticket.js", receipt: { version: 2, path: "src/ticket.js", beforeSha256: before, afterSha256: after } } },
+  ] as unknown as AgentRunReceipt[];
+  const input = { graph, tools, runtimeCache, diagnostic: { stdout: "src/ticket.js:1 AssertionError", stderr: "", truncated: false, redactedLines: 0 }, durableReceipts };
+  assert.deepEqual(constrainValidationRecoveryWorkspaceToolsV1(input).map(tool => tool.function.name), ["code_workspace_read"]);
+  rememberVerifiedWorkspaceReadResult(runtimeCache, { name: "code_workspace_read", arguments: { workspaceId: "one", path: "src/ticket.js" } }, { rootMissionId: "root" }, { ok: true, toolName: "code_workspace_read", output: { path: "src/ticket.js", sha256: `sha256:${"a".repeat(64)}`, content: "before" } });
+  const offered = constrainValidationRecoveryWorkspaceToolsV1(input);
+  assert.deepEqual(offered.map(tool => tool.function.name), ["code_workspace_patch"]);
+  assert.deepEqual(offered[0].function.parameters.properties?.path?.enum, ["src/ticket.js"]);
+  graph.nodes.edit.status = "queued";
+  assert.deepEqual(constrainValidationRecoveryWorkspaceToolsV1(input).map(tool => tool.function.name), ["code_workspace_write_expected"], "a patch that has not completed is not a repeat template");
+});
