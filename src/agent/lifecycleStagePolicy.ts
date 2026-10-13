@@ -77,6 +77,7 @@ export const CODE_IMPLEMENTATION_TOOL_ALLOW = [
   "code_workspace_stat",
   "code_workspace_list",
   "code_workspace_search",
+  "code_workspace_inspect",
   "code_workspace_mkdir",
   "code_workspace_create_file",
   "code_workspace_export_directory",

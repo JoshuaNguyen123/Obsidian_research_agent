@@ -87,6 +87,7 @@ const CODE_WORKFLOW_OBSERVATION_TOOL_NAMES = new Set<string>([
   "code_workspace_stat",
   "code_workspace_list",
   "code_workspace_search",
+  "code_workspace_inspect",
   "code_repair_status",
   "read_workspace_file",
   "list_workspace_files",
@@ -113,6 +114,7 @@ const VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES = new Set<string>([
   "code_workspace_stat",
   "code_workspace_list",
   "code_workspace_search",
+  "code_workspace_inspect",
 ]);
 
 const VALIDATION_RECOVERY_MUTATION_TOOL_NAMES = new Set<string>([

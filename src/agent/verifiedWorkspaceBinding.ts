@@ -437,6 +437,7 @@ export const VERIFIED_WORKSPACE_OBSERVATION_TOOL_NAMES = new Set([
   "code_workspace_list",
   "code_workspace_read",
   "code_workspace_search",
+  "code_workspace_inspect",
   "read_workspace_file",
   "list_workspace_files",
   "preview_workspace_html",
