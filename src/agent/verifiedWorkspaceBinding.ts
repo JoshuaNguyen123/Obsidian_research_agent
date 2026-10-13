@@ -1382,6 +1382,8 @@ export function validationRecoveryPathAtOrBelowV1(
   allowedPath: string,
   candidatePath: string,
 ): boolean {
+  // A trusted repository root still admits only a concrete safe relative file.
+  if (allowedPath === ".") return normalizeValidationRecoveryCandidatePathV1(candidatePath) !== null;
   const allowed = allowedPath.toLowerCase();
   const candidate = candidatePath.toLowerCase();
   return candidate === allowed || candidate.startsWith(`${allowed}/`);
@@ -1430,7 +1432,7 @@ export function getReceiptBackedWorkspaceRecoveryPathsV1(
             return [];
           }
           return rawProject.allowedPaths
-            .map(normalizeValidationRecoveryCandidatePathV1)
+            .map((value) => value === "." ? "." : normalizeValidationRecoveryCandidatePathV1(value))
             .filter((path): path is string => path !== null);
         }),
       ),
