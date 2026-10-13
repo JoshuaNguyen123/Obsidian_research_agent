@@ -6197,8 +6197,17 @@ export async function runAgentMission({
     } = {},
   ): Promise<MissionGraphToolExecution | null> => {
     if (!missionGraphSession) return null;
+    // Recovery already offers this exact diagnostic-selected read. Permit its
+    // bounded continuation in exact plans too; the normal verified-workspace
+    // binding below fixes its arguments before the registry can execute it.
+    const allowRecoveryRead = toolName === "code_workspace_read" &&
+      !missionGraphCapacityExhausted &&
+      getSingleVerifiedDurableWorkspaceId(writeReceipts) !== null &&
+      getValidationRecoveryCorrectionTargetPathV1(
+        missionGraphSession.graph, getLatestFastValidationDiagnostic(runtimeCache), writeReceipts,
+      ) !== null;
     const allowDynamicReadContinuation =
-      dynamicReadContinuationAllowed() ||
+      dynamicReadContinuationAllowed() || allowRecoveryRead ||
       options.allowExactBootstrapRead === true;
     const started = await missionGraphSession.beginToolExecution(toolName, {
       allowDynamicReadContinuation,
@@ -15588,7 +15597,7 @@ export async function runAgentMission({
           ),
       );
       if (
-        readsCreatedWorkspace &&
+        (readsCreatedWorkspace || recoveryBoundPath !== null) &&
         typeof exactPath === "string" &&
         !exactPath.startsWith("prompt-scoped-")
       ) {
