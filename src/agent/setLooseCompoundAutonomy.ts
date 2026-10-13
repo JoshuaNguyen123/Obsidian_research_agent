@@ -1759,6 +1759,7 @@ export const SET_LOOSE_WORKSPACE_STALL_TOOL_NAMES = new Set<string>([
   "code_workspace_list",
   "code_workspace_stat",
   "code_workspace_search",
+  "code_workspace_inspect",
 ]);
 
 export type SetLooseHostProgressDecisionV1 =

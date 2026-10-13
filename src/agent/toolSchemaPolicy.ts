@@ -84,6 +84,7 @@ export const ROUTE_BASE_TOOLS: Readonly<
     "code_workspace_list",
     "code_workspace_read",
     "code_workspace_search",
+    "code_workspace_inspect",
     "code_workspace_mkdir",
     "code_workspace_create_file",
     "code_workspace_export_directory",
