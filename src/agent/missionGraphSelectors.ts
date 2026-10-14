@@ -314,6 +314,13 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
    * is true. Never use this to reopen leftover Soft-union companions.
    */
   admittedCompanionToolNames?: readonly string[] | null;
+  /**
+   * Exactly AgentRunner's `adaptiveCodeInvestigationToolNames()`: the
+   * read-only workspace tools an exact coding plan admits beside its ready
+   * edit (`missionGraphAdaptiveCodeInvestigationToolNamesV1`). The authority
+   * materializes these as bounded dynamic reads, so a message may name them.
+   */
+  adaptiveCodeInvestigationToolNames?: readonly string[] | null;
 }): string[] {
   const clean = (names: readonly string[] | null | undefined): string[] => [
     ...new Set((names ?? []).map((name) => name.trim()).filter(Boolean)),
@@ -322,6 +329,9 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
   const candidates =
     input.candidateToolNames == null ? null : clean(input.candidateToolNames);
   const companionSet = new Set(clean(input.admittedCompanionToolNames));
+  for (const name of clean(input.adaptiveCodeInvestigationToolNames)) {
+    companionSet.add(name);
+  }
   const graph = input.graph;
   if (!graph) {
     // No graph means no MissionGraphSession, so `beginMissionGraphTool` returns

@@ -332,6 +332,7 @@ import {
   buildMissionGraphFrontierTurnContext,
   CITATION_GROUNDING_GATHER_TOOL_NAMES,
   constrainToolsToMissionGraphFrontier,
+  missionGraphAdaptiveCodeInvestigationToolNamesV1,
   narrowAdaptiveCodeMutationsToPlannedWritesV1,
   filterSetLooseToolNamesByMissionGraphAuthority,
   getActiveValidationRecoveryFrontierV1,
@@ -6187,6 +6188,19 @@ export async function runAgentMission({
       setLooseCompoundEnabled,
       envelopeExhausted: missionGraphCapacityExhausted,
     });
+  /**
+   * The read-only workspace tools an exact coding plan admits beside its ready
+   * edit (CIP-3). Like `dynamicReadContinuationAllowed()`, one call answers
+   * the offered menu, the authority and the refusal messages, so none of them
+   * can name a read another refuses.
+   */
+  const adaptiveCodeInvestigationToolNames = (): string[] =>
+    missionGraphAdaptiveCodeInvestigationToolNamesV1({
+      graph: missionGraphSession?.graph,
+      usesExactPlannedFrontier: missionGraphUsesExactPlannedFrontier,
+      envelopeExhausted: missionGraphCapacityExhausted,
+      toolCallsRemaining: maxToolCalls - observedToolCallCount,
+    });
 
   const beginMissionGraphTool = async (
     toolName: string,
@@ -6206,8 +6220,11 @@ export async function runAgentMission({
       getValidationRecoveryCorrectionTargetPathV1(
         missionGraphSession.graph, getLatestFastValidationDiagnostic(runtimeCache), writeReceipts,
       ) !== null;
+    const allowAdaptiveInvestigationRead =
+      adaptiveCodeInvestigationToolNames().includes(toolName);
     const allowDynamicReadContinuation =
       dynamicReadContinuationAllowed() || allowRecoveryRead ||
+      allowAdaptiveInvestigationRead ||
       options.allowExactBootstrapRead === true;
     const started = await missionGraphSession.beginToolExecution(toolName, {
       allowDynamicReadContinuation,
@@ -17994,6 +18011,7 @@ export async function runAgentMission({
                 excludeToolNames: [toolCall.name],
                 allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
                 admittedCompanionToolNames: citationGatherCompanionToolNames(),
+                adaptiveCodeInvestigationToolNames: adaptiveCodeInvestigationToolNames(),
               }),
             }),
           });
@@ -18025,6 +18043,7 @@ export async function runAgentMission({
               excludeToolNames: [toolCall.name],
               allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
               admittedCompanionToolNames: citationGatherCompanionToolNames(),
+              adaptiveCodeInvestigationToolNames: adaptiveCodeInvestigationToolNames(),
             });
           messages.push({
             role: "system" as const,
@@ -20436,6 +20455,8 @@ export async function runAgentMission({
                 includeCapabilityReads: dynamicReadContinuationAllowed(),
                 allowDynamicReadContinuation:
                   dynamicReadContinuationAllowed(),
+                adaptiveCodeInvestigationToolNames:
+                  adaptiveCodeInvestigationToolNames(),
                 // Shrink schemas for cloud tool-calling models by route bucket.
                 route: runPlan.route,
                 maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
@@ -20945,6 +20966,7 @@ export async function runAgentMission({
           candidateToolNames: readyToolNames,
           allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
           admittedCompanionToolNames: citationGatherCompanionToolNames(),
+          adaptiveCodeInvestigationToolNames: adaptiveCodeInvestigationToolNames(),
         });
       const offeredToolsAreAuthoritative =
         authoritativeOfferedToolNames.length > 0;
@@ -23885,6 +23907,8 @@ export async function runAgentMission({
                   includeCapabilityReads: dynamicReadContinuationAllowed(),
                   allowDynamicReadContinuation:
                     dynamicReadContinuationAllowed(),
+                  adaptiveCodeInvestigationToolNames:
+                    adaptiveCodeInvestigationToolNames(),
                   route: runPlan.route,
                   maxEffectClassWithoutGrant: runPlan.maxEffectClassWithoutGrant,
                   setLooseOfferedToolNames: refreshedSetLooseOffered,
@@ -24396,6 +24420,7 @@ export async function runAgentMission({
             excludeToolNames: [toolCall.name],
             allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
             admittedCompanionToolNames: citationGatherCompanionToolNames(),
+            adaptiveCodeInvestigationToolNames: adaptiveCodeInvestigationToolNames(),
           });
         // Authority is unchanged: this only stops host-side menu drift from
         // being counted in the bucket that means "the model named a tool it
@@ -24761,6 +24786,7 @@ export async function runAgentMission({
                 excludeToolNames: [toolCall.name],
                 allowDynamicReadContinuation: dynamicReadContinuationAllowed(),
                 admittedCompanionToolNames: citationGatherCompanionToolNames(),
+                adaptiveCodeInvestigationToolNames: adaptiveCodeInvestigationToolNames(),
               }),
             }),
           });
