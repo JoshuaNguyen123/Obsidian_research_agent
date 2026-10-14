@@ -172,6 +172,106 @@ export function isAdaptiveCodeWorkspaceMutationToolNameV1(
   return CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName);
 }
 
+/** At most this many unplanned investigation reads in one graph. */
+export const MAX_ADAPTIVE_CODE_INVESTIGATION_READS_V1 = 4;
+/**
+ * Tool calls kept back beyond one per unfinished node, so a pass that
+ * investigates still has the calls its edit, a retry and its validators need.
+ */
+const ADAPTIVE_CODE_INVESTIGATION_TOOL_CALL_RESERVE_V1 = 2;
+const DYNAMIC_READ_NODE_ID = /^(?:optional-)?retry-\d+-/u;
+
+/**
+ * The read-only workspace tools an exact coding plan admits beyond its plan:
+ * the names the offered menu adds AND the names `beginMissionGraphTool` lets
+ * `beginToolExecution` materialize as bounded dynamic reads. One answer for
+ * both seats, as with `missionGraphRunAdmitsDynamicReadContinuationV1`.
+ *
+ * Why (CIP-3): an exact plan names its reads up front — list, read, inspect —
+ * then offers the edit alone. A pass whose inspection points at another file
+ * (the declaration it must follow lives elsewhere) could only patch blind. The
+ * host's validation recovery already admits one diagnostic read; this admits a
+ * few while the planned edit is next and nothing else is in flight.
+ *
+ * Bounded every way the graph already bounds a read:
+ *   - only once the workspace exists and the planned edit is the ready node
+ *     (every planned read before it has completed, since the edit depends on
+ *     them);
+ *   - never inside a repair cycle or a validation-recovery window, which own
+ *     their diagnostic reads;
+ *   - each read is a dynamic node that the continuation reserve pays for and
+ *     that the edit never waits on, and the envelope refusing one ends them;
+ *   - at most MAX_ADAPTIVE_CODE_INVESTIGATION_READS_V1 per graph, counting
+ *     every dynamic read already made;
+ *   - only while the run's own tool-call headroom covers one call per
+ *     unfinished node plus a reserve, so investigating cannot cost the edit
+ *     or its validation.
+ * Returns [] whenever any of these fails; a non-exact plan already admits
+ * dynamic reads and needs nothing from here.
+ */
+export function missionGraphAdaptiveCodeInvestigationToolNamesV1(input: {
+  graph: MissionGraphV3 | null | undefined;
+  /** AgentRunner's `missionGraphUsesExactPlannedFrontier`. */
+  usesExactPlannedFrontier: boolean;
+  /** AgentRunner's `missionGraphCapacityExhausted`. */
+  envelopeExhausted?: boolean;
+  /** `maxToolCalls - observedToolCallCount` for this run. */
+  toolCallsRemaining: number;
+}): string[] {
+  const graph = input.graph;
+  if (
+    !graph ||
+    input.usesExactPlannedFrontier !== true ||
+    input.envelopeExhausted === true ||
+    !graphHasCompletedCodeWorkspaceCreation(graph) ||
+    graphHasActiveCodeRepairCycleFrontier(graph) ||
+    getActiveValidationRecoveryFrontierV1(graph) !== null
+  ) {
+    return [];
+  }
+  const nodes = Object.values(graph.nodes);
+  if (
+    nodes.some(
+      (node) =>
+        node.status === "running" ||
+        node.status === "waiting_approval" ||
+        node.status === "waiting_obsidian" ||
+        node.status === "verifying",
+    )
+  ) {
+    return [];
+  }
+  const plannedEditNext = nodes.some(
+    (node) =>
+      node.status === "ready" &&
+      getMissionGraphNodeFrontierToolNames(node).some((toolName) =>
+        CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName),
+      ),
+  );
+  if (!plannedEditNext) return [];
+  const readsMade = nodes.filter(
+    (node) =>
+      DYNAMIC_READ_NODE_ID.test(node.id) &&
+      node.allowedTools.some((toolName) =>
+        VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES.has(toolName),
+      ),
+  ).length;
+  if (readsMade >= MAX_ADAPTIVE_CODE_INVESTIGATION_READS_V1) return [];
+  const unfinished = nodes.filter(
+    (node) => node.status !== "complete" && node.status !== "cancelled",
+  ).length;
+  if (
+    !Number.isFinite(input.toolCallsRemaining) ||
+    input.toolCallsRemaining <
+      unfinished + ADAPTIVE_CODE_INVESTIGATION_TOOL_CALL_RESERVE_V1 + 1
+  ) {
+    return [];
+  }
+  return [...VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES].filter(
+    (toolName) => graph.capabilityEnvelope.tools[toolName]?.effect === "read",
+  );
+}
+
 /**
  * Structural slice of a durable run receipt sufficient to prove one verified
  * workspace creation. Declared structurally so the frontier does not import
@@ -952,6 +1052,12 @@ export function constrainToolsToMissionGraphFrontier(
      * advertises tools every one of which is refused.
      */
     allowDynamicReadContinuation?: boolean;
+    /**
+     * Exactly `missionGraphAdaptiveCodeInvestigationToolNamesV1`'s answer, the
+     * same list `beginMissionGraphTool` admits: read-only workspace tools an
+     * exact coding plan offers beside its ready edit.
+     */
+    adaptiveCodeInvestigationToolNames?: readonly string[];
     route?: string;
     maxEffectClassWithoutGrant?: AutonomyEffectClass;
     /**
@@ -1191,6 +1297,11 @@ export function constrainToolsToMissionGraphFrontier(
       if (grant.effect === "read") {
         frontierNames.add(toolName);
       }
+    }
+  }
+  if (!suppressOptionalFrontier) {
+    for (const toolName of options.adaptiveCodeInvestigationToolNames ?? []) {
+      frontierNames.add(toolName);
     }
   }
   const frontierConstrained = tools.filter((tool) =>
