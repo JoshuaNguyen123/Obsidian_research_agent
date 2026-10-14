@@ -1823,6 +1823,38 @@ test("CodeExtensionRuntimeV2 persists settings-only immutable providers, invalid
   }
 });
 
+for (const progressProtocol of [undefined, 1] as const) test(`CodeExtensionRuntimeV2 persists negotiated progress ${progressProtocol ?? "legacy"} without treating history as fresh authority`, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-progress-status-"));
+  try {
+    const provider = sandboxProviderForCurrentHost();
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    let probes = 0;
+    const runner: SandboxCommandRunnerV2 = { async run(spec) {
+      assert.equal(spec.purpose, "boundary_probe"); probes += 1;
+      const result = validBoundaryProbe(provider.runtimeDigest);
+      return { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), ...(progressProtocol ? { progressProtocol } : {}) }) };
+    } };
+    const make = (suffix: string) => new CodeExtensionRuntimeV2({ plugin: plugin as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({ applicationDataRoot: path.join(root, suffix) }),
+      sandboxRunner: runner, now: () => new Date(NOW) });
+    const runtime = make("first"); await runtime.initialize(); await runtime.configureSandboxProvider(provider);
+    await runtime.ensureHostProvisionedSandboxReadinessV1();
+    const saved = parseCodeRuntimeStateV2(plugin.read().codeRuntimeState);
+    assert.equal(saved.sandbox.lastProbe?.status.providers[0].progressProtocol, progressProtocol);
+    assert.equal(saved.sandbox.lastProbe?.status.executionAvailable, true);
+    for (const patch of [{ progressProtocol: 2 }, { progressProtocol: null }, { unexpected: true }, { progressProtocol: 1, state: "unprobed", probeFingerprint: null }]) {
+      const invalid = structuredClone(saved);
+      Object.assign(invalid.sandbox.lastProbe!.status.providers[0], patch);
+      assert.throws(() => parseCodeRuntimeStateV2(invalid), /invalid/iu);
+    }
+    const restarted = make("second"); await restarted.initialize();
+    assert.equal(restarted.getSandboxCapabilityStatus().executionAvailable, false, "persisted progress cannot authorize execution after restart");
+    await restarted.ensureHostProvisionedSandboxReadinessV1();
+    assert.equal(probes, 2);
+    assert.equal(restarted.getSandboxCapabilityStatus().executionAvailable, true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("CodeExtensionRuntimeV2 shares one host probe across readiness and direct callers", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "code-runtime-sandbox-single-flight-"));
   try {
