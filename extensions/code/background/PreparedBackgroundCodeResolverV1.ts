@@ -21,6 +21,7 @@ import {
 } from "../../../packages/headless-runtime/src";
 import {
   repositoryProfileExecutionBlockersV2,
+  repositoryStagingFileLimitV1,
   type RepositoryProfileV2,
   type RepositoryProjectV2,
   type RepositoryValidationCommandV2,
@@ -429,7 +430,7 @@ export class PreparedBackgroundCodeResolverV1 {
       );
     }
 
-    const stagingManifest = await this.readStagingManifest(manifest);
+    const stagingManifest = await this.readStagingManifest(manifest, profile);
     const stagingManifestFingerprint = await sha256Fingerprint(stagingManifest);
     const binding = fastValidation.binding!;
     if (
@@ -546,14 +547,15 @@ export class PreparedBackgroundCodeResolverV1 {
 
   private async readStagingManifest(
     manifest: WorkspaceManifestV2,
+    profile: RepositoryProfileV2,
   ): Promise<SandboxStagingEntryV2[]> {
     const entries = Object.entries(manifest.hashes.files).sort(([left], [right]) =>
       left.localeCompare(right),
     );
-    if (entries.length < 1 || entries.length > MAX_STAGED_FILES) {
+    if (entries.length < 1 || entries.length > repositoryStagingFileLimitV1(profile.stagingProfile)) {
       fail(
         "background_code_staging_limit_exceeded",
-        "The trusted workspace cannot be staged within the 1-100 file limit.",
+        `The trusted workspace cannot be staged within the 1-${repositoryStagingFileLimitV1(profile.stagingProfile)} file limit.`,
         "Reduce the isolated repository fixture or complete this work in the foreground flow.",
       );
     }

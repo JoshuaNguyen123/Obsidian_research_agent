@@ -1855,6 +1855,44 @@ for (const progressProtocol of [undefined, 1] as const) test(`CodeExtensionRunti
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("CodeExtensionRuntimeV2 reads persisted staging capability but requires a new probe after restart", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-staging-status-"));
+  try {
+    const provider = sandboxProviderForCurrentHost(), plugin = new MemoryPluginData({ schemaVersion: 1 });
+    let probes = 0;
+    const runner: SandboxCommandRunnerV2 = { async run(spec) {
+      assert.equal(spec.purpose, "boundary_probe"); probes++;
+      const result = validBoundaryProbe(provider.runtimeDigest);
+      return { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), progressProtocol: 1, stagingProfiles: ["source-1000-v1"] }) };
+    } };
+    const make = (suffix: string) => new CodeExtensionRuntimeV2({ plugin: plugin as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({ applicationDataRoot: path.join(root, suffix) }), sandboxRunner: runner, now: () => new Date(NOW) });
+    const runtime = make("first"); await runtime.initialize(); await runtime.configureSandboxProvider(provider);
+    await runtime.ensureHostProvisionedSandboxReadinessV1();
+    const saved = parseCodeRuntimeStateV2(plugin.read().codeRuntimeState);
+    assert.deepEqual(saved.sandbox.lastProbe?.status.providers[0].stagingProfiles, ["source-1000-v1"]);
+    const blocked = structuredClone(saved);
+    Object.assign(blocked.sandbox.lastProbe!.status, {
+      mode: "editing_only", executionAvailable: false, selectedProvider: null,
+      blocker: { version: 1, code: "sandbox_staging_profile_unsupported",
+        message: "The runtime has not proved the reviewed staging profile.",
+        requiredAction: "Qualify a compatible runtime.", retryable: true,
+        editingAvailable: true, executionAvailable: false, fingerprint: SHA("a") },
+    });
+    assert.equal(parseCodeRuntimeStateV2(blocked).sandbox.lastProbe?.status.blocker?.code,
+      "sandbox_staging_profile_unsupported");
+    for (const patch of [{ stagingProfiles: [] }, { stagingProfiles: null }, { stagingProfiles: ["unknown"] },
+      { stagingProfiles: ["source-1000-v1", "source-1000-v1"] }, { state: "unprobed", probeFingerprint: null }]) {
+      const invalid = structuredClone(saved); Object.assign(invalid.sandbox.lastProbe!.status.providers[0], patch);
+      assert.throws(() => parseCodeRuntimeStateV2(invalid), /invalid/iu);
+    }
+    const restarted = make("second"); await restarted.initialize();
+    assert.equal(restarted.getSandboxCapabilityStatus().executionAvailable, false);
+    await restarted.ensureHostProvisionedSandboxReadinessV1();
+    assert.equal(probes, 2); assert.deepEqual(restarted.getSandboxCapabilityStatus().providers[0].stagingProfiles, ["source-1000-v1"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("CodeExtensionRuntimeV2 shares one host probe across readiness and direct callers", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "code-runtime-sandbox-single-flight-"));
   try {

@@ -4,6 +4,12 @@ import type { RepositoryProfileV1 } from "../../../src/agent/repositories/Reposi
 
 export const REPOSITORY_PROFILE_V2_SCHEMA_VERSION = 2 as const;
 
+/** Host-selected only, following repository trust review. Omission preserves the legacy profile. */
+export type RepositoryStagingProfileV1 = "source-1000-v1";
+export function repositoryStagingFileLimitV1(profile?: RepositoryStagingProfileV1): number {
+  return profile === "source-1000-v1" ? 1000 : 100;
+}
+
 export type RepositoryEcosystemV2 =
   | "node"
   | "python"
@@ -85,6 +91,7 @@ export interface RepositoryProfileV2 {
   generatedOutputs: string[];
   requiredGitHubChecks: string[];
   mergePolicy: RepositoryMergePolicyV2;
+  stagingProfile?: RepositoryStagingProfileV1;
 }
 
 export interface RepositoryDetectionInputV2 {
@@ -99,6 +106,7 @@ export interface RepositoryDetectionInputV2 {
   allowedPaths?: readonly string[];
   generatedOutputs?: readonly string[];
   requiredGitHubChecks?: readonly string[];
+  stagingProfile?: RepositoryStagingProfileV1;
 }
 
 export interface RepositoryProfileAdapterV2 {
@@ -196,17 +204,19 @@ export function createRepositoryProfileV2(
 
 /** Parse the fully closed V2 contract. Unknown and missing keys fail closed. */
 export function parseRepositoryProfileV2(value: unknown): RepositoryProfileV2 {
+  const hasStagingProfile = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "stagingProfile");
   const record = exactRecord(
     value,
     [
       "schemaVersion", "key", "displayName", "repositoryRoot", "defaultBranch",
       "projects", "ecosystems", "allowedPaths", "protectedControls",
       "pinnedRuntimes", "validationCatalog", "generatedOutputs",
-      "requiredGitHubChecks", "mergePolicy",
+      "requiredGitHubChecks", "mergePolicy", ...(hasStagingProfile ? ["stagingProfile"] : []),
     ],
     "repository profile V2",
   );
   if (record.schemaVersion !== 2) fail("Unsupported RepositoryProfileV2 schema version.");
+  if (hasStagingProfile && record.stagingProfile !== "source-1000-v1") fail("Unsupported repository staging profile.");
   const projects = array(record.projects, "projects", 1, 64).map(parseProject);
   const ecosystems = uniqueEcosystems(record.ecosystems, "ecosystems");
   const projectEcosystems = new Set(projects.flatMap((project) => project.ecosystems));
@@ -303,6 +313,7 @@ export function parseRepositoryProfileV2(value: unknown): RepositoryProfileV2 {
     generatedOutputs: uniquePaths(record.generatedOutputs, "generatedOutputs", 0, 256, false),
     requiredGitHubChecks,
     mergePolicy,
+    ...(hasStagingProfile ? { stagingProfile: "source-1000-v1" as const } : {}),
   };
 }
 
@@ -392,6 +403,7 @@ export function detectRepositoryProfileV2(input: RepositoryDetectionInputV2): Re
       : [...adapterOutputs].sort(),
     requiredGitHubChecks: input.requiredGitHubChecks ?? [],
     mergePolicy: defaultRepositoryMergePolicyV2(),
+    ...(input.stagingProfile !== undefined ? { stagingProfile: input.stagingProfile } : {}),
   });
 }
 
@@ -478,6 +490,7 @@ export function detectSourceOnlyRepositoryProfileV2(
     generatedOutputs: [],
     requiredGitHubChecks: [...(input.requiredGitHubChecks ?? [])],
     mergePolicy: defaultRepositoryMergePolicyV2(),
+    ...(input.stagingProfile !== undefined ? { stagingProfile: input.stagingProfile } : {}),
   });
 }
 

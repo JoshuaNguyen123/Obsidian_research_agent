@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import {
   parseRepositoryProfileV2,
   repositoryProfileExecutionBlockersV2,
+  repositoryStagingFileLimitV1,
+  type RepositoryStagingProfileV1,
   type RepositoryProfileV2,
   type RepositoryValidationCommandV2,
 } from "../repositories/RepositoryProfileV2";
@@ -86,6 +88,7 @@ export interface SandboxProviderStatusV2 {
   probeFingerprint: string | null;
   /** Optional capability proved by this exact digest-pinned runtime. */
   progressProtocol?: 1;
+  stagingProfiles?: RepositoryStagingProfileV1[];
   checkedAt: string | null;
 }
 
@@ -108,6 +111,7 @@ export interface SandboxDurableBlockerV2 {
     | "sandbox_runtime_digest_required"
     | "sandbox_staging_mismatch"
     | "sandbox_staging_transport_unsupported"
+    | "sandbox_staging_profile_unsupported"
     | "sandbox_execution_failed"
     | "sandbox_artifact_readback_failed";
   message: string;
@@ -168,6 +172,7 @@ export interface PreparedSandboxActionV2 {
   };
   environment: Record<string, string>;
   stagingManifest: SandboxStagingEntryV2[];
+  stagingProfile?: RepositoryStagingProfileV1;
   expectedArtifacts: SandboxExpectedArtifactV2[];
   preparedAt: string;
   expiresAt: string;
@@ -306,7 +311,6 @@ export const SANDBOX_ENVIRONMENT_ALLOWLIST_V2: ReadonlySet<string> = new Set([
   "SOURCE_DATE_EPOCH",
   "TZ",
 ]);
-const MAX_STAGED_FILES = 100;
 const MAX_STAGED_FILE_BYTES = 2_000_000;
 const MAX_STAGED_TOTAL_BYTES = 10_000_000;
 const MAX_ARTIFACT_BYTES = 10_000_000;
@@ -504,7 +508,7 @@ export class SandboxManagerV2 {
         ),
       };
     }
-    const stagingManifest = parseStagingManifest(input.stagingManifest);
+    const stagingManifest = parseStagingManifest(input.stagingManifest, profile.stagingProfile);
     const expectedArtifacts = parseExpectedArtifacts(
       input.expectedArtifacts ?? [],
       profile.generatedOutputs,
@@ -529,6 +533,11 @@ export class SandboxManagerV2 {
     const preparedAt = now.toISOString();
     const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
     const status = this.statuses.find((candidate) => candidate.provider === selected.kind)!;
+    if (profile.stagingProfile && !status.stagingProfiles?.includes(profile.stagingProfile)) {
+      return { status: "blocked", blocker: blocker("sandbox_staging_profile_unsupported",
+        "The selected runtime has not proved support for the reviewed staging profile.",
+        "Qualify a compatible runtime and prepare a new action; no partial repository will run.", true) };
+    }
     const core = {
       version: 1 as const,
       purpose: input.purpose,
@@ -561,6 +570,7 @@ export class SandboxManagerV2 {
       resources,
       environment,
       stagingManifest,
+      ...(profile.stagingProfile ? { stagingProfile: profile.stagingProfile } : {}),
       expectedArtifacts,
       preparedAt,
       expiresAt,
@@ -818,6 +828,7 @@ export class SandboxManagerV2 {
             : "Boundary probe verified.",
           probeFingerprint,
           ...(proof.progressProtocol === 1 ? { progressProtocol: 1 as const } : {}),
+          ...(Array.isArray(proof.stagingProfiles) ? { stagingProfiles: ["source-1000-v1" as const] } : {}),
           checkedAt,
         };
       } catch (error) {
@@ -1026,7 +1037,10 @@ export function buildSandboxExecutionCommandV2(
 }
 
 export function parsePreparedSandboxActionV2(value: unknown): PreparedSandboxActionV2 {
-  const record = exactRecord(value, ["version", "id", "purpose", "provider", "profileKey", "projectId", "commandId", "workspaceId", "repairRequestId", "workspaceManifestFingerprint", "runtimeDigest", "probeFingerprint", "command", "network", "resources", "environment", "stagingManifest", "expectedArtifacts", "preparedAt", "expiresAt", "payloadFingerprint"], "prepared sandbox action");
+  const hasStagingProfile = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "stagingProfile");
+  const record = exactRecord(value, ["version", "id", "purpose", "provider", "profileKey", "projectId", "commandId", "workspaceId", "repairRequestId", "workspaceManifestFingerprint", "runtimeDigest", "probeFingerprint", "command", "network", "resources", "environment", "stagingManifest", "expectedArtifacts", "preparedAt", "expiresAt", "payloadFingerprint", ...(hasStagingProfile ? ["stagingProfile"] : [])], "prepared sandbox action");
+  if (hasStagingProfile && record.stagingProfile !== "source-1000-v1") throw new SandboxManagerV2Error("Unsupported prepared staging profile.");
+  const stagingProfile = hasStagingProfile ? "source-1000-v1" as const : undefined;
   if (record.version !== 1) throw new SandboxManagerV2Error("Unsupported prepared sandbox action version.");
   const commandRecord = exactRecord(record.command, ["executable", "args", "cwd", "timeoutMs"], "prepared sandbox command");
   const networkRecord = exactRecord(record.network, ["mode", "credentialPolicy"], "prepared sandbox network");
@@ -1069,7 +1083,8 @@ export function parsePreparedSandboxActionV2(value: unknown): PreparedSandboxAct
     },
     resources: parseResources(resourcesRecord, boundedInteger(commandRecord.timeoutMs, "command timeout", 1_000, 1_800_000)),
     environment: parseEnvironment(exactOpenRecord(record.environment, "sandbox environment")),
-    stagingManifest: parseStagingManifest(array(record.stagingManifest, "staging manifest", 1, MAX_STAGED_FILES) as SandboxStagingEntryV2[]),
+    stagingManifest: parseStagingManifest(array(record.stagingManifest, "staging manifest", 1, repositoryStagingFileLimitV1(stagingProfile)) as SandboxStagingEntryV2[], stagingProfile),
+    ...(stagingProfile ? { stagingProfile } : {}),
     expectedArtifacts: parseExpectedArtifactsWithoutProfile(record.expectedArtifacts),
     preparedAt: isoTimestamp(record.preparedAt, "preparedAt"),
     expiresAt: isoTimestamp(record.expiresAt, "expiresAt"),
@@ -1199,6 +1214,7 @@ function buildProviderCommand(
         provider.runtimeDigest,
       ]
     : [
+        ...(action!.stagingProfile ? ["--staging-profile-source-1000-v1"] : []),
         "--staging-stdin",
         "--artifacts-stdout",
         "--expected-runtime-digest",
@@ -1309,10 +1325,12 @@ function parseBoundaryProof(
     throw new SandboxManagerV2Error("Boundary probe did not return JSON.");
   }
   const hasProgress = typeof parsed === "object" && parsed !== null && Object.prototype.hasOwnProperty.call(parsed, "progressProtocol");
-  const proof = exactRecord(parsed, ["version", "uid", "networkBlocked", "rootReadOnly", "hostRootAbsent", "containerSocketAbsent", "runtimeReadOnly", "runtimeDigest", "stagingIsolated", "resourceLimitsEnforced", ...(hasProgress ? ["progressProtocol"] : [])], "boundary proof");
+  const hasStaging = typeof parsed === "object" && parsed !== null && Object.prototype.hasOwnProperty.call(parsed, "stagingProfiles");
+  const proof = exactRecord(parsed, ["version", "uid", "networkBlocked", "rootReadOnly", "hostRootAbsent", "containerSocketAbsent", "runtimeReadOnly", "runtimeDigest", "stagingIsolated", "resourceLimitsEnforced", ...(hasProgress ? ["progressProtocol"] : []), ...(hasStaging ? ["stagingProfiles"] : [])], "boundary proof");
   if (
     proof.version !== 1 ||
     (hasProgress && proof.progressProtocol !== 1) ||
+    (hasStaging && (!Array.isArray(proof.stagingProfiles) || proof.stagingProfiles.length !== 1 || proof.stagingProfiles[0] !== "source-1000-v1")) ||
     !Number.isSafeInteger(proof.uid) ||
     (proof.uid as number) <= 0 ||
     proof.networkBlocked !== true ||
@@ -1352,9 +1370,9 @@ function assertPurposeMatchesCommand(
   }
 }
 
-function parseStagingManifest(value: readonly SandboxStagingEntryV2[]): SandboxStagingEntryV2[] {
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_STAGED_FILES) {
-    throw new SandboxManagerV2Error(`Staging manifest requires 1-${MAX_STAGED_FILES} entries.`);
+function parseStagingManifest(value: readonly SandboxStagingEntryV2[], profile?: RepositoryStagingProfileV1): SandboxStagingEntryV2[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > repositoryStagingFileLimitV1(profile)) {
+    throw new SandboxManagerV2Error(`Staging manifest requires 1-${repositoryStagingFileLimitV1(profile)} entries.`);
   }
   let total = 0;
   const output = value.map((entry) => {

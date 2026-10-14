@@ -97,7 +97,10 @@ def _canonical_base64(value: Any, maximum: int, label: str) -> bytes:
     return decoded
 
 
-def decode_staging_bundle(data: bytes) -> list[tuple[str, bytes]]:
+def decode_staging_bundle(data: bytes, staging_profile: str | None = None) -> list[tuple[str, bytes]]:
+    if staging_profile not in (None, "source-1000-v1"):
+        raise ProtocolError("unsupported staging profile")
+    max_files = 1000 if staging_profile == "source-1000-v1" else MAX_FILES
     if not 1 <= len(data) <= MAX_STDIN_BYTES:
         raise ProtocolError("staging bundle exceeds its byte boundary")
     try:
@@ -105,7 +108,7 @@ def decode_staging_bundle(data: bytes) -> list[tuple[str, bytes]]:
     except Exception as error:
         raise ProtocolError("staging bundle is not UTF-8 JSON") from error
     bundle = _exact_object(parsed, {"version", "files", "manifestFingerprint"}, "staging bundle")
-    if bundle["version"] != 1 or not isinstance(bundle["files"], list) or not 1 <= len(bundle["files"]) <= MAX_FILES:
+    if bundle["version"] != 1 or not isinstance(bundle["files"], list) or not 1 <= len(bundle["files"]) <= max_files:
         raise ProtocolError("staging bundle version or file count is invalid")
     files: list[tuple[str, bytes]] = []
     manifest: list[dict[str, Any]] = []
@@ -307,6 +310,7 @@ def boundary_proof(expected_runtime_digest: str) -> dict[str, Any]:
         "stagingIsolated": bool(workspace_mount and workspace_mount[2] == "tmpfs"),
         "resourceLimitsEnforced": _resource_limits_enforced(),
         "progressProtocol": 1,
+        "stagingProfiles": ["source-1000-v1"],
     }
 
 
@@ -432,11 +436,12 @@ def _progress_emitter() -> Callable[[str, bytes, bool], None]:
 
 
 def execute(argv: list[str], stdin: bytes, workspace: Path = WORKSPACE_ROOT,
-            progress: Callable[[str, bytes, bool], None] | None = None) -> dict[str, Any]:
+            progress: Callable[[str, bytes, bool], None] | None = None,
+            staging_profile: str | None = None) -> dict[str, Any]:
     runtime_digest, command_digest, cwd, cpu, memory, pids, timeout, command = _parse_execution(argv)
     _load_runtime_identity(runtime_digest)
     _runtime_allows(command[0], command_digest)
-    files = decode_staging_bundle(stdin)
+    files = decode_staging_bundle(stdin, staging_profile)
     _write_staging(files, workspace)
     before = _snapshot(workspace)
     command_cwd = workspace if cwd == "." else workspace.joinpath(*PurePosixPath(cwd).parts)
@@ -495,9 +500,13 @@ def main(argv: list[str]) -> int:
             sys.stdout.buffer.write(_canonical_json(proof))
             return 0
         stdin = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+        staging_profile = "source-1000-v1" if argv and argv[0] == "--staging-profile-source-1000-v1" else None
+        if staging_profile is not None:
+            argv = argv[1:]
         wants_progress = bool(argv and argv[0] == "--progress-stderr-v1")
         result = execute(argv[1:] if wants_progress else argv, stdin,
-                         progress=_progress_emitter() if wants_progress else None)
+                         progress=_progress_emitter() if wants_progress else None,
+                         staging_profile=staging_profile)
         sys.stdout.buffer.write(_canonical_json(result))
         return 0
     except Exception as error:

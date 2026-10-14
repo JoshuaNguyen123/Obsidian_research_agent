@@ -38,6 +38,31 @@ def bundle(files: dict[str, bytes]) -> bytes:
 
 
 class SandboxRuntimeProtocolTests(unittest.TestCase):
+    def test_expanded_source_profile_preserves_default_and_exact_count(self) -> None:
+        files = {f"src/file-{index}.ts": b"x" for index in range(1000)}
+        data = bundle(files)
+        with self.assertRaises(runtime.ProtocolError):
+            runtime.decode_staging_bundle(data)
+        decoded = runtime.decode_staging_bundle(data, "source-1000-v1")
+        self.assertEqual(dict(decoded), files)
+        files["src/overflow.ts"] = b"x"
+        with self.assertRaises(runtime.ProtocolError):
+            runtime.decode_staging_bundle(bundle(files), "source-1000-v1")
+        with self.assertRaises(runtime.ProtocolError):
+            runtime.decode_staging_bundle(bundle({"src/a.ts": b"x"}), "unknown")
+
+    def test_expanded_source_profile_does_not_expand_byte_or_artifact_limits(self) -> None:
+        for files in ({"large.ts": b"x" * 2_000_001},
+                      {f"src/{index}.ts": b"x" * 2_000_000 for index in range(6)}):
+            with self.assertRaises(runtime.ProtocolError):
+                runtime.decode_staging_bundle(bundle(files), "source-1000-v1")
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for index in range(101):
+                (workspace / f"output-{index}.txt").write_text("x")
+            with self.assertRaises(runtime.ProtocolError):
+                runtime.collect_artifacts(workspace, {})
+
     @unittest.skipUnless(sys.platform == "linux", "The sandbox runtime uses Linux pipes")
     def test_output_arrives_before_exit_and_final_bytes_are_unchanged(self) -> None:
         events = []
