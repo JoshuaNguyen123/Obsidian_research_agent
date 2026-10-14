@@ -18,8 +18,10 @@ test("real sandbox output is redacted before exit with unchanged final receipt b
   const manager = new SandboxManagerV2({ providers: [binding.provider], runner: new SpawnSandboxCommandRunnerV2() });
   const cases: unknown[] = [];
   let failure: unknown;
+  let sandbox: unknown;
   try {
-    assert.equal((await manager.probeProviders()).executionAvailable, true);
+    const status = await manager.probeProviders(); sandbox = status;
+    assert.equal(status.executionAvailable, true, JSON.stringify(status));
     const early: boolean[] = [];
     const files = {
       "package.json": JSON.stringify({ name: "progress-fixture", version: "1.0.0", scripts: { test: "node stream.cjs", build: "node stream.cjs" } }),
@@ -54,6 +56,6 @@ test("real sandbox output is redacted before exit with unchanged final receipt b
   } catch (error) { failure = String(error); throw error; }
   finally {
     await mkdir(".cache/cip4-streaming", { recursive: true });
-    await writeFile(`.cache/cip4-streaming/native-${Date.now()}.json`, JSON.stringify({ binding, cases, failure }, null, 2) + "\n", { flag: "wx" });
+    await writeFile(`.cache/cip4-streaming/native-${Date.now()}.json`, JSON.stringify({ binding, sandbox, cases, failure }, null, 2) + "\n", { flag: "wx" });
   }
 });
