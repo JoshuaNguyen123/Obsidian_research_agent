@@ -29,6 +29,7 @@ import {
   type SandboxValidationDiagnosticsV1,
   type SandboxPrepareInputV2,
   type SandboxStagedFileBytesV2,
+  type SandboxExecutionProgressV1,
 } from "./SandboxManager";
 import type {
   SandboxExecutionJournalV1,
@@ -47,10 +48,19 @@ export const CODE_EXECUTION_TOOL_NAMES_V2 = [
   "install_code_dependency",
 ] as const;
 
+export interface SandboxToolProgressV1 extends SandboxExecutionProgressV1 {
+  runId: string;
+  missionId: string;
+  operationId: string | null;
+  toolName: string;
+}
+
 export interface CodeExecutionContributionFactoryOptionsV2 {
   sandboxManager: SandboxManagerV2 | (() => SandboxManagerV2);
   /** Required durable write-ahead execution journal for every caller. */
   executionJournal: SandboxExecutionJournalV1;
+  /** Ephemeral only. Separate from durable observers and completion receipts. */
+  observeExecutionProgress?: (progress: Readonly<SandboxToolProgressV1>) => void;
   getProfile(profileKey: string): Promise<RepositoryProfileV2 | null>;
   /** Resolve mutable workspace proof on the host; model arguments never carry hashes. */
   resolvePreparationInput?(input: {
@@ -375,6 +385,12 @@ function preparedSandboxContribution(
         stagedFiles: executionInput.stagedFiles,
         artifactImporter: executionInput.artifactImporter,
         signal: context.abortSignal,
+        onProgress: excerpt => options.observeExecutionProgress?.(Object.freeze({ ...excerpt,
+          actionId: sandboxAction.id, workspaceId: sandboxAction.workspaceId,
+          repairRequestId: sandboxAction.repairRequestId, commandId: sandboxAction.commandId,
+          purpose: sandboxAction.purpose, runId: context.rootMissionId?.trim() || action.runId,
+          missionId: action.runId, operationId: context.operationId ?? null, toolName: name,
+        })),
       });
       if (result.status === "blocked") {
         throw new CodeSandboxContributionErrorV2(

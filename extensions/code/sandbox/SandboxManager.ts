@@ -53,8 +53,16 @@ export interface SandboxCommandRunnerV2 {
     input?: {
       stagedFiles?: readonly SandboxStagedFileBytesV2[];
       signal?: AbortSignal;
+      /** Internal raw transport; only the manager may expose a redacted view. */
+      onProgress?: (progress: SandboxRunnerProgressV1) => void;
     },
   ): Promise<SandboxRunnerResultV2>;
+}
+
+export interface SandboxRunnerProgressV1 {
+  stream: "stdout" | "stderr";
+  bytes: Uint8Array;
+  truncated: boolean;
 }
 
 export interface SandboxProviderStatusV2 {
@@ -76,6 +84,8 @@ export interface SandboxProviderStatusV2 {
   state: "unprobed" | "verified" | "unavailable" | "rejected" | "no_verdict";
   diagnostic: string;
   probeFingerprint: string | null;
+  /** Optional capability proved by this exact digest-pinned runtime. */
+  progressProtocol?: 1;
   checkedAt: string | null;
 }
 
@@ -240,6 +250,14 @@ export interface SandboxTransientDiagnosticExcerptV1 {
   redactedLines: number;
 }
 
+export interface SandboxExecutionProgressV1 extends SandboxTransientDiagnosticExcerptV1 {
+  actionId: string;
+  workspaceId: string;
+  repairRequestId: string | null;
+  commandId: string;
+  purpose: SandboxActionPurposeV2;
+}
+
 export type SandboxPreparationResultV2 =
   | { status: "prepared"; action: PreparedSandboxActionV2 }
   | { status: "blocked"; blocker: SandboxDurableBlockerV2 };
@@ -270,6 +288,8 @@ export interface SandboxManagerOptionsV2 {
   runner: SandboxCommandRunnerV2;
   providers: readonly SandboxProviderConfigV2[];
   now?: () => Date;
+  /** Foreground-only provisional output; never a receipt or durable event. */
+  onProgress?: (progress: Readonly<SandboxExecutionProgressV1>) => void;
 }
 
 /**
@@ -367,6 +387,7 @@ export class SandboxManagerV2 {
   private readonly runner: SandboxCommandRunnerV2;
   private readonly providers: SandboxProviderConfigV2[];
   private readonly now: () => Date;
+  private readonly onProgress: SandboxManagerOptionsV2["onProgress"];
   private statuses: SandboxProviderStatusV2[];
 
   constructor(options: SandboxManagerOptionsV2) {
@@ -381,6 +402,7 @@ export class SandboxManagerV2 {
       throw new SandboxManagerV2Error("Sandbox provider kinds must be unique.");
     }
     this.now = options.now ?? (() => new Date());
+    this.onProgress = options.onProgress;
     this.statuses = this.providers.map((provider) => ({
       provider: provider.kind,
       state: "unprobed",
@@ -558,6 +580,8 @@ export class SandboxManagerV2 {
       stagedFiles: readonly SandboxStagedFileBytesV2[];
       artifactImporter?: SandboxArtifactImporterV2;
       signal?: AbortSignal;
+      /** Foreground-only, redacted and bounded. Incomplete lines are withheld. */
+      onProgress?: (excerpt: SandboxTransientDiagnosticExcerptV1) => void;
     },
   ): Promise<SandboxExecutionResultV2> {
     const action = parsePreparedSandboxActionV2(rawAction);
@@ -623,12 +647,24 @@ export class SandboxManagerV2 {
       };
     }
     const spec = buildSandboxExecutionCommandV2(provider, action);
+    if (freshProbe.progressProtocol === 1) spec.args.splice(spec.args.indexOf("--staging-stdin"), 0, "--progress-stderr-v1");
     const startedAt = this.now().toISOString();
     let execution: SandboxRunnerResultV2;
+    let progressActive = true;
     try {
-      execution = await this.runner.run(spec, { stagedFiles, signal: input.signal });
+      const progress = diagnosticProgress((excerpt) => {
+        if (!progressActive || input.signal?.aborted) return;
+        const snapshot = Object.freeze({ ...excerpt });
+        try { void Promise.resolve(input.onProgress?.(snapshot)).catch(() => undefined); } catch { /* An observer cannot alter execution. */ }
+        try { void Promise.resolve(this.onProgress?.(Object.freeze({ ...snapshot, actionId: action.id, workspaceId: action.workspaceId,
+          repairRequestId: action.repairRequestId, commandId: action.commandId, purpose: action.purpose }))).catch(() => undefined); }
+        catch { /* Same for the host observer. */ }
+      });
+      execution = await this.runner.run(spec, { stagedFiles, signal: input.signal, onProgress: progress });
     } catch (error) {
       return { status: "blocked", blocker: sandboxExecutionFailedBlockerV2(error) };
+    } finally {
+      progressActive = false;
     }
     assertBoundedRunnerResult(execution);
     const imported: SandboxImportedArtifactV2[] = [];
@@ -781,6 +817,7 @@ export class SandboxManagerV2 {
               `${lastNoVerdict.diagnostic} Retried at ${timeoutMs}ms.`
             : "Boundary probe verified.",
           probeFingerprint,
+          ...(proof.progressProtocol === 1 ? { progressProtocol: 1 as const } : {}),
           checkedAt,
         };
       } catch (error) {
@@ -1052,6 +1089,28 @@ const TRANSIENT_DIAGNOSTIC_STREAM_BYTES = TRANSIENT_DIAGNOSTIC_BYTES / 2;
 const CREDENTIAL_SHAPED_LINE = /(?:authorization|bearer\s+|api[_-]?key|(?:api|access|refresh)?[_-]?token|password|passwd|secret|cookie|credential|(?:gh[pousr]_|github_pat_|lin_api_|sk-(?:proj-)?|glpat-|xox[baprs]-)[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/iu;
 const UNSAFE_DIAGNOSTIC_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu;
 
+function diagnosticProgress(observe: (excerpt: SandboxTransientDiagnosticExcerptV1) => void): (progress: SandboxRunnerProgressV1) => void {
+  const bytes = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+  let truncated = false;
+  let last = "";
+  return (progress) => {
+    const stream = progress.stream;
+    if (stream !== "stdout" && stream !== "stderr") return;
+    const remaining = TRANSIENT_DIAGNOSTIC_STREAM_BYTES - bytes[stream].length;
+    bytes[stream] = Buffer.concat([bytes[stream], Buffer.from(progress.bytes.subarray(0, remaining))]);
+    truncated ||= progress.truncated || progress.bytes.byteLength > remaining;
+    // Redaction needs the whole line, including a credential marker arriving
+    // in a later chunk. A partial line never crosses the manager boundary.
+    const complete = (value: Buffer): string => value.subarray(0, value.lastIndexOf(10) + 1).toString("utf8");
+    const excerpt = transientDiagnosticExcerpt(complete(bytes.stdout), complete(bytes.stderr));
+    excerpt.truncated ||= truncated;
+    const identity = JSON.stringify(excerpt);
+    if (identity === last || (!excerpt.stdout && !excerpt.stderr && !excerpt.truncated)) return;
+    last = identity;
+    observe(excerpt);
+  };
+}
+
 function transientDiagnostics(
   stdoutInput: string,
   stderrInput: string,
@@ -1249,9 +1308,11 @@ function parseBoundaryProof(
   } catch {
     throw new SandboxManagerV2Error("Boundary probe did not return JSON.");
   }
-  const proof = exactRecord(parsed, ["version", "uid", "networkBlocked", "rootReadOnly", "hostRootAbsent", "containerSocketAbsent", "runtimeReadOnly", "runtimeDigest", "stagingIsolated", "resourceLimitsEnforced"], "boundary proof");
+  const hasProgress = typeof parsed === "object" && parsed !== null && Object.prototype.hasOwnProperty.call(parsed, "progressProtocol");
+  const proof = exactRecord(parsed, ["version", "uid", "networkBlocked", "rootReadOnly", "hostRootAbsent", "containerSocketAbsent", "runtimeReadOnly", "runtimeDigest", "stagingIsolated", "resourceLimitsEnforced", ...(hasProgress ? ["progressProtocol"] : [])], "boundary proof");
   if (
     proof.version !== 1 ||
+    (hasProgress && proof.progressProtocol !== 1) ||
     !Number.isSafeInteger(proof.uid) ||
     (proof.uid as number) <= 0 ||
     proof.networkBlocked !== true ||
