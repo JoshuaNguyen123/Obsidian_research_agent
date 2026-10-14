@@ -19,7 +19,8 @@ test("a root scope alone grants no guessed filename", () => {
   assert.deepEqual(getReceiptBackedWorkspaceRecoveryPathsV1([scope()]), []);
 });
 test("root-scoped recovery rejects unverified and unchanged mutations", () => {
-  const unverified = changed(); unverified.readback = { status: "mismatch", checkedAt: "2026-10-13T00:00:00Z" } as AgentRunReceipt["readback"];
+  // Deliberately malformed external data: the public receipt type excludes it.
+  const unverified = changed(); unverified.readback = { status: "mismatch", checkedAt: "2026-10-13T00:00:00Z" } as unknown as AgentRunReceipt["readback"];
   const noChange = changed(); (noChange.output as any).receipt.beforeSha256 = after;
   assert.deepEqual(getReceiptBackedWorkspaceRecoveryPathsV1([scope(), unverified, noChange]), []);
 });

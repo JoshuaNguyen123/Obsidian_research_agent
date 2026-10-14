@@ -1,7 +1,6 @@
 import { portableSha256Text } from "../../../packages/core-api/src/portableSha256";
 
 import type { RepositoryProfileV1 } from "../../../src/agent/repositories/RepositoryProfile";
-import { createNodeNpmValidationProfile } from "../../../src/agent/repositories/NodeNpmValidationProfile";
 
 export const REPOSITORY_PROFILE_V2_SCHEMA_VERSION = 2 as const;
 
@@ -629,7 +628,6 @@ function nodeAdapter(): RepositoryProfileAdapterV2 {
     ecosystem: "node",
     marker: (path) => basename(path) === "package.json",
     contribute(context) {
-      const legacy = createNodeNpmValidationProfile();
       const root = context.projectRoot;
       const lockfile = firstExisting(context.files, root, [
         "npm-shrinkwrap.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
@@ -650,22 +648,26 @@ function nodeAdapter(): RepositoryProfileAdapterV2 {
         runtime: runtimeFromPin(context, "node", "node", [".nvmrc", ".node-version"]),
         commands: [
           ...bootstrap,
-          ...legacy.validationCommands.map((entry, index) => command(
-            context,
-            index === 0 ? "fast" : "full",
-            `npm-${entry.args.at(-1) ?? index + 1}`,
-            entry.command,
-            entry.args,
-            "disabled",
-            null,
-            300_000,
-          )),
+          command(context, "fast", `${manager}-test`, manager, ["run", "test"], "disabled", null, 300_000),
+          command(context, "targeted", `${manager}-targeted-test`, manager, ["run", "test"], "disabled", null, 300_000),
+          // A build can succeed while tests are red. The exact trusted full
+          // command must run both checks against the same staged bytes. This
+          // fixed wrapper executes only inside the existing offline sandbox;
+          // no repository-supplied code is interpolated into it. Missing
+          // scripts/managers, child errors and signals all fail closed.
+          command(context, "full", `${manager}-test-build`, "node", [
+            "--input-type=commonjs", "-e", NODE_FULL_VALIDATION_SCRIPT, manager,
+          ], "disabled", null, 300_000),
         ],
         generatedOutputs: [atRoot(root, "dist")],
       };
     },
   };
 }
+
+// Keep each argv below the closed profile's 500-character limit. The outer
+// sandbox still enforces the combined 300-second deadline and process limit.
+const NODE_FULL_VALIDATION_SCRIPT = 'const {spawnSync}=require("node:child_process");const p=process.argv[1];for(const s of ["test","build"]){console.log("[validation] "+p+" run "+s);const r=spawnSync(p,["run",s],{shell:false,stdio:"inherit",timeout:300000,killSignal:"SIGKILL"});if(r.error||r.signal||r.status!==0)process.exit(Number.isInteger(r.status)&&r.status>0&&r.status<256?r.status:1)}';
 
 function pythonAdapter(): RepositoryProfileAdapterV2 {
   return {

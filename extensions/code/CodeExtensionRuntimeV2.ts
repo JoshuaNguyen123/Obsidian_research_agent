@@ -1,3 +1,4 @@
+import { selectForegroundValidationCommand } from "./repositories/foregroundValidation";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -3682,54 +3683,6 @@ async function collectSandboxStagingManifest(
 
 function compareCanonicalText(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
-}
-
-function selectForegroundValidationCommand(
-  profile: RepositoryProfileV2,
-  projectId: string,
-  purpose: PreparedSandboxActionV2["purpose"],
-): RepositoryValidationCommandV2 {
-  const catalog = profile.validationCatalog
-    .filter((command) => command.projectId === projectId)
-    .sort((left, right) => left.id.localeCompare(right.id));
-  const exactPhase = purpose === "validation_fast"
-    ? "fast"
-    : purpose === "validation_targeted" || purpose === "code_block"
-      ? "targeted"
-      : purpose === "validation_full"
-        ? "full"
-        : "bootstrap";
-  const exact = catalog.filter((command) => command.phase === exactPhase);
-  const legacyFull = catalog.filter((command) => command.phase === "full");
-  const isLegacyV1Catalog = legacyFull.length > 0 && legacyFull.every((command) =>
-    /^root-full-\d+$/u.test(command.id),
-  );
-  if (
-    isLegacyV1Catalog &&
-    (purpose === "validation_fast" || purpose === "validation_targeted" || purpose === "validation_full")
-  ) {
-    return purpose === "validation_full"
-      ? legacyFull.at(-1)!
-      : legacyFull[0];
-  }
-  if (exact.length === 1) return exact[0];
-  if (exact.length > 1) {
-    throw new CodeSandboxContributionErrorV2(
-      "sandbox_validation_command_ambiguous",
-      `The trusted repository profile has multiple ${exactPhase} commands for project ${projectId}.`,
-    );
-  }
-  if (
-    legacyFull.length === 1 &&
-    (purpose === "validation_fast" || purpose === "validation_targeted" || purpose === "validation_full")
-  ) {
-    return legacyFull[0];
-  }
-
-  throw new CodeSandboxContributionErrorV2(
-    "sandbox_validation_command_unavailable",
-    `The trusted repository profile has no unambiguous ${exactPhase} command for project ${projectId}.`,
-  );
 }
 
 /**
