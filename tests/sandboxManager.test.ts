@@ -1626,10 +1626,11 @@ test("sandbox progress withholds split secrets and UTF-8 until complete redacted
   assert.equal(Object.isFrozen(seen[0]), true);
 });
 
-test("sandbox progress observer failures and late callbacks cannot alter durable execution", async () => {
+for (const asynchronous of [false, true]) test(`sandbox progress ${asynchronous ? "async" : "sync"} observer failures and late callbacks cannot alter durable execution`, async () => {
   let late: ((progress: { stream: "stdout"; bytes: Uint8Array; truncated: boolean }) => void) | undefined;
   let observed = 0;
-  const manager = new SandboxManagerV2({ providers: [dockerProvider()], onProgress: () => { observed++; throw Error("observer failed"); }, runner: {
+  const fail = () => { if (asynchronous) return Promise.reject(Error("observer failed")); throw Error("observer failed"); };
+  const manager = new SandboxManagerV2({ providers: [dockerProvider()], onProgress: () => { observed++; return fail(); }, runner: {
     async run(spec, input) {
       if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
       late = input?.onProgress;
@@ -1640,12 +1641,13 @@ test("sandbox progress observer failures and late callbacks cannot alter durable
   await manager.probeProviders();
   const prepared = await manager.prepareExecution(prepareInput());
   if (prepared.status !== "prepared") throw Error("Expected prepared action");
-  const result = await manager.executePrepared(prepared.action, { authorization: authorization(prepared.action), stagedFiles: [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }] });
+  const result = await manager.executePrepared(prepared.action, { authorization: authorization(prepared.action), stagedFiles: [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }], onProgress: fail });
   assert.equal(result.status, "verified");
   assert.equal(observed, 1);
   late?.({ stream: "stdout", bytes: Buffer.from("late\n"), truncated: false });
   assert.equal(observed, 1);
   assert.doesNotMatch(JSON.stringify(result.receipt), /early|late/u);
+  await new Promise(resolve => setImmediate(resolve));
 });
 
 test("aborted or unauthorized sandbox execution publishes no progress", async () => {
@@ -1696,7 +1698,7 @@ async function runProgressTransport(lines: string[], observe?: (bytes: Uint8Arra
   if (lines.length) spec.args.splice(spec.args.indexOf("--staging-stdin"), 0, "--progress-stderr-v1");
   return runner.run(spec, {
     stagedFiles: [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }],
-    onProgress(progress) { assert.equal(closed, false); observe?.(progress.bytes); },
+    onProgress(progress) { assert.equal(closed, false); return observe?.(progress.bytes); },
   });
 }
 
@@ -1721,11 +1723,12 @@ test("sandbox progress transport retains compatibility with the previous bundle-
   assert.equal(result.stderr, "failed\n");
 });
 
-test("sandbox progress transport isolates observer exceptions from execution results", async () => {
+for (const asynchronous of [false, true]) test(`sandbox progress transport isolates ${asynchronous ? "async" : "sync"} observer exceptions from execution results`, async () => {
   let called = false;
-  const result = await runProgressTransport([progressFrame(1, "visible\n")], () => { called = true; throw Error("observer failure"); });
+  const result = await runProgressTransport([progressFrame(1, "visible\n")], () => { called = true; if (asynchronous) return Promise.reject(Error("observer failure")); throw Error("observer failure"); });
   assert.equal(called, true);
   assert.equal(result.exitCode, 1);
+  await new Promise(resolve => setImmediate(resolve));
 });
 
 for (const [name, frames] of [

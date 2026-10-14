@@ -655,9 +655,9 @@ export class SandboxManagerV2 {
       const progress = diagnosticProgress((excerpt) => {
         if (!progressActive || input.signal?.aborted) return;
         const snapshot = Object.freeze({ ...excerpt });
-        try { input.onProgress?.(snapshot); } catch { /* An observer cannot alter execution. */ }
-        try { this.onProgress?.(Object.freeze({ ...snapshot, actionId: action.id, workspaceId: action.workspaceId,
-          repairRequestId: action.repairRequestId, commandId: action.commandId, purpose: action.purpose })); }
+        try { void Promise.resolve(input.onProgress?.(snapshot)).catch(() => undefined); } catch { /* An observer cannot alter execution. */ }
+        try { void Promise.resolve(this.onProgress?.(Object.freeze({ ...snapshot, actionId: action.id, workspaceId: action.workspaceId,
+          repairRequestId: action.repairRequestId, commandId: action.commandId, purpose: action.purpose }))).catch(() => undefined); }
         catch { /* Same for the host observer. */ }
       });
       execution = await this.runner.run(spec, { stagedFiles, signal: input.signal, onProgress: progress });

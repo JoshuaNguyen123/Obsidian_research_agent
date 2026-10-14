@@ -152,7 +152,7 @@ export class SpawnSandboxCommandRunnerV2 implements SandboxCommandRunnerV2 {
           env,
           stdin,
           input.signal,
-          progress => { commandStarted = true; input.onProgress?.(progress); },
+          progress => { commandStarted = true; return input.onProgress?.(progress); },
         );
       } finally {
         stdin?.fill(0);
@@ -583,7 +583,7 @@ class ProgressDecoder {
       this.sequence += 1;
       this.totals[stream] += data.length;
       this.stopped[stream] = frame.truncated as boolean;
-      try { this.observe?.({ stream, bytes: data, truncated: frame.truncated as boolean }); }
+      try { void Promise.resolve(this.observe?.({ stream, bytes: data, truncated: frame.truncated as boolean })).catch(() => undefined); }
       catch { /* A consumer cannot change the command's result. */ }
       finally { data.fill(0); }
     }
