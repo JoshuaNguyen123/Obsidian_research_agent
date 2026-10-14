@@ -82,6 +82,8 @@ import {
   detectSourceOnlyRepositoryProfileV2,
   migrateRepositoryProfileV1,
   parseRepositoryProfileV2,
+  repositoryStagingFileLimitV1,
+  type RepositoryStagingProfileV1,
   repositoryProfileExecutionBlockersV2,
   type RepositoryEcosystemV2,
   type RepositoryProfileV2,
@@ -145,7 +147,6 @@ const EXTENSION_ID = "agentic-researcher-code";
 const MAX_PROFILE_INVENTORY_ENTRIES = 20_000;
 const MAX_PROFILE_INVENTORY_DEPTH = 32;
 const MAX_PIN_BYTES = 64 * 1024;
-const MAX_SANDBOX_STAGING_FILES = 100;
 const MAX_SANDBOX_STAGING_FILE_BYTES = 2_000_000;
 const MAX_SANDBOX_STAGING_TOTAL_BYTES = 10_000_000;
 const MAX_SANDBOX_STAGING_DIRECTORIES = 256;
@@ -632,6 +633,7 @@ export class CodeExtensionRuntimeV2 {
       allowedPaths: existing.allowedPaths,
       generatedOutputs: existing.generatedOutputs,
       requiredGitHubChecks: existing.requiredGitHubChecks,
+      ...(existing.stagingProfile ? { stagingProfile: existing.stagingProfile } : {}),
       runtimeDigests: {
         ...Object.fromEntries(existing.pinnedRuntimes
           .filter((runtime) => runtime.digest)
@@ -643,6 +645,7 @@ export class CodeExtensionRuntimeV2 {
       const current = this.requireState();
       const prior = current.repositoryProfiles[key];
       if (!prior) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", `Repository profile ${key} disappeared during re-detection.`);
+      if (prior.profile.stagingProfile !== existing.stagingProfile) throw new WorkspaceManagerErrorV2("repository_profile_binding_conflict", "Reviewed staging profile changed during repository re-detection.");
       const record: CodeRepositoryProfileRecordV2 = {
         ...prior,
         sourceFingerprint: sha256Canonical({
@@ -716,6 +719,7 @@ export class CodeExtensionRuntimeV2 {
         allowedPaths: existing.allowedPaths,
         generatedOutputs: existing.generatedOutputs,
         requiredGitHubChecks: existing.requiredGitHubChecks,
+        ...(existing.stagingProfile ? { stagingProfile: existing.stagingProfile } : {}),
         runtimeDigests: {
           ...Object.fromEntries(existing.pinnedRuntimes
             .filter((runtime) => runtime.digest)
@@ -726,7 +730,7 @@ export class CodeExtensionRuntimeV2 {
       await this.serializedRefresh(async () => {
         const current = this.requireState();
         const prior = current.repositoryProfiles[key];
-        if (!prior || !samePath(prior.profile.repositoryRoot, root)) {
+        if (!prior || !samePath(prior.profile.repositoryRoot, root) || prior.profile.stagingProfile !== existing.stagingProfile) {
           throw new WorkspaceManagerErrorV2(
             "repository_profile_binding_conflict",
             `Repository profile ${key} changed during runtime binding refresh.`,
@@ -867,6 +871,10 @@ export class CodeExtensionRuntimeV2 {
         );
       }
       profile = repositoryProfile;
+    }
+    if (profile.stagingProfile !== sandboxAction.stagingProfile) {
+      throw new CodeSandboxContributionErrorV2("sandbox_staging_profile_changed",
+        "The reviewed repository staging profile changed after preparation. Prepare a new action.");
     }
     if (manifest.hashes.indexFingerprint !== sandboxAction.workspaceManifestFingerprint) {
       throw new CodeSandboxContributionErrorV2(
@@ -1167,6 +1175,7 @@ export class CodeExtensionRuntimeV2 {
       this.workspaceManager,
       manifest.workspaceId,
       stagingRoots,
+      profile.stagingProfile,
     );
     for (const entry of stagingManifest) {
       const tracked = manifest.hashes.files[entry.path];
@@ -3220,9 +3229,10 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
   const providerKinds = ["docker", "podman", "wsl2", "bubblewrap"] as const;
   const providers = record.providers.map((value, index) => {
     const hasProgress = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "progressProtocol");
+    const hasStaging = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "stagingProfiles");
     const provider = exactRecord(
       value,
-      ["provider", "state", "diagnostic", "probeFingerprint", "checkedAt", ...(hasProgress ? ["progressProtocol"] : [])],
+      ["provider", "state", "diagnostic", "probeFingerprint", "checkedAt", ...(hasProgress ? ["progressProtocol"] : []), ...(hasStaging ? ["stagingProfiles"] : [])],
       `sandbox provider status ${index + 1}`,
     );
     if (
@@ -3231,7 +3241,8 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
       typeof provider.diagnostic !== "string" ||
       provider.diagnostic.length < 1 ||
       provider.diagnostic.length > 2_000 ||
-      (hasProgress && (provider.progressProtocol !== 1 || provider.state !== "verified"))
+      (hasProgress && (provider.progressProtocol !== 1 || provider.state !== "verified")) ||
+      (hasStaging && (provider.state !== "verified" || !Array.isArray(provider.stagingProfiles) || provider.stagingProfiles.length !== 1 || provider.stagingProfiles[0] !== "source-1000-v1"))
     ) throw new Error("Sandbox provider status is invalid.");
     const checkedAt = provider.checkedAt === null
       ? null
@@ -3249,6 +3260,7 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
       probeFingerprint,
       checkedAt,
       ...(hasProgress ? { progressProtocol: 1 as const } : {}),
+      ...(hasStaging ? { stagingProfiles: ["source-1000-v1" as const] } : {}),
     };
   });
   if (new Set(providers.map((provider) => provider.provider)).size !== providers.length) {
@@ -3296,6 +3308,7 @@ function parsePersistedSandboxBlocker(value: unknown): NonNullable<SandboxCapabi
     "sandbox_runtime_digest_required",
     "sandbox_staging_mismatch",
     "sandbox_staging_transport_unsupported",
+    "sandbox_staging_profile_unsupported",
     "sandbox_execution_failed",
     "sandbox_artifact_readback_failed",
   ] as const;
@@ -3545,6 +3558,7 @@ async function collectSandboxStagingManifest(
   manager: WorkspaceManagerV2,
   workspaceId: string,
   roots: readonly string[],
+  stagingProfile?: RepositoryStagingProfileV1,
 ): Promise<Array<{ path: string; sha256: string; bytes: number }>> {
   const files = new Map<string, WorkspaceEntryMetadataV2>();
   const visitedDirectories = new Set<string>();
@@ -3579,10 +3593,10 @@ async function collectSandboxStagingManifest(
         `Sandbox staging file exceeds 2 MB: ${entry.path}.`,
       );
     }
-    if (files.size >= MAX_SANDBOX_STAGING_FILES) {
+    if (files.size >= repositoryStagingFileLimitV1(stagingProfile)) {
       throw new CodeSandboxContributionErrorV2(
         "sandbox_staging_too_large",
-        "Sandbox staging scope exceeds 100 files.",
+        `Sandbox staging scope exceeds ${repositoryStagingFileLimitV1(stagingProfile)} files.`,
       );
     }
     totalBytes += entry.bytes;

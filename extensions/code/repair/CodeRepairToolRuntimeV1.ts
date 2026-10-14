@@ -13,6 +13,7 @@ import { isAgentGitCommitIdentityV1 } from "../../../packages/core-api/src/agent
 import {
   classifyProtectedControlChangesV2,
   parseRepositoryProfileV2,
+  repositoryStagingFileLimitV1,
   type ProtectedControlClassificationV2,
   type RepositoryFileChangeV2,
   type RepositoryProfileV2,
@@ -212,8 +213,8 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       assertContextScope(scope, context);
       const resolved = await this.resolveScope(scope, context);
       const validation = parsed.validationReceiptId === null
-        ? await this.latestValidation(scope, "fast")
-        : await this.requiredValidation(scope, parsed.validationReceiptId, "fast");
+        ? await this.latestValidation(scope, "fast", resolved.profile)
+        : await this.requiredValidation(scope, parsed.validationReceiptId, "fast", resolved.profile);
       assertValidationBoundToWorkspace(
         validation,
         resolved.manifest,
@@ -381,10 +382,12 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     }
     let validation: CodeValidationReceiptV1;
     try {
+      const resolved = await this.resolveScope(payload.scope, context);
       validation = await this.requiredValidation(
         payload.scope,
         payload.validationReceiptId,
         "fast",
+        resolved.profile,
       );
     } catch (error) {
       await this.persistBlocker(
@@ -590,18 +593,20 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       }
       const [targeted, full] = await Promise.all([
         parsed.targetedValidationReceiptId === null
-          ? this.latestValidation(parsed.scope, "targeted")
+          ? this.latestValidation(parsed.scope, "targeted", resolved.profile)
           : this.requiredValidation(
               parsed.scope,
               parsed.targetedValidationReceiptId,
               "targeted",
+              resolved.profile,
             ),
         parsed.fullValidationReceiptId === null
-          ? this.latestValidation(parsed.scope, "full")
+          ? this.latestValidation(parsed.scope, "full", resolved.profile)
           : this.requiredValidation(
               parsed.scope,
               parsed.fullValidationReceiptId,
               "full",
+              resolved.profile,
             ),
       ]);
       assertCommitValidationPair(targeted, full);
@@ -780,11 +785,13 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
             checkpoint.targetedValidation,
             payload.targetedValidationReceiptId,
             "targeted",
+            resolved.profile.stagingProfile,
           ),
           validateValidationReceipt(
             checkpoint.fullValidation,
             payload.fullValidationReceiptId,
             "full",
+            resolved.profile.stagingProfile,
           ),
         ]);
       } else {
@@ -793,11 +800,13 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
             payload.scope,
             payload.targetedValidationReceiptId,
             "targeted",
+            resolved.profile,
           ),
           this.requiredValidation(
             payload.scope,
             payload.fullValidationReceiptId,
             "full",
+            resolved.profile,
           ),
         ]);
       }
@@ -1322,6 +1331,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     scope: CodeRepairScopeArgsV1,
     receiptId: string,
     kind: CodeValidationReceiptV1["kind"],
+    profile: RepositoryProfileV2,
   ): Promise<CodeValidationReceiptV1> {
     const receipt = await this.dependencies.validations.readValidation({
       receiptId,
@@ -1335,12 +1345,13 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
         `Validation receipt ${receiptId} is unavailable for this exact scope.`,
       );
     }
-    return validateValidationReceipt(receipt, receiptId, kind);
+    return validateValidationReceipt(receipt, receiptId, kind, profile.stagingProfile);
   }
 
   private async latestValidation(
     scope: CodeRepairScopeArgsV1,
     kind: CodeValidationReceiptV1["kind"],
+    profile: RepositoryProfileV2,
   ): Promise<CodeValidationReceiptV1> {
     const receipt = await this.dependencies.validations.readLatestValidation?.({
       ...scope,
@@ -1352,7 +1363,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
         `No durable ${kind} validation receipt is available for this exact scope.`,
       );
     }
-    return validateValidationReceipt(receipt, receipt.id, kind);
+    return validateValidationReceipt(receipt, receipt.id, kind, profile.stagingProfile);
   }
 
   private async readCommitProof(
@@ -1777,6 +1788,7 @@ async function validateValidationReceipt(
   input: CodeValidationReceiptV1,
   expectedId: string,
   expectedKind: CodeValidationReceiptV1["kind"],
+  stagingProfile?: RepositoryProfileV2["stagingProfile"],
 ): Promise<CodeValidationReceiptV1> {
   const receipt = cloneJson(input);
   if (
@@ -1833,7 +1845,7 @@ async function validateValidationReceipt(
     checks: receipt.checks,
     status: receipt.status,
     failureFingerprint: receipt.failureFingerprint,
-    binding: normalizeValidationBinding(receipt.binding),
+    binding: normalizeValidationBinding(receipt.binding, repositoryStagingFileLimitV1(stagingProfile)),
   };
   if (await sha256Fingerprint(evidence) !== receipt.fingerprint) {
     throw new CodeRepairToolRuntimeErrorV1(
@@ -1846,9 +1858,10 @@ async function validateValidationReceipt(
 
 function normalizeValidationBinding(
   input: CodeValidationReceiptV1["binding"],
+  maxStagedFiles: number,
 ): CodeValidationReceiptV1["binding"] {
   if (input === null) return null;
-  const stagedFiles = normalizeBoundArtifacts(input.stagedFiles, "staged files");
+  const stagedFiles = normalizeBoundArtifacts(input.stagedFiles, "staged files", maxStagedFiles);
   const importedArtifacts = normalizeBoundArtifacts(input.importedArtifacts, "imported artifacts");
   const workspaceChangedPaths = normalizePathSet(
     input.workspaceChangedPaths,
@@ -1879,9 +1892,10 @@ function normalizeValidationBinding(
 function normalizeBoundArtifacts(
   input: Array<{ path: string; sha256: string; bytes: number }>,
   label: string,
+  maximum = MAX_CHANGED_FILES,
 ): Array<{ path: string; sha256: string; bytes: number }> {
-  if (!Array.isArray(input) || input.length > MAX_CHANGED_FILES) {
-    throw new Error(`${label} exceed ${MAX_CHANGED_FILES} entries.`);
+  if (!Array.isArray(input) || input.length > maximum) {
+    throw new Error(`${label} exceed ${maximum} entries.`);
   }
   const values = input.map((entry) => ({
     path: assertSafeRepositoryRelativePath(entry.path),

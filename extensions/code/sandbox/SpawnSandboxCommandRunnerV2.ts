@@ -360,10 +360,13 @@ function buildStdin(
     }
     return null;
   }
-  if (!stagedFiles || stagedFiles.length < 1 || stagedFiles.length > 100) {
+  const stagingAt = spec.args.indexOf("--staging-stdin");
+  const profileAt = stagingAt - (spec.args[stagingAt - 1] === "--progress-stderr-v1" ? 2 : 1);
+  const maxFiles = spec.args[profileAt] === "--staging-profile-source-1000-v1" ? 1000 : 100;
+  if (!stagedFiles || stagedFiles.length < 1 || stagedFiles.length > maxFiles) {
     throw new SandboxSpawnRunnerV2Error(
       "unsupported_staging",
-      "verified_staging_bundle requires 1-100 hash-verifiable files.",
+      `verified_staging_bundle requires 1-${maxFiles} hash-verifiable files.`,
     );
   }
   let total = 0;
