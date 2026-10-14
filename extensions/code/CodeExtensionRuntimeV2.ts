@@ -3219,9 +3219,10 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
   ) throw new Error("Sandbox capability status is invalid.");
   const providerKinds = ["docker", "podman", "wsl2", "bubblewrap"] as const;
   const providers = record.providers.map((value, index) => {
+    const hasProgress = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "progressProtocol");
     const provider = exactRecord(
       value,
-      ["provider", "state", "diagnostic", "probeFingerprint", "checkedAt"],
+      ["provider", "state", "diagnostic", "probeFingerprint", "checkedAt", ...(hasProgress ? ["progressProtocol"] : [])],
       `sandbox provider status ${index + 1}`,
     );
     if (
@@ -3229,7 +3230,8 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
       !["unprobed", "verified", "unavailable", "rejected", "no_verdict"].includes(String(provider.state)) ||
       typeof provider.diagnostic !== "string" ||
       provider.diagnostic.length < 1 ||
-      provider.diagnostic.length > 2_000
+      provider.diagnostic.length > 2_000 ||
+      (hasProgress && (provider.progressProtocol !== 1 || provider.state !== "verified"))
     ) throw new Error("Sandbox provider status is invalid.");
     const checkedAt = provider.checkedAt === null
       ? null
@@ -3246,6 +3248,7 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
       diagnostic: provider.diagnostic,
       probeFingerprint,
       checkedAt,
+      ...(hasProgress ? { progressProtocol: 1 as const } : {}),
     };
   });
   if (new Set(providers.map((provider) => provider.provider)).size !== providers.length) {
