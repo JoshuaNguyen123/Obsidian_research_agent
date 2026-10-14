@@ -991,6 +991,7 @@ test("supplemental not-applied evidence cannot downgrade a durable uncertain dis
 
 test("failed validation exposes a redacted bounded foreground excerpt while durable observer sees hashes only", async () => {
   const durableSources: unknown[] = [];
+  const progress: Array<{ runId: string; missionId: string; operationId: string | null; toolName: string; workspaceId: string; stderr: string }> = [];
   const bareCredential = `github_pat_${"z".repeat(40)}`;
   const stderr = [
     "API_TOKEN=do-not-persist",
@@ -1000,10 +1001,11 @@ test("failed validation exposes a redacted bounded foreground excerpt while dura
   const manager = new SandboxManagerV2({
     providers: [dockerProvider()],
     runner: {
-      async run(spec) {
+      async run(spec, input) {
         if (spec.purpose === "boundary_probe") {
           return { exitCode: 0, stdout: PROBE, stderr: "" };
         }
+        input?.onProgress?.({ stream: "stderr", bytes: Buffer.from(stderr), truncated: false });
         return {
           exitCode: 1,
           stdout: "src/index.ts(4,3): TS2322 expected string but received number",
@@ -1018,6 +1020,7 @@ test("failed validation exposes a redacted bounded foreground excerpt while dura
   const contributions = createCodeExecutionContributionsV2({
     sandboxManager: manager,
     executionJournal: testExecutionJournal(),
+    observeExecutionProgress: value => progress.push(value),
     getProfile: async () => fixture.profile,
     resolveExecutionInput: async () => ({
       stagedFiles: [{ path: "src/index.ts", bytes: source }],
@@ -1077,6 +1080,11 @@ test("failed validation exposes a redacted bounded foreground excerpt while dura
   assert.doesNotMatch(JSON.stringify(output), /do-not-persist/iu);
   assert.doesNotMatch(JSON.stringify(output), new RegExp(bareCredential, "u"));
   assert.doesNotMatch(JSON.stringify(durableSources), /TS2322|AssertionError|do-not-persist/iu);
+  assert.equal(progress.length, 1);
+  assert.deepEqual([progress[0].runId, progress[0].missionId, progress[0].operationId, progress[0].toolName, progress[0].workspaceId],
+    ["mission-1", "mission-1", "operation-1", "code_validate_fast", "workspace-1"]);
+  assert.match(progress[0].stderr, /redacted credential-shaped/iu);
+  assert.doesNotMatch(JSON.stringify(progress), /do-not-persist|github_pat_/u);
 });
 
 test("SpawnSandboxCommandRunnerV2 launches only fixed provider argv with clean bounded staging protocol", async () => {
@@ -1562,6 +1570,173 @@ function context(
     ...overrides,
   };
 }
+
+test("sandbox progress protocol is selected only from the fresh verified runtime capability", async () => {
+  for (const capability of [undefined, 1, 2]) {
+    let executed = false;
+    const manager = new SandboxManagerV2({ providers: [dockerProvider()], runner: {
+      async run(spec) {
+        if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: JSON.stringify({ ...JSON.parse(PROBE), ...(capability === undefined ? {} : { progressProtocol: capability }) }), stderr: "" };
+        executed = true;
+        assert.equal(spec.args[spec.args.indexOf("--staging-stdin") - 1] === "--progress-stderr-v1", capability === 1);
+        return { exitCode: 0, stdout: "done\n", stderr: "" };
+      },
+    } });
+    const status = await manager.probeProviders();
+    if (capability === 2) { assert.equal(status.executionAvailable, false); assert.equal(executed, false); continue; }
+    assert.equal(status.executionAvailable, true);
+    const prepared = await manager.prepareExecution(prepareInput());
+    if (prepared.status !== "prepared") throw Error("Expected prepared action");
+    const result = await manager.executePrepared(prepared.action, { authorization: authorization(prepared.action), stagedFiles: [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }] });
+    assert.equal(result.status, "verified");
+    assert.equal(executed, true);
+  }
+});
+
+test("sandbox progress withholds split secrets and UTF-8 until complete redacted lines exist", async () => {
+  const seen: unknown[] = [];
+  let beforeExit = false;
+  const manager = new SandboxManagerV2({ providers: [dockerProvider()], onProgress: progress => seen.push(progress), runner: {
+    async run(spec, input) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      const send = (bytes: Uint8Array) => input?.onProgress?.({ stream: "stdout", bytes, truncated: false });
+      send(Buffer.from("ordinary prefix api_"));
+      assert.equal(seen.length, 0, "even an innocuous prefix cannot escape before its line completes");
+      send(Buffer.from("key=private-sentinel\n"));
+      assert.equal(seen.length, 1);
+      assert.doesNotMatch(JSON.stringify(seen), /private-sentinel|ordinary prefix/u);
+      const text = Buffer.from("visible café\n");
+      send(text.subarray(0, text.length - 2));
+      assert.equal(seen.length, 1, "a split UTF-8 character does not publish a partial line");
+      send(text.subarray(text.length - 2));
+      assert.match(JSON.stringify(seen), /visible café/u);
+      beforeExit = seen.length === 2;
+      return { exitCode: 1, stdout: "ordinary prefix api_key=private-sentinel\nvisible café\n", stderr: "failed check\n" };
+    },
+  } });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(prepareInput());
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") throw Error("Expected prepared action");
+  const result = await manager.executePrepared(prepared.action, { authorization: authorization(prepared.action), stagedFiles: [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }] });
+  assert.equal(beforeExit, true);
+  assert.equal(result.status, "failed", "progress never changes a failed command into success");
+  assert.doesNotMatch(JSON.stringify(result), /private-sentinel/u);
+  assert.equal((seen[0] as { workspaceId: string }).workspaceId, prepared.action.workspaceId);
+  assert.equal(Object.isFrozen(seen[0]), true);
+});
+
+test("sandbox progress observer failures and late callbacks cannot alter durable execution", async () => {
+  let late: ((progress: { stream: "stdout"; bytes: Uint8Array; truncated: boolean }) => void) | undefined;
+  let observed = 0;
+  const manager = new SandboxManagerV2({ providers: [dockerProvider()], onProgress: () => { observed++; throw Error("observer failed"); }, runner: {
+    async run(spec, input) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      late = input?.onProgress;
+      late?.({ stream: "stdout", bytes: Buffer.from("early\n"), truncated: false });
+      return { exitCode: 0, stdout: "early\n", stderr: "" };
+    },
+  } });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(prepareInput());
+  if (prepared.status !== "prepared") throw Error("Expected prepared action");
+  const result = await manager.executePrepared(prepared.action, { authorization: authorization(prepared.action), stagedFiles: [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }] });
+  assert.equal(result.status, "verified");
+  assert.equal(observed, 1);
+  late?.({ stream: "stdout", bytes: Buffer.from("late\n"), truncated: false });
+  assert.equal(observed, 1);
+  assert.doesNotMatch(JSON.stringify(result.receipt), /early|late/u);
+});
+
+test("aborted or unauthorized sandbox execution publishes no progress", async () => {
+  const controller = new AbortController();
+  let observed = 0;
+  const manager = new SandboxManagerV2({ providers: [dockerProvider()], onProgress: () => { observed++; }, runner: {
+    async run(spec, input) {
+      if (spec.purpose === "boundary_probe") return { exitCode: 0, stdout: PROBE, stderr: "" };
+      controller.abort();
+      input?.onProgress?.({ stream: "stdout", bytes: Buffer.from("after abort\n"), truncated: false });
+      throw new SandboxSpawnRunnerV2Error("provider_aborted", "Stopped");
+    },
+  } });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(prepareInput());
+  if (prepared.status !== "prepared") throw Error("Expected prepared action");
+  const stagedFiles = [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }];
+  assert.equal((await manager.executePrepared(prepared.action, { authorization: null, stagedFiles })).status, "blocked");
+  assert.equal(observed, 0);
+  assert.equal((await manager.executePrepared(prepared.action, { authorization: authorization(prepared.action), stagedFiles, signal: controller.signal })).status, "blocked");
+  assert.equal(observed, 0);
+});
+
+async function runProgressTransport(lines: string[], observe?: (bytes: Uint8Array) => void, providerExit = 0) {
+  const manager = new SandboxManagerV2({ providers: [dockerProvider()], runner: { async run() { return { exitCode: 0, stdout: PROBE, stderr: "" }; } } });
+  await manager.probeProviders();
+  const prepared = await manager.prepareExecution(prepareInput());
+  if (prepared.status !== "prepared") throw Error("Expected prepared action");
+  const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: Writable; kill: () => boolean };
+  child.stdout = new PassThrough(); child.stderr = new PassThrough();
+  child.stdin = new Writable({ write(_chunk, _encoding, done) { done(); } });
+  let killed = false;
+  let closed = false;
+  child.kill = () => { killed = true; return true; };
+  child.stdin.once("finish", () => queueMicrotask(() => {
+    for (const line of lines) {
+      if (killed) return;
+      const encoded = Buffer.from(line);
+      child.stderr.write(encoded.subarray(0, 9));
+      child.stderr.write(encoded.subarray(9));
+    }
+    if (killed) return;
+    child.stdout.end(JSON.stringify({ version: 1, exitCode: 1, stdoutBase64: Buffer.from("visible\n").toString("base64"), stderrBase64: Buffer.from("failed\n").toString("base64"), artifacts: [] }));
+    child.stderr.end(); closed = true; child.emit("close", providerExit, null);
+  }));
+  const runner = new SpawnSandboxCommandRunnerV2({ spawnAdapter: { spawn() { return child as unknown as SandboxSpawnChildV2; } } });
+  const spec = buildSandboxExecutionCommandV2(dockerProvider(), prepared.action);
+  if (lines.length) spec.args.splice(spec.args.indexOf("--staging-stdin"), 0, "--progress-stderr-v1");
+  return runner.run(spec, {
+    stagedFiles: [{ path: "src/index.ts", bytes: new TextEncoder().encode("export const value = 1;\n") }],
+    onProgress(progress) { assert.equal(closed, false); observe?.(progress.bytes); },
+  });
+}
+
+const progressFrame = (sequence: number, text: string, truncated = false) => "AGENTIC_SANDBOX_PROGRESS_V1:" + JSON.stringify({ version: 1, sequence, stream: "stdout", dataBase64: Buffer.from(text).toString("base64"), truncated }) + "\n";
+
+test("a provider failure after progress never replays an execution with uncertain completion", async () => {
+  await assert.rejects(runProgressTransport([progressFrame(1, "started\n")], undefined, 0xffffffff),
+    error => error instanceof SandboxSpawnRunnerV2Error && error.code === "provider_exit_signature" && error.launches === 1);
+});
+
+test("sandbox progress transport decodes split frames before close and preserves the final bundle", async () => {
+  const chunks: Buffer[] = [];
+  const result = await runProgressTransport([progressFrame(1, "visible\n")], bytes => chunks.push(Buffer.from(bytes)));
+  assert.equal(Buffer.concat(chunks).toString(), "visible\n");
+  assert.deepEqual(result, { exitCode: 1, stdout: "visible\n", stderr: "failed\n", artifacts: {} });
+});
+
+test("sandbox progress transport retains compatibility with the previous bundle-only runtime", async () => {
+  const result = await runProgressTransport([], () => { throw Error("Old runtime should emit no progress"); });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stdout, "visible\n");
+  assert.equal(result.stderr, "failed\n");
+});
+
+test("sandbox progress transport isolates observer exceptions from execution results", async () => {
+  let called = false;
+  const result = await runProgressTransport([progressFrame(1, "visible\n")], () => { called = true; throw Error("observer failure"); });
+  assert.equal(called, true);
+  assert.equal(result.exitCode, 1);
+});
+
+for (const [name, frames] of [
+  ["out-of-order", [progressFrame(2, "visible\n")]],
+  ["oversized", [progressFrame(1, "x".repeat(8193))]],
+  ["continued after truncation", [progressFrame(1, "visible\n", true), progressFrame(2, "more\n")]],
+  ["unterminated", [progressFrame(1, "visible\n").trimEnd()]],
+  ["invalid base64", [progressFrame(1, "visible\n").replace("dmlzaWJsZQo=", "***")]],
+] as const) test(`sandbox progress transport refuses ${name} frames`, async () => {
+  await assert.rejects(runProgressTransport([...frames]), error => error instanceof SandboxSpawnRunnerV2Error && error.code === "invalid_artifact_bundle");
+});
 
 class FakeSandboxChild extends EventEmitter {
   readonly stdout = new PassThrough();

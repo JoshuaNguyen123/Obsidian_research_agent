@@ -53,6 +53,7 @@ import {
   type SandboxArtifactImporterV2,
   type SandboxProviderConfigV2,
   type SandboxExecutionReceiptV2,
+  type SandboxToolProgressV1,
   type SandboxStagedFileBytesV2,
 } from "./sandbox";
 import {
@@ -272,6 +273,8 @@ export interface CodeExtensionRuntimeOptionsV2 {
   sandboxManager?: SandboxManagerV2;
   /** Test/host adapter for the fixed provider catalog; never runs repository commands directly. */
   sandboxRunner?: SandboxCommandRunnerV2;
+  /** Provisional redacted output for the foreground host, never persisted. */
+  onSandboxProgress?: (progress: Readonly<SandboxToolProgressV1>) => void;
   /**
    * Optional production repair tools assembled from narrow, verified adapters.
    * Omission is an explicit degraded capability, never a simulated commit path.
@@ -400,6 +403,7 @@ export class CodeExtensionRuntimeV2 {
   private readonly now: () => Date;
   private readonly injectedSandboxManager: SandboxManagerV2 | null;
   private readonly sandboxRunner: SandboxCommandRunnerV2;
+  private readonly onSandboxProgress: CodeExtensionRuntimeOptionsV2["onSandboxProgress"];
   private repairContributions: ExtensionContributionV1[];
   private validationReceiptRegistry: DurableValidationReceiptRegistryV1 | null = null;
   private sandboxExecutionJournal: DurableSandboxExecutionJournalV1 | null = null;
@@ -433,6 +437,7 @@ export class CodeExtensionRuntimeV2 {
     this.workspaceManager = options.workspaceManager ?? new WorkspaceManagerV2();
     this.injectedSandboxManager = options.sandboxManager ?? null;
     this.sandboxRunner = options.sandboxRunner ?? new SpawnSandboxCommandRunnerV2();
+    this.onSandboxProgress = options.onSandboxProgress;
     this.repairContributions = [...(options.repairContributions ?? [])];
     this.now = options.now ?? (() => new Date());
   }
@@ -498,6 +503,7 @@ export class CodeExtensionRuntimeV2 {
       // startup manager after a verified provider is configured.
       sandboxManager: () => this.requireSandboxManager(),
       executionJournal: this.requireSandboxExecutionJournal(),
+      observeExecutionProgress: this.onSandboxProgress,
       getProfile: (profileKey) => this.getRepositoryProfile(profileKey),
       resolvePreparationInput: ({ purpose, workspaceId, context }) =>
         this.resolveSandboxPreparationInput(purpose, workspaceId, context),
