@@ -70,6 +70,7 @@ const STAGE_PAID_CODE_EXECUTION = new Set<string>([
   "code_workspace_create_file",
   "code_workspace_append",
   "code_workspace_patch",
+  "code_workspace_apply_patch",
   "code_workspace_write_expected",
   "code_workspace_export_directory",
 ]);

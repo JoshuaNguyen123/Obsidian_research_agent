@@ -24,8 +24,18 @@ import {
   isPersonWorkspaceOwnerV2,
   isSha256FingerprintV2,
   workspaceRunMayWorkV2,
+  workspaceFileTreeFingerprintV2,
+  parseUnifiedPatchV1,
+  planUnifiedPatchFileV1,
+  describeUnifiedPatchFileV1,
+  UnifiedPatchErrorV1,
+  type UnifiedPatchFileKindV1,
+  type UnifiedPatchFilePlanV1,
+  type UnifiedPatchFileV1,
+  type WorkspaceFileChangeV2,
   type WorkspaceManifestV2,
   type WorkspaceMutationReceiptV2,
+  type WorkspaceReadResultV2,
 } from "./workspaces";
 import { codeLineSpansV1 } from "../../src/model/codeWorkspacePayloadV1";
 import {
@@ -66,6 +76,7 @@ export const CODE_WORKSPACE_TOOL_NAMES_V2 = [
   "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
+  "code_workspace_apply_patch",
   "code_workspace_move",
   "code_workspace_copy",
   "code_workspace_trash",
@@ -307,6 +318,9 @@ class WorkspaceToolRuntimeV2 {
           ok: true,
           action: await this.prepareScratchRepositoryPromotion(args, context),
         };
+      }
+      if (name === "code_workspace_apply_patch") {
+        return { ok: true, action: await this.prepareApplyPatch(args, context) };
       }
       const workspaceId = workspaceIdFrom(args, context);
       const leaseId = await this.ensureLease(workspaceId, context);
@@ -616,6 +630,9 @@ class WorkspaceToolRuntimeV2 {
     if (name === "code_workspace_init_repository") {
       return this.executePreparedScratchRepositoryPromotion(action, context);
     }
+    if (name === "code_workspace_apply_patch") {
+      return this.executePreparedApplyPatch(action, context);
+    }
     const args = action.normalizedArgs;
     const workspaceId = requiredString(args.workspaceId, "workspaceId");
     const leaseId = requiredString(args.leaseId, "leaseId");
@@ -747,6 +764,9 @@ class WorkspaceToolRuntimeV2 {
       if (name === "code_workspace_export_directory") {
         return this.reconcileDirectoryExport(action, context);
       }
+      if (name === "code_workspace_apply_patch") {
+        return await this.reconcileApplyPatch(action, context);
+      }
       if (name === "code_workspace_init_repository") {
         const promoted = await this.manager.loadManifest(workspaceId);
         const binding = promoted.repositoryBinding;
@@ -831,6 +851,265 @@ class WorkspaceToolRuntimeV2 {
       }
     }
     return { outcome: "still_uncertain" as const, message: `Workspace action ${action.id} could not be proven from exact durable readback; keep it pending.` };
+  }
+
+  /**
+   * A unified diff over up to 20 files as one prepared action (CODE-7). Each
+   * file is read and the patch applied to it now, so the approval shows what
+   * every file becomes; the action binds each file's hash before and after,
+   * and the patch's own. Execution reads the files again, applies the same
+   * patch, and writes every file or none.
+   */
+  private async prepareApplyPatch(
+    args: Record<string, unknown>,
+    context: ScopedExtensionContextV1,
+  ): Promise<PreparedActionV1> {
+    const workspaceId = workspaceIdFrom(args, context);
+    const leaseId = await this.ensureLease(workspaceId, context);
+    const ownerRunId = runId(context);
+    const leaseOwnerId = `extension:${ownerRunId}`;
+    const manifest = await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+    const patch = requiredString(args.patch, "patch");
+    const files = (await planWorkspacePatchV2(this.manager, workspaceId, patch)).map((planned) => planned.bound);
+    const normalizedArgs: Record<string, JsonValueV1> = {
+      workspaceId,
+      leaseId,
+      leaseOwnerId,
+      ownerRunId,
+      patch,
+      patchSha256: sha256Text(patch),
+      files: files.map((file) => ({ ...file })) as unknown as JsonValueV1,
+      payloadBytes: byteLength(patch),
+    };
+    const { requiredConfirmations, warnings } = await this.bindRepositoryPatch(
+      manifest,
+      patchRepositoryChangesV2(files),
+      normalizedArgs,
+      context,
+    );
+    const first = files[0]!;
+    const action: ResourceActionV1 = files.some((file) => file.kind === "delete")
+      ? "trash"
+      : files.some((file) => file.kind === "rename")
+        ? "move"
+        : files.every((file) => file.kind === "add")
+          ? "create"
+          : "update";
+    return preparedAction({
+      name: "code_workspace_apply_patch",
+      context,
+      workspaceId,
+      targetPath: first.path,
+      normalizedArgs,
+      expected: sha256Json(files.map((file) => [file.fromPath ?? file.path, file.expectedSha256])),
+      summary: `Apply a patch to ${files.length} ${files.length === 1 ? "file" : "files"}: ${files.map((file) => file.line).join("; ")}.`,
+      action,
+      outboundBytes: byteLength(patch),
+      previewDestination: files.length === 1 ? first.path : `${files.length} files`,
+      relatedResources: patchRelatedResourcesV2(workspaceId, files, manifest.repositoryBinding?.profileKey),
+      requiredConfirmations,
+      warnings,
+      repositoryProfileId: manifest.repositoryBinding?.profileKey,
+    });
+  }
+
+  private async executePreparedApplyPatch(
+    action: PreparedActionV1,
+    context: ScopedExtensionContextV1,
+  ): Promise<{ output?: unknown; receipt: ActionReceiptV1; mutationState: "applied" }> {
+    const args = action.normalizedArgs;
+    const workspaceId = requiredString(args.workspaceId, "workspaceId");
+    const leaseId = requiredString(args.leaseId, "leaseId");
+    const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
+    const leaseOwnerId = requiredString(args.leaseOwnerId, "leaseOwnerId");
+    if (ownerRunId !== runId(context) || action.target.workspaceId !== workspaceId) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "Prepared workspace owner or target binding changed.");
+    }
+    await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+    const patch = requiredString(args.patch, "patch");
+    assertPayloadBytes(args, byteLength(patch));
+    if (sha256Text(patch) !== args.patchSha256) {
+      throw new WorkspaceManagerErrorV2("prepared_payload_drift", "The prepared patch changed.");
+    }
+    const bound = parseBoundPatchFilesV2(args.files);
+    for (const file of bound) {
+      if (file.expectedSha256 === null) continue;
+      const sourcePath = file.fromPath ?? file.path;
+      const current = await statOrMissing(this.manager, workspaceId, sourcePath);
+      if (current?.sha256 !== file.expectedSha256) {
+        throw new WorkspaceManagerErrorV2(
+          "precondition_failed",
+          `${sourcePath} changed after the patch was approved; read it again and make a new patch.`,
+        );
+      }
+    }
+    const planned = await planWorkspacePatchV2(this.manager, workspaceId, patch);
+    const files = planned.map((entry) => entry.bound);
+    if (files.length !== bound.length) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The patch's files changed after approval.");
+    }
+    files.forEach((file, index) => {
+      const approved = bound[index]!;
+      if (file.kind !== approved.kind || file.path !== approved.path || file.fromPath !== approved.fromPath) {
+        throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The patch's files changed after approval.");
+      }
+      if (file.expectedSha256 !== approved.expectedSha256) {
+        throw new WorkspaceManagerErrorV2(
+          "precondition_failed",
+          `${approved.fromPath ?? approved.path} changed after the patch was approved; read it again and make a new patch.`,
+        );
+      }
+      if (file.expectedAfterSha256 !== approved.expectedAfterSha256) {
+        throw new WorkspaceManagerErrorV2("prepared_binding_drift", `The patch no longer makes the approved text of ${approved.path}.`);
+      }
+    });
+    const profileKey = optionalString(args.repositoryProfileKey);
+    if (profileKey) {
+      const profile = await this.repositories.resolveProfileContract?.(profileKey, context);
+      if (!profile) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", "Repository mutation lost its trusted RepositoryProfileV2.");
+      const changes = patchRepositoryChangesV2(files);
+      if (resolveRepositoryMutationScopeV2(profile, changes).fingerprint !== requiredFingerprint(args.repositoryScopeFingerprint)) {
+        throw new WorkspaceManagerErrorV2(
+          "repository_path_scope_drift",
+          "Repository project allowedPaths changed after this mutation was prepared; prepare the action again against the current trusted profile.",
+        );
+      }
+      const classification = classifyProtectedControlChangesV2(profile, changes);
+      const confirmations = classification.level === "double_exact" ? 2 : 1;
+      if (
+        classification.level === "blocked" ||
+        classification.exactDiffFingerprint !== args.protectedClassificationFingerprint ||
+        confirmations !== (action.requiredConfirmations ?? 1)
+      ) {
+        throw new WorkspaceManagerErrorV2("repository_control_drift", "Repository protected-control classification changed after approval.");
+      }
+    }
+    const receipts = await this.manager.applyFileChanges(
+      workspaceId,
+      leaseId,
+      planned.map(({ bound: file, after }): WorkspaceFileChangeV2 => {
+        if (file.kind === "add") return { kind: "create", path: file.path, content: after! };
+        if (file.kind === "delete") return { kind: "trash", path: file.path, expectedSha256: file.expectedSha256! };
+        if (file.kind === "rename") {
+          return { kind: "move", path: file.fromPath!, destinationPath: file.path, expectedSha256: file.expectedSha256!, content: after! };
+        }
+        return { kind: "write", path: file.path, expectedSha256: file.expectedSha256!, content: after! };
+      }),
+    );
+    if (args.requiresProfileRedetection === true) {
+      await this.repositories.redetectProfile?.(
+        requiredString(args.repositoryProfileKey, "repositoryProfileKey"),
+        workspaceId,
+        context,
+      );
+    }
+    return {
+      output: patchOutputV2(workspaceId, files, receipts),
+      receipt: patchActionReceiptV2(action, context, files, receipts, "committed"),
+      mutationState: "applied",
+    };
+  }
+
+  /**
+   * Whether an apply_patch whose execution was cut off landed. Every file at
+   * the text it was to have is the patch applied; every file as it was read
+   * is the patch not applied; anything between is kept pending, since the
+   * batch puts itself back and a mix means something else wrote there.
+   */
+  private async reconcileApplyPatch(action: PreparedActionV1, context: ScopedExtensionContextV1) {
+    const args = action.normalizedArgs;
+    const workspaceId = requiredString(args.workspaceId, "workspaceId");
+    const bound = parseBoundPatchFilesV2(args.files);
+    let appliedCount = 0;
+    let untouchedCount = 0;
+    for (const file of bound) {
+      const target = await statOrMissing(this.manager, workspaceId, file.path);
+      const source = file.fromPath ? await statOrMissing(this.manager, workspaceId, file.fromPath) : target;
+      let applied: boolean;
+      let untouched: boolean;
+      if (file.kind === "add") {
+        applied = target?.sha256 === file.expectedAfterSha256;
+        untouched = target === null;
+      } else if (file.kind === "delete") {
+        applied = target === null && (await this.manager.findTrashEvidence(
+          workspaceId,
+          file.path,
+          workspaceFileTreeFingerprintV2(file.path, file.expectedSha256!, file.expectedBytes!),
+        )) !== null;
+        untouched = target?.sha256 === file.expectedSha256;
+      } else if (file.kind === "rename") {
+        applied = source === null && target?.sha256 === file.expectedAfterSha256;
+        untouched = target === null && source?.sha256 === file.expectedSha256;
+      } else {
+        applied = target?.sha256 === file.expectedAfterSha256;
+        untouched = target?.sha256 === file.expectedSha256;
+      }
+      if (applied) appliedCount += 1;
+      else if (untouched) untouchedCount += 1;
+    }
+    if (appliedCount === bound.length) {
+      const manifest = await this.manager.loadManifest(workspaceId);
+      const core = {
+        version: 2 as const,
+        id: `workspace-reconcile-${sha256Json({ actionId: action.id, files: bound.map((file) => file.path) }).slice(7, 23)}`,
+        workspaceId,
+        operation: "patch" as const,
+        path: bound[0]!.path,
+        relatedPath: null,
+        beforeSha256: bound[0]!.expectedSha256,
+        afterSha256: bound[0]!.expectedAfterSha256,
+        bytesWritten: 0,
+        bytesDeleted: 0,
+        affectedCount: 0,
+        trashId: null,
+        committedAt: new Date().toISOString(),
+        manifestSha256: sha256Text(JSON.stringify(manifest)),
+      };
+      const synthetic: WorkspaceMutationReceiptV2 = { ...core, fingerprint: sha256Json(core) };
+      return {
+        outcome: "committed" as const,
+        message: `Workspace patch ${action.id} was verified file by file: every file holds the text the patch gave it.`,
+        receipt: patchActionReceiptV2(action, reconcileContext(context, action), bound, [synthetic], "reconciled"),
+      };
+    }
+    if (untouchedCount === bound.length) {
+      return { outcome: "not_applied" as const, message: `Workspace patch ${action.id} was not applied; every file is as it was read.` };
+    }
+    return {
+      outcome: "still_uncertain" as const,
+      message: `Workspace patch ${action.id} could not be proven: ${appliedCount} of ${bound.length} files hold the patched text and ${untouchedCount} are as they were read.`,
+    };
+  }
+
+  /**
+   * The repository checks every workspace write makes, for all of a patch's
+   * files at once: the project scope they fall in, and the protected
+   * controls among them, which ask for one or two exact confirmations.
+   */
+  private async bindRepositoryPatch(
+    manifest: WorkspaceManifestV2,
+    changes: RepositoryFileChangeV2[],
+    normalizedArgs: Record<string, JsonValueV1>,
+    context: ScopedExtensionContextV1,
+  ): Promise<{ requiredConfirmations: 1 | 2; warnings: string[] }> {
+    const warnings: string[] = [];
+    if (manifest.kind !== "repository" || !manifest.repositoryBinding) return { requiredConfirmations: 1, warnings };
+    const profile = await this.repositories.resolveProfileContract?.(manifest.repositoryBinding.profileKey, context);
+    if (!profile) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", "Repository mutation requires its trusted RepositoryProfileV2.");
+    const repositoryScope = resolveRepositoryMutationScopeV2(profile, changes);
+    normalizedArgs.repositoryScopeFingerprint = repositoryScope.fingerprint;
+    normalizedArgs.repositoryScopeBindings = repositoryScope.bindings;
+    const classification = classifyProtectedControlChangesV2(profile, changes);
+    if (classification.level === "blocked") {
+      throw new WorkspaceManagerErrorV2("repository_control_blocked", `Repository controls block: ${classification.blockedPaths.join(", ")}.`);
+    }
+    normalizedArgs.protectedClassificationFingerprint = classification.exactDiffFingerprint;
+    normalizedArgs.repositoryProfileKey = profile.key;
+    if (classification.level === "none") return { requiredConfirmations: 1, warnings };
+    const requiredConfirmations = classification.level === "double_exact" ? 2 : 1;
+    normalizedArgs.requiresProfileRedetection = true;
+    warnings.push(`${classification.matchedControls.length} protected repository control(s) require ${requiredConfirmations === 2 ? "double-exact" : "exact-diff"} approval and profile re-detection.`);
+    return { requiredConfirmations, warnings };
   }
 
   private async prepareDirectoryExport(
@@ -2734,6 +3013,15 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
   if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "content"]);
   if (name === "code_workspace_write_expected" || name === "write_workspace_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "content"]);
   if (name === "code_workspace_patch") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: sha256FingerprintSchema(), replacements: { type: "array", items: objectSchema({ oldText: stringSchema(), newText: stringSchema(), expectedOccurrences: { type: "integer", enum: [1] } }, ["oldText", "newText"]) } }, ["path", "replacements"]);
+  if (name === "code_workspace_apply_patch") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      patch: {
+        type: "string",
+        description: "A unified diff in git diff form over at most 20 workspace files: --- a/<path> and +++ b/<path> per file, then @@ hunks.",
+      },
+    }, ["patch"]);
+  }
   if (name === "code_workspace_move" || name === "code_workspace_copy") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), destinationPath: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "destinationPath"]);
   if (name === "code_workspace_trash") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path"]);
   if (name === "code_workspace_restore") return objectSchema({ workspaceId: stringSchema(), trashId: stringSchema() }, ["trashId"]);
@@ -2791,6 +3079,8 @@ function description(name: string): string {
     text += " Missing parent directories are created automatically, so paths such as src/game/ui/checkers.py are valid in one call.";
   } else if (name === "code_workspace_append") {
     text = `Purpose: Append content to a workspace file, creating the file when the path does not exist yet. Use when: writing a planned implementation file or adding to one you have read. Required: path + content; expectedSha256 only when appending to an existing file you have read, passed in the prefixed form the read reported (sha256:<64 lowercase hex>). Next: code_validate_fast. Side effects: bound local write. ${base}`;
+  } else if (name === "code_workspace_apply_patch") {
+    text = `Purpose: Change several workspace files at once with one unified diff: rename a function and its callers, add a module and its import, delete or rename a file with the edits that go with it. Use when: an edit spans files. Do not use when: one small change in one file (code_workspace_patch is simpler) or a new file on its own (code_workspace_create_file). Required: patch. Next: code_validate_fast. Side effects: one bound write of every file in the patch, or of none. ${base} Write the patch as git diff writes it: for each file a --- a/<path> line and a +++ b/<path> line (--- /dev/null for a new file; +++ /dev/null to move a file to the workspace trash; rename from/rename to lines, or two different paths, to rename one), then hunks headed @@ -<line>,<count> +<line>,<count> @@ of context lines (starting with a space), removed lines (-) and added lines (+). Copy context and removed lines exactly as code_workspace_read shows them, without its line numbers. A hunk applies only where its lines match the file exactly; its line numbers say where to look when the same lines appear more than once. Every file is read and checked when the patch is prepared and again when it is written, so a file that changed in between refuses the whole patch and nothing is written. At most 20 files; binary files, mode changes and copies are refused.`;
   } else if (name === "code_workspace_patch") {
     text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
   } else if (
@@ -3546,6 +3836,229 @@ function applyExactReplacements(
     next = `${next.slice(0, first)}${replacement.newText}${next.slice(first + replacement.oldText.length)}`;
   }
   return next;
+}
+
+/** One file of a prepared apply_patch, as the action binds it. */
+interface BoundPatchFileV2 {
+  kind: UnifiedPatchFileKindV1;
+  path: string;
+  fromPath: string | null;
+  /** The file's hash as it was read; null for a new file. */
+  expectedSha256: string | null;
+  expectedBytes: number | null;
+  /** The hash of the text the patch gives it; null for a delete. */
+  expectedAfterSha256: string | null;
+  added: number;
+  removed: number;
+  /** `src/a.ts: +12 −3`. */
+  line: string;
+}
+
+interface PlannedPatchFileV2 {
+  bound: BoundPatchFileV2;
+  /** The text the patch gives the file; null for a delete. */
+  after: string | null;
+}
+
+/**
+ * Read a patch and every file it names, and work out what each becomes. The
+ * same answer at prepare and at execute is what binds the approval to the
+ * write: the files are read again, so a file that changed in between fails
+ * on its hash.
+ */
+async function planWorkspacePatchV2(
+  manager: WorkspaceManagerV2,
+  workspaceId: string,
+  patch: string,
+): Promise<PlannedPatchFileV2[]> {
+  let files: UnifiedPatchFileV1[];
+  try {
+    files = parseUnifiedPatchV1(patch);
+  } catch (error) {
+    throw asWorkspaceErrorV2(error);
+  }
+  const planned: PlannedPatchFileV2[] = [];
+  for (const file of files) {
+    const sourcePath = file.kind === "rename" ? file.fromPath! : file.path;
+    let current: WorkspaceReadResultV2 | null = null;
+    if (file.kind === "add") {
+      if (await statOrMissing(manager, workspaceId, file.path)) {
+        throw new WorkspaceManagerErrorV2(
+          "path_exists",
+          `${file.path} already exists; give it as a change to the file (--- a/${file.path}), not as a new file.`,
+        );
+      }
+    } else {
+      const stat = await statOrMissing(manager, workspaceId, sourcePath);
+      if (!stat) {
+        throw new WorkspaceManagerErrorV2(
+          "path_not_found",
+          `${sourcePath} does not exist; give a new file as --- /dev/null and +++ b/${sourcePath}.`,
+        );
+      }
+      if (stat.kind !== "file") {
+        throw new WorkspaceManagerErrorV2("path_conflict", `${sourcePath} is not a regular file.`);
+      }
+      current = await manager.read(workspaceId, sourcePath);
+      if (file.kind === "rename" && await statOrMissing(manager, workspaceId, file.path)) {
+        throw new WorkspaceManagerErrorV2(
+          "path_exists",
+          `${file.path} already exists, so ${sourcePath} cannot be renamed to it.`,
+        );
+      }
+    }
+    let plan: UnifiedPatchFilePlanV1;
+    try {
+      plan = planUnifiedPatchFileV1(file, current?.content ?? null);
+    } catch (error) {
+      throw asWorkspaceErrorV2(error);
+    }
+    if (plan.after !== null) assertNotebookResultV1(file.path, plan.after);
+    planned.push({
+      bound: {
+        kind: file.kind,
+        path: file.path,
+        fromPath: file.fromPath,
+        expectedSha256: current?.sha256 ?? null,
+        expectedBytes: current?.bytes ?? null,
+        expectedAfterSha256: plan.after === null ? null : sha256Text(plan.after),
+        added: plan.added,
+        removed: plan.removed,
+        line: describeUnifiedPatchFileV1(file, plan),
+      },
+      after: plan.after,
+    });
+  }
+  return planned;
+}
+
+function asWorkspaceErrorV2(error: unknown): unknown {
+  return error instanceof UnifiedPatchErrorV1 ? new WorkspaceManagerErrorV2(error.code, error.message) : error;
+}
+
+function parseBoundPatchFilesV2(value: unknown): BoundPatchFileV2[] {
+  if (!Array.isArray(value) || value.length < 1) {
+    throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The prepared patch names no files.");
+  }
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The prepared patch's files are invalid.");
+    }
+    const file = entry as Record<string, unknown>;
+    const nullableString = (key: string) => (file[key] === null ? null : requiredString(file[key], key));
+    const kind = requiredString(file.kind, "kind");
+    if (!["modify", "add", "delete", "rename"].includes(kind)) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The prepared patch's files are invalid.");
+    }
+    return {
+      kind: kind as UnifiedPatchFileKindV1,
+      path: requiredString(file.path, "path"),
+      fromPath: nullableString("fromPath"),
+      expectedSha256: nullableString("expectedSha256"),
+      expectedBytes: file.expectedBytes === null ? null : Number(file.expectedBytes),
+      expectedAfterSha256: nullableString("expectedAfterSha256"),
+      added: Number(file.added),
+      removed: Number(file.removed),
+      line: requiredString(file.line, "line"),
+    };
+  });
+}
+
+function patchRepositoryChangesV2(files: readonly BoundPatchFileV2[]): RepositoryFileChangeV2[] {
+  return files.flatMap((file): RepositoryFileChangeV2[] => {
+    if (file.kind === "add") return [{ path: file.path, beforeSha256: null, afterSha256: file.expectedAfterSha256 }];
+    if (file.kind === "delete") return [{ path: file.path, beforeSha256: file.expectedSha256, afterSha256: null }];
+    if (file.kind === "rename") {
+      return [
+        { path: file.path, beforeSha256: null, afterSha256: file.expectedAfterSha256 },
+        { path: file.fromPath!, beforeSha256: file.expectedSha256, afterSha256: null },
+      ];
+    }
+    return [{ path: file.path, beforeSha256: file.expectedSha256, afterSha256: file.expectedAfterSha256 }];
+  });
+}
+
+function patchRelatedResourcesV2(
+  workspaceId: string,
+  files: readonly BoundPatchFileV2[],
+  repositoryProfileId: string | undefined,
+): PreparedActionV1["relatedResources"] {
+  const first = files[0]!.path;
+  const paths = [...new Set(files.flatMap((file) => [file.path, ...(file.fromPath ? [file.fromPath] : [])]))]
+    .filter((path) => path !== first);
+  return paths.map((path) => ({ ...workspaceResource(workspaceId, path, "code_workspace", "workspace", repositoryProfileId) }));
+}
+
+const PATCH_CHANGE_WORDS_V2: Record<UnifiedPatchFileKindV1, string> = {
+  modify: "modified",
+  add: "added",
+  delete: "deleted",
+  rename: "renamed",
+};
+
+function patchOutputV2(
+  workspaceId: string,
+  files: readonly BoundPatchFileV2[],
+  receipts: readonly WorkspaceMutationReceiptV2[],
+) {
+  return {
+    status: "ok",
+    operation: "apply_patch",
+    workspaceId,
+    files: files.map((file, index) => ({
+      path: file.path,
+      fromPath: file.fromPath,
+      change: PATCH_CHANGE_WORDS_V2[file.kind],
+      added: file.added,
+      removed: file.removed,
+      beforeSha256: file.expectedSha256,
+      afterSha256: file.expectedAfterSha256,
+      trashId: receipts[index]?.trashId ?? null,
+      line: file.line,
+    })),
+    receipts,
+  };
+}
+
+function patchActionReceiptV2(
+  action: PreparedActionV1,
+  context: ScopedExtensionContextV1,
+  files: readonly BoundPatchFileV2[],
+  receipts: readonly WorkspaceMutationReceiptV2[],
+  commitKind: ActionReceiptV1["commitKind"],
+): ActionReceiptV1 {
+  const committedAt = receipts.at(-1)?.committedAt ?? context.now().toISOString();
+  const fingerprint = sha256Json(receipts.map((receipt) => receipt.fingerprint));
+  return {
+    version: 1,
+    id: `workspace-patch-${fingerprint.slice(7, 23)}`,
+    runId: action.runId,
+    actionId: action.id,
+    toolName: action.toolName,
+    operation: toolDescriptor("code_workspace_apply_patch", "required").capability.action,
+    resource: action.target,
+    relatedResources: action.relatedResources,
+    message: `Workspace patch ${commitKind === "committed" ? "committed" : "reconciled"} for ${files.length} ${files.length === 1 ? "file" : "files"}: ${files.map((file) => file.line).join("; ")}.`,
+    payloadFingerprint: action.payloadFingerprint,
+    grantId: context.authorizedAction!.grantId,
+    idempotencyKey: action.idempotencyKey,
+    startedAt: action.preparedAt,
+    committedAt,
+    commitKind,
+    readback: {
+      status: "verified",
+      checkedAt: committedAt,
+      observedRevision: sha256Json(files.map((file) => [file.path, file.expectedAfterSha256])),
+      observedFingerprint: fingerprint,
+      priorRevision: action.expectedTargetRevision,
+    },
+    effects: {
+      bytesWritten: receipts.reduce((total, receipt) => total + receipt.bytesWritten, 0),
+      bytesDeleted: receipts.reduce((total, receipt) => total + receipt.bytesDeleted, 0),
+      affectedCount: commitKind === "committed" ? files.length : 0,
+      changedFields: [...new Set(files.flatMap((file) => [file.path, ...(file.fromPath ? [file.fromPath] : [])]))],
+    },
+  };
 }
 
 function mutationChanges(

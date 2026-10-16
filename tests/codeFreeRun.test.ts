@@ -532,3 +532,90 @@ test("the same pass guided still plans its per-tool ladder, never a lifecycle no
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
 });
+
+/** One patch over the code and its test: the fix and a second assertion. */
+const TWO_FILE_PATCH = [
+  "--- a/src/pager.py",
+  "+++ b/src/pager.py",
+  "@@ -1,2 +1,2 @@",
+  " def offset(page, size):",
+  "-    return page * size + 1",
+  "+    return page * size",
+  "--- a/tests/test_pager.py",
+  "+++ b/tests/test_pager.py",
+  "@@ -1 +1,2 @@",
+  " assert offset(0, 10) == 0",
+  "+assert offset(2, 10) == 20",
+  "",
+].join("\n");
+const TESTS_AFTER = "assert offset(0, 10) == 0\nassert offset(2, 10) == 20\n";
+
+test("a free pass changes the code and its test with one patch: one prepared write, one change", async () => {
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_read", { path: "src/pager.py" }),
+    call("code_workspace_apply_patch", { patch: TWO_FILE_PATCH }),
+    call("code_validate_targeted"),
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free" },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        return next ? { calls: [next] } : { content: "Fixed, with a second test." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  const openNode = run.graphs[0]!.nodes.code_free_work!;
+  assert.ok(openNode.allowedTools.includes("code_workspace_apply_patch"), "the open node offers the patch");
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.files.get("tests/test_pager.py"), TESTS_AFTER);
+  assert.deepEqual(
+    run.workspace.state.executed.filter((name) => name.startsWith("code_workspace_") && name !== "code_workspace_create" && name !== "code_workspace_read"),
+    ["code_workspace_apply_patch"],
+  );
+  // What the model read back: a line per file.
+  const after = JSON.stringify(run.model.requests.at(-1)?.messages ?? []);
+  assert.match(after, /Applied the patch to 2 files\./u);
+  assert.ok(after.includes("src/pager.py: +1 −1"), after);
+  assert.ok(after.includes("tests/test_pager.py: +1 −0"), after);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a guided pass whose steps name the patch plans one patch step, offered alone among the writes", async () => {
+  const steps = GUIDED_PASS_STEPS_V1.map((name) => (name === "code_workspace_patch" ? "code_workspace_apply_patch" : name));
+  const offeredAtPatch: string[][] = [];
+  const run = await runPass({
+    steps,
+    decide: (offered) => {
+      if (offered.includes("code_workspace_apply_patch")) {
+        offeredAtPatch.push(offered);
+        return { calls: [call("code_workspace_apply_patch", { patch: TWO_FILE_PATCH })] };
+      }
+      return guidedStep(offered);
+    },
+  });
+  const first = run.graphs[0]!;
+  const tools = Object.values(first.nodes)
+    .filter((node) => node.id !== "final")
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .map((node) => node.allowedTools[0]);
+  assert.deepEqual(tools, steps);
+  assert.ok(offeredAtPatch.length >= 1);
+  for (const offered of offeredAtPatch) {
+    for (const single of ["code_workspace_patch", "code_workspace_write_expected", "code_workspace_create_file"]) {
+      assert.equal(offered.includes(single), false, `${single} is not offered beside the planned patch`);
+    }
+  }
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.files.get("tests/test_pager.py"), TESTS_AFTER);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});

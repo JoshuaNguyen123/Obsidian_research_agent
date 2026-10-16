@@ -83,6 +83,9 @@ export const CODE_IMPLEMENTATION_TOOL_ALLOW = [
   "code_workspace_export_directory",
   "code_workspace_append",
   "code_workspace_patch",
+  // One unified diff over several files, as one prepared action (CODE-7).
+  // Offered where a plan or the open node names it, never as a companion.
+  "code_workspace_apply_patch",
   "code_workspace_write_expected",
   // Relocation and removal have been registered, hash-bound, receipted, and
   // reconcilable since the V2 workspace landed, but were in no lifecycle
