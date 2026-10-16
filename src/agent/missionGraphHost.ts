@@ -326,13 +326,20 @@ export async function buildHostMissionGraphPlanV1(
     }),
     descriptorByName,
   });
-  const compositeLifecyclePlan = buildCompositeLifecyclePlanV1({
-    missionId: input.missionId,
-    exactUserCommand: input.objective,
-    requestedAt: issuedAt,
-    steps: plannedSteps,
-    descriptorByName,
-  });
+  // A free coding pass's planned steps are its guided ladder's closing steps,
+  // all validation and commit tools. Beside words that name the checks they
+  // read as a code_validation lifecycle, which planned one lifecycle-* node
+  // and dropped the open node. A free pass is always the open node, then its
+  // closing steps as per-tool nodes (CODE-18).
+  const compositeLifecyclePlan = input.codeFreeWork
+    ? null
+    : buildCompositeLifecyclePlanV1({
+        missionId: input.missionId,
+        exactUserCommand: input.objective,
+        requestedAt: issuedAt,
+        steps: plannedSteps,
+        descriptorByName,
+      });
   const plannedSet = new Set(plannedSteps.map((step) => step.name));
   const openWorkTools = compositeLifecyclePlan === null && input.codeFreeWork
     ? sortedUnique(
