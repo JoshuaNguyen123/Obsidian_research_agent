@@ -175,13 +175,15 @@ export function scriptedCodeModel(
   decide: (input: { request: ModelChatRequest; offered: string[]; turn: number }) =>
     | { calls: Array<{ name: string; arguments: Record<string, unknown> }> }
     | { content: string },
+  /** What a structured (planner or classifier) request is answered with; "{}" by default. */
+  structured: (request: ModelChatRequest) => string = () => "{}",
 ): { client: ModelClient; turns: ScriptedTurn[]; requests: ModelChatRequest[] } {
   const turns: ScriptedTurn[] = [];
   const requests: ModelChatRequest[] = [];
   const answer = (request: ModelChatRequest): ModelChatResponse => {
     requests.push(request);
     if (request.format) {
-      return { message: { role: "assistant", content: "{}" }, toolCalls: [] };
+      return { message: { role: "assistant", content: structured(request) }, toolCalls: [] };
     }
     const offered = (request.tools ?? []).map((tool) => tool.function.name);
     if (offered.length === 0) {

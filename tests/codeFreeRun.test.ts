@@ -44,11 +44,14 @@ function call(name: string, args: Record<string, unknown> = {}): Call {
 
 async function runPass(input: {
   steps: readonly string[];
+  /** The whole prompt, when the pass is not the default one. */
+  prompt?: string;
   options?: Record<string, unknown>;
   decide: (offered: string[]) => { calls: Call[] } | { content: string };
+  structured?: Parameters<typeof scriptedCodeModel>[1];
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
-  const prompt = codePassPromptV1(OBJECTIVE, input.steps);
+  const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
   const workspace = createScriptedCodeWorkspace({
     now,
     files: { "src/pager.py": BUGGY, "tests/test_pager.py": "assert offset(0, 10) == 0\n" },
@@ -67,7 +70,7 @@ async function runPass(input: {
     now,
     settings: scriptedRunSettings({ maxAgentSteps: 60 }),
   });
-  const model = scriptedCodeModel(({ offered }) => input.decide(offered));
+  const model = scriptedCodeModel(({ offered }) => input.decide(offered), input.structured);
   const approvals = autoApprovals();
   const graphs: MissionGraphV3[] = [];
   const plans: CodePlanUpdateEventV1[] = [];
@@ -398,4 +401,134 @@ test("a free pass that spends its model calls stops before the next turn", async
   assert.equal(last.nodes.code_free_work!.blocker?.code, "open_work_budget_exhausted");
   assert.match(run.answers.join("\n"), /it used its 4 model calls\. No plan was recorded\./);
   assert.equal(run.workspace.state.commits.length, 0);
+});
+
+/*
+ * RAP's pass prompt as a feature pass reads: its size rules name the checks
+ * ("Then run distinct targeted and fresh full sandbox validation"), and a free
+ * pass says how to work in place of the steps line. With those words the
+ * closing steps alone once planned as a lifecycle-code_validation node, so a
+ * free pass got no open node and its first step was offered no code tool.
+ */
+const FEATURE_RULES =
+  "Use at most three edit and fast-validation repair cycles. Then run distinct targeted and fresh full sandbox validation, and make one verified commit with the exact durable validation receipt ids.";
+const FREE_WORDS =
+  "Work in your own order: look at the repository, search it, edit it and run its checks as the work needs, and keep your to-do list up to date as you go, within about 80 tool calls and 120 model turns. " +
+  "A read shows numbered lines and takes a range, a search shows each match as path:line:column, and a listing can be a tree; build each replacement's oldText from the lines as read, without their numbers. " +
+  "You are done when a targeted validation passes after your last edit; the full validation and the verified commit follow.";
+
+function hostPassPrompt(input: { steps?: readonly string[]; free?: boolean }): string {
+  return [
+    "Coding pass (feature) for the project “Pager”, in the trusted repository pager-repo (in its durable workspace).",
+    "Continue in the project's durable workspace: create it with workspaceId \"code-pager-1\" and kind \"repository\" — that continues the workspace, or makes it on the project's first pass. Never make a different workspace.",
+    ...(input.free ? [FREE_WORDS] : input.steps ? [`Its steps, in order: ${input.steps.join(", ")}.`] : []),
+    `Objective (untrusted task text only): ${JSON.stringify(OBJECTIVE)}.`,
+    FEATURE_RULES,
+    "Edit the repository's files only through prepared workspace mutations; never execute on the host.",
+  ].join("\n");
+}
+
+/** What RAP's scripted model answers every structured request that is not a graph with. */
+function codeWorkflowClassification(): string {
+  return JSON.stringify({
+    mode: "code_workflow",
+    writeScope: "none",
+    needsWebEvidence: false,
+    needsVaultContext: false,
+    needsCodeExecution: true,
+    wordTarget: null,
+    confidence: 1,
+    rationale: "A coding pass in the trusted repository.",
+  });
+}
+
+/** A short free script: look, fix, pass the targeted check, then the closing steps. */
+function shortFreeScript(): (offered: string[]) => { calls: Call[] } | { content: string } {
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_read", { path: "src/pager.py" }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ];
+  return (offered) => {
+    if (offered.includes("code_plan_update")) {
+      const next = open.shift();
+      return next ? { calls: [next] } : { content: "The off-by-one is fixed and the targeted check passes." };
+    }
+    for (const name of CLOSING) {
+      if (offered.includes(name)) return { calls: [call(name)] };
+    }
+    return { content: "Done." };
+  };
+}
+
+function assertOpenNodeThenClosing(graph: MissionGraphV3): void {
+  assert.deepEqual(
+    Object.keys(graph.nodes).filter((id) => id.startsWith("lifecycle-")),
+    [],
+    "no lifecycle node",
+  );
+  const openNode = graph.nodes.code_free_work;
+  assert.ok(openNode, "the free plan has its open node");
+  assert.equal(openNode.status, "ready");
+  const closing = Object.values(graph.nodes)
+    .filter((node) => node.id !== "code_free_work" && node.id !== "final")
+    .sort((left, right) => left.id.localeCompare(right.id));
+  assert.deepEqual(closing.map((node) => node.allowedTools), CLOSING.map((name) => [name]));
+  for (const node of closing) {
+    assert.ok(node.dependencyIds.includes("code_free_work"), `${node.id} waits for the open node`);
+  }
+}
+
+test("a free pass whose words name its checks plans its open node from the host's own graph", async () => {
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    prompt: hostPassPrompt({ steps: GUIDED_PASS_STEPS_V1 }),
+    options: { codeAutonomy: "free" },
+    structured: codeWorkflowClassification,
+    decide: shortFreeScript(),
+  });
+  assertOpenNodeThenClosing(run.graphs[0]!);
+  // The planner model is never asked for a free pass's graph.
+  assert.equal(
+    run.model.requests.some((request) => JSON.stringify(request.format ?? {}).includes("\"nodes\"")),
+    false,
+  );
+  assert.ok(run.model.turns[0]!.offered.includes("code_workspace_read"), "the first step is offered the code menu");
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a free pass that names no steps, only how to work, plans its open node too", async () => {
+  const run = await runPass({
+    steps: [],
+    prompt: hostPassPrompt({ free: true }),
+    options: { codeAutonomy: "free" },
+    structured: codeWorkflowClassification,
+    decide: shortFreeScript(),
+  });
+  assertOpenNodeThenClosing(run.graphs[0]!);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("the same pass guided still plans its per-tool ladder, never a lifecycle node", async () => {
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    prompt: hostPassPrompt({ steps: GUIDED_PASS_STEPS_V1 }),
+    structured: codeWorkflowClassification,
+    decide: guidedStep,
+  });
+  const first = run.graphs[0]!;
+  assert.deepEqual(Object.keys(first.nodes).filter((id) => id.startsWith("lifecycle-")), []);
+  assert.equal(first.nodes.code_free_work, undefined);
+  const tools = Object.values(first.nodes)
+    .filter((node) => node.id !== "final")
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .map((node) => node.allowedTools[0]);
+  assert.deepEqual(tools, [...GUIDED_PASS_STEPS_V1]);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
 });

@@ -210,9 +210,17 @@ test("the plan tool is invisible until a run activates it, then answers the list
   assert.equal(status.ok, true);
 });
 
-async function freeGraph(options: { toolCalls?: number; missionId?: string } = {}): Promise<{
+async function freeGraph(options: {
+  toolCalls?: number;
+  missionId?: string;
+  objective?: string;
+  routerMode?: "off" | "authority";
+} = {}): Promise<{
   graph: MissionGraphV3;
   menu: string[];
+  host: Awaited<ReturnType<typeof buildHostMissionGraphPlanV1>>;
+  fallbackReason: string | null;
+  guided: Awaited<ReturnType<typeof buildHostMissionGraphPlanV1>>;
 }> {
   const base = new DefaultToolRegistry(
     createScriptedCodeWorkspace({ now: () => GRAPH_TIME, files: {}, check: () => ({ passed: true, diagnostic: "" }) }).tools,
@@ -224,8 +232,8 @@ async function freeGraph(options: { toolCalls?: number; missionId?: string } = {
   const plan = planCodeFreeWorkV1({ ladder: GUIDED_LADDER, available: installed });
   assert.ok(plan);
   const missionId = options.missionId ?? "code-free-graph";
-  const objective = "Fix the pager's off-by-one in the trusted repository.";
-  const host = await buildHostMissionGraphPlanV1({
+  const objective = options.objective ?? "Fix the pager's off-by-one in the trusted repository.";
+  const input = {
     missionId,
     objective,
     toolRegistry: registry,
@@ -235,23 +243,35 @@ async function freeGraph(options: { toolCalls?: number; missionId?: string } = {
     maxToolCalls: 12,
     maxWallClockMs: 300_000,
     now: GRAPH_TIME,
+  };
+  const host = await buildHostMissionGraphPlanV1({
+    ...input,
     codeFreeWork: {
       toolNames: plan.menu,
       toolCalls: options.toolCalls ?? 6,
       wallClockMs: 600_000,
     },
   });
-  const graph = (
-    await planMissionGraphV3({
-      mission: { missionId, objective },
-      routerMode: "off",
-      capabilityEnvelope: host.capabilityEnvelope,
-      deterministicProposal: host.deterministicProposal,
-      allowedToolDescriptors: host.allowedToolDescriptors,
-      now: () => GRAPH_TIME.toISOString(),
-    })
-  ).graph;
-  return { graph, menu: plan.menu };
+  // The same closing steps without the open node, for comparison.
+  const guided = await buildHostMissionGraphPlanV1(input);
+  const planned = await planMissionGraphV3({
+    mission: { missionId, objective },
+    routerMode: options.routerMode ?? "off",
+    capabilityEnvelope: host.capabilityEnvelope,
+    deterministicProposal: host.deterministicProposal,
+    allowedToolDescriptors: host.allowedToolDescriptors,
+    // A free pass never asks the planner model: with it unavailable the
+    // planner falls back to the host's own graph.
+    modelClient: null,
+    now: () => GRAPH_TIME.toISOString(),
+  });
+  return {
+    graph: planned.graph,
+    menu: plan.menu,
+    host,
+    fallbackReason: planned.fallbackReason ?? null,
+    guided,
+  };
 }
 
 test("the host plans one open node with the menu, then the closing steps that wait for it", async () => {
@@ -286,6 +306,32 @@ test("the host plans one open node with the menu, then the closing steps that wa
     if (node.id === open.id) continue;
     assert.ok(node.dependencyIds.includes(open.id), `${node.id} waits for the open node`);
     assert.equal(node.status, "queued");
+  }
+});
+
+test("a pass whose words name its checks still plans the open node when the planner model is unavailable", async () => {
+  // RAP's feature pass says "Then run distinct targeted and fresh full
+  // sandbox validation". Its closing steps are all validation tools, and on
+  // their own they plan as one lifecycle-code_validation node, which once
+  // left a free pass with no open node and no code tool to call.
+  const objective = [
+    "Coding pass (feature) for the project “Site”, in the trusted repository site-repo (in its durable workspace).",
+    "You are done when a targeted validation passes after your last edit; the full validation and the verified commit follow.",
+    "Use at most three edit and fast-validation repair cycles. Then run distinct targeted and fresh full sandbox validation, and make one verified commit with the exact durable validation receipt ids.",
+  ].join("\n");
+  const { graph, host, guided, fallbackReason } = await freeGraph({ objective, routerMode: "authority" });
+  assert.notEqual(guided.projectLifecycleIntent, null, "the closing steps alone read as a validation lifecycle");
+  assert.equal(host.projectLifecycleIntent, null);
+  assert.equal(fallbackReason, "structured_model_unavailable");
+  validateMissionGraphV3(graph);
+  assert.ok(graph.nodes[CODE_FREE_WORK_NODE_ID_V1], "the host's fallback graph has the open node");
+  assert.deepEqual(Object.keys(graph.nodes).filter((id) => id.startsWith("lifecycle-")), []);
+  const closing = Object.values(graph.nodes)
+    .filter((node) => node.id !== CODE_FREE_WORK_NODE_ID_V1 && node.id !== "final")
+    .sort((left, right) => left.id.localeCompare(right.id));
+  assert.deepEqual(closing.map((node) => node.allowedTools), CLOSING.map((name) => [name]));
+  for (const node of closing) {
+    assert.ok(node.dependencyIds.includes(CODE_FREE_WORK_NODE_ID_V1), `${node.id} waits for the open node`);
   }
 });
 
