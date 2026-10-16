@@ -41,6 +41,7 @@ import {
   type ToolResultSerializationOptionsV1,
 } from "./model/toolResultPayload";
 import { normalizeCodeReadBudgetCharsV1 } from "./model/codeWorkspacePayloadV1";
+import { descriptorForPreparedActionV1 } from "./agent/preparedActionDescriptorV1";
 import { codeWorkflowLeavesCurrentNoteAloneV1 } from "./agent/codeWorkflowCurrentNoteV1";
 import {
   isModelRequestTimeoutError,
@@ -13801,6 +13802,7 @@ export async function runAgentMission({
     };
 
     const descriptor = toolRegistry.getDescriptor?.(toolCall.name) ?? null;
+    const registryDescriptor = descriptor;
     const exactHeadlessDomain = descriptor
       ? isExactBackgroundCodeValidationCommitDescriptor(descriptor)
         ? "code"
@@ -13899,6 +13901,13 @@ export async function runAgentMission({
         };
       }
       const preparedAction = preparedResult.action;
+      // CODE-7 4b: a tool whose one call can make different kinds of change is
+      // judged by the kind its prepared action names, everywhere below: scope,
+      // policy, write autonomy, standing and run grants, the approval and the
+      // grant it mints. A patch that deletes a file asks as a delete does, and
+      // one that renames asks as a move does. Every other tool keeps the
+      // registry descriptor unchanged.
+      const descriptor = descriptorForPreparedActionV1(registryDescriptor!, preparedAction);
       const hostGraphNode = executionGraphNode;
       const graphDestinationSelector = hostGraphNode?.destination?.selector ?? null;
       const exactVaultPathGraphTool =

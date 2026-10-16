@@ -11,6 +11,7 @@ import type {
   ScopedExtensionContextV1,
 } from "../packages/core-api/src";
 import {
+  codeWorkspaceToolDescriptorV2,
   createCodeWorkspaceToolContributionsV2,
   type RepositoryInspectionV2,
   type WorkspaceRepositoryProvisionerV2,
@@ -18,6 +19,11 @@ import {
 import { WorkspaceManagerErrorV2, WorkspaceManagerV2 } from "../extensions/code/workspaces";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories";
 import { serializeToolResultForModel } from "../src/model/toolResultPayload";
+import type { PreparedAction, ToolDescriptor } from "../src/agent/actions";
+import { createBoundedGrant, createOneShotGrant, type AuthorityGrantV1 } from "../src/agent/authority";
+import { descriptorAllowsWriteAutonomyPromptGrantV1, evaluateActionPolicy } from "../src/agent/policyEngine";
+import { descriptorForPreparedActionV1 } from "../src/agent/preparedActionDescriptorV1";
+import { isQueuedCodePreparedActionAllowedV1 } from "../src/agent/queuedCodePreparedActionV1";
 
 const NL = "\n";
 const lines = (...text: string[]) => text.join(NL) + NL;
@@ -347,6 +353,200 @@ test("a batch holds the workspace's change budget before it writes anything", as
   } finally {
     await fixture.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// The policy decides a patch by its prepared kind (CODE-7 4b)
+
+const MODIFY_ONLY = lines(
+  "--- a/src/app.ts",
+  "+++ b/src/app.ts",
+  "@@ -3 +3 @@",
+  "-export const value = a;",
+  "+export const value = a + 1;",
+);
+const ADD_ONLY = lines(
+  "--- /dev/null",
+  "+++ b/src/added.ts",
+  "@@ -0,0 +1 @@",
+  "+export const added = 1;",
+);
+const RENAME = lines(
+  "diff --git a/src/old-name.ts b/src/new-name.ts",
+  "rename from src/old-name.ts",
+  "rename to src/new-name.ts",
+  "--- a/src/old-name.ts",
+  "+++ b/src/new-name.ts",
+  "@@ -1 +1 @@",
+  "-export const name = \"old\";",
+  "+export const name = \"new\";",
+  "--- a/src/app.ts",
+  "+++ b/src/app.ts",
+  "@@ -3 +3 @@",
+  "-export const value = a;",
+  "+export const value = a + 1;",
+);
+const DELETE = lines(
+  "--- a/notes/old.txt",
+  "+++ /dev/null",
+  "@@ -1,2 +0,0 @@",
+  "-one",
+  "-two",
+  "--- a/src/app.ts",
+  "+++ b/src/app.ts",
+  "@@ -3 +3 @@",
+  "-export const value = a;",
+  "+export const value = a + 1;",
+);
+
+test("a patch is judged by its kind: an edit or an add passes under write autonomy, a rename asks as a move does, a delete asks as a trash does", async () => {
+  const fixture = await createFixture("policy-kinds");
+  try {
+    const { tools, context } = await scratchWithFiles(fixture, {
+      "src/app.ts": APP,
+      "src/old-name.ts": OLD_NAME,
+      "notes/old.txt": NOTES,
+    });
+    const applyPatch = tools.get("code_workspace_apply_patch")!;
+    const descriptor = applyPatch.descriptor as unknown as ToolDescriptor;
+    const kinds: Array<[string, string, string]> = [
+      ["modify", MODIFY_ONLY, "update"],
+      ["add", ADD_ONLY, "create"],
+      ["rename", RENAME, "move"],
+      ["delete", DELETE, "trash"],
+    ];
+    const decide = (action: PreparedActionV1, writeAutonomy: boolean, matchingGrant?: AuthorityGrantV1) =>
+      evaluateActionPolicy({
+        toolName: "code_workspace_apply_patch",
+        descriptor,
+        preparedAction: action as unknown as PreparedAction,
+        principal: "single_agent",
+        scopeAllowed: true,
+        isDesktop: true,
+        writeAutonomy,
+        ...(matchingGrant ? { matchingGrant } : {}),
+        now: new Date(Date.parse(action.preparedAt) + 1_000),
+      });
+    const single = (name: string) => codeWorkspaceToolDescriptorV2(name as never) as unknown as ToolDescriptor;
+    for (const [label, patch, operation] of kinds) {
+      const action = await requirePrepared(applyPatch, { patch }, context);
+      assert.equal(action.preview.after?.operation, operation, label);
+      const judged = descriptorForPreparedActionV1(descriptor, action as unknown as PreparedAction);
+      assert.equal(judged.capability.action, operation, label);
+      // Applying it again changes nothing.
+      assert.deepEqual(descriptorForPreparedActionV1(judged, action as unknown as PreparedAction), judged, label);
+
+      const withAutonomy = decide(action, true);
+      const withoutAutonomy = decide(action, false);
+      assert.equal(withoutAutonomy.action, "require_approval", `${label} asks without write autonomy`);
+      if (operation === "update" || operation === "create") {
+        assert.equal(withAutonomy.action, "allow", label);
+        assert.ok(withAutonomy.tags.includes("write_autonomy"), label);
+        assert.equal(descriptorAllowsWriteAutonomyPromptGrantV1(judged), true, label);
+      } else {
+        assert.equal(withAutonomy.action, "require_approval", `${label} asks even under write autonomy`);
+        assert.equal(descriptorAllowsWriteAutonomyPromptGrantV1(judged), false, label);
+      }
+      // The single-file tool for the same change decides the same way.
+      const singleName = {
+        update: "code_workspace_patch",
+        create: "code_workspace_create_file",
+        move: "code_workspace_move",
+        trash: "code_workspace_trash",
+      }[operation]!;
+      assert.equal(
+        descriptorAllowsWriteAutonomyPromptGrantV1(judged),
+        descriptorAllowsWriteAutonomyPromptGrantV1(single(singleName)),
+        `${label} under write autonomy is as ${singleName}`,
+      );
+      assert.equal(judged.effect, single(singleName).effect, label);
+      assert.equal(judged.risk, single(singleName).risk, label);
+      assert.equal(judged.approval.allowPersistentGrant, single(singleName).approval.allowPersistentGrant, label);
+
+      if (operation === "trash") {
+        // No prompt-derived grant can be made for it, and no run or standing grant covers it.
+        await assert.rejects(
+          createOneShotGrant({ id: "prompt-grant", action: action as unknown as PreparedAction, descriptor: judged, issuer: "user_prompt" }),
+          /does not permit prompt-issued one-shot grants/u,
+        );
+        const runGrant = await createBoundedGrant({
+          id: "run-grant",
+          kind: "run_bounded",
+          subject: { type: "run", id: action.runId },
+          rules: [{ system: "workspace", resourceTypes: ["code_workspace"], actions: ["update", "trash"], selector: { workspaceIds: [action.target.workspaceId!] } }],
+          limits: { maxActions: 10, maxExternalMutations: 0, maxCreates: 10, maxDeletes: 10, maxOutboundBytes: 1_000_000 },
+          issuedAt: new Date(action.preparedAt),
+        });
+        const covered = decide(action, true, runGrant);
+        assert.equal(covered.action, "block");
+        assert.ok(covered.tags.includes("persistent_grant_disallowed"), JSON.stringify(covered));
+      }
+      // An approval still lets every kind through: the person's yes is an exact one-shot grant.
+      const approved = await createOneShotGrant({
+        id: `approval-${label}`,
+        action: action as unknown as PreparedAction,
+        descriptor: judged,
+        issuedAt: new Date(action.preparedAt),
+      });
+      assert.equal(decide(action, false, approved).action, "allow", label);
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an unattended queue run takes no patch, whatever its kind; the single-file tools it takes are unchanged", () => {
+  const preparedAt = "2026-10-16T12:00:00.000Z";
+  const actionFor = (toolName: string, operation?: string) => ({
+    version: 1,
+    id: `prepared-${toolName}-${operation ?? "none"}`,
+    runId: "queue-run",
+    toolCallId: "call",
+    toolName,
+    target: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "queue-workspace:src/a.ts",
+      workspaceId: "queue-workspace",
+      repositoryProfileId: "queue-profile",
+      path: "src/a.ts",
+    },
+    relatedResources: [],
+    normalizedArgs: {},
+    preview: {
+      summary: "change",
+      destination: "src/a.ts",
+      warnings: [],
+      outboundBytes: 0,
+      ...(operation ? { after: { operation } } : {}),
+    },
+    payloadFingerprint: `sha256:${"a".repeat(64)}`,
+    requiredConfirmations: 1,
+    preparedAt,
+    expiresAt: "2026-10-16T12:02:00.000Z",
+  }) as unknown as PreparedAction;
+  const allowed = (toolName: string, operation?: string) =>
+    isQueuedCodePreparedActionAllowedV1({
+      action: actionFor(toolName, operation),
+      descriptor: codeWorkspaceToolDescriptorV2(toolName as never) as unknown as ToolDescriptor,
+      runId: "queue-run",
+      workspaceId: "queue-workspace",
+      profileKey: "queue-profile",
+    });
+  // The tools a queued run already took, as before.
+  assert.equal(allowed("code_workspace_patch", "update"), true);
+  assert.equal(allowed("code_workspace_move", "move"), true);
+  assert.equal(allowed("code_workspace_trash", "trash"), false, "a delete is never unattended");
+  // A patch of any kind is refused, never put to a person.
+  for (const operation of ["update", "create", "move", "trash", undefined]) {
+    assert.equal(allowed("code_workspace_apply_patch", operation), false, String(operation));
+  }
+  // A patch that deletes is destructive to the queue's own check.
+  const judged = descriptorForPreparedActionV1(
+    codeWorkspaceToolDescriptorV2("code_workspace_apply_patch") as unknown as ToolDescriptor,
+    actionFor("code_workspace_apply_patch", "trash"),
+  );
+  assert.equal(judged.effect, "destructive_mutation");
 });
 
 async function scratchWithFiles(

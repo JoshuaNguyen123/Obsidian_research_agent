@@ -17,6 +17,7 @@ import type {
 } from "./actions";
 import type { AuthorityGrantV1 } from "./authority";
 import { descriptorAllowsPromptIssuedGrantV1 } from "./authority/grants";
+import { descriptorForPreparedActionV1 } from "./preparedActionDescriptorV1";
 import {
   hasCodeDeliverableIntent,
   hasExplicitCodeExecutionProhibition,
@@ -214,7 +215,10 @@ export function evaluateToolPolicy(ctx: ToolPolicyContext): PolicyDecision {
  * missing security input is a block and there is no default allow fallback.
  */
 export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
-  const descriptor = ctx.descriptor;
+  // A tool whose call can make different kinds of change is judged by the
+  // kind its prepared action names (CODE-7 4b): a patch that deletes a file
+  // asks as a delete does, one that renames asks as a move does.
+  const descriptor = descriptorForPreparedActionV1(ctx.descriptor, ctx.preparedAction);
   if (!descriptor) {
     return block("Tool action descriptor is required.", [
       "descriptor_required",

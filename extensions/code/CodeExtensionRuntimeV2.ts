@@ -3524,6 +3524,12 @@ async function inventoryRepository(repositoryRoot: string): Promise<RepositoryIn
       }
       const relative = relativeFolder ? `${relativeFolder}/${entry.name}` : entry.name;
       const absolute = path.join(folder, entry.name);
+      // A checkout's `.git` directory is skipped below; a worktree's `.git` is
+      // a file naming the repository's Git directory. Either way it is Git's,
+      // never repository content, and no workspace path can name it, so the
+      // re-detection after a protected-control change in a worktree-backed
+      // workspace used to fail on it after the change had landed.
+      if (entry.name.toLowerCase() === ".git") continue;
       const stat = await fs.lstat(absolute);
       if (stat.isSymbolicLink()) continue;
       if (stat.isDirectory()) {
