@@ -70,6 +70,16 @@ export interface ScriptedCodeWorkspaceOptions {
     argv: readonly string[],
     files: ReadonlyMap<string, string>,
   ) => { exitCode: number; stdout: string; stderr: string };
+  /**
+   * Protected repository controls by path (a file, or a folder covering what
+   * is under it) and the confirmations a change to one asks for, as the real
+   * tool's classification sets them: 1 for an exact-diff control (a manifest,
+   * a lockfile), 2 for a double-exact one (a workflow, a hook). A prepared
+   * write that touches one carries that `requiredConfirmations`, the
+   * `requiresProfileRedetection` mark and a warning; any other carries one
+   * confirmation, as every real code workspace write does.
+   */
+  protectedControls?: Record<string, 1 | 2>;
 }
 
 const sha = (value: string): string =>
@@ -168,6 +178,16 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
     path,
   });
   const nowIso = () => options.now().toISOString();
+  /** The confirmations the protected controls a change touches ask for, if any. */
+  const protectionOf = (paths: readonly string[]): 1 | 2 | undefined => {
+    let level: 0 | 1 | 2 = 0;
+    for (const [control, confirmations] of Object.entries(options.protectedControls ?? {})) {
+      if (paths.some((path) => path === control || path.startsWith(`${control}/`))) {
+        level = Math.max(level, confirmations) as 1 | 2;
+      }
+    }
+    return level === 0 ? undefined : level;
+  };
 
   const prepare = async (
     name: string,
@@ -176,8 +196,11 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
     target: ResourceRef,
     summary: string,
     after?: Record<string, string>,
+    protection?: 1 | 2,
   ): Promise<{ ok: true; action: PreparedAction }> => {
     const id = nextId(`action-${name}`);
+    const normalizedArgs = JSON.parse(JSON.stringify(args));
+    if (protection) normalizedArgs.requiresProfileRedetection = true;
     return {
       ok: true,
       action: await withPreparedActionFingerprint({
@@ -188,8 +211,17 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
         toolName: name,
         target,
         relatedResources: [],
-        normalizedArgs: JSON.parse(JSON.stringify(args)),
-        preview: { summary, destination: target.id, warnings: [], outboundBytes: 0, ...(after ? { after } : {}) },
+        normalizedArgs,
+        preview: {
+          summary,
+          destination: target.id,
+          warnings: protection
+            ? [`Protected repository control(s) require ${protection === 2 ? "double-exact" : "exact-diff"} approval and profile re-detection.`]
+            : [],
+          outboundBytes: 0,
+          ...(after ? { after } : {}),
+        },
+        ...(options.protectedControls ? { requiredConfirmations: protection ?? 1 } : {}),
         idempotencyKey: id,
         preparedAt: nowIso(),
         expiresAt: new Date(options.now().getTime() + 10 * 60_000).toISOString(),
@@ -245,6 +277,8 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
     pathOf: (args: Record<string, unknown>) => string;
     /** What the prepared action names as its kind of change, as the real tool does. */
     after?: (args: Record<string, unknown>) => Record<string, string>;
+    /** Every path the change touches, when it is more than `pathOf`'s one. */
+    pathsOf?: (args: Record<string, unknown>) => string[];
   }): AgentTool => ({
     name: input.name,
     description: `Scripted ${input.name}.`,
@@ -261,7 +295,15 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
       return { status: "blocked", code: "prepared_action_required" };
     },
     prepare: async (args, context) =>
-      prepare(input.name, args, context, resource(workspaceOf(args), input.pathOf(args)), `${input.operation} ${input.pathOf(args)}`, input.after?.(args)),
+      prepare(
+        input.name,
+        args,
+        context,
+        resource(workspaceOf(args), input.pathOf(args)),
+        `${input.operation} ${input.pathOf(args)}`,
+        input.after?.(args),
+        protectionOf(input.pathsOf?.(args) ?? [input.pathOf(args)]),
+      ),
     async executePrepared(action, context) {
       const args = action.normalizedArgs as Record<string, unknown>;
       const before = state.files.get(input.pathOf(args));
@@ -486,6 +528,8 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
       action: "update",
       operation: "apply_patch",
       pathOf: (args) => parseUnifiedPatchV1(args.patch)[0]!.path,
+      pathsOf: (args) =>
+        parseUnifiedPatchV1(args.patch).flatMap((file) => (file.fromPath ? [file.fromPath, file.path] : [file.path])),
       // The real tool's rule: a delete makes the patch a trash, else a rename a move,
       // else adding only a create, else an update.
       after: (args) => {

@@ -54,14 +54,19 @@ async function runPass(input: {
   /** What a code_sandbox_run program prints. */
   command?: Parameters<typeof createScriptedCodeWorkspace>[0]["command"];
   diagnosticExcerpts?: boolean;
+  /** More files in the checkout, beside the pager and its test. */
+  files?: Record<string, string>;
+  /** The repository's protected controls and the confirmations each asks for. */
+  protectedControls?: Record<string, 1 | 2>;
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
   const workspace = createScriptedCodeWorkspace({
     now,
-    files: { "src/pager.py": BUGGY, "tests/test_pager.py": "assert offset(0, 10) == 0\n" },
+    files: { "src/pager.py": BUGGY, "tests/test_pager.py": "assert offset(0, 10) == 0\n", ...input.files },
     ...(input.command ? { command: input.command } : {}),
     ...(input.diagnosticExcerpts ? { diagnosticExcerpts: true } : {}),
+    ...(input.protectedControls ? { protectedControls: input.protectedControls } : {}),
     check: (files) => {
       const passed = files.get("src/pager.py") === FIXED;
       return {
@@ -732,6 +737,117 @@ test("a denied patch that deletes a file changes nothing", async () => {
   assert.ok(run.approvals.requests.some((request) => request.toolName === "code_workspace_apply_patch"));
   assert.equal(run.workspace.state.files.get("src/pager.py"), BUGGY);
   assert.equal(run.workspace.state.files.has("tests/test_pager.py"), true);
+});
+
+// Write autonomy never covers a protected repository control: a change to a
+// manifest, a lockfile, a build script, a workflow or a hook asks for its exact
+// approval with the confirmations it names, as it would without autonomy.
+const PACKAGE = "{\"name\":\"pager\"}\n";
+const PACKAGE_AFTER = "{\"name\":\"pager\",\"version\":\"1.0.1\"}\n";
+const WORKFLOW = "name: ci\n";
+const WORKFLOW_AFTER = "name: ci\non: push\n";
+const PROTECTED = { "package.json": 1, ".github/workflows": 2 } as const;
+const PROTECTED_FILES = { "package.json": PACKAGE, ".github/workflows/ci.yml": WORKFLOW };
+
+async function freeCallsPass(calls: Call[]) {
+  const open = [...calls];
+  return runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free" },
+    files: PROTECTED_FILES,
+    protectedControls: PROTECTED,
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        return next ? { calls: [next] } : { content: "Fixed." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+}
+
+/** The confirmations each prepared write asked for, by the path it named. */
+function asksByPath(run: Awaited<ReturnType<typeof runPass>>, toolName: string): Record<string, number[]> {
+  const asks: Record<string, number[]> = {};
+  for (const request of run.approvals.requests) {
+    if (request.toolName !== toolName) continue;
+    const path = String(request.preparedAction?.target.path ?? "");
+    (asks[path] ??= []).push(request.confirmationIndex ?? 1);
+  }
+  return asks;
+}
+
+test("under write autonomy a single write to a protected control asks, twice for a double-exact one, and an ordinary edit still goes ahead", async () => {
+  const run = await freeCallsPass([
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    // The same single-file write to two protected controls and to the code.
+    call("code_workspace_patch", { path: "package.json", replacements: [{ oldText: "\"pager\"}", newText: "\"pager\",\"version\":\"1.0.1\"}" }] }),
+    call("code_workspace_patch", { path: ".github/workflows/ci.yml", replacements: [{ oldText: "name: ci\n", newText: "name: ci\non: push\n" }] }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ]);
+  assert.deepEqual(
+    asksByPath(run, "code_workspace_patch"),
+    { "package.json": [1], ".github/workflows/ci.yml": [1, 2] },
+    "an exact-diff control asks once and a double-exact one twice, as without autonomy, and the ordinary edit, which also names one confirmation, does not ask",
+  );
+  for (const request of run.approvals.requests.filter((entry) => entry.toolName === "code_workspace_patch")) {
+    assert.ok(!request.policyTags.includes("write_autonomy"), JSON.stringify(request.policyTags));
+    assert.ok(request.policyTags.includes("exact_payload_approval"), JSON.stringify(request.policyTags));
+  }
+  assert.equal(run.workspace.state.files.get("package.json"), PACKAGE_AFTER);
+  assert.equal(run.workspace.state.files.get(".github/workflows/ci.yml"), WORKFLOW_AFTER);
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+});
+
+const PROTECTED_PATCH = [
+  "--- a/package.json",
+  "+++ b/package.json",
+  "@@ -1 +1 @@",
+  "-{\"name\":\"pager\"}",
+  "+{\"name\":\"pager\",\"version\":\"1.0.1\"}",
+  "--- a/src/pager.py",
+  "+++ b/src/pager.py",
+  "@@ -1,2 +1,2 @@",
+  " def offset(page, size):",
+  "-    return page * size + 1",
+  "+    return page * size",
+  "--- /dev/null",
+  "+++ b/src/new.py",
+  "@@ -0,0 +1 @@",
+  "+NEW = True",
+  "",
+].join("\n");
+
+test("under write autonomy a patch that touches a protected control asks for its exact approval, and one that does not goes ahead", async () => {
+  const patchCalls = (patch: string): Call[] => [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_read", { path: "src/pager.py" }),
+    call("code_workspace_apply_patch", { patch }),
+    call("code_validate_targeted"),
+  ];
+  const touched = await freeCallsPass(patchCalls(PROTECTED_PATCH));
+  const asks = touched.approvals.requests.filter((request) => request.toolName === "code_workspace_apply_patch");
+  assert.equal(asks.length, 1, "the patch over package.json asks, as a single write to it does");
+  assert.equal(asks[0]!.requiredConfirmations, 1);
+  assert.equal(asks[0]!.preparedAction?.normalizedArgs.requiresProfileRedetection, true);
+  assert.equal(touched.workspace.state.files.get("package.json"), PACKAGE_AFTER);
+  assert.equal(touched.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(touched.workspace.state.files.get("src/new.py"), "NEW = True\n");
+
+  const ordinary = await freeCallsPass(patchCalls(TWO_FILE_PATCH));
+  assert.equal(
+    ordinary.approvals.requests.some((request) => request.toolName === "code_workspace_apply_patch"),
+    false,
+    "a patch that touches no control goes ahead under write autonomy",
+  );
+  assert.equal(ordinary.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(ordinary.workspace.state.files.get("package.json"), PACKAGE);
 });
 
 // CODE-17: one program and its arguments in the sandbox.
