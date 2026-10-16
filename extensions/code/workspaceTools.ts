@@ -562,6 +562,9 @@ class WorkspaceToolRuntimeV2 {
           normalizedArgs.expectedTargetState = "existing";
           normalizedArgs.expectedKind = stat.kind;
           normalizedArgs.expectedSha256 = expected;
+          // The trash record of a single file is fingerprinted over the file's
+          // path, hash and size, so reconcile needs the size to find it.
+          normalizedArgs.expectedBytes = stat.bytes;
           normalizedArgs.expectedAfterSha256 = null;
           normalizedArgs.payloadBytes = 0;
           summary = `Move ${targetPath} to durable workspace trash.`;
@@ -823,7 +826,7 @@ class WorkspaceToolRuntimeV2 {
       let committed = false;
       if (name === "code_workspace_trash") {
         const source = await statOrMissing(this.manager, workspaceId, targetPath);
-        const trash = await this.manager.findTrashEvidence(workspaceId, targetPath, requiredFingerprint(args.expectedSha256));
+        const trash = await this.manager.findTrashEvidence(workspaceId, targetPath, trashRecordFingerprint(targetPath, args));
         committed = source === null && trash !== null;
       } else if (name === "code_workspace_mkdir") {
         committed = target?.kind === "directory";
@@ -2787,6 +2790,21 @@ async function statOrMissing(
 function isMissingWorkspacePath(error: unknown): boolean {
   return error instanceof WorkspaceManagerErrorV2 &&
     (error.code === "path_not_found" || error.code === "parent_missing");
+}
+
+/**
+ * The fingerprint the trash record of a prepared `code_workspace_trash`
+ * carries, as `WorkspaceManagerV2.trash` writes it. A folder's prepared hash
+ * is already its tree fingerprint. A single file's prepared hash is the
+ * file's own, while its record holds the tree fingerprint over its path,
+ * hash and size, which is what `findTrashEvidence` compares, as the patch's
+ * reconcile does. An action prepared before the size was bound keeps the
+ * comparison it had, so it is left uncertain rather than guessed at.
+ */
+function trashRecordFingerprint(targetPath: string, args: Record<string, unknown>): string {
+  const expected = requiredFingerprint(args.expectedSha256);
+  if (args.expectedKind !== "file" || typeof args.expectedBytes !== "number") return expected;
+  return workspaceFileTreeFingerprintV2(targetPath, expected, args.expectedBytes);
 }
 
 async function assertPreparedTargetState(
