@@ -41,6 +41,7 @@ import {
   type ToolResultSerializationOptionsV1,
 } from "./model/toolResultPayload";
 import { normalizeCodeReadBudgetCharsV1 } from "./model/codeWorkspacePayloadV1";
+import { codeWorkflowLeavesCurrentNoteAloneV1 } from "./agent/codeWorkflowCurrentNoteV1";
 import {
   isModelRequestTimeoutError,
   isTransientModelError,
@@ -2785,6 +2786,15 @@ export async function runAgentMission({
     hasActiveRoutedCodeExecution()
       ? getRoutedCodeWorkflowToolNames(activeIntentPrompt)
       : [];
+  // A code workflow works in a code workspace. Unless its prompt names the
+  // open note itself, it neither reads that note first nor writes into it,
+  // whatever words of the person's brief look like a note edit.
+  const codeWorkflowLeavesCurrentNoteAlone = () =>
+    codeWorkflowLeavesCurrentNoteAloneV1(
+      activeIntentPrompt,
+      getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0 ||
+        hasActiveRoutedCodeExecution(),
+    );
   // ---- Durable run anchor writer, shared by the two seams below: the
   // symmetric half of the run-identity publication above. The anchor is the
   // SAME Agent Runs record the full mission ledger evolves in place from
@@ -3836,6 +3846,9 @@ export async function runAgentMission({
   if (isBufferedNewNoteOutput(noteOutputPlan, streamingWritebackKind)) {
     directCurrentNoteWritebackKind = null;
   }
+  if (codeWorkflowLeavesCurrentNoteAlone()) {
+    directCurrentNoteWritebackKind = null;
+  }
   if (
     shouldOmitCurrentNoteReadForTargetOnlyWrite(activeIntentPrompt, missionIntent) &&
     !hasParallelVaultReadIntent(activeIntentPrompt)
@@ -3887,6 +3900,7 @@ export async function runAgentMission({
     activeIntentPrompt,
     allowedToolNames,
     missionIntent,
+    codeWorkflowLeavesCurrentNoteAlone(),
   );
   /**
    * Every markdown path a vault search surfaced this run, in the order it was
@@ -4154,6 +4168,7 @@ export async function runAgentMission({
   let runtimeSnapshot: MissionRuntimeSnapshotV2 | null = null;
   let runPlan = createRunPlan({
     prompt: activeIntentPrompt,
+    codeWorkflowWithoutNote: codeWorkflowLeavesCurrentNoteAlone(),
     missionIntent,
     tools,
     settings: runToolContext.settings,
@@ -4895,6 +4910,9 @@ export async function runAgentMission({
     if (isBufferedNewNoteOutput(noteOutputPlan, streamingWritebackKind)) {
       directCurrentNoteWritebackKind = null;
     }
+    if (codeWorkflowLeavesCurrentNoteAlone()) {
+      directCurrentNoteWritebackKind = null;
+    }
     if (
       shouldOmitCurrentNoteReadForTargetOnlyWrite(
         activeIntentPrompt,
@@ -4931,9 +4949,11 @@ export async function runAgentMission({
       activeIntentPrompt,
       allowedToolNames,
       missionIntent,
+      codeWorkflowLeavesCurrentNoteAlone(),
     );
     runPlan = createRunPlan({
       prompt: activeIntentPrompt,
+      codeWorkflowWithoutNote: codeWorkflowLeavesCurrentNoteAlone(),
       missionIntent,
       tools,
       settings: runToolContext.settings,
@@ -6748,6 +6768,7 @@ export async function runAgentMission({
     );
     runPlan = createRunPlan({
       prompt: activeIntentPrompt,
+      codeWorkflowWithoutNote: codeWorkflowLeavesCurrentNoteAlone(),
       missionIntent,
       tools,
       settings: runToolContext.settings,
@@ -33259,8 +33280,14 @@ function shouldObserveCurrentNote(
   prompt: string,
   allowedToolNames: Set<string>,
   missionIntent: MissionIntent,
+  codeWorkflowLeavesCurrentNoteAlone: boolean,
 ): boolean {
   void missionIntent;
+  // A coding pass has no note open: prefetching one failed the whole run
+  // ("An active markdown file is required") before any code was written.
+  if (codeWorkflowLeavesCurrentNoteAlone) {
+    return false;
+  }
   // Keep read_current_file model-callable for explicit parallel inspection so
   // it can batch with other read-only tools instead of being prefetched away.
   if (hasParallelVaultReadIntent(prompt)) {
