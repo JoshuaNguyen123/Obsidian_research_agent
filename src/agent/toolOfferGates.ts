@@ -212,6 +212,7 @@ const CODE_TOOL_NAMES = new Set([
   "code_commit_verified",
   "code_validate_commit_prepared",
   "run_code_block",
+  "code_sandbox_run",
   "render_html_preview",
   "write_workspace_file",
   "read_workspace_file",

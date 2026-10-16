@@ -42,6 +42,7 @@ import {
 } from "./model/toolResultPayload";
 import { normalizeCodeReadBudgetCharsV1 } from "./model/codeWorkspacePayloadV1";
 import { descriptorForPreparedActionV1 } from "./agent/preparedActionDescriptorV1";
+import { normalizeCodeCommandOutputBudgetCharsV1 } from "./model/codeSandboxRunPayloadV1";
 import { codeWorkflowLeavesCurrentNoteAloneV1 } from "./agent/codeWorkflowCurrentNoteV1";
 import {
   isModelRequestTimeoutError,
@@ -1838,6 +1839,13 @@ interface RunAgentMissionOptions {
    */
   codeReadBudgetChars?: number;
   /**
+   * How many characters of each output stream one `code_sandbox_run` answer
+   * may show the model (CODE-17). Default 2,400, as a validation excerpt;
+   * the free coding profile may ask for up to 12,000. Clamped to
+   * 800-12,000. A longer stream keeps its start and its end.
+   */
+  codeCommandOutputBudgetChars?: number;
+  /**
    * How a coding pass works (CODE-18). `guided`, the default, plans the
    * fixed ladder exactly as before. `free` plans one open node,
    * `code_free_work`, whose code tools the model calls in any order until it
@@ -2209,6 +2217,7 @@ export async function runAgentMission({
   runSteering,
   getLatencyScale,
   codeReadBudgetChars,
+  codeCommandOutputBudgetChars,
   codeAutonomy,
   codeFreeBudget,
 }: RunAgentMissionOptions): Promise<void> {
@@ -2226,6 +2235,9 @@ export async function runAgentMission({
   // the run's options decide only how much of a code read it may show.
   const toolResultSerialization: ToolResultSerializationOptionsV1 = {
     codeReadBudgetChars: normalizeCodeReadBudgetCharsV1(codeReadBudgetChars),
+    codeCommandOutputBudgetChars: normalizeCodeCommandOutputBudgetCharsV1(
+      codeCommandOutputBudgetChars,
+    ),
   };
   const configuredMaxRunMs =
     typeof toolContext.settings?.maxRunMinutes === "number" &&
@@ -31241,6 +31253,7 @@ const CODE_TOOL_NAMES = new Set([
   "code_commit_verified",
   "code_validate_commit_prepared",
   "run_code_block",
+  "code_sandbox_run",
   "render_html_preview",
   "write_workspace_file",
   "read_workspace_file",
@@ -31369,6 +31382,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   browser_screenshot: "web",
   browser_extract_markdown: "web",
   run_code_block: "code",
+  code_sandbox_run: "code",
   render_html_preview: "code",
   write_workspace_file: "code",
   read_workspace_file: "code",
@@ -35743,6 +35757,7 @@ function getMilestoneStageForTool(
   if (
     toolName === "render_html_preview" ||
     toolName === "run_code_block" ||
+    toolName === "code_sandbox_run" ||
     toolName === "code_validate_fast" ||
     toolName === "code_validate_targeted" ||
     toolName === "code_validate_full"
@@ -35936,6 +35951,10 @@ function getToolPreparationStatus(toolName: string): string | null {
 
   if (toolName === "run_code_block") {
     return "Running code in the verified sandbox...";
+  }
+
+  if (toolName === "code_sandbox_run") {
+    return "Running a command in the verified sandbox...";
   }
 
   if (toolName === "code_workspace_create") {
@@ -36134,6 +36153,14 @@ function emitToolSuccessStatus(
       : exitCode === undefined
         ? `Code artifact prepared for ${String(output.language ?? "snippet")}.`
         : `Code finished with exit code ${exitCode}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "code_sandbox_run" && isRecord(output) && typeof output.command === "string") {
+    const message = output.timedOut === true
+      ? `${output.command} reached its time limit and was stopped.`
+      : `${output.command} exited ${String(output.exitCode ?? "without a code")}.`;
     events.onStatus?.(message);
     return message;
   }
