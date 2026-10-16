@@ -1170,7 +1170,13 @@ export class CodeExtensionRuntimeV2 {
       projectId = projects[0].id;
       stagingRoots = [
         ...projects[0].allowedPaths,
-        ...profile.protectedControls.map((control) => control.path),
+        // Git's own controls (`.git/hooks`, `.git/config`) stay protected for
+        // writes, but they are never workspace content: no workspace path can
+        // name `.git`, and a worktree's `.git` is a file. Staging leaves them
+        // out rather than refusing the whole validation over them.
+        ...profile.protectedControls
+          .map((control) => control.path)
+          .filter((controlPath) => !isGitInternalControlPathV1(controlPath)),
       ];
     }
     const project = profile.projects.find((candidate) => candidate.id === projectId)!;
@@ -3894,6 +3900,11 @@ async function canonicalSafeDirectory(value: string): Promise<string> {
 
 function pathAtOrBelow(root: string, candidate: string): boolean {
   return root === "." || candidate === root || candidate.startsWith(`${root}/`);
+}
+
+/** A protected control inside Git's own folder, which a workspace never holds. */
+function isGitInternalControlPathV1(controlPath: string): boolean {
+  return controlPath.split("/").some((part) => part.toLowerCase() === ".git");
 }
 
 async function collectSandboxStagingManifest(

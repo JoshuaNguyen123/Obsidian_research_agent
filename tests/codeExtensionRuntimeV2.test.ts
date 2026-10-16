@@ -42,6 +42,7 @@ import {
   CODE_REPAIR_RECORD_CYCLE_TOOL,
   CODE_REPAIR_STATUS_TOOL,
 } from "../extensions/code/repair";
+import { classifyProtectedControlChanges } from "../extensions/code/repair/protectedControls";
 import { WorkspaceManagerV2 } from "../extensions/code/workspaces";
 import { buildJupyterNotebookV1 } from "../extensions/code/JupyterNotebookV1";
 import { scratchPythonContractCheckArgsV1 } from "../extensions/code/ScratchPythonValidationV1";
@@ -2687,6 +2688,62 @@ test("a patch over a protected control in a worktree-backed repository workspace
     if (!again.ok) return;
     await fixture.tools.get("code_workspace_write_expected").executePrepared(again.action, approved(again.action));
     assert.match(await readFile(path.join(fixture.worktree, "package.json"), "utf8"), /1\.0\.2/u);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a detected profile's Git controls stay protected, and sandbox staging leaves them out, so a repository workspace validates as detected", async () => {
+  // The profile as detected, with `.git/hooks` and `.git/config`: no host
+  // filter takes them out first.
+  const fixture = await worktreePatchFixture("git-controls-staging", { keepGitControls: true });
+  try {
+    const protectedPaths = fixture.profile.protectedControls.map((control) => control.path);
+    assert.ok(protectedPaths.includes(".git/hooks"), JSON.stringify(protectedPaths));
+    assert.ok(protectedPaths.includes(".git/config"), JSON.stringify(protectedPaths));
+    const lease = await fixture.manager.acquireLease("patch-workspace", "fixture-writer");
+    const before = await fixture.manager.read("patch-workspace", "src/a.js");
+    await fixture.manager.writeExpected("patch-workspace", lease.lease!.id, "src/a.js", "export const a = 2;\n", before.sha256);
+    await fixture.manager.releaseLease("patch-workspace", lease.lease!.id);
+
+    const input = await fixture.runtime.resolveSandboxPreparationInput("validation_targeted", "patch-workspace");
+    const staged = input.stagingManifest.map((entry) => entry.path);
+    assert.ok(staged.includes("src/a.js"), JSON.stringify(staged));
+    assert.ok(staged.includes("package.json"), JSON.stringify(staged));
+    assert.equal(
+      staged.some((entry) => entry.split("/").some((part) => part.toLowerCase() === ".git")),
+      false,
+      JSON.stringify(staged),
+    );
+
+    // Validation runs in the sandbox over the profile as detected.
+    for (const name of ["code_validate_fast", "code_validate_targeted"]) {
+      const prepared = await fixture.tools.get(name).prepare(
+        { workspaceId: "patch-workspace", repairRequestId: "git-controls" },
+        extensionContext(false),
+      );
+      assert.equal(prepared.ok, true, `${name}: ${JSON.stringify(prepared)}`);
+      if (!prepared.ok) return;
+      const executed = await fixture.tools.get(name).executePrepared(prepared.action, approved(prepared.action));
+      assert.equal(executed.output.status, "verified", `${name}: ${JSON.stringify(executed.output)}`);
+    }
+
+    // The controls stay protected for writes: the profile still lists them,
+    // a change under them is classified as protected, and no workspace write
+    // can name them.
+    const after = (await fixture.runtime.getRepositoryProfile("patch-repository"))!;
+    assert.ok(after.protectedControls.some((control) => control.path === ".git/hooks"));
+    assert.ok(after.protectedControls.some((control) => control.path === ".git/config"));
+    assert.notEqual(classifyProtectedControlChanges([".git/hooks/pre-commit"], protectedPaths).level, "none");
+    assert.notEqual(classifyProtectedControlChanges([".git/config"], protectedPaths).level, "none");
+    const writeGitConfig = await Promise.resolve(
+      fixture.tools.get("code_workspace_create_file").prepare(
+        { workspaceId: "patch-workspace", path: ".git/config", content: "[core]\n" },
+        extensionContext(false),
+      ),
+    ).then((result: { ok: boolean }) => result.ok, () => false);
+    assert.equal(writeGitConfig, false);
+    assert.match(await readFile(path.join(fixture.worktree, ".git"), "utf8"), /^gitdir: /u);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
