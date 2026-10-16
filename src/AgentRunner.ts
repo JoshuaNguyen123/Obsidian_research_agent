@@ -35,7 +35,12 @@ import {
   runCriticWorker,
 } from "./orchestrator/criticWorker";
 import { appendToolTranscript } from "./model/toolTranscript";
-import { serializeToolResultForModel, sourceReadResultNeedsAssessmentV1 } from "./model/toolResultPayload";
+import {
+  serializeToolResultForModel,
+  sourceReadResultNeedsAssessmentV1,
+  type ToolResultSerializationOptionsV1,
+} from "./model/toolResultPayload";
+import { normalizeCodeReadBudgetCharsV1 } from "./model/codeWorkspacePayloadV1";
 import {
   isModelRequestTimeoutError,
   isTransientModelError,
@@ -461,6 +466,8 @@ import {
   shouldRequestStreamingFinalProjection,
   verifiedWorkspaceReadKey,
   workspaceSourceLineRanges,
+  forgetPartialWorkspaceReadObservationsV1,
+  getPartialWorkspaceReadRefusalV1,
 } from "./agent/verifiedWorkspaceBinding";
 import {
   WordCountTarget,
@@ -1795,6 +1802,14 @@ interface RunAgentMissionOptions {
   runSteering?: {
     drain(): SteeringDirectiveV1[];
   };
+  /**
+   * How many characters of numbered lines one `code_workspace_read` answer
+   * may show the model, measured as sent. Default 7,000, which keeps the
+   * answer inside the usual 8,000-character tool envelope for a small-context
+   * model; a host whose model has a large context window may ask for up to
+   * 60,000. Clamped to 2,000–60,000. No other tool's answer changes.
+   */
+  codeReadBudgetChars?: number;
 }
 
 interface CheckpointResumeState {
@@ -2151,8 +2166,14 @@ export async function runAgentMission({
   maxCompletionSegments,
   runSteering,
   getLatencyScale,
+  codeReadBudgetChars,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
+  // Every tool answer this run shows the model goes through one serializer;
+  // the run's options decide only how much of a code read it may show.
+  const toolResultSerialization: ToolResultSerializationOptionsV1 = {
+    codeReadBudgetChars: normalizeCodeReadBudgetCharsV1(codeReadBudgetChars),
+  };
   const configuredMaxRunMs =
     typeof toolContext.settings?.maxRunMinutes === "number" &&
     toolContext.settings.maxRunMinutes > 0
@@ -14672,7 +14693,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(blockedResult),
+            resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -14817,7 +14838,7 @@ export async function runAgentMission({
         appendToolTranscript({
           messages,
           toolCall,
-          resultContent: serializeToolResultForModel(blockedResult),
+          resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
           origin,
           fallbackId: buildToolCallFallbackId(
             runId,
@@ -14889,7 +14910,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(blockedResult),
+            resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -15046,7 +15067,7 @@ export async function runAgentMission({
         appendToolTranscript({
           messages,
           toolCall,
-          resultContent: serializeToolResultForModel(blockedResult),
+          resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
           origin,
           fallbackId: buildToolCallFallbackId(
             runId,
@@ -15107,7 +15128,7 @@ export async function runAgentMission({
         appendToolTranscript({
           messages,
           toolCall,
-          resultContent: serializeToolResultForModel(blockedResult),
+          resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
           origin,
           fallbackId: buildToolCallFallbackId(
             runId,
@@ -15175,7 +15196,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(blockedResult),
+            resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -15219,7 +15240,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(skippedResult),
+            resultContent: serializeToolResultForModel(skippedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -15345,7 +15366,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(skippedResult),
+            resultContent: serializeToolResultForModel(skippedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -15425,7 +15446,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(blockedResult),
+            resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -15498,7 +15519,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(blockedResult),
+            resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -15651,7 +15672,7 @@ export async function runAgentMission({
             appendToolTranscript({
               messages,
               toolCall,
-              resultContent: serializeToolResultForModel(blockedResult),
+              resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
               origin,
               fallbackId: buildToolCallFallbackId(
                 runId,
@@ -15678,6 +15699,51 @@ export async function runAgentMission({
             path: exactPath,
           },
         });
+      }
+    }
+    {
+      // A line-range read never stands in for a whole-file read: replacing a
+      // file whose latest read in this run showed only some of its lines
+      // would rewrite lines the model never saw.
+      const partialReadRefusal = getPartialWorkspaceReadRefusalV1(
+        runtimeCache,
+        toolCall,
+      );
+      if (partialReadRefusal) {
+        const blockedResult: ToolExecutionResult = {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: partialReadRefusal,
+        };
+        await finishMissionGraphTool(
+          missionGraphExecution,
+          toolCall.name,
+          blockedResult,
+        );
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:${toolCall.name}:partial-read`,
+          kind: "tool_rejected",
+          step,
+          toolName: toolCall.name,
+          message: partialReadRefusal.message,
+          error: blockedResult.error,
+        });
+        if (recordTranscript) {
+          appendToolTranscript({
+            messages,
+            toolCall,
+            resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
+            origin,
+            fallbackId: buildToolCallFallbackId(
+              runId,
+              step,
+              toolIndex,
+              toolCall.name,
+            ),
+          });
+        }
+        return blockedResult;
       }
     }
     if (
@@ -15862,7 +15928,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(blockedResult),
+            resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -16871,7 +16937,7 @@ export async function runAgentMission({
       ? appendToolTranscript({
           messages,
           toolCall,
-          resultContent: serializeToolResultForModel(result),
+          resultContent: serializeToolResultForModel(result, toolResultSerialization),
           origin,
           fallbackId: buildToolCallFallbackId(runId, step, toolIndex, toolCall.name),
         })
@@ -17720,7 +17786,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(softAckResult),
+            resultContent: serializeToolResultForModel(softAckResult, toolResultSerialization),
             origin,
             fallbackId: buildToolCallFallbackId(
               runId,
@@ -24113,7 +24179,7 @@ export async function runAgentMission({
         appendToolTranscript({
           messages,
           toolCall,
-          resultContent: serializeToolResultForModel(deferredResult),
+          resultContent: serializeToolResultForModel(deferredResult, toolResultSerialization),
           origin: "model",
           fallbackId: buildToolCallFallbackId(
             runId,
@@ -24168,7 +24234,7 @@ export async function runAgentMission({
         appendToolTranscript({
           messages,
           toolCall,
-          resultContent: serializeToolResultForModel(deferredResult),
+          resultContent: serializeToolResultForModel(deferredResult, toolResultSerialization),
           origin: "model",
           fallbackId: buildToolCallFallbackId(
             runId,
@@ -24344,7 +24410,7 @@ export async function runAgentMission({
           appendToolTranscript({
             messages,
             toolCall,
-            resultContent: serializeToolResultForModel(noOpResult),
+            resultContent: serializeToolResultForModel(noOpResult, toolResultSerialization),
             origin: "model",
             fallbackId: noOpReceiptId,
           });
@@ -24741,7 +24807,7 @@ export async function runAgentMission({
         appendToolTranscript({
           messages,
           toolCall,
-          resultContent: serializeToolResultForModel(rejectedResult),
+          resultContent: serializeToolResultForModel(rejectedResult, toolResultSerialization),
           origin: "model",
           fallbackId: buildToolCallFallbackId(
             runId,
@@ -25202,7 +25268,7 @@ export async function runAgentMission({
               appendToolTranscript({
                 messages,
                 toolCall: item.call,
-                resultContent: serializeToolResultForModel(results[resultIndex]),
+                resultContent: serializeToolResultForModel(results[resultIndex], toolResultSerialization),
                 origin: "model",
                 fallbackId: buildToolCallFallbackId(
                   runId,
@@ -40622,6 +40688,12 @@ export async function executePreparedToolWithMetrics({
     );
     if (result.ok && ["code_workspace_write_expected", "code_workspace_patch", "code_workspace_append", "code_workspace_create_file"].includes(preparedAction.toolName)) {
       forgetVerifiedWorkspaceReadObservation(
+        toolContext.runtimeCache,
+        getString(preparedAction.normalizedArgs.workspaceId),
+        getString(preparedAction.target.path) ??
+          getString(preparedAction.normalizedArgs.path),
+      );
+      forgetPartialWorkspaceReadObservationsV1(
         toolContext.runtimeCache,
         getString(preparedAction.normalizedArgs.workspaceId),
         getString(preparedAction.target.path) ??

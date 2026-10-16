@@ -159,13 +159,7 @@ export function rememberVerifiedWorkspaceReadResult(
     typeof result.output.content === "string"
       ? result.output.content
       : undefined;
-  if (
-    !path ||
-    !sha256 ||
-    !/^sha256:[a-f0-9]{64}$/u.test(sha256) ||
-    content === undefined ||
-    content.length > MAX_VERIFIED_WORKSPACE_READ_CONTENT_CHARS
-  ) {
+  if (!path || !sha256 || !/^sha256:[a-f0-9]{64}$/u.test(sha256)) {
     return;
   }
   const workspaceId = normalizeWorkspaceObservationId(
@@ -175,8 +169,33 @@ export function rememberVerifiedWorkspaceReadResult(
       context.operationId ??
       "adhoc",
   );
-  runtimeCache.verifiedWorkspaceReads ??= new Map();
   const key = verifiedWorkspaceReadKey(workspaceId, path);
+  const range = partialWorkspaceReadRangeV1(result.output);
+  if (range) {
+    // A line range is never a whole-file read. It is kept apart so a
+    // full-file replacement made from it can be refused in words, and a whole
+    // read it proves stale is dropped.
+    const whole = runtimeCache.verifiedWorkspaceReads?.get(key);
+    if (whole && whole.sha256 !== sha256) {
+      runtimeCache.verifiedWorkspaceReads!.delete(key);
+    }
+    rememberPartialWorkspaceRead(runtimeCache, key, {
+      workspaceId,
+      path,
+      sha256,
+      totalLines: range.totalLines,
+      range: [range.startLine, range.endLine],
+    });
+    return;
+  }
+  runtimeCache.partialWorkspaceReads?.delete(key);
+  if (
+    content === undefined ||
+    content.length > MAX_VERIFIED_WORKSPACE_READ_CONTENT_CHARS
+  ) {
+    return;
+  }
+  runtimeCache.verifiedWorkspaceReads ??= new Map();
   if (
     !runtimeCache.verifiedWorkspaceReads.has(key) &&
     runtimeCache.verifiedWorkspaceReads.size >=
@@ -247,6 +266,167 @@ export function getVerifiedWorkspaceReadObservation(
     (observation) => observation.path === path,
   );
   return matches.length === 1 ? matches[0]! : null;
+}
+
+/**
+ * The line range of a `code_workspace_read` result that did not return the
+ * whole file, or null for a whole-file read. An output without range fields
+ * (an older tool, a host stub) is a whole-file read, as it always was.
+ */
+export function partialWorkspaceReadRangeV1(
+  output: Record<string, unknown>,
+): { startLine: number; endLine: number; totalLines: number } | null {
+  const startLine = output.startLine;
+  const endLine = output.endLine;
+  const totalLines = output.totalLines;
+  if (
+    typeof startLine !== "number" ||
+    typeof endLine !== "number" ||
+    typeof totalLines !== "number" ||
+    !Number.isSafeInteger(startLine) ||
+    !Number.isSafeInteger(endLine) ||
+    !Number.isSafeInteger(totalLines)
+  ) {
+    return null;
+  }
+  if (output.wholeFile === true || (startLine <= 1 && endLine >= totalLines)) {
+    return null;
+  }
+  return { startLine, endLine, totalLines };
+}
+
+function rememberPartialWorkspaceRead(
+  runtimeCache: AgentRuntimeCache,
+  key: string,
+  read: {
+    workspaceId: string;
+    path: string;
+    sha256: string;
+    totalLines: number;
+    range: [number, number];
+  },
+): void {
+  runtimeCache.partialWorkspaceReads ??= new Map();
+  const reads = runtimeCache.partialWorkspaceReads;
+  const previous = reads.get(key);
+  const ranges =
+    previous &&
+    previous.sha256 === read.sha256 &&
+    previous.totalLines === read.totalLines
+      ? mergeLineRangesV1([...previous.ranges, read.range])
+      : [read.range];
+  // Re-inserted so the map's last entry is the latest read.
+  reads.delete(key);
+  if (reads.size >= MAX_VERIFIED_WORKSPACE_READ_OBSERVATIONS) {
+    const oldestKey = reads.keys().next().value;
+    if (typeof oldestKey === "string") reads.delete(oldestKey);
+  }
+  reads.set(key, {
+    workspaceId: read.workspaceId,
+    path: read.path,
+    sha256: read.sha256,
+    totalLines: read.totalLines,
+    ranges,
+  });
+}
+
+function mergeLineRangesV1(
+  ranges: ReadonlyArray<[number, number]>,
+): Array<[number, number]> {
+  const sorted = [...ranges].sort((left, right) => left[0] - right[0]);
+  const merged: Array<[number, number]> = [];
+  for (const [start, end] of sorted) {
+    const last = merged.at(-1);
+    if (last && start <= last[1] + 1) {
+      last[1] = Math.max(last[1], end);
+    } else {
+      merged.push([start, end]);
+    }
+  }
+  return merged;
+}
+
+/** Forget a file's line-range reads once the run has changed it. */
+export function forgetPartialWorkspaceReadObservationsV1(
+  runtimeCache: AgentRuntimeCache | undefined,
+  workspaceId: string | undefined,
+  path: string | undefined,
+): void {
+  const reads = runtimeCache?.partialWorkspaceReads;
+  if (!reads || !path) return;
+  const normalizedPath = normalizeObservedWorkspacePath(path);
+  const normalizedWorkspace = workspaceId
+    ? normalizeWorkspaceObservationId(workspaceId)
+    : null;
+  for (const [key, observation] of reads) {
+    if (
+      observation.path === normalizedPath &&
+      (normalizedWorkspace === null || observation.workspaceId === normalizedWorkspace)
+    ) {
+      reads.delete(key);
+    }
+  }
+}
+
+/**
+ * A full-file replacement written after reading only some of a file's lines
+ * would rewrite lines the model never saw. When the run's latest read of the
+ * target was a line range that does not cover the file, and no whole-file
+ * read of the same version exists, the write is refused with what to do
+ * instead. A write with no read at all is unaffected, and so is
+ * `code_workspace_patch`, whose exact-once oldText match is its own proof.
+ */
+export function getPartialWorkspaceReadRefusalV1(
+  runtimeCache: AgentRuntimeCache | undefined,
+  toolCall: Pick<ModelToolCall, "name" | "arguments">,
+): { code: "workspace_read_partial"; message: string } | null {
+  if (
+    toolCall.name !== "code_workspace_write_expected" &&
+    toolCall.name !== "write_workspace_file"
+  ) {
+    return null;
+  }
+  const reads = runtimeCache?.partialWorkspaceReads;
+  const rawPath = getString(toolCall.arguments.path);
+  if (!reads || reads.size === 0 || !rawPath) return null;
+  const path = normalizeObservedWorkspacePath(rawPath);
+  const explicitWorkspace = getString(toolCall.arguments.workspaceId);
+  const normalizedWorkspace = explicitWorkspace
+    ? normalizeWorkspaceObservationId(explicitWorkspace)
+    : null;
+  const matches = [...reads.values()].filter(
+    (observation) =>
+      observation.path === path &&
+      (normalizedWorkspace === null || observation.workspaceId === normalizedWorkspace),
+  );
+  const partial = matches.at(-1);
+  if (!partial) return null;
+  const covered =
+    partial.ranges.length === 1 &&
+    partial.ranges[0]![0] <= 1 &&
+    partial.ranges[0]![1] >= partial.totalLines;
+  if (covered) return null;
+  const whole = runtimeCache?.verifiedWorkspaceReads?.get(
+    verifiedWorkspaceReadKey(partial.workspaceId, path),
+  );
+  if (whole && whole.sha256 === partial.sha256) return null;
+  const read = partial.ranges
+    .map(([start, end]) => (start === end ? `${start}` : `${start}–${end}`))
+    .join(", ");
+  const single =
+    partial.ranges.length === 1 && partial.ranges[0]![0] === partial.ranges[0]![1];
+  return {
+    code: "workspace_read_partial",
+    message:
+      `Only ${single ? "line" : "lines"} ${read} of ${path} (${partial.totalLines} lines) ` +
+      `${single ? "was" : "were"} read, so replacing the whole file could drop lines that were never seen. ` +
+      "Read the rest first (code_workspace_read without startLine or lineCount, or read on to the last line), " +
+      "or change only the lines you read with code_workspace_patch.",
+  };
+}
+
+function normalizeObservedWorkspacePath(value: string): string {
+  return value.trim().replace(/\\/gu, "/").replace(/^(?:\.\/)+/u, "");
 }
 
 /**

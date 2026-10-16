@@ -16,6 +16,7 @@ import type {
   ToolDescriptorV1,
 } from "../../packages/core-api/src";
 import {
+  MAX_SEARCH_CONTEXT_LINES_V2,
   WorkspaceManagerErrorV2,
   WorkspaceManagerV2,
   assertWorkspaceRelativePathV2,
@@ -24,6 +25,7 @@ import {
   type WorkspaceManifestV2,
   type WorkspaceMutationReceiptV2,
 } from "./workspaces";
+import { codeLineSpansV1 } from "../../src/model/codeWorkspacePayloadV1";
 import {
   classifyProtectedControlChangesV2,
   type RepositoryFileChangeV2,
@@ -205,18 +207,41 @@ class WorkspaceToolRuntimeV2 {
     const workspaceId = workspaceIdFrom(args, context);
     if (name === "code_workspace_status") return this.manager.status(workspaceId);
     if (name === "code_workspace_stat") return this.manager.stat(workspaceId, requiredPath(args, "path"));
-    if (name === "code_workspace_list" || name === "list_workspace_files") {
+    if (name === "code_workspace_list") {
+      const glob = optionalString(args.glob);
+      const maxDepth = optionalBoundedInteger(args.maxDepth, "maxDepth", 1, 20);
+      // A glob or a depth past one level only means something recursively.
+      const recursive = args.recursive === true ||
+        (args.recursive !== false && (glob !== null || (maxDepth !== undefined && maxDepth > 1)));
+      return this.manager.listTree(workspaceId, optionalString(args.path) ?? "", {
+        recursive,
+        maxDepth,
+        glob,
+      });
+    }
+    if (name === "list_workspace_files") {
       return this.manager.list(workspaceId, optionalString(args.path) ?? "");
     }
-    if (name === "code_workspace_read" || name === "read_workspace_file") {
+    if (name === "code_workspace_read") {
+      const read = await this.manager.read(workspaceId, requiredPath(args, "path"));
+      return codeWorkspaceReadRangeV2(workspaceId, read, args);
+    }
+    if (name === "read_workspace_file") {
       return this.manager.read(workspaceId, requiredPath(args, "path"));
     }
     if (name === "code_workspace_search") {
-      return this.manager.search(workspaceId, requiredString(args.query, "query"), {
-        path: optionalString(args.path) ?? undefined,
-        caseSensitive: args.caseSensitive === true,
-        limit: optionalInteger(args.limit),
-      });
+      return {
+        workspaceId,
+        ...(await this.manager.searchDetailed(workspaceId, requiredString(args.query, "query"), {
+          path: optionalString(args.path) ?? undefined,
+          caseSensitive: args.caseSensitive === true,
+          limit: optionalInteger(args.limit),
+          regex: args.regex === true,
+          include: optionalGlobArgument(args.include, "include"),
+          exclude: optionalGlobArgument(args.exclude, "exclude"),
+          contextLines: optionalBoundedInteger(args.contextLines, "contextLines", 0, MAX_SEARCH_CONTEXT_LINES_V2),
+        })),
+      };
     }
     if (name === "preview_workspace_html") {
       const htmlPath = requiredPath(args, "htmlPath");
@@ -2623,9 +2648,38 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
   if (name === "code_workspace_create") return objectSchema({ workspaceId: stringSchema(), kind: { type: "string", enum: ["scratch", "repository"] }, repositoryProfileKey: stringSchema(), repositoryRoot: stringSchema() });
   if (name === "code_workspace_init_repository") return objectSchema({ workspaceId: stringSchema(), commitMessage: stringSchema() });
   if (name === "code_workspace_status") return objectSchema({ workspaceId: stringSchema() });
-  if (name === "code_workspace_search") return objectSchema({ workspaceId: stringSchema(), query: stringSchema(), path: stringSchema(), caseSensitive: { type: "boolean" }, limit: { type: "integer" } }, ["query"]);
-  if (name === "code_workspace_list" || name === "list_workspace_files") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() });
-  if (name === "code_workspace_read" || name === "read_workspace_file" || name === "code_workspace_stat") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
+  if (name === "code_workspace_search") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      query: stringSchema(),
+      path: stringSchema(),
+      caseSensitive: { type: "boolean" },
+      limit: { type: "integer", minimum: 1, maximum: 200 },
+      regex: { type: "boolean", description: "Read query as a JavaScript regular expression; matching lines are listed in file order." },
+      include: { type: "array", items: stringSchema(), maxItems: 20, description: "Globs a file must match one of, such as \"*.ts\" or \"src/**\"." },
+      exclude: { type: "array", items: stringSchema(), maxItems: 20, description: "Globs that leave files or whole folders out, such as \"dist\" or \"**/*.min.js\"." },
+      contextLines: { type: "integer", minimum: 0, maximum: 3, description: "Lines of context shown before and after each match." },
+    }, ["query"]);
+  }
+  if (name === "code_workspace_list") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      path: stringSchema(),
+      recursive: { type: "boolean", description: "List the folders inside as well, as a tree." },
+      maxDepth: { type: "integer", minimum: 1, maximum: 20, description: "How many levels a recursive listing goes down (default 5)." },
+      glob: { type: "string", description: "Only list files matching this glob, such as \"**/*.py\"; implies recursive." },
+    });
+  }
+  if (name === "list_workspace_files") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() });
+  if (name === "code_workspace_read") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      path: stringSchema(),
+      startLine: { type: "integer", minimum: 1, description: "First line to read, 1-based. Omit to start at the top." },
+      lineCount: { type: "integer", minimum: 1, description: "How many lines to read. Omit to read to the end." },
+    }, ["path"]);
+  }
+  if (name === "read_workspace_file" || name === "code_workspace_stat") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
   if (name === "code_workspace_mkdir") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
   if (name === "code_workspace_create_file") return {
     ...objectSchema({
@@ -2706,7 +2760,11 @@ function description(name: string): string {
   } else if (name === "code_workspace_init_repository") {
     text = `Purpose: Turn this scratch workspace into a real Git repository so the commit and GitHub publication steps become available. Use when: the project files are written and validated and the mission asks for a commit, a repository, or a GitHub publication, and code_commit_verified reports that no repository is bound. Do not use when: the workspace was created from an existing repository. Required: nothing beyond the workspace; commitMessage is optional. Next: code_commit_verified, then create_private_github_repository and publish_verified_code_to_github. Side effects: exact approval-gated git init plus one initial commit of the files this workspace already tracks, inside the workspace directory only. ${base} It never touches an existing repository, never adds a remote, and refuses a workspace that already contains one.`;
   } else if (name === "code_workspace_search") {
-    text = `Purpose: Find where something lives in the workspace, best match first. Use when: locating a symbol, string, or concept before reading a file. Do not use when: you already know the path — read it. Required: query. Next: code_workspace_read on the paths this returns. Side effects: none. ${base} Results are ranked, not listed in directory order, so a small limit returns the strongest matches rather than the first ones on disk. Each result carries a score and a matchKind: "definition" means the line declares the match (usually what you want), "reference" an import or re-export, "comment" a mention in prose, "text" anything else. A multi-word query first tries the literal phrase and falls back to lines covering the most query terms, so a description works when an exact string is not known. Matches in test, fixture, and build-output paths rank lower but are never hidden.`;
+    text = `Purpose: Find where something lives in the workspace, best match first. Use when: locating a symbol, string, or concept before reading a file. Do not use when: you already know the path — read it. Required: query. Next: code_workspace_read on the paths and lines this returns. Side effects: none. ${base} Each match comes back as a path:line:column: text line. A literal query is ranked, not listed in directory order, so a small limit returns the strongest matches rather than the first ones on disk: a line that declares the match ranks first, then references and mentions. A multi-word query first tries the literal phrase and falls back to lines covering the most query terms, so a description works when an exact string is not known. Set regex true to search with a JavaScript regular expression; its matching lines are listed in file and line order. include and exclude take globs ("*.py" matches by file name at any depth, "src/**" a folder, "{a,b}" a choice); contextLines (0-3) adds the lines around each match. Files that cannot be searched (binary, over 2 MiB, links, nested .git) are skipped and counted, never fatal. Matches in test, fixture, and build-output paths rank lower but are never hidden.`;
+  } else if (name === "code_workspace_read") {
+    text = `Purpose: Read a workspace file's lines with their numbers. Use when: you need the exact text before editing it, or to understand code. Required: path. Optional: startLine (1-based) and lineCount to read part of a long file. Next: code_workspace_patch with oldText copied exactly from these lines, or code_workspace_write_expected after reading the whole file. Side effects: none. ${base} Each line is shown as its number, two spaces, then the text; the number and the two spaces are not part of the file, so never put them in oldText. The header gives the path, the lines shown, the file's total line count and its sha256 (of the whole file, also when only part is read). When the answer stops before the end of the file it ends with the exact code_workspace_read call that reads on. A full-file replacement with code_workspace_write_expected needs the whole file read first; after reading only part of a file, use code_workspace_patch.`;
+  } else if (name === "code_workspace_list") {
+    text = `Purpose: See what is in a workspace folder. Use when: finding your way around before reading or searching. Required: nothing; path defaults to the workspace root. Next: code_workspace_read or code_workspace_search. Side effects: none. ${base} The answer is an indented tree with folders ending in /. recursive true lists folders inside folders, down to maxDepth levels (default 5); glob (such as "**/*.py") lists only matching files and the folders that lead to them. Dependency and build folders (node_modules, .venv, __pycache__, dist, build and the like) are shown but not opened; list one by its path to see inside. A cut listing says where it stopped.`;
   } else if (name === "code_workspace_mkdir") {
     text = `Purpose: Create a nested directory path inside the bounded code workspace. Required: path. Side effects: bound write. ${base} Every missing parent directory is created safely; an existing directory is accepted, but a file conflict is rejected.`;
   } else if (name === "code_workspace_export_directory") {
@@ -3359,6 +3417,79 @@ function requiredString(value: unknown, label: string, allowEmpty = false): stri
 function requiredStringArray(value: unknown, label: string): string[] { if (!Array.isArray(value) || value.length < 1) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a non-empty array.`); return value.map((entry) => requiredString(entry, label)); }
 function optionalString(value: unknown): string | null { return typeof value === "string" && value.trim() ? value.trim() : null; }
 function optionalInteger(value: unknown): number | undefined { return Number.isSafeInteger(value) ? Number(value) : undefined; }
+function optionalBoundedInteger(value: unknown, label: string, minimum: number, maximum: number): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a whole number from ${minimum} to ${maximum}.`);
+  }
+  return value as number;
+}
+function optionalGlobArgument(value: unknown, label: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value.trim() ? [value] : undefined;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a list of glob strings.`);
+  }
+  return value as string[];
+}
+
+/**
+ * The result of `code_workspace_read`: the requested lines (all of them when
+ * no range is given) with where they sit in the file. `content` is the exact
+ * text of those lines, line breaks included, so a whole-file read is
+ * byte-for-byte what it always was; `sha256` and `bytes` always describe the
+ * whole file, so a partial read can still bind a patch's expectedSha256.
+ */
+export function codeWorkspaceReadRangeV2(
+  workspaceId: string,
+  read: { path: string; content: string; bytes: number; sha256: string },
+  args: Record<string, unknown>,
+): {
+  workspaceId: string;
+  path: string;
+  content: string;
+  bytes: number;
+  sha256: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  nextStartLine: number | null;
+  truncated: boolean;
+  wholeFile: boolean;
+} {
+  const startLine = optionalBoundedInteger(args.startLine, "startLine", 1, Number.MAX_SAFE_INTEGER) ?? 1;
+  const lineCount = optionalBoundedInteger(args.lineCount, "lineCount", 1, Number.MAX_SAFE_INTEGER);
+  const spans = codeLineSpansV1(read.content);
+  const totalLines = spans.length;
+  if (totalLines === 0) {
+    if (startLine > 1) {
+      throw new WorkspaceManagerErrorV2("line_out_of_range", `${read.path} is empty; read it without startLine.`);
+    }
+    return { workspaceId, ...read, startLine: 1, endLine: 0, totalLines: 0, nextStartLine: null, truncated: false, wholeFile: true };
+  }
+  if (startLine > totalLines) {
+    throw new WorkspaceManagerErrorV2(
+      "line_out_of_range",
+      `startLine ${startLine} is past the end of ${read.path}, which has ${totalLines} ${totalLines === 1 ? "line" : "lines"}.`,
+    );
+  }
+  const endLine = lineCount === undefined ? totalLines : Math.min(totalLines, startLine + lineCount - 1);
+  const nextStartLine = endLine < totalLines ? endLine + 1 : null;
+  const wholeFile = startLine === 1 && nextStartLine === null;
+  return {
+    workspaceId,
+    path: read.path,
+    content: wholeFile ? read.content : read.content.slice(spans[startLine - 1]!.start, spans[endLine - 1]!.next),
+    bytes: read.bytes,
+    sha256: read.sha256,
+    startLine,
+    endLine,
+    totalLines,
+    nextStartLine,
+    truncated: nextStartLine !== null,
+    wholeFile,
+  };
+}
 function requiredFingerprint(value: unknown): string { if (!isSha256FingerprintV2(value)) throw new WorkspaceManagerErrorV2("invalid_arguments", "A SHA-256 fingerprint is required."); return value; }
 function byteLength(value: string): number { return new TextEncoder().encode(value).byteLength; }
 function sha256Json(value: unknown): string { return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`; }

@@ -1,6 +1,14 @@
 import type { ToolExecutionResult } from "../tools/types";
 import { truncateText } from "../tools/validation";
 import { extractEvidencePassages } from "../agent/researchDossier";
+import {
+  CODE_FINDING_RENDER_BUDGET_CHARS_V1,
+  normalizeCodeReadBudgetCharsV1,
+  renderCodeWorkspaceListForModelV1,
+  renderCodeWorkspaceReadForModelV1,
+  renderCodeWorkspaceSearchForModelV1,
+  type CodeModelRenderingV1,
+} from "./codeWorkspacePayloadV1";
 
 const MAX_SUMMARY_CHARS = 8000;
 /** Active-note reads must keep body text for edit/expand, not passage snippets. */
@@ -37,6 +45,40 @@ const MAX_SANDBOX_MESSAGE_CHARS = 600;
 const FULL_CONTENT_NOTE_READ_TOOLS = new Set([
   "read_current_file",
 ]);
+
+/**
+ * A code read's whole answer may run this far past its text budget: the
+ * envelope's own keys, the header and the "read on" line. At the default
+ * 7,000-character budget that is today's 8,000-character envelope.
+ */
+const CODE_READ_ENVELOPE_OVERHEAD_CHARS = 1_000;
+/** What the host may say about an edit's diagnostics, kept after the receipt. */
+export const MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1 = 2_000;
+const CODE_WRITE_DIAGNOSTICS_CUT_MARKER = "\n[diagnostics cut]";
+
+/**
+ * The code extension's write tools. A host may put a `diagnostics` string on
+ * their output (the language servers' answer for the files the edit changed);
+ * the serializer keeps it, bounded, after the receipt.
+ */
+export const CODE_WORKSPACE_WRITE_TOOL_NAMES_V1: ReadonlySet<string> = new Set([
+  "code_workspace_create_file",
+  "code_workspace_write_expected",
+  "code_workspace_patch",
+  "code_workspace_append",
+  "code_workspace_apply_patch",
+  "write_workspace_file",
+  "replace_workspace_text",
+]);
+
+export interface ToolResultSerializationOptionsV1 {
+  /**
+   * Character budget for the numbered lines of a `code_workspace_read`
+   * answer, measured as sent (JSON-escaped). Default 7,000; clamped to
+   * 2,000–60,000. Every other tool keeps its own budget.
+   */
+  codeReadBudgetChars?: number;
+}
 
 /**
  * Tools whose results carry text written by someone other than the user or
@@ -103,7 +145,14 @@ export interface ToolPayloadSummary {
   output?: unknown;
 }
 
-export function serializeToolResultForModel(result: ToolExecutionResult): string {
+export function serializeToolResultForModel(
+  result: ToolExecutionResult,
+  options: ToolResultSerializationOptionsV1 = {},
+): string {
+  const code = serializeCodeWorkspaceResultForModel(result, options);
+  if (code !== null) {
+    return code;
+  }
   const summary = withExternalContentTrust(
     summarizeToolOutput(result.toolName, result),
   );
@@ -169,6 +218,59 @@ export function serializeToolResultForModel(result: ToolExecutionResult): string
       : {}),
     truncated: true,
   });
+}
+
+/**
+ * Code reads, searches and listings reach the model as numbered text, not
+ * slimmed JSON (see codeWorkspacePayloadV1). Null for anything else, and for a
+ * code tool's error or an output of an older shape, which keep the generic
+ * path.
+ */
+function serializeCodeWorkspaceResultForModel(
+  result: ToolExecutionResult,
+  options: ToolResultSerializationOptionsV1,
+): string | null {
+  if (!result.ok || !isRecord(result.output)) return null;
+  const output = result.output;
+  let render: ((budget: number) => CodeModelRenderingV1 | null) | null = null;
+  let textBudget: number;
+  let cap: number;
+  if (result.toolName === "code_workspace_read") {
+    textBudget = normalizeCodeReadBudgetCharsV1(options.codeReadBudgetChars);
+    cap = textBudget + CODE_READ_ENVELOPE_OVERHEAD_CHARS;
+    render = (budget) => renderCodeWorkspaceReadForModelV1(output, budget);
+  } else if (result.toolName === "code_workspace_search") {
+    textBudget = CODE_FINDING_RENDER_BUDGET_CHARS_V1;
+    cap = MAX_SUMMARY_CHARS;
+    render = (budget) => renderCodeWorkspaceSearchForModelV1(output, budget);
+  } else if (result.toolName === "code_workspace_list") {
+    textBudget = CODE_FINDING_RENDER_BUDGET_CHARS_V1;
+    cap = MAX_SUMMARY_CHARS;
+    render = (budget) => renderCodeWorkspaceListForModelV1(output, budget);
+  } else {
+    return null;
+  }
+  let serialized: string | null = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const rendering = render(textBudget);
+    if (!rendering) return null;
+    const envelope: ToolPayloadSummary = {
+      toolName: result.toolName,
+      status: "success",
+      summary: rendering.summary,
+      ...(rendering.evidenceRefs && rendering.evidenceRefs.length > 0
+        ? { evidenceRefs: rendering.evidenceRefs }
+        : {}),
+      truncated: rendering.truncated,
+      output: rendering.output,
+    };
+    serialized = JSON.stringify(envelope);
+    if (serialized.length <= cap) return serialized;
+    // An unusually long path or workspace id made the envelope itself larger;
+    // give the text less room and render again.
+    textBudget = Math.max(400, textBudget - (serialized.length - cap) - 120);
+  }
+  return serialized;
 }
 
 export function summarizeToolOutput(
@@ -492,6 +594,22 @@ function slimOutputForModel(
     const receipt = slimReceiptForModel(output.receipt);
     if (Object.keys(receipt).length > 0) {
       keep.receipt = receipt;
+    }
+  }
+  if (
+    CODE_WORKSPACE_WRITE_TOOL_NAMES_V1.has(toolName) &&
+    typeof output.diagnostics === "string"
+  ) {
+    // Placed after the receipt: what the language servers said about the
+    // files this edit changed, as the host wrote it.
+    if (output.diagnostics.length > MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1) {
+      keep.diagnostics = `${output.diagnostics.slice(
+        0,
+        MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1 - CODE_WRITE_DIAGNOSTICS_CUT_MARKER.length,
+      )}${CODE_WRITE_DIAGNOSTICS_CUT_MARKER}`;
+      lossy = true;
+    } else {
+      keep.diagnostics = output.diagnostics;
     }
   }
   if (typeof output.content === "string" && toolName !== "count_words") {
