@@ -10,6 +10,8 @@ import {
   getCurrentMissionCompositeLifecycleActionV1,
   getMissionCompositeLifecycleSpecV1,
   getMissionCompositeLifecycleStateV1,
+  getMissionOpenWorkSpecV1,
+  MISSION_OPEN_WORK_INPUT_KEY_V1,
   type MissionGraphV3,
 } from "../../packages/headless-runtime/src/missionGraphV3";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
@@ -534,6 +536,18 @@ export function getMissionGraphNodeCurrentSelector(
   const action = getSafeMissionCompositeLifecycleActionV1(node);
   if (action) return action.selector;
   return getMissionGraphNodeSelector(node);
+}
+
+/**
+ * The open node of a free coding pass (CODE-18), or null. Its tools are a
+ * menu the model chooses from, not steps it owes.
+ */
+export function getSafeMissionOpenWorkSpecV1(
+  node: MissionGraphV3["nodes"][string],
+) {
+  return isRecord(node.inputs) && node.inputs[MISSION_OPEN_WORK_INPUT_KEY_V1]
+    ? getMissionOpenWorkSpecV1(node)
+    : null;
 }
 
 export function getSafeMissionCompositeLifecycleSpecV1(

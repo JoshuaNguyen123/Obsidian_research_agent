@@ -1166,10 +1166,29 @@ import { planMissionGraphV3 } from "./agent/missionGraphPlanner";
 import {
   MissionGraphSession,
   createFileCollisionRepairRefusalCodeV1,
+  getMissionOpenWorkStateV1,
   isCanonicalHostPostAcceptanceNode,
+  isMissionOpenWorkNodeV1,
+  missionOpenWorkReadyToCompleteV1,
   resolveMissionGraphEvidenceKind,
   type MissionGraphToolExecution,
+  type MissionOpenWorkSpentV1,
 } from "./agent/missionGraphSession";
+import {
+  CODE_FREE_WORK_NODE_ID_V1,
+  CODE_FREE_WRITE_TOOLS_V1,
+  CODE_PLAN_UPDATE_TOOL_NAME_V1,
+  createCodePlanToolOverlayV1,
+  describeCodeFreeWorkLeftV1,
+  normalizeCodeAutonomyV1,
+  normalizeCodeFreeBudgetV1,
+  planCodeFreeWorkV1,
+  type CodeAutonomyV1,
+  type CodeFreeBudgetV1,
+  type CodeFreeWorkPlanV1,
+  type CodePlanItemV1,
+  type CodePlanUpdateEventV1,
+} from "./agent/codeFreeWorkV1";
 import { reconcileCompositeOwnedCurrentNoteGraphOnResume } from "./agent/researchPublicationGraphReconciliation";
 import {
   projectIdeaPromotionCarryOutputsV1,
@@ -1722,6 +1741,12 @@ export interface AgentRunEvents {
     graph: MissionGraphV3,
     patch?: MissionGraphPatchV1,
   ) => void;
+  /**
+   * A free coding pass's to-do list, each time the model records it with
+   * `code_plan_update` (CODE-18). The whole list every time; the newest
+   * revision replaces the one before.
+   */
+  onCodePlan?: (event: CodePlanUpdateEventV1) => void;
 }
 
 interface RunAgentMissionOptions {
@@ -1811,6 +1836,21 @@ interface RunAgentMissionOptions {
    * 60,000. Clamped to 2,000–60,000. No other tool's answer changes.
    */
   codeReadBudgetChars?: number;
+  /**
+   * How a coding pass works (CODE-18). `guided`, the default, plans the
+   * fixed ladder exactly as before. `free` plans one open node,
+   * `code_free_work`, whose code tools the model calls in any order until it
+   * says the work is done after a passing targeted validation, or its budget
+   * ends; the ladder's closing steps (fast, the repair checkpoint, targeted,
+   * full, the verified commit, export when asked) follow unchanged. A free
+   * run whose ask is not an implementation plans as a guided one.
+   */
+  codeAutonomy?: CodeAutonomyV1;
+  /**
+   * The open node's budget. Each field is clamped (normalizeCodeFreeBudgetV1);
+   * a missing one takes its default.
+   */
+  codeFreeBudget?: Partial<CodeFreeBudgetV1>;
 }
 
 interface CheckpointResumeState {
@@ -2144,7 +2184,7 @@ export async function runAgentMission({
   prompt,
   runId: providedRunId,
   modelClient,
-  toolRegistry,
+  toolRegistry: providedToolRegistry,
   toolContext,
   enableStreaming,
   conversationHistory = [],
@@ -2168,8 +2208,19 @@ export async function runAgentMission({
   runSteering,
   getLatencyScale,
   codeReadBudgetChars,
+  codeAutonomy,
+  codeFreeBudget,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
+  // CODE-18: the free coding pass. Guided runs see the host's registry
+  // exactly; the plan tool joins only once a graph holds the open node.
+  const codeAutonomyV1 = normalizeCodeAutonomyV1(codeAutonomy);
+  const codeFreeBudgetV1 = normalizeCodeFreeBudgetV1(codeFreeBudget);
+  const codePlanOverlayV1 = createCodePlanToolOverlayV1(
+    providedToolRegistry,
+    (items) => recordCodePlanV1(items),
+  );
+  const toolRegistry: ToolRegistry = codePlanOverlayV1.registry;
   // Every tool answer this run shows the model goes through one serializer;
   // the run's options decide only how much of a code read it may show.
   const toolResultSerialization: ToolResultSerializationOptionsV1 = {
@@ -5601,6 +5652,45 @@ export async function runAgentMission({
         ),
         activeIntentPrompt,
         ));
+        // CODE-18: a free coding pass replaces the ladder's steps before its
+        // first validation with one open node; the rest of the ladder stays.
+        const codeFreePlanV1: CodeFreeWorkPlanV1 | null =
+          codeAutonomyV1 === "free" &&
+          !exactResumeRunId &&
+          !setLooseCompoundEnabled &&
+          !proofBoundProviderLifecycle &&
+          explicitGraphCodeToolNames.length > 0 &&
+          explicitGraphWorkflowToolNames === explicitGraphCodeToolNames
+            ? planCodeFreeWorkV1({
+                ladder: plannedToolNames,
+                available: installedToolNames,
+              })
+            : null;
+        if (codeFreePlanV1) {
+          codePlanOverlayV1.activate();
+          for (const name of codeFreePlanV1.menu) {
+            if (!graphAllowedToolNames.includes(name)) {
+              graphAllowedToolNames.push(name);
+            }
+          }
+          tools = addToolDefinitions(tools, toolRegistry, codeFreePlanV1.menu);
+          allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+          events.onTrace?.({
+            id: "code-free-work-plan",
+            kind: "status",
+            message:
+              "Free coding pass: one open node with the code menu, then the guided closing steps.",
+            outputPreview: {
+              menu: codeFreePlanV1.menu,
+              closing: codeFreePlanV1.closing,
+              replaced: plannedToolNames.slice(
+                0,
+                plannedToolNames.length - codeFreePlanV1.closing.length,
+              ),
+              budget: codeFreeBudgetV1,
+            },
+          });
+        }
         const graphMissionId = canonicalResumeGraphId ?? canonicalMissionGraphId(runId);
         let missionBindingOverrides:
           | Awaited<
@@ -5645,9 +5735,12 @@ export async function runAgentMission({
               ? new Set([
                   ...explicitGraphWorkflowToolNames,
                   ...runnerOwnedGraphToolNames,
+                  ...(codeFreePlanV1?.menu ?? []),
                 ])
               : allowedToolNames,
-          plannedToolNames,
+          plannedToolNames: codeFreePlanV1
+            ? codeFreePlanV1.closing
+            : plannedToolNames,
           postAcceptanceToolNames,
           currentNotePath: runToolContext.getCurrentMarkdownFile?.()?.path ?? null,
           plannedVaultCreatePath:
@@ -5659,6 +5752,15 @@ export async function runAgentMission({
             ? Math.min(MISSION_GRAPH_MAX_DEPTH, legacyResumePlan.tasks.length)
             : undefined,
           now: runToolContext.now?.() ?? new Date(),
+          ...(codeFreePlanV1
+            ? {
+                codeFreeWork: {
+                  toolNames: codeFreePlanV1.menu,
+                  toolCalls: codeFreeBudgetV1.toolCalls,
+                  wallClockMs: codeFreeBudgetV1.ms,
+                },
+              }
+            : {}),
           ...(missionBindingOverrides
             ? { bindingOverrides: missionBindingOverrides }
             : {}),
@@ -5706,6 +5808,8 @@ export async function runAgentMission({
               modelClient:
                 modelRouterMode === "authority" &&
                 routedModelIntent &&
+                // The host plans a free pass's open node; no planner model.
+                !codeFreePlanV1 &&
                 !structuredPreloop.skipClassifyAndPlan &&
                 !isPromptOnCurrentPageIntent(prompt)
                   ? modelClient
@@ -6243,6 +6347,78 @@ export async function runAgentMission({
       toolCallsRemaining: maxToolCalls - observedToolCallCount,
     });
 
+  /** The free pass's open node, when this run's graph holds one. */
+  const codeFreeOpenNodeV1 = (): MissionNodeV3 | null => {
+    const node = missionGraphSession?.graph.nodes[CODE_FREE_WORK_NODE_ID_V1];
+    return node && isMissionOpenWorkNodeV1(node) ? node : null;
+  };
+  /** The closing steps after the open node, in graph order. */
+  const codeFreeClosingToolNamesV1 = (): string[] =>
+    Object.values(missionGraphSession?.graph.nodes ?? {})
+      .filter(
+        (node) =>
+          node.id !== CODE_FREE_WORK_NODE_ID_V1 &&
+          node.dependencyIds.includes(CODE_FREE_WORK_NODE_ID_V1) &&
+          node.status !== "complete" &&
+          node.status !== "cancelled",
+      )
+      .flatMap((node) => node.allowedTools);
+  // What the open node has spent: its durable count from earlier segments,
+  // plus what this segment has spent since the node was first ready in it.
+  let codeFreeSegmentBaselineV1: {
+    spent: MissionOpenWorkSpentV1;
+    modelCalls: number;
+    tokens: number;
+    at: number;
+  } | null = null;
+  const codeFreeSpentNowV1 = (node: MissionNodeV3): MissionOpenWorkSpentV1 => {
+    const usage = observableModel.getUsage();
+    const tokensNow = usage.reportedTokens + usage.estimatedTokens;
+    if (!codeFreeSegmentBaselineV1) {
+      codeFreeSegmentBaselineV1 = {
+        spent: getMissionOpenWorkStateV1(node).spent,
+        modelCalls: usage.modelCallCount,
+        tokens: tokensNow,
+        at: nowMs(),
+      };
+    }
+    const baseline = codeFreeSegmentBaselineV1;
+    return {
+      modelCalls:
+        baseline.spent.modelCalls +
+        Math.max(0, usage.modelCallCount - baseline.modelCalls),
+      tokens: baseline.spent.tokens + Math.max(0, tokensNow - baseline.tokens),
+      ms: baseline.spent.ms + Math.max(0, Math.round(nowMs() - baseline.at)),
+    };
+  };
+  // The plan the running code_plan_update call recorded, for its finish.
+  let codeFreePendingPlanV1: {
+    revision: number;
+    items: CodePlanItemV1[];
+  } | null = null;
+  const recordCodePlanV1 = (items: CodePlanItemV1[]): void => {
+    const node = codeFreeOpenNodeV1();
+    const revision =
+      (node ? getMissionOpenWorkStateV1(node).plan?.revision ?? 0 : 0) + 1;
+    codeFreePendingPlanV1 = { revision, items: items.map((item) => ({ ...item })) };
+    const event: CodePlanUpdateEventV1 = {
+      version: 1,
+      runId,
+      nodeId: CODE_FREE_WORK_NODE_ID_V1,
+      revision,
+      items: items.map((item) => ({ ...item })),
+      updatedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+    };
+    events.onCodePlan?.(event);
+    events.onTrace?.({
+      id: `code-plan-${revision}`,
+      kind: "status",
+      message: `Coding plan revision ${revision}: ${
+        items.filter((item) => item.status === "done").length
+      } of ${items.length} done.`,
+      outputPreview: event,
+    });
+  };
   const beginMissionGraphTool = async (
     toolName: string,
     options: {
@@ -6306,6 +6482,104 @@ export async function runAgentMission({
           failureMessage: missionNodeFailureMessages.get(node.id),
         })
       : null;
+  /**
+   * One call of the free pass's open node has returned (CODE-18). The node
+   * stays open: the graph counts the call, keeps its evidence and receipt, and
+   * stops the node only on the rules that bound a guided pass. A red
+   * validation is the model's to read and correct; no host recovery is
+   * scheduled inside the open node.
+   */
+  const finishOpenWorkToolV1 = async (
+    execution: MissionGraphToolExecution,
+    toolName: string,
+    result: ToolExecutionResult,
+    receipt: AgentRunReceipt | null,
+    proof: { observedAt: string; evidenceFingerprint: string },
+  ): Promise<void> => {
+    if (!missionGraphSession) return;
+    const node = missionGraphSession.graph.nodes[execution.nodeId];
+    if (!node) return;
+    const validationFailed = hasFailedCodeValidationStatus(toolName, result);
+    const ok = result.ok && !validationFailed;
+    const validationReceipt =
+      isRecord(result.output) && isRecord(result.output.validationReceipt)
+        ? result.output.validationReceipt
+        : null;
+    const failureFingerprint = ok
+      ? undefined
+      : validationFailed &&
+          typeof validationReceipt?.failureFingerprint === "string" &&
+          /^sha256:[a-f0-9]{64}$/u.test(validationReceipt.failureFingerprint)
+        ? validationReceipt.failureFingerprint
+        : await sha256MissionFingerprint({
+            toolName,
+            code: result.error?.code ?? (validationFailed ? "validation_red" : "failed"),
+            message: result.error?.message ?? null,
+          });
+    const revision = missionGraphSession.graph.revision + 1;
+    const evidence = result.ok
+      ? {
+          id: missionGraphReferenceId("evidence", execution.nodeId, revision),
+          kind: "tool-result",
+          fingerprint: proof.evidenceFingerprint,
+          observedAt: proof.observedAt,
+        }
+      : undefined;
+    const graphReceipt =
+      result.ok && receipt
+        ? {
+            id: isSafeMissionGraphReferenceId(receipt.id)
+              ? receipt.id
+              : missionGraphReferenceId("receipt", execution.nodeId, revision),
+            kind: "action-receipt",
+            fingerprint: await sha256MissionFingerprint(
+              JSON.parse(JSON.stringify(receipt)),
+            ),
+            committedAt: proof.observedAt,
+          }
+        : undefined;
+    const plan =
+      toolName === CODE_PLAN_UPDATE_TOOL_NAME_V1 && result.ok
+        ? codeFreePendingPlanV1
+        : null;
+    codeFreePendingPlanV1 = null;
+    if (validationFailed) {
+      runtimeCache.passedFastRepairCycle = false;
+    }
+    const graph = await missionGraphSession.finishToolExecution(execution, {
+      ok,
+      evidence,
+      receipt: graphReceipt,
+      failureFingerprint,
+      failureMessage: validationFailed
+        ? `${toolName} completed red.`
+        : result.error?.message,
+      terminalFailure: false,
+      openWork: {
+        write: result.ok && CODE_FREE_WRITE_TOOLS_V1.has(toolName),
+        targetedPassed: ok && toolName === "code_validate_targeted",
+        validationFailed,
+        spent: codeFreeSpentNowV1(node),
+        ...(plan ? { plan } : {}),
+      },
+    });
+    const after = graph.nodes[execution.nodeId];
+    if (validationFailed && after?.status === "ready") {
+      messages.push({
+        role: "system",
+        content: [
+          `${toolName} completed red.`,
+          "Read the failure (the validation's diagnostic, code_repair_status, or the files it names), correct it with a real workspace edit, then validate again.",
+          "The same failure surviving two corrections stops the pass.",
+        ].join(" "),
+      });
+    }
+    if (after?.status === "blocked") {
+      events.onStatus?.(
+        `The free coding pass stopped: ${after.blocker?.message ?? "the open node is blocked"}`,
+      );
+    }
+  };
   const finishMissionGraphTool = async (
     execution: MissionGraphToolExecution | null,
     toolName: string,
@@ -6349,6 +6623,13 @@ export async function runAgentMission({
       // Approval denial/expiry is already a durable graph transition. Do not
       // reinterpret it as a tool attempt. Denial is blocked; an undecided
       // expired/aborted approval is ready for a fresh prepared action.
+      return;
+    }
+    if (node && isMissionOpenWorkNodeV1(node)) {
+      await finishOpenWorkToolV1(execution, toolName, result, receipt ?? null, {
+        observedAt,
+        evidenceFingerprint,
+      });
       return;
     }
     const canonicalEvidence = result.ok
@@ -6893,6 +7174,21 @@ export async function runAgentMission({
     requireToolBeforeStreamingWriteback = true;
   }
 
+  {
+    // CODE-18: the guided steps an open node replaced are its menu, owed only
+    // as the open node's own completion; the closing nodes keep theirs.
+    const openNode = codeFreeOpenNodeV1();
+    if (openNode && missionGraphSession) {
+      const owedElsewhere = new Set(
+        Object.values(missionGraphSession.graph.nodes)
+          .filter((node) => node.id !== openNode.id)
+          .flatMap((node) => node.allowedTools),
+      );
+      requiredWriteTools = requiredWriteTools.filter(
+        (name) => !openNode.allowedTools.includes(name) || owedElsewhere.has(name),
+      );
+    }
+  }
   const graphRequiredWriteTools = getPendingMissionGraphWriteToolNames(
     missionGraphSession?.graph ?? missionGraph,
   );
@@ -7521,6 +7817,67 @@ export async function runAgentMission({
   // extra reserve. An absolute cap here would re-starve the tool loop of
   // whatever planning consumed.
   applyExecutionBudgetForEffortDecision(runPlan.effortDecision, 0);
+  // CODE-18: a free pass's open node carries its own budget. Make room for
+  // what it has left plus the closing steps; the open node, not the effort
+  // tier, bounds the work, and the person's own caps still apply.
+  {
+    const openNode = codeFreeOpenNodeV1();
+    if (openNode && openNode.status !== "complete" && openNode.status !== "cancelled") {
+      codePlanOverlayV1.activate();
+      const state = getMissionOpenWorkStateV1(openNode);
+      const closingCount = Math.max(
+        0,
+        Object.keys(missionGraphSession?.graph.nodes ?? {}).length - 1,
+      );
+      const callsLeft = Math.max(0, openNode.budget.toolCalls - state.calls);
+      maxToolCalls = Math.min(
+        normalizeInvocationToolCallLimit(providedMaxToolCalls),
+        Math.max(
+          maxToolCalls,
+          observedToolCallCount + callsLeft + closingCount * 2 + 2,
+        ),
+      );
+      const usageNow = observableModel.getUsage();
+      const modelCallsLeft = Math.max(
+        0,
+        codeFreeBudgetV1.modelCalls - state.spent.modelCalls,
+      );
+      const tokensLeft = Math.max(0, codeFreeBudgetV1.tokens - state.spent.tokens);
+      const msLeft = Math.max(0, codeFreeBudgetV1.ms - state.spent.ms);
+      const maxCalls = Math.max(
+        modelExecutionBudget.maxCalls,
+        usageNow.modelCallCount + modelCallsLeft + closingCount * 2 + 4,
+      );
+      updateModelExecutionBudget({
+        schemaVersion: 1,
+        maxCalls,
+        maxTokens: Math.max(
+          modelExecutionBudget.maxTokens,
+          usageNow.reportedTokens +
+            usageNow.estimatedTokens +
+            tokensLeft +
+            (closingCount * 2 + 4) * configuredContextTokens,
+        ),
+        maxWallClockMs: applyEffortRunDeadline(
+          Math.max(
+            modelExecutionBudget.maxWallClockMs,
+            usageNow.wallClockMs + msLeft + closingCount * 120_000,
+          ),
+        ),
+      });
+      events.onTrace?.({
+        id: "code-free-work-budget",
+        kind: "status",
+        message: "Free coding pass budget applied.",
+        outputPreview: {
+          budget: codeFreeBudgetV1,
+          spent: state.spent,
+          maxToolCalls: Number.isFinite(maxToolCalls) ? maxToolCalls : null,
+          maxModelCalls: maxCalls,
+        },
+      });
+    }
+  }
   if (resumedOriginalMission) {
     events.onRunConfig?.(
       buildRunConfigEvent({
@@ -19345,8 +19702,21 @@ export async function runAgentMission({
       );
     }
   }
+  const codeFreeOpenAtLoopStart = (() => {
+    const node = codeFreeOpenNodeV1();
+    return Boolean(
+      node && node.status !== "complete" && node.status !== "cancelled",
+    );
+  })();
   const stepLimit = Math.min(
-    runPlan.maxStepsForRun,
+    // A free pass's open node is bounded by its own budget; the segment keeps
+    // the runner's safety limit and the person's step setting.
+    codeFreeOpenAtLoopStart
+      ? Math.min(
+          MAX_AGENT_STEPS,
+          runToolContext.settings?.maxAgentSteps ?? MAX_AGENT_STEPS,
+        )
+      : runPlan.maxStepsForRun,
     MAX_AGENT_STEPS,
     normalizeInvocationStepLimit(providedMaxSteps),
   );
@@ -20080,6 +20450,67 @@ export async function runAgentMission({
       );
     }
 
+    {
+      // CODE-18: the open node's model-call, token and time budgets are the
+      // host's to count; its tool calls are counted by the graph.
+      const openNode = codeFreeOpenNodeV1();
+      if (openNode?.status === "ready" && missionGraphSession) {
+        const spent = codeFreeSpentNowV1(openNode);
+        const spentOn =
+          spent.modelCalls >= codeFreeBudgetV1.modelCalls
+            ? `its ${codeFreeBudgetV1.modelCalls} model calls`
+            : spent.tokens >= codeFreeBudgetV1.tokens
+              ? `its ${codeFreeBudgetV1.tokens} tokens`
+              : spent.ms >= codeFreeBudgetV1.ms
+                ? `its ${Math.round(codeFreeBudgetV1.ms / 60_000)} minutes`
+                : null;
+        if (spentOn) {
+          await missionGraphSession.blockOpenWork({
+            nodeId: openNode.id,
+            blocker: {
+              code: "open_work_budget_exhausted",
+              message: `The open work node used ${spentOn}.`,
+              requiredAction:
+                "Continue with a larger budget, or finish the work by hand.",
+            },
+          });
+        }
+      }
+      const stopped = codeFreeOpenNodeV1();
+      if (
+        stopped?.status === "blocked" &&
+        stopped.blocker?.code === "open_work_budget_exhausted"
+      ) {
+        const state = getMissionOpenWorkStateV1(stopped);
+        const message = [
+          `Free coding pass stopped at its budget: ${stopped.blocker.message.replace(/^The open work node used /u, "it used ").replace(/\.$/u, "")}.`,
+          describeCodeFreeWorkLeftV1({
+            items: state.plan?.items ?? null,
+            closing: codeFreeClosingToolNamesV1(),
+          }),
+          "Nothing was committed.",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        recordLedgerBlocker(`open_work_budget_exhausted: ${message}`);
+        events.onStatus?.(message);
+        events.onTrace?.({
+          id: `code-free-work-budget-stop-${step}`,
+          kind: "status",
+          step,
+          message,
+          outputPreview: {
+            spent: state.spent,
+            calls: state.calls,
+            budget: codeFreeBudgetV1,
+          },
+        });
+        lastFinalOutput = message;
+        emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+        await finishRun("budget", Math.max(0, step - 1), stepLimit, message, true);
+        return;
+      }
+    }
     const stepGraph = missionGraphSession?.graph ?? missionGraph;
     const codeDeliveryPaid =
       setLooseDeliveryProofs.codeWorkspaceReadback === true ||
@@ -21827,6 +22258,7 @@ export async function runAgentMission({
       hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
     const shouldReserveFinalizationBeforeTool =
       responseToolCalls.length > 0 &&
+      codeFreeOpenNodeV1()?.status !== "ready" &&
       !responseRequestsPendingRequiredWrite &&
       pendingRequiredWritesBeforeToolUse.length === 0 &&
       !pendingStreamingWritebackBeforeTool &&
@@ -21965,6 +22397,73 @@ export async function runAgentMission({
       return;
     }
 
+    if (
+      responseToolCalls.length === 0 &&
+      missionGraphSession &&
+      codeFreeOpenNodeV1()?.status === "ready"
+    ) {
+      // CODE-18: in the open node a reply without a tool call is the model
+      // saying the work is done. It ends the node only after a targeted
+      // validation passed with no edit since; otherwise the model is told so.
+      const openNode = codeFreeOpenNodeV1()!;
+      const state = getMissionOpenWorkStateV1(openNode);
+      if (missionOpenWorkReadyToCompleteV1(state)) {
+        const completed = await missionGraphSession.completeOpenWork({
+          nodeId: openNode.id,
+          evidence: {
+            id: missionGraphReferenceId(
+              "evidence",
+              openNode.id,
+              missionGraphSession.graph.revision + 1,
+            ),
+            kind: "open-work-done",
+            fingerprint: await sha256MissionFingerprint({
+              nodeId: openNode.id,
+              calls: state.calls,
+              lastWriteCall: state.lastWriteCall,
+              lastTargetedPassCall: state.lastTargetedPassCall,
+              said: sanitizedStepResponseContent.slice(0, 2_000),
+            }),
+            observedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+          },
+        });
+        if (completed.ok) {
+          const closing = codeFreeClosingToolNamesV1();
+          const message = closing.length > 0
+            ? `The open coding work is done. The closing steps run now: ${closing.join(", ")}.`
+            : "The open coding work is done.";
+          events.onStatus?.(message);
+          events.onTrace?.({
+            id: `code-free-work-done-${step}`,
+            kind: "status",
+            step,
+            message,
+            outputPreview: { calls: state.calls, closing },
+          });
+          messages.push({
+            role: "system",
+            content: `${message} Call them in that order with the same workspace and repair request.`,
+          });
+          continue;
+        }
+      }
+      const owed =
+        state.lastTargetedPassCall === null
+          ? "No targeted validation has passed yet."
+          : "The workspace changed after the last passing targeted validation.";
+      events.onTrace?.({
+        id: `code-free-work-not-done-${step}`,
+        kind: "status",
+        step,
+        message: `The model said the work is done, but: ${owed}`,
+        outputPreview: { calls: state.calls },
+      });
+      messages.push({
+        role: "system",
+        content: `${owed} Run code_validate_targeted on the current files, and correct what it reports, before saying the work is done.`,
+      });
+      continue;
+    }
     if (responseToolCalls.length === 0) {
       events.onTrace?.({
         id: `no-tool-frontier-${step}`,

@@ -4,6 +4,7 @@ import { descriptorFor } from "../tools/toolDescriptors";
 import {
   buildMissionCapabilityEnvelopeV1,
   MISSION_GRAPH_MAX_DEPTH,
+  MISSION_GRAPH_MAX_NODES,
   type MissionAuthorityEffectV1,
   type MissionBindingGrantV1,
   type MissionCapabilityEnvelopeV1,
@@ -36,6 +37,7 @@ import { deriveRepeatedOperationNodesV1 } from "./repeatedOperationTargets";
 import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTool";
 import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
 import { extractExplicitJupyterNotebookPathsV1 } from "./jupyterReflectionIntent";
+import { CODE_FREE_WORK_NODE_ID_V1 } from "./codeFreeWorkV1";
 import {
   PROJECT_LIFECYCLE_STAGES,
   buildProjectLifecycleStageNodesV1,
@@ -93,6 +95,17 @@ export interface BuildHostMissionGraphPlanInput {
   };
   /** Exact host/extension readbacks applied before graph immutability begins. */
   bindingOverrides?: Readonly<Record<string, MissionBindingGrantV1>>;
+  /**
+   * A free coding pass (CODE-18): one open node `code_free_work` whose tools
+   * the model calls in any order within `toolCalls`, followed by the planned
+   * tools (the guided ladder's closing steps). Ignored for a composite
+   * lifecycle plan. Tools the allowed set lacks are left out.
+   */
+  codeFreeWork?: {
+    toolNames: readonly string[];
+    toolCalls: number;
+    wallClockMs: number;
+  } | null;
 }
 
 export interface HostMissionGraphPlanV1 {
@@ -321,6 +334,19 @@ export async function buildHostMissionGraphPlanV1(
     descriptorByName,
   });
   const plannedSet = new Set(plannedSteps.map((step) => step.name));
+  const openWorkTools = compositeLifecyclePlan === null && input.codeFreeWork
+    ? sortedUnique(
+        input.codeFreeWork.toolNames.filter((name) => descriptorByName.has(name)),
+      )
+    : [];
+  const openWork = openWorkTools.length > 0 && input.codeFreeWork
+    ? {
+        tools: openWorkTools,
+        toolCalls: Math.max(1, Math.floor(input.codeFreeWork.toolCalls)),
+        wallClockMs: Math.max(1_000, Math.floor(input.codeFreeWork.wallClockMs)),
+      }
+    : null;
+  const openWorkToolCalls = openWork?.toolCalls ?? 0;
   const maxToolNodes = MISSION_GRAPH_MAX_DEPTH - 1;
   if (!compositeLifecyclePlan && plannedSteps.length > maxToolNodes) {
     throw new Error(
@@ -330,7 +356,9 @@ export async function buildHostMissionGraphPlanV1(
   const selectedPlanned = compositeLifecyclePlan
     ? plannedSteps
     : plannedSteps.slice(0, maxToolNodes);
-  const maximumToolCallCapacity = compositeLifecyclePlan ? 10_000 : maxToolNodes;
+  const maximumToolCallCapacity = compositeLifecyclePlan
+    ? 10_000
+    : maxToolNodes + openWorkToolCalls;
   const maximumPostAcceptanceNodes = compositeLifecyclePlan
     ? Math.max(0, maxToolNodes - compositeLifecyclePlan.intent.stages.length)
     : Math.max(0, maxToolNodes - selectedPlanned.length);
@@ -342,7 +370,7 @@ export async function buildHostMissionGraphPlanV1(
     .slice(0, maximumPostAcceptanceNodes);
   const lifecycleStageCount = compositeLifecyclePlan?.intent.stages.length ?? 0;
   const mandatoryToolCallCount =
-    selectedPlanned.length + postAcceptanceNames.length;
+    selectedPlanned.length + postAcceptanceNames.length + openWorkToolCalls;
   const compositeBaseNodeCount = compositeLifecyclePlan
     ? lifecycleStageCount + postAcceptanceNames.length + 1
     : 0;
@@ -357,13 +385,24 @@ export async function buildHostMissionGraphPlanV1(
     : compositeLifecyclePlan
       ? mandatoryToolCallCount + compositeSafeReadNodeReserveLimit
       : maxToolNodes;
-  const toolCallCapacity = Math.min(
-    maximumToolCallCapacity,
-    Math.max(
-      selectedPlanned.length + postAcceptanceNames.length,
-      requestedToolCallCapacity,
-    ),
-  );
+  // An open node's calls come on top of the capacity a guided graph would
+  // have, so its closing nodes keep the same reserve for their bounded
+  // retries and recovery reads as the ladder they come from.
+  const toolCallCapacity = openWork
+    ? Math.min(
+        maxToolNodes,
+        Math.max(
+          selectedPlanned.length + postAcceptanceNames.length,
+          requestedToolCallCapacity,
+        ),
+      ) + openWorkToolCalls
+    : Math.min(
+        maximumToolCallCapacity,
+        Math.max(
+          selectedPlanned.length + postAcceptanceNames.length,
+          requestedToolCallCapacity,
+        ),
+      );
   const compositeSafeReadContinuationReserve = compositeLifecyclePlan
     ? Math.min(
         compositeSafeReadNodeReserveLimit,
@@ -388,6 +427,8 @@ export async function buildHostMissionGraphPlanV1(
     .filter((name) => modelVisibleNames.has(name))
     .filter((name) => descriptorByName.get(name)?.effect === "read")
     .filter(() => compositeLifecyclePlan === null)
+    // The open node already offers every read on its menu.
+    .filter(() => openWork === null)
     .slice(
       0,
       Math.max(
@@ -456,18 +497,26 @@ export async function buildHostMissionGraphPlanV1(
   // Reserve bounded graph and wall-clock capacity for repeated approved reads
   // (for example, fetching multiple sources with the same descriptor). A
   // completed node remains immutable, so each repeat receives its own node.
+  // An open node's calls are its own budget, not one node each: the graph
+  // keeps room for the closing nodes and their bounded retries beside it.
   const maxNodes = compositeLifecyclePlan
     ? compositeBaseNodeCount + compositeSafeReadContinuationReserve
-    : toolCallCapacity + 1;
+    : openWork
+      ? Math.min(
+          MISSION_GRAPH_MAX_NODES,
+          Math.max(1, toolCallCapacity - openWorkToolCalls) + 2,
+        )
+      : toolCallCapacity + 1;
   const totalCatalogToolCalls = toolCallCapacity;
-  const budgetNodeCount = toolCallCapacity + 1;
-  const graphWallClockMs = Math.max(
+  const budgetNodeCount = toolCallCapacity + 1 - openWorkToolCalls;
+  const plannedNodeWallClockMs = Math.max(
     Math.round(input.maxWallClockMs),
     budgetNodeCount * 1_000,
   );
+  const graphWallClockMs = plannedNodeWallClockMs + (openWork?.wallClockMs ?? 0);
   const toolNodeWallClockMs = missionGraphToolNodeWallClockMs(
-    graphWallClockMs,
-    toolCallCapacity,
+    plannedNodeWallClockMs,
+    toolCallCapacity - openWorkToolCalls,
   );
   const capabilityEnvelope = await buildMissionCapabilityEnvelopeV1({
     missionId: input.missionId,
@@ -533,7 +582,7 @@ export async function buildHostMissionGraphPlanV1(
         Math.max(
           compositeLifecyclePlan
             ? lifecycleStageCount + 1
-            : selectedPlanned.length + 1,
+            : selectedPlanned.length + 1 + (openWork ? 1 : 0),
           input.minimumGraphDepth ?? 1,
         ),
       ),
@@ -583,6 +632,18 @@ export async function buildHostMissionGraphPlanV1(
     preferBackground: input.background?.preferBackground === true,
     bindingIdByTool,
   });
+  if (openWork) {
+    addOpenWorkNodeV1({
+      nodes: deterministicNodes,
+      tools: openWork.tools,
+      toolCalls: openWork.toolCalls,
+      wallClockMs: openWork.wallClockMs,
+      objective: input.objective,
+      descriptorByName,
+      bindingIdByTool,
+      maxAttempts: capabilityEnvelope.budgets.maxAttemptsPerNode,
+    });
+  }
   addFinalNode(deterministicNodes, input.objective);
   addPostAcceptanceNodes({
     nodes: deterministicNodes,
@@ -1462,6 +1523,88 @@ function explicitVaultSelector(input: {
     return paths[0]!;
   }
   return input.currentNotePath;
+}
+
+/**
+ * The open node of a free coding pass. Its tools are a menu, called in any
+ * order within its tool-call budget; each effectful tool is held under an
+ * exclusive lock on its own binding, and the node carries no destination and
+ * no external action. Every planned step depends on it, so the closing
+ * ladder runs only once the host has completed it.
+ */
+function addOpenWorkNodeV1(input: {
+  nodes: Record<string, MissionGraphNodeProposalV1>;
+  tools: string[];
+  toolCalls: number;
+  wallClockMs: number;
+  objective: string;
+  descriptorByName: ReadonlyMap<string, ToolDescriptor>;
+  bindingIdByTool: ReadonlyMap<string, string | null>;
+  maxAttempts: number;
+}): void {
+  const descriptors = input.tools.map((name) => input.descriptorByName.get(name)!);
+  const lockBindingIds = sortedUnique(
+    descriptors
+      .filter((descriptor) => graphEffect(descriptor) !== "read")
+      .map((descriptor) => input.bindingIdByTool.get(descriptor.name) ?? null)
+      .filter((bindingId): bindingId is string => typeof bindingId === "string"),
+  );
+  for (const node of Object.values(input.nodes)) {
+    node.dependencyIds = sortedUnique([
+      ...node.dependencyIds,
+      CODE_FREE_WORK_NODE_ID_V1,
+    ]);
+  }
+  input.nodes[CODE_FREE_WORK_NODE_ID_V1] = {
+    id: CODE_FREE_WORK_NODE_ID_V1,
+    dependencyIds: [],
+    objective:
+      `Do the coding work in one open step: read, search, edit and check in any order, keeping a plan with code_plan_update, until a targeted validation passes after the last edit; then say the work is done. Mission: ${input.objective}`.slice(
+        0,
+        4_000,
+      ),
+    executorId: "single-agent",
+    executionHost: "obsidian_core",
+    effect: strongestGraphEffectV1(
+      descriptors.map((descriptor) => graphEffect(descriptor)),
+    ),
+    inputs: {
+      open_work: {
+        kind: "literal",
+        value: {
+          version: 1,
+          open: true,
+          kind: "code_free_work",
+          tools: [...input.tools],
+        },
+      },
+    },
+    requiredCapabilities: sortedUnique(
+      descriptors.map((descriptor) => capabilityId(descriptor)),
+    ),
+    allowedTools: [...input.tools],
+    destination: null,
+    resourceLocks: lockBindingIds.map((bindingId) => ({
+      bindingId,
+      mode: "exclusive" as const,
+    })),
+    budget: {
+      toolCalls: input.toolCalls,
+      externalActions: 0,
+      wallClockMs: input.wallClockMs,
+    },
+    maxAttempts: input.maxAttempts,
+    completionContract: {
+      criteria: [
+        "The model said the work is done after a targeted validation passed, with no write after it.",
+      ],
+      minimumEvidence: 1,
+      requiredEvidenceKinds: ["open-work-done"],
+      minimumReceipts: 0,
+      requiredReceiptKinds: [],
+      verifierId: null,
+    },
+  };
 }
 
 function addFinalNode(
