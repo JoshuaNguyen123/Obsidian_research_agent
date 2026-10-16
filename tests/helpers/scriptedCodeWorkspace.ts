@@ -161,6 +161,7 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
     context: ToolExecutionContext,
     target: ResourceRef,
     summary: string,
+    after?: Record<string, string>,
   ): Promise<{ ok: true; action: PreparedAction }> => {
     const id = nextId(`action-${name}`);
     return {
@@ -174,7 +175,7 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
         target,
         relatedResources: [],
         normalizedArgs: JSON.parse(JSON.stringify(args)),
-        preview: { summary, destination: target.id, warnings: [], outboundBytes: 0 },
+        preview: { summary, destination: target.id, warnings: [], outboundBytes: 0, ...(after ? { after } : {}) },
         idempotencyKey: id,
         preparedAt: nowIso(),
         expiresAt: new Date(options.now().getTime() + 10 * 60_000).toISOString(),
@@ -228,6 +229,8 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
     operation: string;
     apply: (args: Record<string, unknown>) => { path: string; output?: Record<string, unknown> };
     pathOf: (args: Record<string, unknown>) => string;
+    /** What the prepared action names as its kind of change, as the real tool does. */
+    after?: (args: Record<string, unknown>) => Record<string, string>;
   }): AgentTool => ({
     name: input.name,
     description: `Scripted ${input.name}.`,
@@ -244,7 +247,7 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
       return { status: "blocked", code: "prepared_action_required" };
     },
     prepare: async (args, context) =>
-      prepare(input.name, args, context, resource(workspaceOf(args), input.pathOf(args)), `${input.operation} ${input.pathOf(args)}`),
+      prepare(input.name, args, context, resource(workspaceOf(args), input.pathOf(args)), `${input.operation} ${input.pathOf(args)}`, input.after?.(args)),
     async executePrepared(action, context) {
       const args = action.normalizedArgs as Record<string, unknown>;
       const applied = input.apply(args);
@@ -446,6 +449,20 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
       action: "update",
       operation: "apply_patch",
       pathOf: (args) => parseUnifiedPatchV1(args.patch)[0]!.path,
+      // The real tool's rule: a delete makes the patch a trash, else a rename a move,
+      // else adding only a create, else an update.
+      after: (args) => {
+        const kinds = parseUnifiedPatchV1(args.patch).map((file) => file.kind);
+        return {
+          operation: kinds.includes("delete")
+            ? "trash"
+            : kinds.includes("rename")
+              ? "move"
+              : kinds.every((kind) => kind === "add")
+                ? "create"
+                : "update",
+        };
+      },
       apply: (args) => {
         // All or nothing, as the workspace manager's batch is.
         const files = parseUnifiedPatchV1(args.patch);

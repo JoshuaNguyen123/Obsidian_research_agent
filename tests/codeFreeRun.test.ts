@@ -49,6 +49,8 @@ async function runPass(input: {
   options?: Record<string, unknown>;
   decide: (offered: string[]) => { calls: Call[] } | { content: string };
   structured?: Parameters<typeof scriptedCodeModel>[1];
+  /** Tools whose approval the person denies. */
+  deny?: readonly string[];
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
@@ -71,7 +73,7 @@ async function runPass(input: {
     settings: scriptedRunSettings({ maxAgentSteps: 60 }),
   });
   const model = scriptedCodeModel(({ offered }) => input.decide(offered), input.structured);
-  const approvals = autoApprovals();
+  const approvals = autoApprovals({ deny: input.deny });
   const graphs: MissionGraphV3[] = [];
   const plans: CodePlanUpdateEventV1[] = [];
   const answers: string[] = [];
@@ -618,4 +620,109 @@ test("a guided pass whose steps name the patch plans one patch step, offered alo
   assert.equal(run.workspace.state.files.get("tests/test_pager.py"), TESTS_AFTER);
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
+});
+
+// CODE-7 4b: a patch is judged by its kind. A patch that renames a file asks
+// as code_workspace_move does, and one that deletes asks as code_workspace_trash
+// does, even though the run's write autonomy passes an edit without asking.
+const RENAMING_PATCH = [
+  "diff --git a/tests/test_pager.py b/tests/test_offset.py",
+  "rename from tests/test_pager.py",
+  "rename to tests/test_offset.py",
+  "--- a/tests/test_pager.py",
+  "+++ b/tests/test_offset.py",
+  "@@ -1 +1,2 @@",
+  " assert offset(0, 10) == 0",
+  "+assert offset(2, 10) == 20",
+  "--- a/src/pager.py",
+  "+++ b/src/pager.py",
+  "@@ -1,2 +1,2 @@",
+  " def offset(page, size):",
+  "-    return page * size + 1",
+  "+    return page * size",
+  "",
+].join("\n");
+const DELETING_PATCH = [
+  "--- a/tests/test_pager.py",
+  "+++ /dev/null",
+  "@@ -1 +0,0 @@",
+  "-assert offset(0, 10) == 0",
+  "--- a/src/pager.py",
+  "+++ b/src/pager.py",
+  "@@ -1,2 +1,2 @@",
+  " def offset(page, size):",
+  "-    return page * size + 1",
+  "+    return page * size",
+  "",
+].join("\n");
+
+async function freePatchPass(patch: string) {
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_read", { path: "src/pager.py" }),
+    call("code_workspace_apply_patch", { patch }),
+    call("code_validate_targeted"),
+  ];
+  return runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free" },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        return next ? { calls: [next] } : { content: "Fixed." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+}
+
+test("under write autonomy a patch that only edits goes ahead, one that renames or deletes a file asks first", async () => {
+  const edits = await freePatchPass(TWO_FILE_PATCH);
+  assert.equal(edits.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(
+    edits.approvals.requests.some((request) => request.toolName === "code_workspace_apply_patch"),
+    false,
+    "an edit passes under write autonomy, as code_workspace_patch does",
+  );
+
+  const renames = await freePatchPass(RENAMING_PATCH);
+  const renameAsks = renames.approvals.requests.filter((request) => request.toolName === "code_workspace_apply_patch");
+  assert.equal(renameAsks.length, 1, "a rename asks once, as code_workspace_move does");
+  assert.equal(renames.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(renames.workspace.state.files.has("tests/test_pager.py"), false);
+  assert.equal(renames.workspace.state.files.get("tests/test_offset.py"), TESTS_AFTER);
+
+  const deletes = await freePatchPass(DELETING_PATCH);
+  const deleteAsks = deletes.approvals.requests.filter((request) => request.toolName === "code_workspace_apply_patch");
+  assert.equal(deleteAsks.length, 1, "a delete asks once, as code_workspace_trash does");
+  assert.equal(deletes.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(deletes.workspace.state.files.has("tests/test_pager.py"), false);
+});
+
+test("a denied patch that deletes a file changes nothing", async () => {
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_read", { path: "src/pager.py" }),
+    call("code_workspace_apply_patch", { patch: DELETING_PATCH }),
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free" },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        return next ? { calls: [next] } : { content: "Stopped." };
+      }
+      return { content: "Stopped." };
+    },
+    deny: ["code_workspace_apply_patch"],
+  });
+  assert.ok(run.approvals.requests.some((request) => request.toolName === "code_workspace_apply_patch"));
+  assert.equal(run.workspace.state.files.get("src/pager.py"), BUGGY);
+  assert.equal(run.workspace.state.files.has("tests/test_pager.py"), true);
 });
