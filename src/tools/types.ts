@@ -399,6 +399,13 @@ export interface AgentRuntimeCache {
    */
   verifiedWorkspaceReads?: Map<string, VerifiedWorkspaceReadObservation>;
   /**
+   * Run-local line-range reads of workspace files (`code_workspace_read` with
+   * `startLine`/`lineCount`). They never stand in for a whole-file read: they
+   * are kept only so a full-file replacement after a partial read can be
+   * refused in words (see getPartialWorkspaceReadRefusalV1).
+   */
+  partialWorkspaceReads?: Map<string, PartialWorkspaceReadObservationV1>;
+  /**
    * Latest already-redacted fast-validation excerpt for the active segment.
    * The cache itself is never serialized; a continuation may rehydrate it only
    * from a canonical committed receipt with verified readback so compaction or
@@ -422,6 +429,16 @@ export interface VerifiedWorkspaceReadObservation {
   path: string;
   sha256: string;
   content: string;
+}
+
+export interface PartialWorkspaceReadObservationV1 {
+  workspaceId: string;
+  path: string;
+  /** SHA-256 of the whole file when the ranges were read. */
+  sha256: string;
+  totalLines: number;
+  /** Inclusive, 1-based line ranges read at this sha256, merged. */
+  ranges: Array<[number, number]>;
 }
 
 export interface VerifiedMermaidReadObservation {

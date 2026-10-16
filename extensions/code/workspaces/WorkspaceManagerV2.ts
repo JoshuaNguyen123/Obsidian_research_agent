@@ -18,16 +18,43 @@ import {
 import {
   MAX_SEARCH_CANDIDATES_V1,
   rankWorkspaceSearchCandidatesV1,
+  scoreWorkspaceSearchCandidateV1,
   workspaceQueryTermsV1,
   type WorkspaceSearchCandidateV1,
   type WorkspaceSearchMatchKindV1,
 } from "./workspaceSearchRankingV1";
+import {
+  WorkspaceGlobErrorV1,
+  compileWorkspaceGlobListV1,
+  workspaceGlobFilterAcceptsV1,
+  workspaceGlobFilterPrunesFolderV1,
+  type WorkspaceGlobV1,
+} from "./workspaceGlobV1";
+import { isWorkspaceListingSkippedDirectoryV1 } from "./workspaceIgnoredDirectoriesV1";
+import { codeLineSpansV1 } from "../../../src/model/codeWorkspacePayloadV1";
 
 const MANIFEST_FILE = "manifest.v2.json";
 const ROOT_FOLDER = "root";
 const TRASH_FOLDER = "trash";
 const MAX_TREE_ENTRIES = 10_000;
 const MAX_LIST_ENTRIES = 500;
+/** Entries a tree listing returns; the model sees as many as fit. */
+const MAX_TREE_LIST_ENTRIES_V2 = 2_000;
+const DEFAULT_TREE_DEPTH_V2 = 5;
+const MAX_TREE_DEPTH_V2 = 20;
+export const MAX_SEARCH_CONTEXT_LINES_V2 = 3;
+/** A search stops, and says so, after this much wall time. */
+const SEARCH_TIME_BUDGET_MS_V2 = 10_000;
+/** A regular expression is tried on at most this much of one line. */
+const MAX_REGEX_LINE_CHARS_V2 = 20_000;
+const MAX_SEARCH_SKIPPED_NAMED_V2 = 20;
+/**
+ * An innermost group that repeats without bound and holds a repeat itself,
+ * `(a+)+`, `(\w*,)*`: the shape whose backtracking is exponential. Refused
+ * rather than run, because one line can hang the host.
+ */
+const NESTED_UNBOUNDED_REPEAT_V2 =
+  /\((?:[^()\\]|\\.)*(?:[+*]|\{\d+,\})(?:[^()\\]|\\.)*\)(?:[+*]|\{\d+,\})/u;
 const DEFAULT_EXPIRY_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export class WorkspaceManagerErrorV2 extends Error {
@@ -89,6 +116,84 @@ export interface WorkspaceSearchResultV2 {
   score: number;
   /** Whether this line declares the match, refers to it, or merely mentions it. */
   matchKind: WorkspaceSearchMatchKindV1;
+}
+
+export interface WorkspaceSearchOptionsV2 {
+  path?: string;
+  caseSensitive?: boolean;
+  limit?: number;
+  /** Read the query as a JavaScript regular expression. */
+  regex?: boolean;
+  /** Globs a file must match one of (workspaceGlobV1 rules). */
+  include?: readonly string[];
+  /** Globs that leave a file, or a whole folder, out. */
+  exclude?: readonly string[];
+  /** Lines of context before and after each hit, 0–3. */
+  contextLines?: number;
+}
+
+export interface WorkspaceSearchContextLineV2 {
+  line: number;
+  text: string;
+}
+
+export interface WorkspaceSearchHitV2 extends WorkspaceSearchResultV2 {
+  before?: WorkspaceSearchContextLineV2[];
+  after?: WorkspaceSearchContextLineV2[];
+}
+
+export type WorkspaceSearchSkipReasonV2 =
+  | "binary"
+  | "too_large"
+  | "link"
+  | "nested_git"
+  | "hard_link"
+  | "unreadable"
+  | "unsupported";
+
+export interface WorkspaceSearchReportV2 {
+  query: string;
+  regex: boolean;
+  caseSensitive: boolean;
+  /** Workspace-relative folder (or file) searched; "" is the root. */
+  path: string;
+  include: string[];
+  exclude: string[];
+  contextLines: number;
+  limit: number;
+  results: WorkspaceSearchHitV2[];
+  /** Matches found before the limit picked `results` (lines, for a regex). */
+  matchCount: number;
+  filesSearched: number;
+  filesSkipped: number;
+  /** The first skipped paths and why; `skippedByReason` counts them all. */
+  skipped: Array<{ path: string; reason: WorkspaceSearchSkipReasonV2 }>;
+  skippedByReason: Partial<Record<WorkspaceSearchSkipReasonV2, number>>;
+  /** True when matches were left out or the walk stopped early. */
+  truncated: boolean;
+  stoppedReason: "entry_cap" | "candidate_cap" | "time_budget" | null;
+}
+
+export interface WorkspaceTreeEntryV2 {
+  path: string;
+  kind: "file" | "directory" | "link" | "other";
+  bytes: number;
+  /** 1 for the listed folder's own children. */
+  depth: number;
+  note: "dependency_or_build" | "not_expanded" | "link" | "unsupported" | null;
+}
+
+export interface WorkspaceTreeListingV2 {
+  path: string;
+  recursive: boolean;
+  maxDepth: number;
+  glob: string | null;
+  entries: WorkspaceTreeEntryV2[];
+  files: number;
+  directories: number;
+  truncated: boolean;
+  /** Where a cut listing stopped. */
+  stoppedAt: string | null;
 }
 
 export interface WorkspaceManagerOptionsV2 {
@@ -838,40 +943,115 @@ export class WorkspaceManagerV2 {
     return readTextFile(target.absolutePath, target.relativePath);
   }
 
-  async search(workspaceId: string, query: string, options: { path?: string; caseSensitive?: boolean; limit?: number } = {}): Promise<WorkspaceSearchResultV2[]> {
+  async search(workspaceId: string, query: string, options: WorkspaceSearchOptionsV2 = {}): Promise<WorkspaceSearchResultV2[]> {
+    const report = await this.searchDetailed(workspaceId, query, options);
+    return report.results.map(({ before: _before, after: _after, ...hit }) => hit);
+  }
+
+  /**
+   * The search a model calls. A literal query is ranked best first (see
+   * workspaceSearchRankingV1); `regex: true` takes a JavaScript regular
+   * expression and lists the matching lines in file and line order. A file
+   * that cannot be searched — a link, a binary or over-2 MiB file, a hard
+   * link, a nested `.git` — is skipped and counted rather than failing the
+   * whole search, and a walk that reaches its entry or time limit stops and
+   * says so.
+   */
+  async searchDetailed(
+    workspaceId: string,
+    query: string,
+    options: WorkspaceSearchOptionsV2 = {},
+  ): Promise<WorkspaceSearchReportV2> {
     const needle = boundedText(query, "search query", 1_000);
     const manifest = await this.requireReadable(await this.loadManifest(workspaceId));
     const start = options.path ? assertWorkspaceRelativePathV2(options.path) : "";
-    const tree = await this.scanTree(manifest, start);
     const limit = clamp(options.limit ?? WORKSPACE_MAX_SEARCH_RESULTS_V2, 1, WORKSPACE_MAX_SEARCH_RESULTS_V2);
     const caseSensitive = options.caseSensitive === true;
+    const regexMode = options.regex === true;
+    const contextLineCount = clamp(options.contextLines ?? 0, 0, MAX_SEARCH_CONTEXT_LINES_V2);
+    const include = compileGlobs(options.include, "include");
+    const exclude = compileGlobs(options.exclude, "exclude");
+    const expression = regexMode ? compileSearchExpressionV2(needle, caseSensitive) : null;
+    const target = start
+      ? await this.resolveSafePath(manifest, start, { mustExist: true, mutation: false })
+      : { absolutePath: manifest.canonicalRoot, relativePath: "" };
+    const walk = await walkSearchableFilesV2(target.absolutePath, target.relativePath, {
+      include,
+      exclude,
+      searchRoot: start,
+    });
+
     const expected = caseSensitive ? needle : needle.toLocaleLowerCase();
-    const queryTerms = workspaceQueryTermsV1(needle, caseSensitive);
+    const queryTerms = regexMode ? [] : workspaceQueryTermsV1(needle, caseSensitive);
     // A single term identical to the query would make the fallback a copy of
     // the phrase pass, so it is only built when it could differ.
-    const wantsTermFallback =
-      queryTerms.length > 1 || (queryTerms.length === 1 && queryTerms[0] !== expected);
+    const wantsTermFallback = !regexMode &&
+      (queryTerms.length > 1 || (queryTerms.length === 1 && queryTerms[0] !== expected));
 
     const phraseMatches: WorkspaceSearchCandidateV1[] = [];
     const termMatches: WorkspaceSearchCandidateV1[] = [];
+    const regexMatches: WorkspaceSearchCandidateV1[] = [];
+    let regexMatchCount = 0;
     const documentFrequencies = new Map<string, number>();
     let documentCount = 0;
+    const fileLines = new Map<string, string[]>();
+    const startedAt = Date.now();
+    let stoppedReason: WorkspaceSearchReportV2["stoppedReason"] = walk.stoppedAtEntryCap ? "entry_cap" : null;
 
-    for (const file of tree.files) {
-      const read = await this.read(workspaceId, file.path);
+    for (const file of walk.files) {
+      if (Date.now() - startedAt > SEARCH_TIME_BUDGET_MS_V2) {
+        stoppedReason = "time_budget";
+        break;
+      }
+      const loaded = await loadSearchableTextV2(file.absolutePath);
+      if (!loaded.ok) {
+        walk.skip(file.path, loaded.reason);
+        continue;
+      }
+      const content = loaded.content;
       documentCount += 1;
-      const haystack = caseSensitive ? read.content : read.content.toLocaleLowerCase();
+      const lines = codeLineSpansV1(content).map((span) => content.slice(span.start, span.end));
+      let fileMatched = false;
+      if (expression) {
+        for (const [index, line] of lines.entries()) {
+          if ((index & 255) === 255 && Date.now() - startedAt > SEARCH_TIME_BUDGET_MS_V2) {
+            stoppedReason = "time_budget";
+            break;
+          }
+          const haystack = line.length > MAX_REGEX_LINE_CHARS_V2 ? line.slice(0, MAX_REGEX_LINE_CHARS_V2) : line;
+          expression.lastIndex = 0;
+          const match = expression.exec(haystack);
+          if (!match) continue;
+          regexMatchCount += 1;
+          fileMatched = true;
+          if (regexMatches.length < MAX_SEARCH_CANDIDATES_V1) {
+            regexMatches.push({ path: file.path, line: index + 1, column: match.index + 1, text: line, needle: match[0], matchedTerms: [], phrase: true });
+          }
+        }
+        if (stoppedReason === "time_budget") {
+          if (fileMatched) fileLines.set(file.path, lines);
+          break;
+        }
+        if (fileMatched) fileLines.set(file.path, lines);
+        if (regexMatches.length >= MAX_SEARCH_CANDIDATES_V1 && regexMatchCount > regexMatches.length) {
+          stoppedReason = "candidate_cap";
+          break;
+        }
+        continue;
+      }
+      const haystack = caseSensitive ? content : content.toLocaleLowerCase();
       for (const term of queryTerms) {
         if (haystack.includes(term)) {
           documentFrequencies.set(term, (documentFrequencies.get(term) ?? 0) + 1);
         }
       }
-      for (const [index, line] of read.content.split(/\r?\n/u).entries()) {
+      for (const [index, line] of lines.entries()) {
         const candidate = caseSensitive ? line : line.toLocaleLowerCase();
         const matchedTerms = queryTerms.filter((term) => candidate.includes(term));
         let offset = candidate.indexOf(expected);
         while (offset >= 0 && phraseMatches.length < MAX_SEARCH_CANDIDATES_V1) {
           phraseMatches.push({ path: file.path, line: index + 1, column: offset + 1, text: line, needle: expected, matchedTerms, phrase: true });
+          fileMatched = true;
           offset = candidate.indexOf(expected, offset + Math.max(1, expected.length));
         }
         if (wantsTermFallback && matchedTerms.length > 0 && termMatches.length < MAX_SEARCH_CANDIDATES_V1) {
@@ -880,26 +1060,184 @@ export class WorkspaceManagerV2 {
           // corpus statistics finish.
           const anchor = [...matchedTerms].sort((left, right) => right.length - left.length || (left < right ? -1 : 1))[0]!;
           termMatches.push({ path: file.path, line: index + 1, column: candidate.indexOf(anchor) + 1, text: line, needle: anchor, matchedTerms, phrase: false });
+          fileMatched = true;
         }
       }
+      if (fileMatched && contextLineCount > 0) fileLines.set(file.path, lines);
     }
 
-    // Term matching widens a query that found nothing; it never dilutes one
-    // that found something.
-    const chosen = phraseMatches.length > 0 ? phraseMatches : termMatches;
-    const ranked = rankWorkspaceSearchCandidatesV1(
-      chosen,
-      { documentCount, documentFrequencies, queryTerms },
-      { caseSensitive },
-    );
-    return ranked.slice(0, limit).map((match) => ({
-      path: match.path,
-      line: match.line,
-      column: match.column,
-      preview: match.text.slice(0, 500),
-      score: match.score,
-      matchKind: match.matchKind,
-    }));
+    let ordered: Array<WorkspaceSearchCandidateV1 & { score: number; matchKind: WorkspaceSearchMatchKindV1 }>;
+    let matchCount: number;
+    if (expression) {
+      // Grep order: a regular expression is usually asked to enumerate, and
+      // context reads best when neighbouring hits stay together.
+      ordered = regexMatches.map((match) => ({
+        ...match,
+        ...scoreWorkspaceSearchCandidateV1(match, { documentCount, documentFrequencies, queryTerms }, { caseSensitive }),
+      }));
+      matchCount = regexMatchCount;
+    } else {
+      // Term matching widens a query that found nothing; it never dilutes one
+      // that found something.
+      const chosen = phraseMatches.length > 0 ? phraseMatches : termMatches;
+      ordered = rankWorkspaceSearchCandidatesV1(
+        chosen,
+        { documentCount, documentFrequencies, queryTerms },
+        { caseSensitive },
+      );
+      matchCount = chosen.length;
+      if (chosen.length >= MAX_SEARCH_CANDIDATES_V1 && stoppedReason === null) stoppedReason = "candidate_cap";
+    }
+    const results: WorkspaceSearchHitV2[] = ordered.slice(0, limit).map((match) => {
+      const hit: WorkspaceSearchHitV2 = {
+        path: match.path,
+        line: match.line,
+        column: match.column,
+        preview: match.text.slice(0, 500),
+        score: match.score,
+        matchKind: match.matchKind,
+      };
+      const lines = contextLineCount > 0 ? fileLines.get(match.path) : undefined;
+      if (lines) {
+        hit.before = contextWindow(lines, match.line - contextLineCount, match.line - 1);
+        hit.after = contextWindow(lines, match.line + 1, match.line + contextLineCount);
+      }
+      return hit;
+    });
+    return {
+      query: needle,
+      regex: regexMode,
+      caseSensitive,
+      path: target.relativePath,
+      include: include.map((glob) => glob.pattern),
+      exclude: exclude.map((glob) => glob.pattern),
+      contextLines: contextLineCount,
+      limit,
+      results,
+      matchCount,
+      filesSearched: documentCount,
+      filesSkipped: walk.skippedCount(),
+      skipped: walk.skipped.slice(0, MAX_SEARCH_SKIPPED_NAMED_V2),
+      skippedByReason: walk.skippedByReason(),
+      truncated: matchCount > results.length || stoppedReason !== null,
+      stoppedReason,
+    };
+  }
+
+  /**
+   * A folder as a tree for a model to read. Nothing is hashed (a listing is
+   * for finding, not for proof), links are shown and never followed, `.git`
+   * is left out, and dependency and build folders (node_modules, dist, build,
+   * __pycache__, …) are shown but not descended into unless the listing
+   * starts inside one. With `glob`, only matching files and the folders that
+   * lead to them are kept.
+   */
+  async listTree(
+    workspaceId: string,
+    relativePath = "",
+    options: { recursive?: boolean; maxDepth?: number; glob?: string | null } = {},
+  ): Promise<WorkspaceTreeListingV2> {
+    const manifest = await this.requireReadable(await this.loadManifest(workspaceId));
+    const target = relativePath
+      ? await this.resolveSafePath(manifest, relativePath, { mustExist: true, mutation: false })
+      : { absolutePath: manifest.canonicalRoot, relativePath: "" };
+    const rootStat = await fs.lstat(target.absolutePath);
+    if (!rootStat.isDirectory()) {
+      throw new WorkspaceManagerErrorV2(
+        "not_a_directory",
+        `${target.relativePath} is a file; read it with code_workspace_read instead of listing it.`,
+      );
+    }
+    const recursive = options.recursive === true;
+    const maxDepth = recursive
+      ? clamp(options.maxDepth ?? DEFAULT_TREE_DEPTH_V2, 1, MAX_TREE_DEPTH_V2)
+      : 1;
+    const glob = options.glob ? compileGlobs([options.glob], "glob")[0] ?? null : null;
+    const insideSkipped = target.relativePath
+      .split("/")
+      .some((segment) => segment && isWorkspaceListingSkippedDirectoryV1(segment));
+    const raw: WorkspaceTreeEntryV2[] = [];
+    let visited = 0;
+    let truncated = false;
+    let stoppedAt: string | null = null;
+    const visit = async (folder: string, relative: string, depth: number): Promise<void> => {
+      if (truncated) return;
+      const names: string[] = [];
+      try {
+        for await (const entry of await fs.opendir(folder)) {
+          names.push(entry.name);
+          if (names.length > MAX_LIST_ENTRIES) break;
+        }
+      } catch (error) {
+        // The listed folder itself must be readable; a subfolder that is not
+        // is shown without its contents.
+        if (depth === 1) throw error;
+        return;
+      }
+      if (names.length > MAX_LIST_ENTRIES) {
+        truncated = true;
+        stoppedAt = relative ? `${relative}/` : "./";
+        names.length = MAX_LIST_ENTRIES;
+      }
+      for (const name of names.sort((left, right) => left.localeCompare(right))) {
+        if (name.toLowerCase() === ".git") continue;
+        visited += 1;
+        if (visited > MAX_TREE_ENTRIES || raw.length >= MAX_TREE_LIST_ENTRIES_V2) {
+          truncated = true;
+          stoppedAt ??= relative ? `${relative}/${name}` : name;
+          return;
+        }
+        const entryRelative = relative ? `${relative}/${name}` : name;
+        const absolute = path.join(folder, name);
+        const stat = await fs.lstat(absolute).catch(() => null);
+        if (!stat) continue;
+        if (stat.isSymbolicLink()) {
+          raw.push({ path: entryRelative, kind: "link", bytes: 0, depth, note: "link" });
+        } else if (stat.isDirectory()) {
+          const skipped = !insideSkipped && isWorkspaceListingSkippedDirectoryV1(name);
+          const expand = !skipped && depth < maxDepth;
+          raw.push({
+            path: entryRelative,
+            kind: "directory",
+            bytes: 0,
+            depth,
+            note: skipped ? "dependency_or_build" : !expand && recursive ? "not_expanded" : null,
+          });
+          if (expand) await visit(absolute, entryRelative, depth + 1);
+        } else if (stat.isFile()) {
+          raw.push({ path: entryRelative, kind: "file", bytes: stat.size, depth, note: null });
+        } else {
+          raw.push({ path: entryRelative, kind: "other", bytes: 0, depth, note: "unsupported" });
+        }
+        if (truncated) return;
+      }
+    };
+    await visit(target.absolutePath, target.relativePath, 1);
+    let entries = raw;
+    if (glob) {
+      const keptFiles = raw.filter((entry) => entry.kind === "file" && glob.matches(entry.path, target.relativePath));
+      const folders = new Set<string>();
+      for (const file of keptFiles) {
+        const segments = file.path.split("/");
+        for (let length = segments.length - 1; length >= 1; length -= 1) {
+          folders.add(segments.slice(0, length).join("/"));
+        }
+      }
+      const kept = new Set(keptFiles.map((entry) => entry.path));
+      entries = raw.filter((entry) =>
+        kept.has(entry.path) || (entry.kind === "directory" && folders.has(entry.path)));
+    }
+    return {
+      path: target.relativePath,
+      recursive,
+      maxDepth,
+      glob: glob?.pattern ?? null,
+      entries,
+      files: entries.filter((entry) => entry.kind === "file").length,
+      directories: entries.filter((entry) => entry.kind === "directory").length,
+      truncated,
+      stoppedAt,
+    };
   }
 
   async mkdir(workspaceId: string, leaseId: string, relativePath: string): Promise<WorkspaceMutationReceiptV2> {
@@ -1713,6 +2051,184 @@ async function readTextFile(absolutePath: string, relativePath: string): Promise
   const bytes = await fs.readFile(absolutePath);
   const content = decodeText(bytes);
   return { path: relativePath, content, bytes: bytes.byteLength, sha256: sha256Bytes(bytes) };
+}
+
+function compileGlobs(value: unknown, label: string): WorkspaceGlobV1[] {
+  try {
+    return compileWorkspaceGlobListV1(value, label);
+  } catch (error) {
+    if (error instanceof WorkspaceGlobErrorV1) {
+      throw new WorkspaceManagerErrorV2("invalid_glob", error.message);
+    }
+    throw error;
+  }
+}
+
+/** A search's regular expression, or a refusal in words. */
+export function compileSearchExpressionV2(pattern: string, caseSensitive: boolean): RegExp {
+  if (NESTED_UNBOUNDED_REPEAT_V2.test(pattern)) {
+    throw new WorkspaceManagerErrorV2(
+      "regex_too_costly",
+      "The regular expression repeats a group that itself repeats without bound (such as (a+)+), which can take exponential time on one line. Rewrite it without the nested repeat.",
+    );
+  }
+  const flags = caseSensitive ? "g" : "gi";
+  try {
+    return new RegExp(pattern, `${flags}u`);
+  } catch {
+    // Some ordinary patterns (an escaped "-" or "/") are valid only without
+    // the Unicode flag.
+  }
+  try {
+    return new RegExp(pattern, flags);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new WorkspaceManagerErrorV2(
+      "invalid_regex",
+      `The query is not a valid JavaScript regular expression (${reason}). Fix it, or pass regex: false to search for the text literally.`,
+    );
+  }
+}
+
+interface SearchableFileV2 {
+  path: string;
+  absolutePath: string;
+}
+
+interface SearchWalkV2 {
+  files: SearchableFileV2[];
+  skipped: Array<{ path: string; reason: WorkspaceSearchSkipReasonV2 }>;
+  skip(path: string, reason: WorkspaceSearchSkipReasonV2): void;
+  skippedCount(): number;
+  skippedByReason(): Partial<Record<WorkspaceSearchSkipReasonV2, number>>;
+  stoppedAtEntryCap: boolean;
+}
+
+/**
+ * The files a search reads. Unlike scanAbsoluteTree (which proves a tree and
+ * so must refuse anything it cannot vouch for), this walk is for finding: a
+ * link is never followed but only noted, a nested `.git` is skipped, and the
+ * walk stops at the entry limit instead of failing.
+ */
+async function walkSearchableFilesV2(
+  absoluteRoot: string,
+  relativeRoot: string,
+  filter: {
+    include: readonly WorkspaceGlobV1[];
+    exclude: readonly WorkspaceGlobV1[];
+    searchRoot: string;
+  },
+): Promise<SearchWalkV2> {
+  const files: SearchableFileV2[] = [];
+  const skipped: Array<{ path: string; reason: WorkspaceSearchSkipReasonV2 }> = [];
+  const counts = new Map<WorkspaceSearchSkipReasonV2, number>();
+  const walk: SearchWalkV2 = {
+    files,
+    skipped,
+    skip(pathValue, reason) {
+      counts.set(reason, (counts.get(reason) ?? 0) + 1);
+      if (skipped.length < 200) skipped.push({ path: pathValue, reason });
+    },
+    skippedCount: () => [...counts.values()].reduce((total, count) => total + count, 0),
+    skippedByReason: () => Object.fromEntries(counts) as Partial<Record<WorkspaceSearchSkipReasonV2, number>>,
+    stoppedAtEntryCap: false,
+  };
+  const accepts = (relative: string) => workspaceGlobFilterAcceptsV1(relative, filter);
+  const consider = (relative: string, absolute: string, stat: Awaited<ReturnType<typeof fs.lstat>>) => {
+    if (!accepts(relative)) return;
+    if (stat.nlink > 1) walk.skip(relative, "hard_link");
+    else if (stat.size > WORKSPACE_MAX_TEXT_BYTES_V2) walk.skip(relative, "too_large");
+    else files.push({ path: relative, absolutePath: absolute });
+  };
+  const rootStat = await fs.lstat(absoluteRoot);
+  if (rootStat.isSymbolicLink()) {
+    throw new WorkspaceManagerErrorV2("reparse_path", "Workspace paths cannot traverse symlinks, junctions, or reparse points.");
+  }
+  if (rootStat.isFile()) {
+    consider(relativeRoot, absoluteRoot, rootStat);
+    return walk;
+  }
+  if (!rootStat.isDirectory()) {
+    throw new WorkspaceManagerErrorV2("unsupported_entry", "Workspace target is not a file or directory.");
+  }
+  let entriesVisited = 0;
+  const visit = async (folder: string, relative: string): Promise<void> => {
+    let names: string[];
+    try {
+      names = (await fs.readdir(folder)).sort((left, right) => left.localeCompare(right));
+    } catch {
+      walk.skip(relative || ".", "unreadable");
+      return;
+    }
+    for (const name of names) {
+      if (walk.stoppedAtEntryCap) return;
+      entriesVisited += 1;
+      if (entriesVisited > MAX_TREE_ENTRIES) {
+        walk.stoppedAtEntryCap = true;
+        return;
+      }
+      const entryRelative = relative ? `${relative}/${name}` : name;
+      const absolute = path.join(folder, name);
+      if (name.toLowerCase() === ".git") {
+        // The workspace's own repository is not part of it; any other .git is
+        // a nested repository the workspace does not own.
+        if (!relativeRoot && folder === absoluteRoot) continue;
+        walk.skip(entryRelative, "nested_git");
+        continue;
+      }
+      let stat: Awaited<ReturnType<typeof fs.lstat>>;
+      try {
+        stat = await fs.lstat(absolute);
+      } catch {
+        walk.skip(entryRelative, "unreadable");
+        continue;
+      }
+      if (stat.isSymbolicLink()) {
+        if (accepts(entryRelative)) walk.skip(entryRelative, "link");
+        continue;
+      }
+      if (stat.isDirectory()) {
+        if (workspaceGlobFilterPrunesFolderV1(entryRelative, filter)) continue;
+        await visit(absolute, entryRelative);
+        continue;
+      }
+      if (!stat.isFile()) {
+        if (accepts(entryRelative)) walk.skip(entryRelative, "unsupported");
+        continue;
+      }
+      consider(entryRelative, absolute, stat);
+    }
+  };
+  await visit(absoluteRoot, relativeRoot);
+  return walk;
+}
+
+async function loadSearchableTextV2(
+  absolutePath: string,
+): Promise<{ ok: true; content: string } | { ok: false; reason: WorkspaceSearchSkipReasonV2 }> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await fs.readFile(absolutePath);
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  }
+  if (bytes.byteLength > WORKSPACE_MAX_TEXT_BYTES_V2) return { ok: false, reason: "too_large" };
+  let content: string;
+  try {
+    content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return { ok: false, reason: "binary" };
+  }
+  if (content.includes("\0")) return { ok: false, reason: "binary" };
+  return { ok: true, content };
+}
+
+function contextWindow(lines: readonly string[], from: number, to: number): WorkspaceSearchContextLineV2[] {
+  const out: WorkspaceSearchContextLineV2[] = [];
+  for (let line = Math.max(1, from); line <= Math.min(lines.length, to); line += 1) {
+    out.push({ line, text: lines[line - 1]!.slice(0, 500) });
+  }
+  return out;
 }
 
 async function hashFile(absolutePath: string): Promise<{ sha256: string; bytes: number }> {

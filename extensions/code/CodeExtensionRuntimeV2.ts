@@ -106,6 +106,7 @@ import {
   WorkspaceManagerV2,
   assertWorkspaceRelativePathV2,
   createVerifiedWorkspaceBaseReadbackV2,
+  WORKSPACE_INVENTORY_IGNORED_DIRECTORIES_V1,
   type WorkspaceEntryMetadataV2,
 } from "./workspaces";
 import {
@@ -155,25 +156,7 @@ const MAX_SANDBOX_STAGING_DEPTH = 32;
 const MAX_REFLECTION_SOURCE_BYTES = 1_000_000;
 const MAX_REFLECTION_EXAMPLE_LINES = 20;
 const SCRATCH_SANDBOX_PROJECT_ID = "scratch";
-const IGNORED_INVENTORY_DIRECTORIES = new Set([
-  ".git",
-  ".agent-backups",
-  ".cache",
-  ".gradle",
-  ".idea",
-  ".next",
-  ".pytest_cache",
-  ".venv",
-  ".vscode",
-  "bin",
-  "build",
-  "coverage",
-  "dist",
-  "node_modules",
-  "obj",
-  "target",
-  "vendor",
-]);
+const IGNORED_INVENTORY_DIRECTORIES = WORKSPACE_INVENTORY_IGNORED_DIRECTORIES_V1;
 const PIN_BASENAMES = new Set([
   ".node-version",
   ".nvmrc",
