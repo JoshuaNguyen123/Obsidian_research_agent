@@ -4,6 +4,7 @@ import { extractEvidencePassages } from "../agent/researchDossier";
 import {
   CODE_FINDING_RENDER_BUDGET_CHARS_V1,
   normalizeCodeReadBudgetCharsV1,
+  renderCodeWorkspaceApplyPatchForModelV1,
   renderCodeWorkspaceListForModelV1,
   renderCodeWorkspaceReadForModelV1,
   renderCodeWorkspaceSearchForModelV1,
@@ -247,6 +248,11 @@ function serializeCodeWorkspaceResultForModel(
     textBudget = CODE_FINDING_RENDER_BUDGET_CHARS_V1;
     cap = MAX_SUMMARY_CHARS;
     render = (budget) => renderCodeWorkspaceListForModelV1(output, budget);
+  } else if (result.toolName === "code_workspace_apply_patch") {
+    textBudget = MAX_SUMMARY_CHARS;
+    cap = MAX_SUMMARY_CHARS;
+    const diagnostics = boundedCodeWriteDiagnostics(output.diagnostics);
+    render = () => renderCodeWorkspaceApplyPatchForModelV1(output, diagnostics);
   } else {
     return null;
   }
@@ -602,15 +608,8 @@ function slimOutputForModel(
   ) {
     // Placed after the receipt: what the language servers said about the
     // files this edit changed, as the host wrote it.
-    if (output.diagnostics.length > MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1) {
-      keep.diagnostics = `${output.diagnostics.slice(
-        0,
-        MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1 - CODE_WRITE_DIAGNOSTICS_CUT_MARKER.length,
-      )}${CODE_WRITE_DIAGNOSTICS_CUT_MARKER}`;
-      lossy = true;
-    } else {
-      keep.diagnostics = output.diagnostics;
-    }
+    keep.diagnostics = boundedCodeWriteDiagnostics(output.diagnostics);
+    lossy ||= keep.diagnostics !== output.diagnostics;
   }
   if (typeof output.content === "string" && toolName !== "count_words") {
     if (FULL_CONTENT_NOTE_READ_TOOLS.has(toolName)) {
@@ -988,6 +987,16 @@ function collectRefs(output: unknown): {
 
 function isToolResult(value: unknown): value is ToolExecutionResult {
   return isRecord(value) && typeof value.toolName === "string" && typeof value.ok === "boolean";
+}
+
+/** What the host said about an edit's files, cut to its budget. */
+function boundedCodeWriteDiagnostics(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  if (value.length <= MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1) return value;
+  return `${value.slice(
+    0,
+    MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1 - CODE_WRITE_DIAGNOSTICS_CUT_MARKER.length,
+  )}${CODE_WRITE_DIAGNOSTICS_CUT_MARKER}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

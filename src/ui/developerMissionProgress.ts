@@ -192,6 +192,7 @@ function completionPhaseForReceiptToolV1(
     case "code_workspace_append":
     case "code_workspace_edit":
     case "code_workspace_patch":
+    case "code_workspace_apply_patch":
     case "code_workspace_copy":
     case "code_workspace_move":
     case "code_workspace_restore":

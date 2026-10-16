@@ -8,6 +8,11 @@ import type {
 } from "../../src/agent/actions/types";
 import type { JsonSchemaObject } from "../../src/model/types";
 import type { AgentTool, ToolExecutionContext } from "../../src/tools/types";
+import {
+  describeUnifiedPatchFileV1,
+  parseUnifiedPatchV1,
+  planUnifiedPatchFileV1,
+} from "../../extensions/code/workspaces/UnifiedPatchV1";
 
 /*
  * A small code workspace held in memory, with the code tools a coding pass
@@ -434,6 +439,33 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
         }
         state.files.set(path, content);
         return { path, output: { sha256: sha(content) } };
+      },
+    }),
+    write({
+      name: "code_workspace_apply_patch",
+      action: "update",
+      operation: "apply_patch",
+      pathOf: (args) => parseUnifiedPatchV1(args.patch)[0]!.path,
+      apply: (args) => {
+        // All or nothing, as the workspace manager's batch is.
+        const files = parseUnifiedPatchV1(args.patch);
+        const next = new Map(state.files);
+        const lines: string[] = [];
+        for (const file of files) {
+          const source = file.fromPath ?? file.path;
+          const plan = planUnifiedPatchFileV1(file, file.kind === "add" ? null : state.files.get(source) ?? null);
+          if (file.kind === "add" && state.files.has(file.path)) throw new Error(`${file.path} already exists.`);
+          if (file.fromPath) next.delete(file.fromPath);
+          if (plan.after === null) next.delete(file.path);
+          else next.set(file.path, plan.after);
+          lines.push(describeUnifiedPatchFileV1(file, plan));
+        }
+        state.files.clear();
+        for (const [path, content] of next) state.files.set(path, content);
+        return {
+          path: files[0]!.path,
+          output: { files: files.map((file, index) => ({ path: file.path, fromPath: file.fromPath, line: lines[index] })) },
+        };
       },
     }),
     write({

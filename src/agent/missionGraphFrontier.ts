@@ -110,6 +110,17 @@ const CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES = new Set<string>([
   "code_workspace_write_expected",
 ]);
 
+/**
+ * The edits a planned node can name: the adaptive single-file writes, and the
+ * multi-file patch a guided plan names for an edit across files (CODE-7). The
+ * patch is not an adaptive companion: it is offered only where a plan or the
+ * open node names it, and it pins the menu as a planned write does.
+ */
+const CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES = new Set<string>([
+  ...CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES,
+  "code_workspace_apply_patch",
+]);
+
 const VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES = new Set<string>([
   "code_workspace_read",
   "code_workspace_stat",
@@ -246,7 +257,7 @@ export function missionGraphAdaptiveCodeInvestigationToolNamesV1(input: {
     (node) =>
       node.status === "ready" &&
       getMissionGraphNodeFrontierToolNames(node).some((toolName) =>
-        CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName),
+        CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES.has(toolName),
       ),
   );
   if (!plannedEditNext) return [];
@@ -389,7 +400,7 @@ export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
     const names = getMissionGraphNodeFrontierToolNames(
       node as MissionGraphV3["nodes"][string],
     ).filter((toolName) =>
-      CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName),
+      CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES.has(toolName),
     );
     if (names.length === 0) continue;
     // The real graph nests attempts under retries; UI/E2E projections flatten
@@ -412,7 +423,7 @@ export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
   }
   return tools.filter(
     (tool) =>
-      !CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(tool.function.name) ||
+      !CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES.has(tool.function.name) ||
       pinned.has(tool.function.name),
   );
 }

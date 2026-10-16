@@ -522,6 +522,36 @@ function positiveIntegerOrZero(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+// ---------------------------------------------------------------------------
+// code_workspace_apply_patch
+
+/**
+ * A multi-file patch's result as the model reads it (CODE-7): one line per
+ * file, `src/a.ts: +12 −3`, then what the host says about the files after
+ * the edit, when it says anything.
+ */
+export function renderCodeWorkspaceApplyPatchForModelV1(
+  output: Record<string, unknown>,
+  diagnostics: string | null,
+): CodeModelRenderingV1 | null {
+  if (output.operation !== "apply_patch" || !Array.isArray(output.files)) return null;
+  const lines: string[] = [];
+  for (const item of output.files) {
+    if (isRecord(item) && typeof item.line === "string") lines.push(item.line);
+  }
+  if (lines.length === 0) return null;
+  return {
+    summary: `Applied the patch to ${lines.length} ${lines.length === 1 ? "file" : "files"}.`,
+    output: {
+      operation: "apply_patch",
+      ...(typeof output.workspaceId === "string" ? { workspaceId: output.workspaceId } : {}),
+      changes: lines.join("\n"),
+      ...(diagnostics !== null ? { diagnostics } : {}),
+    },
+    truncated: false,
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -89,6 +89,34 @@ export interface WorkspaceMutationReceiptV2 {
   fingerprint: string;
 }
 
+/** At most this many files change in one `applyFileChanges` batch. */
+export const WORKSPACE_MAX_FILE_CHANGES_V2 = 20;
+
+/**
+ * One change of a batch (`applyFileChanges`): a file's new text, a new file,
+ * a rename with new text, or a file moved to the workspace's trash. Each
+ * existing file is named by the hash it was read at.
+ */
+export type WorkspaceFileChangeV2 =
+  | { kind: "write"; path: string; expectedSha256: string; content: string }
+  | { kind: "create"; path: string; content: string }
+  | { kind: "move"; path: string; destinationPath: string; expectedSha256: string; content: string }
+  | { kind: "trash"; path: string; expectedSha256: string };
+
+type NormalizedFileChangeV2 =
+  | { kind: "write"; path: string; expectedSha256: string; bytes: Uint8Array }
+  | { kind: "create"; path: string; expectedSha256: null; bytes: Uint8Array }
+  | { kind: "move"; path: string; destinationPath: string; expectedSha256: string; bytes: Uint8Array }
+  | { kind: "trash"; path: string; expectedSha256: string; bytes: null };
+
+/**
+ * The fingerprint a single file's trash record carries, as `trash` writes it
+ * and `findTrashEvidence` reads it.
+ */
+export function workspaceFileTreeFingerprintV2(relativePath: string, sha256: string, bytes: number): string {
+  return sha256Json([{ path: relativePath, sha256, bytes }]);
+}
+
 export interface WorkspaceReadResultV2 {
   path: string;
   content: string;
@@ -1686,6 +1714,273 @@ export class WorkspaceManagerV2 {
     });
   }
 
+  /**
+   * Change several text files as one write (CODE-7): every change lands, or
+   * none does. Each change names the file's hash as it was read, and nothing
+   * is touched until every hash, every absent target and the change budget
+   * hold. A write replaces a file's text, a create makes a new file (and its
+   * missing folders), a move renames a file and gives it new text, and a
+   * trash moves a file into the workspace's trash as `trash` does. A failure
+   * part-way puts back what had changed, in reverse order, and the manifest
+   * with it.
+   */
+  async applyFileChanges(
+    workspaceId: string,
+    leaseId: string,
+    changesInput: readonly WorkspaceFileChangeV2[],
+  ): Promise<WorkspaceMutationReceiptV2[]> {
+    return this.serializeWrite(async () => {
+      const originalManifest = await this.requireLease(await this.loadManifest(workspaceId), leaseId);
+      if (
+        !Array.isArray(changesInput) ||
+        changesInput.length < 1 ||
+        changesInput.length > WORKSPACE_MAX_FILE_CHANGES_V2
+      ) {
+        throw new WorkspaceManagerErrorV2(
+          "invalid_changes",
+          `A batch of file changes takes 1-${WORKSPACE_MAX_FILE_CHANGES_V2} changes.`,
+        );
+      }
+      const changes = changesInput.map(normalizeFileChange);
+      const touched = changes.flatMap((change) =>
+        change.kind === "move" ? [change.path, change.destinationPath] : [change.path],
+      );
+      if (new Set(touched).size !== touched.length) {
+        throw new WorkspaceManagerErrorV2("invalid_changes", "A batch of file changes names a path more than once.");
+      }
+
+      // Every precondition, before anything changes.
+      const before = new Map<string, { sha256: string; bytes: number }>();
+      for (const change of changes) {
+        if (change.kind !== "create") {
+          const source = await this.resolveSafePath(originalManifest, change.path, { mustExist: true, mutation: true });
+          const stat = await fs.lstat(source.absolutePath);
+          if (!stat.isFile()) throw new WorkspaceManagerErrorV2("path_conflict", `${source.relativePath} is not a regular file.`);
+          const hash = await hashFile(source.absolutePath);
+          if (hash.sha256 !== change.expectedSha256) {
+            throw new WorkspaceManagerErrorV2("precondition_failed", `${source.relativePath} changed after the change was prepared.`);
+          }
+          before.set(change.path, hash);
+        }
+        if (change.kind === "create" || change.kind === "move") {
+          await this.assertCreatablePath(originalManifest, change.kind === "move" ? change.destinationPath : change.path);
+        }
+      }
+      const writtenBytes = changes.reduce((total, change) => total + (change.bytes?.byteLength ?? 0), 0);
+      const trashedBytes = changes.reduce(
+        (total, change) => total + (change.kind === "trash" ? before.get(change.path)!.bytes : 0),
+        0,
+      );
+      this.assertBudget(originalManifest, touched, writtenBytes + trashedBytes);
+
+      const undo: Array<() => Promise<void>> = [];
+      const temporaries: string[] = [];
+      const backups: string[] = [];
+      const createdDirectories: string[] = [];
+      const applied: Array<{
+        change: NormalizedFileChangeV2;
+        targetPath: string;
+        after: { sha256: string; bytes: number } | null;
+        trashId: string | null;
+      }> = [];
+      let manifest = originalManifest;
+      try {
+        // Missing folders for the new files, then each new text written
+        // beside its target and each replaced file copied aside.
+        for (const change of changes) {
+          if (change.kind === "create" || change.kind === "move") {
+            await this.createParentDirectories(
+              originalManifest,
+              change.kind === "move" ? change.destinationPath : change.path,
+              createdDirectories,
+            );
+          }
+        }
+        const staged: Array<{
+          change: NormalizedFileChangeV2;
+          target: Awaited<ReturnType<WorkspaceManagerV2["resolveSafePath"]>>;
+          source: Awaited<ReturnType<WorkspaceManagerV2["resolveSafePath"]>> | null;
+          temporary: string | null;
+          backup: string | null;
+        }> = [];
+        for (const change of changes) {
+          const targetPath = change.kind === "move" ? change.destinationPath : change.path;
+          const target = await this.resolveSafePath(originalManifest, targetPath, { mustExist: false, mutation: true });
+          const source = change.kind === "move"
+            ? await this.resolveSafePath(originalManifest, change.path, { mustExist: true, mutation: true })
+            : null;
+          let temporary: string | null = null;
+          let backup: string | null = null;
+          if (change.bytes) {
+            temporary = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.batch.tmp`);
+            const handle = await fs.open(temporary, "wx", 0o600);
+            temporaries.push(temporary);
+            try { await handle.writeFile(change.bytes); await handle.sync(); } finally { await handle.close(); }
+          }
+          if (change.kind === "write") {
+            backup = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.batch.bak`);
+            await fs.copyFile(target.absolutePath, backup, fsConstants.COPYFILE_EXCL);
+            backups.push(backup);
+            if ((await hashFile(backup)).sha256 !== change.expectedSha256) {
+              throw new WorkspaceManagerErrorV2("rollback_backup_failed", `The copy of ${change.path} kept for rollback failed hash readback.`);
+            }
+          }
+          staged.push({ change, target, source, temporary, backup });
+        }
+        // The last look before the first change: no parent swapped, no file changed.
+        for (const entry of staged) {
+          await this.revalidateGuard(entry.target.parentGuard!);
+          if (entry.source) await this.revalidateGuard(entry.source.parentGuard!);
+          if (entry.change.kind !== "create") {
+            const latest = await hashFile((entry.source ?? entry.target).absolutePath);
+            if (latest.sha256 !== entry.change.expectedSha256) {
+              throw new WorkspaceManagerErrorV2("precondition_failed", `${entry.change.path} changed while the batch was being written.`);
+            }
+          }
+        }
+        for (const entry of staged) {
+          const { change, target } = entry;
+          if (change.kind === "write") {
+            await renameWithBoundedWindowsRetry(entry.temporary!, target.absolutePath);
+            const backup = entry.backup!;
+            undo.push(async () => {
+              await fs.rm(target.absolutePath, { force: true });
+              await renameWithBoundedWindowsRetry(backup, target.absolutePath);
+            });
+          } else if (change.kind === "create" || change.kind === "move") {
+            if (change.kind === "move") {
+              const source = entry.source!;
+              const aside = path.join(path.dirname(source.absolutePath), `.${path.basename(source.absolutePath)}.${this.randomId()}.batch.bak`);
+              await renameWithBoundedWindowsRetry(source.absolutePath, aside);
+              backups.push(aside);
+              undo.push(async () => { await renameWithBoundedWindowsRetry(aside, source.absolutePath); });
+            }
+            if (await pathExists(target.absolutePath)) {
+              throw new WorkspaceManagerErrorV2("path_exists", `${target.relativePath} appeared while the batch was being written.`);
+            }
+            await renameWithBoundedWindowsRetry(entry.temporary!, target.absolutePath);
+            undo.push(async () => { await fs.rm(target.absolutePath, { force: true }); });
+          } else {
+            const hash = before.get(change.path)!;
+            const trashId = workspaceIdentifier(`trash-${this.randomId()}`);
+            const trashRoot = path.join(this.containerPath(originalManifest.workspaceId), TRASH_FOLDER, trashId);
+            await this.assertMetadataBoundary(trashRoot, true);
+            await fs.mkdir(path.dirname(trashRoot), { recursive: true });
+            await this.assertMetadataBoundary(trashRoot, true);
+            await fs.mkdir(trashRoot);
+            undo.push(async () => { await fs.rm(trashRoot, { recursive: true, force: true }); });
+            const payload = path.join(trashRoot, "payload");
+            await moveAcrossDevices(target.absolutePath, payload);
+            undo.push(async () => { await moveAcrossDevices(payload, target.absolutePath); });
+            await fs.writeFile(
+              path.join(trashRoot, "record.json"),
+              `${JSON.stringify({ version: 1, trashId, workspaceId: originalManifest.workspaceId, originalPath: change.path, fingerprint: workspaceFileTreeFingerprintV2(change.path, hash.sha256, hash.bytes), bytes: hash.bytes, affectedCount: 1, trashedAt: this.isoNow() }, null, 2)}\n`,
+              { encoding: "utf8", flag: "wx" },
+            );
+            applied.push({ change, targetPath: change.path, after: null, trashId });
+            continue;
+          }
+          const after = await hashFile(target.absolutePath);
+          if (after.sha256 !== sha256Bytes(change.bytes!)) {
+            throw new WorkspaceManagerErrorV2("batch_readback_failed", `${target.relativePath} failed SHA-256 readback after it was written.`);
+          }
+          applied.push({ change, targetPath: target.relativePath, after, trashId: null });
+        }
+        const updates = applied
+          .filter((entry) => entry.after !== null)
+          .map((entry) => ({ path: entry.targetPath, hash: entry.after! }));
+        const removals = changes
+          .filter((change) => change.kind === "trash" || change.kind === "move")
+          .map((change) => change.path);
+        manifest = await this.recordChanges(originalManifest, updates, writtenBytes + trashedBytes, removals, touched);
+      } catch (error) {
+        let rollbackFailure: Error | null = null;
+        for (const step of [...undo].reverse()) {
+          try { await step(); } catch (rollbackError) {
+            rollbackFailure ??= rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError));
+          }
+        }
+        for (const temporary of temporaries) await fs.rm(temporary, { force: true }).catch(() => undefined);
+        for (const backup of backups) {
+          if (await pathExists(backup)) await fs.rm(backup, { force: true }).catch(() => undefined);
+        }
+        for (const directory of [...createdDirectories].reverse()) {
+          try { await fs.rmdir(directory); } catch { /* kept only if another writer filled it */ }
+        }
+        try {
+          await this.persistManifest(originalManifest);
+        } catch (rollbackError) {
+          rollbackFailure ??= rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError));
+        }
+        if (rollbackFailure) {
+          throw new WorkspaceManagerErrorV2(
+            "batch_rollback_failed",
+            `The batch of file changes failed and putting it back failed too: ${rollbackFailure.message}`,
+          );
+        }
+        throw error;
+      }
+      for (const backup of backups) await fs.rm(backup, { force: true }).catch(() => undefined);
+      const receipts: WorkspaceMutationReceiptV2[] = [];
+      for (const entry of applied) {
+        const { change } = entry;
+        const prior = before.get(change.path) ?? null;
+        receipts.push(await this.receipt(manifest, {
+          operation: change.kind === "write" ? "patch" : change.kind,
+          path: change.path,
+          relatedPath: change.kind === "move" ? change.destinationPath : null,
+          beforeSha256: prior?.sha256 ?? null,
+          afterSha256: entry.after?.sha256 ?? null,
+          bytesWritten: entry.after?.bytes ?? 0,
+          bytesDeleted: change.kind === "create" ? 0 : prior?.bytes ?? 0,
+          affectedCount: 1,
+          trashId: entry.trashId,
+        }));
+      }
+      return receipts;
+    });
+  }
+
+  /** A path a new file can be made at: absent, under folders that are folders. */
+  private async assertCreatablePath(manifest: WorkspaceManifestV2, relativePath: string): Promise<void> {
+    const normalized = assertWorkspaceRelativePathV2(relativePath);
+    const segments = normalized.split("/");
+    let prefix = "";
+    for (let index = 0; index < segments.length; index += 1) {
+      prefix = prefix ? `${prefix}/${segments[index]}` : segments[index]!;
+      const resolved = await this.resolveSafePath(manifest, prefix, { mustExist: false, mutation: true });
+      if (!resolved.exists) return;
+      const stat = await fs.lstat(resolved.absolutePath);
+      if (index === segments.length - 1) {
+        throw new WorkspaceManagerErrorV2("path_exists", `${normalized} already exists.`);
+      }
+      if (!stat.isDirectory()) {
+        throw new WorkspaceManagerErrorV2("path_conflict", `${prefix} is not a directory.`);
+      }
+    }
+  }
+
+  private async createParentDirectories(
+    manifest: WorkspaceManifestV2,
+    relativePath: string,
+    created: string[],
+  ): Promise<void> {
+    const segments = assertWorkspaceRelativePathV2(relativePath).split("/").slice(0, -1);
+    let prefix = "";
+    for (const segment of segments) {
+      prefix = prefix ? `${prefix}/${segment}` : segment;
+      const directory = await this.resolveSafePath(manifest, prefix, { mustExist: false, mutation: true });
+      if (directory.exists) {
+        const stat = await fs.lstat(directory.absolutePath);
+        if (!stat.isDirectory()) throw new WorkspaceManagerErrorV2("path_conflict", `${prefix} is not a directory.`);
+        continue;
+      }
+      await this.revalidateGuard(directory.parentGuard!);
+      await fs.mkdir(directory.absolutePath);
+      created.push(directory.absolutePath);
+    }
+  }
+
   async move(workspaceId: string, leaseId: string, sourcePath: string, destinationPath: string, expectedSha256: string): Promise<WorkspaceMutationReceiptV2> {
     return this.serializeWrite(async () => {
       let manifest = await this.requireLease(await this.loadManifest(workspaceId), leaseId);
@@ -2470,6 +2765,39 @@ async function renameWithBoundedWindowsRetry(
 function assertSafeRegularFile(stat: Awaited<ReturnType<typeof fs.lstat>>, label: string, mutation: boolean): void {
   if (!stat.isFile() || stat.isSymbolicLink()) throw new WorkspaceManagerErrorV2("not_regular_file", `${label} is not a regular file.`);
   if (stat.nlink > 1) throw new WorkspaceManagerErrorV2("unsafe_hard_link", `${label} has multiple hard links.`);
+}
+
+function normalizeFileChange(change: WorkspaceFileChangeV2): NormalizedFileChangeV2 {
+  if (!change || typeof change !== "object") {
+    throw new WorkspaceManagerErrorV2("invalid_changes", "A file change must be an object.");
+  }
+  const relativePath = assertWorkspaceRelativePathV2(change.path);
+  if (change.kind === "create") {
+    return { kind: "create", path: relativePath, expectedSha256: null, bytes: textBytes(change.content) };
+  }
+  if (!["write", "move", "trash"].includes(change.kind)) {
+    throw new WorkspaceManagerErrorV2("invalid_changes", `A file change cannot be ${String((change as { kind?: unknown }).kind)}.`);
+  }
+  if (!isSha256FingerprintV2(change.expectedSha256)) {
+    throw new WorkspaceManagerErrorV2("invalid_precondition", `The expected SHA-256 of ${relativePath} is invalid.`);
+  }
+  if (change.kind === "write") {
+    return { kind: "write", path: relativePath, expectedSha256: change.expectedSha256, bytes: textBytes(change.content) };
+  }
+  if (change.kind === "move") {
+    return {
+      kind: "move",
+      path: relativePath,
+      destinationPath: assertWorkspaceRelativePathV2(change.destinationPath),
+      expectedSha256: change.expectedSha256,
+      bytes: textBytes(change.content),
+    };
+  }
+  return { kind: "trash", path: relativePath, expectedSha256: change.expectedSha256, bytes: null };
+}
+
+async function pathExists(absolutePath: string): Promise<boolean> {
+  return fs.lstat(absolutePath).then(() => true, (error) => isMissing(error) ? false : Promise.reject(error));
 }
 
 function textBytes(content: string): Uint8Array {

@@ -31217,6 +31217,7 @@ const CODE_TOOL_NAMES = new Set([
   "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
+  "code_workspace_apply_patch",
   "code_workspace_move",
   "code_workspace_copy",
   "code_workspace_trash",
@@ -31381,6 +31382,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   code_workspace_append: "code",
   code_workspace_write_expected: "code",
   code_workspace_patch: "code",
+  code_workspace_apply_patch: "code",
   code_workspace_move: "code",
   code_workspace_copy: "code",
   code_workspace_trash: "code",
@@ -41225,6 +41227,23 @@ export async function executePreparedToolWithMetrics({
         getString(preparedAction.target.path) ??
           getString(preparedAction.normalizedArgs.path),
       );
+    }
+    if (result.ok && preparedAction.toolName === "code_workspace_apply_patch") {
+      // Every file the patch wrote, deleted or renamed: a read of one before
+      // it is no longer the file.
+      const patchedWorkspace = getString(preparedAction.normalizedArgs.workspaceId);
+      const patchedFiles = Array.isArray(preparedAction.normalizedArgs.files)
+        ? preparedAction.normalizedArgs.files
+        : [];
+      for (const file of patchedFiles) {
+        if (!file || typeof file !== "object" || Array.isArray(file)) continue;
+        const entry = file as Record<string, unknown>;
+        for (const patchedPath of [getString(entry.path), getString(entry.fromPath)]) {
+          if (!patchedPath) continue;
+          forgetVerifiedWorkspaceReadObservation(toolContext.runtimeCache, patchedWorkspace, patchedPath);
+          forgetPartialWorkspaceReadObservationsV1(toolContext.runtimeCache, patchedWorkspace, patchedPath);
+        }
+      }
     }
     if (
       result.ok &&

@@ -197,6 +197,7 @@ const CODE_TOOL_NAMES = new Set([
   "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
+  "code_workspace_apply_patch",
   "code_workspace_move",
   "code_workspace_copy",
   "code_workspace_trash",
