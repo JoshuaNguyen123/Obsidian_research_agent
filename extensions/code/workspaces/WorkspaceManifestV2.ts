@@ -57,7 +57,18 @@ export interface WorkspaceManifestV2 {
   version: typeof WORKSPACE_MANIFEST_VERSION_V2;
   workspaceId: string;
   kind: WorkspaceKindV2;
+  /**
+   * The durable owner. A run's id, or a person's (`person:<surface>`, see
+   * {@link isPersonWorkspaceOwnerV2}): a person's workspace is never re-owned
+   * by a run.
+   */
   ownerRunId: string;
+  /**
+   * The run working in a person's workspace without owning it, set by
+   * `WorkspaceManagerV2.attachRunToPersonWorkspace`. Absent when none, and
+   * only ever present when the owner is a person.
+   */
+  attachedRunId?: string;
   repositoryBinding: WorkspaceRepositoryBindingV2 | null;
   canonicalRoot: string;
   baseSha: string | null;
@@ -75,6 +86,28 @@ export interface WorkspaceManifestV2 {
   budget: WorkspaceBudgetV2;
 }
 
+/** An owner beginning with this is a person, never a run (`person:code-page`). */
+export const PERSON_WORKSPACE_OWNER_PREFIX_V2 = "person:" as const;
+
+export function isPersonWorkspaceOwnerV2(ownerRunId: string): boolean {
+  return typeof ownerRunId === "string" &&
+    ownerRunId.startsWith(PERSON_WORKSPACE_OWNER_PREFIX_V2) &&
+    ownerRunId.length > PERSON_WORKSPACE_OWNER_PREFIX_V2.length;
+}
+
+/**
+ * Whether a run may work in the workspace: it owns it, or it is the run
+ * attached to a person's workspace. Proof of a verified commit still asks for
+ * the owner alone.
+ */
+export function workspaceRunMayWorkV2(
+  manifest: Pick<WorkspaceManifestV2, "ownerRunId" | "attachedRunId">,
+  runId: string,
+): boolean {
+  return manifest.ownerRunId === runId ||
+    (manifest.attachedRunId !== undefined && manifest.attachedRunId === runId);
+}
+
 export class WorkspaceManifestErrorV2 extends Error {
   constructor(message: string) {
     super(message);
@@ -84,10 +117,12 @@ export class WorkspaceManifestErrorV2 extends Error {
 
 export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
   const source = record(value, "workspace manifest");
+  const attached = source.attachedRunId !== undefined;
   exact(source, [
     "version", "workspaceId", "kind", "ownerRunId", "repositoryBinding",
     "canonicalRoot", "baseSha", "sandboxPolicy", "hashes", "validationHistory",
     "lease", "status", "expiresAt", "createdAt", "updatedAt", "budget",
+    ...(attached ? ["attachedRunId"] : []),
   ], "workspace manifest");
   if (source.version !== WORKSPACE_MANIFEST_VERSION_V2) {
     throw new WorkspaceManifestErrorV2("Unsupported workspace manifest version.");
@@ -95,6 +130,17 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
   const workspaceId = identifier(source.workspaceId, "workspace id");
   const kind = enumValue(source.kind, ["scratch", "repository"] as const, "workspace kind");
   const ownerRunId = boundedString(source.ownerRunId, "owner run id", 1, 256);
+  const attachedRunId = attached
+    ? boundedString(source.attachedRunId, "attached run id", 1, 256)
+    : undefined;
+  if (
+    attachedRunId !== undefined &&
+    (!isPersonWorkspaceOwnerV2(ownerRunId) ||
+      attachedRunId.startsWith(PERSON_WORKSPACE_OWNER_PREFIX_V2) ||
+      attachedRunId === ownerRunId)
+  ) {
+    throw new WorkspaceManifestErrorV2("Only a person's workspace can have a run attached, and only a run.");
+  }
   const canonicalRoot = absolutePath(source.canonicalRoot, "canonical root");
   const repositoryBinding = source.repositoryBinding === null
     ? null
@@ -160,6 +206,7 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     workspaceId,
     kind,
     ownerRunId,
+    ...(attachedRunId === undefined ? {} : { attachedRunId }),
     repositoryBinding,
     canonicalRoot,
     baseSha,
