@@ -29,6 +29,7 @@ import {
   authoritativeRefusalFrontierToolNamesV1,
   getMissionGraphNodeFrontierToolNames,
   getSafeMissionCompositeLifecycleSpecV1,
+  getSafeMissionOpenWorkSpecV1,
   getSafeMissionCompositeLifecycleStateV1,
   missionGraphOnlyFinalSynthesisRemainsV1,
   missionGraphPlannedSequenceAfterFrontierV1,
@@ -1030,6 +1031,9 @@ function graphHasIncompleteCodeExecutionWork(
 function getMissionGraphNodePendingWriteToolNames(
   node: MissionGraphV3["nodes"][string],
 ): string[] {
+  // An open node's menu is offered, never owed: the graph holds its own
+  // completion, and the writes the mission owes are its closing nodes'.
+  if (getSafeMissionOpenWorkSpecV1(node)) return [];
   const lifecycle = getSafeMissionCompositeLifecycleSpecV1(node);
   if (!lifecycle) {
     return node.allowedTools.filter(isWriteToolName);
@@ -1647,8 +1651,25 @@ export function buildMissionGraphFrontierTurnContext(
       options.graph ?? null,
     ),
   });
+  // CODE-18: the open step of a free coding pass is a menu, not a sequence.
+  const openWorkNode = options.graph
+    ? Object.values(options.graph.nodes).find(
+        (node) =>
+          (node.status === "ready" || node.status === "running") &&
+          getSafeMissionOpenWorkSpecV1(node) !== null,
+      )
+    : undefined;
+  const openWorkBoundary = openWorkNode
+    ? [
+        "This is the open coding step of a free pass: call the listed code tools in any order and as often as the work needs, within the step's budget.",
+        "Keep your to-do list current with code_plan_update (the whole list each time).",
+        "When code_validate_targeted has passed on the current files, with no edit after it, reply without a tool call to say the work is done; the closing steps (fast validation, the repair checkpoint, targeted and full validation, the verified commit) then run.",
+        "A red validation is yours to read and correct. The same failure surviving two corrections stops the pass. Trashing a file still asks the person.",
+      ]
+    : [];
   const toolContractLines = [
     ...(plannedSequenceLine ? [plannedSequenceLine] : []),
+    ...openWorkBoundary,
     ...codeCapabilityBoundary,
     ...acceptedResearchBoundary,
     ...researchHierarchyBoundary,

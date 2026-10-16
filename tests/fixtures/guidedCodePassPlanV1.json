@@ -1,0 +1,457 @@
+{
+  "source": "The guided coding pass as planned before CODE-18 (core 5d389183), wall-clock budgets left out because they follow the run clock.",
+  "nodes": [
+    {
+      "id": "final",
+      "allowedTools": [],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status",
+        "tool-02-code_workspace_create",
+        "tool-03-code_workspace_list",
+        "tool-04-code_workspace_read",
+        "tool-05-code_workspace_patch",
+        "tool-06-code_validate_fast",
+        "tool-07-code_repair_record_cycle",
+        "tool-08-code_validate_targeted",
+        "tool-09-code_validate_full",
+        "tool-10-code_commit_verified"
+      ],
+      "effect": "read",
+      "status": "queued",
+      "selector": null,
+      "contract": {
+        "criteria": [
+          "A relevant final result is visible and acceptance checks pass."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "final-output"
+        ],
+        "minimumReceipts": 0,
+        "requiredReceiptKinds": [],
+        "verifierId": "host-acceptance-v1"
+      },
+      "budget": {
+        "toolCalls": 0,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-01-code_sandbox_status",
+      "allowedTools": [
+        "code_sandbox_status"
+      ],
+      "dependencyIds": [],
+      "effect": "read",
+      "status": "ready",
+      "selector": null,
+      "contract": {
+        "criteria": [
+          "code_sandbox_status produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 0,
+        "requiredReceiptKinds": [],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-02-code_workspace_create",
+      "allowedTools": [
+        "code_workspace_create"
+      ],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status"
+      ],
+      "effect": "mutation",
+      "status": "queued",
+      "selector": "prompt-scoped-workspace-target",
+      "contract": {
+        "criteria": [
+          "code_workspace_create produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 1,
+        "requiredReceiptKinds": [
+          "code_change"
+        ],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-03-code_workspace_list",
+      "allowedTools": [
+        "code_workspace_list"
+      ],
+      "dependencyIds": [
+        "tool-02-code_workspace_create"
+      ],
+      "effect": "read",
+      "status": "queued",
+      "selector": null,
+      "contract": {
+        "criteria": [
+          "code_workspace_list produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 0,
+        "requiredReceiptKinds": [],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-04-code_workspace_read",
+      "allowedTools": [
+        "code_workspace_read"
+      ],
+      "dependencyIds": [
+        "tool-02-code_workspace_create"
+      ],
+      "effect": "read",
+      "status": "queued",
+      "selector": null,
+      "contract": {
+        "criteria": [
+          "code_workspace_read produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 0,
+        "requiredReceiptKinds": [],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-05-code_workspace_patch",
+      "allowedTools": [
+        "code_workspace_patch"
+      ],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status",
+        "tool-02-code_workspace_create",
+        "tool-03-code_workspace_list",
+        "tool-04-code_workspace_read"
+      ],
+      "effect": "mutation",
+      "status": "queued",
+      "selector": "prompt-scoped-workspace-target",
+      "contract": {
+        "criteria": [
+          "code_workspace_patch produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 1,
+        "requiredReceiptKinds": [
+          "code_change"
+        ],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-06-code_validate_fast",
+      "allowedTools": [
+        "code_validate_fast"
+      ],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status",
+        "tool-03-code_workspace_list",
+        "tool-04-code_workspace_read",
+        "tool-05-code_workspace_patch"
+      ],
+      "effect": "execution",
+      "status": "queued",
+      "selector": "prompt-scoped-workspace-target",
+      "contract": {
+        "criteria": [
+          "code_validate_fast produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 1,
+        "requiredReceiptKinds": [
+          "artifact"
+        ],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-07-code_repair_record_cycle",
+      "allowedTools": [
+        "code_repair_record_cycle"
+      ],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status",
+        "tool-03-code_workspace_list",
+        "tool-04-code_workspace_read",
+        "tool-06-code_validate_fast"
+      ],
+      "effect": "mutation",
+      "status": "queued",
+      "selector": "prompt-scoped-workspace-target",
+      "contract": {
+        "criteria": [
+          "code_repair_record_cycle produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 1,
+        "requiredReceiptKinds": [
+          "code_change"
+        ],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-08-code_validate_targeted",
+      "allowedTools": [
+        "code_validate_targeted"
+      ],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status",
+        "tool-03-code_workspace_list",
+        "tool-04-code_workspace_read",
+        "tool-07-code_repair_record_cycle"
+      ],
+      "effect": "execution",
+      "status": "queued",
+      "selector": "prompt-scoped-workspace-target",
+      "contract": {
+        "criteria": [
+          "code_validate_targeted produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 1,
+        "requiredReceiptKinds": [
+          "artifact"
+        ],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-09-code_validate_full",
+      "allowedTools": [
+        "code_validate_full"
+      ],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status",
+        "tool-03-code_workspace_list",
+        "tool-04-code_workspace_read",
+        "tool-08-code_validate_targeted"
+      ],
+      "effect": "execution",
+      "status": "queued",
+      "selector": "prompt-scoped-workspace-target",
+      "contract": {
+        "criteria": [
+          "code_validate_full produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 1,
+        "requiredReceiptKinds": [
+          "artifact"
+        ],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    },
+    {
+      "id": "tool-10-code_commit_verified",
+      "allowedTools": [
+        "code_commit_verified"
+      ],
+      "dependencyIds": [
+        "tool-01-code_sandbox_status",
+        "tool-03-code_workspace_list",
+        "tool-04-code_workspace_read",
+        "tool-09-code_validate_full"
+      ],
+      "effect": "execution",
+      "status": "queued",
+      "selector": "prompt-scoped-git-target",
+      "contract": {
+        "criteria": [
+          "code_commit_verified produced an observable accepted result."
+        ],
+        "minimumEvidence": 1,
+        "requiredEvidenceKinds": [
+          "tool-result"
+        ],
+        "minimumReceipts": 1,
+        "requiredReceiptKinds": [
+          "code_change"
+        ],
+        "verifierId": null
+      },
+      "budget": {
+        "toolCalls": 1,
+        "externalActions": 0
+      }
+    }
+  ],
+  "envelopeBudgets": {
+    "maxNodes": 61,
+    "maxDepth": 11,
+    "maxConcurrentReadNodes": 3,
+    "maxTotalToolCalls": 60,
+    "maxExternalActions": 0,
+    "maxAttemptsPerNode": 3
+  },
+  "turns": [
+    {
+      "offered": [
+        "code_sandbox_status"
+      ],
+      "calls": [
+        "code_sandbox_status"
+      ]
+    },
+    {
+      "offered": [
+        "code_workspace_create"
+      ],
+      "calls": [
+        "code_workspace_create"
+      ]
+    },
+    {
+      "offered": [
+        "code_workspace_list",
+        "code_workspace_read"
+      ],
+      "calls": [
+        "code_workspace_list"
+      ]
+    },
+    {
+      "offered": [
+        "code_workspace_read"
+      ],
+      "calls": [
+        "code_workspace_read"
+      ]
+    },
+    {
+      "offered": [
+        "code_workspace_stat",
+        "code_workspace_list",
+        "code_workspace_read",
+        "code_workspace_search",
+        "code_workspace_patch"
+      ],
+      "calls": [
+        "code_workspace_patch"
+      ]
+    },
+    {
+      "offered": [
+        "code_validate_fast"
+      ],
+      "calls": [
+        "code_validate_fast"
+      ]
+    },
+    {
+      "offered": [
+        "code_repair_record_cycle"
+      ],
+      "calls": [
+        "code_repair_record_cycle"
+      ]
+    },
+    {
+      "offered": [
+        "code_validate_targeted"
+      ],
+      "calls": [
+        "code_validate_targeted"
+      ]
+    },
+    {
+      "offered": [
+        "code_validate_full"
+      ],
+      "calls": [
+        "code_validate_full"
+      ]
+    },
+    {
+      "offered": [
+        "code_commit_verified"
+      ],
+      "calls": [
+        "code_commit_verified"
+      ]
+    }
+  ],
+  "executed": [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_list",
+    "code_workspace_read",
+    "code_workspace_patch",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified"
+  ]
+}
