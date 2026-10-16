@@ -1156,6 +1156,14 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       );
     }
     if (manifest.ownerRunId !== scope.runId) {
+      // A run attached to a person's workspace changes and checks its files;
+      // the verified commit there is the person's (CODE-15).
+      if (manifest.attachedRunId === scope.runId) {
+        throw new CodeRepairToolRuntimeErrorV1(
+          "workspace_commit_by_person",
+          "This workspace is the person's: the agent can change and check its files, and the person commits them.",
+        );
+      }
       throw new CodeRepairToolRuntimeErrorV1(
         "workspace_owner_mismatch",
         "Workspace is owned by a different mission.",

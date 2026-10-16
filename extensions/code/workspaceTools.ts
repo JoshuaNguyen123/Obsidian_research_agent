@@ -21,7 +21,9 @@ import {
   WorkspaceManagerV2,
   assertWorkspaceRelativePathV2,
   createVerifiedWorkspaceBaseReadbackV2,
+  isPersonWorkspaceOwnerV2,
   isSha256FingerprintV2,
+  workspaceRunMayWorkV2,
   type WorkspaceManifestV2,
   type WorkspaceMutationReceiptV2,
 } from "./workspaces";
@@ -1161,10 +1163,15 @@ class WorkspaceToolRuntimeV2 {
           : Promise.reject(error),
     );
     if (existing) {
-      const rebound = await this.manager.rebindWorkspaceOwnerForContinuation(
-        workspaceId,
-        ownerRunId,
-      );
+      // A person's workspace stays the person's: the run is attached to it,
+      // never made its owner (CODE-8).
+      const personOwned = isPersonWorkspaceOwnerV2(existing.ownerRunId);
+      const rebound = personOwned
+        ? await this.manager.attachRunToPersonWorkspace(workspaceId, ownerRunId)
+        : await this.manager.rebindWorkspaceOwnerForContinuation(
+            workspaceId,
+            ownerRunId,
+          );
       const leaseOwnerId = `extension:${ownerRunId}`;
       const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
       const leaseId = leased.lease?.id ?? null;
@@ -1184,6 +1191,7 @@ class WorkspaceToolRuntimeV2 {
           leaseOwnerId,
           expectedWorkspaceState: "existing",
           payloadBytes: 0,
+          ...(personOwned ? { workspaceOwner: rebound.ownerRunId } : {}),
         },
         expected: sha256Json({
           workspaceId,
@@ -1191,7 +1199,9 @@ class WorkspaceToolRuntimeV2 {
           canonicalRoot: rebound.canonicalRoot,
           leaseId,
         }),
-        summary: `Reuse durable scratch workspace ${workspaceId} for continue segment ${ownerRunId}.`,
+        summary: personOwned
+          ? `Work in the person's scratch workspace ${workspaceId} for run ${ownerRunId}; it stays the person's.`
+          : `Reuse durable scratch workspace ${workspaceId} for continue segment ${ownerRunId}.`,
         action: "create",
         outboundBytes: 0,
         targetType: "code_workspace",
@@ -1242,6 +1252,7 @@ class WorkspaceToolRuntimeV2 {
     assertPayloadBytes(args, 0);
     if (expectedState === "existing") {
       const readback = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
+      assertPreparedWorkspaceOwner(args, readback);
       const leaseId =
         optionalString(args.leaseId) ??
         (await this.manager.acquireLease(workspaceId, leaseOwnerId)).lease?.id;
@@ -1313,10 +1324,13 @@ class WorkspaceToolRuntimeV2 {
           : Promise.reject(error),
     );
     if (existing?.kind === "repository" && existing.repositoryBinding) {
-      const rebound = await this.manager.rebindWorkspaceOwnerForContinuation(
-        workspaceId,
-        ownerRunId,
-      );
+      const personOwned = isPersonWorkspaceOwnerV2(existing.ownerRunId);
+      const rebound = personOwned
+        ? await this.manager.attachRunToPersonWorkspace(workspaceId, ownerRunId)
+        : await this.manager.rebindWorkspaceOwnerForContinuation(
+            workspaceId,
+            ownerRunId,
+          );
       const leaseOwnerId = `extension:${ownerRunId}`;
       const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
       const leaseId = leased.lease?.id ?? null;
@@ -1337,6 +1351,7 @@ class WorkspaceToolRuntimeV2 {
           leaseOwnerId,
           expectedWorkspaceState: "existing",
           payloadBytes: 0,
+          ...(personOwned ? { workspaceOwner: rebound.ownerRunId } : {}),
           profileKey: binding.profileKey,
           repositoryRoot: binding.repositoryRoot,
           baseSha: rebound.baseSha,
@@ -1477,6 +1492,7 @@ class WorkspaceToolRuntimeV2 {
     assertPayloadBytes(args, 0);
     if (expectedState === "existing") {
       const readback = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
+      assertPreparedWorkspaceOwner(args, readback);
       const leaseId =
         optionalString(args.leaseId) ??
         (await this.manager.acquireLease(workspaceId, leaseOwnerId)).lease?.id;
@@ -1920,14 +1936,15 @@ class WorkspaceToolRuntimeV2 {
     if (known) {
       const manifest = await this.manager.renewLease(workspaceId, known).catch(() => null);
       if (
-        manifest?.ownerRunId === ownerRunId &&
+        manifest &&
+        workspaceRunMayWorkV2(manifest, ownerRunId) &&
         manifest.lease?.id === known &&
         manifest.lease.ownerId === leaseOwnerId
       ) return known;
       this.leases.delete(cacheKey);
     }
     const existing = await this.manager.loadManifest(workspaceId);
-    if (existing.ownerRunId !== ownerRunId) {
+    if (!workspaceRunMayWorkV2(existing, ownerRunId)) {
       throw new WorkspaceManagerErrorV2("workspace_owner_mismatch", "Workspace belongs to another run.");
     }
     const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
@@ -1943,7 +1960,7 @@ class WorkspaceToolRuntimeV2 {
   ): Promise<WorkspaceManifestV2> {
     const manifest = await this.manager.loadManifest(workspaceId);
     if (
-      manifest.ownerRunId !== ownerRunId ||
+      !workspaceRunMayWorkV2(manifest, ownerRunId) ||
       manifest.lease?.id !== leaseId ||
       manifest.lease.ownerId !== leaseOwnerId ||
       manifest.status !== "leased"
@@ -3415,6 +3432,26 @@ function actionRunId(context: ScopedExtensionContextV1): string { return context
 function requiredPath(args: Record<string, unknown>, ...names: string[]): string { for (const name of names) { const value = optionalString(args[name]); if (value) return assertWorkspaceRelativePathV2(value); } throw new WorkspaceManagerErrorV2("invalid_arguments", `${names[0]} is required.`); }
 function requiredString(value: unknown, label: string, allowEmpty = false): string { if (typeof value !== "string" || (!allowEmpty && !value.length)) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a string${allowEmpty ? "" : " with content"}.`); return value; }
 function requiredStringArray(value: unknown, label: string): string[] { if (!Array.isArray(value) || value.length < 1) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a non-empty array.`); return value.map((entry) => requiredString(entry, label)); }
+/**
+ * A create prepared against a person's workspace names that person; the
+ * workspace must still be theirs, with this run attached, when it executes.
+ */
+function assertPreparedWorkspaceOwner(
+  args: Record<string, JsonValueV1>,
+  manifest: WorkspaceManifestV2,
+): void {
+  const owner = optionalString(args.workspaceOwner);
+  if (owner === null) return;
+  if (
+    manifest.ownerRunId !== owner ||
+    manifest.attachedRunId !== requiredString(args.ownerRunId, "ownerRunId")
+  ) {
+    throw new WorkspaceManagerErrorV2(
+      "prepared_binding_drift",
+      "The person's workspace changed hands after this action was prepared.",
+    );
+  }
+}
 function optionalString(value: unknown): string | null { return typeof value === "string" && value.trim() ? value.trim() : null; }
 function optionalInteger(value: unknown): number | undefined { return Number.isSafeInteger(value) ? Number(value) : undefined; }
 function optionalBoundedInteger(value: unknown, label: string, minimum: number, maximum: number): number | undefined {

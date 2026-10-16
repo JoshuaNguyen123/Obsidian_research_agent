@@ -8,10 +8,13 @@ import {
   WORKSPACE_MAX_CHANGED_FILES_V2,
   WORKSPACE_MAX_SEARCH_RESULTS_V2,
   WORKSPACE_MAX_TEXT_BYTES_V2,
+  PERSON_WORKSPACE_OWNER_PREFIX_V2,
   assertWorkspaceRelativePathV2,
+  isPersonWorkspaceOwnerV2,
   isSha256FingerprintV2,
   parseWorkspaceManifestV2,
   serializeWorkspaceManifestV2,
+  workspaceRunMayWorkV2,
   type WorkspaceManifestV2,
   type WorkspaceSandboxPolicyV2,
 } from "./WorkspaceManifestV2";
@@ -56,6 +59,10 @@ const MAX_SEARCH_SKIPPED_NAMED_V2 = 20;
 const NESTED_UNBOUNDED_REPEAT_V2 =
   /\((?:[^()\\]|\\.)*(?:[+*]|\{\d+,\})(?:[^()\\]|\\.)*\)(?:[+*]|\{\d+,\})/u;
 const DEFAULT_EXPIRY_MS = 7 * 24 * 60 * 60 * 1_000;
+/** A new workspace's life, and what a renewal keeps it for by default. */
+export const WORKSPACE_DEFAULT_EXPIRY_MS_V2 = DEFAULT_EXPIRY_MS;
+/** The furthest ahead a renewal may set a workspace's expiry. */
+export const WORKSPACE_MAX_EXPIRY_MS_V2 = 30 * 24 * 60 * 60 * 1_000;
 
 export class WorkspaceManagerErrorV2 extends Error {
   constructor(readonly code: string, message: string) {
@@ -402,7 +409,7 @@ export class WorkspaceManagerV2 {
 
   async resumeWorkspace(workspaceId: string, ownerRunId: string): Promise<WorkspaceManifestV2> {
     let manifest = await this.loadManifest(workspaceId);
-    if (manifest.ownerRunId !== ownerRunId) throw new WorkspaceManagerErrorV2("workspace_owner_mismatch", "Workspace belongs to another run.");
+    if (!workspaceRunMayWorkV2(manifest, ownerRunId)) throw new WorkspaceManagerErrorV2("workspace_owner_mismatch", "Workspace belongs to another run.");
     manifest = await this.applyExpiry(manifest);
     if (["expired", "closed", "blocked"].includes(manifest.status)) {
       throw new WorkspaceManagerErrorV2(`workspace_${manifest.status}`, `Workspace is ${manifest.status}.`);
@@ -444,6 +451,12 @@ export class WorkspaceManagerV2 {
       if (manifest.ownerRunId === ownerRunId) {
         return manifest;
       }
+      if (isPersonWorkspaceOwnerV2(manifest.ownerRunId)) {
+        throw new WorkspaceManagerErrorV2(
+          "workspace_owned_by_person",
+          `Workspace ${id} belongs to a person; a run attaches to it rather than taking it over.`,
+        );
+      }
       const rebound: WorkspaceManifestV2 = {
         ...manifest,
         ownerRunId,
@@ -452,6 +465,108 @@ export class WorkspaceManagerV2 {
       };
       await this.persistManifest(rebound);
       return rebound;
+    });
+  }
+
+  /**
+   * Keep a workspace past its expiry. With no `expiresAt` it is kept for
+   * {@link WORKSPACE_DEFAULT_EXPIRY_MS_V2} from now; an explicit time may be
+   * at most {@link WORKSPACE_MAX_EXPIRY_MS_V2} ahead. A renewal never
+   * shortens: a time at or before the current expiry leaves the manifest as
+   * it is. An expired, closed or blocked workspace is not renewed, because an
+   * expired id is never reused.
+   */
+  async renewWorkspaceExpiry(
+    workspaceId: string,
+    options: { expiresAt?: string } = {},
+  ): Promise<WorkspaceManifestV2> {
+    return this.serializeWrite(async () => {
+      const id = workspaceIdentifier(workspaceId);
+      const manifest = await this.applyExpiry(await this.loadManifest(id));
+      if (["expired", "closed", "blocked"].includes(manifest.status)) {
+        throw new WorkspaceManagerErrorV2(`workspace_${manifest.status}`, `Workspace is ${manifest.status}.`);
+      }
+      await this.assertWorkspaceRoot(manifest);
+      const now = this.now().getTime();
+      let requested = now + DEFAULT_EXPIRY_MS;
+      if (options.expiresAt !== undefined) {
+        requested = typeof options.expiresAt === "string" ? Date.parse(options.expiresAt) : Number.NaN;
+        if (!Number.isFinite(requested)) {
+          throw new WorkspaceManagerErrorV2("invalid_expiry", "Workspace expiry must be a time.");
+        }
+      }
+      if (requested <= now) {
+        throw new WorkspaceManagerErrorV2("invalid_expiry", "Workspace expiry must be in the future.");
+      }
+      if (requested > now + WORKSPACE_MAX_EXPIRY_MS_V2) {
+        throw new WorkspaceManagerErrorV2("invalid_expiry", "A workspace can be kept at most 30 days ahead.");
+      }
+      if (requested <= Date.parse(manifest.expiresAt)) return manifest;
+      const renewed = parseWorkspaceManifestV2({
+        ...manifest,
+        expiresAt: new Date(requested).toISOString(),
+        updatedAt: this.isoNow(),
+      });
+      await this.persistManifest(renewed);
+      return renewed;
+    });
+  }
+
+  /**
+   * Let a run work in a person's workspace without taking it over. The owner
+   * stays the person's and the run is recorded as `attachedRunId`, which the
+   * workspace tools accept as the run's binding. Attaching another run
+   * replaces the first, never while some other owner holds a live lease. A
+   * run attached to a person's workspace cannot make a verified commit there:
+   * the person commits.
+   */
+  async attachRunToPersonWorkspace(workspaceId: string, runId: string): Promise<WorkspaceManifestV2> {
+    return this.serializeWrite(async () => {
+      const id = workspaceIdentifier(workspaceId);
+      const attachedRunId = boundedText(runId, "attached run id", 256);
+      if (attachedRunId.startsWith(PERSON_WORKSPACE_OWNER_PREFIX_V2)) {
+        throw new WorkspaceManagerErrorV2("invalid_owner", "Only a run can be attached to a person's workspace.");
+      }
+      const manifest = await this.applyExpiry(await this.loadManifest(id));
+      if (!isPersonWorkspaceOwnerV2(manifest.ownerRunId)) {
+        throw new WorkspaceManagerErrorV2("workspace_not_person_owned", `Workspace ${id} is not a person's workspace.`);
+      }
+      if (["expired", "closed", "blocked"].includes(manifest.status)) {
+        throw new WorkspaceManagerErrorV2(`workspace_${manifest.status}`, `Workspace is ${manifest.status}.`);
+      }
+      await this.assertWorkspaceRoot(manifest);
+      if (manifest.attachedRunId === attachedRunId) return manifest;
+      // applyExpiry has already dropped a lease that ran out.
+      if (manifest.lease && manifest.lease.ownerId !== `extension:${attachedRunId}`) {
+        throw new WorkspaceManagerErrorV2("workspace_in_use", `Workspace ${id} is in use; try again when it is free.`);
+      }
+      const attached = parseWorkspaceManifestV2({ ...manifest, attachedRunId, updatedAt: this.isoNow() });
+      await this.persistManifest(attached);
+      return attached;
+    });
+  }
+
+  /**
+   * End a run's attachment to a person's workspace and drop the lease it
+   * holds there. Naming a run that is not the attached one changes nothing.
+   */
+  async detachRunFromPersonWorkspace(workspaceId: string, runId: string): Promise<WorkspaceManifestV2> {
+    return this.serializeWrite(async () => {
+      const id = workspaceIdentifier(workspaceId);
+      const detachedRunId = boundedText(runId, "attached run id", 256);
+      const manifest = await this.applyExpiry(await this.loadManifest(id));
+      if (manifest.attachedRunId !== detachedRunId) return manifest;
+      const { attachedRunId: _detached, ...rest } = manifest;
+      const leaseWasTheRuns = manifest.lease?.ownerId === `extension:${detachedRunId}`;
+      const detached = parseWorkspaceManifestV2({
+        ...rest,
+        ...(leaseWasTheRuns
+          ? { lease: null, status: manifest.status === "leased" ? "active" : manifest.status }
+          : {}),
+        updatedAt: this.isoNow(),
+      });
+      await this.persistManifest(detached);
+      return detached;
     });
   }
 

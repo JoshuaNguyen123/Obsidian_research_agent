@@ -112,6 +112,13 @@ import {
 import {
   DurableValidationReceiptRegistryV1,
   CallbackCodeRepairCheckpointStoreV1,
+  PersonWorkspaceCommitRuntimeV1,
+  type NormalizedCodeRepairRequestV1,
+  type PersonWorkspaceCommitInputV1,
+  type PersonWorkspaceCommitResultV1,
+  type PersonWorkspaceRevertInputV1,
+  type CodeValidationReceiptV1,
+  type ValidationKindV1,
   FixedArgvArtifactHashReaderV1,
   FixedArgvRepairProofAdapterV1,
   SpawnFixedArgvGitRunnerV1,
@@ -140,6 +147,7 @@ import {
   type SealBackgroundValidationCommitPackageResultV1,
 } from "./background";
 import { classifyProtectedControlChanges } from "./repair/protectedControls";
+import { isAgentGitCommitIdentityV1 } from "../../packages/core-api/src/agentGitCommitIdentityV1";
 
 export const CODE_RUNTIME_STATE_VERSION_V2 = 2 as const;
 export const CODE_EXTENSION_VERSION_V2 = "0.2.0" as const;
@@ -791,7 +799,7 @@ export class CodeExtensionRuntimeV2 {
 
   async resolveSandboxExecutionInput(
     sandboxAction: PreparedSandboxActionV2,
-    _context: ScopedExtensionContextV1,
+    _context?: ScopedExtensionContextV1,
   ): Promise<{
     stagedFiles: readonly SandboxStagedFileBytesV2[];
     artifactImporter?: SandboxArtifactImporterV2;
@@ -958,6 +966,12 @@ export class CodeExtensionRuntimeV2 {
         expectedExistingSha256: existing?.sha256 ?? null,
         maxBytes: artifact.maxBytes,
       });
+    }
+    if (!_context) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_artifact_context_required",
+        "Generated sandbox artifacts are imported only for a run.",
+      );
     }
     const leaseOwner = `extension:${contextRunId(_context)}`;
     let leaseId = await this.ensureArtifactImportLease(
@@ -1829,17 +1843,31 @@ export class CodeExtensionRuntimeV2 {
       this.checkpointPersistence(),
     );
     const eligible = [];
+    // A person's commit (CODE-15) is verified but never published: the push
+    // path is the agent's. It still ends the agent's commits before it in the
+    // same workspace, which are no longer what that workspace is at.
+    const personCommits: Array<{ workspaceId: string; committedAt: string }> = [];
     for (const id of checkpointIds) {
       const checkpoint = await store.load(id);
       if (
         checkpoint?.terminal?.status === "complete" &&
         checkpoint.terminal.publicationEligible === true &&
         checkpoint.verifiedCommitReceipt &&
-        checkpoint.request.worktree.profileId === profileKey &&
-        (!exactRunId || checkpoint.request.runId === exactRunId) &&
-        (!exactRequestId || checkpoint.request.id === exactRequestId)
+        checkpoint.request.worktree.profileId === profileKey
       ) {
-        eligible.push(checkpoint);
+        if (!isAgentGitCommitIdentityV1(checkpoint.verifiedCommitReceipt.identity)) {
+          personCommits.push({
+            workspaceId: checkpoint.verifiedCommitReceipt.workspaceId,
+            committedAt: checkpoint.verifiedCommitReceipt.committedAt,
+          });
+          continue;
+        }
+        if (
+          (!exactRunId || checkpoint.request.runId === exactRunId) &&
+          (!exactRequestId || checkpoint.request.id === exactRequestId)
+        ) {
+          eligible.push(checkpoint);
+        }
       }
     }
     eligible.sort((left, right) =>
@@ -1850,6 +1878,12 @@ export class CodeExtensionRuntimeV2 {
     const checkpoint = eligible[0];
     const receipt = checkpoint?.verifiedCommitReceipt;
     if (!checkpoint || !receipt) return null;
+    if (personCommits.some((person) =>
+      person.workspaceId === receipt.workspaceId &&
+      person.committedAt.localeCompare(receipt.committedAt) > 0
+    )) {
+      return null;
+    }
     const manifest = await this.workspaceManager.loadManifest(receipt.workspaceId);
     const binding = manifest.repositoryBinding;
     if (
@@ -2293,6 +2327,152 @@ export class CodeExtensionRuntimeV2 {
       }),
       now: this.now,
     });
+  }
+
+  /**
+   * The person's *Validate and commit* (CODE-15): their changes in a
+   * repository workspace, validated in the sandbox (fast, targeted, then a
+   * fresh full validation) and committed with their message and as them,
+   * through the same verified path and proof a pass's commit takes. The
+   * workspace's base then moves to the new commit. A person's commit is never
+   * a publication handoff. Host-only: no model or tool reaches it.
+   */
+  async commitPersonWorkspaceChanges(
+    input: PersonWorkspaceCommitInputV1,
+  ): Promise<PersonWorkspaceCommitResultV1> {
+    this.assertInitialized();
+    const runtime = this.personWorkspaceCommits();
+    if (!runtime) return personCommitUnavailable(input.workspaceId);
+    return runtime.commit(input);
+  }
+
+  /**
+   * Revert a verified commit, a pass's or a person's, as a new verified
+   * commit by the person (DEBT-125). Only the workspace's newest commit, on a
+   * workspace with nothing else changed. Host-only.
+   */
+  async revertVerifiedWorkspaceCommit(
+    input: PersonWorkspaceRevertInputV1,
+  ): Promise<PersonWorkspaceCommitResultV1> {
+    this.assertInitialized();
+    const runtime = this.personWorkspaceCommits();
+    if (!runtime) return personCommitUnavailable(input.workspaceId);
+    return runtime.revert(input);
+  }
+
+  private personWorkspaceCommits(): PersonWorkspaceCommitRuntimeV1 | null {
+    const registry = this.validationReceiptRegistry;
+    const git = this.repairGit;
+    if (!registry || !git) return null;
+    return new PersonWorkspaceCommitRuntimeV1({
+      workspaceManager: this.workspaceManager,
+      getRepositoryProfile: (profileKey) => this.getRepositoryProfile(profileKey),
+      checkpointPersistence: this.checkpointPersistence(),
+      validate: (validation) => this.runPersonValidation(validation, registry),
+      sandboxReady: async (signal) => {
+        const status = await this.probeConfiguredSandboxProviders(signal);
+        return status.executionAvailable
+          ? { ready: true }
+          : {
+              ready: false,
+              message: status.blocker?.message ??
+                "No sandbox passed its boundary check, so these changes cannot be validated.",
+            };
+      },
+      git,
+      disabledHooksPath: path.join(
+        this.workspaceManager.applicationDataRoot,
+        "repair-disabled-hooks",
+      ),
+      now: this.now,
+    });
+  }
+
+  /**
+   * One validation of a person's commit: the trusted profile's own command for
+   * the phase, prepared over the workspace as it stands, run in the verified
+   * sandbox and captured as a receipt bound to the person's request.
+   */
+  private async runPersonValidation(
+    input: {
+      operationId: string;
+      request: NormalizedCodeRepairRequestV1;
+      kind: ValidationKindV1;
+      signal?: AbortSignal;
+    },
+    registry: DurableValidationReceiptRegistryV1,
+  ): Promise<CodeValidationReceiptV1> {
+    const sandbox = this.requireSandboxManager();
+    const preparation = await this.resolveSandboxPreparationInput(
+      `validation_${input.kind}`,
+      input.request.worktree.id,
+    );
+    if ((preparation.expectedArtifacts?.length ?? 0) > 0) {
+      // A run imports what its validation generates; a person's commit
+      // commits their own changes and nothing the sandbox wrote.
+      throw new CodeSandboxContributionErrorV2(
+        "person_commit_generated_outputs",
+        "This validation writes generated files, which a person's commit does not take in.",
+      );
+    }
+    const prepared = await sandbox.prepareExecution({
+      ...preparation,
+      purpose: `validation_${input.kind}`,
+      repairRequestId: input.request.id,
+      environment: { CI: "1", NO_COLOR: "1", TZ: "UTC" },
+      ttlMs: 10 * 60_000,
+    });
+    if (prepared.status === "blocked") {
+      throw new CodeSandboxContributionErrorV2(prepared.blocker.code, prepared.blocker.message);
+    }
+    const execution = await this.resolveSandboxExecutionInput(prepared.action);
+    const result = await sandbox.executePrepared(prepared.action, {
+      authorization: {
+        preparedActionId: prepared.action.id,
+        payloadFingerprint: prepared.action.payloadFingerprint,
+        grantId: `person-commit:${input.request.id}`,
+      },
+      stagedFiles: execution.stagedFiles,
+      artifactImporter: execution.artifactImporter,
+      signal: input.signal,
+    });
+    if (result.status === "blocked") {
+      throw new CodeSandboxContributionErrorV2(result.blocker.code, result.blocker.message);
+    }
+    const manifest = await this.workspaceManager.loadManifest(prepared.action.workspaceId);
+    const captured = await registry.capture({
+      scope: {
+        runId: input.request.runId,
+        workspaceId: prepared.action.workspaceId,
+        requestId: input.request.id,
+      },
+      action: prepared.action,
+      receipt: result.receipt,
+      diagnostics: result.diagnostics,
+      validatedWorkspaceManifestFingerprint: manifest.hashes.indexFingerprint,
+      workspaceChangedPaths: manifest.budget.changedPaths,
+    });
+    // The coordinator binds each receipt to its own operation, as the
+    // background runtime does with the same captured evidence.
+    const evidence = {
+      operationId: input.operationId,
+      kind: captured.kind,
+      sandboxId: captured.sandboxId,
+      freshSandbox: true,
+      startedAt: captured.startedAt,
+      completedAt: captured.completedAt,
+      checks: captured.checks,
+      status: captured.status,
+      failureFingerprint: captured.failureFingerprint,
+      binding: captured.binding,
+    };
+    return {
+      version: 1,
+      kindName: "code_validation",
+      id: input.operationId,
+      ...evidence,
+      fingerprint: await sha256Fingerprint(evidence),
+    };
   }
 
   /**
@@ -3002,6 +3182,15 @@ export class ProfileAwareRepositoryProvisionerV2
     }
     return promoted;
   }
+}
+
+function personCommitUnavailable(workspaceId: string): PersonWorkspaceCommitResultV1 {
+  return {
+    status: "refused",
+    workspaceId: String(workspaceId ?? ""),
+    code: "commit_unavailable",
+    message: "The verified commit path is not connected in this session, so nothing can be committed.",
+  };
 }
 
 export function createInitialCodeRuntimeStateV2(now: string): CodeRuntimeStateV2 {

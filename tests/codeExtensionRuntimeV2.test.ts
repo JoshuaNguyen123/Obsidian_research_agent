@@ -352,6 +352,252 @@ test("CodeExtensionRuntimeV2 resolves only a terminal verified commit through th
   }
 });
 
+test("a person's verified commit is never a publication handoff, and it ends the agent's before it in that workspace", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-person-commit-"));
+  try {
+    const repositoryRoot = path.join(root, "repository");
+    const worktreeRoot = path.join(root, "worktree");
+    await mkdir(repositoryRoot);
+    await mkdir(worktreeRoot);
+    await writeFile(path.join(worktreeRoot, ".git"), "gitdir: fixture\n", "utf8");
+    const profile = createRepositoryProfile({
+      key: "trusted-person-repository",
+      displayName: "Trusted person repository",
+      repositoryRoot,
+      defaultBranch: "main",
+      allowedPathPrefixes: ["src"],
+      validationProfile: createNodeNpmValidationProfile(),
+    });
+    const workspaceId = "person-workspace";
+    const owner = "run-2026-08-21T04:15:10.123Z-AbCd1234";
+    const branch = "codex/workspace-person-workspace";
+    const worktree = { id: workspaceId, path: worktreeRoot, repositoryRoot, branch, profileId: profile.key };
+    const agent = terminalCheckpointFixture({
+      request: {
+        id: "request-agent-pass",
+        runId: owner,
+        objective: "Repair and verify the fixture.",
+        worktree: { ...worktree, baseSha: "a".repeat(40) },
+        commitMessage: "fix: the pass",
+        maxCycles: 3,
+        expectedArtifacts: [],
+        protectedControlPaths: [],
+      },
+      commitSha: "b".repeat(40),
+      treeSha: "c".repeat(40),
+      artifactSha: SHA("1"),
+      artifactBytes: 24,
+    });
+    const person = terminalCheckpointFixture({
+      request: {
+        id: "person-revert-op-1",
+        runId: owner,
+        objective: "Validate and commit the person's changes in this workspace.",
+        worktree: { ...worktree, baseSha: "b".repeat(40) },
+        commitMessage: "Revert the pass",
+        maxCycles: 3,
+        expectedArtifacts: [],
+        protectedControlPaths: [],
+        commitIdentity: {
+          authorName: "Ada Lovelace",
+          authorEmail: "ada@example.com",
+          committerName: "Ada Lovelace",
+          committerEmail: "ada@example.com",
+        },
+      },
+      commitSha: "d".repeat(40),
+      treeSha: "e".repeat(40),
+      artifactSha: SHA("2"),
+      artifactBytes: 24,
+      committedAt: "2026-07-12T18:05:00.000Z",
+    });
+    const handoffWith = async (checkpoints: Array<typeof agent>) => {
+      const plugin = new MemoryPluginData({
+        schemaVersion: 1,
+        extensionStateMigration: migrationRecord(codeSnapshot([profile])),
+        codeRepairCheckpointsV1: {
+          version: 1,
+          revision: 1,
+          checkpoints: Object.fromEntries(checkpoints.map((checkpoint) => [checkpoint.id, checkpoint])),
+        },
+      });
+      const manager = new WorkspaceManagerV2({
+        applicationDataRoot: path.join(root, `app-data-${checkpoints.length}-${checkpoints[0]!.request.id}`),
+        now: () => new Date(NOW),
+        randomId: incrementingId(),
+      });
+      await manager.registerTrustedRepositoryWorkspace({
+        workspaceId,
+        ownerRunId: owner,
+        profileKey: profile.key,
+        repositoryRoot,
+        worktreeRoot,
+        branch,
+        baseSha: "a".repeat(40),
+        bindingFingerprint: SHA("6"),
+        trusted: true,
+      });
+      const runtime = new CodeExtensionRuntimeV2({
+        plugin: plugin as unknown as Plugin,
+        workspaceManager: manager,
+        now: () => new Date(NOW),
+      });
+      await runtime.initialize();
+      return runtime.resolveLatestVerifiedPublicationHandoff(profile.key);
+    };
+    assert.equal((await handoffWith([agent]))?.commitSha, "b".repeat(40), "the pass alone is the handoff");
+    assert.equal(await handoffWith([agent, person]), null, "the person's later commit ends it");
+    assert.equal(await handoffWith([person]), null, "a person's commit is never published");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 validates a person's changes in the sandbox and commits them as the person", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-person-commit-live-"));
+  try {
+    const repositoryRoot = path.join(root, "repository");
+    const worktreeRoot = path.join(root, "worktree");
+    await mkdir(path.join(repositoryRoot, "src"), { recursive: true });
+    const git = (cwd: string, ...args: string[]) => execFileAsync("git", args, { cwd, windowsHide: true, encoding: "utf8" });
+    await git(repositoryRoot, "init", "--initial-branch=main");
+    await git(repositoryRoot, "config", "user.name", "Fixture");
+    await git(repositoryRoot, "config", "user.email", "fixture@example.invalid");
+    await git(repositoryRoot, "config", "core.autocrlf", "false");
+    await writeFile(path.join(repositoryRoot, "package.json"), '{"scripts":{"test":"node --test","build":"node --check src/value.ts"}}\n', "utf8");
+    await writeFile(path.join(repositoryRoot, "src", "value.ts"), "export const value = 1;\n", "utf8");
+    await git(repositoryRoot, "add", "--all");
+    await git(repositoryRoot, "commit", "-m", "base");
+    const baseSha = (await git(repositoryRoot, "rev-parse", "HEAD")).stdout.trim();
+    await git(repositoryRoot, "worktree", "add", "-b", "codex/person", worktreeRoot, baseSha);
+    const canonicalRepository = await realpath(repositoryRoot);
+    const canonicalWorktree = await realpath(worktreeRoot);
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    let tick = Date.parse(NOW);
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(root, "app-data"),
+      now: () => new Date(tick += 1_000),
+      randomId: incrementingId(),
+    });
+    const ran: string[] = [];
+    const sandboxRunner: SandboxCommandRunnerV2 = {
+      async run(spec) {
+        if (spec.purpose === "boundary_probe") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              version: 1,
+              uid: 65532,
+              networkBlocked: true,
+              rootReadOnly: true,
+              hostRootAbsent: true,
+              containerSocketAbsent: true,
+              runtimeReadOnly: true,
+              runtimeDigest: SHA("f"),
+              stagingIsolated: true,
+              resourceLimitsEnforced: true,
+            }),
+            stderr: "",
+          };
+        }
+        ran.push(spec.purpose);
+        return { exitCode: 0, stdout: "ok\n", stderr: "" };
+      },
+    };
+    const detecting = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: manager,
+      sandboxRunner,
+      now: () => new Date(tick += 1_000),
+    });
+    await detecting.initialize();
+    await detecting.configureSandboxProvider({
+      version: 1,
+      kind: "docker",
+      executable: "docker",
+      priority: 10,
+      runtimeReference: "registry.example/agentic-sandbox",
+      runtimeDigest: SHA("f"),
+      wslDistribution: null,
+      runtimeRoot: null,
+    });
+    await detecting.probeConfiguredSandboxProviders();
+    // The profile the person trusted: detected from the checkout, its Node
+    // runtime pinned to the probed sandbox's digest, and, as the host trusts
+    // one, without the Git-internal controls no workspace path can name.
+    await detecting.persistDetectedRepositoryProfile({
+      profileKey: "person-repository",
+      inspection: { repositoryRoot: canonicalRepository, baseSha, branch: "main", clean: true },
+      context: extensionContext(true),
+    });
+    const stored = plugin.read();
+    const record = stored.codeRuntimeState.repositoryProfiles["person-repository"];
+    record.profile.protectedControls = record.profile.protectedControls.filter(
+      (control: { path: string }) => !control.path.split("/").includes(".git"),
+    );
+    await plugin.saveData(stored);
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: manager,
+      sandboxRunner,
+      now: () => new Date(tick += 1_000),
+    });
+    await runtime.initialize();
+    await runtime.probeConfiguredSandboxProviders();
+    const profile = (await runtime.getRepositoryProfile("person-repository"))!;
+    assert.ok(profile);
+    await manager.registerTrustedRepositoryWorkspace({
+      workspaceId: "person-workspace",
+      ownerRunId: "person:code-page",
+      profileKey: profile.key,
+      repositoryRoot: canonicalRepository,
+      worktreeRoot: canonicalWorktree,
+      branch: "codex/person",
+      baseSha,
+      bindingFingerprint: SHA("6"),
+      trusted: true,
+    });
+    const lease = await manager.acquireLease("person-workspace", "person:code-workspaces-pane");
+    const before = await manager.read("person-workspace", "src/value.ts");
+    await manager.writeExpected("person-workspace", lease.lease!.id, "src/value.ts", "export const value = 2;\n", before.sha256);
+    await manager.releaseLease("person-workspace", lease.lease!.id);
+
+    const result = await runtime.commitPersonWorkspaceChanges({
+      workspaceId: "person-workspace",
+      operationId: "op-1",
+      message: "Make the value two",
+      person: { name: "Ada Lovelace", email: "ada@example.com" },
+    });
+    assert.equal(result.status, "committed", JSON.stringify(result));
+    if (result.status !== "committed") return;
+    // One sandbox execution for each of the fast, targeted and full validations.
+    assert.deepEqual(ran, ["execute", "execute", "execute"]);
+    const head = (await git(canonicalWorktree, "rev-parse", "HEAD")).stdout.trim();
+    assert.equal(result.commitSha, head);
+    assert.equal(
+      (await git(canonicalWorktree, "log", "-1", "--format=%an <%ae>|%cn <%ce>|%s")).stdout.trim(),
+      "Ada Lovelace <ada@example.com>|Ada Lovelace <ada@example.com>|Make the value two",
+    );
+    assert.equal(result.base.advanced, true);
+    assert.equal((await manager.loadManifest("person-workspace")).baseSha, head);
+    // The validations are the sandbox's own durable receipts, bound to the person's request.
+    const data = await plugin.loadData() as Record<string, any>;
+    const receipts = Object.values(data.codeValidationReceiptsV1.receipts) as Array<{
+      scope: { runId: string; workspaceId: string; requestId: string };
+      validation: { kind: string };
+    }>;
+    assert.deepEqual(receipts.map((receipt) => receipt.validation.kind).sort(), ["fast", "full", "targeted"]);
+    for (const receipt of receipts) {
+      assert.deepEqual(receipt.scope, { runId: "person:code-page", workspaceId: "person-workspace", requestId: "person-commit-op-1" });
+    }
+    assert.ok(data.codeRepairCheckpointsV1.checkpoints[result.checkpointId]);
+    // A person's commit is not published.
+    assert.equal(await runtime.resolveLatestVerifiedPublicationHandoff(profile.key), null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CodeExtensionRuntimeV2 acquires reflection examples from the exact verified commit instead of the mutable worktree", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "code-runtime-reflection-"));
   try {
@@ -2327,13 +2573,17 @@ function terminalCheckpointFixture(input: {
     maxCycles: 3;
     expectedArtifacts: [];
     protectedControlPaths: [];
+    commitIdentity?: { authorName: string; authorEmail: string; committerName: string; committerEmail: string };
   };
   commitSha: string;
   treeSha: string;
   artifactSha: string;
   artifactBytes: number;
+  committedAt?: string;
 }) {
   const { request } = input;
+  const identity = request.commitIdentity ?? COMMIT_IDENTITY;
+  const committedAt = input.committedAt ?? NOW;
   const changedPath = "src/value.ts";
   const files = [{
     path: changedPath,
@@ -2413,7 +2663,7 @@ function terminalCheckpointFixture(input: {
   const commit = {
     operationId: commitOperationId,
     commitSha: input.commitSha,
-    committedAt: NOW,
+    committedAt,
   };
   const commitReadback = {
     operationId: `${commitOperationId}:readback`,
@@ -2423,7 +2673,7 @@ function terminalCheckpointFixture(input: {
     diffFingerprint,
     changedPaths: [changedPath],
     artifactHashes: artifactReadback,
-    identity: { ...COMMIT_IDENTITY },
+    identity: { ...identity },
     readAt: NOW,
   };
   const commitEvidence = {
@@ -2440,12 +2690,12 @@ function terminalCheckpointFixture(input: {
     changedPaths: [changedPath],
     artifactHashes: artifactReadback,
     changedArtifacts: [{ path: changedPath, sha256: input.artifactSha }],
-    identity: { ...COMMIT_IDENTITY },
+    identity: { ...identity },
     targetedValidationReceiptId: targetedValidation.id,
     fullValidationReceiptId: fullValidation.id,
     targetedValidationFingerprint: targetedValidation.fingerprint,
     fullValidationFingerprint: fullValidation.fingerprint,
-    committedAt: NOW,
+    committedAt,
   };
   const verifiedCommitReceipt = {
     version: 1 as const,
