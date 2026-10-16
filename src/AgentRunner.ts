@@ -1055,6 +1055,7 @@ import {
   descriptorAllowsWriteAutonomyPromptGrantV1,
   deriveRoutedIntentFallback,
   evaluateToolPolicy,
+  preparedActionAllowsWriteAutonomyV1,
   resolvePolicyRoutedIntent,
   type PolicyDecision,
 } from "./agent/policyEngine";
@@ -14066,7 +14067,8 @@ export async function runAgentMission({
         preparedPolicyDecision.tags.includes("write_autonomy") &&
         preparedPolicyDecision.tags.includes("prepared_fingerprint") &&
         descriptor.effect === "reversible_mutation" &&
-        descriptorAllowsWriteAutonomyPromptGrantV1(descriptor)
+        descriptorAllowsWriteAutonomyPromptGrantV1(descriptor) &&
+        preparedActionAllowsWriteAutonomyV1(preparedAction)
       ) {
         try {
           const grant = await createOneShotGrant({

@@ -112,6 +112,27 @@ export function isPromptDerivedAuthorityGrantV1(
  * has opted out of prompt-derived authority entirely, so it must fall through
  * to the exact approval its `fallback` names.
  */
+/**
+ * Whether write autonomy may cover this prepared action itself, beside what
+ * its descriptor allows. An action that asks for more than the ordinary single
+ * confirmation, or that changes a protected repository control (a manifest, a
+ * lockfile, a build script, a workflow or a hook: the classification's
+ * `requiresProfileRedetection` mark, which the unattended queue already
+ * refuses), asks for its exact approval whatever the run's autonomy, with the
+ * count it asks for without it. The count alone cannot say it: every prepared
+ * code workspace write names one confirmation, a protected exact-diff change
+ * as well as an ordinary edit. Like the descriptor predicate, the policy
+ * engine and the runner's one-shot grant both read this one function.
+ */
+export function preparedActionAllowsWriteAutonomyV1(
+  action: Pick<PreparedAction, "requiredConfirmations" | "normalizedArgs">,
+): boolean {
+  return (
+    (action.requiredConfirmations ?? 1) <= 1 &&
+    action.normalizedArgs?.requiresProfileRedetection !== true
+  );
+}
+
 export function descriptorAllowsWriteAutonomyPromptGrantV1(
   descriptor: ToolDescriptor,
 ): boolean {
@@ -350,7 +371,8 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
   if (
     action &&
     ctx.writeAutonomy &&
-    descriptorAllowsWriteAutonomyPromptGrantV1(descriptor)
+    descriptorAllowsWriteAutonomyPromptGrantV1(descriptor) &&
+    preparedActionAllowsWriteAutonomyV1(action)
   ) {
     return allow(
       "Scoped reversible mutation proceeds under write autonomy with a fingerprint-bound prepared action.",
