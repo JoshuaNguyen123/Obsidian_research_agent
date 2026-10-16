@@ -99,6 +99,7 @@ export const ROUTE_BASE_TOOLS: Readonly<
     "code_validate_fast",
     "code_validate_targeted",
     "code_validate_full",
+    "code_sandbox_run",
     "code_repair_record_cycle",
     "code_repair_status",
     "code_workspace_init_repository",

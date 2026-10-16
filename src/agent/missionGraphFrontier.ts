@@ -83,6 +83,8 @@ function isWriteToolName(toolName: string): boolean {
 
 const CODE_WORKFLOW_OBSERVATION_TOOL_NAMES = new Set<string>([
   "code_sandbox_status",
+  // A command writes nothing back, so it is never a required workflow step.
+  "code_sandbox_run",
   "code_workspace_status",
   "code_workspace_read",
   "code_workspace_stat",

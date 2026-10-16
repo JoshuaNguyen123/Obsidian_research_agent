@@ -107,6 +107,11 @@ export const CODE_VALIDATION_TOOL_ALLOW = [
   "code_validate_fast",
   "code_validate_targeted",
   "code_validate_full",
+  // One program and its arguments in the verified sandbox, network off,
+  // nothing written back (CODE-17). Offered by the free node, and in a guided
+  // ladder only as a bounded investigation during validation recovery; it
+  // proves nothing for a commit.
+  "code_sandbox_run",
   "code_repair_record_cycle",
   "code_repair_status",
   "code_commit_verified",

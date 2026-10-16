@@ -10,6 +10,10 @@ import {
   renderCodeWorkspaceSearchForModelV1,
   type CodeModelRenderingV1,
 } from "./codeWorkspacePayloadV1";
+import {
+  normalizeCodeCommandOutputBudgetCharsV1,
+  renderCodeSandboxRunForModelV1,
+} from "./codeSandboxRunPayloadV1";
 
 const MAX_SUMMARY_CHARS = 8000;
 /** Active-note reads must keep body text for edit/expand, not passage snippets. */
@@ -53,6 +57,8 @@ const FULL_CONTENT_NOTE_READ_TOOLS = new Set([
  * 7,000-character budget that is today's 8,000-character envelope.
  */
 const CODE_READ_ENVELOPE_OVERHEAD_CHARS = 1_000;
+/** A command answer's room beyond its two streams: the summary, guard, notes and fields. */
+const CODE_COMMAND_ENVELOPE_OVERHEAD_CHARS = 2_400;
 /** What the host may say about an edit's diagnostics, kept after the receipt. */
 export const MAX_CODE_WRITE_DIAGNOSTICS_CHARS_V1 = 2_000;
 const CODE_WRITE_DIAGNOSTICS_CUT_MARKER = "\n[diagnostics cut]";
@@ -79,6 +85,12 @@ export interface ToolResultSerializationOptionsV1 {
    * 2,000–60,000. Every other tool keeps its own budget.
    */
   codeReadBudgetChars?: number;
+  /**
+   * Character budget for each output stream of a `code_sandbox_run` answer
+   * (CODE-17). Default 2,400, as a validation excerpt; clamped to
+   * 800-12,000. A longer stream keeps its start and its end.
+   */
+  codeCommandOutputBudgetChars?: number;
 }
 
 /**
@@ -233,7 +245,7 @@ function serializeCodeWorkspaceResultForModel(
 ): string | null {
   if (!result.ok || !isRecord(result.output)) return null;
   const output = result.output;
-  let render: ((budget: number) => CodeModelRenderingV1 | null) | null = null;
+  let render: ((budget: number) => (CodeModelRenderingV1 & { guard?: string }) | null) | null = null;
   let textBudget: number;
   let cap: number;
   if (result.toolName === "code_workspace_read") {
@@ -253,6 +265,10 @@ function serializeCodeWorkspaceResultForModel(
     cap = MAX_SUMMARY_CHARS;
     const diagnostics = boundedCodeWriteDiagnostics(output.diagnostics);
     render = () => renderCodeWorkspaceApplyPatchForModelV1(output, diagnostics);
+  } else if (result.toolName === "code_sandbox_run") {
+    textBudget = normalizeCodeCommandOutputBudgetCharsV1(options.codeCommandOutputBudgetChars);
+    cap = textBudget * 2 + CODE_COMMAND_ENVELOPE_OVERHEAD_CHARS;
+    render = (budget) => renderCodeSandboxRunForModelV1(output, budget);
   } else {
     return null;
   }
@@ -263,6 +279,10 @@ function serializeCodeWorkspaceResultForModel(
     const envelope: ToolPayloadSummary = {
       toolName: result.toolName,
       status: "success",
+      // A program's output is untrusted: the marker and the guard come before it.
+      ...(rendering.guard
+        ? { trust: UNTRUSTED_EXTERNAL_CONTENT_TRUST, guard: rendering.guard }
+        : {}),
       summary: rendering.summary,
       ...(rendering.evidenceRefs && rendering.evidenceRefs.length > 0
         ? { evidenceRefs: rendering.evidenceRefs }

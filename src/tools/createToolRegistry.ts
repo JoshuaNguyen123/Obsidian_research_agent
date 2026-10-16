@@ -102,6 +102,7 @@ export const CODE_EXTENSION_V2_TOOL_NAMES = Object.freeze([
   "code_validate_fast",
   "code_validate_targeted",
   "code_validate_full",
+  "code_sandbox_run",
   "code_repair_status",
   "code_repair_record_cycle",
   "code_commit_verified",

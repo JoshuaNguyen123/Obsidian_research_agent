@@ -45,6 +45,8 @@ export interface ScriptedCodeWorkspaceState {
   validations: ScriptedValidation[];
   passedFastCycle: boolean;
   commits: Array<{ commitSha: string; contentFingerprint: string }>;
+  /** The argv of each `code_sandbox_run` that ran. */
+  commands: string[][];
 }
 
 export interface ScriptedCodeWorkspaceOptions {
@@ -57,6 +59,17 @@ export interface ScriptedCodeWorkspaceOptions {
   ) => { passed: boolean; diagnostic: string };
   workspaceId?: string;
   profileKey?: string;
+  /**
+   * Answer as the real tools do where validation recovery reads them: a failed
+   * validation carries the sandbox's diagnostic excerpt, an edit its mutation
+   * receipt, and the workspace its repository write scope.
+   */
+  diagnosticExcerpts?: boolean;
+  /** What a `code_sandbox_run` program prints, from its argv and the files. */
+  command?: (
+    argv: readonly string[],
+    files: ReadonlyMap<string, string>,
+  ) => { exitCode: number; stdout: string; stderr: string };
 }
 
 const sha = (value: string): string =>
@@ -136,6 +149,7 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
     validations: [],
     passedFastCycle: false,
     commits: [],
+    commands: [],
   };
   const defaultWorkspaceId = options.workspaceId ?? "code-pager-1";
   const profileKey = options.profileKey ?? "pager-repo";
@@ -250,12 +264,29 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
       prepare(input.name, args, context, resource(workspaceOf(args), input.pathOf(args)), `${input.operation} ${input.pathOf(args)}`, input.after?.(args)),
     async executePrepared(action, context) {
       const args = action.normalizedArgs as Record<string, unknown>;
+      const before = state.files.get(input.pathOf(args));
       const applied = input.apply(args);
       state.executed.push(input.name);
+      const after = state.files.get(applied.path);
+      // The manager's own mutation receipt, which validation recovery reads to
+      // know which file an edit changed, when the run asks for it.
+      const mutation = options.diagnosticExcerpts && after !== undefined
+        ? {
+            receipt: {
+              version: 2,
+              path: applied.path,
+              beforeSha256: before === undefined ? null : sha(before),
+              afterSha256: sha(after),
+            },
+          }
+        : {};
+      const receipt = receiptFor(action, context, input.action, `${input.operation} ${applied.path}`);
       return {
         mutationState: "applied",
-        output: { status: "ok", operation: input.operation, path: applied.path, ...applied.output },
-        receipt: receiptFor(action, context, input.action, `${input.operation} ${applied.path}`),
+        output: { status: "ok", operation: input.operation, path: applied.path, ...applied.output, ...mutation },
+        receipt: "receipt" in mutation
+          ? { ...receipt, readback: { ...receipt.readback, observedRevision: sha(after!) } }
+          : receipt,
       };
     },
   });
@@ -302,6 +333,10 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
             status: record.status,
             kind,
             diagnostic: verdict.diagnostic,
+            // The sandbox's own excerpt, as a real validation answers, when asked for.
+            ...(options.diagnosticExcerpts && record.status === "failed"
+              ? { validationDiagnosticExcerpt: { version: 1, stdout: "", stderr: verdict.diagnostic, truncated: false, redactedLines: 0 } }
+              : {}),
             validationReceipt: {
               id: record.id,
               kind,
@@ -353,7 +388,9 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
             workspaceId,
             kind: "repository",
             profileKey,
-            repositoryWriteScope: { allowedPaths: ["."] },
+            repositoryWriteScope: options.diagnosticExcerpts
+              ? { allowedPaths: ["."], projects: [{ id: "pager", allowedPaths: ["src", "tests"] }] }
+              : { allowedPaths: ["."] },
           },
           receipt: receiptFor(action, context, "create", `Created ${workspaceId}`),
         };
@@ -627,5 +664,67 @@ export function createScriptedCodeWorkspace(options: ScriptedCodeWorkspaceOption
       },
     },
   ];
+  // CODE-17: one program and its arguments, prepared and approved as the
+  // code extension's `code_sandbox_run` is, answering what `options.command`
+  // says the program printed over the files as they are.
+  tools.push({
+    name: "code_sandbox_run",
+    description: "Scripted code_sandbox_run.",
+    parameters: looseSchema({
+      workspaceId: { type: "string" },
+      argv: { type: "array", items: { type: "string" } },
+      cwd: { type: "string" },
+      timeoutSeconds: { type: "integer" },
+    }),
+    descriptor: preparedDescriptor({
+      name: "code_sandbox_run",
+      resourceType: "code_execution",
+      action: "execute",
+      effect: "execution",
+      receiptKind: "artifact",
+      allowPersistentGrant: false,
+    }),
+    async execute() {
+      return { status: "blocked", code: "prepared_sandbox_action_required" };
+    },
+    prepare: async (args, context) => {
+      const argv = Array.isArray(args.argv) ? args.argv.map(String) : [];
+      return prepare("code_sandbox_run", args, context, {
+        system: "workspace",
+        resourceType: "code_execution",
+        id: workspaceOf(args),
+        workspaceId: workspaceOf(args),
+      }, `Run ${argv.join(" ")} in the verified sandbox`);
+    },
+    async executePrepared(action, context) {
+      const args = action.normalizedArgs as Record<string, unknown>;
+      const argv = Array.isArray(args.argv) ? args.argv.map(String) : [];
+      const answer = options.command?.(argv, state.files) ?? { exitCode: 0, stdout: "ok\n", stderr: "" };
+      state.commands.push(argv);
+      state.executed.push("code_sandbox_run");
+      return {
+        mutationState: "applied",
+        output: {
+          status: answer.exitCode === 0 ? "passed" : "failed",
+          operation: "sandbox_run",
+          workspaceId: workspaceOf(args),
+          command: argv.join(" "),
+          program: argv[0] ?? "",
+          cwd: typeof args.cwd === "string" ? args.cwd : ".",
+          exitCode: answer.exitCode,
+          timedOut: false,
+          durationMs: 1_200,
+          trust: "untrusted_sandbox_output",
+          stdout: answer.stdout,
+          stderr: answer.stderr,
+          truncated: false,
+          redactedLines: 0,
+          staged: state.files.size,
+          notes: [],
+        },
+        receipt: receiptFor(action, context, "execute", `Ran ${argv.join(" ")}`),
+      };
+    },
+  });
   return { tools, state };
 }

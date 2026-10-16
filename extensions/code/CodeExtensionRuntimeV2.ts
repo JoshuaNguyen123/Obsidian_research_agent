@@ -35,6 +35,7 @@ import { withPluginDataLock } from "../shared/softDependency";
 import { scratchPythonContractCheckArgsV1 } from "./ScratchPythonValidationV1";
 import {
   CODE_EXECUTION_TOOL_NAMES_V2,
+  CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1,
   CodeSandboxContributionErrorV2,
   DurableSandboxExecutionJournalV1,
   SandboxManagerV2,
@@ -55,6 +56,7 @@ import {
   type SandboxExecutionReceiptV2,
   type SandboxToolProgressV1,
   type SandboxStagedFileBytesV2,
+  type CodeSandboxRunStagingV1,
 } from "./sandbox";
 import {
   NOTEBOOK_OPTIONAL_MODULES_V1,
@@ -107,6 +109,7 @@ import {
   assertWorkspaceRelativePathV2,
   createVerifiedWorkspaceBaseReadbackV2,
   WORKSPACE_INVENTORY_IGNORED_DIRECTORIES_V1,
+  workspaceRunMayWorkV2,
   type WorkspaceEntryMetadataV2,
 } from "./workspaces";
 import {
@@ -501,6 +504,10 @@ export class CodeExtensionRuntimeV2 {
         this.resolveSandboxPreparationInput(purpose, workspaceId, context),
       resolveExecutionInput: (_action, sandboxAction, context) =>
         this.resolveSandboxExecutionInput(sandboxAction, context),
+      resolveCommandPreparationInput: ({ workspaceId, cwd, ecosystem, context }) =>
+        this.resolveSandboxCommandPreparationInput({ workspaceId, cwd, ecosystem, context }),
+      resolveCommandExecutionInput: (sandboxAction, context) =>
+        this.resolveSandboxCommandExecutionInput(sandboxAction, context),
       observeValidationReceipt: this.validationReceiptRegistry
         ? async ({ runId, requestId, action, receipt, diagnostics, context }) => {
             const manifest = await this.workspaceManager.loadManifest(action.workspaceId);
@@ -1220,6 +1227,163 @@ export class CodeExtensionRuntimeV2 {
       stagingManifest,
       ...(expectedArtifacts.length > 0 ? { expectedArtifacts } : {}),
     };
+  }
+
+  /**
+   * The workspace's files for one `code_sandbox_run` command (CODE-17): the
+   * run may work in the workspace, a provider passes a fresh boundary probe,
+   * and the files are staged as saved through the workspace manager, the
+   * whole workspace within the sandbox's bounds (dependency and build folders
+   * out), else the working folder, with what was left out said in words. A
+   * command with nothing to stage still runs over one empty placeholder.
+   */
+  async resolveSandboxCommandPreparationInput(input: {
+    workspaceId: string;
+    cwd: string;
+    ecosystem: "node" | "python";
+    context?: ScopedExtensionContextV1;
+  }): Promise<CodeSandboxRunStagingV1> {
+    this.assertInitialized();
+    const manifest = await this.requireCommandWorkspaceV1(input.workspaceId, input.context);
+    let stagingProfile: RepositoryStagingProfileV1 | undefined;
+    if (manifest.kind === "repository" && manifest.repositoryBinding?.profileKey) {
+      const profile = await this.getRepositoryProfile(manifest.repositoryBinding.profileKey);
+      stagingProfile = profile?.stagingProfile;
+    }
+    const notes: string[] = [];
+    let listed: Array<{ path: string; sha256: string; bytes: number }>;
+    try {
+      listed = await collectSandboxStagingManifest(
+        this.workspaceManager,
+        manifest.workspaceId,
+        ["."],
+        stagingProfile,
+      );
+    } catch (whole) {
+      if (input.cwd === "." || !(whole instanceof CodeSandboxContributionErrorV2)) throw whole;
+      listed = await collectSandboxStagingManifest(
+        this.workspaceManager,
+        manifest.workspaceId,
+        [input.cwd],
+        stagingProfile,
+      );
+      notes.push(`Only ${input.cwd} was staged: ${whole.message}`);
+    }
+    const stagingManifest: Array<{ path: string; sha256: string; bytes: number }> = [];
+    for (const entry of listed) {
+      let read: { content: string; sha256: string; bytes: number };
+      try {
+        read = await this.workspaceManager.read(manifest.workspaceId, entry.path);
+      } catch (error) {
+        if (error instanceof WorkspaceManagerErrorV2) {
+          notes.push(`${entry.path} was left out: it is not a text file the workspace can read.`);
+          continue;
+        }
+        throw error;
+      }
+      const tracked = manifest.hashes.files[entry.path];
+      if (
+        read.sha256 !== entry.sha256 ||
+        (tracked && (tracked.sha256 !== read.sha256 || tracked.bytes !== read.bytes))
+      ) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_workspace_manifest_drift",
+          `${entry.path} changed while it was being staged; run the command again.`,
+        );
+      }
+      // What is staged is the text as the manager reads it, so the manifest
+      // is over these bytes and execution re-reads the same.
+      const bytes = new TextEncoder().encode(read.content);
+      stagingManifest.push({ path: entry.path, sha256: sha256Bytes(bytes), bytes: bytes.byteLength });
+    }
+    if (stagingManifest.length === 0) {
+      stagingManifest.push({
+        path: CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1,
+        sha256: sha256Bytes(new Uint8Array(0)),
+        bytes: 0,
+      });
+    }
+    const sandboxStatus = await this.probeConfiguredSandboxProviders(input.context?.abortSignal);
+    if (!sandboxStatus.executionAvailable) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_provider_unavailable",
+        sandboxStatus.blocker?.message ??
+          "No sandbox provider passed the fresh preparation boundary probe.",
+      );
+    }
+    const runtimeDigest = this.verifiedSandboxRuntimeDigests([input.ecosystem])[input.ecosystem];
+    if (!runtimeDigest) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_runtime_digest_required",
+        `A command needs a verified sandbox runtime that carries ${input.ecosystem === "node" ? "Node" : "Python"}.`,
+      );
+    }
+    return {
+      workspaceId: manifest.workspaceId,
+      runtimeDigest,
+      ...(stagingProfile ? { stagingProfile } : {}),
+      workspaceManifestFingerprint: manifest.hashes.indexFingerprint,
+      stagingManifest,
+      notes,
+    };
+  }
+
+  /** The staged bytes for a prepared command, read again and checked against its manifest. */
+  async resolveSandboxCommandExecutionInput(
+    sandboxAction: PreparedSandboxActionV2,
+    context?: ScopedExtensionContextV1,
+  ): Promise<{ stagedFiles: readonly SandboxStagedFileBytesV2[] }> {
+    this.assertInitialized();
+    const manifest = await this.requireCommandWorkspaceV1(sandboxAction.workspaceId, context);
+    if (manifest.hashes.indexFingerprint !== sandboxAction.workspaceManifestFingerprint) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_workspace_manifest_drift",
+        "The workspace changed after this command was prepared; run it again.",
+      );
+    }
+    const stagedFiles: SandboxStagedFileBytesV2[] = [];
+    for (const entry of sandboxAction.stagingManifest) {
+      if (
+        entry.path === CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1 &&
+        entry.bytes === 0 &&
+        sandboxAction.stagingManifest.length === 1
+      ) {
+        stagedFiles.push({ path: entry.path, bytes: new Uint8Array(0) });
+        continue;
+      }
+      const relativePath = assertWorkspaceRelativePathV2(entry.path);
+      const read = await this.workspaceManager.read(manifest.workspaceId, relativePath);
+      const bytes = new TextEncoder().encode(read.content);
+      if (sha256Bytes(bytes) !== entry.sha256 || bytes.byteLength !== entry.bytes) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_staging_mismatch",
+          `${relativePath} changed after the command was prepared; run it again.`,
+        );
+      }
+      stagedFiles.push({ path: relativePath, bytes });
+    }
+    return { stagedFiles };
+  }
+
+  /** A workspace a command may run in: open, and this run's or attached to it. */
+  private async requireCommandWorkspaceV1(
+    workspaceId: string,
+    context?: ScopedExtensionContextV1,
+  ) {
+    const manifest = await this.workspaceManager.loadManifest(workspaceId);
+    if (manifest.status === "expired" || manifest.status === "blocked" || manifest.status === "closed") {
+      throw new CodeSandboxContributionErrorV2(
+        "workspace_unavailable",
+        `The workspace is ${manifest.status}, so nothing can run in it.`,
+      );
+    }
+    if (!context || !workspaceRunMayWorkV2(manifest, contextRunId(context))) {
+      throw new CodeSandboxContributionErrorV2(
+        "workspace_owner_mismatch",
+        "The workspace belongs to another run, so this run cannot run commands in it.",
+      );
+    }
+    return manifest;
   }
 
   /** Host-controlled boundary probe. It never receives a model-supplied command. */

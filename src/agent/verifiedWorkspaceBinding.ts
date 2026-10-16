@@ -642,6 +642,7 @@ export const VERIFIED_DURABLE_WORKSPACE_CONSUMER_TOOL_NAMES = new Set([
   "code_workspace_copy",
   "code_workspace_trash",
   "code_workspace_restore",
+  "code_sandbox_run",
   "write_workspace_file",
   "replace_workspace_text",
   "export_workspace_artifact",

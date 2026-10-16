@@ -51,19 +51,26 @@ async function runPass(input: {
   structured?: Parameters<typeof scriptedCodeModel>[1];
   /** Tools whose approval the person denies. */
   deny?: readonly string[];
+  /** What a code_sandbox_run program prints. */
+  command?: Parameters<typeof createScriptedCodeWorkspace>[0]["command"];
+  diagnosticExcerpts?: boolean;
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
   const workspace = createScriptedCodeWorkspace({
     now,
     files: { "src/pager.py": BUGGY, "tests/test_pager.py": "assert offset(0, 10) == 0\n" },
+    ...(input.command ? { command: input.command } : {}),
+    ...(input.diagnosticExcerpts ? { diagnosticExcerpts: true } : {}),
     check: (files) => {
       const passed = files.get("src/pager.py") === FIXED;
       return {
         passed,
         diagnostic: passed
           ? "1 passed"
-          : `tests/test_pager.py:1 AssertionError: ${files.get("src/pager.py")?.trim()}`,
+          : input.diagnosticExcerpts
+            ? `src/pager.py:2: AssertionError: offset(0, 10) is not 0\n${files.get("src/pager.py")?.trim()}`
+            : `tests/test_pager.py:1 AssertionError: ${files.get("src/pager.py")?.trim()}`,
       };
     },
   });
@@ -725,4 +732,84 @@ test("a denied patch that deletes a file changes nothing", async () => {
   assert.ok(run.approvals.requests.some((request) => request.toolName === "code_workspace_apply_patch"));
   assert.equal(run.workspace.state.files.get("src/pager.py"), BUGGY);
   assert.equal(run.workspace.state.files.has("tests/test_pager.py"), true);
+});
+
+// CODE-17: one program and its arguments in the sandbox.
+const RED_RUN = { exitCode: 1, stdout: "F\n1 failed in 0.02s\n", stderr: "AssertionError: offset(0, 10) == 1\n" };
+
+test("a free pass runs one test on its own in the sandbox, after asking, and reads what it printed", async () => {
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_sandbox_run", { argv: ["python3", "-m", "pytest", "-q", "tests/test_pager.py"] }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free" },
+    command: (argv, files) => (files.get("src/pager.py") === FIXED ? { exitCode: 0, stdout: "1 passed\n", stderr: "" } : RED_RUN),
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        return next ? { calls: [next] } : { content: "Fixed." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  assert.ok(run.graphs[0]!.nodes.code_free_work!.allowedTools.includes("code_sandbox_run"), "the open node offers the command");
+  assert.deepEqual(run.workspace.state.commands, [["python3", "-m", "pytest", "-q", "tests/test_pager.py"]]);
+  assert.equal(
+    run.approvals.requests.filter((request) => request.toolName === "code_sandbox_run").length,
+    1,
+    "the command asked first",
+  );
+  const heard = JSON.stringify(run.model.requests.map((request) => request.messages));
+  assert.match(heard, /python3 -m pytest -q tests\/test_pager\.py exited 1/u);
+  assert.match(heard, /what a program printed in the sandbox/u);
+  assert.match(heard, /1 failed in 0\.02s/u);
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a guided pass never offers the command, even while a red validation waits for its correction", async () => {
+  // The guided ladder plans no command, and a mission graph cannot add an
+  // execution its plan did not hold, so the recovery after a red validation
+  // offers its own read and correction and nothing else.
+  const menus: string[][] = [];
+  let wrongPatchDone = false;
+  let read = false;
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    command: () => RED_RUN,
+    diagnosticExcerpts: true,
+    decide: (offered) => {
+      menus.push([...offered]);
+      if (offered.includes("code_workspace_patch") && !wrongPatchDone) {
+        wrongPatchDone = true;
+        return { calls: [call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size - 1" }] })] };
+      }
+      if (offered.includes("code_workspace_read") && wrongPatchDone && !read) {
+        read = true;
+        return { calls: [call("code_workspace_read", { path: "src/pager.py" })] };
+      }
+      if (offered.includes("code_workspace_patch") && read) {
+        return { calls: [call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size - 1", newText: "page * size" }] })] };
+      }
+      if (offered.includes("code_workspace_write_expected")) {
+        return { calls: [call("code_workspace_write_expected", { path: "src/pager.py", content: FIXED })] };
+      }
+      return guidedStep(offered);
+    },
+  });
+  assert.ok(read, "the recovery offered its read");
+  assert.equal(menus.some((offered) => offered.includes("code_sandbox_run")), false, JSON.stringify(menus));
+  assert.deepEqual(run.workspace.state.commands, []);
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
 });
