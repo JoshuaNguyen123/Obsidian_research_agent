@@ -161,6 +161,12 @@ export interface CreateRunPlanInput {
   routedIntent?: RoutedMissionIntent | null;
   /** Host-resolved output destination. Automatic defaults to a new note. */
   outputTarget?: NoteOutputDestination;
+  /**
+   * The run is a code workflow whose prompt names no current note (see
+   * codeWorkflowLeavesCurrentNoteAloneV1). The current-note routes do not
+   * apply to it, whatever its words suggest about editing or replacing.
+   */
+  codeWorkflowWithoutNote?: boolean;
 }
 
 export interface RunPlanDecision extends RunPlan {
@@ -180,6 +186,7 @@ export function createRunPlan({
   speechActOverride,
   routedIntent,
   outputTarget,
+  codeWorkflowWithoutNote = false,
 }: CreateRunPlanInput): RunPlanDecision {
   const speechAct = speechActOverride ?? classifyMissionSpeechAct(prompt);
   const routedCodeExecutionProposal =
@@ -380,7 +387,11 @@ export function createRunPlan({
     });
   }
 
-  if (directCurrentNoteWritebackKind !== null && outputTarget !== "new_note") {
+  if (
+    directCurrentNoteWritebackKind !== null &&
+    outputTarget !== "new_note" &&
+    !codeWorkflowWithoutNote
+  ) {
     return plan({
       route: "direct_writeback",
       maxStepsForRun: capSteps(1),
@@ -545,6 +556,7 @@ export function createRunPlan({
   if (
     streamingWritebackKind !== null &&
     outputTarget !== "new_note" &&
+    !codeWorkflowWithoutNote &&
     !hasTitleIntent(prompt) &&
     !isTitleOnlyIntent(prompt)
   ) {
@@ -575,7 +587,7 @@ export function createRunPlan({
     });
   }
 
-  if (isNamedSectionEditIntent(prompt)) {
+  if (!codeWorkflowWithoutNote && isNamedSectionEditIntent(prompt)) {
     return plan({
       route: "tool_required",
       maxStepsForRun: capSteps(3),
@@ -587,7 +599,7 @@ export function createRunPlan({
     });
   }
 
-  if (requiresCurrentNoteContent(prompt)) {
+  if (!codeWorkflowWithoutNote && requiresCurrentNoteContent(prompt)) {
     const compoundTitleWriteback =
       hasTitleIntent(prompt) &&
       missionIntent.noteOutput &&
@@ -613,6 +625,7 @@ export function createRunPlan({
   // Current-note edit/organize prefers streamed replace; when stream kind was
   // not precomputed, still route as write/edit rather than chat-only.
   if (
+    !codeWorkflowWithoutNote &&
     !hasExplicitNoNoteWriteIntent(prompt) &&
     (prefersStreamedReplaceForEditOrganize(prompt) ||
       isCurrentNoteEditOrganizeIntent(prompt) ||
