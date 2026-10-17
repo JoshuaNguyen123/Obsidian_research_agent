@@ -489,7 +489,9 @@ import {
   // would quietly reacquire its own answer.
   authoritativeRefusalFrontierToolNamesV1,
   countReadyMissionGraphToolSlots,
+  missionGraphBarrierWaitsForOpenWorkV1,
   missionGraphHasQueuedToolDependencyV1,
+  nextReadyMissionGraphSlotForToolV1,
   missionGraphHasRequiredToolDebtV1,
   findExactGraphBoundToolCallIndex,
   findReadyMissionGraphToolNodes,
@@ -25680,6 +25682,9 @@ export async function runAgentMission({
         const exactReadySlotsByTool = new Map<string, number>();
         const reservedReadySlotsByTool = new Map<string, number>();
         const reservedResearchSourceReferences = new Set<string>();
+        // The nodes the barrier's earlier calls will hold, as the session
+        // will give them out: an open node is one slot for every tool.
+        const heldReadyNodeIds = new Set<string>();
         const batchGraph = missionGraphSession?.graph ?? missionGraph;
         for (
           let batchIndex = toolIndex;
@@ -25713,6 +25718,15 @@ export async function runAgentMission({
             // rejection path handles the duplicate without paying proof.
             break;
           }
+          if (
+            batchGraph &&
+            missionGraphBarrierWaitsForOpenWorkV1(batchGraph, candidate.name, heldReadyNodeIds)
+          ) {
+            // A free pass's open node runs one call at a time, whatever its
+            // tool. This call takes the sequential path once the earlier one
+            // has finished and the node is ready again.
+            break;
+          }
           if (batchGraph && (missionGraphUsesExactPlannedFrontier ||
             missionGraphHasQueuedToolDependencyV1(batchGraph, candidate.name))) {
             const readySlots =
@@ -25730,6 +25744,14 @@ export async function runAgentMission({
             reservedResearchSourceReferences.add(
               researchSourceReservation.reference,
             );
+          }
+          if (batchGraph) {
+            const slot = nextReadyMissionGraphSlotForToolV1(
+              batchGraph,
+              candidate.name,
+              heldReadyNodeIds,
+            );
+            if (slot) heldReadyNodeIds.add(slot.id);
           }
           batch.push({ call: candidate, index: batchIndex });
         }
