@@ -200,8 +200,8 @@ test("what the patch cannot express is refused in words", () => {
   refused("patch_invalid", () => parseUnifiedPatchV1(lines("--- /dev/null", "+++ b/new", "@@ -0,0 +1,2 @@", " context", "+added")), /can only add lines/u);
   refused("patch_invalid", () => parseUnifiedPatchV1(lines("--- a/f", "+++ b/f", "@@ -1 +1 @@", " same")), /changes nothing/u);
   refused("patch_no_change", () => applyOne(lines("--- a/f", "+++ b/f", "@@ -1 +1 @@", "-a", "+a"), lines("a")));
-  const many = Array.from({ length: 21 }, (_, index) => lines(`--- a/f${index}`, `+++ b/f${index}`, "@@ -1 +1 @@", "-a", "+b")).join("");
-  refused("patch_too_many_files", () => parseUnifiedPatchV1(many), /at most 20/u);
+  const many = Array.from({ length: 101 }, (_, index) => lines(`--- a/f${index}`, `+++ b/f${index}`, "@@ -1 +1 @@", "-a", "+b")).join("");
+  refused("patch_too_many_files", () => parseUnifiedPatchV1(many), /at most 100/u);
   refused("patch_hunk_mismatch", () => applyOne(lines("--- a/missing", "+++ b/missing", "@@ -1 +1 @@", "-a", "+b"), null), /does not exist/u);
 });
 

@@ -4,8 +4,11 @@ import { createHash, randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2,
+  WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2,
   WORKSPACE_MAX_CHANGED_BYTES_V2,
   WORKSPACE_MAX_CHANGED_FILES_V2,
+  WORKSPACE_MAX_TRACKED_CHANGED_PATHS_V2,
   WORKSPACE_MAX_SEARCH_RESULTS_V2,
   WORKSPACE_MAX_TEXT_BYTES_V2,
   PERSON_WORKSPACE_OWNER_PREFIX_V2,
@@ -90,7 +93,23 @@ export interface WorkspaceMutationReceiptV2 {
 }
 
 /** At most this many files change in one `applyFileChanges` batch. */
-export const WORKSPACE_MAX_FILE_CHANGES_V2 = 20;
+export const WORKSPACE_MAX_FILE_CHANGES_V2 = 100;
+
+/** A workspace's per-run change budget, as a host sets it (CODE2-14). */
+export interface WorkspaceChangeBudgetV2 {
+  /** Files one run may change. */
+  maxChangedFiles: number;
+  /** Bytes one run may add. */
+  maxChangedBytes: number;
+}
+
+/** What a change counts against the run now writing. */
+interface WorkspaceChangeCountV2 {
+  /** Bytes the change adds: a new file's size, what an edit grows a file by. */
+  addedBytes: number;
+  /** Paths the change counts against the run's file budget. */
+  budgetPaths: string[];
+}
 
 /**
  * One change of a batch (`applyFileChanges`): a file's new text, a new file,
@@ -322,6 +341,8 @@ export class WorkspaceManagerV2 {
     ownerRunId: string;
     expiresAt?: string;
     sandboxPolicy?: WorkspaceSandboxPolicyV2;
+    /** The per-run change budget; the default when absent. */
+    changeBudget?: WorkspaceChangeBudgetV2;
   }): Promise<WorkspaceManifestV2> {
     const workspaceId = workspaceIdentifier(input.workspaceId);
     const container = this.containerPath(workspaceId);
@@ -343,6 +364,7 @@ export class WorkspaceManagerV2 {
       baseSha: null,
       expiresAt: input.expiresAt,
       sandboxPolicy: input.sandboxPolicy,
+      changeBudget: input.changeBudget,
     });
     try {
       await this.persistNewManifest(manifest);
@@ -365,6 +387,8 @@ export class WorkspaceManagerV2 {
     trusted: true;
     expiresAt?: string;
     sandboxPolicy?: WorkspaceSandboxPolicyV2;
+    /** The per-run change budget; the default when absent. */
+    changeBudget?: WorkspaceChangeBudgetV2;
   }): Promise<WorkspaceManifestV2> {
     if (input.trusted !== true) throw new WorkspaceManagerErrorV2("untrusted_worktree", "Repository workspaces require an explicit trusted worktree binding.");
     if (!isSha256FingerprintV2(input.bindingFingerprint)) throw new WorkspaceManagerErrorV2("invalid_binding", "Repository binding fingerprint is invalid.");
@@ -416,6 +440,7 @@ export class WorkspaceManagerV2 {
       baseSha: input.baseSha.toLowerCase(),
       expiresAt: input.expiresAt,
       sandboxPolicy: input.sandboxPolicy,
+      changeBudget: input.changeBudget,
     });
     try {
       await this.persistNewManifest(manifest);
@@ -887,8 +912,7 @@ export class WorkspaceManagerV2 {
     return {
       manifest,
       rootReadable,
-      remainingChangedFiles: WORKSPACE_MAX_CHANGED_FILES_V2 - manifest.budget.changedPaths.length,
-      remainingChangedBytes: WORKSPACE_MAX_CHANGED_BYTES_V2 - manifest.budget.changedBytes,
+      ...remainingRunBudget(manifest),
     };
   }
 
@@ -1451,7 +1475,8 @@ export class WorkspaceManagerV2 {
           mutation: true,
         });
         if (target.exists) throw new WorkspaceManagerErrorV2("path_exists", `${target.relativePath} already exists.`);
-        this.assertBudget(manifest, [target.relativePath], bytes.byteLength);
+        const createCount: WorkspaceChangeCountV2 = { addedBytes: bytes.byteLength, budgetPaths: [target.relativePath] };
+        this.assertBudget(manifest, [target.relativePath], createCount);
         await this.revalidateGuard(target.parentGuard!);
         const handle = await fs.open(target.absolutePath, "wx", 0o600);
         createdFilePath = target.absolutePath;
@@ -1462,7 +1487,7 @@ export class WorkspaceManagerV2 {
           await handle.close();
         }
         const after = await hashFile(target.absolutePath);
-        manifest = await this.recordChanges(manifest, [{ path: target.relativePath, hash: after }], bytes.byteLength);
+        manifest = await this.recordChanges(manifest, [{ path: target.relativePath, hash: after }], createCount);
         return this.receipt(manifest, {
           operation: "create",
           path: target.relativePath,
@@ -1588,8 +1613,11 @@ export class WorkspaceManagerV2 {
       if (new Set(normalized.map((artifact) => artifact.relativePath)).size !== normalized.length) {
         throw new WorkspaceManagerErrorV2("sandbox_artifact_invalid", "Sandbox artifact batch contains duplicate paths.");
       }
-      const changedBytes = normalized.reduce((total, artifact) => total + artifact.bytes.byteLength, 0);
-      this.assertBudget(originalManifest, normalized.map((artifact) => artifact.relativePath), changedBytes);
+      const artifactPaths = normalized.map((artifact) => artifact.relativePath);
+      // The paths are known now; the bytes the batch adds once each existing
+      // file has been read.
+      this.assertBudget(originalManifest, artifactPaths, { addedBytes: 0, budgetPaths: artifactPaths });
+      let artifactCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: artifactPaths };
 
       const createdDirectories: string[] = [];
       const prepared: Array<{
@@ -1648,6 +1676,14 @@ export class WorkspaceManagerV2 {
             }
           }
         }
+        artifactCount = {
+          addedBytes: prepared.reduce(
+            (total, entry) => total + Math.max(0, entry.artifact.bytes.byteLength - (entry.before?.bytes ?? 0)),
+            0,
+          ),
+          budgetPaths: artifactPaths,
+        };
+        this.assertBudget(originalManifest, artifactPaths, artifactCount);
         for (const entry of prepared) {
           await this.revalidateGuard(entry.target.parentGuard!);
           if (entry.before) {
@@ -1668,7 +1704,7 @@ export class WorkspaceManagerV2 {
         manifest = await this.recordChanges(
           originalManifest,
           prepared.map((entry) => ({ path: entry.target.relativePath, hash: entry.after! })),
-          changedBytes,
+          artifactCount,
         );
       } catch (error) {
         let rollbackFailure: Error | null = null;
@@ -1766,12 +1802,16 @@ export class WorkspaceManagerV2 {
           await this.assertCreatablePath(originalManifest, change.kind === "move" ? change.destinationPath : change.path);
         }
       }
-      const writtenBytes = changes.reduce((total, change) => total + (change.bytes?.byteLength ?? 0), 0);
-      const trashedBytes = changes.reduce(
-        (total, change) => total + (change.kind === "trash" ? before.get(change.path)!.bytes : 0),
-        0,
-      );
-      this.assertBudget(originalManifest, touched, writtenBytes + trashedBytes);
+      // A new file adds its size, an edit what it grows the file by, and a
+      // trash nothing (CODE2-14).
+      const batchCount: WorkspaceChangeCountV2 = {
+        addedBytes: changes.reduce(
+          (total, change) => total + Math.max(0, (change.bytes?.byteLength ?? 0) - (before.get(change.path)?.bytes ?? 0)),
+          0,
+        ),
+        budgetPaths: touched,
+      };
+      this.assertBudget(originalManifest, touched, batchCount);
 
       const undo: Array<() => Promise<void>> = [];
       const temporaries: string[] = [];
@@ -1892,7 +1932,7 @@ export class WorkspaceManagerV2 {
         const removals = changes
           .filter((change) => change.kind === "trash" || change.kind === "move")
           .map((change) => change.path);
-        manifest = await this.recordChanges(originalManifest, updates, writtenBytes + trashedBytes, removals, touched);
+        manifest = await this.recordChanges(originalManifest, updates, batchCount, removals, touched);
       } catch (error) {
         let rollbackFailure: Error | null = null;
         for (const step of [...undo].reverse()) {
@@ -1991,7 +2031,9 @@ export class WorkspaceManagerV2 {
       const sourceFingerprint = mutationFingerprint(tree, source.relativePath);
       if (sourceFingerprint !== expectedSha256) throw new WorkspaceManagerErrorV2("precondition_failed", "Move source fingerprint changed.");
       const changed = [...tree.files.map((file) => file.path), ...tree.files.map((file) => remapPath(file.path, source.relativePath, destination.relativePath))];
-      this.assertBudget(manifest, changed, tree.bytes);
+      // A move adds no bytes and counts the two paths it names, not its tree.
+      const moveCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: [source.relativePath, destination.relativePath] };
+      this.assertBudget(manifest, changed, moveCount);
       await this.revalidateGuard(source.parentGuard!);
       await this.revalidateGuard(destination.parentGuard!);
       await fs.rename(source.absolutePath, destination.absolutePath);
@@ -1999,7 +2041,7 @@ export class WorkspaceManagerV2 {
       const updates = tree.files.map((file) => ({ path: remapPath(file.path, source.relativePath, destination.relativePath), hash: { sha256: file.sha256, bytes: file.bytes } }));
       const removals = tree.files.map((file) => file.path);
       try {
-        manifest = await this.recordChanges(manifest, updates, tree.bytes, removals, changed);
+        manifest = await this.recordChanges(manifest, updates, moveCount, removals, changed);
       } catch (error) {
         await fs.rename(destination.absolutePath, source.absolutePath);
         await this.restoreManifestAfterFailedMutation(manifest);
@@ -2025,7 +2067,8 @@ export class WorkspaceManagerV2 {
       const sourceFingerprint = mutationFingerprint(tree, source.relativePath);
       if (sourceFingerprint !== expectedSha256) throw new WorkspaceManagerErrorV2("precondition_failed", "Copy source fingerprint changed.");
       const changed = tree.files.map((file) => remapPath(file.path, source.relativePath, destination.relativePath));
-      this.assertBudget(manifest, changed, tree.bytes);
+      const copyCount: WorkspaceChangeCountV2 = { addedBytes: tree.bytes, budgetPaths: changed };
+      this.assertBudget(manifest, changed, copyCount);
       await this.revalidateGuard(source.parentGuard!);
       await this.revalidateGuard(destination.parentGuard!);
       let destinationCreated = false;
@@ -2046,7 +2089,7 @@ export class WorkspaceManagerV2 {
             throw new WorkspaceManagerErrorV2("copy_readback_failed", "Copied workspace tree failed hash readback.");
           }
           const updates = readback.files.map((file) => ({ path: file.path, hash: { sha256: file.sha256, bytes: file.bytes } }));
-          manifest = await this.recordChanges(manifest, updates, tree.bytes, [], changed);
+          manifest = await this.recordChanges(manifest, updates, copyCount, [], changed);
           return readback;
         } catch (error) {
           if (destinationCreated) {
@@ -2067,7 +2110,9 @@ export class WorkspaceManagerV2 {
       const tree = await this.scanTree(manifest, source.relativePath, true);
       const sourceFingerprint = mutationFingerprint(tree, source.relativePath);
       if (sourceFingerprint !== expectedSha256) throw new WorkspaceManagerErrorV2("precondition_failed", "Trash source fingerprint changed.");
-      this.assertBudget(manifest, tree.files.map((file) => file.path), tree.bytes);
+      // A trash adds no bytes and counts the one path it names.
+      const trashCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: [source.relativePath] };
+      this.assertBudget(manifest, tree.files.map((file) => file.path), trashCount);
       const trashId = workspaceIdentifier(`trash-${this.randomId()}`);
       const trashRoot = path.join(this.containerPath(manifest.workspaceId), TRASH_FOLDER, trashId);
       await this.assertMetadataBoundary(trashRoot, true);
@@ -2079,7 +2124,7 @@ export class WorkspaceManagerV2 {
       await moveAcrossDevices(source.absolutePath, payload);
       await fs.writeFile(path.join(trashRoot, "record.json"), `${JSON.stringify({ version: 1, trashId, workspaceId: manifest.workspaceId, originalPath: source.relativePath, fingerprint: tree.fingerprint, bytes: tree.bytes, affectedCount: tree.files.length, trashedAt: this.isoNow() }, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
       try {
-        manifest = await this.recordChanges(manifest, [], tree.bytes, tree.files.map((file) => file.path));
+        manifest = await this.recordChanges(manifest, [], trashCount, tree.files.map((file) => file.path));
       } catch (error) {
         await moveAcrossDevices(payload, source.absolutePath);
         await fs.rm(trashRoot, { recursive: true, force: true });
@@ -2106,11 +2151,12 @@ export class WorkspaceManagerV2 {
       const payload = path.join(trashRoot, "payload");
       const tree = await scanAbsoluteTree(payload, originalPath);
       if (tree.fingerprint !== expectedTrashFingerprint) throw new WorkspaceManagerErrorV2("trash_hash_drift", "Trash payload hash changed.");
-      this.assertBudget(manifest, tree.files.map((file) => file.path), tree.bytes);
+      const restoreCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: [originalPath] };
+      this.assertBudget(manifest, tree.files.map((file) => file.path), restoreCount);
       await this.revalidateGuard(destination.parentGuard!);
       await moveAcrossDevices(payload, destination.absolutePath);
       try {
-        manifest = await this.recordChanges(manifest, tree.files.map((file) => ({ path: file.path, hash: { sha256: file.sha256, bytes: file.bytes } })), tree.bytes);
+        manifest = await this.recordChanges(manifest, tree.files.map((file) => ({ path: file.path, hash: { sha256: file.sha256, bytes: file.bytes } })), restoreCount);
       } catch (error) {
         await moveAcrossDevices(destination.absolutePath, payload);
         await this.restoreManifestAfterFailedMutation(manifest);
@@ -2129,7 +2175,12 @@ export class WorkspaceManagerV2 {
       const target = await this.resolveSafePath(manifest, relativePath, { mustExist: true, mutation: true });
       const before = await hashFile(target.absolutePath);
       if (before.sha256 !== expectedSha256) throw new WorkspaceManagerErrorV2("precondition_failed", "Workspace file changed after preparation.");
-      this.assertBudget(manifest, [target.relativePath], budgetBytes ?? bytes.byteLength);
+      // An edit adds what it grows the file by, never the whole file (CODE2-14).
+      const editCount: WorkspaceChangeCountV2 = {
+        addedBytes: budgetBytes ?? Math.max(0, bytes.byteLength - before.bytes),
+        budgetPaths: [target.relativePath],
+      };
+      this.assertBudget(manifest, [target.relativePath], editCount);
       const temporary = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.tmp`);
       const backup = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.rollback.bak`);
       await fs.copyFile(target.absolutePath, backup, fsConstants.COPYFILE_EXCL);
@@ -2151,7 +2202,7 @@ export class WorkspaceManagerV2 {
       }
       const after = await hashFile(target.absolutePath);
       try {
-        manifest = await this.recordChanges(manifest, [{ path: target.relativePath, hash: after }], budgetBytes ?? bytes.byteLength);
+        manifest = await this.recordChanges(manifest, [{ path: target.relativePath, hash: after }], editCount);
       } catch (error) {
         await fs.rm(target.absolutePath, { force: true });
         await renameWithBoundedWindowsRetry(backup, target.absolutePath);
@@ -2167,6 +2218,7 @@ export class WorkspaceManagerV2 {
     workspaceId: string; ownerRunId: string; kind: "scratch" | "repository"; canonicalRoot: string;
     repositoryBinding: WorkspaceManifestV2["repositoryBinding"]; baseSha: string | null;
     expiresAt?: string; sandboxPolicy?: WorkspaceSandboxPolicyV2;
+    changeBudget?: WorkspaceChangeBudgetV2;
   }): Promise<WorkspaceManifestV2> {
     const now = this.isoNow();
     const expiresAt = input.expiresAt ?? new Date(Date.parse(now) + DEFAULT_EXPIRY_MS).toISOString();
@@ -2187,7 +2239,7 @@ export class WorkspaceManagerV2 {
       expiresAt,
       createdAt: now,
       updatedAt: now,
-      budget: { changedPaths: [], changedBytes: 0, maxChangedFiles: WORKSPACE_MAX_CHANGED_FILES_V2, maxChangedBytes: WORKSPACE_MAX_CHANGED_BYTES_V2 },
+      budget: { changedPaths: [], changedBytes: 0, ...normalizeChangeBudget(input.changeBudget) },
     });
   }
 
@@ -2224,17 +2276,27 @@ export class WorkspaceManagerV2 {
     return manifest;
   }
 
-  private async recordChanges(manifest: WorkspaceManifestV2, updates: Array<{ path: string; hash: { sha256: string; bytes: number } }>, changedBytes: number, removals: string[] = [], changedPaths?: string[]): Promise<WorkspaceManifestV2> {
+  private async recordChanges(manifest: WorkspaceManifestV2, updates: Array<{ path: string; hash: { sha256: string; bytes: number } }>, count: WorkspaceChangeCountV2, removals: string[] = [], changedPaths?: string[]): Promise<WorkspaceManifestV2> {
     const now = this.isoNow();
     const files = { ...manifest.hashes.files };
     for (const removal of removals) delete files[removal];
     for (const update of updates) files[update.path] = { ...update.hash, updatedAt: now };
     const paths = [...new Set([...manifest.budget.changedPaths, ...(changedPaths ?? [...updates.map((item) => item.path), ...removals])])].sort();
+    const run = runBudgetOf(manifest);
     const next = parseWorkspaceManifestV2({
       ...manifest,
       updatedAt: now,
       hashes: { files, indexFingerprint: sha256Json(files) },
-      budget: { ...manifest.budget, changedPaths: paths, changedBytes: manifest.budget.changedBytes + changedBytes },
+      budget: {
+        ...manifest.budget,
+        changedPaths: paths,
+        changedBytes: manifest.budget.changedBytes + count.addedBytes,
+        run: {
+          runId: run.runId,
+          changedPaths: [...new Set([...run.changedPaths, ...count.budgetPaths])].sort(),
+          addedBytes: run.addedBytes + count.addedBytes,
+        },
+      },
     });
     await this.persistManifest(next);
     return next;
@@ -2261,10 +2323,58 @@ export class WorkspaceManagerV2 {
     }
   }
 
-  private assertBudget(manifest: WorkspaceManifestV2, changedPaths: string[], bytes: number): void {
-    const paths = new Set([...manifest.budget.changedPaths, ...changedPaths]);
-    if (paths.size > WORKSPACE_MAX_CHANGED_FILES_V2) throw new WorkspaceManagerErrorV2("workspace_file_budget_exceeded", "Workspace mission exceeds 100 changed files.");
-    if (manifest.budget.changedBytes + bytes > WORKSPACE_MAX_CHANGED_BYTES_V2) throw new WorkspaceManagerErrorV2("workspace_byte_budget_exceeded", "Workspace mission exceeds 10 MiB changed bytes.");
+  /**
+   * The run now writing (the lease's owner) against the workspace's per-run
+   * budget (CODE2-14): the files it has changed and the bytes it has added,
+   * counted afresh from its first write. `changedPaths` are what the change
+   * adds to the paths changed since the base, which stay bounded too.
+   */
+  private assertBudget(manifest: WorkspaceManifestV2, changedPaths: string[], count: WorkspaceChangeCountV2): void {
+    const { maxChangedFiles, maxChangedBytes } = manifest.budget;
+    const run = runBudgetOf(manifest);
+    const paths = new Set([...run.changedPaths, ...count.budgetPaths]);
+    if (paths.size > maxChangedFiles) {
+      throw new WorkspaceManagerErrorV2(
+        "workspace_file_budget_exceeded",
+        `This run would change ${paths.size} files in the workspace; its budget is ${maxChangedFiles}.`,
+      );
+    }
+    if (run.addedBytes + count.addedBytes > maxChangedBytes) {
+      throw new WorkspaceManagerErrorV2(
+        "workspace_byte_budget_exceeded",
+        `This run would add ${formatBytes(run.addedBytes + count.addedBytes)} to the workspace; its budget is ${formatBytes(maxChangedBytes)}.`,
+      );
+    }
+    const tracked = new Set([...manifest.budget.changedPaths, ...changedPaths]);
+    if (tracked.size > WORKSPACE_MAX_TRACKED_CHANGED_PATHS_V2) {
+      throw new WorkspaceManagerErrorV2(
+        "workspace_file_budget_exceeded",
+        `The workspace would hold ${tracked.size} changed paths since its base; at most ${WORKSPACE_MAX_TRACKED_CHANGED_PATHS_V2} are kept. Commit, or start from a fresh base.`,
+      );
+    }
+  }
+
+  /**
+   * Set the workspace's per-run change budget (CODE2-14), for the host: a
+   * person's own folder takes more than a scratch workspace does. It applies
+   * from the next write; what the run now writing has counted stays counted.
+   */
+  async setWorkspaceChangeBudget(workspaceId: string, budget: WorkspaceChangeBudgetV2): Promise<WorkspaceManifestV2> {
+    return this.serializeWrite(async () => {
+      const id = workspaceIdentifier(workspaceId);
+      const limits = normalizeChangeBudget(budget);
+      const manifest = await this.applyExpiry(await this.loadManifest(id));
+      if (manifest.budget.maxChangedFiles === limits.maxChangedFiles && manifest.budget.maxChangedBytes === limits.maxChangedBytes) {
+        return manifest;
+      }
+      const next = parseWorkspaceManifestV2({
+        ...manifest,
+        budget: { ...manifest.budget, ...limits },
+        updatedAt: this.isoNow(),
+      });
+      await this.persistManifest(next);
+      return next;
+    });
   }
 
   private async scanTree(manifest: WorkspaceManifestV2, relativePath: string, mutation = false) {
@@ -2816,6 +2926,49 @@ function decodeText(bytes: Uint8Array): string {
 
 function sha256Bytes(value: Uint8Array): string { return `sha256:${createHash("sha256").update(value).digest("hex")}`; }
 function sha256Text(value: string): string { return sha256Bytes(new TextEncoder().encode(value)); }
+/**
+ * What the run now writing has counted: the lease owner's, when the manifest's
+ * run count is theirs, else a fresh one. A manifest written before CODE2-14
+ * has no run count, so its next run starts fresh.
+ */
+function runBudgetOf(manifest: WorkspaceManifestV2): { runId: string; changedPaths: string[]; addedBytes: number } {
+  const runId = manifest.lease?.ownerId ?? manifest.budget.run?.runId ?? manifest.ownerRunId;
+  const current = manifest.budget.run;
+  return current && current.runId === runId
+    ? current
+    : { runId, changedPaths: [], addedBytes: 0 };
+}
+
+function remainingRunBudget(manifest: WorkspaceManifestV2): { remainingChangedFiles: number; remainingChangedBytes: number } {
+  const run = runBudgetOf(manifest);
+  return {
+    remainingChangedFiles: Math.max(0, manifest.budget.maxChangedFiles - run.changedPaths.length),
+    remainingChangedBytes: Math.max(0, manifest.budget.maxChangedBytes - run.addedBytes),
+  };
+}
+
+function normalizeChangeBudget(budget: WorkspaceChangeBudgetV2 | undefined): WorkspaceChangeBudgetV2 {
+  if (budget === undefined) {
+    return { maxChangedFiles: WORKSPACE_MAX_CHANGED_FILES_V2, maxChangedBytes: WORKSPACE_MAX_CHANGED_BYTES_V2 };
+  }
+  const files = budget.maxChangedFiles;
+  const bytes = budget.maxChangedBytes;
+  if (!Number.isSafeInteger(files) || files < 1 || files > WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2) {
+    throw new WorkspaceManagerErrorV2("invalid_change_budget", `A run's file budget is 1-${WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2} files.`);
+  }
+  if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2) {
+    throw new WorkspaceManagerErrorV2("invalid_change_budget", `A run's byte budget is 1 byte to ${formatBytes(WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2)}.`);
+  }
+  return { maxChangedFiles: files, maxChangedBytes: bytes };
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 && bytes % (1024 * 1024) === 0) return `${bytes / (1024 * 1024)} MiB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KiB`;
+  return `${bytes} bytes`;
+}
+
 function sha256Json(value: unknown): string { return sha256Text(JSON.stringify(value)); }
 function mutationFingerprint(tree: { files: Array<{ path: string; sha256: string }>; fingerprint: string }, root: string): string { return tree.files.length === 1 && tree.files[0].path === root ? tree.files[0].sha256 : tree.fingerprint; }
 function remapTree(tree: { files: Array<{ path: string; sha256: string; bytes: number }>; bytes: number }, from: string, to: string) { const files = tree.files.map((file) => ({ ...file, path: remapPath(file.path, from, to) })); return { files, bytes: tree.bytes, fingerprint: sha256Json(files.map((file) => ({ path: file.path, sha256: file.sha256, bytes: file.bytes }))) }; }

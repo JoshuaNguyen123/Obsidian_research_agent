@@ -22,7 +22,7 @@ import { assertWorkspaceRelativePathV2 } from "./WorkspaceManifestV2";
  * recounted from its lines when they are not.
  */
 
-export const UNIFIED_PATCH_MAX_FILES_V1 = 20;
+export const UNIFIED_PATCH_MAX_FILES_V1 = 100;
 export const UNIFIED_PATCH_MAX_CHARACTERS_V1 = 1_048_576;
 export const UNIFIED_PATCH_MAX_HUNKS_PER_FILE_V1 = 200;
 
