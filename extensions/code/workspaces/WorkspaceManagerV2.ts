@@ -42,6 +42,21 @@ import { codeLineSpansV1 } from "../../../src/model/codeWorkspacePayloadV1";
 const MANIFEST_FILE = "manifest.v2.json";
 const ROOT_FOLDER = "root";
 const TRASH_FOLDER = "trash";
+/** Where a run's originals are kept, per run, before its first write to each path. */
+const PREIMAGES_FOLDER = "preimages";
+/** Where an interrupted write's backups found in a person's folder are moved. */
+const LEFTOVERS_FOLDER = "leftovers";
+/**
+ * Every temporary file the manager writes beside its target starts with this
+ * (CODE2-5): `.agentws-new-<id>.tmp` holds new text before it is renamed into
+ * place, `.agentws-old-<id>.bak` the old text until the write has held. A
+ * person's folder is swept for leftovers of an interrupted write when it is
+ * opened: a new text is removed, an old one moved into the container.
+ */
+export const WORKSPACE_TEMPORARY_PREFIX_V2 = ".agentws-" as const;
+const TEMPORARY_NAME_V2 = /^\.agentws-(new|old)-[A-Za-z0-9._-]{1,160}\.(tmp|bak)$/u;
+/** Entries the leftover sweep visits at most. */
+const MAX_SWEEP_ENTRIES_V2 = 50_000;
 const MAX_TREE_ENTRIES = 10_000;
 const MAX_LIST_ENTRIES = 500;
 /** Entries a tree listing returns; the model sees as many as fit. */
@@ -317,6 +332,62 @@ export function createVerifiedWorkspaceBaseReadbackV2(input: {
   };
 }
 
+/** What a sweep of a person's folder found of an interrupted write (CODE2-5). */
+export interface WorkspaceLeftoverSweepV2 {
+  /** New texts never renamed into place, removed. */
+  removed: string[];
+  /** Old texts kept for a rollback, moved into the container's `leftovers/`. */
+  keptAside: string[];
+  /** The sweep stopped at its entry limit. */
+  truncated: boolean;
+}
+
+export interface WorkspaceRunOriginalsV2 {
+  workspaceId: string;
+  runId: string;
+  entries: Array<{ path: string; existed: boolean; unchangedSinceRun: boolean }>;
+}
+
+export interface WorkspaceRunRestoreV2 {
+  workspaceId: string;
+  runId: string;
+  /** Files given their kept original back. */
+  restored: string[];
+  /** Files the run made, removed. */
+  removed: string[];
+  /** Files left as they are, and why. */
+  skipped: Array<{ path: string; reason: "changed_since_run" | "original_damaged" | "unwritable" }>;
+}
+
+interface PreimageEntryV2 {
+  existed: boolean;
+  sha256: string | null;
+  bytes: number | null;
+  /** The kept bytes' file in the run's folder, when the path existed. */
+  blob: string | null;
+  keptAt: string;
+  /** What the run left there: a SHA-256, null for absent; undefined until a write landed. */
+  after?: string | null;
+}
+
+interface PreimageIndexV2 {
+  version: 1;
+  workspaceId: string;
+  runId: string;
+  entries: Record<string, PreimageEntryV2>;
+}
+
+/**
+ * The host's door to a workspace in the person's own folder (CODE2-5, D-287).
+ * Never registered as a tool and never reached from `code_workspace_create`.
+ */
+export function registerPersonFolderWorkspaceV1(
+  manager: WorkspaceManagerV2,
+  input: Parameters<WorkspaceManagerV2["registerPersonFolderWorkspace"]>[0],
+): ReturnType<WorkspaceManagerV2["registerPersonFolderWorkspace"]> {
+  return manager.registerPersonFolderWorkspace(input);
+}
+
 export class WorkspaceManagerV2 {
   readonly applicationDataRoot: string;
   readonly metadataRoot: string;
@@ -468,6 +539,7 @@ export class WorkspaceManagerV2 {
       throw new WorkspaceManagerErrorV2(`workspace_${manifest.status}`, `Workspace is ${manifest.status}.`);
     }
     await this.assertWorkspaceRoot(manifest);
+    if (manifest.personFolder) return this.forgetPersonEdits(manifest);
     for (const [relative, expected] of Object.entries(manifest.hashes.files)) {
       const target = await this.resolveSafePath(manifest, relative, { mustExist: true, mutation: false });
       const actual = await hashFile(target.absolutePath);
@@ -519,6 +591,413 @@ export class WorkspaceManagerV2 {
       await this.persistManifest(rebound);
       return rebound;
     });
+  }
+
+  /**
+   * Register a workspace whose root is the person's own folder (CODE2-5,
+   * D-287). The host's door alone: no tool calls it, and `code_workspace_create`
+   * makes only a scratch workspace in its own container or binds a trusted
+   * worktree, whose refusal of a repository's base checkout is unchanged.
+   *
+   * The folder stays the person's: the manifest, the lease, the receipts, the
+   * trash and each run's kept originals live in the workspace's container under
+   * application data, and expiry or `closeWorkspace` only unregister it. The
+   * owner must be a person (`person:<surface>`); a run attaches. The folder must
+   * be an absolute, existing directory reached through no link, not a
+   * filesystem root, and neither inside the application data nor holding it;
+   * the host refuses the rest (a profile folder, a system folder, the app's own
+   * repository). Registering the same folder under the same id again opens it
+   * again. Either way the folder is swept for an interrupted write's leftovers.
+   */
+  async registerPersonFolderWorkspace(input: {
+    workspaceId: string;
+    ownerRunId: string;
+    root: string;
+    expiresAt?: string;
+    sandboxPolicy?: WorkspaceSandboxPolicyV2;
+    changeBudget?: WorkspaceChangeBudgetV2;
+  }): Promise<{ manifest: WorkspaceManifestV2; leftovers: WorkspaceLeftoverSweepV2 }> {
+    return this.serializeWrite(async () => {
+      const ownerRunId = boundedText(input.ownerRunId, "owner run id", 256);
+      if (!isPersonWorkspaceOwnerV2(ownerRunId)) {
+        throw new WorkspaceManagerErrorV2("invalid_owner", "A workspace in a person's own folder belongs to that person.");
+      }
+      if (typeof input.root !== "string" || !path.isAbsolute(input.root)) {
+        throw new WorkspaceManagerErrorV2("invalid_absolute_path", "The folder must be an absolute path.");
+      }
+      const stat = await fs.lstat(input.root).catch((error) => {
+        if (isMissing(error)) throw new WorkspaceManagerErrorV2("folder_not_found", "The folder does not exist.");
+        throw error;
+      });
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new WorkspaceManagerErrorV2("unsafe_directory", "The folder must be a directory reached through no link.");
+      }
+      const canonicalRoot = await fs.realpath(input.root);
+      if (!samePath(canonicalRoot, path.resolve(input.root))) {
+        throw new WorkspaceManagerErrorV2("unsafe_directory", "The folder is reached through a link or junction.");
+      }
+      if (samePath(canonicalRoot, path.parse(canonicalRoot).root)) {
+        throw new WorkspaceManagerErrorV2("unsafe_directory", "A drive or filesystem root cannot be a workspace.");
+      }
+      const applicationRoot = await fs.realpath(this.applicationDataRoot).catch(() => path.resolve(this.applicationDataRoot));
+      if (isSameOrDescendantPath(canonicalRoot, applicationRoot) || isSameOrDescendantPath(applicationRoot, canonicalRoot)) {
+        throw new WorkspaceManagerErrorV2("unsafe_directory", "The folder cannot hold, or be inside, the workspaces' own application data.");
+      }
+      const workspaceId = workspaceIdentifier(input.workspaceId);
+      const existing = await this.loadManifest(workspaceId).catch((error) =>
+        error instanceof WorkspaceManagerErrorV2 && error.code === "workspace_not_found" ? null : Promise.reject(error),
+      );
+      let manifest: WorkspaceManifestV2;
+      if (existing) {
+        if (!existing.personFolder || existing.ownerRunId !== ownerRunId || !samePath(existing.canonicalRoot, canonicalRoot)) {
+          throw new WorkspaceManagerErrorV2("workspace_binding_conflict", "Workspace id is already bound to different durable state.");
+        }
+        manifest = await this.applyExpiry(existing);
+        if (["expired", "closed", "blocked"].includes(manifest.status)) {
+          throw new WorkspaceManagerErrorV2(`workspace_${manifest.status}`, `Workspace is ${manifest.status}.`);
+        }
+      } else {
+        const container = this.containerPath(workspaceId);
+        await this.ensureMetadataContainer(container);
+        manifest = await this.newManifest({
+          workspaceId,
+          ownerRunId,
+          kind: "scratch",
+          canonicalRoot,
+          repositoryBinding: null,
+          baseSha: null,
+          expiresAt: input.expiresAt,
+          sandboxPolicy: input.sandboxPolicy,
+          changeBudget: input.changeBudget,
+          personFolder: true,
+        });
+        try {
+          await this.persistNewManifest(manifest);
+        } catch (error) {
+          // Only the container this call made; never the folder.
+          await fs.rm(container, { recursive: true, force: true });
+          throw error;
+        }
+      }
+      const leftovers = await this.sweepLeftovers(manifest);
+      return { manifest, leftovers };
+    });
+  }
+
+  /**
+   * Unregister a workspace: closed, its lease dropped, its id never reused.
+   * Nothing is removed, in the container or under the root; a person's folder
+   * is left exactly as it is (CODE2-5).
+   */
+  async closeWorkspace(workspaceId: string): Promise<WorkspaceManifestV2> {
+    return this.serializeWrite(async () => {
+      const manifest = await this.loadManifest(workspaceIdentifier(workspaceId));
+      if (manifest.status === "closed") return manifest;
+      const { attachedRunId: _attached, ...rest } = manifest;
+      const closed = parseWorkspaceManifestV2({ ...rest, status: "closed", lease: null, updatedAt: this.isoNow() });
+      await this.persistManifest(closed);
+      return closed;
+    });
+  }
+
+  /**
+   * What a run changed in a person's folder, from the originals kept before its
+   * first write to each path (CODE2-5): each path, whether it existed before,
+   * and whether what is there now is what the run left.
+   */
+  async runOriginals(workspaceId: string, runId: string): Promise<WorkspaceRunOriginalsV2> {
+    const manifest = await this.loadManifest(workspaceIdentifier(workspaceId));
+    if (!manifest.personFolder) {
+      throw new WorkspaceManagerErrorV2("workspace_not_person_folder", "Only a workspace in a person's own folder keeps a run's originals.");
+    }
+    const index = await this.readPreimageIndex(manifest, runId);
+    const entries: WorkspaceRunOriginalsV2["entries"] = [];
+    for (const [relative, entry] of Object.entries(index?.entries ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
+      if (entry.after === undefined) continue;
+      const now = await this.currentState(manifest, relative);
+      entries.push({ path: relative, existed: entry.existed, unchangedSinceRun: now === entry.after });
+    }
+    return { workspaceId: manifest.workspaceId, runId, entries };
+  }
+
+  /**
+   * Put a person's folder back as it was before a run (CODE2-5): each file the
+   * run changed gets its kept original back, each file it made is removed, and
+   * a file changed since the run left it is skipped and named, never
+   * overwritten. Refused while a lease is held. What was put back is forgotten,
+   * so a second call does nothing; what was skipped stays to be asked again.
+   */
+  async restoreRunOriginals(workspaceId: string, runId: string): Promise<WorkspaceRunRestoreV2> {
+    return this.serializeWrite(async () => {
+      const manifest = await this.applyExpiry(await this.loadManifest(workspaceIdentifier(workspaceId)));
+      if (!manifest.personFolder) {
+        throw new WorkspaceManagerErrorV2("workspace_not_person_folder", "Only a workspace in a person's own folder keeps a run's originals.");
+      }
+      if (manifest.lease) {
+        throw new WorkspaceManagerErrorV2("workspace_in_use", `Workspace ${manifest.workspaceId} is in use; try again when it is free.`);
+      }
+      await this.assertWorkspaceRoot(manifest);
+      const index = await this.readPreimageIndex(manifest, runId);
+      const result: WorkspaceRunRestoreV2 = { workspaceId: manifest.workspaceId, runId, restored: [], removed: [], skipped: [] };
+      if (!index) return result;
+      const runFolder = this.preimageFolder(manifest, runId);
+      const remaining: Record<string, PreimageEntryV2> = {};
+      const forgotten: string[] = [];
+      for (const [relative, entry] of Object.entries(index.entries).sort(([left], [right]) => left.localeCompare(right))) {
+        if (entry.after === undefined) {
+          forgotten.push(relative);
+          continue;
+        }
+        try {
+          const now = await this.currentState(manifest, relative);
+          if (now !== entry.after) {
+            result.skipped.push({ path: relative, reason: "changed_since_run" });
+            remaining[relative] = entry;
+            continue;
+          }
+          if (!entry.existed) {
+            if (now !== null) {
+              const target = await this.resolveSafePath(manifest, relative, { mustExist: true, mutation: true });
+              await this.revalidateGuard(target.parentGuard!);
+              await fs.rm(target.absolutePath, { force: true });
+            }
+            result.removed.push(relative);
+          } else {
+            const blob = path.join(runFolder, entry.blob!);
+            await this.assertMetadataBoundary(blob, false);
+            const bytes = await fs.readFile(blob);
+            if (sha256Bytes(bytes) !== entry.sha256) {
+              result.skipped.push({ path: relative, reason: "original_damaged" });
+              remaining[relative] = entry;
+              continue;
+            }
+            await this.createParentDirectories(manifest, relative, []);
+            const target = await this.resolveSafePath(manifest, relative, { mustExist: false, mutation: true });
+            const temporary = this.temporaryBeside(target.absolutePath, "new");
+            const handle = await fs.open(temporary, "wx", 0o600);
+            try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+            try {
+              await this.revalidateGuard(target.parentGuard!);
+              if (now !== await this.currentState(manifest, relative)) {
+                throw new WorkspaceManagerErrorV2("precondition_failed", `${relative} changed while it was being put back.`);
+              }
+              await renameWithBoundedWindowsRetry(temporary, target.absolutePath);
+            } catch (error) {
+              await fs.rm(temporary, { force: true });
+              throw error;
+            }
+            result.restored.push(relative);
+          }
+          forgotten.push(relative);
+        } catch (error) {
+          result.skipped.push({
+            path: relative,
+            reason: error instanceof WorkspaceManagerErrorV2 && error.code === "precondition_failed" ? "changed_since_run" : "unwritable",
+          });
+          remaining[relative] = entry;
+        }
+      }
+      const files = { ...manifest.hashes.files };
+      for (const relative of [...result.restored, ...result.removed]) delete files[relative];
+      const next = parseWorkspaceManifestV2({
+        ...manifest,
+        hashes: { files, indexFingerprint: sha256Json(files) },
+        updatedAt: this.isoNow(),
+      });
+      await this.persistManifest(next);
+      if (Object.keys(remaining).length === 0) {
+        await fs.rm(runFolder, { recursive: true, force: true });
+      } else {
+        for (const relative of forgotten) {
+          const blob = index.entries[relative]?.blob;
+          if (blob) await fs.rm(path.join(runFolder, blob), { force: true });
+        }
+        await this.writePreimageIndex(manifest, runId, { ...index, entries: remaining });
+      }
+      return result;
+    });
+  }
+
+  /**
+   * Keep each path's original before the run's first write to it (CODE2-5), in
+   * a person's folder only: its bytes, or that it did not exist. Later writes
+   * by the same run keep nothing more. A person's own writes keep nothing.
+   */
+  private async keepOriginals(manifest: WorkspaceManifestV2, relativePaths: readonly string[]): Promise<void> {
+    const runId = this.writingRunOf(manifest);
+    if (runId === null) return;
+    const runFolder = this.preimageFolder(manifest, runId);
+    const index = (await this.readPreimageIndex(manifest, runId)) ?? {
+      version: 1 as const,
+      workspaceId: manifest.workspaceId,
+      runId,
+      entries: {},
+    };
+    let changed = false;
+    for (const relativeInput of relativePaths) {
+      const relative = assertWorkspaceRelativePathV2(relativeInput);
+      if (index.entries[relative]) continue;
+      const absolute = path.resolve(manifest.canonicalRoot, ...relative.split("/"));
+      const stat = await fs.lstat(absolute).catch((error) => (isMissing(error) ? null : Promise.reject(error)));
+      if (!stat) {
+        index.entries[relative] = { existed: false, sha256: null, bytes: null, blob: null, keptAt: this.isoNow() };
+      } else if (stat.isFile() && !stat.isSymbolicLink()) {
+        if (!changed) {
+          await this.assertMetadataBoundary(runFolder, true);
+          await fs.mkdir(runFolder, { recursive: true });
+          await this.assertMetadataBoundary(runFolder, false);
+        }
+        const bytes = await fs.readFile(absolute);
+        const blob = `${Object.keys(index.entries).length + 1}-${this.randomId()}.bin`;
+        await fs.writeFile(path.join(runFolder, blob), bytes, { flag: "wx" });
+        index.entries[relative] = { existed: true, sha256: sha256Bytes(bytes), bytes: bytes.byteLength, blob, keptAt: this.isoNow() };
+      } else {
+        // A folder is kept through the files in it; anything else is refused
+        // by the write that follows.
+        continue;
+      }
+      changed = true;
+    }
+    if (changed) await this.writePreimageIndex(manifest, runId, index);
+  }
+
+  /** What each path a run wrote holds after it, so a restore can tell the person's later edits from the run's. */
+  private async noteRunAfterStates(
+    manifest: WorkspaceManifestV2,
+    updates: ReadonlyArray<{ path: string; hash: { sha256: string } }>,
+    removals: readonly string[],
+  ): Promise<void> {
+    const runId = this.writingRunOf(manifest);
+    if (runId === null) return;
+    const index = await this.readPreimageIndex(manifest, runId);
+    if (!index) return;
+    let changed = false;
+    for (const removal of removals) {
+      if (index.entries[removal]) { index.entries[removal]!.after = null; changed = true; }
+    }
+    for (const update of updates) {
+      if (index.entries[update.path]) { index.entries[update.path]!.after = update.hash.sha256; changed = true; }
+    }
+    if (changed) await this.writePreimageIndex(manifest, runId, index);
+  }
+
+  /** The run now writing in a person's folder, or null (another workspace, or the person writing). */
+  private writingRunOf(manifest: WorkspaceManifestV2): string | null {
+    if (!manifest.personFolder || !manifest.lease) return null;
+    const owner = manifest.lease.ownerId;
+    const runId = owner.startsWith("extension:") ? owner.slice("extension:".length) : owner;
+    if (!runId || isPersonWorkspaceOwnerV2(runId)) return null;
+    return runId;
+  }
+
+  private preimageFolder(manifest: WorkspaceManifestV2, runId: string): string {
+    const plain = boundedText(runId, "run id", 256);
+    const slug = plain.toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 96) || "run";
+    return path.join(this.containerPath(manifest.workspaceId), PREIMAGES_FOLDER, `${slug}-${sha256Text(plain).slice(7, 19)}`);
+  }
+
+  private async readPreimageIndex(manifest: WorkspaceManifestV2, runId: string): Promise<PreimageIndexV2 | null> {
+    const file = path.join(this.preimageFolder(manifest, runId), "index.json");
+    await this.assertMetadataBoundary(file, true);
+    const raw = await fs.readFile(file, "utf8").catch((error) => (isMissing(error) ? null : Promise.reject(error)));
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as PreimageIndexV2;
+    if (parsed.version !== 1 || parsed.workspaceId !== manifest.workspaceId || parsed.runId !== runId || typeof parsed.entries !== "object") {
+      throw new WorkspaceManagerErrorV2("preimage_index_invalid", "The run's kept originals cannot be read.");
+    }
+    const entries: Record<string, PreimageEntryV2> = Object.create(null);
+    for (const [relative, entry] of Object.entries(parsed.entries)) {
+      entries[assertWorkspaceRelativePathV2(relative)] = entry;
+    }
+    return { ...parsed, entries };
+  }
+
+  private async writePreimageIndex(manifest: WorkspaceManifestV2, runId: string, index: PreimageIndexV2): Promise<void> {
+    const folder = this.preimageFolder(manifest, runId);
+    await this.assertMetadataBoundary(folder, true);
+    await fs.mkdir(folder, { recursive: true });
+    const file = path.join(folder, "index.json");
+    const temporary = `${file}.${this.randomId()}.tmp`;
+    await fs.writeFile(temporary, `${JSON.stringify({ ...index, entries: { ...index.entries } }, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    try { await renameWithBoundedWindowsRetry(temporary, file); } catch (error) { await fs.rm(temporary, { force: true }); throw error; }
+  }
+
+  /** A path's state as a restore compares it: its SHA-256, or null when it is absent. */
+  private async currentState(manifest: WorkspaceManifestV2, relative: string): Promise<string | null> {
+    const absolute = path.resolve(manifest.canonicalRoot, ...relative.split("/"));
+    if (!inside(manifest.canonicalRoot, absolute)) throw new WorkspaceManagerErrorV2("path_escape", "Workspace path escaped its root.");
+    const stat = await fs.lstat(absolute).catch((error) => (isMissing(error) ? null : Promise.reject(error)));
+    if (!stat) return null;
+    if (!stat.isFile() || stat.isSymbolicLink()) return "not-a-file";
+    return sha256Bytes(await fs.readFile(absolute));
+  }
+
+  /**
+   * A person's folder changes under the person's own hands: on resume, a file
+   * whose hash moved since the manager last wrote it is forgotten rather than
+   * read as drift, because every write still checks the file as it is now.
+   */
+  private async forgetPersonEdits(manifest: WorkspaceManifestV2): Promise<WorkspaceManifestV2> {
+    const files = { ...manifest.hashes.files };
+    let changed = false;
+    for (const [relative, expected] of Object.entries(manifest.hashes.files)) {
+      const now = await this.currentState(manifest, relative).catch(() => "unreadable");
+      if (now !== expected.sha256) {
+        delete files[relative];
+        changed = true;
+      }
+    }
+    if (!changed) return manifest;
+    const next = parseWorkspaceManifestV2({ ...manifest, hashes: { files, indexFingerprint: sha256Json(files) }, updatedAt: this.isoNow() });
+    await this.persistManifest(next);
+    return next;
+  }
+
+  /** A temporary path beside a target, named with the manager's prefix. */
+  private temporaryBeside(absoluteTarget: string, kind: "new" | "old"): string {
+    const id = String(this.randomId()).replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 120);
+    return path.join(path.dirname(absoluteTarget), `${WORKSPACE_TEMPORARY_PREFIX_V2}${kind}-${id}.${kind === "new" ? "tmp" : "bak"}`);
+  }
+
+  /**
+   * An interrupted write's leftovers in a person's folder: a new text never
+   * renamed into place is removed, and an old text kept for a rollback is moved
+   * into the container (under `leftovers/`), because it may be the only copy.
+   * Dependency and build folders, links and other files are left alone.
+   */
+  private async sweepLeftovers(manifest: WorkspaceManifestV2): Promise<WorkspaceLeftoverSweepV2> {
+    const sweep: WorkspaceLeftoverSweepV2 = { removed: [], keptAside: [], truncated: false };
+    let visited = 0;
+    const stamp = this.isoNow().replace(/[^0-9]/gu, "").slice(0, 14);
+    const visit = async (folder: string, relative: string): Promise<void> => {
+      const entries = await fs.readdir(folder, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (++visited > MAX_SWEEP_ENTRIES_V2) { sweep.truncated = true; return; }
+        const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
+        const absolute = path.join(folder, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === ".git" || isWorkspaceListingSkippedDirectoryV1(entry.name)) continue;
+          await visit(absolute, childRelative);
+          if (sweep.truncated) return;
+          continue;
+        }
+        if (!entry.isFile() || !TEMPORARY_NAME_V2.test(entry.name)) continue;
+        const stat = await fs.lstat(absolute).catch(() => null);
+        if (!stat || !stat.isFile() || stat.isSymbolicLink()) continue;
+        if (entry.name.startsWith(`${WORKSPACE_TEMPORARY_PREFIX_V2}new-`)) {
+          await fs.rm(absolute, { force: true });
+          sweep.removed.push(childRelative);
+        } else {
+          const destination = path.join(this.containerPath(manifest.workspaceId), LEFTOVERS_FOLDER, stamp, ...childRelative.split("/"));
+          await this.assertMetadataBoundary(destination, true);
+          await fs.mkdir(path.dirname(destination), { recursive: true });
+          await moveAcrossDevices(absolute, destination);
+          sweep.keptAside.push(childRelative);
+        }
+      }
+    };
+    await visit(manifest.canonicalRoot, "");
+    return sweep;
   }
 
   /**
@@ -1477,6 +1956,7 @@ export class WorkspaceManagerV2 {
         if (target.exists) throw new WorkspaceManagerErrorV2("path_exists", `${target.relativePath} already exists.`);
         const createCount: WorkspaceChangeCountV2 = { addedBytes: bytes.byteLength, budgetPaths: [target.relativePath] };
         this.assertBudget(manifest, [target.relativePath], createCount);
+        await this.keepOriginals(manifest, [target.relativePath]);
         await this.revalidateGuard(target.parentGuard!);
         const handle = await fs.open(target.absolutePath, "wx", 0o600);
         createdFilePath = target.absolutePath;
@@ -1617,6 +2097,7 @@ export class WorkspaceManagerV2 {
       // The paths are known now; the bytes the batch adds once each existing
       // file has been read.
       this.assertBudget(originalManifest, artifactPaths, { addedBytes: 0, budgetPaths: artifactPaths });
+      await this.keepOriginals(originalManifest, artifactPaths);
       let artifactCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: artifactPaths };
 
       const createdDirectories: string[] = [];
@@ -1661,9 +2142,9 @@ export class WorkspaceManagerV2 {
               `Expected generated artifact does not exist: ${artifact.relativePath}.`,
             );
           }
-          const temporary = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.sandbox.tmp`);
+          const temporary = this.temporaryBeside(target.absolutePath, "new");
           const backup = before
-            ? path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.sandbox.bak`)
+            ? this.temporaryBeside(target.absolutePath, "old")
             : null;
           const preparedEntry = { artifact, target, before, temporary, backup, applied: false, after: null };
           prepared.push(preparedEntry);
@@ -1812,6 +2293,7 @@ export class WorkspaceManagerV2 {
         budgetPaths: touched,
       };
       this.assertBudget(originalManifest, touched, batchCount);
+      await this.keepOriginals(originalManifest, touched);
 
       const undo: Array<() => Promise<void>> = [];
       const temporaries: string[] = [];
@@ -1852,13 +2334,13 @@ export class WorkspaceManagerV2 {
           let temporary: string | null = null;
           let backup: string | null = null;
           if (change.bytes) {
-            temporary = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.batch.tmp`);
+            temporary = this.temporaryBeside(target.absolutePath, "new");
             const handle = await fs.open(temporary, "wx", 0o600);
             temporaries.push(temporary);
             try { await handle.writeFile(change.bytes); await handle.sync(); } finally { await handle.close(); }
           }
           if (change.kind === "write") {
-            backup = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.batch.bak`);
+            backup = this.temporaryBeside(target.absolutePath, "old");
             await fs.copyFile(target.absolutePath, backup, fsConstants.COPYFILE_EXCL);
             backups.push(backup);
             if ((await hashFile(backup)).sha256 !== change.expectedSha256) {
@@ -1890,7 +2372,7 @@ export class WorkspaceManagerV2 {
           } else if (change.kind === "create" || change.kind === "move") {
             if (change.kind === "move") {
               const source = entry.source!;
-              const aside = path.join(path.dirname(source.absolutePath), `.${path.basename(source.absolutePath)}.${this.randomId()}.batch.bak`);
+              const aside = this.temporaryBeside(source.absolutePath, "old");
               await renameWithBoundedWindowsRetry(source.absolutePath, aside);
               backups.push(aside);
               undo.push(async () => { await renameWithBoundedWindowsRetry(aside, source.absolutePath); });
@@ -2034,6 +2516,7 @@ export class WorkspaceManagerV2 {
       // A move adds no bytes and counts the two paths it names, not its tree.
       const moveCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: [source.relativePath, destination.relativePath] };
       this.assertBudget(manifest, changed, moveCount);
+      await this.keepOriginals(manifest, changed);
       await this.revalidateGuard(source.parentGuard!);
       await this.revalidateGuard(destination.parentGuard!);
       await fs.rename(source.absolutePath, destination.absolutePath);
@@ -2069,6 +2552,7 @@ export class WorkspaceManagerV2 {
       const changed = tree.files.map((file) => remapPath(file.path, source.relativePath, destination.relativePath));
       const copyCount: WorkspaceChangeCountV2 = { addedBytes: tree.bytes, budgetPaths: changed };
       this.assertBudget(manifest, changed, copyCount);
+      await this.keepOriginals(manifest, changed);
       await this.revalidateGuard(source.parentGuard!);
       await this.revalidateGuard(destination.parentGuard!);
       let destinationCreated = false;
@@ -2113,6 +2597,7 @@ export class WorkspaceManagerV2 {
       // A trash adds no bytes and counts the one path it names.
       const trashCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: [source.relativePath] };
       this.assertBudget(manifest, tree.files.map((file) => file.path), trashCount);
+      await this.keepOriginals(manifest, tree.files.map((file) => file.path));
       const trashId = workspaceIdentifier(`trash-${this.randomId()}`);
       const trashRoot = path.join(this.containerPath(manifest.workspaceId), TRASH_FOLDER, trashId);
       await this.assertMetadataBoundary(trashRoot, true);
@@ -2153,6 +2638,7 @@ export class WorkspaceManagerV2 {
       if (tree.fingerprint !== expectedTrashFingerprint) throw new WorkspaceManagerErrorV2("trash_hash_drift", "Trash payload hash changed.");
       const restoreCount: WorkspaceChangeCountV2 = { addedBytes: 0, budgetPaths: [originalPath] };
       this.assertBudget(manifest, tree.files.map((file) => file.path), restoreCount);
+      await this.keepOriginals(manifest, tree.files.map((file) => file.path));
       await this.revalidateGuard(destination.parentGuard!);
       await moveAcrossDevices(payload, destination.absolutePath);
       try {
@@ -2181,8 +2667,9 @@ export class WorkspaceManagerV2 {
         budgetPaths: [target.relativePath],
       };
       this.assertBudget(manifest, [target.relativePath], editCount);
-      const temporary = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.tmp`);
-      const backup = path.join(path.dirname(target.absolutePath), `.${path.basename(target.absolutePath)}.${this.randomId()}.rollback.bak`);
+      await this.keepOriginals(manifest, [target.relativePath]);
+      const temporary = this.temporaryBeside(target.absolutePath, "new");
+      const backup = this.temporaryBeside(target.absolutePath, "old");
       await fs.copyFile(target.absolutePath, backup, fsConstants.COPYFILE_EXCL);
       if ((await hashFile(backup)).sha256 !== before.sha256) {
         await fs.rm(backup, { force: true });
@@ -2219,6 +2706,7 @@ export class WorkspaceManagerV2 {
     repositoryBinding: WorkspaceManifestV2["repositoryBinding"]; baseSha: string | null;
     expiresAt?: string; sandboxPolicy?: WorkspaceSandboxPolicyV2;
     changeBudget?: WorkspaceChangeBudgetV2;
+    personFolder?: true;
   }): Promise<WorkspaceManifestV2> {
     const now = this.isoNow();
     const expiresAt = input.expiresAt ?? new Date(Date.parse(now) + DEFAULT_EXPIRY_MS).toISOString();
@@ -2229,6 +2717,7 @@ export class WorkspaceManagerV2 {
       kind: input.kind,
       ownerRunId: boundedText(input.ownerRunId, "owner run id", 256),
       repositoryBinding: input.repositoryBinding,
+      ...(input.personFolder ? { personFolder: true } : {}),
       canonicalRoot: input.canonicalRoot,
       baseSha: input.baseSha,
       sandboxPolicy: input.sandboxPolicy ?? { mode: "editing_only", provider: null, boundaryFingerprint: null, network: "disabled" },
@@ -2299,6 +2788,7 @@ export class WorkspaceManagerV2 {
       },
     });
     await this.persistManifest(next);
+    await this.noteRunAfterStates(next, updates, removals);
     return next;
   }
 

@@ -97,6 +97,14 @@ export interface WorkspaceManifestV2 {
    */
   attachedRunId?: string;
   repositoryBinding: WorkspaceRepositoryBindingV2 | null;
+  /**
+   * The root is the person's own folder, registered by the host alone
+   * (`registerPersonFolderWorkspace`, CODE2-5), not a folder in the
+   * workspace's container. Its manifest, lease, receipts, trash and the runs'
+   * kept originals stay in the container; nothing under the root is ever
+   * removed by expiry or close. Absent for every other workspace.
+   */
+  personFolder?: true;
   canonicalRoot: string;
   baseSha: string | null;
   sandboxPolicy: WorkspaceSandboxPolicyV2;
@@ -145,11 +153,13 @@ export class WorkspaceManifestErrorV2 extends Error {
 export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
   const source = record(value, "workspace manifest");
   const attached = source.attachedRunId !== undefined;
+  const personFolder = source.personFolder !== undefined;
   exact(source, [
     "version", "workspaceId", "kind", "ownerRunId", "repositoryBinding",
     "canonicalRoot", "baseSha", "sandboxPolicy", "hashes", "validationHistory",
     "lease", "status", "expiresAt", "createdAt", "updatedAt", "budget",
     ...(attached ? ["attachedRunId"] : []),
+    ...(personFolder ? ["personFolder"] : []),
   ], "workspace manifest");
   if (source.version !== WORKSPACE_MANIFEST_VERSION_V2) {
     throw new WorkspaceManifestErrorV2("Unsupported workspace manifest version.");
@@ -177,6 +187,9 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     : sha(source.baseSha, "base SHA", /^[a-f0-9]{40,64}$/iu);
   if (kind === "scratch" && (repositoryBinding !== null || baseSha !== null)) {
     throw new WorkspaceManifestErrorV2("Scratch workspaces cannot carry repository binding state.");
+  }
+  if (personFolder && (source.personFolder !== true || kind !== "scratch" || !isPersonWorkspaceOwnerV2(ownerRunId))) {
+    throw new WorkspaceManifestErrorV2("Only a person's own scratch workspace can be rooted in their folder.");
   }
   if (kind === "repository") {
     if (!repositoryBinding || !baseSha || repositoryBinding.worktreeRoot !== canonicalRoot) {
@@ -243,6 +256,7 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     ownerRunId,
     ...(attachedRunId === undefined ? {} : { attachedRunId }),
     repositoryBinding,
+    ...(personFolder ? { personFolder: true as const } : {}),
     canonicalRoot,
     baseSha,
     sandboxPolicy,
