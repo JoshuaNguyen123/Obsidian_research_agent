@@ -64,6 +64,8 @@ export const CODE_PLAN_MAX_TEXT_CHARS_V1 = 200;
  * (`code_workspace_apply_patch`, `code_sandbox_run`) or a host provides
  * (`code_workspace_inspect`) joins without a change here. Trash is on the
  * menu and still asks: its approval comes from its own descriptor.
+ * `recall_tool_result` reads back what context compaction set aside, so a
+ * long pass can return to a read it made early instead of making it again.
  */
 export const CODE_FREE_MENU_V1 = Object.freeze([
   "code_sandbox_status",
@@ -86,6 +88,7 @@ export const CODE_FREE_MENU_V1 = Object.freeze([
   "code_validate_targeted",
   "code_sandbox_run",
   "code_repair_status",
+  "recall_tool_result",
   CODE_PLAN_UPDATE_TOOL_NAME_V1,
 ] as const);
 
