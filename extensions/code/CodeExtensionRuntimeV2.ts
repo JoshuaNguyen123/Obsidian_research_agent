@@ -1,3 +1,4 @@
+import { selectForegroundValidationCommand } from "./repositories/foregroundValidation";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -34,6 +35,7 @@ import { withPluginDataLock } from "../shared/softDependency";
 import { scratchPythonContractCheckArgsV1 } from "./ScratchPythonValidationV1";
 import {
   CODE_EXECUTION_TOOL_NAMES_V2,
+  CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1,
   CodeSandboxContributionErrorV2,
   DurableSandboxExecutionJournalV1,
   SandboxManagerV2,
@@ -52,7 +54,9 @@ import {
   type SandboxArtifactImporterV2,
   type SandboxProviderConfigV2,
   type SandboxExecutionReceiptV2,
+  type SandboxToolProgressV1,
   type SandboxStagedFileBytesV2,
+  type CodeSandboxRunStagingV1,
 } from "./sandbox";
 import {
   NOTEBOOK_OPTIONAL_MODULES_V1,
@@ -80,6 +84,8 @@ import {
   detectSourceOnlyRepositoryProfileV2,
   migrateRepositoryProfileV1,
   parseRepositoryProfileV2,
+  repositoryStagingFileLimitV1,
+  type RepositoryStagingProfileV1,
   repositoryProfileExecutionBlockersV2,
   type RepositoryEcosystemV2,
   type RepositoryProfileV2,
@@ -102,11 +108,20 @@ import {
   WorkspaceManagerV2,
   assertWorkspaceRelativePathV2,
   createVerifiedWorkspaceBaseReadbackV2,
+  WORKSPACE_INVENTORY_IGNORED_DIRECTORIES_V1,
+  workspaceRunMayWorkV2,
   type WorkspaceEntryMetadataV2,
 } from "./workspaces";
 import {
   DurableValidationReceiptRegistryV1,
   CallbackCodeRepairCheckpointStoreV1,
+  PersonWorkspaceCommitRuntimeV1,
+  type NormalizedCodeRepairRequestV1,
+  type PersonWorkspaceCommitInputV1,
+  type PersonWorkspaceCommitResultV1,
+  type PersonWorkspaceRevertInputV1,
+  type CodeValidationReceiptV1,
+  type ValidationKindV1,
   FixedArgvArtifactHashReaderV1,
   FixedArgvRepairProofAdapterV1,
   SpawnFixedArgvGitRunnerV1,
@@ -135,6 +150,7 @@ import {
   type SealBackgroundValidationCommitPackageResultV1,
 } from "./background";
 import { classifyProtectedControlChanges } from "./repair/protectedControls";
+import { isAgentGitCommitIdentityV1 } from "../../packages/core-api/src/agentGitCommitIdentityV1";
 
 export const CODE_RUNTIME_STATE_VERSION_V2 = 2 as const;
 export const CODE_EXTENSION_VERSION_V2 = "0.2.0" as const;
@@ -143,7 +159,6 @@ const EXTENSION_ID = "agentic-researcher-code";
 const MAX_PROFILE_INVENTORY_ENTRIES = 20_000;
 const MAX_PROFILE_INVENTORY_DEPTH = 32;
 const MAX_PIN_BYTES = 64 * 1024;
-const MAX_SANDBOX_STAGING_FILES = 100;
 const MAX_SANDBOX_STAGING_FILE_BYTES = 2_000_000;
 const MAX_SANDBOX_STAGING_TOTAL_BYTES = 10_000_000;
 const MAX_SANDBOX_STAGING_DIRECTORIES = 256;
@@ -152,25 +167,7 @@ const MAX_SANDBOX_STAGING_DEPTH = 32;
 const MAX_REFLECTION_SOURCE_BYTES = 1_000_000;
 const MAX_REFLECTION_EXAMPLE_LINES = 20;
 const SCRATCH_SANDBOX_PROJECT_ID = "scratch";
-const IGNORED_INVENTORY_DIRECTORIES = new Set([
-  ".git",
-  ".agent-backups",
-  ".cache",
-  ".gradle",
-  ".idea",
-  ".next",
-  ".pytest_cache",
-  ".venv",
-  ".vscode",
-  "bin",
-  "build",
-  "coverage",
-  "dist",
-  "node_modules",
-  "obj",
-  "target",
-  "vendor",
-]);
+const IGNORED_INVENTORY_DIRECTORIES = WORKSPACE_INVENTORY_IGNORED_DIRECTORIES_V1;
 const PIN_BASENAMES = new Set([
   ".node-version",
   ".nvmrc",
@@ -271,6 +268,8 @@ export interface CodeExtensionRuntimeOptionsV2 {
   sandboxManager?: SandboxManagerV2;
   /** Test/host adapter for the fixed provider catalog; never runs repository commands directly. */
   sandboxRunner?: SandboxCommandRunnerV2;
+  /** Provisional redacted output for the foreground host, never persisted. */
+  onSandboxProgress?: (progress: Readonly<SandboxToolProgressV1>) => void;
   /**
    * Optional production repair tools assembled from narrow, verified adapters.
    * Omission is an explicit degraded capability, never a simulated commit path.
@@ -399,6 +398,7 @@ export class CodeExtensionRuntimeV2 {
   private readonly now: () => Date;
   private readonly injectedSandboxManager: SandboxManagerV2 | null;
   private readonly sandboxRunner: SandboxCommandRunnerV2;
+  private readonly onSandboxProgress: CodeExtensionRuntimeOptionsV2["onSandboxProgress"];
   private repairContributions: ExtensionContributionV1[];
   private validationReceiptRegistry: DurableValidationReceiptRegistryV1 | null = null;
   private sandboxExecutionJournal: DurableSandboxExecutionJournalV1 | null = null;
@@ -432,6 +432,7 @@ export class CodeExtensionRuntimeV2 {
     this.workspaceManager = options.workspaceManager ?? new WorkspaceManagerV2();
     this.injectedSandboxManager = options.sandboxManager ?? null;
     this.sandboxRunner = options.sandboxRunner ?? new SpawnSandboxCommandRunnerV2();
+    this.onSandboxProgress = options.onSandboxProgress;
     this.repairContributions = [...(options.repairContributions ?? [])];
     this.now = options.now ?? (() => new Date());
   }
@@ -497,11 +498,16 @@ export class CodeExtensionRuntimeV2 {
       // startup manager after a verified provider is configured.
       sandboxManager: () => this.requireSandboxManager(),
       executionJournal: this.requireSandboxExecutionJournal(),
+      observeExecutionProgress: this.onSandboxProgress,
       getProfile: (profileKey) => this.getRepositoryProfile(profileKey),
       resolvePreparationInput: ({ purpose, workspaceId, context }) =>
         this.resolveSandboxPreparationInput(purpose, workspaceId, context),
       resolveExecutionInput: (_action, sandboxAction, context) =>
         this.resolveSandboxExecutionInput(sandboxAction, context),
+      resolveCommandPreparationInput: ({ workspaceId, cwd, ecosystem, context }) =>
+        this.resolveSandboxCommandPreparationInput({ workspaceId, cwd, ecosystem, context }),
+      resolveCommandExecutionInput: (sandboxAction, context) =>
+        this.resolveSandboxCommandExecutionInput(sandboxAction, context),
       observeValidationReceipt: this.validationReceiptRegistry
         ? async ({ runId, requestId, action, receipt, diagnostics, context }) => {
             const manifest = await this.workspaceManager.loadManifest(action.workspaceId);
@@ -625,6 +631,7 @@ export class CodeExtensionRuntimeV2 {
       allowedPaths: existing.allowedPaths,
       generatedOutputs: existing.generatedOutputs,
       requiredGitHubChecks: existing.requiredGitHubChecks,
+      ...(existing.stagingProfile ? { stagingProfile: existing.stagingProfile } : {}),
       runtimeDigests: {
         ...Object.fromEntries(existing.pinnedRuntimes
           .filter((runtime) => runtime.digest)
@@ -636,6 +643,7 @@ export class CodeExtensionRuntimeV2 {
       const current = this.requireState();
       const prior = current.repositoryProfiles[key];
       if (!prior) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", `Repository profile ${key} disappeared during re-detection.`);
+      if (prior.profile.stagingProfile !== existing.stagingProfile) throw new WorkspaceManagerErrorV2("repository_profile_binding_conflict", "Reviewed staging profile changed during repository re-detection.");
       const record: CodeRepositoryProfileRecordV2 = {
         ...prior,
         sourceFingerprint: sha256Canonical({
@@ -709,6 +717,7 @@ export class CodeExtensionRuntimeV2 {
         allowedPaths: existing.allowedPaths,
         generatedOutputs: existing.generatedOutputs,
         requiredGitHubChecks: existing.requiredGitHubChecks,
+        ...(existing.stagingProfile ? { stagingProfile: existing.stagingProfile } : {}),
         runtimeDigests: {
           ...Object.fromEntries(existing.pinnedRuntimes
             .filter((runtime) => runtime.digest)
@@ -719,7 +728,7 @@ export class CodeExtensionRuntimeV2 {
       await this.serializedRefresh(async () => {
         const current = this.requireState();
         const prior = current.repositoryProfiles[key];
-        if (!prior || !samePath(prior.profile.repositoryRoot, root)) {
+        if (!prior || !samePath(prior.profile.repositoryRoot, root) || prior.profile.stagingProfile !== existing.stagingProfile) {
           throw new WorkspaceManagerErrorV2(
             "repository_profile_binding_conflict",
             `Repository profile ${key} changed during runtime binding refresh.`,
@@ -797,7 +806,7 @@ export class CodeExtensionRuntimeV2 {
 
   async resolveSandboxExecutionInput(
     sandboxAction: PreparedSandboxActionV2,
-    _context: ScopedExtensionContextV1,
+    _context?: ScopedExtensionContextV1,
   ): Promise<{
     stagedFiles: readonly SandboxStagedFileBytesV2[];
     artifactImporter?: SandboxArtifactImporterV2;
@@ -860,6 +869,10 @@ export class CodeExtensionRuntimeV2 {
         );
       }
       profile = repositoryProfile;
+    }
+    if (profile.stagingProfile !== sandboxAction.stagingProfile) {
+      throw new CodeSandboxContributionErrorV2("sandbox_staging_profile_changed",
+        "The reviewed repository staging profile changed after preparation. Prepare a new action.");
     }
     if (manifest.hashes.indexFingerprint !== sandboxAction.workspaceManifestFingerprint) {
       throw new CodeSandboxContributionErrorV2(
@@ -960,6 +973,12 @@ export class CodeExtensionRuntimeV2 {
         expectedExistingSha256: existing?.sha256 ?? null,
         maxBytes: artifact.maxBytes,
       });
+    }
+    if (!_context) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_artifact_context_required",
+        "Generated sandbox artifacts are imported only for a run.",
+      );
     }
     const leaseOwner = `extension:${contextRunId(_context)}`;
     let leaseId = await this.ensureArtifactImportLease(
@@ -1151,7 +1170,13 @@ export class CodeExtensionRuntimeV2 {
       projectId = projects[0].id;
       stagingRoots = [
         ...projects[0].allowedPaths,
-        ...profile.protectedControls.map((control) => control.path),
+        // Git's own controls (`.git/hooks`, `.git/config`) stay protected for
+        // writes, but they are never workspace content: no workspace path can
+        // name `.git`, and a worktree's `.git` is a file. Staging leaves them
+        // out rather than refusing the whole validation over them.
+        ...profile.protectedControls
+          .map((control) => control.path)
+          .filter((controlPath) => !isGitInternalControlPathV1(controlPath)),
       ];
     }
     const project = profile.projects.find((candidate) => candidate.id === projectId)!;
@@ -1160,6 +1185,7 @@ export class CodeExtensionRuntimeV2 {
       this.workspaceManager,
       manifest.workspaceId,
       stagingRoots,
+      profile.stagingProfile,
     );
     for (const entry of stagingManifest) {
       const tracked = manifest.hashes.files[entry.path];
@@ -1207,6 +1233,163 @@ export class CodeExtensionRuntimeV2 {
       stagingManifest,
       ...(expectedArtifacts.length > 0 ? { expectedArtifacts } : {}),
     };
+  }
+
+  /**
+   * The workspace's files for one `code_sandbox_run` command (CODE-17): the
+   * run may work in the workspace, a provider passes a fresh boundary probe,
+   * and the files are staged as saved through the workspace manager, the
+   * whole workspace within the sandbox's bounds (dependency and build folders
+   * out), else the working folder, with what was left out said in words. A
+   * command with nothing to stage still runs over one empty placeholder.
+   */
+  async resolveSandboxCommandPreparationInput(input: {
+    workspaceId: string;
+    cwd: string;
+    ecosystem: "node" | "python";
+    context?: ScopedExtensionContextV1;
+  }): Promise<CodeSandboxRunStagingV1> {
+    this.assertInitialized();
+    const manifest = await this.requireCommandWorkspaceV1(input.workspaceId, input.context);
+    let stagingProfile: RepositoryStagingProfileV1 | undefined;
+    if (manifest.kind === "repository" && manifest.repositoryBinding?.profileKey) {
+      const profile = await this.getRepositoryProfile(manifest.repositoryBinding.profileKey);
+      stagingProfile = profile?.stagingProfile;
+    }
+    const notes: string[] = [];
+    let listed: Array<{ path: string; sha256: string; bytes: number }>;
+    try {
+      listed = await collectSandboxStagingManifest(
+        this.workspaceManager,
+        manifest.workspaceId,
+        ["."],
+        stagingProfile,
+      );
+    } catch (whole) {
+      if (input.cwd === "." || !(whole instanceof CodeSandboxContributionErrorV2)) throw whole;
+      listed = await collectSandboxStagingManifest(
+        this.workspaceManager,
+        manifest.workspaceId,
+        [input.cwd],
+        stagingProfile,
+      );
+      notes.push(`Only ${input.cwd} was staged: ${whole.message}`);
+    }
+    const stagingManifest: Array<{ path: string; sha256: string; bytes: number }> = [];
+    for (const entry of listed) {
+      let read: { content: string; sha256: string; bytes: number };
+      try {
+        read = await this.workspaceManager.read(manifest.workspaceId, entry.path);
+      } catch (error) {
+        if (error instanceof WorkspaceManagerErrorV2) {
+          notes.push(`${entry.path} was left out: it is not a text file the workspace can read.`);
+          continue;
+        }
+        throw error;
+      }
+      const tracked = manifest.hashes.files[entry.path];
+      if (
+        read.sha256 !== entry.sha256 ||
+        (tracked && (tracked.sha256 !== read.sha256 || tracked.bytes !== read.bytes))
+      ) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_workspace_manifest_drift",
+          `${entry.path} changed while it was being staged; run the command again.`,
+        );
+      }
+      // What is staged is the text as the manager reads it, so the manifest
+      // is over these bytes and execution re-reads the same.
+      const bytes = new TextEncoder().encode(read.content);
+      stagingManifest.push({ path: entry.path, sha256: sha256Bytes(bytes), bytes: bytes.byteLength });
+    }
+    if (stagingManifest.length === 0) {
+      stagingManifest.push({
+        path: CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1,
+        sha256: sha256Bytes(new Uint8Array(0)),
+        bytes: 0,
+      });
+    }
+    const sandboxStatus = await this.probeConfiguredSandboxProviders(input.context?.abortSignal);
+    if (!sandboxStatus.executionAvailable) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_provider_unavailable",
+        sandboxStatus.blocker?.message ??
+          "No sandbox provider passed the fresh preparation boundary probe.",
+      );
+    }
+    const runtimeDigest = this.verifiedSandboxRuntimeDigests([input.ecosystem])[input.ecosystem];
+    if (!runtimeDigest) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_runtime_digest_required",
+        `A command needs a verified sandbox runtime that carries ${input.ecosystem === "node" ? "Node" : "Python"}.`,
+      );
+    }
+    return {
+      workspaceId: manifest.workspaceId,
+      runtimeDigest,
+      ...(stagingProfile ? { stagingProfile } : {}),
+      workspaceManifestFingerprint: manifest.hashes.indexFingerprint,
+      stagingManifest,
+      notes,
+    };
+  }
+
+  /** The staged bytes for a prepared command, read again and checked against its manifest. */
+  async resolveSandboxCommandExecutionInput(
+    sandboxAction: PreparedSandboxActionV2,
+    context?: ScopedExtensionContextV1,
+  ): Promise<{ stagedFiles: readonly SandboxStagedFileBytesV2[] }> {
+    this.assertInitialized();
+    const manifest = await this.requireCommandWorkspaceV1(sandboxAction.workspaceId, context);
+    if (manifest.hashes.indexFingerprint !== sandboxAction.workspaceManifestFingerprint) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_workspace_manifest_drift",
+        "The workspace changed after this command was prepared; run it again.",
+      );
+    }
+    const stagedFiles: SandboxStagedFileBytesV2[] = [];
+    for (const entry of sandboxAction.stagingManifest) {
+      if (
+        entry.path === CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1 &&
+        entry.bytes === 0 &&
+        sandboxAction.stagingManifest.length === 1
+      ) {
+        stagedFiles.push({ path: entry.path, bytes: new Uint8Array(0) });
+        continue;
+      }
+      const relativePath = assertWorkspaceRelativePathV2(entry.path);
+      const read = await this.workspaceManager.read(manifest.workspaceId, relativePath);
+      const bytes = new TextEncoder().encode(read.content);
+      if (sha256Bytes(bytes) !== entry.sha256 || bytes.byteLength !== entry.bytes) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_staging_mismatch",
+          `${relativePath} changed after the command was prepared; run it again.`,
+        );
+      }
+      stagedFiles.push({ path: relativePath, bytes });
+    }
+    return { stagedFiles };
+  }
+
+  /** A workspace a command may run in: open, and this run's or attached to it. */
+  private async requireCommandWorkspaceV1(
+    workspaceId: string,
+    context?: ScopedExtensionContextV1,
+  ) {
+    const manifest = await this.workspaceManager.loadManifest(workspaceId);
+    if (manifest.status === "expired" || manifest.status === "blocked" || manifest.status === "closed") {
+      throw new CodeSandboxContributionErrorV2(
+        "workspace_unavailable",
+        `The workspace is ${manifest.status}, so nothing can run in it.`,
+      );
+    }
+    if (!context || !workspaceRunMayWorkV2(manifest, contextRunId(context))) {
+      throw new CodeSandboxContributionErrorV2(
+        "workspace_owner_mismatch",
+        "The workspace belongs to another run, so this run cannot run commands in it.",
+      );
+    }
+    return manifest;
   }
 
   /** Host-controlled boundary probe. It never receives a model-supplied command. */
@@ -1830,17 +2013,31 @@ export class CodeExtensionRuntimeV2 {
       this.checkpointPersistence(),
     );
     const eligible = [];
+    // A person's commit (CODE-15) is verified but never published: the push
+    // path is the agent's. It still ends the agent's commits before it in the
+    // same workspace, which are no longer what that workspace is at.
+    const personCommits: Array<{ workspaceId: string; committedAt: string }> = [];
     for (const id of checkpointIds) {
       const checkpoint = await store.load(id);
       if (
         checkpoint?.terminal?.status === "complete" &&
         checkpoint.terminal.publicationEligible === true &&
         checkpoint.verifiedCommitReceipt &&
-        checkpoint.request.worktree.profileId === profileKey &&
-        (!exactRunId || checkpoint.request.runId === exactRunId) &&
-        (!exactRequestId || checkpoint.request.id === exactRequestId)
+        checkpoint.request.worktree.profileId === profileKey
       ) {
-        eligible.push(checkpoint);
+        if (!isAgentGitCommitIdentityV1(checkpoint.verifiedCommitReceipt.identity)) {
+          personCommits.push({
+            workspaceId: checkpoint.verifiedCommitReceipt.workspaceId,
+            committedAt: checkpoint.verifiedCommitReceipt.committedAt,
+          });
+          continue;
+        }
+        if (
+          (!exactRunId || checkpoint.request.runId === exactRunId) &&
+          (!exactRequestId || checkpoint.request.id === exactRequestId)
+        ) {
+          eligible.push(checkpoint);
+        }
       }
     }
     eligible.sort((left, right) =>
@@ -1851,6 +2048,12 @@ export class CodeExtensionRuntimeV2 {
     const checkpoint = eligible[0];
     const receipt = checkpoint?.verifiedCommitReceipt;
     if (!checkpoint || !receipt) return null;
+    if (personCommits.some((person) =>
+      person.workspaceId === receipt.workspaceId &&
+      person.committedAt.localeCompare(receipt.committedAt) > 0
+    )) {
+      return null;
+    }
     const manifest = await this.workspaceManager.loadManifest(receipt.workspaceId);
     const binding = manifest.repositoryBinding;
     if (
@@ -2294,6 +2497,152 @@ export class CodeExtensionRuntimeV2 {
       }),
       now: this.now,
     });
+  }
+
+  /**
+   * The person's *Validate and commit* (CODE-15): their changes in a
+   * repository workspace, validated in the sandbox (fast, targeted, then a
+   * fresh full validation) and committed with their message and as them,
+   * through the same verified path and proof a pass's commit takes. The
+   * workspace's base then moves to the new commit. A person's commit is never
+   * a publication handoff. Host-only: no model or tool reaches it.
+   */
+  async commitPersonWorkspaceChanges(
+    input: PersonWorkspaceCommitInputV1,
+  ): Promise<PersonWorkspaceCommitResultV1> {
+    this.assertInitialized();
+    const runtime = this.personWorkspaceCommits();
+    if (!runtime) return personCommitUnavailable(input.workspaceId);
+    return runtime.commit(input);
+  }
+
+  /**
+   * Revert a verified commit, a pass's or a person's, as a new verified
+   * commit by the person (DEBT-125). Only the workspace's newest commit, on a
+   * workspace with nothing else changed. Host-only.
+   */
+  async revertVerifiedWorkspaceCommit(
+    input: PersonWorkspaceRevertInputV1,
+  ): Promise<PersonWorkspaceCommitResultV1> {
+    this.assertInitialized();
+    const runtime = this.personWorkspaceCommits();
+    if (!runtime) return personCommitUnavailable(input.workspaceId);
+    return runtime.revert(input);
+  }
+
+  private personWorkspaceCommits(): PersonWorkspaceCommitRuntimeV1 | null {
+    const registry = this.validationReceiptRegistry;
+    const git = this.repairGit;
+    if (!registry || !git) return null;
+    return new PersonWorkspaceCommitRuntimeV1({
+      workspaceManager: this.workspaceManager,
+      getRepositoryProfile: (profileKey) => this.getRepositoryProfile(profileKey),
+      checkpointPersistence: this.checkpointPersistence(),
+      validate: (validation) => this.runPersonValidation(validation, registry),
+      sandboxReady: async (signal) => {
+        const status = await this.probeConfiguredSandboxProviders(signal);
+        return status.executionAvailable
+          ? { ready: true }
+          : {
+              ready: false,
+              message: status.blocker?.message ??
+                "No sandbox passed its boundary check, so these changes cannot be validated.",
+            };
+      },
+      git,
+      disabledHooksPath: path.join(
+        this.workspaceManager.applicationDataRoot,
+        "repair-disabled-hooks",
+      ),
+      now: this.now,
+    });
+  }
+
+  /**
+   * One validation of a person's commit: the trusted profile's own command for
+   * the phase, prepared over the workspace as it stands, run in the verified
+   * sandbox and captured as a receipt bound to the person's request.
+   */
+  private async runPersonValidation(
+    input: {
+      operationId: string;
+      request: NormalizedCodeRepairRequestV1;
+      kind: ValidationKindV1;
+      signal?: AbortSignal;
+    },
+    registry: DurableValidationReceiptRegistryV1,
+  ): Promise<CodeValidationReceiptV1> {
+    const sandbox = this.requireSandboxManager();
+    const preparation = await this.resolveSandboxPreparationInput(
+      `validation_${input.kind}`,
+      input.request.worktree.id,
+    );
+    if ((preparation.expectedArtifacts?.length ?? 0) > 0) {
+      // A run imports what its validation generates; a person's commit
+      // commits their own changes and nothing the sandbox wrote.
+      throw new CodeSandboxContributionErrorV2(
+        "person_commit_generated_outputs",
+        "This validation writes generated files, which a person's commit does not take in.",
+      );
+    }
+    const prepared = await sandbox.prepareExecution({
+      ...preparation,
+      purpose: `validation_${input.kind}`,
+      repairRequestId: input.request.id,
+      environment: { CI: "1", NO_COLOR: "1", TZ: "UTC" },
+      ttlMs: 10 * 60_000,
+    });
+    if (prepared.status === "blocked") {
+      throw new CodeSandboxContributionErrorV2(prepared.blocker.code, prepared.blocker.message);
+    }
+    const execution = await this.resolveSandboxExecutionInput(prepared.action);
+    const result = await sandbox.executePrepared(prepared.action, {
+      authorization: {
+        preparedActionId: prepared.action.id,
+        payloadFingerprint: prepared.action.payloadFingerprint,
+        grantId: `person-commit:${input.request.id}`,
+      },
+      stagedFiles: execution.stagedFiles,
+      artifactImporter: execution.artifactImporter,
+      signal: input.signal,
+    });
+    if (result.status === "blocked") {
+      throw new CodeSandboxContributionErrorV2(result.blocker.code, result.blocker.message);
+    }
+    const manifest = await this.workspaceManager.loadManifest(prepared.action.workspaceId);
+    const captured = await registry.capture({
+      scope: {
+        runId: input.request.runId,
+        workspaceId: prepared.action.workspaceId,
+        requestId: input.request.id,
+      },
+      action: prepared.action,
+      receipt: result.receipt,
+      diagnostics: result.diagnostics,
+      validatedWorkspaceManifestFingerprint: manifest.hashes.indexFingerprint,
+      workspaceChangedPaths: manifest.budget.changedPaths,
+    });
+    // The coordinator binds each receipt to its own operation, as the
+    // background runtime does with the same captured evidence.
+    const evidence = {
+      operationId: input.operationId,
+      kind: captured.kind,
+      sandboxId: captured.sandboxId,
+      freshSandbox: true,
+      startedAt: captured.startedAt,
+      completedAt: captured.completedAt,
+      checks: captured.checks,
+      status: captured.status,
+      failureFingerprint: captured.failureFingerprint,
+      binding: captured.binding,
+    };
+    return {
+      version: 1,
+      kindName: "code_validation",
+      id: input.operationId,
+      ...evidence,
+      fingerprint: await sha256Fingerprint(evidence),
+    };
   }
 
   /**
@@ -3005,6 +3354,15 @@ export class ProfileAwareRepositoryProvisionerV2
   }
 }
 
+function personCommitUnavailable(workspaceId: string): PersonWorkspaceCommitResultV1 {
+  return {
+    status: "refused",
+    workspaceId: String(workspaceId ?? ""),
+    code: "commit_unavailable",
+    message: "The verified commit path is not connected in this session, so nothing can be committed.",
+  };
+}
+
 export function createInitialCodeRuntimeStateV2(now: string): CodeRuntimeStateV2 {
   return parseCodeRuntimeStateV2({
     version: 2,
@@ -3212,9 +3570,11 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
   ) throw new Error("Sandbox capability status is invalid.");
   const providerKinds = ["docker", "podman", "wsl2", "bubblewrap"] as const;
   const providers = record.providers.map((value, index) => {
+    const hasProgress = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "progressProtocol");
+    const hasStaging = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "stagingProfiles");
     const provider = exactRecord(
       value,
-      ["provider", "state", "diagnostic", "probeFingerprint", "checkedAt"],
+      ["provider", "state", "diagnostic", "probeFingerprint", "checkedAt", ...(hasProgress ? ["progressProtocol"] : []), ...(hasStaging ? ["stagingProfiles"] : [])],
       `sandbox provider status ${index + 1}`,
     );
     if (
@@ -3222,7 +3582,9 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
       !["unprobed", "verified", "unavailable", "rejected", "no_verdict"].includes(String(provider.state)) ||
       typeof provider.diagnostic !== "string" ||
       provider.diagnostic.length < 1 ||
-      provider.diagnostic.length > 2_000
+      provider.diagnostic.length > 2_000 ||
+      (hasProgress && (provider.progressProtocol !== 1 || provider.state !== "verified")) ||
+      (hasStaging && (provider.state !== "verified" || !Array.isArray(provider.stagingProfiles) || provider.stagingProfiles.length !== 1 || provider.stagingProfiles[0] !== "source-1000-v1"))
     ) throw new Error("Sandbox provider status is invalid.");
     const checkedAt = provider.checkedAt === null
       ? null
@@ -3239,6 +3601,8 @@ function parseSandboxCapabilityStatus(value: unknown): SandboxCapabilityStatusV2
       diagnostic: provider.diagnostic,
       probeFingerprint,
       checkedAt,
+      ...(hasProgress ? { progressProtocol: 1 as const } : {}),
+      ...(hasStaging ? { stagingProfiles: ["source-1000-v1" as const] } : {}),
     };
   });
   if (new Set(providers.map((provider) => provider.provider)).size !== providers.length) {
@@ -3286,6 +3650,7 @@ function parsePersistedSandboxBlocker(value: unknown): NonNullable<SandboxCapabi
     "sandbox_runtime_digest_required",
     "sandbox_staging_mismatch",
     "sandbox_staging_transport_unsupported",
+    "sandbox_staging_profile_unsupported",
     "sandbox_execution_failed",
     "sandbox_artifact_readback_failed",
   ] as const;
@@ -3329,6 +3694,12 @@ async function inventoryRepository(repositoryRoot: string): Promise<RepositoryIn
       }
       const relative = relativeFolder ? `${relativeFolder}/${entry.name}` : entry.name;
       const absolute = path.join(folder, entry.name);
+      // A checkout's `.git` directory is skipped below; a worktree's `.git` is
+      // a file naming the repository's Git directory. Either way it is Git's,
+      // never repository content, and no workspace path can name it, so the
+      // re-detection after a protected-control change in a worktree-backed
+      // workspace used to fail on it after the change had landed.
+      if (entry.name.toLowerCase() === ".git") continue;
       const stat = await fs.lstat(absolute);
       if (stat.isSymbolicLink()) continue;
       if (stat.isDirectory()) {
@@ -3531,10 +3902,16 @@ function pathAtOrBelow(root: string, candidate: string): boolean {
   return root === "." || candidate === root || candidate.startsWith(`${root}/`);
 }
 
+/** A protected control inside Git's own folder, which a workspace never holds. */
+function isGitInternalControlPathV1(controlPath: string): boolean {
+  return controlPath.split("/").some((part) => part.toLowerCase() === ".git");
+}
+
 async function collectSandboxStagingManifest(
   manager: WorkspaceManagerV2,
   workspaceId: string,
   roots: readonly string[],
+  stagingProfile?: RepositoryStagingProfileV1,
 ): Promise<Array<{ path: string; sha256: string; bytes: number }>> {
   const files = new Map<string, WorkspaceEntryMetadataV2>();
   const visitedDirectories = new Set<string>();
@@ -3569,10 +3946,10 @@ async function collectSandboxStagingManifest(
         `Sandbox staging file exceeds 2 MB: ${entry.path}.`,
       );
     }
-    if (files.size >= MAX_SANDBOX_STAGING_FILES) {
+    if (files.size >= repositoryStagingFileLimitV1(stagingProfile)) {
       throw new CodeSandboxContributionErrorV2(
         "sandbox_staging_too_large",
-        "Sandbox staging scope exceeds 100 files.",
+        `Sandbox staging scope exceeds ${repositoryStagingFileLimitV1(stagingProfile)} files.`,
       );
     }
     totalBytes += entry.bytes;
@@ -3682,54 +4059,6 @@ async function collectSandboxStagingManifest(
 
 function compareCanonicalText(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
-}
-
-function selectForegroundValidationCommand(
-  profile: RepositoryProfileV2,
-  projectId: string,
-  purpose: PreparedSandboxActionV2["purpose"],
-): RepositoryValidationCommandV2 {
-  const catalog = profile.validationCatalog
-    .filter((command) => command.projectId === projectId)
-    .sort((left, right) => left.id.localeCompare(right.id));
-  const exactPhase = purpose === "validation_fast"
-    ? "fast"
-    : purpose === "validation_targeted" || purpose === "code_block"
-      ? "targeted"
-      : purpose === "validation_full"
-        ? "full"
-        : "bootstrap";
-  const exact = catalog.filter((command) => command.phase === exactPhase);
-  const legacyFull = catalog.filter((command) => command.phase === "full");
-  const isLegacyV1Catalog = legacyFull.length > 0 && legacyFull.every((command) =>
-    /^root-full-\d+$/u.test(command.id),
-  );
-  if (
-    isLegacyV1Catalog &&
-    (purpose === "validation_fast" || purpose === "validation_targeted" || purpose === "validation_full")
-  ) {
-    return purpose === "validation_full"
-      ? legacyFull.at(-1)!
-      : legacyFull[0];
-  }
-  if (exact.length === 1) return exact[0];
-  if (exact.length > 1) {
-    throw new CodeSandboxContributionErrorV2(
-      "sandbox_validation_command_ambiguous",
-      `The trusted repository profile has multiple ${exactPhase} commands for project ${projectId}.`,
-    );
-  }
-  if (
-    legacyFull.length === 1 &&
-    (purpose === "validation_fast" || purpose === "validation_targeted" || purpose === "validation_full")
-  ) {
-    return legacyFull[0];
-  }
-
-  throw new CodeSandboxContributionErrorV2(
-    "sandbox_validation_command_unavailable",
-    `The trusted repository profile has no unambiguous ${exactPhase} command for project ${projectId}.`,
-  );
 }
 
 /**

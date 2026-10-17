@@ -29,6 +29,7 @@ import {
   authoritativeRefusalFrontierToolNamesV1,
   getMissionGraphNodeFrontierToolNames,
   getSafeMissionCompositeLifecycleSpecV1,
+  getSafeMissionOpenWorkSpecV1,
   getSafeMissionCompositeLifecycleStateV1,
   missionGraphOnlyFinalSynthesisRemainsV1,
   missionGraphPlannedSequenceAfterFrontierV1,
@@ -82,11 +83,14 @@ function isWriteToolName(toolName: string): boolean {
 
 const CODE_WORKFLOW_OBSERVATION_TOOL_NAMES = new Set<string>([
   "code_sandbox_status",
+  // A command writes nothing back, so it is never a required workflow step.
+  "code_sandbox_run",
   "code_workspace_status",
   "code_workspace_read",
   "code_workspace_stat",
   "code_workspace_list",
   "code_workspace_search",
+  "code_workspace_inspect",
   "code_repair_status",
   "read_workspace_file",
   "list_workspace_files",
@@ -108,11 +112,23 @@ const CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES = new Set<string>([
   "code_workspace_write_expected",
 ]);
 
+/**
+ * The edits a planned node can name: the adaptive single-file writes, and the
+ * multi-file patch a guided plan names for an edit across files (CODE-7). The
+ * patch is not an adaptive companion: it is offered only where a plan or the
+ * open node names it, and it pins the menu as a planned write does.
+ */
+const CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES = new Set<string>([
+  ...CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES,
+  "code_workspace_apply_patch",
+]);
+
 const VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES = new Set<string>([
   "code_workspace_read",
   "code_workspace_stat",
   "code_workspace_list",
   "code_workspace_search",
+  "code_workspace_inspect",
 ]);
 
 const VALIDATION_RECOVERY_MUTATION_TOOL_NAMES = new Set<string>([
@@ -168,6 +184,106 @@ export function isAdaptiveCodeWorkspaceMutationToolNameV1(
   toolName: string,
 ): boolean {
   return CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName);
+}
+
+/** At most this many unplanned investigation reads in one graph. */
+export const MAX_ADAPTIVE_CODE_INVESTIGATION_READS_V1 = 4;
+/**
+ * Tool calls kept back beyond one per unfinished node, so a pass that
+ * investigates still has the calls its edit, a retry and its validators need.
+ */
+const ADAPTIVE_CODE_INVESTIGATION_TOOL_CALL_RESERVE_V1 = 2;
+const DYNAMIC_READ_NODE_ID = /^(?:optional-)?retry-\d+-/u;
+
+/**
+ * The read-only workspace tools an exact coding plan admits beyond its plan:
+ * the names the offered menu adds AND the names `beginMissionGraphTool` lets
+ * `beginToolExecution` materialize as bounded dynamic reads. One answer for
+ * both seats, as with `missionGraphRunAdmitsDynamicReadContinuationV1`.
+ *
+ * Why (CIP-3): an exact plan names its reads up front — list, read, inspect —
+ * then offers the edit alone. A pass whose inspection points at another file
+ * (the declaration it must follow lives elsewhere) could only patch blind. The
+ * host's validation recovery already admits one diagnostic read; this admits a
+ * few while the planned edit is next and nothing else is in flight.
+ *
+ * Bounded every way the graph already bounds a read:
+ *   - only once the workspace exists and the planned edit is the ready node
+ *     (every planned read before it has completed, since the edit depends on
+ *     them);
+ *   - never inside a repair cycle or a validation-recovery window, which own
+ *     their diagnostic reads;
+ *   - each read is a dynamic node that the continuation reserve pays for and
+ *     that the edit never waits on, and the envelope refusing one ends them;
+ *   - at most MAX_ADAPTIVE_CODE_INVESTIGATION_READS_V1 per graph, counting
+ *     every dynamic read already made;
+ *   - only while the run's own tool-call headroom covers one call per
+ *     unfinished node plus a reserve, so investigating cannot cost the edit
+ *     or its validation.
+ * Returns [] whenever any of these fails; a non-exact plan already admits
+ * dynamic reads and needs nothing from here.
+ */
+export function missionGraphAdaptiveCodeInvestigationToolNamesV1(input: {
+  graph: MissionGraphV3 | null | undefined;
+  /** AgentRunner's `missionGraphUsesExactPlannedFrontier`. */
+  usesExactPlannedFrontier: boolean;
+  /** AgentRunner's `missionGraphCapacityExhausted`. */
+  envelopeExhausted?: boolean;
+  /** `maxToolCalls - observedToolCallCount` for this run. */
+  toolCallsRemaining: number;
+}): string[] {
+  const graph = input.graph;
+  if (
+    !graph ||
+    input.usesExactPlannedFrontier !== true ||
+    input.envelopeExhausted === true ||
+    !graphHasCompletedCodeWorkspaceCreation(graph) ||
+    graphHasActiveCodeRepairCycleFrontier(graph) ||
+    getActiveValidationRecoveryFrontierV1(graph) !== null
+  ) {
+    return [];
+  }
+  const nodes = Object.values(graph.nodes);
+  if (
+    nodes.some(
+      (node) =>
+        node.status === "running" ||
+        node.status === "waiting_approval" ||
+        node.status === "waiting_obsidian" ||
+        node.status === "verifying",
+    )
+  ) {
+    return [];
+  }
+  const plannedEditNext = nodes.some(
+    (node) =>
+      node.status === "ready" &&
+      getMissionGraphNodeFrontierToolNames(node).some((toolName) =>
+        CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES.has(toolName),
+      ),
+  );
+  if (!plannedEditNext) return [];
+  const readsMade = nodes.filter(
+    (node) =>
+      DYNAMIC_READ_NODE_ID.test(node.id) &&
+      node.allowedTools.some((toolName) =>
+        VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES.has(toolName),
+      ),
+  ).length;
+  if (readsMade >= MAX_ADAPTIVE_CODE_INVESTIGATION_READS_V1) return [];
+  const unfinished = nodes.filter(
+    (node) => node.status !== "complete" && node.status !== "cancelled",
+  ).length;
+  if (
+    !Number.isFinite(input.toolCallsRemaining) ||
+    input.toolCallsRemaining <
+      unfinished + ADAPTIVE_CODE_INVESTIGATION_TOOL_CALL_RESERVE_V1 + 1
+  ) {
+    return [];
+  }
+  return [...VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES].filter(
+    (toolName) => graph.capabilityEnvelope.tools[toolName]?.effect === "read",
+  );
 }
 
 /**
@@ -286,7 +402,7 @@ export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
     const names = getMissionGraphNodeFrontierToolNames(
       node as MissionGraphV3["nodes"][string],
     ).filter((toolName) =>
-      CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName),
+      CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES.has(toolName),
     );
     if (names.length === 0) continue;
     // The real graph nests attempts under retries; UI/E2E projections flatten
@@ -309,7 +425,7 @@ export function narrowAdaptiveCodeMutationsToPlannedWritesV1(
   }
   return tools.filter(
     (tool) =>
-      !CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(tool.function.name) ||
+      !CODE_WORKFLOW_PLANNED_EDIT_TOOL_NAMES.has(tool.function.name) ||
       pinned.has(tool.function.name),
   );
 }
@@ -928,6 +1044,9 @@ function graphHasIncompleteCodeExecutionWork(
 function getMissionGraphNodePendingWriteToolNames(
   node: MissionGraphV3["nodes"][string],
 ): string[] {
+  // An open node's menu is offered, never owed: the graph holds its own
+  // completion, and the writes the mission owes are its closing nodes'.
+  if (getSafeMissionOpenWorkSpecV1(node)) return [];
   const lifecycle = getSafeMissionCompositeLifecycleSpecV1(node);
   if (!lifecycle) {
     return node.allowedTools.filter(isWriteToolName);
@@ -950,6 +1069,12 @@ export function constrainToolsToMissionGraphFrontier(
      * advertises tools every one of which is refused.
      */
     allowDynamicReadContinuation?: boolean;
+    /**
+     * Exactly `missionGraphAdaptiveCodeInvestigationToolNamesV1`'s answer, the
+     * same list `beginMissionGraphTool` admits: read-only workspace tools an
+     * exact coding plan offers beside its ready edit.
+     */
+    adaptiveCodeInvestigationToolNames?: readonly string[];
     route?: string;
     maxEffectClassWithoutGrant?: AutonomyEffectClass;
     /**
@@ -1189,6 +1314,11 @@ export function constrainToolsToMissionGraphFrontier(
       if (grant.effect === "read") {
         frontierNames.add(toolName);
       }
+    }
+  }
+  if (!suppressOptionalFrontier) {
+    for (const toolName of options.adaptiveCodeInvestigationToolNames ?? []) {
+      frontierNames.add(toolName);
     }
   }
   const frontierConstrained = tools.filter((tool) =>
@@ -1534,8 +1664,25 @@ export function buildMissionGraphFrontierTurnContext(
       options.graph ?? null,
     ),
   });
+  // CODE-18: the open step of a free coding pass is a menu, not a sequence.
+  const openWorkNode = options.graph
+    ? Object.values(options.graph.nodes).find(
+        (node) =>
+          (node.status === "ready" || node.status === "running") &&
+          getSafeMissionOpenWorkSpecV1(node) !== null,
+      )
+    : undefined;
+  const openWorkBoundary = openWorkNode
+    ? [
+        "This is the open coding step of a free pass: call the listed code tools in any order and as often as the work needs, within the step's budget.",
+        "Keep your to-do list current with code_plan_update (the whole list each time).",
+        "When code_validate_targeted has passed on the current files, with no edit after it, reply without a tool call to say the work is done; the closing steps (fast validation, the repair checkpoint, targeted and full validation, the verified commit) then run.",
+        "A red validation is yours to read and correct. The same failure surviving two corrections stops the pass. Trashing a file still asks the person.",
+      ]
+    : [];
   const toolContractLines = [
     ...(plannedSequenceLine ? [plannedSequenceLine] : []),
+    ...openWorkBoundary,
     ...codeCapabilityBoundary,
     ...acceptedResearchBoundary,
     ...researchHierarchyBoundary,

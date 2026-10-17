@@ -1,7 +1,16 @@
 export const WORKSPACE_MANIFEST_VERSION_V2 = 2 as const;
 export const WORKSPACE_MAX_TEXT_BYTES_V2 = 2 * 1024 * 1024;
+/** A run's change budget by default: files it may change, bytes it may add. */
 export const WORKSPACE_MAX_CHANGED_FILES_V2 = 100;
 export const WORKSPACE_MAX_CHANGED_BYTES_V2 = 10 * 1024 * 1024;
+/** The most a host may set a workspace's per-run change budget to. */
+export const WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2 = 10_000;
+export const WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2 = 1024 * 1024 * 1024;
+/**
+ * The paths a workspace keeps as changed since its base, which a verified
+ * commit stages. Every run's changes land here until a commit resets it.
+ */
+export const WORKSPACE_MAX_TRACKED_CHANGED_PATHS_V2 = 50_000;
 export const WORKSPACE_MAX_SEARCH_RESULTS_V2 = 200;
 
 export type WorkspaceKindV2 = "scratch" | "repository";
@@ -46,19 +55,56 @@ export interface WorkspaceLeaseV2 {
   expiresAt: string;
 }
 
-export interface WorkspaceBudgetV2 {
+/**
+ * What one run has changed, against the workspace's per-run budget (CODE2-14).
+ * The run is the lease's owner; another owner's first write starts a fresh
+ * count. A write counts its path, and the bytes it adds: a new file its size,
+ * an edit only what it grows the file by; a move, a trash and a restore add
+ * nothing and count only the paths they name.
+ */
+export interface WorkspaceRunBudgetV2 {
+  runId: string;
   changedPaths: string[];
+  addedBytes: number;
+}
+
+export interface WorkspaceBudgetV2 {
+  /** Every path changed since the base, which a verified commit stages. */
+  changedPaths: string[];
+  /** Bytes added since the base. */
   changedBytes: number;
-  maxChangedFiles: typeof WORKSPACE_MAX_CHANGED_FILES_V2;
-  maxChangedBytes: typeof WORKSPACE_MAX_CHANGED_BYTES_V2;
+  /** The per-run limits: files a run may change, bytes it may add. */
+  maxChangedFiles: number;
+  maxChangedBytes: number;
+  /** The run now writing, absent before any run's first counted write. */
+  run?: WorkspaceRunBudgetV2;
 }
 
 export interface WorkspaceManifestV2 {
   version: typeof WORKSPACE_MANIFEST_VERSION_V2;
   workspaceId: string;
   kind: WorkspaceKindV2;
+  /**
+   * The durable owner. A run's id, or a person's (`person:<surface>`, see
+   * {@link isPersonWorkspaceOwnerV2}): a person's workspace is never re-owned
+   * by a run.
+   */
   ownerRunId: string;
+  /**
+   * The run working in a person's workspace without owning it, set by
+   * `WorkspaceManagerV2.attachRunToPersonWorkspace`. Absent when none, and
+   * only ever present when the owner is a person.
+   */
+  attachedRunId?: string;
   repositoryBinding: WorkspaceRepositoryBindingV2 | null;
+  /**
+   * The root is the person's own folder, registered by the host alone
+   * (`registerPersonFolderWorkspace`, CODE2-5), not a folder in the
+   * workspace's container. Its manifest, lease, receipts, trash and the runs'
+   * kept originals stay in the container; nothing under the root is ever
+   * removed by expiry or close. Absent for every other workspace.
+   */
+  personFolder?: true;
   canonicalRoot: string;
   baseSha: string | null;
   sandboxPolicy: WorkspaceSandboxPolicyV2;
@@ -75,6 +121,28 @@ export interface WorkspaceManifestV2 {
   budget: WorkspaceBudgetV2;
 }
 
+/** An owner beginning with this is a person, never a run (`person:code-page`). */
+export const PERSON_WORKSPACE_OWNER_PREFIX_V2 = "person:" as const;
+
+export function isPersonWorkspaceOwnerV2(ownerRunId: string): boolean {
+  return typeof ownerRunId === "string" &&
+    ownerRunId.startsWith(PERSON_WORKSPACE_OWNER_PREFIX_V2) &&
+    ownerRunId.length > PERSON_WORKSPACE_OWNER_PREFIX_V2.length;
+}
+
+/**
+ * Whether a run may work in the workspace: it owns it, or it is the run
+ * attached to a person's workspace. Proof of a verified commit still asks for
+ * the owner alone.
+ */
+export function workspaceRunMayWorkV2(
+  manifest: Pick<WorkspaceManifestV2, "ownerRunId" | "attachedRunId">,
+  runId: string,
+): boolean {
+  return manifest.ownerRunId === runId ||
+    (manifest.attachedRunId !== undefined && manifest.attachedRunId === runId);
+}
+
 export class WorkspaceManifestErrorV2 extends Error {
   constructor(message: string) {
     super(message);
@@ -84,10 +152,14 @@ export class WorkspaceManifestErrorV2 extends Error {
 
 export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
   const source = record(value, "workspace manifest");
+  const attached = source.attachedRunId !== undefined;
+  const personFolder = source.personFolder !== undefined;
   exact(source, [
     "version", "workspaceId", "kind", "ownerRunId", "repositoryBinding",
     "canonicalRoot", "baseSha", "sandboxPolicy", "hashes", "validationHistory",
     "lease", "status", "expiresAt", "createdAt", "updatedAt", "budget",
+    ...(attached ? ["attachedRunId"] : []),
+    ...(personFolder ? ["personFolder"] : []),
   ], "workspace manifest");
   if (source.version !== WORKSPACE_MANIFEST_VERSION_V2) {
     throw new WorkspaceManifestErrorV2("Unsupported workspace manifest version.");
@@ -95,6 +167,17 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
   const workspaceId = identifier(source.workspaceId, "workspace id");
   const kind = enumValue(source.kind, ["scratch", "repository"] as const, "workspace kind");
   const ownerRunId = boundedString(source.ownerRunId, "owner run id", 1, 256);
+  const attachedRunId = attached
+    ? boundedString(source.attachedRunId, "attached run id", 1, 256)
+    : undefined;
+  if (
+    attachedRunId !== undefined &&
+    (!isPersonWorkspaceOwnerV2(ownerRunId) ||
+      attachedRunId.startsWith(PERSON_WORKSPACE_OWNER_PREFIX_V2) ||
+      attachedRunId === ownerRunId)
+  ) {
+    throw new WorkspaceManifestErrorV2("Only a person's workspace can have a run attached, and only a run.");
+  }
   const canonicalRoot = absolutePath(source.canonicalRoot, "canonical root");
   const repositoryBinding = source.repositoryBinding === null
     ? null
@@ -104,6 +187,9 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     : sha(source.baseSha, "base SHA", /^[a-f0-9]{40,64}$/iu);
   if (kind === "scratch" && (repositoryBinding !== null || baseSha !== null)) {
     throw new WorkspaceManifestErrorV2("Scratch workspaces cannot carry repository binding state.");
+  }
+  if (personFolder && (source.personFolder !== true || kind !== "scratch" || !isPersonWorkspaceOwnerV2(ownerRunId))) {
+    throw new WorkspaceManifestErrorV2("Only a person's own scratch workspace can be rooted in their folder.");
   }
   if (kind === "repository") {
     if (!repositoryBinding || !baseSha || repositoryBinding.worktreeRoot !== canonicalRoot) {
@@ -143,24 +229,34 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     throw new WorkspaceManifestErrorV2("Workspace lease and status are inconsistent.");
   }
   const budgetSource = record(source.budget, "workspace budget");
-  exact(budgetSource, ["changedPaths", "changedBytes", "maxChangedFiles", "maxChangedBytes"], "workspace budget");
-  const changedPaths = array(budgetSource.changedPaths, "changed paths", WORKSPACE_MAX_CHANGED_FILES_V2)
-    .map((path, index) => relativePath(path, `changed path ${index + 1}`));
-  if (new Set(changedPaths).size !== changedPaths.length) {
-    throw new WorkspaceManifestErrorV2("Workspace changed paths must be unique.");
-  }
-  if (
-    budgetSource.maxChangedFiles !== WORKSPACE_MAX_CHANGED_FILES_V2 ||
-    budgetSource.maxChangedBytes !== WORKSPACE_MAX_CHANGED_BYTES_V2
-  ) {
-    throw new WorkspaceManifestErrorV2("Workspace budget limits do not match the v2 contract.");
-  }
+  const hasRunBudget = budgetSource.run !== undefined;
+  exact(
+    budgetSource,
+    ["changedPaths", "changedBytes", "maxChangedFiles", "maxChangedBytes", ...(hasRunBudget ? ["run"] : [])],
+    "workspace budget",
+  );
+  const changedPaths = uniquePaths(budgetSource.changedPaths, "changed paths", WORKSPACE_MAX_TRACKED_CHANGED_PATHS_V2);
+  const maxChangedFiles = integer(
+    budgetSource.maxChangedFiles,
+    "workspace budget files",
+    1,
+    WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2,
+  );
+  const maxChangedBytes = integer(
+    budgetSource.maxChangedBytes,
+    "workspace budget bytes",
+    1,
+    WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2,
+  );
+  const runBudget = hasRunBudget ? parseRunBudget(budgetSource.run) : undefined;
   return {
     version: WORKSPACE_MANIFEST_VERSION_V2,
     workspaceId,
     kind,
     ownerRunId,
+    ...(attachedRunId === undefined ? {} : { attachedRunId }),
     repositoryBinding,
+    ...(personFolder ? { personFolder: true as const } : {}),
     canonicalRoot,
     baseSha,
     sandboxPolicy,
@@ -176,9 +272,10 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     updatedAt: iso(source.updatedAt, "workspace updatedAt"),
     budget: {
       changedPaths,
-      changedBytes: integer(source.budget && budgetSource.changedBytes, "changed bytes", 0, WORKSPACE_MAX_CHANGED_BYTES_V2),
-      maxChangedFiles: WORKSPACE_MAX_CHANGED_FILES_V2,
-      maxChangedBytes: WORKSPACE_MAX_CHANGED_BYTES_V2,
+      changedBytes: integer(budgetSource.changedBytes, "changed bytes", 0, Number.MAX_SAFE_INTEGER),
+      maxChangedFiles,
+      maxChangedBytes,
+      ...(runBudget === undefined ? {} : { run: runBudget }),
     },
   };
 }
@@ -271,6 +368,25 @@ function parseSandboxPolicy(value: unknown): WorkspaceSandboxPolicyV2 {
     throw new WorkspaceManifestErrorV2("Workspace sandbox network must default to disabled.");
   }
   return { mode, provider, boundaryFingerprint, network: "disabled" };
+}
+
+function parseRunBudget(value: unknown): WorkspaceRunBudgetV2 {
+  const source = record(value, "workspace run budget");
+  exact(source, ["runId", "changedPaths", "addedBytes"], "workspace run budget");
+  return {
+    runId: boundedString(source.runId, "workspace run budget run id", 1, 256),
+    changedPaths: uniquePaths(source.changedPaths, "run changed paths", WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2),
+    addedBytes: integer(source.addedBytes, "run added bytes", 0, WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2),
+  };
+}
+
+function uniquePaths(value: unknown, label: string, max: number): string[] {
+  const paths = array(value, label, max)
+    .map((path, index) => relativePath(path, `${label} ${index + 1}`));
+  if (new Set(paths).size !== paths.length) {
+    throw new WorkspaceManifestErrorV2(`Workspace ${label} must be unique.`);
+  }
+  return paths;
 }
 
 function parseValidation(value: unknown, index: number): WorkspaceValidationRecordV2 {

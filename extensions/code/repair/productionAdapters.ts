@@ -17,7 +17,11 @@ import {
   type NormalizedCodeRepairRequestV1,
   type VerifiedCommitGatewayV1,
 } from "./types";
-import { parseCodeRepairCheckpointV1 } from "./codeRepairCoordinator";
+import {
+  expectedCommitIdentityV1,
+  parseCodeRepairCheckpointV1,
+  sameCommitIdentityV1,
+} from "./codeRepairCoordinator";
 
 const CHECKPOINT_NAMESPACE_VERSION = 1 as const;
 const MAX_CHECKPOINTS = 512;
@@ -198,6 +202,11 @@ export interface FixedArgvGitRunnerV1 {
     cwd: string;
     args: readonly string[];
     signal?: AbortSignal;
+    /**
+     * Author and committer for a `git commit` made for a person. Absent, a
+     * commit is the host-pinned Agentic Researcher identity.
+     */
+    commitIdentity?: AgentGitCommitIdentityV1;
   }): Promise<FixedArgvGitResultV1>;
 }
 
@@ -406,14 +415,14 @@ export class CommitOnlyVerifiedCommitGatewayV1
       );
     }
 
-    await this.gitOk(input.request.worktree.path, [
+    await this.git(input.request.worktree.path, [
       "commit",
       "--no-verify",
       "--no-gpg-sign",
       "-m",
       boundedArg(input.request.commitMessage, "commit message", 4_000),
       "--",
-    ]);
+    ], [0], input.request.commitIdentity);
     const commitSha = assertGitSha(
       await this.gitText(input.request.worktree.path, ["rev-parse", "HEAD"]),
       "created commit SHA",
@@ -553,10 +562,12 @@ export class CommitOnlyVerifiedCommitGatewayV1
         commitSha,
       ]),
     );
-    if (!isAgentGitCommitIdentityV1(identity)) {
+    if (!sameCommitIdentityV1(identity, expectedCommitIdentityV1(input.request))) {
       throw new ProductionAdapterErrorV1(
         "commit_identity_mismatch",
-        "Commit author or committer is not the host-pinned Agentic Researcher identity.",
+        isAgentGitCommitIdentityV1(expectedCommitIdentityV1(input.request))
+          ? "Commit author or committer is not the host-pinned Agentic Researcher identity."
+          : "Commit author or committer is not the person the commit was made for.",
       );
     }
     return {
@@ -819,6 +830,7 @@ export class CommitOnlyVerifiedCommitGatewayV1
     cwd: string,
     commandArgs: readonly string[],
     allowedExitCodes: readonly number[],
+    commitIdentity?: AgentGitCommitIdentityV1,
   ): Promise<FixedArgvGitResultV1> {
     for (const argument of commandArgs) boundedArg(argument, "Git argument", 16_384);
     const args = [
@@ -835,6 +847,7 @@ export class CommitOnlyVerifiedCommitGatewayV1
       cwd,
       args,
       signal: this.options.signal,
+      ...(commitIdentity ? { commitIdentity } : {}),
     });
     if (
       !result ||

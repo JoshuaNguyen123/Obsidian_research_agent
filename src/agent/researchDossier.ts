@@ -76,12 +76,19 @@ export interface EvidencePassageOptions {
   maxTotalChars?: number;
 }
 
+interface LocalHeadingV1 {
+  start: number;
+  end: number;
+}
+
 interface PassageCandidate {
   start: number;
   end: number;
   score: number;
   selection: EvidencePassage["selection"];
   matchedTerms: string[];
+  /** Private literal context anchor, never a public ownership verdict. */
+  heading?: LocalHeadingV1;
 }
 
 /**
@@ -126,8 +133,13 @@ export function extractEvidencePassages(
   }
 
   const terms = tokenizeQuery(query ?? "");
+  // A partial source window cannot reveal a preceding fence/ancestor. Also
+  // decline context relocation if query folding changes UTF16 offset lengths.
+  const headings = terms.length > 0 && baseOffset === 0 && content.toLocaleLowerCase().length === content.length
+    ? collectLocalHeadingsV1(content)
+    : [];
   const candidates = terms.length > 0
-    ? buildQueryCandidates(content, terms, maxPassageChars)
+    ? buildQueryCandidates(content, terms, maxPassageChars, headings)
     : [];
   const selected = selectNonOverlapping(candidates, maxPassages);
 
@@ -136,8 +148,9 @@ export function extractEvidencePassages(
       content.length,
       maxPassages,
       maxPassageChars,
-    );
+    ).map((candidate) => clipCoverageToLocalSectionV1(candidate, candidates.length > 0 ? headings : [], content.length));
     for (const candidate of coverage) {
+      if (candidate.end <= candidate.start) continue;
       if (selected.length >= maxPassages) {
         break;
       }
@@ -147,6 +160,7 @@ export function extractEvidencePassages(
     }
   }
 
+  retainOneLocalHeadingV1(selected, maxPassages, maxPassageChars);
   selected.sort((left, right) => left.start - right.start);
   const passages: EvidencePassage[] = [];
   let remainingChars = maxTotalChars;
@@ -284,10 +298,95 @@ function spreadOccurrencesV1(lowerContent: string, term: string): number[] {
  * repeats and keyword-dense lines outright. Coverage stays the primary key: a
  * window answering three of three terms should still precede one answering one.
  */
+/** Source-derived ATX anchors outside fenced code, not full Markdown parsing. */
+function collectLocalHeadingsV1(content: string): LocalHeadingV1[] {
+  const headings: LocalHeadingV1[] = [];
+  let cursor = 0;
+  let fence: { marker: string; length: number } | undefined;
+  while (cursor < content.length) {
+    const newline = content.indexOf("\n", cursor);
+    const next = newline < 0 ? content.length : newline + 1;
+    let end = newline < 0 ? content.length : newline;
+    if (end > cursor && content[end - 1] === "\r") end -= 1;
+    const line = content.slice(cursor, end);
+    const delimiter = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/u);
+    if (fence) {
+      if (delimiter && delimiter[1][0] === fence.marker &&
+          delimiter[1].length >= fence.length && /^[ \t]*$/u.test(delimiter[2])) {
+        fence = undefined;
+      }
+    } else if (delimiter &&
+        (delimiter[1][0] !== "`" || !delimiter[2].includes("`"))) {
+      fence = { marker: delimiter[1][0], length: delimiter[1].length };
+    } else if (/^ {0,3}#{1,6}(?:[ \t]+|$)/u.test(line)) {
+      headings.push({ start: cursor, end });
+    }
+    cursor = next;
+  }
+  return headings;
+}
+
+function localSectionAtV1(
+  headings: LocalHeadingV1[],
+  offset: number,
+  contentLength: number,
+): { start: number; end: number; heading?: LocalHeadingV1 } {
+  let low = 0;
+  let high = headings.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (headings[middle].start <= offset) low = middle + 1;
+    else high = middle;
+  }
+  const heading = low > 0 ? headings[low - 1] : undefined;
+  return {
+    start: heading?.start ?? 0,
+    end: headings[low]?.start ?? contentLength,
+    ...(heading ? { heading } : {}),
+  };
+}
+
+function clipCoverageToLocalSectionV1(
+  candidate: PassageCandidate,
+  headings: LocalHeadingV1[],
+  contentLength: number,
+): PassageCandidate {
+  const scope = localSectionAtV1(headings, candidate.start, contentLength);
+  return { ...candidate, end: Math.min(candidate.end, scope.end) };
+}
+
+/** At most one literal context slot replaces one lower-priority window. */
+function retainOneLocalHeadingV1(
+  selected: PassageCandidate[],
+  maxPassages: number,
+  maxPassageChars: number,
+): void {
+  if (maxPassages < 2) return;
+  const body = selected.find((candidate) => candidate.selection === "query_match" &&
+    candidate.heading && candidate.heading.end - candidate.heading.start <= maxPassageChars &&
+    !selected.some((other) => other.start <= candidate.heading!.start &&
+      other.end >= candidate.heading!.end));
+  if (!body?.heading) return;
+  const heading = body.heading;
+  const start = heading.start;
+  // Keep the real prefix including a complete heading; do not join text across
+  // a gap or label an ancestor that is absent from this bounded source.
+  const end = Math.min(body.start, start + Math.min(maxPassageChars,
+    Math.max(240, heading.end - heading.start)));
+  if (end < heading.end || end <= start) return;
+  if (selected.length >= maxPassages) {
+    let remove = selected.length - 1;
+    while (remove >= 0 && selected[remove] === body) remove -= 1;
+    if (remove < 0) return;
+    selected.splice(remove, 1);
+  }
+  selected.push({ start, end, score: 0, selection: "coverage", matchedTerms: [] });
+}
 function buildQueryCandidates(
   content: string,
   terms: string[],
   maxPassageChars: number,
+  headings: LocalHeadingV1[],
 ): PassageCandidate[] {
   const lowerContent = content.toLocaleLowerCase();
   const windows: Array<{
@@ -295,25 +394,31 @@ function buildQueryCandidates(
     end: number;
     matchedTerms: string[];
     stats: LexicalDocumentTermStatsV1;
+    heading?: LocalHeadingV1;
   }> = [];
   const seenStarts = new Set<number>();
 
   for (const term of terms) {
     for (const index of spreadOccurrencesV1(lowerContent, term)) {
       if (windows.length >= MAX_QUERY_WINDOWS) break;
-      const start = clampInteger(
+      const scope = localSectionAtV1(headings, index, content.length);
+      let start = clampInteger(
         index - Math.floor(maxPassageChars * 0.35),
-        0,
-        Math.max(0, content.length - Math.min(maxPassageChars, content.length)),
+        scope.start,
+        Math.max(scope.start, scope.end - Math.min(maxPassageChars, scope.end - scope.start)),
       );
+      if (scope.heading && index + term.length <= scope.start + maxPassageChars) {
+        start = scope.start;
+      }
       if (seenStarts.has(start)) continue;
-      const end = Math.min(content.length, start + maxPassageChars);
+      const end = Math.min(scope.end, start + maxPassageChars);
       const lowerWindow = lowerContent.slice(start, end);
       windows.push({
         start,
         end,
         matchedTerms: terms.filter((candidate) => lowerWindow.includes(candidate)),
         stats: buildLexicalDocumentTermStatsV1(lowerWindow, terms),
+        ...(scope.heading ? { heading: scope.heading } : {}),
       });
       seenStarts.add(start);
     }
@@ -337,6 +442,7 @@ function buildQueryCandidates(
       window.matchedTerms.length * 100 + bm25ContentScoreV1(window.stats, corpus),
     selection: "query_match",
     matchedTerms: window.matchedTerms,
+    ...(window.heading ? { heading: window.heading } : {}),
   }));
 
   return candidates.sort(

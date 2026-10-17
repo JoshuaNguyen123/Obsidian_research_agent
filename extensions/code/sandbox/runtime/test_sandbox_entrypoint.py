@@ -6,6 +6,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import subprocess
+import sys
+import time
+import os
+import signal
 
 ENTRYPOINT = Path(__file__).with_name("sandbox-entrypoint.py")
 SPEC = importlib.util.spec_from_file_location("agentic_sandbox_entrypoint", ENTRYPOINT)
@@ -33,6 +38,75 @@ def bundle(files: dict[str, bytes]) -> bytes:
 
 
 class SandboxRuntimeProtocolTests(unittest.TestCase):
+    def test_expanded_source_profile_preserves_default_and_exact_count(self) -> None:
+        files = {f"src/file-{index}.ts": b"x" for index in range(1000)}
+        data = bundle(files)
+        with self.assertRaises(runtime.ProtocolError):
+            runtime.decode_staging_bundle(data)
+        decoded = runtime.decode_staging_bundle(data, "source-1000-v1")
+        self.assertEqual(dict(decoded), files)
+        files["src/overflow.ts"] = b"x"
+        with self.assertRaises(runtime.ProtocolError):
+            runtime.decode_staging_bundle(bundle(files), "source-1000-v1")
+        with self.assertRaises(runtime.ProtocolError):
+            runtime.decode_staging_bundle(bundle({"src/a.ts": b"x"}), "unknown")
+
+    def test_expanded_source_profile_does_not_expand_byte_or_artifact_limits(self) -> None:
+        for files in ({"large.ts": b"x" * 2_000_001},
+                      {f"src/{index}.ts": b"x" * 2_000_000 for index in range(6)}):
+            with self.assertRaises(runtime.ProtocolError):
+                runtime.decode_staging_bundle(bundle(files), "source-1000-v1")
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for index in range(101):
+                (workspace / f"output-{index}.txt").write_text("x")
+            with self.assertRaises(runtime.ProtocolError):
+                runtime.collect_artifacts(workspace, {})
+
+    @unittest.skipUnless(sys.platform == "linux", "The sandbox runtime uses Linux pipes")
+    def test_output_arrives_before_exit_and_final_bytes_are_unchanged(self) -> None:
+        events = []
+        script = "import time,sys; print('early',flush=True); time.sleep(.4); print('late',flush=True); print('error',file=sys.stderr,flush=True)"
+        with subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+            stdout, stderr = runtime._communicate_bounded(process, 3, lambda stream, data, cut: events.append((stream, data, cut, process.poll())))
+        self.assertEqual(stdout, b"early\nlate\n")
+        self.assertEqual(stderr, b"error\n")
+        self.assertEqual(events[0][:2], ("stdout", b"early\n"))
+        self.assertIsNone(events[0][3], "first output must arrive while the child is still running")
+
+    @unittest.skipUnless(sys.platform == "linux", "The sandbox runtime uses Linux pipes")
+    def test_progress_is_bounded_but_final_output_retains_the_existing_full_limit(self) -> None:
+        events = []
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdout.write('x'*20000)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+            stdout, stderr = runtime._communicate_bounded(process, 3, lambda stream, data, cut: events.append((stream, data, cut)))
+        self.assertEqual(stdout, b"x" * 20000)
+        self.assertEqual(stderr, b"")
+        self.assertEqual(sum(len(event[1]) for event in events), 8192)
+        self.assertTrue(events[-1][2])
+
+    @unittest.skipUnless(sys.platform == "linux", "The sandbox runtime uses Linux pipes")
+    def test_oversized_command_output_is_refused_while_draining(self) -> None:
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdout.write('x'*1100000)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+            try:
+                with self.assertRaisesRegex(runtime.ProtocolError, "exceeded 1 MiB"):
+                    runtime._communicate_bounded(process, 3)
+            finally:
+                if process.poll() is None: os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+
+    @unittest.skipUnless(sys.platform == "linux", "The sandbox runtime uses Linux pipes")
+    def test_timeout_retains_the_prefix_and_does_not_wait_forever_for_open_pipes(self) -> None:
+        with subprocess.Popen([sys.executable, "-c", "import time; print('started',flush=True); time.sleep(3)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+            started = time.monotonic()
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                    runtime._communicate_bounded(process, .3)
+                self.assertEqual(raised.exception.output, b"started\n")
+                self.assertLess(time.monotonic() - started, 2)
+            finally:
+                if process.poll() is None: os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+
     def test_staging_bundle_requires_canonical_hashes_and_paths(self) -> None:
         decoded = runtime.decode_staging_bundle(bundle({"src/value.txt": b"safe\n"}))
         self.assertEqual(decoded, [("src/value.txt", b"safe\n")])

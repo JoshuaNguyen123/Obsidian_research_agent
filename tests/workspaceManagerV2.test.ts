@@ -296,7 +296,7 @@ test("workspace search, text, changed-file, path, symlink, and hard-link boundar
     await fixture.manager.createFile("limits-workspace", lease, "budget-98.txt", "x");
     await assert.rejects(
       fixture.manager.createFile("limits-workspace", lease, "budget-over.txt", "x"),
-      /100 changed files/u,
+      /would change 101 files in the workspace; its budget is 100\./u,
     );
   } finally {
     await fixture.cleanup();
@@ -531,7 +531,7 @@ test("workspace byte budget and durable expiry remain enforced after lease acqui
     }
     await assert.rejects(
       fixture.manager.createFile("byte-space", lease, "large-over.txt", chunk),
-      /10 MiB changed bytes/u,
+      /its budget is 10 MiB\./u,
     );
 
     await fixture.manager.createScratchWorkspace({
@@ -853,6 +853,148 @@ test("workspace copy rejects a destination inside its source without leaving par
     assert.equal(
       (await fixture.manager.read("copy-descendant-space", "source/value.txt")).content,
       "safe\n",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a run's budget counts the bytes an edit adds, so 100 patches to one 100 KB file fit (CODE2-14)", async () => {
+  const fixture = await fixtureManager("edit-growth");
+  try {
+    await fixture.manager.createScratchWorkspace({ workspaceId: "growth-space", ownerRunId: "run-growth" });
+    const lease = (await fixture.manager.acquireLease("growth-space", "extension:run-growth")).lease!.id;
+    const line = (index: number) => `line ${String(index).padStart(5, "0")} ${"x".repeat(88)}\n`;
+    const original = Array.from({ length: 1_000 }, (_, index) => line(index)).join("");
+    assert.ok(original.length >= 100_000);
+    await fixture.manager.createFile("growth-space", lease, "big.txt", original);
+    for (let index = 0; index < 100; index += 1) {
+      const current = await fixture.manager.read("growth-space", "big.txt");
+      await fixture.manager.patchExact("growth-space", lease, "big.txt", current.sha256, [
+        { oldText: line(index), newText: line(index).replace("x", "y") },
+      ]);
+    }
+    // One more byte per patch for ten patches: what they add, not the file.
+    for (let index = 100; index < 110; index += 1) {
+      const current = await fixture.manager.read("growth-space", "big.txt");
+      await fixture.manager.patchExact("growth-space", lease, "big.txt", current.sha256, [
+        { oldText: line(index), newText: `${line(index).trimEnd()}z\n` },
+      ]);
+    }
+    const manifest = await fixture.manager.loadManifest("growth-space");
+    assert.deepEqual(manifest.budget.run, {
+      runId: "extension:run-growth",
+      changedPaths: ["big.txt"],
+      addedBytes: Buffer.byteLength(original) + 10,
+    });
+    const status = await fixture.manager.status("growth-space");
+    assert.equal(status.remainingChangedFiles, 99);
+    assert.equal(status.remainingChangedBytes, 10 * 1024 * 1024 - Buffer.byteLength(original) - 10);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a run's budget starts fresh; the paths changed since the base are every run's (CODE2-14)", async () => {
+  const fixture = await fixtureManager("run-fresh");
+  try {
+    await fixture.manager.createScratchWorkspace({ workspaceId: "fresh-space", ownerRunId: "person:code-page" });
+    const first = (await fixture.manager.acquireLease("fresh-space", "extension:run-one")).lease!.id;
+    for (let index = 0; index < 100; index += 1) {
+      await fixture.manager.createFile("fresh-space", first, `one/${index}.txt`, "1\n");
+    }
+    await assert.rejects(
+      fixture.manager.createFile("fresh-space", first, "one/over.txt", "1\n"),
+      (error: unknown) => error instanceof WorkspaceManagerErrorV2 && error.code === "workspace_file_budget_exceeded",
+    );
+    await fixture.manager.releaseLease("fresh-space", first);
+    const second = (await fixture.manager.acquireLease("fresh-space", "extension:run-two")).lease!.id;
+    assert.equal((await fixture.manager.status("fresh-space")).remainingChangedFiles, 100);
+    await fixture.manager.createFile("fresh-space", second, "two/0.txt", "2\n");
+    const manifest = await fixture.manager.loadManifest("fresh-space");
+    assert.deepEqual(manifest.budget.run, { runId: "extension:run-two", changedPaths: ["two/0.txt"], addedBytes: 2 });
+    assert.equal(manifest.budget.changedPaths.length, 101, "a commit still stages every run's changes");
+    assert.equal(manifest.budget.changedBytes, 202);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a move and a trash add no bytes and count only the paths they name (CODE2-14)", async () => {
+  const fixture = await fixtureManager("move-trash-count");
+  try {
+    await fixture.manager.createScratchWorkspace({ workspaceId: "tree-space", ownerRunId: "run-tree" });
+    await fixture.manager.setWorkspaceChangeBudget("tree-space", { maxChangedFiles: 100, maxChangedBytes: 3 * 1024 * 1024 });
+    const lease = (await fixture.manager.acquireLease("tree-space", "extension:run-tree")).lease!.id;
+    const megabyte = "m".repeat(1024 * 1024 - 1) + "\n";
+    for (const name of ["a", "b"]) {
+      await fixture.manager.createFile("tree-space", lease, `src/${name}.txt`, megabyte);
+    }
+    await fixture.manager.createFile("tree-space", lease, "src/c.txt", "c\n");
+    const tree = await fixture.manager.stat("tree-space", "src");
+    await fixture.manager.move("tree-space", lease, "src", "lib", tree.sha256);
+    const moved = await fixture.manager.stat("tree-space", "lib");
+    await fixture.manager.trash("tree-space", lease, "lib", moved.sha256);
+    const manifest = await fixture.manager.loadManifest("tree-space");
+    assert.deepEqual(manifest.budget.run?.changedPaths, ["lib", "src", "src/a.txt", "src/b.txt", "src/c.txt"]);
+    assert.equal(manifest.budget.run?.addedBytes, 2 * 1024 * 1024 + 2, "the move and the trash added nothing");
+    // The bytes the run has left are not spent by moving or trashing.
+    await fixture.manager.createFile("tree-space", lease, "next.txt", "n".repeat(900 * 1024));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("the host sets a workspace's per-run budget, and it survives a restart (CODE2-14)", async () => {
+  const fixture = await fixtureManager("host-budget");
+  try {
+    const created = await fixture.manager.createScratchWorkspace({
+      workspaceId: "host-space",
+      ownerRunId: "run-host",
+      changeBudget: { maxChangedFiles: 1_000, maxChangedBytes: 64 * 1024 * 1024 },
+    });
+    assert.equal(created.budget.maxChangedFiles, 1_000);
+    assert.equal(created.budget.maxChangedBytes, 64 * 1024 * 1024);
+    const lease = (await fixture.manager.acquireLease("host-space", "extension:run-host")).lease!.id;
+    for (let index = 0; index < 150; index += 1) {
+      await fixture.manager.createFile("host-space", lease, `f/${index}.txt`, "x\n");
+    }
+    const restarted = new WorkspaceManagerV2({ applicationDataRoot: fixture.root, now: fixture.now, randomId: fixture.randomId });
+    assert.equal((await restarted.status("host-space")).remainingChangedFiles, 850);
+    await restarted.setWorkspaceChangeBudget("host-space", { maxChangedFiles: 150, maxChangedBytes: 1024 });
+    await assert.rejects(
+      restarted.createFile("host-space", lease, "f/over.txt", "x\n"),
+      /would change 151 files in the workspace; its budget is 150\./u,
+    );
+    for (const budget of [
+      { maxChangedFiles: 0, maxChangedBytes: 1 },
+      { maxChangedFiles: 10_001, maxChangedBytes: 1 },
+      { maxChangedFiles: 1, maxChangedBytes: 1024 * 1024 * 1024 + 1 },
+      { maxChangedFiles: 1.5, maxChangedBytes: 1 },
+    ]) {
+      await assert.rejects(
+        restarted.setWorkspaceChangeBudget("host-space", budget),
+        (error: unknown) => error instanceof WorkspaceManagerErrorV2 && error.code === "invalid_change_budget",
+      );
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a manifest written before CODE2-14 still reads, and its next run starts fresh", async () => {
+  const fixture = await fixtureManager("legacy-budget");
+  try {
+    const manifest = await fixture.manager.createScratchWorkspace({ workspaceId: "legacy-space", ownerRunId: "run-legacy" });
+    const legacy = {
+      ...manifest,
+      budget: { changedPaths: ["a.txt"], changedBytes: 10 * 1024 * 1024, maxChangedFiles: 100, maxChangedBytes: 10 * 1024 * 1024 },
+    };
+    const parsed = parseWorkspaceManifestV2(JSON.parse(JSON.stringify(legacy)));
+    assert.equal(parsed.budget.run, undefined);
+    assert.throws(
+      () => parseWorkspaceManifestV2({ ...legacy, budget: { ...legacy.budget, run: { runId: "r", changedPaths: [], addedBytes: 0, extra: 1 } } }),
+      /unknown or missing fields/u,
     );
   } finally {
     await fixture.cleanup();

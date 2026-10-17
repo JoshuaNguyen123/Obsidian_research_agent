@@ -40,12 +40,14 @@ export const COMPOUND_TOOL_PURPOSE: Readonly<Record<string, string>> = {
     "deliver beside the vault by default, or to an explicitly named host folder",
   code_workspace_append: "append to workspace file",
   code_workspace_patch: "patch workspace file",
+  code_workspace_apply_patch: "one unified diff over several workspace files",
   code_workspace_write_expected:
     "hash-bound correction in the real workspace before validation and delivery",
   code_workspace_mkdir: "create workspace directory",
   code_validate_fast: "sandbox smoke tests",
   code_validate_targeted: "targeted sandbox validation",
   code_validate_full: "full sandbox validation",
+  code_sandbox_run: "one program and its arguments in the sandbox (no shell, no network)",
   code_repair_record_cycle:
     "record fast-validation proof; open repair only when red",
   code_repair_status: "repair cycle status",

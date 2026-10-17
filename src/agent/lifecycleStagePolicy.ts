@@ -77,11 +77,15 @@ export const CODE_IMPLEMENTATION_TOOL_ALLOW = [
   "code_workspace_stat",
   "code_workspace_list",
   "code_workspace_search",
+  "code_workspace_inspect",
   "code_workspace_mkdir",
   "code_workspace_create_file",
   "code_workspace_export_directory",
   "code_workspace_append",
   "code_workspace_patch",
+  // One unified diff over several files, as one prepared action (CODE-7).
+  // Offered where a plan or the open node names it, never as a companion.
+  "code_workspace_apply_patch",
   "code_workspace_write_expected",
   // Relocation and removal have been registered, hash-bound, receipted, and
   // reconcilable since the V2 workspace landed, but were in no lifecycle
@@ -103,6 +107,11 @@ export const CODE_VALIDATION_TOOL_ALLOW = [
   "code_validate_fast",
   "code_validate_targeted",
   "code_validate_full",
+  // One program and its arguments in the verified sandbox, network off,
+  // nothing written back (CODE-17). Offered by the free node, and in a guided
+  // ladder only as a bounded investigation during validation recovery; it
+  // proves nothing for a commit.
+  "code_sandbox_run",
   "code_repair_record_cycle",
   "code_repair_status",
   "code_commit_verified",

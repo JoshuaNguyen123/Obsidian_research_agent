@@ -9,6 +9,7 @@ import { createOneShotGrant } from "../src/agent/authority";
 import {
   evaluateActionPolicy,
   evaluateToolPolicy,
+  preparedActionAllowsWriteAutonomyV1,
 } from "../src/agent/policyEngine";
 
 test("descriptor-aware policy fails closed on missing context", async () => {
@@ -191,6 +192,74 @@ test("write autonomy still permits a scoped local reversible mutation", async ()
 
   assert.equal(decision.action, "allow");
   assert.ok(decision.tags.includes("write_autonomy"));
+});
+
+test("write autonomy never covers a protected control or a second confirmation: the action asks as it would without autonomy", async () => {
+  const descriptor: ToolDescriptor = {
+    ...descriptorFixture(),
+    name: "code_workspace_write_expected",
+    capability: { system: "workspace", resourceType: "code_workspace", action: "update" },
+  };
+  const prepared = (
+    requiredConfirmations: 1 | 2,
+    normalizedArgs: Record<string, unknown>,
+  ): Promise<PreparedAction> =>
+    withPreparedActionFingerprint({
+      version: 1,
+      id: `action-${requiredConfirmations}-${Object.keys(normalizedArgs).join("-")}`,
+      runId: "run-1",
+      toolCallId: "call-1",
+      toolName: descriptor.name,
+      target: {
+        system: "workspace",
+        resourceType: "code_workspace",
+        id: "code-1:package.json",
+        workspaceId: "code-1",
+        path: "package.json",
+      },
+      relatedResources: [],
+      normalizedArgs: { workspaceId: "code-1", ...normalizedArgs } as PreparedAction["normalizedArgs"],
+      preview: { summary: "Write package.json", destination: "package.json", warnings: [], outboundBytes: 2 },
+      // Every prepared code workspace write names its confirmations: one for an
+      // ordinary edit and an exact-diff control alike, two for a double-exact one.
+      requiredConfirmations,
+      preparedAt: "2026-07-11T12:00:00.000Z",
+      expiresAt: "2026-07-11T12:05:00.000Z",
+    });
+  const decide = (action: PreparedAction, writeAutonomy: boolean) =>
+    evaluateActionPolicy({
+      toolName: descriptor.name,
+      descriptor,
+      preparedAction: action,
+      principal: "single_agent",
+      scopeAllowed: true,
+      writeAutonomy,
+      isDesktop: true,
+      now: new Date("2026-07-11T12:01:00.000Z"),
+    });
+
+  const cases: Array<[string, PreparedAction, 0 | 1 | 2]> = [
+    ["an ordinary edit", await prepared(1, {}), 0],
+    ["an exact-diff control (a manifest, a lockfile)", await prepared(1, { requiresProfileRedetection: true }), 1],
+    ["a double-exact control (a workflow, a hook)", await prepared(2, { requiresProfileRedetection: true }), 2],
+    ["an action that asks for two confirmations", await prepared(2, {}), 2],
+  ];
+  for (const [label, action, asksUnderAutonomy] of cases) {
+    const without = decide(action, false);
+    assert.equal(without.action, "require_approval", label);
+    assert.equal(without.requiredConfirmations, asksUnderAutonomy === 2 ? 2 : 1, label);
+    assert.equal(without.payloadFingerprint, action.payloadFingerprint, label);
+
+    const withAutonomy = decide(action, true);
+    assert.equal(preparedActionAllowsWriteAutonomyV1(action), asksUnderAutonomy === 0, label);
+    if (asksUnderAutonomy === 0) {
+      assert.equal(withAutonomy.action, "allow", label);
+      assert.ok(withAutonomy.tags.includes("write_autonomy"), label);
+    } else {
+      // The same decision, and the same count, it gets without autonomy.
+      assert.deepEqual(withAutonomy, without, label);
+    }
+  }
 });
 
 test("in-scope descriptor reads do not require a mutation grant", () => {
