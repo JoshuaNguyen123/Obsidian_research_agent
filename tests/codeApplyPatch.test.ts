@@ -21,7 +21,7 @@ import { detectRepositoryProfileV2 } from "../extensions/code/repositories";
 import { serializeToolResultForModel } from "../src/model/toolResultPayload";
 import type { PreparedAction, ToolDescriptor } from "../src/agent/actions";
 import { createBoundedGrant, createOneShotGrant, type AuthorityGrantV1 } from "../src/agent/authority";
-import { descriptorAllowsWriteAutonomyPromptGrantV1, evaluateActionPolicy } from "../src/agent/policyEngine";
+import { descriptorAllowsWorkspaceAutoApplyV1, descriptorAllowsWriteAutonomyPromptGrantV1, evaluateActionPolicy } from "../src/agent/policyEngine";
 import { descriptorForPreparedActionV1 } from "../src/agent/preparedActionDescriptorV1";
 import { isQueuedCodePreparedActionAllowedV1 } from "../src/agent/queuedCodePreparedActionV1";
 
@@ -691,3 +691,72 @@ function sha256Json(value: unknown): string {
   return sha256Text(JSON.stringify(value));
 }
 
+
+test("under the person's Auto-apply a rename or a delete inside the workspace passes; an edit is still write autonomy's (CODE2-16)", async () => {
+  const fixture = await createFixture("auto-apply-kinds");
+  try {
+    const { tools, context } = await scratchWithFiles(fixture, {
+      "src/app.ts": APP,
+      "src/old-name.ts": OLD_NAME,
+      "notes/old.txt": NOTES,
+    });
+    const applyPatch = tools.get("code_workspace_apply_patch")!;
+    const descriptor = applyPatch.descriptor as unknown as ToolDescriptor;
+    const decide = (action: PreparedActionV1, workspaceAutoApply: boolean, writeAutonomy = false) =>
+      evaluateActionPolicy({
+        toolName: "code_workspace_apply_patch",
+        descriptor,
+        preparedAction: action as unknown as PreparedAction,
+        principal: "single_agent",
+        scopeAllowed: true,
+        isDesktop: true,
+        writeAutonomy,
+        workspaceAutoApply,
+        now: new Date(Date.parse(action.preparedAt) + 1_000),
+      });
+    for (const [label, patch] of [["rename", RENAME], ["delete", DELETE]] as const) {
+      const action = await requirePrepared(applyPatch, { patch }, context);
+      const judged = descriptorForPreparedActionV1(descriptor, action as unknown as PreparedAction);
+      assert.equal(descriptorAllowsWorkspaceAutoApplyV1(judged), true, label);
+      const allowed = decide(action, true);
+      assert.equal(allowed.action, "allow", label);
+      assert.ok(allowed.tags.includes("workspace_auto_apply"), label);
+      assert.equal(decide(action, false, true).action, "require_approval", `${label} asks without Auto-apply`);
+      // The grant the runner mints is the person's, never a prompt's.
+      const grant = await createOneShotGrant({
+        id: `auto-apply-${label}`,
+        action: action as unknown as PreparedAction,
+        descriptor: judged,
+        issuer: "user_approval",
+        issuedAt: new Date(action.preparedAt),
+      });
+      assert.equal(
+        evaluateActionPolicy({
+          toolName: "code_workspace_apply_patch",
+          descriptor,
+          preparedAction: action as unknown as PreparedAction,
+          principal: "single_agent",
+          scopeAllowed: true,
+          isDesktop: true,
+          workspaceAutoApply: true,
+          matchingGrant: grant,
+          now: new Date(Date.parse(action.preparedAt) + 1_000),
+        }).action,
+        "allow",
+        label,
+      );
+    }
+    const modify = await requirePrepared(applyPatch, { patch: MODIFY_ONLY }, context);
+    assert.equal(decide(modify, true).action, "require_approval", "Auto-apply alone does not widen edits");
+    assert.equal(decide(modify, true, true).action, "allow");
+    // The single-file tools: a move and a trash pass, an export out of the workspace never does.
+    const single = (name: string) => codeWorkspaceToolDescriptorV2(name as never) as unknown as ToolDescriptor;
+    assert.equal(descriptorAllowsWorkspaceAutoApplyV1(single("code_workspace_move")), true);
+    assert.equal(descriptorAllowsWorkspaceAutoApplyV1(single("code_workspace_trash")), true);
+    assert.equal(descriptorAllowsWorkspaceAutoApplyV1(single("code_workspace_export_directory")), false);
+    assert.equal(descriptorAllowsWorkspaceAutoApplyV1(single("code_workspace_patch")), false);
+    assert.equal(descriptorAllowsWorkspaceAutoApplyV1(single("code_workspace_copy")), false);
+  } finally {
+    await fixture.cleanup();
+  }
+});

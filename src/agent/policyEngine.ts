@@ -54,6 +54,8 @@ export interface ToolPolicyContext {
   scopeAllowed?: boolean;
   /** A grant already verified against this action by the authority evaluator. */
   matchingGrant?: AuthorityGrantV1 | null;
+  /** The person chose Auto-apply for this run (see `ActionPolicyContext`). */
+  workspaceAutoApply?: boolean;
   now?: Date;
 }
 
@@ -66,6 +68,13 @@ export interface ActionPolicyContext {
   matchingGrant?: AuthorityGrantV1 | null;
   isDesktop: boolean;
   writeAutonomy?: boolean;
+  /**
+   * The person chose Auto-apply for this run (CODE2-16, D-291): a move, a
+   * trash, and a patch that deletes or renames, inside a code workspace,
+   * go ahead without a card, because each is undone from the workspace's
+   * trash or the run's kept originals. Never set by the prompt.
+   */
+  workspaceAutoApply?: boolean;
   researchPhase?: ResearchPhaseDescriptor | null;
   now?: Date;
 }
@@ -133,6 +142,35 @@ export function preparedActionAllowsWriteAutonomyV1(
   );
 }
 
+/** The tools whose moves and deletes Auto-apply may cover inside a code workspace. */
+const WORKSPACE_AUTO_APPLY_TOOLS_V1: ReadonlySet<string> = new Set([
+  "code_workspace_move",
+  "code_workspace_trash",
+  "code_workspace_apply_patch",
+]);
+
+/**
+ * Whether the person's Auto-apply covers this descriptor (CODE2-16, D-291),
+ * read after `descriptorForPreparedActionV1` has judged a patch by its kind: a
+ * move or a trash of a code workspace's own files, asked for once, and never
+ * a file outside the workspace (an export names `host_directory`). What else
+ * keeps it asking is the prepared action's own say, through
+ * {@link preparedActionAllowsWriteAutonomyV1}: a protected repository control
+ * or a second confirmation. The policy engine and the runner's one-shot grant
+ * both read this one function.
+ */
+export function descriptorAllowsWorkspaceAutoApplyV1(descriptor: ToolDescriptor): boolean {
+  return (
+    WORKSPACE_AUTO_APPLY_TOOLS_V1.has(descriptor.name) &&
+    descriptor.capability.system === "workspace" &&
+    descriptor.capability.resourceType === "code_workspace" &&
+    (descriptor.capability.action === "move" || descriptor.capability.action === "trash") &&
+    (descriptor.effect === "reversible_mutation" || descriptor.effect === "destructive_mutation") &&
+    descriptor.risk !== "critical" &&
+    descriptor.approval.fallback === "exact"
+  );
+}
+
 export function descriptorAllowsWriteAutonomyPromptGrantV1(
   descriptor: ToolDescriptor,
 ): boolean {
@@ -161,6 +199,7 @@ export function evaluateToolPolicy(ctx: ToolPolicyContext): PolicyDecision {
       matchingGrant: ctx.matchingGrant,
       isDesktop: ctx.isDesktop,
       writeAutonomy: ctx.writeAutonomy,
+      workspaceAutoApply: ctx.workspaceAutoApply,
       researchPhase: ctx.researchPhase,
       now: ctx.now,
     });
@@ -377,6 +416,18 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
     return allow(
       "Scoped reversible mutation proceeds under write autonomy with a fingerprint-bound prepared action.",
       ["write_autonomy", "prepared_fingerprint"],
+    );
+  }
+
+  if (
+    action &&
+    ctx.workspaceAutoApply === true &&
+    descriptorAllowsWorkspaceAutoApplyV1(descriptor) &&
+    preparedActionAllowsWriteAutonomyV1(action)
+  ) {
+    return allow(
+      "A move or a delete inside the code workspace proceeds under the person's Auto-apply with a fingerprint-bound prepared action.",
+      ["workspace_auto_apply", "prepared_fingerprint"],
     );
   }
 
