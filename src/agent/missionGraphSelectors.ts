@@ -159,6 +159,50 @@ export function isReadyMissionGraphSlotForToolV1(
 }
 
 /**
+ * The ready node a call in a parallel barrier would claim, given the nodes the
+ * barrier's earlier calls hold: the first ready node, in graph order, whose
+ * frontier expects the tool and that no earlier call holds. That is the node
+ * `MissionGraphSession.beginToolExecution` gives the call once the earlier
+ * calls have started, since a started node is running, not ready.
+ */
+export function nextReadyMissionGraphSlotForToolV1(
+  graph: MissionGraphV3,
+  toolName: string,
+  held: ReadonlySet<string>,
+): MissionGraphV3["nodes"][string] | null {
+  return (
+    Object.values(graph.nodes).find(
+      (node) => !held.has(node.id) && isReadyMissionGraphSlotForToolV1(node, toolName),
+    ) ?? null
+  );
+}
+
+/**
+ * True when a call has to wait outside a parallel barrier because the open
+ * node it would run in (a free coding pass's `code_free_work`) is held by an
+ * earlier call of the barrier. An open node runs one call at a time, whatever
+ * its tool: it is running for one execution, holds its resource locks for
+ * that execution, and counts its calls one by one. Counted per tool name, two
+ * different read tools each saw that one node as their own ready slot, so
+ * both joined the barrier and the second was refused at its start, which
+ * ended the run. A node that is not open is never one slot for several tools
+ * here, so guided and research plans batch exactly as before.
+ */
+export function missionGraphBarrierWaitsForOpenWorkV1(
+  graph: MissionGraphV3,
+  toolName: string,
+  held: ReadonlySet<string>,
+): boolean {
+  if (nextReadyMissionGraphSlotForToolV1(graph, toolName, held)) return false;
+  return Object.values(graph.nodes).some(
+    (node) =>
+      held.has(node.id) &&
+      getSafeMissionOpenWorkSpecV1(node) !== null &&
+      isReadyMissionGraphSlotForToolV1(node, toolName),
+  );
+}
+
+/**
  * Exact ready-frontier tool names. This is the corrective payload an authority
  * rejection owes the model: naming what was refused teaches it nothing, and a
  * model told only that it was wrong will rationally try again.

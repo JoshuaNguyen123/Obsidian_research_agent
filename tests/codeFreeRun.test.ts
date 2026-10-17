@@ -89,6 +89,7 @@ async function runPass(input: {
   const graphs: MissionGraphV3[] = [];
   const plans: CodePlanUpdateEventV1[] = [];
   const answers: string[] = [];
+  const statuses: string[] = [];
   let complete: AgentRunCompleteEvent | null = null;
   __setCodeToolsDesktopAppForTests(true);
   try {
@@ -111,6 +112,7 @@ async function runPass(input: {
         onCodePlan: (event) => plans.push(event),
         onFinalDelta: (delta) => answers.push(delta),
         onFinalReplace: (content) => answers.push(content),
+        onStatus: (message) => statuses.push(message),
       },
     });
   } finally {
@@ -122,6 +124,7 @@ async function runPass(input: {
     graphs,
     plans,
     answers,
+    statuses,
     approvals,
     complete: complete as AgentRunCompleteEvent | null,
   };
@@ -926,6 +929,132 @@ test("a guided pass never offers the command, even while a red validation waits 
   assert.equal(menus.some((offered) => offered.includes("code_sandbox_run")), false, JSON.stringify(menus));
   assert.deepEqual(run.workspace.state.commands, []);
   assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+/** A free pass whose open steps are model turns of one call or several. */
+async function freeTurnsPass(turns: Call[][]) {
+  const open = turns.map((turn) => [...turn]);
+  return runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free" },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        return next ? { calls: next } : { content: "The off-by-one is fixed and the targeted check passes." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+}
+
+/** What the model was told about each of a turn's calls, by call id. */
+function toolAnswers(run: Awaited<ReturnType<typeof runPass>>, turnCalls: number): Array<{ name: string; status: string }> {
+  const turn = run.model.turns.find((entry) => entry.calls.length === turnCalls);
+  assert.ok(turn, `a model turn asked for ${turnCalls} calls`);
+  const transcript = run.model.requests.at(-1)!.messages;
+  return turn.calls.map((asked) => {
+    const answers = transcript.filter((message) => message.role === "tool" && message.toolCallId === asked.id);
+    assert.equal(answers.length, 1, `${asked.name} (${asked.id}) was answered once`);
+    const payload = JSON.parse(String(answers[0]!.content)) as { toolName: string; status: string };
+    return { name: payload.toolName, status: payload.status };
+  });
+}
+
+const PLAN_ITEMS = [
+  { text: "Read offset()", status: "in_progress" },
+  { text: "Fix it and pass the targeted check", status: "pending" },
+];
+
+for (const second of [
+  call("code_workspace_stat", { path: "src/pager.py" }),
+  call("code_workspace_list"),
+]) {
+  test(`a free pass whose model asks for a read and a ${second.name.replace("code_workspace_", "")} in one turn runs both in its open node, one after the other`, async () => {
+    // The open node runs one call at a time whatever its tool. Two different
+    // read tools each counted that one node as their ready slot, so both
+    // entered the parallel batch, the first claimed the node and the second
+    // was refused as "not ready in the exact authoritative mission graph",
+    // which ended the run (CODE-19's pilot, glm-5.3-flash, 2026-10-16).
+    const run = await freeTurnsPass([
+      [{ name: "code_plan_update", arguments: { items: PLAN_ITEMS } }],
+      [{ name: "code_sandbox_status", arguments: {} }],
+      [call("code_workspace_create", { kind: "repository" })],
+      [call("code_workspace_read", { path: "src/pager.py" }), second],
+      [call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] })],
+      [call("code_validate_targeted")],
+    ]);
+    assert.equal(run.complete?.stopReason, "final", JSON.stringify(run.statuses));
+    assert.deepEqual(
+      run.statuses.filter((message) => /not ready|Tool execution failed|in parallel/.test(message)),
+      [],
+      "neither call was refused, and the two were not run side by side in the one node",
+    );
+    assert.deepEqual(toolAnswers(run, 2), [
+      { name: "code_workspace_read", status: "success" },
+      { name: second.name, status: "success" },
+    ]);
+    assert.deepEqual(run.workspace.state.executed, [
+      "code_sandbox_status",
+      "code_workspace_create",
+      "code_workspace_read",
+      second.name,
+      "code_workspace_patch",
+      "code_validate_targeted",
+      ...CLOSING,
+    ]);
+    const last = run.graphs.at(-1)!;
+    for (const node of Object.values(last.nodes)) {
+      assert.equal(node.status, "complete", `${node.id} completed`);
+    }
+    const state = last.nodes.code_free_work!.outputs.open_work as Record<string, unknown>;
+    assert.equal(state.calls, 7, "each call of the turn is one call of the open node");
+    assert.equal(state.lastWriteCall, 6);
+    assert.equal(state.lastTargetedPassCall, 7);
+    assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+    assert.equal(run.workspace.state.commits.length, 1);
+  });
+}
+
+test("a guided pass whose model asks for its list and its read in one turn still runs the two steps side by side", async () => {
+  // The control: in a guided pass the list and the read are two ready steps,
+  // each its own node, and a turn asking for both runs them in parallel as it
+  // always has. Only an open node is one slot for every tool.
+  const expected = JSON.parse(
+    readFileSync(new URL("./fixtures/guidedCodePassPlanV1.json", import.meta.url), "utf8"),
+  ) as { nodes: unknown; executed: string[] };
+  let asked = false;
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    decide: (offered) => {
+      if (!asked && offered.includes("code_workspace_list") && offered.includes("code_workspace_read")) {
+        asked = true;
+        return { calls: [call("code_workspace_list"), call("code_workspace_read", { path: "src/pager.py" })] };
+      }
+      return guidedStep(offered);
+    },
+  });
+  assert.deepEqual(planShape(run.graphs[0]!), expected.nodes);
+  assert.ok(run.statuses.includes("Running 2 read-only tools in parallel..."), JSON.stringify(run.statuses));
+  assert.deepEqual(toolAnswers(run, 2), [
+    { name: "code_workspace_list", status: "success" },
+    { name: "code_workspace_read", status: "success" },
+  ]);
+  assert.deepEqual(
+    run.model.turns.map((turn) => turn.calls.map((entry) => entry.name)),
+    [
+      ["code_sandbox_status"],
+      ["code_workspace_create"],
+      ["code_workspace_list", "code_workspace_read"],
+      ["code_workspace_patch"],
+      ...CLOSING.map((name) => [name]),
+    ],
+  );
+  assert.deepEqual([...run.workspace.state.executed].sort(), [...expected.executed].sort());
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
 });
