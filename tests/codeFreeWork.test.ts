@@ -110,6 +110,12 @@ test("the free plan replaces the steps before the first validation and keeps the
   assert.ok(later?.menu.includes("code_workspace_apply_patch"));
   assert.ok(later?.menu.includes("code_sandbox_run"));
   assert.ok(later?.menu.includes("code_workspace_inspect"));
+  // What compaction set aside can be read back from the open node (CODE2-13).
+  const recall = planCodeFreeWorkV1({
+    ladder: GUIDED_LADDER,
+    available: new Set([...available, "recall_tool_result"]),
+  });
+  assert.deepEqual(recall?.menu.slice(-2), ["recall_tool_result", "code_plan_update"]);
   // Not an implementation, or not a plain coding pass: plan it guided.
   assert.equal(planCodeFreeWorkV1({ ladder: ["code_sandbox_status", "code_validate_fast"], available }), null);
   assert.equal(planCodeFreeWorkV1({ ladder: ["code_workspace_patch"], available }), null);

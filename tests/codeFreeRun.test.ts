@@ -5,6 +5,8 @@ import { runAgentMission, type AgentRunCompleteEvent } from "../src/AgentRunner"
 import type { MissionGraphV3 } from "../src/agent/missionGraphV3";
 import type { CodePlanUpdateEventV1 } from "../src/agent/codeFreeWorkV1";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
+import { createRecallTools } from "../src/tools/recallTools";
+import type { AgentTool } from "../src/tools/types";
 import { __setCodeToolsDesktopAppForTests } from "../src/tools/codeTools";
 import { createScriptedCodeWorkspace } from "./helpers/scriptedCodeWorkspace";
 import {
@@ -60,6 +62,8 @@ async function runPass(input: {
   protectedControls?: Record<string, 1 | 2>;
   /** The person's step setting. */
   maxAgentSteps?: number;
+  /** Tools the registry has beside the workspace's. */
+  extraTools?: AgentTool[];
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
@@ -99,7 +103,7 @@ async function runPass(input: {
       prompt,
       runId: "run-code-free",
       modelClient: model.client,
-      toolRegistry: new DefaultToolRegistry(workspace.tools),
+      toolRegistry: new DefaultToolRegistry([...workspace.tools, ...(input.extraTools ?? [])]),
       toolContext: context,
       enableStreaming: false,
       interactiveApprovals: true,
@@ -1095,6 +1099,42 @@ test("a free pass's open node is bounded by its own model calls, not the runner'
   assert.ok(Number(limit) >= 240, `step limit ${limit}`);
   assert.ok(openTurns > 30, `${openTurns} open turns`);
   assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a free pass's open node offers recall_tool_result, so what compaction set aside can be read back (CODE2-13)", async () => {
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_read", { path: "src/pager.py" }),
+    { name: "recall_tool_result", arguments: { key: "tr_run-code-free_3" } },
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ];
+  const offeredInOpenNode: string[][] = [];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    extraTools: createRecallTools(),
+    options: { codeAutonomy: "free" },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        offeredInOpenNode.push(offered);
+        const next = open.shift();
+        return next ? { calls: [next] } : { content: "The off-by-one is fixed and the targeted check passes." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  assert.ok(offeredInOpenNode.length > 0);
+  for (const offered of offeredInOpenNode) {
+    assert.ok(offered.includes("recall_tool_result"), "recall is on the open node's menu");
+  }
+  const state = run.graphs.at(-1)!.nodes.code_free_work!.outputs.open_work as Record<string, unknown>;
+  assert.equal(state.calls, 6, "the recall counted as one of the open node's calls");
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
 });
