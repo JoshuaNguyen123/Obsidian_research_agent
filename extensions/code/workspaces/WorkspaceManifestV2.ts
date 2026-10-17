@@ -1,7 +1,16 @@
 export const WORKSPACE_MANIFEST_VERSION_V2 = 2 as const;
 export const WORKSPACE_MAX_TEXT_BYTES_V2 = 2 * 1024 * 1024;
+/** A run's change budget by default: files it may change, bytes it may add. */
 export const WORKSPACE_MAX_CHANGED_FILES_V2 = 100;
 export const WORKSPACE_MAX_CHANGED_BYTES_V2 = 10 * 1024 * 1024;
+/** The most a host may set a workspace's per-run change budget to. */
+export const WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2 = 10_000;
+export const WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2 = 1024 * 1024 * 1024;
+/**
+ * The paths a workspace keeps as changed since its base, which a verified
+ * commit stages. Every run's changes land here until a commit resets it.
+ */
+export const WORKSPACE_MAX_TRACKED_CHANGED_PATHS_V2 = 50_000;
 export const WORKSPACE_MAX_SEARCH_RESULTS_V2 = 200;
 
 export type WorkspaceKindV2 = "scratch" | "repository";
@@ -46,11 +55,29 @@ export interface WorkspaceLeaseV2 {
   expiresAt: string;
 }
 
-export interface WorkspaceBudgetV2 {
+/**
+ * What one run has changed, against the workspace's per-run budget (CODE2-14).
+ * The run is the lease's owner; another owner's first write starts a fresh
+ * count. A write counts its path, and the bytes it adds: a new file its size,
+ * an edit only what it grows the file by; a move, a trash and a restore add
+ * nothing and count only the paths they name.
+ */
+export interface WorkspaceRunBudgetV2 {
+  runId: string;
   changedPaths: string[];
+  addedBytes: number;
+}
+
+export interface WorkspaceBudgetV2 {
+  /** Every path changed since the base, which a verified commit stages. */
+  changedPaths: string[];
+  /** Bytes added since the base. */
   changedBytes: number;
-  maxChangedFiles: typeof WORKSPACE_MAX_CHANGED_FILES_V2;
-  maxChangedBytes: typeof WORKSPACE_MAX_CHANGED_BYTES_V2;
+  /** The per-run limits: files a run may change, bytes it may add. */
+  maxChangedFiles: number;
+  maxChangedBytes: number;
+  /** The run now writing, absent before any run's first counted write. */
+  run?: WorkspaceRunBudgetV2;
 }
 
 export interface WorkspaceManifestV2 {
@@ -189,18 +216,26 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     throw new WorkspaceManifestErrorV2("Workspace lease and status are inconsistent.");
   }
   const budgetSource = record(source.budget, "workspace budget");
-  exact(budgetSource, ["changedPaths", "changedBytes", "maxChangedFiles", "maxChangedBytes"], "workspace budget");
-  const changedPaths = array(budgetSource.changedPaths, "changed paths", WORKSPACE_MAX_CHANGED_FILES_V2)
-    .map((path, index) => relativePath(path, `changed path ${index + 1}`));
-  if (new Set(changedPaths).size !== changedPaths.length) {
-    throw new WorkspaceManifestErrorV2("Workspace changed paths must be unique.");
-  }
-  if (
-    budgetSource.maxChangedFiles !== WORKSPACE_MAX_CHANGED_FILES_V2 ||
-    budgetSource.maxChangedBytes !== WORKSPACE_MAX_CHANGED_BYTES_V2
-  ) {
-    throw new WorkspaceManifestErrorV2("Workspace budget limits do not match the v2 contract.");
-  }
+  const hasRunBudget = budgetSource.run !== undefined;
+  exact(
+    budgetSource,
+    ["changedPaths", "changedBytes", "maxChangedFiles", "maxChangedBytes", ...(hasRunBudget ? ["run"] : [])],
+    "workspace budget",
+  );
+  const changedPaths = uniquePaths(budgetSource.changedPaths, "changed paths", WORKSPACE_MAX_TRACKED_CHANGED_PATHS_V2);
+  const maxChangedFiles = integer(
+    budgetSource.maxChangedFiles,
+    "workspace budget files",
+    1,
+    WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2,
+  );
+  const maxChangedBytes = integer(
+    budgetSource.maxChangedBytes,
+    "workspace budget bytes",
+    1,
+    WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2,
+  );
+  const runBudget = hasRunBudget ? parseRunBudget(budgetSource.run) : undefined;
   return {
     version: WORKSPACE_MANIFEST_VERSION_V2,
     workspaceId,
@@ -223,9 +258,10 @@ export function parseWorkspaceManifestV2(value: unknown): WorkspaceManifestV2 {
     updatedAt: iso(source.updatedAt, "workspace updatedAt"),
     budget: {
       changedPaths,
-      changedBytes: integer(source.budget && budgetSource.changedBytes, "changed bytes", 0, WORKSPACE_MAX_CHANGED_BYTES_V2),
-      maxChangedFiles: WORKSPACE_MAX_CHANGED_FILES_V2,
-      maxChangedBytes: WORKSPACE_MAX_CHANGED_BYTES_V2,
+      changedBytes: integer(budgetSource.changedBytes, "changed bytes", 0, Number.MAX_SAFE_INTEGER),
+      maxChangedFiles,
+      maxChangedBytes,
+      ...(runBudget === undefined ? {} : { run: runBudget }),
     },
   };
 }
@@ -318,6 +354,25 @@ function parseSandboxPolicy(value: unknown): WorkspaceSandboxPolicyV2 {
     throw new WorkspaceManifestErrorV2("Workspace sandbox network must default to disabled.");
   }
   return { mode, provider, boundaryFingerprint, network: "disabled" };
+}
+
+function parseRunBudget(value: unknown): WorkspaceRunBudgetV2 {
+  const source = record(value, "workspace run budget");
+  exact(source, ["runId", "changedPaths", "addedBytes"], "workspace run budget");
+  return {
+    runId: boundedString(source.runId, "workspace run budget run id", 1, 256),
+    changedPaths: uniquePaths(source.changedPaths, "run changed paths", WORKSPACE_CHANGE_BUDGET_CEILING_FILES_V2),
+    addedBytes: integer(source.addedBytes, "run added bytes", 0, WORKSPACE_CHANGE_BUDGET_CEILING_BYTES_V2),
+  };
+}
+
+function uniquePaths(value: unknown, label: string, max: number): string[] {
+  const paths = array(value, label, max)
+    .map((path, index) => relativePath(path, `${label} ${index + 1}`));
+  if (new Set(paths).size !== paths.length) {
+    throw new WorkspaceManifestErrorV2(`Workspace ${label} must be unique.`);
+  }
+  return paths;
 }
 
 function parseValidation(value: unknown, index: number): WorkspaceValidationRecordV2 {

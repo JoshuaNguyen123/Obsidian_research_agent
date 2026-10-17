@@ -343,7 +343,7 @@ test("a batch holds the workspace's change budget before it writes anything", as
     const root = (await fixture.manager.loadManifest("budget-space")).canonicalRoot;
     assert.equal(existsSync(path.join(root, "g")), false, "not even a folder is made");
     await assert.rejects(
-      fixture.manager.applyFileChanges("budget-space", leaseId, Array.from({ length: 21 }, (_, index) => ({
+      fixture.manager.applyFileChanges("budget-space", leaseId, Array.from({ length: 101 }, (_, index) => ({
         kind: "create" as const,
         path: `h/${index}.txt`,
         content: "x\n",
