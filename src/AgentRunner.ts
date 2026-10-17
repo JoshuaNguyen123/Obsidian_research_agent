@@ -1054,6 +1054,7 @@ import {
   type RoutedMissionIntent,
 } from "./agent/missionRouter";
 import {
+  descriptorAllowsWorkspaceAutoApplyV1,
   descriptorAllowsWriteAutonomyPromptGrantV1,
   deriveRoutedIntentFallback,
   evaluateToolPolicy,
@@ -1864,6 +1865,13 @@ interface RunAgentMissionOptions {
    * a missing one takes its default.
    */
   codeFreeBudget?: Partial<CodeFreeBudgetV1>;
+  /**
+   * The person chose Auto-apply for this run (CODE2-16, D-291). A move, a
+   * trash and a patch that deletes or renames, inside a code workspace, then
+   * go ahead without asking; a protected repository control still asks. The
+   * host sets it from the run's mode, never from the prompt.
+   */
+  codeWorkspaceAutoApply?: boolean;
 }
 
 interface CheckpointResumeState {
@@ -2224,6 +2232,7 @@ export async function runAgentMission({
   codeCommandOutputBudgetChars,
   codeAutonomy,
   codeFreeBudget,
+  codeWorkspaceAutoApply,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
   // CODE-18: the free coding pass. Guided runs see the host's registry
@@ -13985,6 +13994,7 @@ export async function runAgentMission({
         approvalGranted: false,
         isDesktop: isCodeToolsDesktopRuntime(),
         writeAutonomy: writeAutonomy || hostAuthorizedMemorySave,
+        workspaceAutoApply: codeWorkspaceAutoApply === true,
         codeRunCount: executedCodeRunCount,
         maxCodeRunsPerMission: runToolContext.settings?.maxCodeRunsPerMission,
         researchPhase: researchPhaseDescriptor,
@@ -14128,6 +14138,67 @@ export async function runAgentMission({
               code: "authority_grant_invalid",
               message: getUnknownErrorMessage(error),
             },
+          };
+        }
+      }
+
+      // CODE2-16: the person's Auto-apply covers a move or a delete inside a
+      // code workspace. The person chose it for this run, so the one-use grant
+      // is theirs (`user_approval`), never derived from the prompt; the same
+      // predicates decided the policy, so the two cannot disagree.
+      if (
+        !matchingGrant &&
+        codeWorkspaceAutoApply === true &&
+        preparedPolicyDecision.action === "allow" &&
+        preparedPolicyDecision.tags.includes("workspace_auto_apply") &&
+        preparedPolicyDecision.tags.includes("prepared_fingerprint") &&
+        // Already judged by its prepared kind (a patch that deletes is a trash).
+        descriptorAllowsWorkspaceAutoApplyV1(descriptor) &&
+        preparedActionAllowsWriteAutonomyV1(preparedAction)
+      ) {
+        try {
+          const grant = await createOneShotGrant({
+            id: `grant:workspace-auto-apply:${preparedAction.id}`,
+            action: preparedAction,
+            descriptor,
+            issuer: "user_approval",
+            issuedAt: runToolContext.now?.() ?? new Date(),
+          });
+          const evaluated = await evaluateAuthorityGrant({
+            grant,
+            action: preparedAction,
+            descriptor,
+            now: runToolContext.now?.() ?? new Date(),
+          });
+          if (!evaluated.allowed) {
+            return {
+              ok: false,
+              toolName: toolCall.name,
+              mutationState: "not_applied",
+              error: { code: "authority_grant_invalid", message: evaluated.reason },
+            };
+          }
+          matchingGrant = evaluated.grant;
+          const grantedDecision = evaluateToolPolicy({
+            ...actionPolicyContext,
+            matchingGrant,
+          });
+          if (grantedDecision.action !== "allow") {
+            return buildPolicyBlockedResult(grantedDecision);
+          }
+          preparedPolicyDecision = {
+            ...grantedDecision,
+            reason:
+              "A move or a delete inside the code workspace is covered by a fingerprint-bound one-shot grant under the person's Auto-apply.",
+            tags: [...grantedDecision.tags, "workspace_auto_apply", "prepared_fingerprint"],
+          };
+          events.onStatus?.(`Auto-apply; running tool: ${toolCall.name}`);
+        } catch (error) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: { code: "authority_grant_invalid", message: getUnknownErrorMessage(error) },
           };
         }
       }

@@ -677,7 +677,7 @@ const DELETING_PATCH = [
   "",
 ].join("\n");
 
-async function freePatchPass(patch: string) {
+async function freePatchPass(patch: string, options: Record<string, unknown> = {}) {
   const open: Call[] = [
     { name: "code_sandbox_status", arguments: {} },
     call("code_workspace_create", { kind: "repository" }),
@@ -687,7 +687,7 @@ async function freePatchPass(patch: string) {
   ];
   return runPass({
     steps: GUIDED_PASS_STEPS_V1,
-    options: { codeAutonomy: "free" },
+    options: { codeAutonomy: "free", ...options },
     decide: (offered) => {
       if (offered.includes("code_plan_update")) {
         const next = open.shift();
@@ -758,12 +758,12 @@ const WORKFLOW_AFTER = "name: ci\non: push\n";
 const PROTECTED = { "package.json": 1, ".github/workflows": 2 } as const;
 const PROTECTED_FILES = { "package.json": PACKAGE, ".github/workflows/ci.yml": WORKFLOW };
 
-async function freeCallsPass(calls: Call[]) {
+async function freeCallsPass(calls: Call[], options: Record<string, unknown> = {}, files: Record<string, string> = {}) {
   const open = [...calls];
   return runPass({
     steps: GUIDED_PASS_STEPS_V1,
-    options: { codeAutonomy: "free" },
-    files: PROTECTED_FILES,
+    options: { codeAutonomy: "free", ...options },
+    files: { ...PROTECTED_FILES, ...files },
     protectedControls: PROTECTED,
     decide: (offered) => {
       if (offered.includes("code_plan_update")) {
@@ -1137,4 +1137,57 @@ test("a free pass's open node offers recall_tool_result, so what compaction set 
   assert.equal(state.calls, 6, "the recall counted as one of the open node's calls");
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
+});
+
+// CODE2-16 (D-291): under the person's Auto-apply a move, a trash and a patch
+// that renames or deletes go ahead inside the workspace; a protected control
+// still asks, as it does under write autonomy.
+test("under Auto-apply a patch that renames or deletes a file goes ahead without asking (CODE2-16)", async () => {
+  for (const [label, patch] of [["rename", RENAMING_PATCH], ["delete", DELETING_PATCH]] as const) {
+    const run = await freePatchPass(patch, { codeWorkspaceAutoApply: true });
+    assert.equal(
+      run.approvals.requests.some((request) => request.toolName === "code_workspace_apply_patch"),
+      false,
+      `a ${label} patch does not ask under Auto-apply`,
+    );
+    assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED, label);
+    assert.equal(run.workspace.state.files.has("tests/test_pager.py"), false, label);
+    assert.ok(run.statuses.includes("Auto-apply; running tool: code_workspace_apply_patch"), label);
+    assert.equal(run.workspace.state.commits.length, 1, label);
+  }
+});
+
+test("under Auto-apply a move and a trash go ahead, and one of a protected control still asks (CODE2-16)", async () => {
+  const run = await freeCallsPass([
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_move", { path: "tests/test_pager.py", from: "tests/test_pager.py", to: "tests/test_offset.py" }),
+    call("code_workspace_trash", { path: "src/unused.py" }),
+    call("code_workspace_trash", { path: "package.json" }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ], { codeWorkspaceAutoApply: true }, { "src/unused.py": "UNUSED = 1\n" });
+  const asked = run.approvals.requests
+    .filter((request) => request.toolName === "code_workspace_move" || request.toolName === "code_workspace_trash")
+    .map((request) => `${request.toolName}:${String(request.preparedAction?.target.path ?? "")}`);
+  assert.deepEqual(asked, ["code_workspace_trash:package.json"], "only the protected control asked");
+  assert.equal(run.workspace.state.files.has("tests/test_pager.py"), false);
+  assert.equal(run.workspace.state.files.has("tests/test_offset.py"), true);
+  assert.equal(run.workspace.state.files.has("src/unused.py"), false);
+  assert.equal(run.workspace.state.files.has("package.json"), false, "approved by hand, then trashed");
+});
+
+test("without Auto-apply a move and a trash still ask under write autonomy (CODE2-16)", async () => {
+  const run = await freeCallsPass([
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_move", { path: "tests/test_pager.py", from: "tests/test_pager.py", to: "tests/test_offset.py" }),
+    call("code_workspace_trash", { path: "src/unused.py" }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ], {}, { "src/unused.py": "UNUSED = 1\n" });
+  const asked = run.approvals.requests
+    .filter((request) => request.toolName === "code_workspace_move" || request.toolName === "code_workspace_trash")
+    .map((request) => request.toolName);
+  assert.deepEqual(asked, ["code_workspace_move", "code_workspace_trash"]);
 });
