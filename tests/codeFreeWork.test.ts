@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CODE_FREE_BUDGET_LIMITS_V1,
+  codeFreeSegmentStepLimitV1,
   CODE_FREE_WORK_NODE_ID_V1,
   CODE_PLAN_MAX_ITEMS_V1,
   createCodePlanToolOverlayV1,
@@ -562,4 +563,13 @@ test("a refused approval inside the open node refuses that action, not the work"
   const node = session.graph.nodes[CODE_FREE_WORK_NODE_ID_V1]!;
   assert.equal(node.status, "ready");
   assert.equal(node.blocker, null);
+});
+
+test("a free segment's step limit is the open node's model calls left and the closing steps' allowance (CODE2-2)", () => {
+  // Past the runner's 100-step cap: a deep and an extended budget are reachable.
+  assert.equal(codeFreeSegmentStepLimitV1({ budget: { modelCalls: 240 }, spentModelCalls: 0, closingCount: 6 }), 256);
+  assert.equal(codeFreeSegmentStepLimitV1({ budget: { modelCalls: 400 }, spentModelCalls: 0, closingCount: 6 }), 416);
+  // A continuation gets what the node has left, never less than one step.
+  assert.equal(codeFreeSegmentStepLimitV1({ budget: { modelCalls: 240 }, spentModelCalls: 200, closingCount: 6 }), 56);
+  assert.equal(codeFreeSegmentStepLimitV1({ budget: { modelCalls: 40 }, spentModelCalls: 90, closingCount: 0 }), 4);
 });

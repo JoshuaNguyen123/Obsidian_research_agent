@@ -1186,6 +1186,7 @@ import {
   createCodePlanToolOverlayV1,
   describeCodeFreeWorkLeftV1,
   normalizeCodeAutonomyV1,
+  codeFreeSegmentStepLimitV1,
   normalizeCodeFreeBudgetV1,
   planCodeFreeWorkV1,
   type CodeAutonomyV1,
@@ -19727,22 +19728,26 @@ export async function runAgentMission({
       );
     }
   }
-  const codeFreeOpenAtLoopStart = (() => {
+  const codeFreeStepLimitAtLoopStart = (() => {
     const node = codeFreeOpenNodeV1();
-    return Boolean(
-      node && node.status !== "complete" && node.status !== "cancelled",
-    );
+    if (!node || node.status === "complete" || node.status === "cancelled") {
+      return null;
+    }
+    return codeFreeSegmentStepLimitV1({
+      budget: codeFreeBudgetV1,
+      spentModelCalls: getMissionOpenWorkStateV1(node).spent.modelCalls,
+      closingCount: Math.max(
+        0,
+        Object.keys(missionGraphSession?.graph.nodes ?? {}).length - 1,
+      ),
+    });
   })();
+  // A free pass's open node is bounded by its own model calls (CODE2-2), not
+  // by the runner's hard cap or the person's step setting, so a deep or an
+  // extended budget is reachable; the open node's own budget stop ends it.
   const stepLimit = Math.min(
-    // A free pass's open node is bounded by its own budget; the segment keeps
-    // the runner's safety limit and the person's step setting.
-    codeFreeOpenAtLoopStart
-      ? Math.min(
-          MAX_AGENT_STEPS,
-          runToolContext.settings?.maxAgentSteps ?? MAX_AGENT_STEPS,
-        )
-      : runPlan.maxStepsForRun,
-    MAX_AGENT_STEPS,
+    codeFreeStepLimitAtLoopStart ??
+      Math.min(runPlan.maxStepsForRun, MAX_AGENT_STEPS),
     normalizeInvocationStepLimit(providedMaxSteps),
   );
   const maxRunMs = effectiveMaxRunMs;
