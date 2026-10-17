@@ -58,6 +58,8 @@ async function runPass(input: {
   files?: Record<string, string>;
   /** The repository's protected controls and the confirmations each asks for. */
   protectedControls?: Record<string, 1 | 2>;
+  /** The person's step setting. */
+  maxAgentSteps?: number;
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
@@ -82,7 +84,7 @@ async function runPass(input: {
   const { context } = scriptedRunContext({
     prompt,
     now,
-    settings: scriptedRunSettings({ maxAgentSteps: 60 }),
+    settings: scriptedRunSettings({ maxAgentSteps: input.maxAgentSteps ?? 60 }),
   });
   const model = scriptedCodeModel(({ offered }) => input.decide(offered), input.structured);
   const approvals = autoApprovals({ deny: input.deny });
@@ -1055,6 +1057,44 @@ test("a guided pass whose model asks for its list and its read in one turn still
     ],
   );
   assert.deepEqual([...run.workspace.state.executed].sort(), [...expected.executed].sort());
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a free pass's open node is bounded by its own model calls, not the runner's step cap or the person's step setting (CODE2-2)", async () => {
+  // 30 distinct searches before the fix: past the person's step setting (20).
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    ...Array.from({ length: 30 }, (_, index) => call("code_workspace_search", { query: `offset ${index}` })),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ];
+  let openTurns = 0;
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    maxAgentSteps: 20,
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        openTurns += 1;
+        const next = open.shift();
+        return next ? { calls: [next] } : { content: "The off-by-one is fixed and the targeted check passes." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  // The segment's step limit is the node's 240 model calls and the closing
+  // steps' allowance, past MAX_AGENT_STEPS (100).
+  const limit = run.statuses
+    .map((status) => /^Agent step 1 of max (\d+)\.\.\.$/u.exec(status)?.[1])
+    .find((value) => value !== undefined);
+  assert.ok(Number(limit) >= 240, `step limit ${limit}`);
+  assert.ok(openTurns > 30, `${openTurns} open turns`);
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
 });

@@ -125,6 +125,22 @@ export function normalizeCodeFreeBudgetV1(
   };
 }
 
+/**
+ * The agent steps a segment may take while the open node is open (CODE2-2).
+ * The open node is bounded by its own model calls, not by the runner's
+ * hard step cap or the person's step setting, so a deep (240) or extended
+ * (400) budget is reachable; the closing nodes keep the allowance the model
+ * and tool budgets give them (two turns each, and four to finish).
+ */
+export function codeFreeSegmentStepLimitV1(input: {
+  budget: Pick<CodeFreeBudgetV1, "modelCalls">;
+  spentModelCalls: number;
+  closingCount: number;
+}): number {
+  const left = Math.max(0, input.budget.modelCalls - Math.max(0, input.spentModelCalls));
+  return Math.max(1, left + Math.max(0, input.closingCount) * 2 + 4);
+}
+
 /** The menu tools the registry has, in menu order. */
 export function codeFreeMenuToolNamesV1(
   available: ReadonlySet<string>,
