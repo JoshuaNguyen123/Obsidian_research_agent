@@ -1696,13 +1696,31 @@ export class MissionGraphSession {
         return this.record.graph;
       }
 
-      const fastTemplate = repairTemplate.dependencyIds
-        .map((dependencyId) => this.record.graph.nodes[dependencyId])
-        .find(
-          (candidate) =>
-            candidate?.status === "complete" &&
-            candidate.allowedTools.includes("code_validate_fast"),
-        );
+      // The fast validation the repair records, nearest first. A scratch
+      // workspace's ladder puts code_workspace_init_repository between the
+      // fast validation and its repair record, so the fast node is an
+      // ancestor of the repair, not always its direct dependency.
+      let fastTemplate: MissionNodeV3 | undefined;
+      const visited = new Set<string>([repairTemplate.id]);
+      let frontier = [...repairTemplate.dependencyIds];
+      while (!fastTemplate && frontier.length > 0) {
+        const next: string[] = [];
+        for (const dependencyId of frontier) {
+          if (visited.has(dependencyId)) continue;
+          visited.add(dependencyId);
+          const candidate = this.record.graph.nodes[dependencyId];
+          if (!candidate || candidate.status === "cancelled") continue;
+          if (
+            candidate.status === "complete" &&
+            candidate.allowedTools.includes("code_validate_fast")
+          ) {
+            fastTemplate = candidate;
+            break;
+          }
+          next.push(...candidate.dependencyIds);
+        }
+        frontier = next;
+      }
       if (!fastTemplate) {
         throw new Error(
           `Repair node ${repairTemplate.id} has no completed fast-validation dependency to repeat.`,

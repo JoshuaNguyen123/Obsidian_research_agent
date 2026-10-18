@@ -16221,10 +16221,61 @@ export async function runAgentMission({
         return blockedResult;
       }
     }
+    // The guided ladder binds a full-file write to the one path its step, the
+    // prompt or the last red check names. The free pass's open node names no
+    // path: the model chooses the file, and the tool's own expectedSha256
+    // check against what it read is the fence. Binding there refused every
+    // full-file write to a brief that names more than one file. Shorthand in
+    // place of a file is still never written over one.
+    if (
+      toolCall.name === "code_workspace_write_expected" &&
+      missionGraphExecution?.nodeId === CODE_FREE_WORK_NODE_ID_V1 &&
+      isIncompleteWorkspaceReplacementContent(toolCall.arguments.content)
+    ) {
+      const blockedResult: ToolExecutionResult = {
+        ok: false,
+        toolName: toolCall.name,
+        mutationState: "not_applied",
+        error: {
+          code: "workspace_replacement_incomplete",
+          message:
+            "The content is a placeholder, not the file: send the whole new file, or change part of it with code_workspace_patch.",
+        },
+      };
+      await finishMissionGraphTool(
+        missionGraphExecution,
+        toolCall.name,
+        blockedResult,
+      );
+      events.onTrace?.({
+        id: `${step}:${String(toolIndex)}:code_workspace_write_expected:free-incomplete`,
+        kind: "tool_rejected",
+        step,
+        toolName: toolCall.name,
+        message: blockedResult.error!.message,
+        error: blockedResult.error,
+      });
+      if (recordTranscript) {
+        appendToolTranscript({
+          messages,
+          toolCall,
+          resultContent: serializeToolResultForModel(blockedResult, toolResultSerialization),
+          origin,
+          fallbackId: buildToolCallFallbackId(
+            runId,
+            step,
+            toolIndex,
+            toolCall.name,
+          ),
+        });
+      }
+      return blockedResult;
+    }
     if (
       toolCall.name === "code_workspace_write_expected" &&
       missionGraphExecution &&
-      missionGraphSession
+      missionGraphSession &&
+      missionGraphExecution.nodeId !== CODE_FREE_WORK_NODE_ID_V1
     ) {
       const executionNode =
         missionGraphSession.graph.nodes[missionGraphExecution.nodeId];
@@ -24764,10 +24815,17 @@ export async function runAgentMission({
         step,
       };
 
+      // One hash-bound correction a response is the guided repair cycle's
+      // rule. In the free pass's open node each full-file write carries the
+      // SHA of its own read, so a second file written in the same response is
+      // fenced on its own and is not deferred.
+      const openWorkActive = ["ready", "running"].includes(
+        codeFreeOpenNodeV1()?.status ?? "",
+      );
       if (
         shouldDeferAdditionalWorkspaceCorrection(
           toolCall.name,
-          workspaceCorrectionAttemptedThisResponse,
+          workspaceCorrectionAttemptedThisResponse && !openWorkActive,
         )
       ) {
         const message =

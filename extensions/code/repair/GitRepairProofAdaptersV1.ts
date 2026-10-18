@@ -585,13 +585,38 @@ export class FixedArgvRepairProofAdapterV1
         true,
         gitIndexFile,
       );
-      await this.gitText(
-        worktreePath,
-        ["add", "--all", "--", ...authorizedPaths],
-        [0],
-        true,
-        gitIndexFile,
-      );
+      // A path the run made and then removed is in neither the base nor the
+      // worktree, and a pathspec that matches nothing makes `git add` fail the
+      // whole proof. It has nothing to stage, so it is left out; with nothing
+      // left at all the add is skipped, since `add --all` with no path would
+      // stage the whole tree.
+      const stageable: string[] = [];
+      for (const authorizedPath of authorizedPaths) {
+        const present = await fs
+          .lstat(path.join(worktreePath, ...authorizedPath.split("/")))
+          .then(() => true, () => false);
+        if (present) {
+          stageable.push(authorizedPath);
+          continue;
+        }
+        // Gone from the worktree: a deletion when the base has it.
+        const inBase = await this.gitText(
+          worktreePath,
+          ["rev-parse", "--verify", "--quiet", `${baseSha}:${authorizedPath}`],
+          [0, 1],
+          true,
+        );
+        if (inBase) stageable.push(authorizedPath);
+      }
+      if (stageable.length > 0) {
+        await this.gitText(
+          worktreePath,
+          ["add", "--all", "--", ...stageable],
+          [0],
+          true,
+          gitIndexFile,
+        );
+      }
       return await operation(gitIndexFile);
     } finally {
       const resolvedContainer = path.resolve(canonicalContainer);

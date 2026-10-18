@@ -547,6 +547,94 @@ test("added-only 3 MiB sandbox artifact is hash-proved through an ephemeral inde
   assert.equal(await gitText(canonicalWorktree, "status", "--porcelain=v1"), "");
 });
 
+test("a file the run made and then trashed is left out of the ephemeral-index proof", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "repair-trashed-probe-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repository = path.join(root, "repository");
+  const worktree = path.join(root, "worktree");
+  await fs.mkdir(path.join(repository, "src"), { recursive: true });
+  await git(repository, "init", "--initial-branch=main");
+  await git(repository, "config", "user.name", "Fixture");
+  await git(repository, "config", "user.email", "fixture@example.invalid");
+  await git(repository, "config", "core.autocrlf", "false");
+  await fs.writeFile(path.join(repository, "package.json"), "{\"scripts\":{\"test\":\"node --test\"}}\n");
+  await fs.writeFile(path.join(repository, "src", "app.js"), "export const add = (a, b) => a - b;\n");
+  await git(repository, "add", "--all");
+  await git(repository, "commit", "-m", "base");
+  const baseSha = await gitText(repository, "rev-parse", "HEAD");
+  await git(repository, "worktree", "add", "-b", "codex/trashed-probe", worktree, baseSha);
+  const canonicalRepository = await fs.realpath(repository);
+  const canonicalWorktree = await fs.realpath(worktree);
+  const manager = new WorkspaceManagerV2({
+    applicationDataRoot: path.join(root, "app-data"),
+    now: () => NOW,
+  });
+  await manager.registerTrustedRepositoryWorkspace({
+    workspaceId: "workspace-probe",
+    ownerRunId: "mission-probe",
+    profileKey: "profile-probe",
+    repositoryRoot: canonicalRepository,
+    worktreeRoot: canonicalWorktree,
+    branch: "codex/trashed-probe",
+    baseSha,
+    bindingFingerprint: SHA("4"),
+    trusted: true,
+  });
+  const lease = await manager.acquireLease("workspace-probe", "mission-probe");
+  const leaseId = lease.lease!.id;
+  const source = await manager.read("workspace-probe", "src/app.js");
+  await manager.patchExact("workspace-probe", leaseId, "src/app.js", source.sha256, [
+    { oldText: "a - b", newText: "a + b" },
+  ]);
+  // The run checks its work with a throwaway script, then trashes it.
+  const probe = await manager.createFile("workspace-probe", leaseId, ".tmp-probe.mjs", "console.log(1);\n");
+  await manager.trash("workspace-probe", leaseId, ".tmp-probe.mjs", probe.afterSha256!);
+  await manager.releaseLease("workspace-probe", leaseId);
+  assert.deepEqual(
+    [...(await manager.loadManifest("workspace-probe")).budget.changedPaths].sort(),
+    [".tmp-probe.mjs", "src/app.js"],
+    "the manager still names the trashed file as changed",
+  );
+  const profile = detectRepositoryProfileV2({
+    key: "profile-probe",
+    displayName: "Probe fixture",
+    repositoryRoot: canonicalRepository,
+    defaultBranch: "main",
+    files: ["package.json", "src/app.js"],
+    fileContents: { "package.json": "{\"scripts\":{\"test\":\"node --test\"}}\n" },
+    runtimeDigests: { node: SHA("5") },
+    allowedPaths: ["src", "package.json", ".tmp-probe.mjs"],
+  });
+  const runner = new SpawnFixedArgvGitRunnerV1();
+  const proof = new FixedArgvRepairProofAdapterV1({
+    workspaceManager: manager,
+    git: runner,
+    artifactHashReader: new FixedArgvArtifactHashReaderV1(runner),
+    getProfile: async () => profile,
+    now: () => NOW,
+  });
+  const request = normalizeCodeRepairRequestV1({
+    id: "request-probe",
+    runId: "mission-probe",
+    objective: "Fix add",
+    worktree: {
+      id: "workspace-probe",
+      path: canonicalWorktree,
+      repositoryRoot: canonicalRepository,
+      branch: "codex/trashed-probe",
+      baseSha,
+      profileId: profile.key,
+    },
+    commitMessage: "Fix add",
+  });
+  const rawDiff = await proof.readDiff({ operationId: "proof-probe", request });
+  assert.deepEqual(rawDiff.files.map(({ path, status }) => ({ path, status })), [
+    { path: "src/app.js", status: "modified" },
+  ]);
+  assert.match(rawDiff.patch, /a \+ b/u);
+  assert.equal(await gitText(canonicalWorktree, "diff", "--cached", "--name-only"), "");
+});
+
 async function sandboxAction(
   purpose: PreparedSandboxActionV2["purpose"],
   repairRequestId = "request-1",

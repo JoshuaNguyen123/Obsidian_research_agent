@@ -64,6 +64,8 @@ async function runPass(input: {
   maxAgentSteps?: number;
   /** Tools the registry has beside the workspace's. */
   extraTools?: AgentTool[];
+  /** The reflex completion gate, on by default in the product. */
+  reflex?: boolean;
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
@@ -88,7 +90,7 @@ async function runPass(input: {
   const { context } = scriptedRunContext({
     prompt,
     now,
-    settings: scriptedRunSettings({ maxAgentSteps: input.maxAgentSteps ?? 60 }),
+    settings: scriptedRunSettings({ maxAgentSteps: input.maxAgentSteps ?? 60, agenticReflexEnabled: input.reflex ?? false }),
   });
   const model = scriptedCodeModel(({ offered }) => input.decide(offered), input.structured);
   const approvals = autoApprovals({ deny: input.deny });
@@ -1190,4 +1192,75 @@ test("without Auto-apply a move and a trash still ask under write autonomy (CODE
     .filter((request) => request.toolName === "code_workspace_move" || request.toolName === "code_workspace_trash")
     .map((request) => request.toolName);
   assert.deepEqual(asked, ["code_workspace_move", "code_workspace_trash"]);
+});
+
+test("in the open node a full-file write goes to the file the model names, and shorthand for a file is refused", async () => {
+  const { createHash } = await import("node:crypto");
+  const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+  const run = await freeCallsPass([
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_read", { path: "src/pager.py" }),
+    call("code_workspace_write_expected", { path: "src/pager.py", expectedSha256: sha(BUGGY), content: "# ..." }),
+    call("code_workspace_write_expected", { path: "src/pager.py", expectedSha256: sha(BUGGY), content: FIXED }),
+    call("code_validate_targeted"),
+  ]);
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  const said = JSON.stringify(run.model.requests.map((request) => request.messages));
+  assert.match(said, /The content is a placeholder, not the file/u);
+  assert.doesNotMatch(said, /workspace read SHA and bounded content from the completed graph dependency/u);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("in the open node two files written whole in one response are both written, neither deferred", async () => {
+  const { createHash } = await import("node:crypto");
+  const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+  const turns: Call[][] = [
+    [{ name: "code_sandbox_status", arguments: {} }],
+    [call("code_workspace_create", { kind: "repository" })],
+    [call("code_workspace_read", { path: "src/pager.py" }), call("code_workspace_read", { path: "tests/test_pager.py" })],
+    [
+      call("code_workspace_write_expected", { path: "src/pager.py", expectedSha256: sha(BUGGY), content: FIXED }),
+      call("code_workspace_write_expected", {
+        path: "tests/test_pager.py",
+        expectedSha256: sha("assert offset(0, 10) == 0\n"),
+        content: TESTS_AFTER,
+      }),
+    ],
+    [call("code_validate_targeted")],
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free" },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = turns.shift();
+        return next ? { calls: next } : { content: "Fixed, with a second test." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.files.get("tests/test_pager.py"), TESTS_AFTER);
+  assert.ok(!run.statuses.some((status) => /may attempt only one hash-bound workspace correction/u.test(status)));
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("with the reflex gate on, a pass that commits finishes there instead of being told its write is missing", async () => {
+  const run = await runPass({
+    steps: [],
+    prompt: hostPassPrompt({ free: true }),
+    options: { codeAutonomy: "free" },
+    structured: codeWorkflowClassification,
+    reflex: true,
+    decide: shortFreeScript(),
+  });
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.ok(!run.statuses.some((status) => /Reflex completion gate missing/u.test(status)), run.statuses.join(" | "));
+  assert.equal(run.complete?.stopReason, "final");
 });

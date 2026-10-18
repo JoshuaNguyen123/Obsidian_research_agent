@@ -10,8 +10,27 @@ import {
 import { stripWriteVerificationPhrasesV1 } from "../claimLedger";
 import { hasWordCountIntent } from "../wordCountIntent";
 import { hasExplicitNoWebIntent, requiresWebEvidenceProof } from "../evidenceIntent";
+import { receiptSatisfiesProof } from "../missionPlan";
 
 export { WRITE_RECEIPT_MISSING, receiptsSatisfyWriteProof };
+
+/**
+ * A code workspace change or a verified commit is a coding pass's write, as
+ * the mission plan's own write_receipt predicate already reads it. The vault
+ * predicate alone never saw one, so a committed pass was told on every step
+ * that its write was missing until the step cap ended it as an error.
+ */
+function isCodeWriteReceipt(receipt: AgenticReflexInput["receipts"][number]): boolean {
+  const system = receipt.resource?.system;
+  return (
+    (system === "workspace" || system === "git") &&
+    receiptSatisfiesProof("write_receipt", {
+      toolName: receipt.toolName,
+      operation: receipt.operation,
+      resource: { system },
+    })
+  );
+}
 
 export function evaluateCompletion(input: AgenticReflexInput): CompletionSignal {
   if (isBlockedBroadUnscopedMutation(input)) {
@@ -32,6 +51,7 @@ export function evaluateCompletion(input: AgenticReflexInput): CompletionSignal 
     input.missionIntent.mode !== "chat_only" &&
     input.missionIntent.requireWriteCompletion &&
     !receiptsSatisfyWriteProof(input.receipts) &&
+    !input.receipts.some(isCodeWriteReceipt) &&
     !input.receipts.some((receipt) =>
       isCompletedAcceptedResearchPublicationReceipt(receipt),
     )
