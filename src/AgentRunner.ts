@@ -6453,6 +6453,11 @@ export async function runAgentMission({
   // Closing steps' tools the model asked for in the open node this step, which
   // the next step reads as the model saying the work is done (RAP CODE2-24).
   let codeFreeClosingAskedV1: string[] = [];
+  // Failure fingerprints the open node's calls met in this step's response
+  // (RAP CODE2-24). A call that fails as an earlier one in the same response
+  // did was written before the model could read that refusal, so it is not a
+  // second attempt at the call.
+  let codeFreeStepFailuresV1 = new Set<string>();
   /**
    * The model says the open coding work is done (CODE-18): by a reply with no
    * tool call, or (RAP CODE2-24) by asking for a closing step's tool, the same
@@ -6686,6 +6691,9 @@ export async function runAgentMission({
             code: result.error?.code ?? (validationFailed ? "validation_red" : "failed"),
             message: result.error?.message ?? null,
           });
+    const repeatInResponse =
+      failureFingerprint !== undefined && codeFreeStepFailuresV1.has(failureFingerprint);
+    if (failureFingerprint !== undefined) codeFreeStepFailuresV1.add(failureFingerprint);
     const revision = missionGraphSession.graph.revision + 1;
     const evidence = result.ok
       ? {
@@ -6731,6 +6739,7 @@ export async function runAgentMission({
         validationFailed,
         spent: codeFreeSpentNowV1(node),
         ...(plan ? { plan } : {}),
+        ...(repeatInResponse ? { repeatInResponse } : {}),
       },
     });
     const after = graph.nodes[execution.nodeId];
@@ -20583,6 +20592,7 @@ export async function runAgentMission({
       codeFreeClosingAskedV1 = [];
       await codeFreeModelSaysDoneV1({ step, said: "", asked });
     }
+    codeFreeStepFailuresV1 = new Set();
     events.onPlanningStart?.(step);
     // Mid-run steering applies here and only here: at a step boundary, after
     // the previous tool result is recorded and before the next request is
