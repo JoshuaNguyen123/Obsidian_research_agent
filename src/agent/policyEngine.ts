@@ -22,6 +22,7 @@ import {
   hasCodeDeliverableIntent,
   hasExplicitCodeExecutionProhibition,
 } from "./codeDeliverableIntent";
+import { hasExplicitNoWebIntent } from "./evidenceIntent";
 
 export type PolicyAction = "allow" | "require_approval" | "block";
 
@@ -544,12 +545,22 @@ export function resolvePolicyRoutedIntent({
     writeToolExposed,
     prompt,
   });
-  const resolved = resolveRoutedMissionIntent({
+  const routed = resolveRoutedMissionIntent({
     mode,
     modelIntent,
     regexIntent,
     confidenceThreshold,
   });
+  // Read authority is additive, but not past what the prompt rules out: an
+  // explicit local-only scope outranks the model's opinion that the web would
+  // help, as it does on the decision path (`routedIntentFromAssessmentV1`).
+  // Without it a router model that read a code change in a workspace as web
+  // research added web evidence to a prompt that said "no web research", and
+  // the run spent its budget searching and failed its own citation check.
+  const resolved: ResolvedRouterIntent =
+    routed.intent.needsWebEvidence && hasExplicitNoWebIntent(prompt ?? "")
+      ? { ...routed, intent: { ...routed.intent, needsWebEvidence: false } }
+      : routed;
   if (
     mode === "authority" &&
     resolved.source === "model" &&
