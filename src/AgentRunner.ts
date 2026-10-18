@@ -1188,6 +1188,7 @@ import {
   PERSON_COMMITTED_CODE_TOOLS_V1,
   createCodePlanToolOverlayV1,
   describeCodeFreeWorkLeftV1,
+  isMissingRepairRecordV1,
   normalizeCodeAutonomyV1,
   codeFreeSegmentStepLimitV1,
   normalizeCodeFreeBudgetV1,
@@ -6448,6 +6449,110 @@ export async function runAgentMission({
   // Replies that said the open work was done before a targeted validation had
   // passed, since the model last called a tool (CODE_FREE_UNCHECKED_DONE_LIMIT_V1).
   let codeFreeUncheckedDoneClaimsV1 = 0;
+  // Closing steps' tools the model asked for in the open node this step, which
+  // the next step reads as the model saying the work is done (RAP CODE2-24).
+  let codeFreeClosingAskedV1: string[] = [];
+  /**
+   * The model says the open coding work is done (CODE-18): by a reply with no
+   * tool call, or (RAP CODE2-24) by asking for a closing step's tool, the same
+   * claim made with the next step's name. Beam asked for code_validate_full,
+   * code_repair_record_cycle and code_commit_verified fourteen times in one
+   * open node, each deferred, none read as the claim it was. The node ends only
+   * after a targeted validation passed with no edit since, or after
+   * CODE_FREE_UNCHECKED_DONE_LIMIT_V1 claims without one, when its closing
+   * steps judge the work; otherwise the model is told what is owed. True when
+   * the node ended.
+   */
+  const codeFreeModelSaysDoneV1 = async (input: {
+    step: number;
+    said: string;
+    asked: readonly string[];
+  }): Promise<boolean> => {
+    const openNode = codeFreeOpenNodeV1();
+    if (!missionGraphSession || openNode?.status !== "ready") return false;
+    const state = getMissionOpenWorkStateV1(openNode);
+    const proven = missionOpenWorkReadyToCompleteV1(state);
+    if (!proven) codeFreeUncheckedDoneClaimsV1 += 1;
+    // RAP CODE2-24: a model that keeps saying it is done without the check
+    // is not told so for the rest of its budget. After the limit the node is
+    // handed to its closing steps, whose targeted validation judges the work.
+    const handOver =
+      !proven && codeFreeUncheckedDoneClaimsV1 >= CODE_FREE_UNCHECKED_DONE_LIMIT_V1;
+    if (proven || handOver) {
+      const completed = await missionGraphSession.completeOpenWork({
+        nodeId: openNode.id,
+        evidence: {
+          id: missionGraphReferenceId(
+            "evidence",
+            openNode.id,
+            missionGraphSession.graph.revision + 1,
+          ),
+          kind: "open-work-done",
+          fingerprint: await sha256MissionFingerprint({
+            nodeId: openNode.id,
+            calls: state.calls,
+            lastWriteCall: state.lastWriteCall,
+            lastTargetedPassCall: state.lastTargetedPassCall,
+            said: input.said.slice(0, 2_000),
+            ...(input.asked.length > 0 ? { asked: [...input.asked] } : {}),
+            ...(handOver ? { unchecked: true } : {}),
+          }),
+          observedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+        },
+        ...(handOver ? { unchecked: true } : {}),
+      });
+      if (completed.ok) {
+        const closing = codeFreeClosingToolNamesV1();
+        const message = handOver
+          ? `The model said ${codeFreeUncheckedDoneClaimsV1} times that the open coding work is done without a passing targeted validation. The closing steps check it now: ${closing.join(", ")}.`
+          : closing.length > 0
+            ? `The open coding work is done. The closing steps run now: ${closing.join(", ")}.`
+            : "The open coding work is done.";
+        events.onStatus?.(message);
+        events.onTrace?.({
+          id: `${handOver ? "code-free-work-handed-over" : "code-free-work-done"}-${input.step}`,
+          kind: "status",
+          step: input.step,
+          message,
+          outputPreview: {
+            calls: state.calls,
+            closing,
+            unchecked: handOver,
+            ...(input.asked.length > 0 ? { asked: [...input.asked] } : {}),
+          },
+        });
+        messages.push({
+          role: "system",
+          content: `${message} Call them in that order with the same workspace and repair request.`,
+        });
+        codeFreeUncheckedDoneClaimsV1 = 0;
+        return true;
+      }
+    }
+    const owed =
+      state.lastTargetedPassCall === null
+        ? "No targeted validation has passed yet."
+        : "The workspace changed after the last passing targeted validation.";
+    events.onTrace?.({
+      id: `code-free-work-not-done-${input.step}`,
+      kind: "status",
+      step: input.step,
+      message: input.asked.length > 0
+        ? `The model asked for ${input.asked.join(", ")}, saying the work is done, but: ${owed}`
+        : `The model said the work is done, but: ${owed}`,
+      outputPreview: {
+        calls: state.calls,
+        ...(input.asked.length > 0 ? { asked: [...input.asked] } : {}),
+      },
+    });
+    messages.push({
+      role: "system",
+      content: input.asked.length > 0
+        ? `Asking for ${input.asked.join(", ")} says the open work is done, but: ${owed} Run code_validate_targeted on the current files, and correct what it reports; once it passes, say the work is done and the closing steps run.`
+        : `${owed} Run code_validate_targeted on the current files, and correct what it reports, before saying the work is done.`,
+    });
+    return false;
+  };
   // The plan the running code_plan_update call recorded, for its finish.
   let codeFreePendingPlanV1: {
     revision: number;
@@ -6560,11 +6665,16 @@ export async function runAgentMission({
     if (!node) return;
     const validationFailed = hasFailedCodeValidationStatus(toolName, result);
     const ok = result.ok && !validationFailed;
+    // RAP CODE2-24: no repair record exists inside the open node, so a status
+    // read finding none is an answer and carries no failure fingerprint: two of
+    // them must not end the node as two identical failures do.
+    const noRepairRecordYet =
+      !result.ok && isMissingRepairRecordV1(toolName, result.error);
     const validationReceipt =
       isRecord(result.output) && isRecord(result.output.validationReceipt)
         ? result.output.validationReceipt
         : null;
-    const failureFingerprint = ok
+    const failureFingerprint = ok || noRepairRecordYet
       ? undefined
       : validationFailed &&
           typeof validationReceipt?.failureFingerprint === "string" &&
@@ -6628,9 +6738,16 @@ export async function runAgentMission({
         role: "system",
         content: [
           `${toolName} completed red.`,
-          "Read the failure (the validation's diagnostic, code_repair_status, or the files it names), correct it with a real workspace edit, then validate again.",
+          "Read the failure (the validation's own diagnostic, or the files it names), correct it with a real workspace edit, then validate again.",
           "The same failure surviving two corrections stops the pass.",
         ].join(" "),
+      });
+    }
+    if (noRepairRecordYet && after?.status === "ready") {
+      messages.push({
+        role: "system",
+        content:
+          "code_repair_status has nothing to read yet: the repair record is written by the closing steps, after the open work is done. A validation's own result carries its diagnostic; read that instead.",
       });
     }
     if (after?.status === "blocked") {
@@ -20456,6 +20573,15 @@ export async function runAgentMission({
       await parkRunForExpiredApproval(expiredInteractiveApproval, step, stepLimit);
       return;
     }
+    // RAP CODE2-24: the last step asked for a closing step's tool from the
+    // open node. Its refusal is in the transcript; read the ask as the model
+    // saying the work is done before this step's menu is built, so a node it
+    // ends offers the closing steps now.
+    if (codeFreeClosingAskedV1.length > 0) {
+      const asked = codeFreeClosingAskedV1;
+      codeFreeClosingAskedV1 = [];
+      await codeFreeModelSaysDoneV1({ step, said: "", asked });
+    }
     events.onPlanningStart?.(step);
     // Mid-run steering applies here and only here: at a step boundary, after
     // the previous tool result is recorded and before the next request is
@@ -22588,76 +22714,11 @@ export async function runAgentMission({
       codeFreeOpenNodeV1()?.status === "ready"
     ) {
       // CODE-18: in the open node a reply without a tool call is the model
-      // saying the work is done. It ends the node only after a targeted
-      // validation passed with no edit since; otherwise the model is told so.
-      const openNode = codeFreeOpenNodeV1()!;
-      const state = getMissionOpenWorkStateV1(openNode);
-      const proven = missionOpenWorkReadyToCompleteV1(state);
-      if (!proven) codeFreeUncheckedDoneClaimsV1 += 1;
-      // RAP CODE2-24: a model that keeps saying it is done without the check
-      // is not told so for the rest of its budget. After the limit the node is
-      // handed to its closing steps, whose targeted validation judges the work.
-      const handOver =
-        !proven && codeFreeUncheckedDoneClaimsV1 >= CODE_FREE_UNCHECKED_DONE_LIMIT_V1;
-      if (proven || handOver) {
-        const completed = await missionGraphSession.completeOpenWork({
-          nodeId: openNode.id,
-          evidence: {
-            id: missionGraphReferenceId(
-              "evidence",
-              openNode.id,
-              missionGraphSession.graph.revision + 1,
-            ),
-            kind: "open-work-done",
-            fingerprint: await sha256MissionFingerprint({
-              nodeId: openNode.id,
-              calls: state.calls,
-              lastWriteCall: state.lastWriteCall,
-              lastTargetedPassCall: state.lastTargetedPassCall,
-              said: sanitizedStepResponseContent.slice(0, 2_000),
-              ...(handOver ? { unchecked: true } : {}),
-            }),
-            observedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
-          },
-          ...(handOver ? { unchecked: true } : {}),
-        });
-        if (completed.ok) {
-          const closing = codeFreeClosingToolNamesV1();
-          const message = handOver
-            ? `The model said ${codeFreeUncheckedDoneClaimsV1} times that the open coding work is done without a passing targeted validation. The closing steps check it now: ${closing.join(", ")}.`
-            : closing.length > 0
-              ? `The open coding work is done. The closing steps run now: ${closing.join(", ")}.`
-              : "The open coding work is done.";
-          events.onStatus?.(message);
-          events.onTrace?.({
-            id: `${handOver ? "code-free-work-handed-over" : "code-free-work-done"}-${step}`,
-            kind: "status",
-            step,
-            message,
-            outputPreview: { calls: state.calls, closing, unchecked: handOver },
-          });
-          messages.push({
-            role: "system",
-            content: `${message} Call them in that order with the same workspace and repair request.`,
-          });
-          codeFreeUncheckedDoneClaimsV1 = 0;
-          continue;
-        }
-      }
-      const owed =
-        state.lastTargetedPassCall === null
-          ? "No targeted validation has passed yet."
-          : "The workspace changed after the last passing targeted validation.";
-      events.onTrace?.({
-        id: `code-free-work-not-done-${step}`,
-        kind: "status",
+      // saying the work is done (codeFreeModelSaysDoneV1).
+      await codeFreeModelSaysDoneV1({
         step,
-        message: `The model said the work is done, but: ${owed}`,
-        outputPreview: { calls: state.calls },
-      });
-      messages.push({
-        role: "system",
-        content: `${owed} Run code_validate_targeted on the current files, and correct what it reports, before saying the work is done.`,
+        said: sanitizedStepResponseContent,
+        asked: [],
       });
       continue;
     }
@@ -25315,6 +25376,19 @@ export async function runAgentMission({
           fallbackId: `${toolEventBase.id}:rejected`,
         });
         shouldReplanAfterUnavailableTool = true;
+        // RAP CODE2-24: from the open node, a closing step's tool is the model
+        // saying the work is done. The call stays refused; the next step reads
+        // the claim (codeFreeModelSaysDoneV1), once for the whole response.
+        if (
+          pendingGraphNode &&
+          pendingGraphNode.id !== CODE_FREE_WORK_NODE_ID_V1 &&
+          codeFreeOpenNodeV1()?.status === "ready" &&
+          !codeFreeOpenNodeV1()!.allowedTools.includes(toolCall.name) &&
+          codeFreeClosingToolNamesV1().includes(toolCall.name) &&
+          !codeFreeClosingAskedV1.includes(toolCall.name)
+        ) {
+          codeFreeClosingAskedV1.push(toolCall.name);
+        }
         toolIndex += 1;
         continue;
       }
