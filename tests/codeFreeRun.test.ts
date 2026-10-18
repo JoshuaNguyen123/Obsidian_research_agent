@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { runAgentMission, type AgentRunCompleteEvent } from "../src/AgentRunner";
+import { missionRequiresClaimGroundingV1, runAgentMission, type AgentRunCompleteEvent } from "../src/AgentRunner";
+import { shouldRequireClaimGrounding } from "../src/agent/claimLedger";
 import type { MissionGraphV3 } from "../src/agent/missionGraphV3";
 import { CODE_FREE_UNCHECKED_DONE_LIMIT_V1, type CodePlanUpdateEventV1 } from "../src/agent/codeFreeWorkV1";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
@@ -1281,6 +1282,54 @@ test("in the open node code_repair_status finding no repair record is an answer,
   // The red check's own message no longer points at a read that cannot answer in the open node.
   assert.ok(said.some((text) => text.startsWith("code_validate_fast completed red.") && !text.includes("code_repair_status")));
   assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a coding mission's quotes and checks are about its code: no claim grounding unless it asks for citations in words that cannot be (RAP CODE2-24)", () => {
+  const csv = codePassPromptV1("Repair the CSV import/export helpers to preserve quoted commas, escaped quotes, empty fields and embedded newlines.", GUIDED_PASS_STEPS_V1);
+  // The keyword rule alone reads "quoted" as an ask for quotation-level grounding; the mission rule does not.
+  assert.equal(shouldRequireClaimGrounding(csv), true);
+  assert.equal(missionRequiresClaimGroundingV1(csv), false);
+  assert.equal(missionRequiresClaimGroundingV1(codePassPromptV1("Fix the parser and verify the tests pass.", GUIDED_PASS_STEPS_V1)), false);
+  // A coding mission that asks for its sources still grounds its claims.
+  assert.equal(missionRequiresClaimGroundingV1(codePassPromptV1("Fix the CSV quoting as RFC 4180 says, and cite the passage of the RFC you follow.", GUIDED_PASS_STEPS_V1)), true);
+  // A mission that is not a coding mission is unchanged.
+  for (const prompt of ["Summarize the attached note with quotations from it.", "Verify the claims in this note against its sources.", "Write a brief on CSV quoting."]) {
+    assert.equal(missionRequiresClaimGroundingV1(prompt), shouldRequireClaimGrounding(prompt), prompt);
+  }
+});
+
+test("a coding pass about quoting finishes on its verified commit: its summary is not held for citations it cannot have (RAP CODE2-24)", async () => {
+  // deepseek and glm on the pilot's CSV task: both committed, both had the summary held for claim grounding, and both
+  // went on reading files and verifying citations for half an hour until the run failed.
+  const open: Array<Call | string> = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+    "The quoting is fixed and checked.",
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    prompt: codePassPromptV1("Repair the CSV import/export helpers to preserve quoted commas, escaped quotes, empty fields and embedded newlines.", GUIDED_PASS_STEPS_V1),
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        if (next && typeof next !== "string") return { calls: [next] };
+        return { content: typeof next === "string" ? next : "Done." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return {
+        content:
+          'Fixed the CSV helpers: a field "a,b" now stays one field, an escaped "" inside quotes stays a quote, and an empty field stays empty. The targeted and full validations passed and the change is in a verified commit.',
+      };
+    },
+  });
+  assert.deepEqual(run.statuses.filter((status) => /claim_grounding/u.test(status)), []);
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
 });
