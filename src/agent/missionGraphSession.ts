@@ -278,6 +278,11 @@ export interface MissionOpenWorkCallV1 {
   spent?: MissionOpenWorkSpentV1;
   /** The to-do list this call recorded. */
   plan?: MissionOpenWorkPlanV1;
+  /**
+   * The call failed as an earlier call in the same model response did. The model wrote both before it could read the
+   * first refusal, so the repeat is not a second attempt and leaves the failure counts as they were.
+   */
+  repeatInResponse?: boolean;
 }
 
 /**
@@ -1248,7 +1253,10 @@ export class MissionGraphSession {
     const failures = state.failures.map((failure) => ({ ...failure }));
     let consecutive = state.consecutive ? { ...state.consecutive } : null;
     let seen = 0;
-    if (fingerprint) {
+    if (fingerprint && result.openWork?.repeatInResponse === true) {
+      // RAP CODE2-24: the same refusal twice in one response is one attempt; the failure counts stay as they were.
+      seen = failures.find((failure) => failure.fingerprint === fingerprint)?.count ?? 0;
+    } else if (fingerprint) {
       const existing = failures.find((failure) => failure.fingerprint === fingerprint);
       if (existing) {
         existing.count += 1;

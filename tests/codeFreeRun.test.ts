@@ -69,6 +69,8 @@ async function runPass(input: {
   reflex?: boolean;
   /** code_repair_status as the code runtime answers before any repair record exists. */
   noRepairRecord?: boolean;
+  /** code_sandbox_run refusing an argument with a line break, as the sandbox command policy does. */
+  refuseLineBreaks?: boolean;
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
@@ -123,7 +125,22 @@ async function runPass(input: {
                     },
                   }
                 : tool)
-          : workspace.tools),
+          : workspace.tools
+        ).map((tool) =>
+          input.refuseLineBreaks && tool.name === "code_sandbox_run" && tool.prepare
+            ? {
+                ...tool,
+                async prepare(args: Record<string, unknown>, context: Parameters<NonNullable<AgentTool["prepare"]>>[1]) {
+                  const argv = Array.isArray(args.argv) ? args.argv.map(String) : [];
+                  if (argv.some((arg) => /[\r\n]/u.test(arg))) {
+                    // SandboxCommandPolicyV1, before anything is staged.
+                    throw Object.assign(new Error("An argument cannot hold a line break."), { code: "command_args" });
+                  }
+                  return tool.prepare!(args, context);
+                },
+              }
+            : tool,
+        ),
         ...(input.extraTools ?? []),
       ]),
       toolContext: context,
@@ -1284,6 +1301,76 @@ test("in the open node code_repair_status finding no repair record is an answer,
   assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
+});
+
+/** A multi-line `python3 -c`, as glm sent on the pilot's CSV task. */
+function multiLineCheck(tag: string): Call {
+  return call("code_sandbox_run", { argv: ["python3", "-c", `from src.pager import offset\nprint(offset(0, 10), ${JSON.stringify(tag)})`] });
+}
+
+test("the same refusal twice in one response is one attempt, so the pass goes on to its fix (RAP CODE2-24)", async () => {
+  // glm on the pilot's CSV task sent two multi-line programs to the sandbox in one response; the policy refused both
+  // the same way before the model had read either refusal, and the two counted as two identical failures and ended
+  // the pass with the work done.
+  const open: Array<Call[] | string> = [
+    [{ name: "code_sandbox_status", arguments: {} }],
+    [call("code_workspace_create", { kind: "repository" })],
+    [multiLineCheck("first"), multiLineCheck("second")],
+    [call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] })],
+    [call("code_validate_targeted")],
+    "The fix is in and checked.",
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    refuseLineBreaks: true,
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        if (next && typeof next !== "string") return { calls: next };
+        return { content: typeof next === "string" ? next : "Done." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  assert.deepEqual(run.statuses.filter((status) => status.startsWith("The free coding pass stopped")), []);
+  assert.deepEqual(run.workspace.state.commands, [], "neither program ran");
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("the same refusal in the next response still ends the open node: the model was told (RAP CODE2-24)", async () => {
+  const open: Array<Call[] | string> = [
+    [{ name: "code_sandbox_status", arguments: {} }],
+    [call("code_workspace_create", { kind: "repository" })],
+    [multiLineCheck("first")],
+    [multiLineCheck("again")],
+    [call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] })],
+    "Done.",
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    refuseLineBreaks: true,
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        if (next && typeof next !== "string") return { calls: next };
+        return { content: typeof next === "string" ? next : "Done." };
+      }
+      return { content: "Done." };
+    },
+  });
+  assert.ok(
+    run.statuses.some((status) => status.startsWith("The free coding pass stopped") && status.includes("cannot hold a line break")),
+    `the pass stopped on the repeated refusal: ${run.statuses.filter((status) => status.startsWith("The free")).join(" | ")}`,
+  );
+  assert.equal(run.workspace.state.files.get("src/pager.py"), BUGGY);
+  assert.equal(run.workspace.state.commits.length, 0);
 });
 
 test("a coding mission's quotes and checks are about its code: no claim grounding unless it asks for citations in words that cannot be (RAP CODE2-24)", () => {
