@@ -68,6 +68,23 @@ export const CODE_PLAN_MAX_TEXT_CHARS_V1 = 200;
 export const CODE_FREE_UNCHECKED_DONE_LIMIT_V1 = 3;
 
 /**
+ * A `code_repair_status` read that found no repair record (RAP CODE2-24). The
+ * open node writes none: `code_repair_record_cycle` is a closing step, so a
+ * status read inside the node always finds nothing, and that is an answer, not
+ * a failure for the two-identical-failures rule to count. Beam read it twice
+ * after a red check, as the node's own message told it to, and the pass ended
+ * on "No durable code repair checkpoint exists".
+ */
+export function isMissingRepairRecordV1(
+  toolName: string,
+  error: { code?: string; message?: string } | null | undefined,
+): boolean {
+  if (toolName !== "code_repair_status" || !error) return false;
+  return error.code === "repair_checkpoint_missing" ||
+    /^No durable code repair checkpoint exists\b/u.test(error.message ?? "");
+}
+
+/**
  * The open node's menu, in the order the model is offered it. A tool is on it
  * only when the registry has it, so a tool a later core adds
  * (`code_workspace_apply_patch`, `code_sandbox_run`) or a host provides

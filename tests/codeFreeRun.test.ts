@@ -66,6 +66,8 @@ async function runPass(input: {
   extraTools?: AgentTool[];
   /** The reflex completion gate, on by default in the product. */
   reflex?: boolean;
+  /** code_repair_status as the code runtime answers before any repair record exists. */
+  noRepairRecord?: boolean;
 }) {
   const now = () => new Date("2026-10-16T12:00:00.000Z");
   const prompt = input.prompt ?? codePassPromptV1(OBJECTIVE, input.steps);
@@ -105,7 +107,24 @@ async function runPass(input: {
       prompt,
       runId: "run-code-free",
       modelClient: model.client,
-      toolRegistry: new DefaultToolRegistry([...workspace.tools, ...(input.extraTools ?? [])]),
+      toolRegistry: new DefaultToolRegistry([
+        ...(input.noRepairRecord
+          ? workspace.tools.map((tool) =>
+              tool.name === "code_repair_status"
+                ? {
+                    ...tool,
+                    async execute() {
+                      // CodeRepairToolRuntimeV1.readStatus with no checkpoint saved.
+                      throw Object.assign(
+                        new Error(`No durable code repair checkpoint exists for code-repair:run-code-free:${WORKSPACE}:repair-1.`),
+                        { code: "repair_checkpoint_missing" },
+                      );
+                    },
+                  }
+                : tool)
+          : workspace.tools),
+        ...(input.extraTools ?? []),
+      ]),
       toolContext: context,
       enableStreaming: false,
       interactiveApprovals: true,
@@ -1143,6 +1162,124 @@ test("a model that keeps saying it is done without the targeted check hands the 
   const turns = run.model.requests.filter((request) => !request.format).length;
   assert.ok(turns < 20, `${turns} model turns`);
   // The closing checks judged the work: they passed, and the pass committed.
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a model that asks for a closing check from the open node, after its targeted check passed, has said the work is done (RAP CODE2-24)", async () => {
+  // Beam on the pilot: with the fix checked it asked for code_validate_full and code_repair_record_cycle from the open
+  // node instead of saying it was done; each was deferred and none was read as the claim it was.
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+  ];
+  let asked = 0;
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        if (next) return { calls: [next] };
+        asked += 1;
+        return { calls: [call("code_validate_full"), call("code_repair_record_cycle")] };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  // One ask, for two closing tools at once, ends the node: never a loop of deferrals.
+  assert.equal(asked, 1);
+  assert.ok(
+    run.statuses.includes(`The open coding work is done. The closing steps run now: ${CLOSING.join(", ")}.`),
+    run.statuses.filter((status) => /open coding work|free coding pass/u.test(status)).join("\n"),
+  );
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a model that keeps asking for the closing checks without the targeted check hands the open node over at the limit (RAP CODE2-24)", async () => {
+  const open: Call[] = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+  ];
+  const closingAsks = ["code_validate_full", "code_repair_record_cycle", "code_commit_verified"];
+  let asked = 0;
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        if (next) return { calls: [next] };
+        asked += 1;
+        return { calls: [call(closingAsks[(asked - 1) % closingAsks.length]!)] };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  assert.equal(asked, CODE_FREE_UNCHECKED_DONE_LIMIT_V1);
+  assert.deepEqual(
+    run.statuses.filter((status) => status.startsWith("The model said ")),
+    [`The model said ${CODE_FREE_UNCHECKED_DONE_LIMIT_V1} times that the open coding work is done without a passing targeted validation. The closing steps check it now: ${CLOSING.join(", ")}.`],
+  );
+  // Each ask before the limit was told what is owed, in words that name what it asked for.
+  const told = run.model.requests.flatMap((request) =>
+    request.messages.filter((message) => message.role === "system" && /^Asking for code_/u.test(String(message.content ?? ""))),
+  );
+  assert.ok(told.length > 0, "the model was told what an ask for a closing check still owes");
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("in the open node code_repair_status finding no repair record is an answer, so reading it twice does not end the pass (RAP CODE2-24)", async () => {
+  // Beam on the pilot read code_repair_status twice after a red check, as the open node's own message told it to;
+  // the open node writes no repair record, both reads failed the same way, and the pass ended on them.
+  const open: Array<Call | string> = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_validate_fast"),
+    call("code_repair_status"),
+    call("code_repair_status"),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    call("code_validate_targeted"),
+    "The fix is in and checked.",
+  ];
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    noRepairRecord: true,
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        if (next && typeof next !== "string") return { calls: [next] };
+        return { content: typeof next === "string" ? next : "Done." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  assert.deepEqual(run.statuses.filter((status) => status.startsWith("The free coding pass stopped")), []);
+  const said = run.model.requests.flatMap((request) =>
+    request.messages
+      .filter((message) => message.role === "system")
+      .map((message) => String(message.content ?? "")),
+  );
+  assert.ok(said.some((text) => text.startsWith("code_repair_status has nothing to read yet")), "the model was told why");
+  // The red check's own message no longer points at a read that cannot answer in the open node.
+  assert.ok(said.some((text) => text.startsWith("code_validate_fast completed red.") && !text.includes("code_repair_status")));
   assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");
