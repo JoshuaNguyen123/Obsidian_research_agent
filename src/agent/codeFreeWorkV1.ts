@@ -59,6 +59,15 @@ export const CODE_PLAN_MAX_ITEMS_V1 = 20;
 export const CODE_PLAN_MAX_TEXT_CHARS_V1 = 200;
 
 /**
+ * How many times in a row the model may say the open work is done without a
+ * passing targeted validation before the open node is handed to its closing
+ * steps, which run that validation (RAP CODE2-24). Each time it is told what is
+ * owed; a model that keeps answering in prose instead spent 200 turns of a
+ * 240-turn budget, so after this many the checks decide instead of the model.
+ */
+export const CODE_FREE_UNCHECKED_DONE_LIMIT_V1 = 3;
+
+/**
  * The open node's menu, in the order the model is offered it. A tool is on it
  * only when the registry has it, so a tool a later core adds
  * (`code_workspace_apply_patch`, `code_sandbox_run`) or a host provides

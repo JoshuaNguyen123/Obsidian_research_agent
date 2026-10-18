@@ -510,6 +510,33 @@ test("the open node stays ready between calls and completes only after a targete
   assert.equal(fast?.status, "ready", "the closing steps start once the open node is done");
 });
 
+test("the open node is handed over unchecked only while a closing step still runs a targeted validation (RAP CODE2-24)", async () => {
+  const session = await openSession(8, "code-free-unchecked");
+  const nodeId = CODE_FREE_WORK_NODE_ID_V1;
+  const early = await session.completeOpenWork({ nodeId, evidence: evidence("open-work-done") });
+  assert.equal(early.ok, false, "the model's word alone still does not end the node");
+  const handed = await session.completeOpenWork({ nodeId, evidence: evidence("open-work-done"), unchecked: true });
+  assert.equal(handed.ok, true);
+  assert.equal(session.graph.nodes[nodeId]!.status, "complete");
+  const fast = Object.values(session.graph.nodes).find(
+    (candidate) => candidate.id !== nodeId && candidate.allowedTools.includes("code_validate_fast"),
+  );
+  assert.equal(fast?.status, "ready", "the closing checks start, and judge the work");
+
+  // With no targeted validation left to run, handing over would skip the check: refused.
+  const { graph } = await freeGraph({ missionId: "code-free-unchecked-none" });
+  for (const candidate of Object.values(graph.nodes)) {
+    if (candidate.id !== nodeId && candidate.allowedTools.includes("code_validate_targeted")) candidate.status = "cancelled";
+  }
+  const bare = await MissionGraphSession.open({ context: vaultContext(), initialGraph: graph });
+  const refused = await bare.completeOpenWork({ nodeId, evidence: evidence("open-work-done"), unchecked: true });
+  assert.deepEqual(refused, {
+    ok: false,
+    reason: "No closing step runs a targeted validation, so the open work cannot be handed over unchecked.",
+  });
+  assert.equal(bare.graph.nodes[nodeId]!.status, "ready");
+});
+
 test("the same validation failure surviving two corrections stops the open node", async () => {
   const session = await openSession(12, "code-free-unchanged");
   const red = async () => {

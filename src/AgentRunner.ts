@@ -1181,6 +1181,7 @@ import {
   type MissionOpenWorkSpentV1,
 } from "./agent/missionGraphSession";
 import {
+  CODE_FREE_UNCHECKED_DONE_LIMIT_V1,
   CODE_FREE_WORK_NODE_ID_V1,
   CODE_FREE_WRITE_TOOLS_V1,
   CODE_PLAN_UPDATE_TOOL_NAME_V1,
@@ -6444,6 +6445,9 @@ export async function runAgentMission({
       ms: baseline.spent.ms + Math.max(0, Math.round(nowMs() - baseline.at)),
     };
   };
+  // Replies that said the open work was done before a targeted validation had
+  // passed, since the model last called a tool (CODE_FREE_UNCHECKED_DONE_LIMIT_V1).
+  let codeFreeUncheckedDoneClaimsV1 = 0;
   // The plan the running code_plan_update call recorded, for its finish.
   let codeFreePendingPlanV1: {
     revision: number;
@@ -6481,6 +6485,8 @@ export async function runAgentMission({
     } = {},
   ): Promise<MissionGraphToolExecution | null> => {
     if (!missionGraphSession) return null;
+    // A tool call is the model working, not saying it is done.
+    codeFreeUncheckedDoneClaimsV1 = 0;
     // Recovery already offers this exact diagnostic-selected read. Permit its
     // bounded continuation in exact plans too; the normal verified-workspace
     // binding below fixes its arguments before the registry can execute it.
@@ -22586,7 +22592,14 @@ export async function runAgentMission({
       // validation passed with no edit since; otherwise the model is told so.
       const openNode = codeFreeOpenNodeV1()!;
       const state = getMissionOpenWorkStateV1(openNode);
-      if (missionOpenWorkReadyToCompleteV1(state)) {
+      const proven = missionOpenWorkReadyToCompleteV1(state);
+      if (!proven) codeFreeUncheckedDoneClaimsV1 += 1;
+      // RAP CODE2-24: a model that keeps saying it is done without the check
+      // is not told so for the rest of its budget. After the limit the node is
+      // handed to its closing steps, whose targeted validation judges the work.
+      const handOver =
+        !proven && codeFreeUncheckedDoneClaimsV1 >= CODE_FREE_UNCHECKED_DONE_LIMIT_V1;
+      if (proven || handOver) {
         const completed = await missionGraphSession.completeOpenWork({
           nodeId: openNode.id,
           evidence: {
@@ -22602,27 +22615,32 @@ export async function runAgentMission({
               lastWriteCall: state.lastWriteCall,
               lastTargetedPassCall: state.lastTargetedPassCall,
               said: sanitizedStepResponseContent.slice(0, 2_000),
+              ...(handOver ? { unchecked: true } : {}),
             }),
             observedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
           },
+          ...(handOver ? { unchecked: true } : {}),
         });
         if (completed.ok) {
           const closing = codeFreeClosingToolNamesV1();
-          const message = closing.length > 0
-            ? `The open coding work is done. The closing steps run now: ${closing.join(", ")}.`
-            : "The open coding work is done.";
+          const message = handOver
+            ? `The model said ${codeFreeUncheckedDoneClaimsV1} times that the open coding work is done without a passing targeted validation. The closing steps check it now: ${closing.join(", ")}.`
+            : closing.length > 0
+              ? `The open coding work is done. The closing steps run now: ${closing.join(", ")}.`
+              : "The open coding work is done.";
           events.onStatus?.(message);
           events.onTrace?.({
-            id: `code-free-work-done-${step}`,
+            id: `${handOver ? "code-free-work-handed-over" : "code-free-work-done"}-${step}`,
             kind: "status",
             step,
             message,
-            outputPreview: { calls: state.calls, closing },
+            outputPreview: { calls: state.calls, closing, unchecked: handOver },
           });
           messages.push({
             role: "system",
             content: `${message} Call them in that order with the same workspace and repair request.`,
           });
+          codeFreeUncheckedDoneClaimsV1 = 0;
           continue;
         }
       }
