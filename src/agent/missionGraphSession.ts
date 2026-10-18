@@ -1330,10 +1330,15 @@ export class MissionGraphSession {
         observedAt: this.now(),
       },
     ];
-    if (result.evidence) {
+    // A call that repeats one the node already holds proof of adds nothing to it: a second identical attach is the
+    // same prepared receipt, named by its arguments, and appending it again failed the graph and ended the pass. The
+    // same id with other content is still the graph's to refuse.
+    const held = (items: ReadonlyArray<{ id: string; fingerprint: string }>, ref: { id: string; fingerprint: string }) =>
+      items.some((item) => item.id === ref.id && item.fingerprint === ref.fingerprint);
+    if (result.evidence && !held(node.evidence, result.evidence)) {
       operations.push({ op: "append_evidence", nodeId: node.id, evidence: result.evidence });
     }
-    if (result.receipt) {
+    if (result.receipt && !held(node.receipts, result.receipt)) {
       operations.push({ op: "append_receipt", nodeId: node.id, receipt: result.receipt });
     }
     operations.push(
