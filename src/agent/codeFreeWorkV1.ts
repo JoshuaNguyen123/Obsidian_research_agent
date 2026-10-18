@@ -94,6 +94,20 @@ export const CODE_FREE_MENU_V1 = Object.freeze([
 ] as const);
 
 /**
+ * Steps that need the run to own its workspace (CODE2-24). A run attached to a
+ * person's workspace changes and checks its files and the person commits
+ * them, so its ladder leaves these out: the code runtime refuses the repair
+ * cycle record and the verified commit there, publication follows the commit,
+ * and promoting a scratch workspace to a repository would take it over.
+ */
+export const PERSON_COMMITTED_CODE_TOOLS_V1: ReadonlySet<string> = new Set([
+  "code_repair_record_cycle",
+  "code_commit_verified",
+  "publish_verified_code_to_github",
+  "code_workspace_init_repository",
+]);
+
+/**
  * Writes that change the workspace's files, after which a check is owed. An
  * append is one: a ladder whose only write was an append (a brief that says
  * "append") was planned as a guided pass, not the open node.

@@ -274,6 +274,29 @@ test("mission acceptance fails when a required write has no receipt", () => {
   assert.ok(result.missing.includes("write_receipt"));
 });
 
+test("a coding pass's change to its files is its write, and a commit asked for is still required by name (CODE2-24)", () => {
+  const accept = (receipts: Array<Record<string, unknown>>, requiredTools: string[] = []) =>
+    evaluateMissionAcceptance({
+      prompt: "Fix offset() in src/pager.py so the tests pass.",
+      missionIntent: { ...baseIntent, requireWriteCompletion: true },
+      requiredTools,
+      successfulTools: receipts.map((receipt) => String(receipt.toolName)),
+      failedTools: [],
+      evidence: [],
+      receipts: receipts as never,
+      operationGoals: {},
+      finalOutput: "Fixed.",
+    });
+  const patch = { toolName: "code_workspace_patch", operation: "update", message: "update src/pager.py", resource: { system: "workspace" } };
+  assert.ok(!accept([patch]).missing.includes("write_receipt"), "a patch is the write");
+  assert.ok(
+    accept([{ toolName: "code_workspace_read", operation: "read", message: "read", resource: { system: "workspace" } }]).missing.includes("write_receipt"),
+    "a read is not",
+  );
+  const asked = accept([patch], ["code_commit_verified"]);
+  assert.ok(asked.missing.includes("tool:code_commit_verified"), "a commit asked for and not made is still missing");
+});
+
 test("mission acceptance asks for more work when source evidence is missing", () => {
   const result = evaluateMissionAcceptance({
     prompt: "Verify this with web sources and citations.",
