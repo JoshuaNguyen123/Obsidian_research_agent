@@ -551,9 +551,11 @@ test("the same tool failure twice in a row stops the open node, as it stops any 
   assert.equal(node.blocker?.code, "tool_failure_repeated");
 });
 
-test("a call that repeats one the open node holds proof of is the same proof; other content under its id is refused", async () => {
-  // Live on muse-spark-open, a follow-up attached the person's workspace twice. The prepared receipt is named by its
-  // arguments, so the second call's was the first's, and appending it again failed the graph and ended the pass.
+test("a call that repeats an action the open node holds proof of keeps the first proof and goes on", async () => {
+  // Live on muse-spark-open and mistral-large-4, a pass attached the person's workspace twice. The receipt is named by
+  // its prepared action, which is named by the arguments and the state they expect, so the second was named as the
+  // first; it differed only in when it was taken and that it said it reconciled. Appending it failed the graph and
+  // ended the pass.
   const session = await openSession(12, "code-free-repeated-receipt");
   const receipt: MissionReceiptRefV1 = {
     id: "workspace-create-prepared-code_workspace_create-da95d62ae07113d5",
@@ -568,13 +570,13 @@ test("a call that repeats one the open node holds proof of is the same proof; ot
   const seen = evidence();
   await attach(receipt, seen);
   await attach({ ...receipt }, { ...seen });
+  // The reconciling repeat, as the code extension writes it: the same id, its own time and fingerprint.
+  await attach({ ...receipt, fingerprint: sha("f"), committedAt: new Date(GRAPH_TIME.getTime() + 5_000).toISOString() }, { ...seen, fingerprint: sha("a") });
   const node = session.graph.nodes[CODE_FREE_WORK_NODE_ID_V1]!;
   assert.equal(node.status, "ready", "the pass goes on");
-  assert.deepEqual(node.receipts.filter((item) => item.id === receipt.id), [receipt], "held once");
-  assert.equal(node.evidence.filter((item) => item.id === seen.id).length, 1);
-  assert.equal(getMissionOpenWorkStateV1(node).calls, 2, "both calls are counted");
-
-  await assert.rejects(attach({ ...receipt, fingerprint: sha("f") }, evidence()), /Receipt .* already exists on code_free_work/u);
+  assert.deepEqual(node.receipts.filter((item) => item.id === receipt.id), [receipt], "the first is kept, once");
+  assert.deepEqual(node.evidence.filter((item) => item.id === seen.id), [seen]);
+  assert.equal(getMissionOpenWorkStateV1(node).calls, 3, "every call is counted");
 });
 
 test("the open node stops when its tool calls are spent, and on a budget the host counts", async () => {
