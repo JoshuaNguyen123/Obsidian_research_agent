@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { runAgentMission, type AgentRunCompleteEvent } from "../src/AgentRunner";
 import type { MissionGraphV3 } from "../src/agent/missionGraphV3";
-import type { CodePlanUpdateEventV1 } from "../src/agent/codeFreeWorkV1";
+import { CODE_FREE_UNCHECKED_DONE_LIMIT_V1, type CodePlanUpdateEventV1 } from "../src/agent/codeFreeWorkV1";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
 import { createRecallTools } from "../src/tools/recallTools";
 import type { AgentTool } from "../src/tools/types";
@@ -1100,6 +1100,49 @@ test("a free pass's open node is bounded by its own model calls, not the runner'
     .find((value) => value !== undefined);
   assert.ok(Number(limit) >= 240, `step limit ${limit}`);
   assert.ok(openTurns > 30, `${openTurns} open turns`);
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 1);
+  assert.equal(run.complete?.stopReason, "final");
+});
+
+test("a model that keeps saying it is done without the targeted check hands the open node to its closing checks (RAP CODE2-24)", async () => {
+  // Beam on the IDE journey: it fixed the bug, checked it with its own command, then said it was done 200 times
+  // without running code_validate_targeted, each time told so, until its 240 model calls were gone.
+  const open: Array<Call | string> = [
+    { name: "code_sandbox_status", arguments: {} },
+    call("code_workspace_create", { kind: "repository" }),
+    call("code_workspace_patch", { path: "src/pager.py", replacements: [{ oldText: "page * size + 1", newText: "page * size" }] }),
+    "The off-by-one is fixed.",
+    "Done: the fix is in.",
+    // A call in between is work, so the count starts again after it.
+    call("code_workspace_search", { query: "offset" }),
+  ];
+  let claims = 0;
+  const run = await runPass({
+    steps: GUIDED_PASS_STEPS_V1,
+    options: { codeAutonomy: "free", codeFreeBudget: { modelCalls: 240, toolCalls: 300 } },
+    decide: (offered) => {
+      if (offered.includes("code_plan_update")) {
+        const next = open.shift();
+        if (next && typeof next !== "string") return { calls: [next] };
+        claims += 1;
+        return { content: typeof next === "string" ? next : "The fix is complete; nothing else to do." };
+      }
+      for (const name of CLOSING) {
+        if (offered.includes(name)) return { calls: [call(name)] };
+      }
+      return { content: "Done." };
+    },
+  });
+  const handed = run.statuses.filter((status) => status.startsWith("The model said "));
+  assert.deepEqual(handed, [
+    `The model said ${CODE_FREE_UNCHECKED_DONE_LIMIT_V1} times that the open coding work is done without a passing targeted validation. The closing steps check it now: ${CLOSING.join(", ")}.`,
+  ]);
+  // Two claims before the search, then the limit after it; never the rest of the budget.
+  assert.equal(claims, 2 + CODE_FREE_UNCHECKED_DONE_LIMIT_V1);
+  const turns = run.model.requests.filter((request) => !request.format).length;
+  assert.ok(turns < 20, `${turns} model turns`);
+  // The closing checks judged the work: they passed, and the pass committed.
   assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
   assert.equal(run.workspace.state.commits.length, 1);
   assert.equal(run.complete?.stopReason, "final");

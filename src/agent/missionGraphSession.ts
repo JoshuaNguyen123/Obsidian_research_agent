@@ -1400,10 +1400,17 @@ export class MissionGraphSession {
    * Complete an open node because the model said its work is done. Refused
    * unless a targeted validation passed after the node's last write: the
    * model's word alone does not end the node.
+   *
+   * `unchecked` hands the node to its closing steps without that pass, for a
+   * model that keeps saying it is done without running the check (RAP
+   * CODE2-24: one spent 200 turns saying so). It is refused unless a closing
+   * step still to run is a targeted validation, so the check is moved, never
+   * skipped: what the open node did is judged by the steps after it.
    */
   async completeOpenWork(input: {
     nodeId: string;
     evidence: MissionEvidenceRefV1;
+    unchecked?: boolean;
   }): Promise<{ ok: true; graph: MissionGraphV3 } | { ok: false; reason: string }> {
     return this.enqueueMutation(async () => {
       const node = this.record.graph.nodes[input.nodeId];
@@ -1414,10 +1421,22 @@ export class MissionGraphSession {
         return { ok: false as const, reason: `Open work node ${node.id} is ${node.status}.` };
       }
       if (!missionOpenWorkReadyToCompleteV1(getMissionOpenWorkStateV1(node))) {
-        return {
-          ok: false as const,
-          reason: "No targeted validation has passed since the last edit.",
-        };
+        const checkedAfter = Object.values(this.record.graph.nodes).some(
+          (candidate) =>
+            candidate.id !== node.id &&
+            candidate.dependencyIds.includes(node.id) &&
+            candidate.status !== "complete" &&
+            candidate.status !== "cancelled" &&
+            candidate.allowedTools.includes("code_validate_targeted"),
+        );
+        if (!input.unchecked || !checkedAfter) {
+          return {
+            ok: false as const,
+            reason: input.unchecked
+              ? "No closing step runs a targeted validation, so the open work cannot be handed over unchecked."
+              : "No targeted validation has passed since the last edit.",
+          };
+        }
       }
       const operations: MissionGraphPatchOperationV1[] = [
         { op: "set_status", nodeId: node.id, expectedStatus: "ready", status: "running", blocker: null },
