@@ -28,6 +28,7 @@ import {
   validateMissionGraphV3,
   type MissionEvidenceRefV1,
   type MissionGraphV3,
+  type MissionReceiptRefV1,
 } from "../src/agent/missionGraphV3";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
 import type { ToolExecutionContext } from "../src/tools/types";
@@ -548,6 +549,32 @@ test("the same tool failure twice in a row stops the open node, as it stops any 
   const node = session.graph.nodes[CODE_FREE_WORK_NODE_ID_V1]!;
   assert.equal(node.status, "blocked");
   assert.equal(node.blocker?.code, "tool_failure_repeated");
+});
+
+test("a call that repeats one the open node holds proof of is the same proof; other content under its id is refused", async () => {
+  // Live on muse-spark-open, a follow-up attached the person's workspace twice. The prepared receipt is named by its
+  // arguments, so the second call's was the first's, and appending it again failed the graph and ended the pass.
+  const session = await openSession(12, "code-free-repeated-receipt");
+  const receipt: MissionReceiptRefV1 = {
+    id: "workspace-create-prepared-code_workspace_create-da95d62ae07113d5",
+    kind: "workspace",
+    fingerprint: sha("d"),
+    committedAt: GRAPH_TIME.toISOString(),
+  };
+  const attach = async (ref: MissionReceiptRefV1, proof: MissionEvidenceRefV1) => {
+    const execution = started(await session.beginToolExecution("code_workspace_create"));
+    return session.finishToolExecution(execution, { ok: true, receipt: ref, evidence: proof });
+  };
+  const seen = evidence();
+  await attach(receipt, seen);
+  await attach({ ...receipt }, { ...seen });
+  const node = session.graph.nodes[CODE_FREE_WORK_NODE_ID_V1]!;
+  assert.equal(node.status, "ready", "the pass goes on");
+  assert.deepEqual(node.receipts.filter((item) => item.id === receipt.id), [receipt], "held once");
+  assert.equal(node.evidence.filter((item) => item.id === seen.id).length, 1);
+  assert.equal(getMissionOpenWorkStateV1(node).calls, 2, "both calls are counted");
+
+  await assert.rejects(attach({ ...receipt, fingerprint: sha("f") }, evidence()), /Receipt .* already exists on code_free_work/u);
 });
 
 test("the open node stops when its tool calls are spent, and on a budget the host counts", async () => {
