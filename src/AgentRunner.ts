@@ -1184,6 +1184,7 @@ import {
   CODE_FREE_WORK_NODE_ID_V1,
   CODE_FREE_WRITE_TOOLS_V1,
   CODE_PLAN_UPDATE_TOOL_NAME_V1,
+  PERSON_COMMITTED_CODE_TOOLS_V1,
   createCodePlanToolOverlayV1,
   describeCodeFreeWorkLeftV1,
   normalizeCodeAutonomyV1,
@@ -1872,6 +1873,16 @@ interface RunAgentMissionOptions {
    * host sets it from the run's mode, never from the prompt.
    */
   codeWorkspaceAutoApply?: boolean;
+  /**
+   * The run is attached to a person's workspace (CODE-15, CODE2-24): it may
+   * change and check the files, and the person commits them. The ladder then
+   * leaves out the steps that need the run to own the workspace — the repair
+   * cycle record, the verified commit, publication and a scratch workspace's
+   * promotion — which the code runtime refuses there. Planned anyway, the
+   * first of them ended every such run as an error after its first check.
+   * The host sets it when it attaches the run, never from the prompt.
+   */
+  codeWorkspaceCommitByPerson?: boolean;
 }
 
 interface CheckpointResumeState {
@@ -2233,6 +2244,7 @@ export async function runAgentMission({
   codeAutonomy,
   codeFreeBudget,
   codeWorkspaceAutoApply,
+  codeWorkspaceCommitByPerson,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
   // CODE-18: the free coding pass. Guided runs see the host's registry
@@ -3937,12 +3949,23 @@ export async function runAgentMission({
   );
   let allowedToolNames = new Set(tools.map((tool) => tool.function.name));
   const initiallyAuthorizedToolNames = [...allowedToolNames];
+  // A run attached to a person's workspace owes no step that needs to own it
+  // (CODE2-24): the person commits, so a commit the words imply is not a
+  // write this run must make.
+  const requiredWritesOwnedByRunV1 = (
+    ...args: Parameters<typeof getRequiredWriteToolNames>
+  ): string[] =>
+    codeWorkspaceCommitByPerson === true
+      ? getRequiredWriteToolNames(...args).filter(
+          (name) => !PERSON_COMMITTED_CODE_TOOLS_V1.has(name),
+        )
+      : getRequiredWriteToolNames(...args);
   let requiredWriteTools = isBufferedNewNoteOutput(
     noteOutputPlan,
     streamingWritebackKind,
   )
     ? ["create_file"]
-    : getRequiredWriteToolNames(
+    : requiredWritesOwnedByRunV1(
         activeIntentPrompt,
         allowedToolNames,
         missionIntent,
@@ -5004,7 +5027,7 @@ export async function runAgentMission({
       streamingWritebackKind,
     )
       ? ["create_file"]
-      : getRequiredWriteToolNames(
+      : requiredWritesOwnedByRunV1(
           activeIntentPrompt,
           allowedToolNames,
           missionIntent,
@@ -5674,7 +5697,11 @@ export async function runAgentMission({
         ].filter(
           (name) =>
             currentlyRunnableGraphToolNames.has(name) &&
-            !resumeReceiptToolNames.has(name),
+            !resumeReceiptToolNames.has(name) &&
+            !(
+              codeWorkspaceCommitByPerson === true &&
+              PERSON_COMMITTED_CODE_TOOLS_V1.has(name)
+            ),
         ),
         activeIntentPrompt,
         ));
@@ -7053,7 +7080,7 @@ export async function runAgentMission({
       streamingWritebackKind,
     )
       ? ["create_file"]
-      : getRequiredWriteToolNames(
+      : requiredWritesOwnedByRunV1(
           activeIntentPrompt,
           allowedToolNames,
           missionIntent,
@@ -7121,7 +7148,7 @@ export async function runAgentMission({
       streamingWritebackKind,
     )
       ? ["create_file"]
-      : getRequiredWriteToolNames(
+      : requiredWritesOwnedByRunV1(
           activeIntentPrompt,
           allowedToolNames,
           missionIntent,

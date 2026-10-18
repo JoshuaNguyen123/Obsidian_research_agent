@@ -27,7 +27,7 @@ import {
   receiptReportsAffirmativeZeroDelta,
   receiptsSatisfyWriteProof,
 } from "./editOrganizeIntent";
-import { receiptSatisfiesProof } from "./missionPlan";
+import { receiptIsCodeChangeV1, receiptSatisfiesProof } from "./missionPlan";
 import {
   requiresVaultEvidenceProof,
   requiresWebEvidenceProof,
@@ -141,7 +141,10 @@ export function evaluateMissionAcceptance(
     input.missionIntent.requireWriteCompletion &&
     !vaultOrganizeClarify &&
     !receiptsSatisfyWriteProof(input.receipts) &&
-    !receiptsSatisfyMatchingNonVaultProof(input)
+    !receiptsSatisfyMatchingNonVaultProof(input) &&
+    // A coding pass's change to its files is its write (CODE2-24), as the
+    // reflex gate reads it; a commit that was asked for is required by name.
+    !input.receipts.some((receipt) => receiptIsCodeChangeV1(receipt))
   ) {
     missing.add(WRITE_RECEIPT_MISSING);
   }

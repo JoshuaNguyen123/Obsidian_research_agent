@@ -852,6 +852,28 @@ export function getReceiptProofKinds(
   return receiptSatisfiesProof("write_receipt", receipt) ? ["write_receipt"] : [];
 }
 
+/**
+ * A code workspace change or a verified commit: a coding pass's write
+ * (CODE2-24). The one reading the reflex gate and acceptance share, so a pass
+ * that changed its files is not held for a missing write by either; a commit
+ * that was asked for is still required by name, as any required tool is.
+ */
+export function receiptIsCodeChangeV1(receipt: {
+  toolName?: string;
+  operation?: string;
+  resource?: { system?: string | null } | null;
+}): boolean {
+  const system = receipt.resource?.system;
+  return (
+    (system === "workspace" || system === "git") &&
+    receiptSatisfiesProof("write_receipt", {
+      toolName: receipt.toolName,
+      operation: receipt.operation,
+      resource: { system },
+    })
+  );
+}
+
 export function receiptSatisfiesProof(
   proof: MissionPlanProofKind,
   receipt: MissionReceiptProofLike,

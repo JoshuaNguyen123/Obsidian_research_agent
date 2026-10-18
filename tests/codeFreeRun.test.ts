@@ -1264,3 +1264,31 @@ test("with the reflex gate on, a pass that commits finishes there instead of bei
   assert.ok(!run.statuses.some((status) => /Reflex completion gate missing/u.test(status)), run.statuses.join(" | "));
   assert.equal(run.complete?.stopReason, "final");
 });
+
+test("a pass attached to a person's workspace plans no repair record or commit, and ends done once its checks pass", async () => {
+  const run = await runPass({
+    steps: [],
+    prompt: hostPassPrompt({ free: true }),
+    options: { codeAutonomy: "free", codeWorkspaceCommitByPerson: true },
+    structured: codeWorkflowClassification,
+    reflex: true,
+    decide: shortFreeScript(),
+  });
+  const planned = Object.values(run.graphs[0]!.nodes).flatMap((node) => node.allowedTools);
+  for (const tool of ["code_repair_record_cycle", "code_commit_verified", "publish_verified_code_to_github", "code_workspace_init_repository"]) {
+    assert.ok(!planned.includes(tool), `${tool} is not planned`);
+  }
+  assert.ok(planned.includes("code_validate_targeted"), "the checks are still planned");
+  assert.equal(run.workspace.state.files.get("src/pager.py"), FIXED);
+  assert.equal(run.workspace.state.commits.length, 0, "the person commits");
+  assert.equal(run.complete?.stopReason, "final");
+  // The same pass without the attachment plans the agent's own commit, as before.
+  const owned = await runPass({
+    steps: [],
+    prompt: hostPassPrompt({ free: true }),
+    options: { codeAutonomy: "free" },
+    structured: codeWorkflowClassification,
+    decide: shortFreeScript(),
+  });
+  assert.ok(Object.values(owned.graphs[0]!.nodes).some((node) => node.allowedTools.includes("code_commit_verified")));
+});
