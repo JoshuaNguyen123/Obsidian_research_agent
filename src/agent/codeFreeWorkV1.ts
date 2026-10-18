@@ -77,6 +77,7 @@ export const CODE_FREE_MENU_V1 = Object.freeze([
   "code_workspace_search",
   "code_workspace_inspect",
   "code_workspace_create_file",
+  "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
   "code_workspace_apply_patch",
@@ -92,9 +93,14 @@ export const CODE_FREE_MENU_V1 = Object.freeze([
   CODE_PLAN_UPDATE_TOOL_NAME_V1,
 ] as const);
 
-/** Writes that change the workspace's files, after which a check is owed. */
+/**
+ * Writes that change the workspace's files, after which a check is owed. An
+ * append is one: a ladder whose only write was an append (a brief that says
+ * "append") was planned as a guided pass, not the open node.
+ */
 export const CODE_FREE_WRITE_TOOLS_V1: ReadonlySet<string> = new Set([
   "code_workspace_create_file",
+  "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
   "code_workspace_apply_patch",

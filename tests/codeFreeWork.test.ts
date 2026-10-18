@@ -116,6 +116,18 @@ test("the free plan replaces the steps before the first validation and keeps the
     available: new Set([...available, "recall_tool_result"]),
   });
   assert.deepEqual(recall?.menu.slice(-2), ["recall_tool_result", "code_plan_update"]);
+  // A ladder whose only write is an append is an implementation too.
+  const appendLadder = GUIDED_LADDER.map((name) =>
+    name === "code_workspace_patch" ? "code_workspace_append" : name,
+  );
+  const append = planCodeFreeWorkV1({
+    ladder: appendLadder,
+    available: new Set([...available, "code_workspace_append"]),
+  });
+  assert.ok(append, "an append-only ladder plans the open node");
+  assert.deepEqual(append.closing, CLOSING);
+  assert.ok(append.menu.includes("code_workspace_append"));
+  assert.ok(append.menu.includes("code_workspace_patch"));
   // Not an implementation, or not a plain coding pass: plan it guided.
   assert.equal(planCodeFreeWorkV1({ ladder: ["code_sandbox_status", "code_validate_fast"], available }), null);
   assert.equal(planCodeFreeWorkV1({ ladder: ["code_workspace_patch"], available }), null);
