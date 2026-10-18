@@ -898,6 +898,7 @@ import {
   type ResearchClaim,
   claimIdFromGroundingToken,
   collectPassageIdsFromText,
+  hasExplicitSourceGroundingRequestV1,
   shouldRequireClaimGrounding,
   shouldVerifyQuoteSpansV1,
 } from "./agent/claimLedger";
@@ -9842,7 +9843,7 @@ export async function runAgentMission({
     // verify). Auto deep_web from "current/latest" market language alone must not
     // block ordinary sourced writeback when the model uses URL citations instead
     // of passage ids; research acceptance still enforces fetched-source coverage.
-    const requireClaimGrounding = shouldRequireClaimGrounding(activeIntentPrompt);
+    const requireClaimGrounding = missionRequiresClaimGroundingV1(activeIntentPrompt);
     // Verbatim quote checking used to need the prompt to literally say "quote".
     // A deep sourced writeback is a claim of thoroughness and its passages are
     // already persisted, so the quotations it does contain get checked against
@@ -10288,7 +10289,7 @@ export async function runAgentMission({
         ).length ?? 0,
       evidenceGroundingApplicable:
         Boolean(missionResearchSignals) ||
-        shouldRequireClaimGrounding(activeIntentPrompt),
+        missionRequiresClaimGroundingV1(activeIntentPrompt),
       mutationsPerformed: writeReceipts.length,
       // Every entry is a concrete receipt object restored from or persisted to
       // the runtime snapshot. Ledger ids are reconciled above, but the score
@@ -21564,7 +21565,7 @@ export async function runAgentMission({
     if (
       !passageGroundedWriteContractInjected &&
       stepAllowedToolNames.has("append_to_current_file") &&
-      shouldRequireClaimGrounding(activeIntentPrompt) &&
+      missionRequiresClaimGroundingV1(activeIntentPrompt) &&
       requiresVerifiedFinalOutput(
         missionPlan,
         researchPlan,
@@ -33556,6 +33557,26 @@ export function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
 }
 
 /**
+ * Whether this mission's answer must ground its claims in cited passages (RAP
+ * CODE2-24). `shouldRequireClaimGrounding` reads "quoted", "quotes" and
+ * "verify" as asks for quotation-level grounding; in a coding mission they
+ * describe the code ("preserve quoted commas, escaped quotes"), its proof is
+ * the verified commit, and there are no passages to cite. Two models' coding
+ * passes on a CSV task made their verified commit, had the summary held for
+ * claim grounding, and then spent half an hour reading files and verifying
+ * citations until the run failed. A coding mission still grounds its claims
+ * when it asks in words that cannot be about code
+ * (`hasExplicitSourceGroundingRequestV1`).
+ */
+export function missionRequiresClaimGroundingV1(prompt: string): boolean {
+  if (!shouldRequireClaimGrounding(prompt)) return false;
+  return (
+    getRequiredCodeWorkflowToolNames(prompt).length === 0 ||
+    hasExplicitSourceGroundingRequestV1(prompt)
+  );
+}
+
+/**
  * A prior segment can persist `grounded_workflow` plus a code-ladder graph
  * for a prompt that is only a topic brief ("write me brief about dfs and bfs
  * in python"). Resume must not inherit that route or keep those unpaid nodes:
@@ -40851,7 +40872,7 @@ export function requiresVerifiedFinalOutput(
   researchPlan: ResearchPlan | null,
   missionPrompt: string,
 ): boolean {
-  if (shouldRequireClaimGrounding(missionPrompt)) {
+  if (missionRequiresClaimGroundingV1(missionPrompt)) {
     return true;
   }
   if (
@@ -41214,7 +41235,7 @@ function buildFinalOutputVerificationCorrectionPrompt(
   researchPlan: ResearchPlan | null = null,
   quoteCorrections: ClaimQuoteCorrection[] = [],
 ): string {
-  const requirePassageIds = shouldRequireClaimGrounding(missionPrompt);
+  const requirePassageIds = missionRequiresClaimGroundingV1(missionPrompt);
   const requiredLiteralAnchors = extractRequiredLiteralAnchors(missionPrompt);
   const finalRelevanceMissing = acceptance.missing.some(
     (item) => /(?:^|:)final_relevance$/u.test(item),

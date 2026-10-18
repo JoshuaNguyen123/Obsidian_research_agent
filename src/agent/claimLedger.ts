@@ -332,6 +332,20 @@ export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
   );
 }
 
+/**
+ * Whether a prompt asks for passage-level grounding in words that cannot be
+ * about code (RAP CODE2-24). In a coding mission "quoted commas", "escaped
+ * quotes" and "verify the tests pass" describe the work, and the summary's
+ * proof is its receipts; only an explicit ask for citations, passages, a
+ * fact-check or deep research asks for cited passages there.
+ */
+export function hasExplicitSourceGroundingRequestV1(prompt: string): boolean {
+  const value = stripWriteVerificationPhrasesV1(prompt).replace(/\s+/g, " ");
+  return /\b(?:cite|cited|citation|citations|passage|passages|fact[-\s]?check|deep\s+research|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
+    value,
+  );
+}
+
 export function shouldRequireQuoteSpans(promptOrMode: string): boolean {
   const value = promptOrMode.replace(/\s+/g, " ").trim();
   // Negation is invisible to a keyword trigger: "in your own words (no
