@@ -870,6 +870,8 @@ import {
   type MutationFootprintV1,
 } from "./decisions/missionDecisionAssessment";
 import {
+  claimCitedPassageIdsV1,
+  footnotePassageIdsV1,
   isClaimSupportTokenV1,
   normalizeClaimSupportLedgerV1,
   type ClaimSupportLedgerV1,
@@ -40915,6 +40917,13 @@ export interface ClaimScopedRepairPlanEntry {
   tokens: string[];
   /** Verbatim current sentence bytes from the candidate. */
   currentText: string;
+  /**
+   * Every passage the sentence cites, its footnotes resolved: what the claim
+   * check judged it against (planner v2), so a claim-support repair is shown
+   * those passages and not the ledger's word-overlap binding, which is empty
+   * for a cited claim the ledger exempted.
+   */
+  citedPassageIds?: string[];
 }
 
 export interface ClaimScopedRepairPlan {
@@ -40964,7 +40973,12 @@ export function collectClaimScopedRepairPlan(
     if (currentText.replace(/\s+/gu, " ").trim() !== claim.text) {
       return null;
     }
-    repairs.push({ claim, tokens, currentText });
+    repairs.push({
+      claim,
+      tokens,
+      currentText,
+      citedPassageIds: claimCitedPassageIdsV1(claim, footnotePassageIdsV1(candidate)),
+    });
   }
   repairs.sort((a, b) => b.claim.draftStart! - a.claim.draftStart!);
   for (let index = 1; index < repairs.length; index += 1) {
@@ -41004,7 +41018,8 @@ export function buildClaimScopedRepairPrompt(
           ? "A check against the cited passage found that it contradicts this sentence. Rewrite the sentence to state what the passage says, or drop the contradicted assertion, and keep its citation."
           : "A check against the cited passage found that it does not establish this sentence. Narrow the sentence to what the passage states, or attribute and hedge it, and keep its citation.",
       );
-      for (const passageId of [...new Set(repair.claim.passageIds)].slice(0, 3)) {
+      const shown = repair.citedPassageIds && repair.citedPassageIds.length > 0 ? repair.citedPassageIds : repair.claim.passageIds;
+      for (const passageId of [...new Set(shown)].slice(0, 3)) {
         const text = passageText?.get(passageId);
         if (text) {
           lines.push(`Cited passage ${passageId} reads: "${text.slice(0, 600)}"`);

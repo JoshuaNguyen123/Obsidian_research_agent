@@ -24,6 +24,7 @@ import {
   type ClaimSupportCheckV1,
 } from "../src/decisions/claimSupportAssessment";
 import { claimsForCandidateV1 } from "../src/decisions/claimSupportGate";
+import { buildClaimScopedRepairPrompt, collectClaimScopedRepairPlan } from "../src/AgentRunner";
 import type { DecisionResultV1 } from "../src/decisions/decisionClient";
 
 const token = (source: string, start: number, end: number) => `source:${source}:passage:${start}-${end}`;
@@ -212,6 +213,32 @@ test("past the whole-send bounds the closest passages are sent and 'insufficient
   assert.equal(contradicted.status, "decided");
   assert.equal(contradicted.verdict, "contradicted");
   assert.equal(contradicted.citedPassageIds?.length, 8);
+});
+
+test("a claim-support repair is shown the passage the check judged, for a footnoted and a Limitations claim", () => {
+  const passages = pilotPassages();
+  const { draft, ledger, claims } = renderedDraft(
+    [
+      "# Pilot",
+      `Every month the pilot ran, revenue doubled at the participating companies [${passages[2]!.id}].`,
+      "",
+      "## Limitations",
+      "",
+      `Every participating company was a manufacturing firm [${passages[5]!.id}].`,
+    ],
+    passages,
+  );
+  const revenue = claims.find((claim) => claim.text.includes("doubled"))!;
+  const limitation = claims.find((claim) => claim.text.includes("manufacturing"))!;
+  const plan = collectClaimScopedRepairPlan(
+    [`claim_support:insufficient:${revenue.id}`, `claim_support:contradicted:${limitation.id}`],
+    ledger,
+    draft,
+  );
+  assert.ok(plan, "both sentences are repairable by their own offsets");
+  const prompt = buildClaimScopedRepairPrompt(plan, [], new Map(passages.map((passage) => [passage.id, passage.text])));
+  assert.match(prompt, new RegExp(`Cited passage ${passages[2]!.id.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")} reads`));
+  assert.match(prompt, /Because companies opted in/u, "the Limitations claim's own passage is shown");
 });
 
 test("the assessment records its planner and what it left out, and rejections stand by cited passages", async () => {
