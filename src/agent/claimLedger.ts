@@ -400,6 +400,7 @@ export function extractClaimsFromDraft(
       status:
         sentence.epistemicSection ||
         isExemptLimitationSentence(text) ||
+        isProcessStatementV1(text) ||
         isReceiptBackedClaimSentenceV1(text, options.receiptAnchors)
           ? "exempt"
           : "ungrounded",
@@ -1081,6 +1082,53 @@ function isCandidateClaimSentence(text: string): boolean {
   return tokenize(stripCitations(text)).length >= 3;
 }
 
+/**
+ * A sentence about the research or the note itself rather than about the
+ * world: what was searched, what could not be verified, what the gathered
+ * sources do not cover, how a figure or recording was read. It asserts nothing
+ * a passage could support, so judging it against one can only hold a correct
+ * note (D-135: "Could not verify: …" was held after one failed repair).
+ *
+ * Deliberately narrow. A sentence with a subject of its own is about that
+ * subject ("Two later trials could not confirm the effect" is a claim about the
+ * trials), and a disclaimer is recognised only where it opens the sentence or
+ * names the author, the note, or the gathered sources. Rules were written from
+ * the calibration drafts of the JEV-5 evaluation (tests/fixtures/decisionEval/
+ * claimDraftEvalSet.ts); the held-out drafts score them.
+ */
+export function isProcessStatementV1(text: string): boolean {
+  const plain = stripCitations(text)
+    .replace(/\[\^[^\]]+\]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!plain) return false;
+  return (
+    PROCESS_STATEMENT_PATTERNS_V1.some((pattern) => pattern.test(plain)) ||
+    (SOURCE_SCOPE_PATTERN_V1.test(plain) && SOURCE_SCOPE_NEGATION_V1.test(plain))
+  );
+}
+
+const PROCESS_STATEMENT_PATTERNS_V1: readonly RegExp[] = [
+  // An unattributed disclaimer, often written as a label: "Could not verify: …",
+  // "Not independently verified: …", "Unable to confirm whether …".
+  /^(?:could\s+not|couldn['’]t|was\s+unable\s+to|unable\s+to|not\s+(?:independently\s+)?(?:verified|confirmed|checked)|unverified|unconfirmed)\b/iu,
+  // The author's own research actions, in the first person.
+  /^(?:i|we)\s+(?:could\s+not|couldn['’]t|did\s+not|didn['’]t|was\s+unable|were\s+unable|have\s+not|haven['’]t|cannot|can['’]t|searched|screened|reviewed|read|relied|looked|consulted|checked|found|limited|focused|used|excluded|included)\b/iu,
+  // The note describing itself.
+  /^(?:this|the)\s+(?:note|summary|answer|draft|write-?up)\s+(?:relies|covers|does|did|is|was|draws|uses|focuses|summari[sz]es|only|excludes|includes)\b/iu,
+  // What the gathered sources do not address.
+  /\bthe\s+(?:gathered\s+)?sources?\s+(?:did|do|does)\s+not\b/iu,
+  // How a figure, page or recording was read, which no passage states.
+  /\b(?:was|were)\s+(?:read|sampled|transcribed|extracted)\s+(?:from|at)\s+(?:the\s+)?(?:(?:figure|chart|image|page|pdf|recording|video|webinar|transcript)['’]s?\s+)?(?:figure|chart|image|page|pdf|recording|video|transcript|text\s+layer|timestamps?)\b/iu,
+];
+
+/** "… in the sources gathered", "… from the sources reviewed" … */
+const SOURCE_SCOPE_PATTERN_V1 =
+  /\b(?:in|from|among|during|by)\s+(?:the|these|this)\s+(?:sources?|search(?:es)?|research|session)(?:\s+(?:gathered|reviewed|fetched|consulted|read|available|used|searched))?\b/iu;
+/** … only when the sentence says something was missing or unclear there. */
+const SOURCE_SCOPE_NEGATION_V1 =
+  /\b(?:not|no|none|never|unclear|unknown|unable|absent|missing)\b|n['’]t\b/iu;
+
 function isExemptLimitationSentence(text: string): boolean {
   return /\b(?:limitations?|confidence|uncertain(?:ty)?|may\s+vary|further\s+research(?:\s+is\s+needed)?|cannot\s+be\s+certain|with\s+(?:low|limited)\s+confidence|this\s+(?:summary|answer)\s+is\s+incomplete|evidence\s+is\s+(?:limited|incomplete|mixed))\b/i.test(
     text,
@@ -1127,6 +1175,15 @@ function extractQuoteSpans(
       quote,
     };
   });
+}
+
+/**
+ * Content terms a claim shares with a passage, citations stripped: the same
+ * measure the binder uses, exported so the claim-support planner ranks a
+ * claim's passages by exactly what bound them.
+ */
+export function claimPassageOverlapV1(claimText: string, passageText: string): number {
+  return lexicalOverlapScore(claimText, passageText);
 }
 
 function lexicalOverlapScore(left: string, right: string): number {
