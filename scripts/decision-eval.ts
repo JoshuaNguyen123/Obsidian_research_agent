@@ -5,6 +5,7 @@
  *   npx tsx scripts/decision-eval.ts                      # offline baseline only
  *   npx tsx scripts/decision-eval.ts --live --split=calibration
  *   npx tsx scripts/decision-eval.ts --live --split=heldout
+ *   npx tsx scripts/decision-eval.ts --drafts --base=<core checkout> [--judge=oracle|live] [--split=heldout] [--reps=3]
  *
  * Live runs read the OpenRouter credential from OPENROUTER_API_KEY (never from
  * a vault) and call the pinned model. Reports land in docs/eval/decisions/
@@ -68,6 +69,19 @@ import {
   CLAIM_SUPPORT_EVAL_SET_V1,
   type ClaimSupportEvalCaseV1,
 } from "../tests/fixtures/decisionEval/claimSupportEvalSet";
+import {
+  casesFor,
+  describeScore,
+  fixtureFingerprint,
+  liveJudge,
+  loadArm,
+  oracleJudge,
+  regressions,
+  runArmOnCase,
+  scoreArm,
+  type ArmRun,
+  type Judge,
+} from "./decisionEvalDrafts";
 import {
   CLAIM_SUPPORT_TEMPLATE_VERSION_V1,
   CLAIM_SUPPORT_THRESHOLDS_V1,
@@ -343,6 +357,10 @@ function claimChecks(items: readonly ClaimSupportEvalCaseV1[]): ClaimSupportChec
 
 async function main() {
   mkdirSync(outDir, { recursive: true });
+  if (args.get("drafts") === "true") {
+    await runDrafts();
+    return;
+  }
   const report: Record<string, unknown> = {
     generatedAt: new Date().toISOString(),
     model: JEV_DECISION_MODEL_V1,
@@ -592,6 +610,95 @@ async function main() {
   writeFileSync(`${base}.md`, renderMarkdown(report));
   console.log(renderMarkdown(report));
   console.log(`Wrote ${base}.json and .md`);
+}
+
+/**
+ * Whole drafts through the production claim path, baseline core against this
+ * checkout (JEV-5). See scripts/decisionEvalDrafts.ts for what each judge
+ * measures; the labels are the frozen fixture's, never either arm's output.
+ */
+async function runDrafts() {
+  const baseRoot = args.get("base");
+  if (!baseRoot || baseRoot === "true") {
+    console.error("--drafts needs --base=<path to the baseline core checkout>.");
+    process.exitCode = 2;
+    return;
+  }
+  const judgeName = args.get("judge") ?? "oracle";
+  const draftSplit = (args.get("split") ?? "heldout") as "calibration" | "heldout" | "all";
+  const reps = Math.max(1, Number.parseInt(args.get("reps") ?? "3", 10) || 3);
+  let judge: Judge;
+  if (judgeName === "live") {
+    const apiKey = process.env.OPENROUTER_API_KEY?.trim() ?? "";
+    if (!apiKey) {
+      console.error("OPENROUTER_API_KEY is not set; a live draft evaluation needs the decision credential.");
+      process.exitCode = 2;
+      return;
+    }
+    judge = liveJudge(
+      createOpenRouterDecisionClientV1({ apiKey, transport: fetchTransport }),
+      DECISION_VERIFICATION_TIMEOUT_MS_V1 * 3,
+    );
+  } else if (judgeName === "oracle") {
+    judge = oracleJudge();
+  } else {
+    console.error(`Unknown --judge=${judgeName}; use oracle or live.`);
+    process.exitCode = 2;
+    return;
+  }
+  const arms = [await loadArm("baseline", baseRoot), await loadArm("candidate", process.cwd())];
+  const cases = casesFor(draftSplit);
+  const runs: Record<string, ArmRun[]> = { baseline: [], candidate: [] };
+  for (let rep = 1; rep <= reps; rep += 1) {
+    for (const [index, item] of cases.entries()) {
+      // Interleaved and alternating, so neither arm always asks first.
+      const order = (rep + index) % 2 === 0 ? arms : [...arms].reverse();
+      for (const arm of order) runs[arm.name]!.push(await runArmOnCase(arm, item, judge, rep));
+    }
+  }
+  const scores = { baseline: scoreArm(runs.baseline!), candidate: scoreArm(runs.candidate!) };
+  const found = regressions(runs.baseline!, runs.candidate!);
+  const fixtureSha256 = fixtureFingerprint(process.cwd());
+  let baselineFixtureSha256: string | null = null;
+  try {
+    baselineFixtureSha256 = fixtureFingerprint(baseRoot);
+  } catch {
+    baselineFixtureSha256 = null;
+  }
+  const report = {
+    generatedAt: new Date().toISOString(),
+    judge: judgeName,
+    model: judgeName === "live" ? JEV_DECISION_MODEL_V1 : "oracle",
+    split: draftSplit,
+    reps,
+    cases: cases.length,
+    fixtureSha256,
+    baselineFixtureSha256,
+    claimTemplate: CLAIM_SUPPORT_TEMPLATE_VERSION_V1,
+    claimThresholds: CLAIM_SUPPORT_THRESHOLDS_V1,
+    scores,
+    regressions: found,
+    runs,
+  };
+  const name = join(outDir, `drafts-${judgeName}-${draftSplit}-${stamp}`);
+  const lines = [
+    `# Jev claim checks on whole drafts (${report.generatedAt})`,
+    "",
+    `Judge \`${report.model}\` · split ${draftSplit} · ${cases.length} drafts × ${reps} reps · fixture sha256 \`${fixtureSha256.slice(0, 16)}\``,
+  ];
+  for (const score of [scores.baseline, scores.candidate]) {
+    lines.push("", `## ${score.arm}`, "", ...describeScore(score));
+  }
+  lines.push(
+    "",
+    "## Regressions (candidate against baseline)",
+    "",
+    ...(found.length > 0 ? found.map((line) => `- ${line}`) : ["- none"]),
+  );
+  writeFileSync(`${name}.json`, `${JSON.stringify(report, null, 2)}\n`);
+  writeFileSync(`${name}.md`, `${lines.join("\n")}\n`);
+  console.log(lines.join("\n"));
+  console.log(`Wrote ${name}.json and .md`);
 }
 
 function renderMarkdown(report: Record<string, unknown>): string {
