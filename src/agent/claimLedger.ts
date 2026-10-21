@@ -1097,7 +1097,9 @@ function isCandidateClaimSentence(text: string): boolean {
  * claimDraftEvalSet.ts); the held-out drafts score them.
  */
 export function isProcessStatementV1(text: string): boolean {
-  const plain = stripCitations(text)
+  // The host's own unverified label is not the author's disclaimer: a
+  // sentence it is glued to is still that sentence, and still owes grounding.
+  const plain = stripCitations(text.split(UNVERIFIED_CLAIM_MARKER_V1).join(" "))
     .replace(/\[\^[^\]]+\]/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();

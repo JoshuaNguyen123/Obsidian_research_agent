@@ -235,10 +235,14 @@ export async function runArmOnCase(
     coverage: null,
     findings: [] as Array<{ claimId: string; status: SentenceOutcome["check"]; passageIds: string[]; exclusion?: string; verdict: Verdict | null }>,
   };
-  const failing = new Set(
-    outcome.action === "accept"
-      ? []
-      : outcome.tokens.map((token) => arm.claimLedger.claimIdFromGroundingToken(token)).filter((id): id is string => Boolean(id)),
+  const failing = new Set<string>(
+    outcome.action === "repair"
+      ? outcome.tokens
+          .map((token: string) => arm.claimLedger.claimIdFromGroundingToken(token))
+          .filter((id: string | null): id is string => Boolean(id))
+      : outcome.action === "hold"
+        ? outcome.rejections.map((rejection) => rejection.claimId)
+        : [],
   );
   const findingFor = new Map(assessment.findings.map((finding) => [finding.claimId, finding]));
   const deterministicFlagged = new Set(

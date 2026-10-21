@@ -78,7 +78,9 @@ test("only grounded, passage-bound claims are eligible; what cannot be sent whol
     {
       c3: "claim_too_long",
       c4: "passage_too_long",
-      c5: "too_many_passages",
+      // Four passages are no longer too many (planner v2 sends up to six
+      // whole); one of these is over the passage bound, which still excludes.
+      c5: "passage_too_long",
       c6: "no_passage_text",
       c7: "no_passage_text",
     },
