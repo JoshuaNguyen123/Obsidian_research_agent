@@ -108,13 +108,13 @@ test("Off constructs no runtime and so can make no request", async () => {
   assert.equal(transportCalls, 0);
 });
 
-test("an unpromoted component configured Enabled runs in Shadow and says why", () => {
-  // Claim support passed its held-out gates (2026-09-28) but held a good
-  // note over a limitations sentence end to end, so it stays in Shadow.
+test("both components configured Enabled act on this candidate", () => {
+  // Candidate branch only (JEV-5): claim support is promoted for the owner's
+  // end-to-end comparison and merges only if that comparison holds up.
   const claims = resolveDecisionComponentModeV1("enabled", "claim_support");
-  assert.equal(claims.effective, "shadow");
-  assert.match(claims.heldInShadowBecause ?? "", /Shadow|limitations/u);
-  assert.equal(DECISION_PROMOTION_MANIFEST_V1.claim_support.promoted, false);
+  assert.equal(claims.effective, "enabled");
+  assert.equal(claims.heldInShadowBecause, null);
+  assert.equal(DECISION_PROMOTION_MANIFEST_V1.claim_support.promoted, true);
   // Mission routing passed every held-out gate and the owner switched it on.
   assert.equal(DECISION_PROMOTION_MANIFEST_V1.mission_routing.promoted, true);
   assert.equal(resolveDecisionComponentModeV1("enabled", "mission_routing").effective, "enabled");

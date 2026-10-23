@@ -49,11 +49,11 @@ export const DECISION_PROMOTION_MANIFEST_V1: Readonly<
       "Passed every frozen held-out gate on typesafe/jev-1.13: hard-case evidence errors 7/16 -> 2/16, ordinary 2/16 -> 0/16, no constraint violation, 347 ms median against 7.8 s for the model router. Owner switched it on (2026-09-28).",
   }),
   claim_support: Object.freeze({
-    promoted: false,
-    evaluatedAt: "2026-09-28",
-    report: "docs/eval/decisions/live-heldout-2026-09-28T19-23-56-585Z.md; docs/eval/decisions/live-e2e-comparison-2026-09-28.md",
+    promoted: true,
+    evaluatedAt: "2026-10-22",
+    report: "docs/eval/decisions/drafts-live-heldout-2026-10-23T00-36-51-205Z.md",
     reason:
-      "Passed the frozen held-out gates, but in the end-to-end comparison one of two Enabled drafts that reached the check was held over the note's own limitations sentence (\"Could not verify: …\"). Held in Shadow until limitation and process sentences cannot hold a draft.",
+      "Candidate for the owner's end-to-end comparison (JEV-5): on frozen held-out drafts, 98% of factual sentences assessed, 0/96 unsupported claims reached the draft unflagged, and Jev flagged 0/156 supported claims and 0/57 process sentences.",
   }),
 });
 
