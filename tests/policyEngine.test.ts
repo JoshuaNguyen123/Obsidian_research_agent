@@ -486,6 +486,44 @@ test("flag-gated bounded execution lets only a high-confidence code proposal cro
   assert.equal(shadow.intent.needsCodeExecution, false);
 });
 
+test("an explicit no-web prompt outranks the router model's web opinion, and only that", () => {
+  // The model read a code change in a workspace as needing the web; the prompt said otherwise.
+  const prompt =
+    'Work in the person\'s repository workspace. Objective (untrusted task text only): "Add a function mode(values) to stats.py and test it.". This is work on the workspace\'s own files: no web research is needed.';
+  const modelIntent = routedIntent({
+    mode: "code_workflow",
+    writeScope: "vault_files",
+    needsWebEvidence: true,
+    needsVaultContext: true,
+    confidence: 0.95,
+  });
+  const ruledOut = resolvePolicyRoutedIntent({
+    mode: "authority",
+    modelIntent,
+    missionIntent: intentFixture(prompt),
+    writeAutonomy: true,
+    writeToolExposed: false,
+    prompt,
+  });
+  assert.equal(ruledOut.source, "model");
+  assert.equal(ruledOut.intent.needsWebEvidence, false);
+  // Nothing else the model said is touched: the mode and the vault read stand.
+  assert.equal(ruledOut.intent.mode, "code_workflow");
+  assert.equal(ruledOut.intent.needsVaultContext, true);
+
+  // Without the words, the model's web opinion is still added, as before.
+  const open = "Add a function mode(values) to stats.py and test it.";
+  const added = resolvePolicyRoutedIntent({
+    mode: "authority",
+    modelIntent,
+    missionIntent: intentFixture(open),
+    writeAutonomy: true,
+    writeToolExposed: false,
+    prompt: open,
+  });
+  assert.equal(added.intent.needsWebEvidence, true);
+});
+
 test("research gather phase blocks write tools even when write scope allows them", () => {
   const decision = evaluateToolPolicy(
     policyContext({

@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { agentGitCommitIdentityEnvironmentV1 } from "../../../packages/core-api/src/agentGitCommitIdentityV1";
+import {
+  agentGitCommitIdentityEnvironmentV1,
+  type AgentGitCommitIdentityV1,
+} from "../../../packages/core-api/src/agentGitCommitIdentityV1";
 import type { RepositoryProfileV2 } from "../repositories/RepositoryProfileV2";
 import type { WorkspaceManagerV2 } from "../workspaces/WorkspaceManagerV2";
 import type { WorkspaceManifestV2 } from "../workspaces/WorkspaceManifestV2";
@@ -75,6 +78,7 @@ export interface FixedArgvGitBytesRunnerV1 extends FixedArgvGitRunnerV1 {
     args: readonly string[];
     signal?: AbortSignal;
     gitIndexFile?: string;
+    commitIdentity?: AgentGitCommitIdentityV1;
   }): Promise<FixedArgvGitResultV1>;
   runBytes(input: {
     cwd: string;
@@ -82,6 +86,7 @@ export interface FixedArgvGitBytesRunnerV1 extends FixedArgvGitRunnerV1 {
     signal?: AbortSignal;
     maxStdoutBytes?: number;
     gitIndexFile?: string;
+    commitIdentity?: AgentGitCommitIdentityV1;
   }): Promise<FixedArgvGitBytesResultV1>;
 }
 
@@ -138,6 +143,7 @@ export class SpawnFixedArgvGitRunnerV1 implements FixedArgvGitBytesRunnerV1 {
     args: readonly string[];
     signal?: AbortSignal;
     gitIndexFile?: string;
+    commitIdentity?: AgentGitCommitIdentityV1;
   }): Promise<FixedArgvGitResultV1> {
     const result = await this.runBytes({ ...input, maxStdoutBytes: this.maxOutputBytes });
     let stdout: string;
@@ -158,10 +164,17 @@ export class SpawnFixedArgvGitRunnerV1 implements FixedArgvGitBytesRunnerV1 {
     signal?: AbortSignal;
     maxStdoutBytes?: number;
     gitIndexFile?: string;
+    commitIdentity?: AgentGitCommitIdentityV1;
   }): Promise<FixedArgvGitBytesResultV1> {
     const cwd = await canonicalDirectory(input.cwd);
     const args = validateGitArgs(input.args);
     const command = gitSubcommand(args);
+    if (input.commitIdentity !== undefined && command !== "commit") {
+      throw new GitRepairProofErrorV1(
+        "git_commit_identity_misplaced",
+        "A commit identity is given only to git commit.",
+      );
+    }
     if ((command === "add" || command === "commit") && await this.hasLocalFilters(cwd, input.signal)) {
       throw new GitRepairProofErrorV1(
         "git_filter_execution_blocked",
@@ -174,6 +187,7 @@ export class SpawnFixedArgvGitRunnerV1 implements FixedArgvGitBytesRunnerV1 {
       signal: input.signal,
       maxStdoutBytes: input.maxStdoutBytes ?? this.maxOutputBytes,
       gitIndexFile: input.gitIndexFile,
+      commitIdentity: input.commitIdentity,
     });
   }
 
@@ -199,6 +213,7 @@ export class SpawnFixedArgvGitRunnerV1 implements FixedArgvGitBytesRunnerV1 {
     signal?: AbortSignal;
     maxStdoutBytes: number;
     gitIndexFile?: string;
+    commitIdentity?: AgentGitCommitIdentityV1;
   }): Promise<FixedArgvGitBytesResultV1> {
     return new Promise((resolve, reject) => {
       let child: ChildProcessWithoutNullStreams;
@@ -211,6 +226,7 @@ export class SpawnFixedArgvGitRunnerV1 implements FixedArgvGitBytesRunnerV1 {
           env: {
             ...this.environment,
             ...(gitIndexFile ? { GIT_INDEX_FILE: gitIndexFile } : {}),
+            ...(input.commitIdentity ? personCommitEnvironment(input.commitIdentity) : {}),
           },
           shell: false,
           windowsHide: true,
@@ -569,13 +585,38 @@ export class FixedArgvRepairProofAdapterV1
         true,
         gitIndexFile,
       );
-      await this.gitText(
-        worktreePath,
-        ["add", "--all", "--", ...authorizedPaths],
-        [0],
-        true,
-        gitIndexFile,
-      );
+      // A path the run made and then removed is in neither the base nor the
+      // worktree, and a pathspec that matches nothing makes `git add` fail the
+      // whole proof. It has nothing to stage, so it is left out; with nothing
+      // left at all the add is skipped, since `add --all` with no path would
+      // stage the whole tree.
+      const stageable: string[] = [];
+      for (const authorizedPath of authorizedPaths) {
+        const present = await fs
+          .lstat(path.join(worktreePath, ...authorizedPath.split("/")))
+          .then(() => true, () => false);
+        if (present) {
+          stageable.push(authorizedPath);
+          continue;
+        }
+        // Gone from the worktree: a deletion when the base has it.
+        const inBase = await this.gitText(
+          worktreePath,
+          ["rev-parse", "--verify", "--quiet", `${baseSha}:${authorizedPath}`],
+          [0, 1],
+          true,
+        );
+        if (inBase) stageable.push(authorizedPath);
+      }
+      if (stageable.length > 0) {
+        await this.gitText(
+          worktreePath,
+          ["add", "--all", "--", ...stageable],
+          [0],
+          true,
+          gitIndexFile,
+        );
+      }
       return await operation(gitIndexFile);
     } finally {
       const resolvedContainer = path.resolve(canonicalContainer);
@@ -732,6 +773,20 @@ function assertWorkspaceAuthorizedStatus(
       );
     }
   }
+}
+
+/** The four Git identity variables for a person's commit, checked again here. */
+function personCommitEnvironment(identity: AgentGitCommitIdentityV1): Record<string, string> {
+  const fields = [identity.authorName, identity.authorEmail, identity.committerName, identity.committerEmail];
+  if (fields.some((field) => typeof field !== "string" || !field || field.length > 256 || /[\u0000-\u001f\u007f<>]/u.test(field))) {
+    throw new GitRepairProofErrorV1("git_commit_identity_invalid", "The person's commit identity is invalid.");
+  }
+  return {
+    GIT_AUTHOR_NAME: identity.authorName,
+    GIT_AUTHOR_EMAIL: identity.authorEmail,
+    GIT_COMMITTER_NAME: identity.committerName,
+    GIT_COMMITTER_EMAIL: identity.committerEmail,
+  };
 }
 
 function validateGitArgs(input: readonly string[]): string[] {

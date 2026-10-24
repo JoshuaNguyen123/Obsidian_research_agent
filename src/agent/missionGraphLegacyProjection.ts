@@ -909,6 +909,10 @@ function projectEvidenceKindToLegacyProof(
     }
     return [];
   }
+  // A free coding pass's open node (CODE-18) completes only by the graph's
+  // own rule (a passing targeted validation after its last edit), and its
+  // closing nodes carry the proof. Its done evidence is not a source.
+  if (kind === "open-work-done") return [];
   if (/vault|note|graph/i.test(kind)) return ["vault_evidence"];
   if (/word.?count/i.test(kind)) return ["word_count"];
   if (/code|execution|test/i.test(kind)) return ["code_execution"];

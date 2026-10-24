@@ -52,6 +52,8 @@ const EXACT_ROOT_FILES = new Set([
   "rust-toolchain.toml",
   "settings.gradle",
   "settings.gradle.kts",
+  "setup.cfg",
+  "setup.py",
   "uv.lock",
   "yarn.lock",
 ]);

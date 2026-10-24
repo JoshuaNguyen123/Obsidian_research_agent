@@ -16,14 +16,28 @@ import type {
   ToolDescriptorV1,
 } from "../../packages/core-api/src";
 import {
+  MAX_SEARCH_CONTEXT_LINES_V2,
   WorkspaceManagerErrorV2,
   WorkspaceManagerV2,
   assertWorkspaceRelativePathV2,
   createVerifiedWorkspaceBaseReadbackV2,
+  isPersonWorkspaceOwnerV2,
   isSha256FingerprintV2,
+  workspaceRunMayWorkV2,
+  workspaceFileTreeFingerprintV2,
+  parseUnifiedPatchV1,
+  planUnifiedPatchFileV1,
+  describeUnifiedPatchFileV1,
+  UnifiedPatchErrorV1,
+  type UnifiedPatchFileKindV1,
+  type UnifiedPatchFilePlanV1,
+  type UnifiedPatchFileV1,
+  type WorkspaceFileChangeV2,
   type WorkspaceManifestV2,
   type WorkspaceMutationReceiptV2,
+  type WorkspaceReadResultV2,
 } from "./workspaces";
+import { codeLineSpansV1 } from "../../src/model/codeWorkspacePayloadV1";
 import {
   classifyProtectedControlChangesV2,
   type RepositoryFileChangeV2,
@@ -62,6 +76,7 @@ export const CODE_WORKSPACE_TOOL_NAMES_V2 = [
   "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
+  "code_workspace_apply_patch",
   "code_workspace_move",
   "code_workspace_copy",
   "code_workspace_trash",
@@ -205,18 +220,41 @@ class WorkspaceToolRuntimeV2 {
     const workspaceId = workspaceIdFrom(args, context);
     if (name === "code_workspace_status") return this.manager.status(workspaceId);
     if (name === "code_workspace_stat") return this.manager.stat(workspaceId, requiredPath(args, "path"));
-    if (name === "code_workspace_list" || name === "list_workspace_files") {
+    if (name === "code_workspace_list") {
+      const glob = optionalString(args.glob);
+      const maxDepth = optionalBoundedInteger(args.maxDepth, "maxDepth", 1, 20);
+      // A glob or a depth past one level only means something recursively.
+      const recursive = args.recursive === true ||
+        (args.recursive !== false && (glob !== null || (maxDepth !== undefined && maxDepth > 1)));
+      return this.manager.listTree(workspaceId, optionalString(args.path) ?? "", {
+        recursive,
+        maxDepth,
+        glob,
+      });
+    }
+    if (name === "list_workspace_files") {
       return this.manager.list(workspaceId, optionalString(args.path) ?? "");
     }
-    if (name === "code_workspace_read" || name === "read_workspace_file") {
+    if (name === "code_workspace_read") {
+      const read = await this.manager.read(workspaceId, requiredPath(args, "path"));
+      return codeWorkspaceReadRangeV2(workspaceId, read, args);
+    }
+    if (name === "read_workspace_file") {
       return this.manager.read(workspaceId, requiredPath(args, "path"));
     }
     if (name === "code_workspace_search") {
-      return this.manager.search(workspaceId, requiredString(args.query, "query"), {
-        path: optionalString(args.path) ?? undefined,
-        caseSensitive: args.caseSensitive === true,
-        limit: optionalInteger(args.limit),
-      });
+      return {
+        workspaceId,
+        ...(await this.manager.searchDetailed(workspaceId, requiredString(args.query, "query"), {
+          path: optionalString(args.path) ?? undefined,
+          caseSensitive: args.caseSensitive === true,
+          limit: optionalInteger(args.limit),
+          regex: args.regex === true,
+          include: optionalGlobArgument(args.include, "include"),
+          exclude: optionalGlobArgument(args.exclude, "exclude"),
+          contextLines: optionalBoundedInteger(args.contextLines, "contextLines", 0, MAX_SEARCH_CONTEXT_LINES_V2),
+        })),
+      };
     }
     if (name === "preview_workspace_html") {
       const htmlPath = requiredPath(args, "htmlPath");
@@ -280,6 +318,9 @@ class WorkspaceToolRuntimeV2 {
           ok: true,
           action: await this.prepareScratchRepositoryPromotion(args, context),
         };
+      }
+      if (name === "code_workspace_apply_patch") {
+        return { ok: true, action: await this.prepareApplyPatch(args, context) };
       }
       const workspaceId = workspaceIdFrom(args, context);
       const leaseId = await this.ensureLease(workspaceId, context);
@@ -521,6 +562,9 @@ class WorkspaceToolRuntimeV2 {
           normalizedArgs.expectedTargetState = "existing";
           normalizedArgs.expectedKind = stat.kind;
           normalizedArgs.expectedSha256 = expected;
+          // The trash record of a single file is fingerprinted over the file's
+          // path, hash and size, so reconcile needs the size to find it.
+          normalizedArgs.expectedBytes = stat.bytes;
           normalizedArgs.expectedAfterSha256 = null;
           normalizedArgs.payloadBytes = 0;
           summary = `Move ${targetPath} to durable workspace trash.`;
@@ -588,6 +632,9 @@ class WorkspaceToolRuntimeV2 {
     }
     if (name === "code_workspace_init_repository") {
       return this.executePreparedScratchRepositoryPromotion(action, context);
+    }
+    if (name === "code_workspace_apply_patch") {
+      return this.executePreparedApplyPatch(action, context);
     }
     const args = action.normalizedArgs;
     const workspaceId = requiredString(args.workspaceId, "workspaceId");
@@ -720,6 +767,9 @@ class WorkspaceToolRuntimeV2 {
       if (name === "code_workspace_export_directory") {
         return this.reconcileDirectoryExport(action, context);
       }
+      if (name === "code_workspace_apply_patch") {
+        return await this.reconcileApplyPatch(action, context);
+      }
       if (name === "code_workspace_init_repository") {
         const promoted = await this.manager.loadManifest(workspaceId);
         const binding = promoted.repositoryBinding;
@@ -776,7 +826,7 @@ class WorkspaceToolRuntimeV2 {
       let committed = false;
       if (name === "code_workspace_trash") {
         const source = await statOrMissing(this.manager, workspaceId, targetPath);
-        const trash = await this.manager.findTrashEvidence(workspaceId, targetPath, requiredFingerprint(args.expectedSha256));
+        const trash = await this.manager.findTrashEvidence(workspaceId, targetPath, trashRecordFingerprint(targetPath, args));
         committed = source === null && trash !== null;
       } else if (name === "code_workspace_mkdir") {
         committed = target?.kind === "directory";
@@ -804,6 +854,265 @@ class WorkspaceToolRuntimeV2 {
       }
     }
     return { outcome: "still_uncertain" as const, message: `Workspace action ${action.id} could not be proven from exact durable readback; keep it pending.` };
+  }
+
+  /**
+   * A unified diff over up to 100 files as one prepared action (CODE-7). Each
+   * file is read and the patch applied to it now, so the approval shows what
+   * every file becomes; the action binds each file's hash before and after,
+   * and the patch's own. Execution reads the files again, applies the same
+   * patch, and writes every file or none.
+   */
+  private async prepareApplyPatch(
+    args: Record<string, unknown>,
+    context: ScopedExtensionContextV1,
+  ): Promise<PreparedActionV1> {
+    const workspaceId = workspaceIdFrom(args, context);
+    const leaseId = await this.ensureLease(workspaceId, context);
+    const ownerRunId = runId(context);
+    const leaseOwnerId = `extension:${ownerRunId}`;
+    const manifest = await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+    const patch = requiredString(args.patch, "patch");
+    const files = (await planWorkspacePatchV2(this.manager, workspaceId, patch)).map((planned) => planned.bound);
+    const normalizedArgs: Record<string, JsonValueV1> = {
+      workspaceId,
+      leaseId,
+      leaseOwnerId,
+      ownerRunId,
+      patch,
+      patchSha256: sha256Text(patch),
+      files: files.map((file) => ({ ...file })) as unknown as JsonValueV1,
+      payloadBytes: byteLength(patch),
+    };
+    const { requiredConfirmations, warnings } = await this.bindRepositoryPatch(
+      manifest,
+      patchRepositoryChangesV2(files),
+      normalizedArgs,
+      context,
+    );
+    const first = files[0]!;
+    const action: ResourceActionV1 = files.some((file) => file.kind === "delete")
+      ? "trash"
+      : files.some((file) => file.kind === "rename")
+        ? "move"
+        : files.every((file) => file.kind === "add")
+          ? "create"
+          : "update";
+    return preparedAction({
+      name: "code_workspace_apply_patch",
+      context,
+      workspaceId,
+      targetPath: first.path,
+      normalizedArgs,
+      expected: sha256Json(files.map((file) => [file.fromPath ?? file.path, file.expectedSha256])),
+      summary: `Apply a patch to ${files.length} ${files.length === 1 ? "file" : "files"}: ${files.map((file) => file.line).join("; ")}.`,
+      action,
+      outboundBytes: byteLength(patch),
+      previewDestination: files.length === 1 ? first.path : `${files.length} files`,
+      relatedResources: patchRelatedResourcesV2(workspaceId, files, manifest.repositoryBinding?.profileKey),
+      requiredConfirmations,
+      warnings,
+      repositoryProfileId: manifest.repositoryBinding?.profileKey,
+    });
+  }
+
+  private async executePreparedApplyPatch(
+    action: PreparedActionV1,
+    context: ScopedExtensionContextV1,
+  ): Promise<{ output?: unknown; receipt: ActionReceiptV1; mutationState: "applied" }> {
+    const args = action.normalizedArgs;
+    const workspaceId = requiredString(args.workspaceId, "workspaceId");
+    const leaseId = requiredString(args.leaseId, "leaseId");
+    const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
+    const leaseOwnerId = requiredString(args.leaseOwnerId, "leaseOwnerId");
+    if (ownerRunId !== runId(context) || action.target.workspaceId !== workspaceId) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "Prepared workspace owner or target binding changed.");
+    }
+    await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+    const patch = requiredString(args.patch, "patch");
+    assertPayloadBytes(args, byteLength(patch));
+    if (sha256Text(patch) !== args.patchSha256) {
+      throw new WorkspaceManagerErrorV2("prepared_payload_drift", "The prepared patch changed.");
+    }
+    const bound = parseBoundPatchFilesV2(args.files);
+    for (const file of bound) {
+      if (file.expectedSha256 === null) continue;
+      const sourcePath = file.fromPath ?? file.path;
+      const current = await statOrMissing(this.manager, workspaceId, sourcePath);
+      if (current?.sha256 !== file.expectedSha256) {
+        throw new WorkspaceManagerErrorV2(
+          "precondition_failed",
+          `${sourcePath} changed after the patch was approved; read it again and make a new patch.`,
+        );
+      }
+    }
+    const planned = await planWorkspacePatchV2(this.manager, workspaceId, patch);
+    const files = planned.map((entry) => entry.bound);
+    if (files.length !== bound.length) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The patch's files changed after approval.");
+    }
+    files.forEach((file, index) => {
+      const approved = bound[index]!;
+      if (file.kind !== approved.kind || file.path !== approved.path || file.fromPath !== approved.fromPath) {
+        throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The patch's files changed after approval.");
+      }
+      if (file.expectedSha256 !== approved.expectedSha256) {
+        throw new WorkspaceManagerErrorV2(
+          "precondition_failed",
+          `${approved.fromPath ?? approved.path} changed after the patch was approved; read it again and make a new patch.`,
+        );
+      }
+      if (file.expectedAfterSha256 !== approved.expectedAfterSha256) {
+        throw new WorkspaceManagerErrorV2("prepared_binding_drift", `The patch no longer makes the approved text of ${approved.path}.`);
+      }
+    });
+    const profileKey = optionalString(args.repositoryProfileKey);
+    if (profileKey) {
+      const profile = await this.repositories.resolveProfileContract?.(profileKey, context);
+      if (!profile) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", "Repository mutation lost its trusted RepositoryProfileV2.");
+      const changes = patchRepositoryChangesV2(files);
+      if (resolveRepositoryMutationScopeV2(profile, changes).fingerprint !== requiredFingerprint(args.repositoryScopeFingerprint)) {
+        throw new WorkspaceManagerErrorV2(
+          "repository_path_scope_drift",
+          "Repository project allowedPaths changed after this mutation was prepared; prepare the action again against the current trusted profile.",
+        );
+      }
+      const classification = classifyProtectedControlChangesV2(profile, changes);
+      const confirmations = classification.level === "double_exact" ? 2 : 1;
+      if (
+        classification.level === "blocked" ||
+        classification.exactDiffFingerprint !== args.protectedClassificationFingerprint ||
+        confirmations !== (action.requiredConfirmations ?? 1)
+      ) {
+        throw new WorkspaceManagerErrorV2("repository_control_drift", "Repository protected-control classification changed after approval.");
+      }
+    }
+    const receipts = await this.manager.applyFileChanges(
+      workspaceId,
+      leaseId,
+      planned.map(({ bound: file, after }): WorkspaceFileChangeV2 => {
+        if (file.kind === "add") return { kind: "create", path: file.path, content: after! };
+        if (file.kind === "delete") return { kind: "trash", path: file.path, expectedSha256: file.expectedSha256! };
+        if (file.kind === "rename") {
+          return { kind: "move", path: file.fromPath!, destinationPath: file.path, expectedSha256: file.expectedSha256!, content: after! };
+        }
+        return { kind: "write", path: file.path, expectedSha256: file.expectedSha256!, content: after! };
+      }),
+    );
+    if (args.requiresProfileRedetection === true) {
+      await this.repositories.redetectProfile?.(
+        requiredString(args.repositoryProfileKey, "repositoryProfileKey"),
+        workspaceId,
+        context,
+      );
+    }
+    return {
+      output: patchOutputV2(workspaceId, files, receipts),
+      receipt: patchActionReceiptV2(action, context, files, receipts, "committed"),
+      mutationState: "applied",
+    };
+  }
+
+  /**
+   * Whether an apply_patch whose execution was cut off landed. Every file at
+   * the text it was to have is the patch applied; every file as it was read
+   * is the patch not applied; anything between is kept pending, since the
+   * batch puts itself back and a mix means something else wrote there.
+   */
+  private async reconcileApplyPatch(action: PreparedActionV1, context: ScopedExtensionContextV1) {
+    const args = action.normalizedArgs;
+    const workspaceId = requiredString(args.workspaceId, "workspaceId");
+    const bound = parseBoundPatchFilesV2(args.files);
+    let appliedCount = 0;
+    let untouchedCount = 0;
+    for (const file of bound) {
+      const target = await statOrMissing(this.manager, workspaceId, file.path);
+      const source = file.fromPath ? await statOrMissing(this.manager, workspaceId, file.fromPath) : target;
+      let applied: boolean;
+      let untouched: boolean;
+      if (file.kind === "add") {
+        applied = target?.sha256 === file.expectedAfterSha256;
+        untouched = target === null;
+      } else if (file.kind === "delete") {
+        applied = target === null && (await this.manager.findTrashEvidence(
+          workspaceId,
+          file.path,
+          workspaceFileTreeFingerprintV2(file.path, file.expectedSha256!, file.expectedBytes!),
+        )) !== null;
+        untouched = target?.sha256 === file.expectedSha256;
+      } else if (file.kind === "rename") {
+        applied = source === null && target?.sha256 === file.expectedAfterSha256;
+        untouched = target === null && source?.sha256 === file.expectedSha256;
+      } else {
+        applied = target?.sha256 === file.expectedAfterSha256;
+        untouched = target?.sha256 === file.expectedSha256;
+      }
+      if (applied) appliedCount += 1;
+      else if (untouched) untouchedCount += 1;
+    }
+    if (appliedCount === bound.length) {
+      const manifest = await this.manager.loadManifest(workspaceId);
+      const core = {
+        version: 2 as const,
+        id: `workspace-reconcile-${sha256Json({ actionId: action.id, files: bound.map((file) => file.path) }).slice(7, 23)}`,
+        workspaceId,
+        operation: "patch" as const,
+        path: bound[0]!.path,
+        relatedPath: null,
+        beforeSha256: bound[0]!.expectedSha256,
+        afterSha256: bound[0]!.expectedAfterSha256,
+        bytesWritten: 0,
+        bytesDeleted: 0,
+        affectedCount: 0,
+        trashId: null,
+        committedAt: new Date().toISOString(),
+        manifestSha256: sha256Text(JSON.stringify(manifest)),
+      };
+      const synthetic: WorkspaceMutationReceiptV2 = { ...core, fingerprint: sha256Json(core) };
+      return {
+        outcome: "committed" as const,
+        message: `Workspace patch ${action.id} was verified file by file: every file holds the text the patch gave it.`,
+        receipt: patchActionReceiptV2(action, reconcileContext(context, action), bound, [synthetic], "reconciled"),
+      };
+    }
+    if (untouchedCount === bound.length) {
+      return { outcome: "not_applied" as const, message: `Workspace patch ${action.id} was not applied; every file is as it was read.` };
+    }
+    return {
+      outcome: "still_uncertain" as const,
+      message: `Workspace patch ${action.id} could not be proven: ${appliedCount} of ${bound.length} files hold the patched text and ${untouchedCount} are as they were read.`,
+    };
+  }
+
+  /**
+   * The repository checks every workspace write makes, for all of a patch's
+   * files at once: the project scope they fall in, and the protected
+   * controls among them, which ask for one or two exact confirmations.
+   */
+  private async bindRepositoryPatch(
+    manifest: WorkspaceManifestV2,
+    changes: RepositoryFileChangeV2[],
+    normalizedArgs: Record<string, JsonValueV1>,
+    context: ScopedExtensionContextV1,
+  ): Promise<{ requiredConfirmations: 1 | 2; warnings: string[] }> {
+    const warnings: string[] = [];
+    if (manifest.kind !== "repository" || !manifest.repositoryBinding) return { requiredConfirmations: 1, warnings };
+    const profile = await this.repositories.resolveProfileContract?.(manifest.repositoryBinding.profileKey, context);
+    if (!profile) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", "Repository mutation requires its trusted RepositoryProfileV2.");
+    const repositoryScope = resolveRepositoryMutationScopeV2(profile, changes);
+    normalizedArgs.repositoryScopeFingerprint = repositoryScope.fingerprint;
+    normalizedArgs.repositoryScopeBindings = repositoryScope.bindings;
+    const classification = classifyProtectedControlChangesV2(profile, changes);
+    if (classification.level === "blocked") {
+      throw new WorkspaceManagerErrorV2("repository_control_blocked", `Repository controls block: ${classification.blockedPaths.join(", ")}.`);
+    }
+    normalizedArgs.protectedClassificationFingerprint = classification.exactDiffFingerprint;
+    normalizedArgs.repositoryProfileKey = profile.key;
+    if (classification.level === "none") return { requiredConfirmations: 1, warnings };
+    const requiredConfirmations = classification.level === "double_exact" ? 2 : 1;
+    normalizedArgs.requiresProfileRedetection = true;
+    warnings.push(`${classification.matchedControls.length} protected repository control(s) require ${requiredConfirmations === 2 ? "double-exact" : "exact-diff"} approval and profile re-detection.`);
+    return { requiredConfirmations, warnings };
   }
 
   private async prepareDirectoryExport(
@@ -1136,10 +1445,15 @@ class WorkspaceToolRuntimeV2 {
           : Promise.reject(error),
     );
     if (existing) {
-      const rebound = await this.manager.rebindWorkspaceOwnerForContinuation(
-        workspaceId,
-        ownerRunId,
-      );
+      // A person's workspace stays the person's: the run is attached to it,
+      // never made its owner (CODE-8).
+      const personOwned = isPersonWorkspaceOwnerV2(existing.ownerRunId);
+      const rebound = personOwned
+        ? await this.manager.attachRunToPersonWorkspace(workspaceId, ownerRunId)
+        : await this.manager.rebindWorkspaceOwnerForContinuation(
+            workspaceId,
+            ownerRunId,
+          );
       const leaseOwnerId = `extension:${ownerRunId}`;
       const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
       const leaseId = leased.lease?.id ?? null;
@@ -1159,6 +1473,7 @@ class WorkspaceToolRuntimeV2 {
           leaseOwnerId,
           expectedWorkspaceState: "existing",
           payloadBytes: 0,
+          ...(personOwned ? { workspaceOwner: rebound.ownerRunId } : {}),
         },
         expected: sha256Json({
           workspaceId,
@@ -1166,7 +1481,9 @@ class WorkspaceToolRuntimeV2 {
           canonicalRoot: rebound.canonicalRoot,
           leaseId,
         }),
-        summary: `Reuse durable scratch workspace ${workspaceId} for continue segment ${ownerRunId}.`,
+        summary: personOwned
+          ? `Work in the person's scratch workspace ${workspaceId} for run ${ownerRunId}; it stays the person's.`
+          : `Reuse durable scratch workspace ${workspaceId} for continue segment ${ownerRunId}.`,
         action: "create",
         outboundBytes: 0,
         targetType: "code_workspace",
@@ -1217,6 +1534,7 @@ class WorkspaceToolRuntimeV2 {
     assertPayloadBytes(args, 0);
     if (expectedState === "existing") {
       const readback = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
+      assertPreparedWorkspaceOwner(args, readback);
       const leaseId =
         optionalString(args.leaseId) ??
         (await this.manager.acquireLease(workspaceId, leaseOwnerId)).lease?.id;
@@ -1288,10 +1606,13 @@ class WorkspaceToolRuntimeV2 {
           : Promise.reject(error),
     );
     if (existing?.kind === "repository" && existing.repositoryBinding) {
-      const rebound = await this.manager.rebindWorkspaceOwnerForContinuation(
-        workspaceId,
-        ownerRunId,
-      );
+      const personOwned = isPersonWorkspaceOwnerV2(existing.ownerRunId);
+      const rebound = personOwned
+        ? await this.manager.attachRunToPersonWorkspace(workspaceId, ownerRunId)
+        : await this.manager.rebindWorkspaceOwnerForContinuation(
+            workspaceId,
+            ownerRunId,
+          );
       const leaseOwnerId = `extension:${ownerRunId}`;
       const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
       const leaseId = leased.lease?.id ?? null;
@@ -1312,6 +1633,7 @@ class WorkspaceToolRuntimeV2 {
           leaseOwnerId,
           expectedWorkspaceState: "existing",
           payloadBytes: 0,
+          ...(personOwned ? { workspaceOwner: rebound.ownerRunId } : {}),
           profileKey: binding.profileKey,
           repositoryRoot: binding.repositoryRoot,
           baseSha: rebound.baseSha,
@@ -1452,6 +1774,7 @@ class WorkspaceToolRuntimeV2 {
     assertPayloadBytes(args, 0);
     if (expectedState === "existing") {
       const readback = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
+      assertPreparedWorkspaceOwner(args, readback);
       const leaseId =
         optionalString(args.leaseId) ??
         (await this.manager.acquireLease(workspaceId, leaseOwnerId)).lease?.id;
@@ -1895,14 +2218,15 @@ class WorkspaceToolRuntimeV2 {
     if (known) {
       const manifest = await this.manager.renewLease(workspaceId, known).catch(() => null);
       if (
-        manifest?.ownerRunId === ownerRunId &&
+        manifest &&
+        workspaceRunMayWorkV2(manifest, ownerRunId) &&
         manifest.lease?.id === known &&
         manifest.lease.ownerId === leaseOwnerId
       ) return known;
       this.leases.delete(cacheKey);
     }
     const existing = await this.manager.loadManifest(workspaceId);
-    if (existing.ownerRunId !== ownerRunId) {
+    if (!workspaceRunMayWorkV2(existing, ownerRunId)) {
       throw new WorkspaceManagerErrorV2("workspace_owner_mismatch", "Workspace belongs to another run.");
     }
     const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
@@ -1918,7 +2242,7 @@ class WorkspaceToolRuntimeV2 {
   ): Promise<WorkspaceManifestV2> {
     const manifest = await this.manager.loadManifest(workspaceId);
     if (
-      manifest.ownerRunId !== ownerRunId ||
+      !workspaceRunMayWorkV2(manifest, ownerRunId) ||
       manifest.lease?.id !== leaseId ||
       manifest.lease.ownerId !== leaseOwnerId ||
       manifest.status !== "leased"
@@ -2468,6 +2792,21 @@ function isMissingWorkspacePath(error: unknown): boolean {
     (error.code === "path_not_found" || error.code === "parent_missing");
 }
 
+/**
+ * The fingerprint the trash record of a prepared `code_workspace_trash`
+ * carries, as `WorkspaceManagerV2.trash` writes it. A folder's prepared hash
+ * is already its tree fingerprint. A single file's prepared hash is the
+ * file's own, while its record holds the tree fingerprint over its path,
+ * hash and size, which is what `findTrashEvidence` compares, as the patch's
+ * reconcile does. An action prepared before the size was bound keeps the
+ * comparison it had, so it is left uncertain rather than guessed at.
+ */
+function trashRecordFingerprint(targetPath: string, args: Record<string, unknown>): string {
+  const expected = requiredFingerprint(args.expectedSha256);
+  if (args.expectedKind !== "file" || typeof args.expectedBytes !== "number") return expected;
+  return workspaceFileTreeFingerprintV2(targetPath, expected, args.expectedBytes);
+}
+
 async function assertPreparedTargetState(
   manager: WorkspaceManagerV2,
   workspaceId: string,
@@ -2623,9 +2962,38 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
   if (name === "code_workspace_create") return objectSchema({ workspaceId: stringSchema(), kind: { type: "string", enum: ["scratch", "repository"] }, repositoryProfileKey: stringSchema(), repositoryRoot: stringSchema() });
   if (name === "code_workspace_init_repository") return objectSchema({ workspaceId: stringSchema(), commitMessage: stringSchema() });
   if (name === "code_workspace_status") return objectSchema({ workspaceId: stringSchema() });
-  if (name === "code_workspace_search") return objectSchema({ workspaceId: stringSchema(), query: stringSchema(), path: stringSchema(), caseSensitive: { type: "boolean" }, limit: { type: "integer" } }, ["query"]);
-  if (name === "code_workspace_list" || name === "list_workspace_files") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() });
-  if (name === "code_workspace_read" || name === "read_workspace_file" || name === "code_workspace_stat") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
+  if (name === "code_workspace_search") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      query: stringSchema(),
+      path: stringSchema(),
+      caseSensitive: { type: "boolean" },
+      limit: { type: "integer", minimum: 1, maximum: 200 },
+      regex: { type: "boolean", description: "Read query as a JavaScript regular expression; matching lines are listed in file order." },
+      include: { type: "array", items: stringSchema(), maxItems: 20, description: "Globs a file must match one of, such as \"*.ts\" or \"src/**\"." },
+      exclude: { type: "array", items: stringSchema(), maxItems: 20, description: "Globs that leave files or whole folders out, such as \"dist\" or \"**/*.min.js\"." },
+      contextLines: { type: "integer", minimum: 0, maximum: 3, description: "Lines of context shown before and after each match." },
+    }, ["query"]);
+  }
+  if (name === "code_workspace_list") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      path: stringSchema(),
+      recursive: { type: "boolean", description: "List the folders inside as well, as a tree." },
+      maxDepth: { type: "integer", minimum: 1, maximum: 20, description: "How many levels a recursive listing goes down (default 5)." },
+      glob: { type: "string", description: "Only list files matching this glob, such as \"**/*.py\"; implies recursive." },
+    });
+  }
+  if (name === "list_workspace_files") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() });
+  if (name === "code_workspace_read") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      path: stringSchema(),
+      startLine: { type: "integer", minimum: 1, description: "First line to read, 1-based. Omit to start at the top." },
+      lineCount: { type: "integer", minimum: 1, description: "How many lines to read. Omit to read to the end." },
+    }, ["path"]);
+  }
+  if (name === "read_workspace_file" || name === "code_workspace_stat") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
   if (name === "code_workspace_mkdir") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
   if (name === "code_workspace_create_file") return {
     ...objectSchema({
@@ -2663,6 +3031,15 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
   if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "content"]);
   if (name === "code_workspace_write_expected" || name === "write_workspace_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "content"]);
   if (name === "code_workspace_patch") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: sha256FingerprintSchema(), replacements: { type: "array", items: objectSchema({ oldText: stringSchema(), newText: stringSchema(), expectedOccurrences: { type: "integer", enum: [1] } }, ["oldText", "newText"]) } }, ["path", "replacements"]);
+  if (name === "code_workspace_apply_patch") {
+    return objectSchema({
+      workspaceId: stringSchema(),
+      patch: {
+        type: "string",
+        description: "A unified diff in git diff form over at most 20 workspace files: --- a/<path> and +++ b/<path> per file, then @@ hunks.",
+      },
+    }, ["patch"]);
+  }
   if (name === "code_workspace_move" || name === "code_workspace_copy") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), destinationPath: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path", "destinationPath"]);
   if (name === "code_workspace_trash") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: sha256FingerprintSchema() }, ["path"]);
   if (name === "code_workspace_restore") return objectSchema({ workspaceId: stringSchema(), trashId: stringSchema() }, ["trashId"]);
@@ -2706,7 +3083,11 @@ function description(name: string): string {
   } else if (name === "code_workspace_init_repository") {
     text = `Purpose: Turn this scratch workspace into a real Git repository so the commit and GitHub publication steps become available. Use when: the project files are written and validated and the mission asks for a commit, a repository, or a GitHub publication, and code_commit_verified reports that no repository is bound. Do not use when: the workspace was created from an existing repository. Required: nothing beyond the workspace; commitMessage is optional. Next: code_commit_verified, then create_private_github_repository and publish_verified_code_to_github. Side effects: exact approval-gated git init plus one initial commit of the files this workspace already tracks, inside the workspace directory only. ${base} It never touches an existing repository, never adds a remote, and refuses a workspace that already contains one.`;
   } else if (name === "code_workspace_search") {
-    text = `Purpose: Find where something lives in the workspace, best match first. Use when: locating a symbol, string, or concept before reading a file. Do not use when: you already know the path — read it. Required: query. Next: code_workspace_read on the paths this returns. Side effects: none. ${base} Results are ranked, not listed in directory order, so a small limit returns the strongest matches rather than the first ones on disk. Each result carries a score and a matchKind: "definition" means the line declares the match (usually what you want), "reference" an import or re-export, "comment" a mention in prose, "text" anything else. A multi-word query first tries the literal phrase and falls back to lines covering the most query terms, so a description works when an exact string is not known. Matches in test, fixture, and build-output paths rank lower but are never hidden.`;
+    text = `Purpose: Find where something lives in the workspace, best match first. Use when: locating a symbol, string, or concept before reading a file. Do not use when: you already know the path — read it. Required: query. Next: code_workspace_read on the paths and lines this returns. Side effects: none. ${base} Each match comes back as a path:line:column: text line. A literal query is ranked, not listed in directory order, so a small limit returns the strongest matches rather than the first ones on disk: a line that declares the match ranks first, then references and mentions. A multi-word query first tries the literal phrase and falls back to lines covering the most query terms, so a description works when an exact string is not known. Set regex true to search with a JavaScript regular expression; its matching lines are listed in file and line order. include and exclude take globs ("*.py" matches by file name at any depth, "src/**" a folder, "{a,b}" a choice); contextLines (0-3) adds the lines around each match. Files that cannot be searched (binary, over 2 MiB, links, nested .git) are skipped and counted, never fatal. Matches in test, fixture, and build-output paths rank lower but are never hidden.`;
+  } else if (name === "code_workspace_read") {
+    text = `Purpose: Read a workspace file's lines with their numbers. Use when: you need the exact text before editing it, or to understand code. Required: path. Optional: startLine (1-based) and lineCount to read part of a long file. Next: code_workspace_patch with oldText copied exactly from these lines, or code_workspace_write_expected after reading the whole file. Side effects: none. ${base} Each line is shown as its number, two spaces, then the text; the number and the two spaces are not part of the file, so never put them in oldText. The header gives the path, the lines shown, the file's total line count and its sha256 (of the whole file, also when only part is read). When the answer stops before the end of the file it ends with the exact code_workspace_read call that reads on. A full-file replacement with code_workspace_write_expected needs the whole file read first; after reading only part of a file, use code_workspace_patch.`;
+  } else if (name === "code_workspace_list") {
+    text = `Purpose: See what is in a workspace folder. Use when: finding your way around before reading or searching. Required: nothing; path defaults to the workspace root. Next: code_workspace_read or code_workspace_search. Side effects: none. ${base} The answer is an indented tree with folders ending in /. recursive true lists folders inside folders, down to maxDepth levels (default 5); glob (such as "**/*.py") lists only matching files and the folders that lead to them. Dependency and build folders (node_modules, .venv, __pycache__, dist, build and the like) are shown but not opened; list one by its path to see inside. A cut listing says where it stopped.`;
   } else if (name === "code_workspace_mkdir") {
     text = `Purpose: Create a nested directory path inside the bounded code workspace. Required: path. Side effects: bound write. ${base} Every missing parent directory is created safely; an existing directory is accepted, but a file conflict is rejected.`;
   } else if (name === "code_workspace_export_directory") {
@@ -2716,6 +3097,8 @@ function description(name: string): string {
     text += " Missing parent directories are created automatically, so paths such as src/game/ui/checkers.py are valid in one call.";
   } else if (name === "code_workspace_append") {
     text = `Purpose: Append content to a workspace file, creating the file when the path does not exist yet. Use when: writing a planned implementation file or adding to one you have read. Required: path + content; expectedSha256 only when appending to an existing file you have read, passed in the prefixed form the read reported (sha256:<64 lowercase hex>). Next: code_validate_fast. Side effects: bound local write. ${base}`;
+  } else if (name === "code_workspace_apply_patch") {
+    text = `Purpose: Change several workspace files at once with one unified diff: rename a function and its callers, add a module and its import, delete or rename a file with the edits that go with it. Use when: an edit spans files. Do not use when: one small change in one file (code_workspace_patch is simpler) or a new file on its own (code_workspace_create_file). Required: patch. Next: code_validate_fast. Side effects: one bound write of every file in the patch, or of none. ${base} Write the patch as git diff writes it: for each file a --- a/<path> line and a +++ b/<path> line (--- /dev/null for a new file; +++ /dev/null to move a file to the workspace trash; rename from/rename to lines, or two different paths, to rename one), then hunks headed @@ -<line>,<count> +<line>,<count> @@ of context lines (starting with a space), removed lines (-) and added lines (+). Copy context and removed lines exactly as code_workspace_read shows them, without its line numbers. A hunk applies only where its lines match the file exactly; its line numbers say where to look when the same lines appear more than once. Every file is read and checked when the patch is prepared and again when it is written, so a file that changed in between refuses the whole patch and nothing is written. At most 100 files; binary files, mode changes and copies are refused.`;
   } else if (name === "code_workspace_patch") {
     text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
   } else if (
@@ -3357,8 +3740,101 @@ function actionRunId(context: ScopedExtensionContextV1): string { return context
 function requiredPath(args: Record<string, unknown>, ...names: string[]): string { for (const name of names) { const value = optionalString(args[name]); if (value) return assertWorkspaceRelativePathV2(value); } throw new WorkspaceManagerErrorV2("invalid_arguments", `${names[0]} is required.`); }
 function requiredString(value: unknown, label: string, allowEmpty = false): string { if (typeof value !== "string" || (!allowEmpty && !value.length)) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a string${allowEmpty ? "" : " with content"}.`); return value; }
 function requiredStringArray(value: unknown, label: string): string[] { if (!Array.isArray(value) || value.length < 1) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a non-empty array.`); return value.map((entry) => requiredString(entry, label)); }
+/**
+ * A create prepared against a person's workspace names that person; the
+ * workspace must still be theirs, with this run attached, when it executes.
+ */
+function assertPreparedWorkspaceOwner(
+  args: Record<string, JsonValueV1>,
+  manifest: WorkspaceManifestV2,
+): void {
+  const owner = optionalString(args.workspaceOwner);
+  if (owner === null) return;
+  if (
+    manifest.ownerRunId !== owner ||
+    manifest.attachedRunId !== requiredString(args.ownerRunId, "ownerRunId")
+  ) {
+    throw new WorkspaceManagerErrorV2(
+      "prepared_binding_drift",
+      "The person's workspace changed hands after this action was prepared.",
+    );
+  }
+}
 function optionalString(value: unknown): string | null { return typeof value === "string" && value.trim() ? value.trim() : null; }
 function optionalInteger(value: unknown): number | undefined { return Number.isSafeInteger(value) ? Number(value) : undefined; }
+function optionalBoundedInteger(value: unknown, label: string, minimum: number, maximum: number): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a whole number from ${minimum} to ${maximum}.`);
+  }
+  return value as number;
+}
+function optionalGlobArgument(value: unknown, label: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value.trim() ? [value] : undefined;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a list of glob strings.`);
+  }
+  return value as string[];
+}
+
+/**
+ * The result of `code_workspace_read`: the requested lines (all of them when
+ * no range is given) with where they sit in the file. `content` is the exact
+ * text of those lines, line breaks included, so a whole-file read is
+ * byte-for-byte what it always was; `sha256` and `bytes` always describe the
+ * whole file, so a partial read can still bind a patch's expectedSha256.
+ */
+export function codeWorkspaceReadRangeV2(
+  workspaceId: string,
+  read: { path: string; content: string; bytes: number; sha256: string },
+  args: Record<string, unknown>,
+): {
+  workspaceId: string;
+  path: string;
+  content: string;
+  bytes: number;
+  sha256: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  nextStartLine: number | null;
+  truncated: boolean;
+  wholeFile: boolean;
+} {
+  const startLine = optionalBoundedInteger(args.startLine, "startLine", 1, Number.MAX_SAFE_INTEGER) ?? 1;
+  const lineCount = optionalBoundedInteger(args.lineCount, "lineCount", 1, Number.MAX_SAFE_INTEGER);
+  const spans = codeLineSpansV1(read.content);
+  const totalLines = spans.length;
+  if (totalLines === 0) {
+    if (startLine > 1) {
+      throw new WorkspaceManagerErrorV2("line_out_of_range", `${read.path} is empty; read it without startLine.`);
+    }
+    return { workspaceId, ...read, startLine: 1, endLine: 0, totalLines: 0, nextStartLine: null, truncated: false, wholeFile: true };
+  }
+  if (startLine > totalLines) {
+    throw new WorkspaceManagerErrorV2(
+      "line_out_of_range",
+      `startLine ${startLine} is past the end of ${read.path}, which has ${totalLines} ${totalLines === 1 ? "line" : "lines"}.`,
+    );
+  }
+  const endLine = lineCount === undefined ? totalLines : Math.min(totalLines, startLine + lineCount - 1);
+  const nextStartLine = endLine < totalLines ? endLine + 1 : null;
+  const wholeFile = startLine === 1 && nextStartLine === null;
+  return {
+    workspaceId,
+    path: read.path,
+    content: wholeFile ? read.content : read.content.slice(spans[startLine - 1]!.start, spans[endLine - 1]!.next),
+    bytes: read.bytes,
+    sha256: read.sha256,
+    startLine,
+    endLine,
+    totalLines,
+    nextStartLine,
+    truncated: nextStartLine !== null,
+    wholeFile,
+  };
+}
 function requiredFingerprint(value: unknown): string { if (!isSha256FingerprintV2(value)) throw new WorkspaceManagerErrorV2("invalid_arguments", "A SHA-256 fingerprint is required."); return value; }
 function byteLength(value: string): number { return new TextEncoder().encode(value).byteLength; }
 function sha256Json(value: unknown): string { return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`; }
@@ -3378,6 +3854,229 @@ function applyExactReplacements(
     next = `${next.slice(0, first)}${replacement.newText}${next.slice(first + replacement.oldText.length)}`;
   }
   return next;
+}
+
+/** One file of a prepared apply_patch, as the action binds it. */
+interface BoundPatchFileV2 {
+  kind: UnifiedPatchFileKindV1;
+  path: string;
+  fromPath: string | null;
+  /** The file's hash as it was read; null for a new file. */
+  expectedSha256: string | null;
+  expectedBytes: number | null;
+  /** The hash of the text the patch gives it; null for a delete. */
+  expectedAfterSha256: string | null;
+  added: number;
+  removed: number;
+  /** `src/a.ts: +12 −3`. */
+  line: string;
+}
+
+interface PlannedPatchFileV2 {
+  bound: BoundPatchFileV2;
+  /** The text the patch gives the file; null for a delete. */
+  after: string | null;
+}
+
+/**
+ * Read a patch and every file it names, and work out what each becomes. The
+ * same answer at prepare and at execute is what binds the approval to the
+ * write: the files are read again, so a file that changed in between fails
+ * on its hash.
+ */
+async function planWorkspacePatchV2(
+  manager: WorkspaceManagerV2,
+  workspaceId: string,
+  patch: string,
+): Promise<PlannedPatchFileV2[]> {
+  let files: UnifiedPatchFileV1[];
+  try {
+    files = parseUnifiedPatchV1(patch);
+  } catch (error) {
+    throw asWorkspaceErrorV2(error);
+  }
+  const planned: PlannedPatchFileV2[] = [];
+  for (const file of files) {
+    const sourcePath = file.kind === "rename" ? file.fromPath! : file.path;
+    let current: WorkspaceReadResultV2 | null = null;
+    if (file.kind === "add") {
+      if (await statOrMissing(manager, workspaceId, file.path)) {
+        throw new WorkspaceManagerErrorV2(
+          "path_exists",
+          `${file.path} already exists; give it as a change to the file (--- a/${file.path}), not as a new file.`,
+        );
+      }
+    } else {
+      const stat = await statOrMissing(manager, workspaceId, sourcePath);
+      if (!stat) {
+        throw new WorkspaceManagerErrorV2(
+          "path_not_found",
+          `${sourcePath} does not exist; give a new file as --- /dev/null and +++ b/${sourcePath}.`,
+        );
+      }
+      if (stat.kind !== "file") {
+        throw new WorkspaceManagerErrorV2("path_conflict", `${sourcePath} is not a regular file.`);
+      }
+      current = await manager.read(workspaceId, sourcePath);
+      if (file.kind === "rename" && await statOrMissing(manager, workspaceId, file.path)) {
+        throw new WorkspaceManagerErrorV2(
+          "path_exists",
+          `${file.path} already exists, so ${sourcePath} cannot be renamed to it.`,
+        );
+      }
+    }
+    let plan: UnifiedPatchFilePlanV1;
+    try {
+      plan = planUnifiedPatchFileV1(file, current?.content ?? null);
+    } catch (error) {
+      throw asWorkspaceErrorV2(error);
+    }
+    if (plan.after !== null) assertNotebookResultV1(file.path, plan.after);
+    planned.push({
+      bound: {
+        kind: file.kind,
+        path: file.path,
+        fromPath: file.fromPath,
+        expectedSha256: current?.sha256 ?? null,
+        expectedBytes: current?.bytes ?? null,
+        expectedAfterSha256: plan.after === null ? null : sha256Text(plan.after),
+        added: plan.added,
+        removed: plan.removed,
+        line: describeUnifiedPatchFileV1(file, plan),
+      },
+      after: plan.after,
+    });
+  }
+  return planned;
+}
+
+function asWorkspaceErrorV2(error: unknown): unknown {
+  return error instanceof UnifiedPatchErrorV1 ? new WorkspaceManagerErrorV2(error.code, error.message) : error;
+}
+
+function parseBoundPatchFilesV2(value: unknown): BoundPatchFileV2[] {
+  if (!Array.isArray(value) || value.length < 1) {
+    throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The prepared patch names no files.");
+  }
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The prepared patch's files are invalid.");
+    }
+    const file = entry as Record<string, unknown>;
+    const nullableString = (key: string) => (file[key] === null ? null : requiredString(file[key], key));
+    const kind = requiredString(file.kind, "kind");
+    if (!["modify", "add", "delete", "rename"].includes(kind)) {
+      throw new WorkspaceManagerErrorV2("prepared_binding_drift", "The prepared patch's files are invalid.");
+    }
+    return {
+      kind: kind as UnifiedPatchFileKindV1,
+      path: requiredString(file.path, "path"),
+      fromPath: nullableString("fromPath"),
+      expectedSha256: nullableString("expectedSha256"),
+      expectedBytes: file.expectedBytes === null ? null : Number(file.expectedBytes),
+      expectedAfterSha256: nullableString("expectedAfterSha256"),
+      added: Number(file.added),
+      removed: Number(file.removed),
+      line: requiredString(file.line, "line"),
+    };
+  });
+}
+
+function patchRepositoryChangesV2(files: readonly BoundPatchFileV2[]): RepositoryFileChangeV2[] {
+  return files.flatMap((file): RepositoryFileChangeV2[] => {
+    if (file.kind === "add") return [{ path: file.path, beforeSha256: null, afterSha256: file.expectedAfterSha256 }];
+    if (file.kind === "delete") return [{ path: file.path, beforeSha256: file.expectedSha256, afterSha256: null }];
+    if (file.kind === "rename") {
+      return [
+        { path: file.path, beforeSha256: null, afterSha256: file.expectedAfterSha256 },
+        { path: file.fromPath!, beforeSha256: file.expectedSha256, afterSha256: null },
+      ];
+    }
+    return [{ path: file.path, beforeSha256: file.expectedSha256, afterSha256: file.expectedAfterSha256 }];
+  });
+}
+
+function patchRelatedResourcesV2(
+  workspaceId: string,
+  files: readonly BoundPatchFileV2[],
+  repositoryProfileId: string | undefined,
+): PreparedActionV1["relatedResources"] {
+  const first = files[0]!.path;
+  const paths = [...new Set(files.flatMap((file) => [file.path, ...(file.fromPath ? [file.fromPath] : [])]))]
+    .filter((path) => path !== first);
+  return paths.map((path) => ({ ...workspaceResource(workspaceId, path, "code_workspace", "workspace", repositoryProfileId) }));
+}
+
+const PATCH_CHANGE_WORDS_V2: Record<UnifiedPatchFileKindV1, string> = {
+  modify: "modified",
+  add: "added",
+  delete: "deleted",
+  rename: "renamed",
+};
+
+function patchOutputV2(
+  workspaceId: string,
+  files: readonly BoundPatchFileV2[],
+  receipts: readonly WorkspaceMutationReceiptV2[],
+) {
+  return {
+    status: "ok",
+    operation: "apply_patch",
+    workspaceId,
+    files: files.map((file, index) => ({
+      path: file.path,
+      fromPath: file.fromPath,
+      change: PATCH_CHANGE_WORDS_V2[file.kind],
+      added: file.added,
+      removed: file.removed,
+      beforeSha256: file.expectedSha256,
+      afterSha256: file.expectedAfterSha256,
+      trashId: receipts[index]?.trashId ?? null,
+      line: file.line,
+    })),
+    receipts,
+  };
+}
+
+function patchActionReceiptV2(
+  action: PreparedActionV1,
+  context: ScopedExtensionContextV1,
+  files: readonly BoundPatchFileV2[],
+  receipts: readonly WorkspaceMutationReceiptV2[],
+  commitKind: ActionReceiptV1["commitKind"],
+): ActionReceiptV1 {
+  const committedAt = receipts.at(-1)?.committedAt ?? context.now().toISOString();
+  const fingerprint = sha256Json(receipts.map((receipt) => receipt.fingerprint));
+  return {
+    version: 1,
+    id: `workspace-patch-${fingerprint.slice(7, 23)}`,
+    runId: action.runId,
+    actionId: action.id,
+    toolName: action.toolName,
+    operation: toolDescriptor("code_workspace_apply_patch", "required").capability.action,
+    resource: action.target,
+    relatedResources: action.relatedResources,
+    message: `Workspace patch ${commitKind === "committed" ? "committed" : "reconciled"} for ${files.length} ${files.length === 1 ? "file" : "files"}: ${files.map((file) => file.line).join("; ")}.`,
+    payloadFingerprint: action.payloadFingerprint,
+    grantId: context.authorizedAction!.grantId,
+    idempotencyKey: action.idempotencyKey,
+    startedAt: action.preparedAt,
+    committedAt,
+    commitKind,
+    readback: {
+      status: "verified",
+      checkedAt: committedAt,
+      observedRevision: sha256Json(files.map((file) => [file.path, file.expectedAfterSha256])),
+      observedFingerprint: fingerprint,
+      priorRevision: action.expectedTargetRevision,
+    },
+    effects: {
+      bytesWritten: receipts.reduce((total, receipt) => total + receipt.bytesWritten, 0),
+      bytesDeleted: receipts.reduce((total, receipt) => total + receipt.bytesDeleted, 0),
+      affectedCount: commitKind === "committed" ? files.length : 0,
+      changedFields: [...new Set(files.flatMap((file) => [file.path, ...(file.fromPath ? [file.fromPath] : [])]))],
+    },
+  };
 }
 
 function mutationChanges(

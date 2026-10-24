@@ -187,3 +187,69 @@ test("protected-control classifier binds exact hashes and escalates workflows an
   ]);
   assert.equal(gitInternal.level, "blocked");
 });
+
+function detectFiles(files: string[]) {
+  return detectRepositoryProfileV2({
+    key: "python-legacy",
+    displayName: "Python repository",
+    repositoryRoot: "/work/python-legacy",
+    defaultBranch: "main",
+    files,
+  });
+}
+
+test("a Python repository declared by setup.py or setup.cfg alone is trusted as a Python project (CODE2-25)", () => {
+  for (const manifest of ["setup.py", "setup.cfg"]) {
+    const profile = detectFiles([manifest, "README.md", "pkg/__init__.py", "tests/test_pkg.py"]);
+    assert.deepEqual(profile.ecosystems, ["python"], manifest);
+    assert.deepEqual(profile.projects.map((project) => project.root), ["."], manifest);
+    const phases = profile.validationCatalog.map((command) => `${command.phase}:${command.executable} ${command.args.join(" ")}`);
+    assert.deepEqual(phases, ["fast:python -m pytest -q", "full:python -m pytest"], manifest);
+    assert.ok(
+      profile.validationCatalog.every((command) => command.network === "disabled" && command.lockfile === null),
+      "with nothing pinned there is no bootstrap: installing the project would run its setup.py with the network on",
+    );
+    assert.equal(
+      profile.protectedControls.find((control) => control.path === manifest)?.kind,
+      "manifest",
+      `${manifest} runs code at install, so a change to it asks as a manifest's does`,
+    );
+    assert.equal(
+      classifyProtectedControlChangesV2(profile, [{ path: manifest, beforeSha256: SHA_A, afterSha256: SHA_B }]).level,
+      "exact_diff",
+    );
+  }
+  const pinned = detectFiles(["setup.py", "requirements.txt", "tests/test_pkg.py"]);
+  assert.deepEqual(
+    pinned.validationCatalog.filter((command) => command.phase === "bootstrap").map((command) => command.lockfile),
+    ["requirements.txt"],
+    "a root requirements.txt beside setup.py is still the hash-pinned bootstrap",
+  );
+});
+
+test("a requirements.txt below a declared Python project is that project's file, not a project (CODE2-25)", () => {
+  for (const manifest of ["setup.py", "setup.cfg", "pyproject.toml"]) {
+    const profile = detectFiles([manifest, "docs/requirements.txt", "docs/conf.py", "src/pkg/__init__.py", "tests/test_pkg.py"]);
+    assert.deepEqual(profile.projects.map((project) => project.root), ["."], manifest);
+    assert.deepEqual(profile.allowedPaths, ["."], manifest);
+    assert.ok(profile.validationCatalog.every((command) => command.cwd === "."), manifest);
+  }
+
+  // Without a declared project above it, a requirements.txt is still a project of its own.
+  assert.deepEqual(detectFiles(["docs/requirements.txt", "docs/conf.py"]).projects.map((project) => project.root), ["docs"]);
+  assert.deepEqual(
+    detectFiles(["requirements.txt", "tools/requirements.txt"]).projects.map((project) => project.root),
+    [".", "tools"],
+    "a root requirements.txt lists dependencies; it does not declare a project that holds tools/",
+  );
+  assert.deepEqual(
+    detectFiles(["package.json", "package-lock.json", "docs/requirements.txt"]).projects.map((project) => `${project.root}:${project.ecosystems.join(",")}`),
+    [".:node", "docs:python"],
+    "a Node project does not hold a Python folder",
+  );
+  // A nested project that declares itself, or carries a lock, stays its own.
+  assert.deepEqual(
+    detectFiles(["setup.py", "plugins/extra/setup.py", "services/api/requirements.txt", "services/api/uv.lock"]).projects.map((project) => project.root),
+    [".", "plugins/extra", "services/api"],
+  );
+});

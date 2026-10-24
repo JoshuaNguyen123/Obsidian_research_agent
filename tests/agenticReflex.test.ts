@@ -555,6 +555,42 @@ test("completion evaluator accepts only a canonical completed research publicati
   assert.deepEqual(unverified.missing, ["write_receipt"]);
 });
 
+test("completion evaluator takes a code change or a verified commit as a coding pass's write", () => {
+  const codingIntent: MissionIntent = {
+    ...missionIntent,
+    mode: "explicit_file_mutation",
+    explicitMutation: true,
+    allowAutonomousWrite: true,
+    requireWriteCompletion: true,
+  };
+  const prompt = "Fix offset() in src/pager.py so the tests pass, then commit it.";
+  const evaluate = (receipts: AgenticReflexInput["receipts"]) =>
+    evaluateCompletion(input({ prompt, missionIntent: codingIntent, allowedToolNames: new Set(), receipts }));
+  const commit = {
+    toolName: "code_commit_verified",
+    operation: "commit",
+    message: "Created and read back verified local commit d4395fa.",
+    resource: { system: "git" },
+  };
+  const patch = {
+    toolName: "code_workspace_patch",
+    operation: "update",
+    message: "update src/pager.py",
+    resource: { system: "workspace" },
+  };
+  assert.deepEqual(evaluate([commit]).missing, []);
+  assert.deepEqual(evaluate([patch]).missing, []);
+  // A read of the workspace is not a write, and neither is a validation.
+  assert.deepEqual(
+    evaluate([{ toolName: "code_workspace_read", operation: "read", message: "read", resource: { system: "workspace" } }]).missing,
+    ["write_receipt"],
+  );
+  assert.deepEqual(
+    evaluate([{ toolName: "code_validate_fast", operation: "validate", message: "validate", resource: { system: "workspace" } }]).missing,
+    ["write_receipt"],
+  );
+});
+
 test("completion evaluator recommends available recovery tools before final answer", () => {
   const completion = evaluateCompletion(
     input({

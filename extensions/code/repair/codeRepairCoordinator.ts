@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import { sha256Fingerprint } from "../../../packages/headless-runtime/src/canonicalize";
 import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
   isAgentGitCommitIdentityV1,
   type AgentGitCommitIdentityV1,
 } from "../../../packages/core-api/src/agentGitCommitIdentityV1";
@@ -417,6 +419,7 @@ export class CodeRepairCoordinatorV1 {
           commitSha: commit.commitSha,
         }),
         operationId,
+        expectedCommitIdentityV1(request),
       );
       checkpoint = await this.persist(checkpoint, (next) => {
         next.commitReadback = readback;
@@ -560,6 +563,7 @@ export class CodeRepairCoordinatorV1 {
     const commitReadback = normalizeCommitReadback(
       reconciliation.readback,
       readbackOperationId,
+      expectedCommitIdentityV1(request),
     );
     const mismatch = compareCommitReadback({
       request,
@@ -628,6 +632,7 @@ export class CodeRepairCoordinatorV1 {
         commitSha: commit.commitSha,
       }),
       operationId,
+      expectedCommitIdentityV1(request),
     );
     const mismatch = compareCommitReadback({
       request,
@@ -935,6 +940,9 @@ export function normalizeCodeRepairRequestV1(
   const expectedArtifacts = normalizeExpectedArtifacts(input.expectedArtifacts ?? []);
   const protectedControlPaths = [...new Set(input.protectedControlPaths ?? [])].sort();
   classifyProtectedControlChanges([], protectedControlPaths);
+  const commitIdentity = input.commitIdentity === undefined
+    ? undefined
+    : normalizePersonCommitIdentityV1(input.commitIdentity);
   return {
     id,
     runId,
@@ -944,7 +952,68 @@ export function normalizeCodeRepairRequestV1(
     maxCycles,
     expectedArtifacts,
     protectedControlPaths,
+    ...(commitIdentity === undefined ? {} : { commitIdentity }),
   };
+}
+
+/**
+ * The identity a request's verified commit must carry: the person's named on
+ * the request, else the host-pinned Agentic Researcher identity.
+ */
+export function expectedCommitIdentityV1(
+  request: Pick<NormalizedCodeRepairRequestV1, "commitIdentity">,
+): AgentGitCommitIdentityV1 {
+  return request.commitIdentity
+    ? { ...request.commitIdentity }
+    : {
+        authorName: AGENT_GIT_COMMIT_NAME_V1,
+        authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+        committerName: AGENT_GIT_COMMIT_NAME_V1,
+        committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+      };
+}
+
+export function sameCommitIdentityV1(
+  left: AgentGitCommitIdentityV1,
+  right: AgentGitCommitIdentityV1,
+): boolean {
+  return left.authorName === right.authorName &&
+    left.authorEmail === right.authorEmail &&
+    left.committerName === right.committerName &&
+    left.committerEmail === right.committerEmail;
+}
+
+/**
+ * A person's commit identity: one name and one address, the same as author
+ * and committer, never the agent's. Git would write the name and address
+ * into the commit object between `<` and `>`, so neither may hold an angle
+ * bracket, a control character or a line break.
+ */
+export function normalizePersonCommitIdentityV1(
+  input: AgentGitCommitIdentityV1,
+): AgentGitCommitIdentityV1 {
+  assertPlainObject(input, "Person commit identity");
+  assertExactKeys(input, [
+    "authorName", "authorEmail", "committerName", "committerEmail",
+  ], "Person commit identity");
+  const name = assertBoundedString(input.authorName, "Person commit name", 1, 256);
+  const email = assertBoundedString(input.authorEmail, "Person commit email", 3, 256);
+  if (
+    input.committerName !== name ||
+    input.committerEmail !== email ||
+    name.trim() !== name ||
+    email.trim() !== email ||
+    /[\u0000-\u001f\u007f<>]/u.test(name) ||
+    /[\u0000-\u0020\u007f<>]/u.test(email) ||
+    !/^[^@]+@[^@]+$/u.test(email)
+  ) {
+    throw new Error("A person's commit identity is one plain name and one address, as author and committer.");
+  }
+  const identity = { authorName: name, authorEmail: email, committerName: name, committerEmail: email };
+  if (isAgentGitCommitIdentityV1(identity) || name === AGENT_GIT_COMMIT_NAME_V1 || email === AGENT_GIT_COMMIT_EMAIL_V1) {
+    throw new Error("A person's commit identity cannot be the agent's.");
+  }
+  return identity;
 }
 
 /** Stable persistence key scoped to mission, workspace, and repair request. */
@@ -991,6 +1060,9 @@ export async function parseCodeRepairCheckpointV1(
   assertExactKeys(checkpoint.request, [
     "id", "runId", "objective", "worktree", "commitMessage", "maxCycles",
     "expectedArtifacts", "protectedControlPaths",
+    ...(Object.prototype.hasOwnProperty.call(checkpoint.request, "commitIdentity")
+      ? ["commitIdentity"]
+      : []),
   ], "normalized Code repair request");
   assertExactKeys(checkpoint.request.worktree, [
     "id", "path", "repositoryRoot", "branch", "baseSha", "profileId",
@@ -1189,11 +1261,18 @@ export async function parseCodeRepairCheckpointV1(
       "operationId", "commitSha", "parentSha", "treeSha", "diffFingerprint",
       "changedPaths", "artifactHashes", "identity", "readAt",
     ], "commit readback");
-    normalizeCommitReadback(checkpoint.commitReadback, checkpoint.commitReadback.operationId);
+    normalizeCommitReadback(
+      checkpoint.commitReadback,
+      checkpoint.commitReadback.operationId,
+      expectedCommitIdentityV1(request),
+    );
   }
 
   if (checkpoint.verifiedCommitReceipt) {
-    assertExactVerifiedCommitReceipt(checkpoint.verifiedCommitReceipt);
+    assertExactVerifiedCommitReceipt(
+      checkpoint.verifiedCommitReceipt,
+      expectedCommitIdentityV1(request),
+    );
     if (
       !checkpoint.commit ||
       !checkpoint.commitReadback ||
@@ -1612,6 +1691,7 @@ function normalizeCommitResult(input: CodeCommitResultV1, operationId: string): 
 function normalizeCommitReadback(
   input: CodeCommitReadbackV1,
   operationId: string,
+  expected: AgentGitCommitIdentityV1,
 ): CodeCommitReadbackV1 {
   assertPlainObject(input, "Commit readback");
   if (input.operationId !== operationId) throw new Error("Commit readback operation ID mismatch.");
@@ -1623,12 +1703,15 @@ function normalizeCommitReadback(
     diffFingerprint: assertSha256(input.diffFingerprint, "readback diff fingerprint"),
     changedPaths: normalizePathSet(input.changedPaths, "commit readback changed paths"),
     artifactHashes: normalizeArtifactReadback(input.artifactHashes),
-    identity: normalizeCommitIdentity(input.identity),
+    identity: normalizeCommitIdentity(input.identity, expected),
     readAt: assertBoundedString(input.readAt, "commit readback time", 1, 128),
   };
 }
 
-function normalizeCommitIdentity(input: AgentGitCommitIdentityV1): AgentGitCommitIdentityV1 {
+function normalizeCommitIdentity(
+  input: AgentGitCommitIdentityV1,
+  expected: AgentGitCommitIdentityV1,
+): AgentGitCommitIdentityV1 {
   assertPlainObject(input, "Git commit identity");
   assertExactKeys(input, [
     "authorName", "authorEmail", "committerName", "committerEmail",
@@ -1641,10 +1724,12 @@ function normalizeCommitIdentity(input: AgentGitCommitIdentityV1): AgentGitCommi
   };
   if (
     Object.values(identity).some((value) => /[\0\r\n]/u.test(value)) ||
-    !isAgentGitCommitIdentityV1(identity)
+    !sameCommitIdentityV1(identity, expected)
   ) {
     throw new Error(
-      "Git commit readback does not contain the host-pinned Agentic Researcher author and committer identity.",
+      isAgentGitCommitIdentityV1(expected)
+        ? "Git commit readback does not contain the host-pinned Agentic Researcher author and committer identity."
+        : "Git commit readback does not contain the person's author and committer identity.",
     );
   }
   return identity;
@@ -1892,7 +1977,10 @@ async function createVerifiedCommitReceipt(input: {
       path: file.path,
       sha256: file.afterSha256,
     })),
-    identity: normalizeCommitIdentity(input.commitReadback.identity),
+    identity: normalizeCommitIdentity(
+      input.commitReadback.identity,
+      expectedCommitIdentityV1(input.request),
+    ),
     targetedValidationReceiptId: input.targetedValidation.id,
     fullValidationReceiptId: input.fullValidation.id,
     targetedValidationFingerprint: input.targetedValidation.fingerprint,
@@ -2079,7 +2167,10 @@ function assertExactValidationReceipt(receipt: CodeValidationReceiptV1): void {
   }
 }
 
-function assertExactVerifiedCommitReceipt(receipt: VerifiedLocalCommitReceiptV1): void {
+function assertExactVerifiedCommitReceipt(
+  receipt: VerifiedLocalCommitReceiptV1,
+  expected: AgentGitCommitIdentityV1,
+): void {
   assertExactKeys(receipt, [
     "version", "kind", "id", "status", "requestId", "runId", "worktreeId",
     "workspaceId", "branch", "baseSha", "commitSha", "parentSha", "treeSha",
@@ -2095,7 +2186,7 @@ function assertExactVerifiedCommitReceipt(receipt: VerifiedLocalCommitReceiptV1)
   for (const artifact of receipt.changedArtifacts) {
     assertExactKeys(artifact, ["path", "sha256"], "verified changed artifact");
   }
-  normalizeCommitIdentity(receipt.identity);
+  normalizeCommitIdentity(receipt.identity, expected);
 }
 
 function sameStrings(left: string[], right: string[]): boolean {

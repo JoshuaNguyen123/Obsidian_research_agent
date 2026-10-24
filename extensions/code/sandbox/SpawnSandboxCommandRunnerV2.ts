@@ -1,11 +1,13 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 
 import type {
   SandboxCommandRunnerV2,
   SandboxHostCommandSpecV2,
   SandboxRunnerResultV2,
   SandboxStagedFileBytesV2,
+  SandboxRunnerProgressV1,
 } from "./SandboxManager";
 
 export interface SandboxSpawnOptionsV2 {
@@ -134,6 +136,7 @@ export class SpawnSandboxCommandRunnerV2 implements SandboxCommandRunnerV2 {
     input: {
       stagedFiles?: readonly SandboxStagedFileBytesV2[];
       signal?: AbortSignal;
+      onProgress?: (progress: SandboxRunnerProgressV1) => void;
     } = {},
   ): Promise<SandboxRunnerResultV2> {
     const spec = validateFixedProviderSpec(rawSpec);
@@ -141,6 +144,7 @@ export class SpawnSandboxCommandRunnerV2 implements SandboxCommandRunnerV2 {
     for (let launch = 0; ; launch += 1) {
       const stdin = buildStdin(spec, input.stagedFiles);
       let result: SandboxRunnerResultV2;
+      let commandStarted = false;
       try {
         result = await spawnBounded(
           this.spawnAdapter,
@@ -148,6 +152,7 @@ export class SpawnSandboxCommandRunnerV2 implements SandboxCommandRunnerV2 {
           env,
           stdin,
           input.signal,
+          progress => { commandStarted = true; return input.onProgress?.(progress); },
         );
       } finally {
         stdin?.fill(0);
@@ -157,6 +162,13 @@ export class SpawnSandboxCommandRunnerV2 implements SandboxCommandRunnerV2 {
           return result;
         }
         return parseArtifactBundle(result.stdout, result.stderr);
+      }
+      if (commandStarted) {
+        throw new SandboxSpawnRunnerV2Error(
+          "provider_exit_signature",
+          "Sandbox provider failed after command output began; execution was not replayed.",
+          { exitCode: result.exitCode, launches: launch + 1 },
+        );
       }
       const delay = this.providerRetryDelaysMs[launch];
       if (delay === undefined) {
@@ -348,10 +360,13 @@ function buildStdin(
     }
     return null;
   }
-  if (!stagedFiles || stagedFiles.length < 1 || stagedFiles.length > 100) {
+  const stagingAt = spec.args.indexOf("--staging-stdin");
+  const profileAt = stagingAt - (spec.args[stagingAt - 1] === "--progress-stderr-v1" ? 2 : 1);
+  const maxFiles = spec.args[profileAt] === "--staging-profile-source-1000-v1" ? 1000 : 100;
+  if (!stagedFiles || stagedFiles.length < 1 || stagedFiles.length > maxFiles) {
     throw new SandboxSpawnRunnerV2Error(
       "unsupported_staging",
-      "verified_staging_bundle requires 1-100 hash-verifiable files.",
+      `verified_staging_bundle requires 1-${maxFiles} hash-verifiable files.`,
     );
   }
   let total = 0;
@@ -394,6 +409,7 @@ async function spawnBounded(
   env: NodeJS.ProcessEnv,
   stdin: Buffer | null,
   signal?: AbortSignal,
+  onProgress?: (progress: SandboxRunnerProgressV1) => void,
 ): Promise<SandboxRunnerResultV2> {
   if (signal?.aborted) {
     throw new SandboxSpawnRunnerV2Error(
@@ -424,6 +440,7 @@ async function spawnBounded(
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let settled = false;
+    const progress = spec.purpose === "execute" && spec.args[spec.args.indexOf("--staging-stdin") - 1] === "--progress-stderr-v1" ? new ProgressDecoder(onProgress) : null;
     const cleanup = () => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
@@ -452,6 +469,7 @@ async function spawnBounded(
       );
     };
     child.stdout.on("data", (chunk) => {
+      if (settled) return;
       const bytes = Buffer.from(chunk);
       stdoutBytes += bytes.byteLength;
       if (stdoutBytes > MAX_PROCESS_STDOUT_BYTES) {
@@ -462,13 +480,20 @@ async function spawnBounded(
       }
     });
     child.stderr.on("data", (chunk) => {
+      if (settled) return;
       const bytes = Buffer.from(chunk);
       stderrBytes += bytes.byteLength;
       if (stderrBytes > MAX_PROCESS_STDERR_BYTES) {
         bytes.fill(0);
         exceed("stderr");
       } else {
-        stderr.push(bytes);
+        if (progress) {
+          try { progress.push(bytes); }
+          catch {
+            child.kill("SIGKILL");
+            finish(new SandboxSpawnRunnerV2Error("invalid_artifact_bundle", "Sandbox progress did not match its bounded protocol."));
+          } finally { bytes.fill(0); }
+        } else stderr.push(bytes);
       }
     });
     child.once("error", (error) => {
@@ -480,6 +505,14 @@ async function spawnBounded(
       );
     });
     child.once("close", (code, closeSignal) => {
+      if (settled) return;
+      if (progress) {
+        try { stderr.push(Buffer.from(progress.end())); }
+        catch {
+          finish(new SandboxSpawnRunnerV2Error("invalid_artifact_bundle", "Sandbox progress ended with an incomplete frame."));
+          return;
+        }
+      }
       const stdoutBuffer = Buffer.concat(stdout);
       const stderrBuffer = Buffer.concat(stderr);
       const stdoutText = stdoutBuffer.toString("utf8");
@@ -525,6 +558,45 @@ async function spawnBounded(
     });
     child.stdin.end(stdin ?? undefined);
   });
+}
+
+/** Frames stay under the existing 1 MiB provider-stderr bound. Older runtimes
+ * emit no frames and retain the ordinary final-bundle path. */
+class ProgressDecoder {
+  private readonly decoder = new StringDecoder("utf8");
+  private pending = "";
+  private readonly provider: string[] = [];
+  private sequence = 0;
+  private readonly totals = { stdout: 0, stderr: 0 };
+  private readonly stopped = { stdout: false, stderr: false };
+  constructor(private readonly observe?: (progress: SandboxRunnerProgressV1) => void) {}
+  push(bytes: Uint8Array): void {
+    this.pending += this.decoder.write(Buffer.from(bytes));
+    let end: number;
+    while ((end = this.pending.indexOf("\n")) >= 0) {
+      const line = this.pending.slice(0, end);
+      this.pending = this.pending.slice(end + 1);
+      if (!line.startsWith("AGENTIC_SANDBOX_PROGRESS_V1:")) { this.provider.push(line + "\n"); continue; }
+      const frame = exactRecord(JSON.parse(line.slice("AGENTIC_SANDBOX_PROGRESS_V1:".length)), ["version", "sequence", "stream", "dataBase64", "truncated"], "progress frame");
+      if (frame.version !== 1 || frame.sequence !== this.sequence + 1 || this.sequence >= 1024
+        || (frame.stream !== "stdout" && frame.stream !== "stderr") || typeof frame.truncated !== "boolean") invalidBundle("Invalid progress frame identity.");
+      const stream = frame.stream as "stdout" | "stderr";
+      if (this.stopped[stream]) invalidBundle("Progress continued after its limit.");
+      const data = decodeBase64(frame.dataBase64, "progress bytes", 8192 - this.totals[stream]);
+      this.sequence += 1;
+      this.totals[stream] += data.length;
+      this.stopped[stream] = frame.truncated as boolean;
+      try { void Promise.resolve(this.observe?.({ stream, bytes: data, truncated: frame.truncated as boolean })).catch(() => undefined); }
+      catch { /* A consumer cannot change the command's result. */ }
+      finally { data.fill(0); }
+    }
+    if (this.pending.startsWith("AGENTIC_SANDBOX_PROGRESS_V1:") && this.pending.length > 12000) invalidBundle("Progress frame is too large.");
+  }
+  end(): string {
+    this.pending += this.decoder.end();
+    if (this.pending.startsWith("AGENTIC_SANDBOX_PROGRESS_V1:")) invalidBundle("Unterminated progress frame.");
+    return this.provider.join("") + this.pending;
+  }
 }
 
 function parseArtifactBundle(

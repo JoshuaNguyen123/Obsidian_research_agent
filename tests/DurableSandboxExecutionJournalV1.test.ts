@@ -109,8 +109,8 @@ test("non-validation execution persists exact receipt and reconciles across rest
   assert.equal(fixture.executions(), 1, "journal reconciliation must not run the sandbox again");
 });
 
-test("repair validation remains uncertain until both exact durable receipts exist", async () => {
-  const fixture = await createFixture("validation_fast");
+for (const stagedFileCount of [1, 1000]) test(`repair validation of ${stagedFileCount} files remains uncertain until both exact durable receipts exist`, async () => {
+  const fixture = await createFixture("validation_fast", stagedFileCount);
   const persistence = new MemoryPersistence();
   const journal = new DurableSandboxExecutionJournalV1(persistence, () => new Date(NOW));
   await journal.recordPrepared({ runId: "run-1", action: fixture.action });
@@ -441,6 +441,7 @@ function retirementFence(recordIds: string[] = []) {
 
 async function createFixture(
   purpose: "validation_fast" | "code_block",
+  stagedFileCount = 1,
 ): Promise<{
   action: PreparedSandboxActionV2;
   execute(): Promise<SandboxExecutionReceiptV2>;
@@ -452,7 +453,7 @@ async function createFixture(
     runner: {
       async run(spec) {
         if (spec.purpose === "boundary_probe") {
-          return { exitCode: 0, stdout: PROBE, stderr: "" };
+          return { exitCode: 0, stdout: stagedFileCount > 100 ? JSON.stringify({ ...JSON.parse(PROBE), stagingProfiles: ["source-1000-v1"] }) : PROBE, stderr: "" };
         }
         executions += 1;
         return { exitCode: 0, stdout: "ok", stderr: "" };
@@ -462,6 +463,7 @@ async function createFixture(
   });
   await manager.probeProviders();
   const source = new TextEncoder().encode("export const value = 1;\n");
+  const stagedFiles = Array.from({ length: stagedFileCount }, (_, index) => ({ path: index === 0 ? "src/index.ts" : `src/file-${index}.ts`, bytes: source }));
   let profile = detectRepositoryProfileV2({
     key: "sandbox-journal-fixture",
     displayName: "Sandbox journal fixture",
@@ -469,6 +471,7 @@ async function createFixture(
     defaultBranch: "main",
     files: ["package.json", "package-lock.json", ".nvmrc", "src/index.ts"],
     fileContents: { ".nvmrc": "24.16.0" },
+    ...(stagedFileCount > 100 ? { stagingProfile: "source-1000-v1" as const } : {}),
   });
   if (purpose === "code_block") {
     const offlineCommand = profile.validationCatalog.find((command) => command.phase === "fast");
@@ -493,11 +496,7 @@ async function createFixture(
     workspaceId: "workspace-1",
     repairRequestId: purpose === "validation_fast" ? "request-1" : null,
     workspaceManifestFingerprint: `sha256:${"e".repeat(64)}`,
-    stagingManifest: [{
-      path: "src/index.ts",
-      bytes: source.byteLength,
-      sha256: bytesFingerprint(source),
-    }],
+    stagingManifest: stagedFiles.map(file => ({ path: file.path, bytes: file.bytes.byteLength, sha256: bytesFingerprint(file.bytes) })),
   });
   if (prepared.status !== "prepared") throw new Error("Sandbox fixture preparation was blocked.");
   assert.equal(prepared.status, "prepared");
@@ -510,7 +509,7 @@ async function createFixture(
           payloadFingerprint: prepared.action.payloadFingerprint,
           grantId: "grant-1",
         },
-        stagedFiles: [{ path: "src/index.ts", bytes: source }],
+        stagedFiles,
       });
       assert.notEqual(result.status, "blocked");
       if (result.status === "blocked") throw new Error(result.blocker.message);

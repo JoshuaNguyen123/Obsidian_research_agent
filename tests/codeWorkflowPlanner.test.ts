@@ -94,3 +94,33 @@ test("selects mkdir only for an actual directory inside the code workspace", () 
     "code_workspace_mkdir",
   );
 });
+
+test("an edit that names two files is planned as one patch; one file, or new files, keep the single writes", () => {
+  const allow = new Set<string>(CODE_EXECUTION_TOOL_ALLOW);
+  assert.ok(allow.has("code_workspace_apply_patch"));
+  assert.equal(
+    selectCodeWorkspaceEditToolName("Rename parse() in src/parse.ts and update its caller in src/main.ts.", allow),
+    "code_workspace_apply_patch",
+  );
+  assert.equal(
+    selectCodeWorkspaceEditToolName("Fix the off-by-one in pager.py and add a case to tests/test_pager.py.", allow),
+    "code_workspace_apply_patch",
+  );
+  assert.equal(
+    selectCodeWorkspaceEditToolName("Fix the off-by-one in src/pager.py.", allow),
+    "code_workspace_patch",
+  );
+  assert.equal(
+    selectCodeWorkspaceEditToolName("Fix src/pager.py; the same file, src/pager.py, holds the test.", allow),
+    "code_workspace_patch",
+  );
+  assert.equal(
+    selectCodeWorkspaceEditToolName("Create main.py and utils.py for a new command-line tool.", allow),
+    "code_workspace_create_file",
+  );
+  const withoutPatch = new Set([...allow].filter((name) => name !== "code_workspace_apply_patch"));
+  assert.equal(
+    selectCodeWorkspaceEditToolName("Rename parse() in src/parse.ts and update its caller in src/main.ts.", withoutPatch),
+    "code_workspace_patch",
+  );
+});
