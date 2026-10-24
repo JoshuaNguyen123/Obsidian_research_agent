@@ -1,7 +1,7 @@
 import {
   claimPassageOverlapV1,
   collectPassageIdsFromText,
-  isProcessStatementV1,
+  isNotATopicClaimV1,
   type ClaimPassageRef,
   type ResearchClaim,
 } from "../agent/claimLedger";
@@ -231,7 +231,7 @@ export function planClaimSupportChecksV1(input: {
     });
   for (const claim of input.claims) {
     if (claim.status !== "grounded" && claim.status !== "exempt") continue;
-    if (isProcessStatementV1(claim.text)) {
+    if (isNotATopicClaimV1(claim)) {
       processStatements += 1;
       continue;
     }
@@ -735,7 +735,7 @@ export function standingRejectionsV1(
   for (const claim of claims) {
     // A sentence about the research itself is never held, including by a
     // rejection recorded before the planner stopped asking about it.
-    if (isProcessStatementV1(claim.text)) continue;
+    if (isNotATopicClaimV1(claim)) continue;
     if (claim.passageIds.length > 0) present.add(claimFingerprintV1(claim.text, claim.passageIds));
     const cited = claimCitedPassageIdsV1(claim, footnotes);
     if (cited.length > 0) present.add(claimFingerprintV1(claim.text, cited));
