@@ -32,6 +32,32 @@ import {
   type ClaimDraftEvalCaseV1,
   type ClaimDraftLabelV1,
 } from "../tests/fixtures/decisionEval/claimDraftEvalSet";
+import {
+  CLAIM_DRAFT_SOURCE_LIST_SET_V2,
+  type ClaimDraftEvalCaseV2,
+} from "../tests/fixtures/decisionEval/claimDraftSourceListSet";
+import { CLAIM_DRAFT_REAL_SET_V2 } from "../tests/fixtures/decisionEval/claimDraftRealSet";
+
+/** A frozen draft from any of the sets: V1 (JEV-5), source lists, real drafts. */
+export type DraftCase = ClaimDraftEvalCaseV1 | ClaimDraftEvalCaseV2;
+
+/**
+ * Which frozen set a run scores. `v1` is the first JEV-5 set; `sources` is the
+ * calibration for source lists, bibliography lines, quotation notes and asides;
+ * `real` is the held-out set taken from real drafts of the 2026-10-23
+ * end-to-end comparison; `new` is the last two together.
+ */
+export type DraftSet = "v1" | "sources" | "real" | "new" | "all";
+
+const SET_FILES: Record<Exclude<DraftSet, "new" | "all">, string> = {
+  v1: "tests/fixtures/decisionEval/claimDraftEvalSet.ts",
+  sources: "tests/fixtures/decisionEval/claimDraftSourceListSet.ts",
+  real: "tests/fixtures/decisionEval/claimDraftRealSet.ts",
+};
+
+function setsOf(set: DraftSet): Array<Exclude<DraftSet, "new" | "all">> {
+  return set === "all" ? ["v1", "sources", "real"] : set === "new" ? ["sources", "real"] : [set];
+}
 import type {
   DecisionClient,
   DecisionRequestV1,
@@ -103,7 +129,7 @@ export interface ArmRun {
 
 const normalize = (text: string) => text.replace(/\s+/gu, " ").trim().toLowerCase();
 
-function evidenceFor(item: ClaimDraftEvalCaseV1) {
+function evidenceFor(item: DraftCase) {
   return item.sources.map((source) => ({
     id: `evidence:${source.sourceId}`,
     kind: "web_source" as const,
@@ -117,16 +143,16 @@ function evidenceFor(item: ClaimDraftEvalCaseV1) {
   }));
 }
 
-function passagesFor(item: ClaimDraftEvalCaseV1) {
+function passagesFor(item: DraftCase) {
   return item.sources.flatMap((source) =>
     source.passages.map((passage) => ({ id: passage.id, text: passage.text, evidenceId: `evidence:${source.sourceId}` })),
   );
 }
 
 /** The passages cited in the token-form line holding a labeled sentence. */
-function intendedPassagesFor(item: ClaimDraftEvalCaseV1, match: string): string[] {
+function intendedPassagesFor(item: DraftCase, match: string): string[] {
   const line = item.draft.split("\n").find((candidate) => candidate.includes(match)) ?? "";
-  return [...line.matchAll(/source:[a-z0-9]+:passage:\d+-\d+/giu)].map((found) => found[0]);
+  return [...line.matchAll(/source:[a-z0-9]+(?::version:[a-f0-9]+)?:passage:\d+-\d+/giu)].map((found) => found[0]);
 }
 
 /** The judge's side: an answer for every question in a claim-support request. */
@@ -168,7 +194,7 @@ export function liveJudge(client: DecisionClient, timeoutMs: number): Judge {
 
 export async function runArmOnCase(
   arm: ArmModules,
-  item: ClaimDraftEvalCaseV1,
+  item: DraftCase,
   judge: Judge,
   rep: number,
 ): Promise<ArmRun> {
@@ -433,14 +459,20 @@ export function regressions(base: readonly ArmRun[], candidate: readonly ArmRun[
   return found;
 }
 
-export function fixtureFingerprint(root: string): string {
-  return createHash("sha256")
-    .update(readFileSync(join(root, "tests/fixtures/decisionEval/claimDraftEvalSet.ts")))
-    .digest("hex");
+export function fixtureFingerprint(root: string, set: DraftSet = "v1"): string {
+  const hash = createHash("sha256");
+  const files = setsOf(set);
+  // One set hashes as its file alone, so the V1 hash reads as it always has.
+  if (files.length === 1) return hash.update(readFileSync(join(root, SET_FILES[files[0]!]))).digest("hex");
+  for (const file of files) hash.update(`${SET_FILES[file]}\n`).update(readFileSync(join(root, SET_FILES[file])));
+  return hash.digest("hex");
 }
 
-export function casesFor(split: "calibration" | "heldout" | "all"): readonly ClaimDraftEvalCaseV1[] {
-  return split === "all" ? CLAIM_DRAFT_EVAL_SET_V1 : CLAIM_DRAFT_EVAL_SET_V1.filter((item) => item.split === split);
+export function casesFor(split: "calibration" | "heldout" | "all", set: DraftSet = "v1"): readonly DraftCase[] {
+  const all: DraftCase[] = setsOf(set).flatMap((name): readonly DraftCase[] =>
+    name === "v1" ? CLAIM_DRAFT_EVAL_SET_V1 : name === "sources" ? CLAIM_DRAFT_SOURCE_LIST_SET_V2 : CLAIM_DRAFT_REAL_SET_V2,
+  );
+  return split === "all" ? all : all.filter((item) => item.split === split);
 }
 
 export function describeScore(score: ArmScore): string[] {

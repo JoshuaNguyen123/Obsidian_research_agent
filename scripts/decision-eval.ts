@@ -71,6 +71,7 @@ import {
 } from "../tests/fixtures/decisionEval/claimSupportEvalSet";
 import {
   casesFor,
+  type DraftSet,
   describeScore,
   fixtureFingerprint,
   liveJudge,
@@ -627,6 +628,12 @@ async function runDrafts() {
   const judgeName = args.get("judge") ?? "oracle";
   const draftSplit = (args.get("split") ?? "heldout") as "calibration" | "heldout" | "all";
   const reps = Math.max(1, Number.parseInt(args.get("reps") ?? "3", 10) || 3);
+  const draftSet = (args.get("set") ?? "v1") as DraftSet;
+  if (!["v1", "sources", "real", "new", "all"].includes(draftSet)) {
+    console.error(`Unknown --set=${draftSet}; use v1, sources, real, new or all.`);
+    process.exitCode = 2;
+    return;
+  }
   let judge: Judge;
   if (judgeName === "live") {
     const apiKey = process.env.OPENROUTER_API_KEY?.trim() ?? "";
@@ -647,7 +654,7 @@ async function runDrafts() {
     return;
   }
   const arms = [await loadArm("baseline", baseRoot), await loadArm("candidate", process.cwd())];
-  const cases = casesFor(draftSplit);
+  const cases = casesFor(draftSplit, draftSet);
   const runs: Record<string, ArmRun[]> = { baseline: [], candidate: [] };
   for (let rep = 1; rep <= reps; rep += 1) {
     for (const [index, item] of cases.entries()) {
@@ -658,10 +665,10 @@ async function runDrafts() {
   }
   const scores = { baseline: scoreArm(runs.baseline!), candidate: scoreArm(runs.candidate!) };
   const found = regressions(runs.baseline!, runs.candidate!);
-  const fixtureSha256 = fixtureFingerprint(process.cwd());
+  const fixtureSha256 = fixtureFingerprint(process.cwd(), draftSet);
   let baselineFixtureSha256: string | null = null;
   try {
-    baselineFixtureSha256 = fixtureFingerprint(baseRoot);
+    baselineFixtureSha256 = fixtureFingerprint(baseRoot, draftSet);
   } catch {
     baselineFixtureSha256 = null;
   }
@@ -670,6 +677,7 @@ async function runDrafts() {
     judge: judgeName,
     model: judgeName === "live" ? JEV_DECISION_MODEL_V1 : "oracle",
     split: draftSplit,
+    set: draftSet,
     reps,
     cases: cases.length,
     fixtureSha256,
@@ -680,11 +688,11 @@ async function runDrafts() {
     regressions: found,
     runs,
   };
-  const name = join(outDir, `drafts-${judgeName}-${draftSplit}-${stamp}`);
+  const name = join(outDir, `drafts-${judgeName}-${draftSet === "v1" ? "" : `${draftSet}-`}${draftSplit}-${stamp}`);
   const lines = [
     `# Jev claim checks on whole drafts (${report.generatedAt})`,
     "",
-    `Judge \`${report.model}\` · split ${draftSplit} · ${cases.length} drafts × ${reps} reps · fixture sha256 \`${fixtureSha256.slice(0, 16)}\``,
+    `Judge \`${report.model}\` · set ${draftSet} · split ${draftSplit} · ${cases.length} drafts × ${reps} reps · fixture sha256 \`${fixtureSha256.slice(0, 16)}\``,
   ];
   for (const score of [scores.baseline, scores.candidate]) {
     lines.push("", `## ${score.arm}`, "", ...describeScore(score));
