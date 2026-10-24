@@ -50,10 +50,10 @@ export const DECISION_PROMOTION_MANIFEST_V1: Readonly<
   }),
   claim_support: Object.freeze({
     promoted: true,
-    evaluatedAt: "2026-10-22",
-    report: "docs/eval/decisions/drafts-live-heldout-2026-10-23T00-36-51-205Z.md",
+    evaluatedAt: "2026-10-24",
+    report: "docs/eval/decisions/drafts-live-real-heldout-2026-10-24T00-47-45-589Z.md; docs/eval/decisions/drafts-live-heldout-2026-10-23T00-36-51-205Z.md",
     reason:
-      "Candidate for the owner's end-to-end comparison (JEV-5): on frozen held-out drafts, 98% of factual sentences assessed, 0/96 unsupported claims reached the draft unflagged, and Jev flagged 0/156 supported claims and 0/57 process sentences.",
+      "Candidate for the owner's end-to-end comparison (JEV-5): on frozen held-out drafts, 98% of factual sentences assessed, 0/96 unsupported claims reached the draft unflagged, and Jev flagged 0/156 supported claims and 0/57 process sentences; with source lists, bibliography lines, quote notes and asides exempt (#66), non-claims flagged on real drafts fell 61/156 -> 27/156.",
   }),
 });
 
