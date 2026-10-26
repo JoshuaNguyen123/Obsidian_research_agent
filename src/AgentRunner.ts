@@ -377,6 +377,7 @@ import {
   degenerateStreamVerdictFromError,
   retryRequestAfterDegenerateStreamV1,
 } from "./model/degenerateStreamGuard";
+import { settleCutDeliberationV1 } from "./model/cutDeliberation";
 import {
   createRunPlan,
   resolveThinkingMode,
@@ -22138,6 +22139,25 @@ export async function runAgentMission({
         disableThinkingForRun,
         enableStreaming,
       );
+      // A reply cut off at its length limit while it was still deliberating
+      // holds no answer: as thinking it never enters the conversation, and the
+      // unproductive-response guard below reads it as thinking_only. One that
+      // wrote a tool call as text did something, and recovery reads it below.
+      const settledResponse = containsRecoverableToolRequest(
+        response.message.content ?? "",
+        knownToolNames,
+      )
+        ? response
+        : settleCutDeliberationV1(response);
+      if (settledResponse !== response) {
+        events.onTrace?.({
+          id: `cut-deliberation-${step}`,
+          kind: "status",
+          step,
+          message: `The reply ran out of room while deliberating (${response.message.content.length} chars, done_reason=${response.doneReason}); kept as thinking, not as the reply's words.`,
+        });
+        response = settledResponse;
+      }
       // A prose response assesses the prior excerpts. Tool responses keep
       // the window live through execution so advertised reads remain admitted.
       if (response.toolCalls.length === 0) sourceReadAssessmentPending = false;
