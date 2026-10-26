@@ -1613,8 +1613,63 @@ function toolSupportsProof(
   );
 }
 
+/**
+ * English function words and task-framing words of four letters or more, which
+ * say nothing about what an answer is about. The terms are the first eight
+ * words left, so a prompt that opens with a framing sentence made them the
+ * relevance test. Observed live (Research Agent Platform ATR-15 comparison V6,
+ * 2026-10-26): "Research these independent evidence questions using the
+ * primary reports listed below." gave these, independent, questions, using,
+ * primary, reports, listed and below, and an answer that stated every asked
+ * figure, which a blind review accepted, used none of them, so
+ * verifier:final_relevance never passed and the run ended at its budget.
+ */
+const RELEVANCE_FUNCTION_WORDS = [
+  "above",
+  "also",
+  "below",
+  "been",
+  "does",
+  "following",
+  "from",
+  "have",
+  "here",
+  "into",
+  "listed",
+  "many",
+  "more",
+  "much",
+  "question",
+  "questions",
+  "some",
+  "such",
+  "task",
+  "tasks",
+  "than",
+  "that",
+  "their",
+  "them",
+  "there",
+  "these",
+  "they",
+  "this",
+  "those",
+  "using",
+  "very",
+  "were",
+  "what",
+  "when",
+  "where",
+  "which",
+  "while",
+  "will",
+  "would",
+  "your",
+];
+
 export function extractRelevanceTerms(value: string): string[] {
   const stopWords = new Set([
+    ...RELEVANCE_FUNCTION_WORDS,
     "about",
     "across",
     "after",

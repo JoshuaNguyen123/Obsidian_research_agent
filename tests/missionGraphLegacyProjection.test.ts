@@ -348,6 +348,47 @@ test("legacy final-relevance projection keeps the mission objective instead of t
   );
 });
 
+test("an answer to every question is relevant though it never repeats the framing sentence's words", async () => {
+  // Research Agent Platform ATR-15 comparison V6 (2026-10-26): the terms were these, independent,
+  // questions, using, primary, reports, listed and below. This answer, which a blind review
+  // accepted, used none of them, so verifier:final_relevance never passed and the run ended at
+  // its budget.
+  const envelope = await createEnvelope();
+  const objective = [
+    "Research these independent evidence questions using the primary reports listed below. Verify the source passages.",
+    "1. What annual energy-use reduction did the pilot measure?",
+    "2. How many adults and sites did the cohort enroll, and does it establish results for children?",
+  ].join("\n");
+  const migrated = await migrateLegacyMissionPlanToMissionGraphV3(completePlan(), { ...migrationOptions(envelope), objective });
+  const graph = await parseMissionGraphV3({
+    ...migrated,
+    objective,
+    nodes: {
+      ...migrated.nodes,
+      write: {
+        ...migrated.nodes.write,
+        objective: "Synthesize and verify the final response.",
+        status: "ready",
+        receipts: [],
+        completionContract: {
+          ...migrated.nodes.write.completionContract,
+          requiredEvidenceKinds: ["final-relevance"],
+          requiredReceiptKinds: [],
+        },
+      },
+    },
+  });
+  const projected = projectMissionGraphToLegacyPlan(graph);
+  const answer = [
+    "- **Pilot:** 18% annual energy-use reduction against a baseline of 120 MWh/site/yr (source:1q2zopq:passage:0-700).",
+    "- **Cohort:** 240 adults at four sites; children under 18 excluded, so it does not establish results for children (source:16vk8tr:passage:110-809).",
+    "## Limitations",
+    "The cohort describes its enrolled population, with missing follow-up and site differences limiting generalization.",
+  ].join("\n");
+  assert.equal(isFinalOutputRelevant(projected, answer), true);
+  assert.equal(isFinalOutputRelevant(projected, "A generic response about unrelated weather."), false);
+});
+
 test("legacy projection does not invent a citation contract for an external prerequisite", async () => {
   const envelope = await createEnvelope();
   const migrated = await migrateLegacyMissionPlanToMissionGraphV3(

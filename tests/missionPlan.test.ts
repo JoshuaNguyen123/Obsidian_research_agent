@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
 import {
   createMissionPlan,
+  extractRelevanceTerms,
   getNextMissionPlanAction,
   isFinalOutputRelevant,
   isMissionPlanComplete,
@@ -204,6 +205,21 @@ test("final relevance prioritizes the research subject over procedural tool word
     ),
     JSON.stringify(verifyTask?.completionContract.relevanceTerms),
   );
+});
+
+test("relevance terms skip a framing sentence's function words for what the questions ask", () => {
+  // Research Agent Platform ATR-15 comparison V6: the terms were the framing sentence's
+  // words. tests/missionGraphLegacyProjection.test.ts holds the answer this cost.
+  const prompt = [
+    "Research these independent evidence questions using the primary reports listed below. Verify the source passages.",
+    "1. What annual energy-use reduction did the pilot measure?",
+    "2. How many adults and sites did the cohort enroll, and does it establish results for children?",
+  ].join("\n");
+  const terms = extractRelevanceTerms(prompt);
+  for (const word of ["these", "questions", "using", "listed", "below", "what"]) {
+    assert.equal(terms.includes(word), false, `${word} is not what an answer is about: ${JSON.stringify(terms)}`);
+  }
+  assert.ok(terms.includes("annual") && terms.includes("pilot"), JSON.stringify(terms));
 });
 
 test("compound code-ladder plans accept stage-progress prose as final relevance", () => {
