@@ -22141,8 +22141,14 @@ export async function runAgentMission({
       );
       // A reply cut off at its length limit while it was still deliberating
       // holds no answer: as thinking it never enters the conversation, and the
-      // unproductive-response guard below reads it as thinking_only.
-      const settledResponse = settleCutDeliberationV1(response);
+      // unproductive-response guard below reads it as thinking_only. One that
+      // wrote a tool call as text did something, and recovery reads it below.
+      const settledResponse = containsRecoverableToolRequest(
+        response.message.content ?? "",
+        knownToolNames,
+      )
+        ? response
+        : settleCutDeliberationV1(response);
       if (settledResponse !== response) {
         events.onTrace?.({
           id: `cut-deliberation-${step}`,

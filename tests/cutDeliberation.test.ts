@@ -20,7 +20,7 @@ const reply = (content: string, doneReason?: string, toolCalls: ModelChatRespons
 });
 
 test("a reply cut off at its length limit while deliberating is thinking, and reads as thinking_only", () => {
-  for (const doneReason of ["length", "max_tokens"]) {
+  for (const doneReason of ["length", "max_tokens", "model_length", "LENGTH"]) {
     const settled = settleCutDeliberationV1(reply(CUT, doneReason));
     assert.equal(settled.message.content, "", doneReason);
     assert.equal(settled.message.thinking, CUT);
@@ -43,6 +43,20 @@ ${"Breadth-first search visits every neighbour first. ".repeat(20)}`;
   assert.equal(isCutDeliberationV1(tagged), false, "a reasoning tag is another reader's to split");
   assert.equal(readsAsDeliberationLeadV1("Let me explain how BFS works."), false, "explaining is answering");
   assert.equal(readsAsDeliberationLeadV1("The user wants a short brief."), true);
+});
+
+test("a cut reply is left as it came when its content is the answer by another sign", () => {
+  // The provider kept reasoning apart itself, so the content is what it answered.
+  const thought: ModelChatResponse = { ...reply(CUT, "length"), message: { role: "assistant", content: CUT, thinking: "Planning the summary." } };
+  assert.equal(settleCutDeliberationV1(thought), thought);
+  // A tool call written as text is recovered from the content by the caller.
+  const textCall = reply(`Let me analyze what to read first. <tool_call>{"name":"read_current_file","arguments":{}}</tool_call>`, "length");
+  assert.equal(settleCutDeliberationV1(textCall), textCall);
+  // Analyzing what was handed over opens an answer; analyzing the ask is deliberation.
+  assert.equal(readsAsDeliberationLeadV1("Let me analyze the data for you: revenue rose 12% in the third quarter."), false);
+  for (const lead of ["Let me analyze what's being asked here.", "Let me analyze the request.", "Okay, let me analyze this task."]) {
+    assert.equal(readsAsDeliberationLeadV1(lead), true, lead);
+  }
 });
 
 test("a run whose first step is cut off while deliberating goes on to do the work, and never sends it back as words", async () => {

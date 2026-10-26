@@ -14,28 +14,38 @@
  * conversation as the reply's words, and `classifyUnproductiveModelResponseV1`
  * reads it as `thinking_only`: the step loop's existing remedy for a model
  * that deliberated and delivered nothing. The rule is narrow on purpose: only
- * a reply the provider cut off at its length limit, with no tool call, no
- * reasoning tag, and an opening that narrates the ask instead of answering it.
- * A long answer cut off at the limit keeps what it wrote, and a reply that
- * ended on its own is never touched.
+ * a reply the provider cut off at its length limit, with no tool call (native,
+ * or written as text for the caller to recover), no reasoning tag, no
+ * reasoning the provider sent apart (which makes the content its answer), and
+ * an opening that narrates the ask instead of answering it. A long answer cut
+ * off at the limit keeps what it wrote, and a reply that ended on its own is
+ * never touched.
  */
 
 import type { ModelChatResponse } from "./types";
 
-/** The provider's words for "stopped because the output limit was reached". */
-const LENGTH_DONE_REASONS = new Set(["length", "max_tokens"]);
+/** The providers' words for "stopped because the output limit was reached". */
+const LENGTH_DONE_REASONS = new Set(["length", "max_tokens", "model_length"]);
 
 /** A reasoning tag means another reader splits the reply; this rule stays out of its way. */
 const REASONING_TAG = /<\/?think(?:ing)?>/iu;
+
+/** A tool call written as text, which the caller recovers from the content: the reply did something. */
+const TEXT_TOOL_CALL = /<(?:requested_)?tool_call\b/iu;
 
 /** "Okay, so", "Alright," "Hmm." before the words that say what the reply is. */
 const LEAD_IN = String.raw`(?:(?:okay|ok|alright|all right|so|hmm+|well)[,.!]?\s+)`;
 /** First-person openings that are deliberation only after a lead-in: "Okay, let me…", not "Let me explain…". */
 const AFTER_LEAD_IN = String.raw`(?:let me|let's|i'll|i will|first,? (?:i|let me|we))\b`;
-/** Openings that are deliberation about the ask however they start. */
+/**
+ * Openings that are deliberation about the ask however they start. "Let me
+ * analyze" counts only when what it analyzes is the ask ("what's being
+ * asked", "the request"): "Let me analyze the data for you:" opens an answer.
+ */
 const ABOUT_THE_ASK = [
   String.raw`(?:the )?user(?:'s)? (?:asks?|asked|wants?|wanted|is asking|requests?|requested|says|said|would like|needs?|question|request|message)\b`,
-  String.raw`let me (?:think|count|check|see|figure|plan|reason|work out|draft|analy[sz]e)\b`,
+  String.raw`let me (?:think|count|check|see|figure|plan|reason|work out|draft)\b`,
+  String.raw`let me analy[sz]e (?:what|how|the (?:user|request|task|ask|question|prompt|mission)|this (?:request|task|ask|question|mission))\b`,
   String.raw`(?:(?:first,? )?(?:i|we) need to|we should|we must)\b`,
   String.raw`(?:we are|i am|i'm) (?:asked|being asked|told|given)\b`,
   String.raw`(?:the|this) (?:task|request|mission|ask) (?:is|asks|wants|says)\b`,
@@ -54,9 +64,11 @@ export function readsAsDeliberationLeadV1(text: string): boolean {
 export function isCutDeliberationV1(response: ModelChatResponse): boolean {
   const content = response.message.content ?? "";
   return (
-    LENGTH_DONE_REASONS.has(response.doneReason ?? "") &&
+    LENGTH_DONE_REASONS.has((response.doneReason ?? "").toLowerCase()) &&
     response.toolCalls.length === 0 &&
+    !response.message.thinking?.trim() &&
     !REASONING_TAG.test(content) &&
+    !TEXT_TOOL_CALL.test(content) &&
     readsAsDeliberationLeadV1(content)
   );
 }
@@ -69,8 +81,8 @@ export function settleCutDeliberationV1(
   response: ModelChatResponse,
 ): ModelChatResponse {
   if (!isCutDeliberationV1(response)) return response;
-  const thinking = [response.message.thinking, response.message.content]
-    .filter((part): part is string => typeof part === "string" && part.length > 0)
-    .join("\n\n");
-  return { ...response, message: { ...response.message, content: "", thinking } };
+  return {
+    ...response,
+    message: { ...response.message, content: "", thinking: response.message.content },
+  };
 }
