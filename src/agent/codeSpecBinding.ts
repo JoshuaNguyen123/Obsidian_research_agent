@@ -14,6 +14,7 @@ export const CODE_SPEC_GATED_MUTATION_TOOLS = [
   "code_workspace_create_file",
   "code_workspace_append",
   "code_workspace_patch",
+  "code_workspace_apply_patch",
   "code_workspace_write_expected",
   "code_workspace_mkdir",
 ] as const;

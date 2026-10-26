@@ -852,6 +852,28 @@ export function getReceiptProofKinds(
   return receiptSatisfiesProof("write_receipt", receipt) ? ["write_receipt"] : [];
 }
 
+/**
+ * A code workspace change or a verified commit: a coding pass's write
+ * (CODE2-24). The one reading the reflex gate and acceptance share, so a pass
+ * that changed its files is not held for a missing write by either; a commit
+ * that was asked for is still required by name, as any required tool is.
+ */
+export function receiptIsCodeChangeV1(receipt: {
+  toolName?: string;
+  operation?: string;
+  resource?: { system?: string | null } | null;
+}): boolean {
+  const system = receipt.resource?.system;
+  return (
+    (system === "workspace" || system === "git") &&
+    receiptSatisfiesProof("write_receipt", {
+      toolName: receipt.toolName,
+      operation: receipt.operation,
+      resource: { system },
+    })
+  );
+}
+
 export function receiptSatisfiesProof(
   proof: MissionPlanProofKind,
   receipt: MissionReceiptProofLike,
@@ -1591,6 +1613,60 @@ function toolSupportsProof(
   );
 }
 
+/**
+ * English function words and task-framing words of four letters or more, which
+ * say little about what an answer is about. They only fill the terms when the
+ * words that do say it run out, so "List my tasks" keeps "tasks". Observed live
+ * (Research Agent Platform ATR-15 comparison V6, 2026-10-26): the terms were
+ * the first eight words left, and "Research these independent evidence
+ * questions using the primary reports listed below." gave these, independent,
+ * questions, using, primary, reports, listed and below. An answer that stated
+ * every asked figure, which a blind review accepted, used none of them, so
+ * verifier:final_relevance never passed and the run ended at its budget.
+ */
+const RELEVANCE_FUNCTION_WORDS = [
+  "above",
+  "also",
+  "below",
+  "been",
+  "does",
+  "following",
+  "from",
+  "have",
+  "here",
+  "into",
+  "listed",
+  "many",
+  "more",
+  "much",
+  "question",
+  "questions",
+  "some",
+  "such",
+  "task",
+  "tasks",
+  "than",
+  "that",
+  "their",
+  "them",
+  "there",
+  "these",
+  "they",
+  "this",
+  "those",
+  "using",
+  "very",
+  "were",
+  "what",
+  "when",
+  "where",
+  "which",
+  "while",
+  "will",
+  "would",
+  "your",
+];
+
 export function extractRelevanceTerms(value: string): string[] {
   const stopWords = new Set([
     "about",
@@ -1651,8 +1727,23 @@ export function extractRelevanceTerms(value: string): string[] {
   const preferred = selectedBlock.trim()
     ? extractRelevanceTermsFromBlob(selectedBlock, stopWords)
     : [];
+  // What the questions ask comes before the sentence that frames them.
+  const asked = extractRelevanceTermsFromBlob(askedSegments(value).join("\n"), stopWords);
   const general = extractRelevanceTermsFromBlob(value, stopWords);
-  return dedupeStrings([...preferred, ...general]).slice(0, 8);
+  const candidates = dedupeStrings([...preferred, ...asked, ...general]);
+  const framing = new Set(RELEVANCE_FUNCTION_WORDS);
+  return [
+    ...candidates.filter((term) => !framing.has(term)),
+    ...candidates.filter((term) => framing.has(term)),
+  ].slice(0, 8);
+}
+
+/** The lines and sentences of a prompt that ask something. */
+function askedSegments(value: string): string[] {
+  return value
+    .split(/\n+|(?<=[.!?])\s+/u)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.endsWith("?"));
 }
 
 function extractRelevanceTermsFromBlob(

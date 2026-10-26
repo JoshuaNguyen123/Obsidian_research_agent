@@ -64,6 +64,8 @@ const BLOCKED_MUTATION_FILES = new Set([
   "poetry.lock",
   "pyproject.toml",
   "requirements.txt",
+  "setup.cfg",
+  "setup.py",
   "tsconfig.json",
   "yarn.lock",
 ]);

@@ -151,6 +151,14 @@ export function isLanguageNamedOnlyAsTopicModifier(prompt: string): boolean {
   );
 }
 
+// A source filename is an observation target when the request only reads it.
+// Keep mixed read/write or execution requests on the existing authoring path.
+function isReadOnlyCodeSourceClause(clause: string): boolean {
+  const words = clause.replace(/[a-z0-9_./\\-]+\.(?:py|ts|tsx|js|jsx|rs|go|java|cs)\b/giu, " ");
+  return /\b(?:code_workspace_(?:inspect|read|search|stat|list)|read|inspect|review|explain|describe|summari[sz]e|understand|search|find|list)\b/iu.test(words) &&
+    !/\b(?:create|write|build|implement|make|generate|save|fix|repair|modify|edit|patch|refactor|rename|move|copy|delete|remove|add|append|replace|run|execute|compile|test|validate|commit)\b/iu.test(words);
+}
+
 export function hasCodeDeliverableIntent(prompt: string): boolean {
   if (hasCurrentNoteCodeSampleWriteSurface(prompt)) {
     return false;
@@ -175,6 +183,7 @@ export function hasCodeDeliverableIntent(prompt: string): boolean {
     clauses.some(
       (clause) =>
         !hasExplicitCodeExecutionProhibition(clause) &&
+        !isReadOnlyCodeSourceClause(clause) &&
         /\.(?:py|ts|tsx|js|jsx|rs|go|java|cs)\b/i.test(clause),
     )
   ) {

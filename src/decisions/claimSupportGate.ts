@@ -4,11 +4,13 @@ import type { DecisionRuntimeV1 } from "./decisionRuntime";
 import type { DecisionModelModeV1 } from "./decisionSettings";
 import {
   assessClaimSupportV1,
+  claimCitedPassageIdsV1,
   claimFingerprintV1,
   claimSupportBlockerV1,
   claimSupportMissingTokensV1,
   confidentClaimFailuresV1,
   emptyClaimSupportLedgerV1,
+  footnotePassageIdsV1,
   holdClaimSupportCandidateV1,
   recordClaimSupportAssessmentV1,
   standingRejectionsV1,
@@ -102,7 +104,7 @@ export async function evaluateStagedClaimSupportV1(input: {
   if (assessment.status !== "not_applicable") {
     ledger = recordClaimSupportAssessmentV1(ledger, assessment, claims, input.now());
   }
-  const rejections = standingRejectionsV1(ledger, claims);
+  const rejections = standingRejectionsV1(ledger, claims, input.candidate);
   if (rejections.length === 0) {
     return {
       action: "accept",
@@ -118,16 +120,20 @@ export async function evaluateStagedClaimSupportV1(input: {
               : "unassessed",
     };
   }
+  const footnotes = footnotePassageIdsV1(input.candidate);
   const tokens = claimSupportMissingTokensV1(
     rejections.map((rejection) => ({
       claimId:
         // A standing rejection names the claim by its words; the current
         // candidate's id for those words is what a repair must address.
-        claims.find(
-          (claim) =>
-            claim.passageIds.length > 0 &&
-            claimFingerprintV1(claim.text, claim.passageIds) === rejection.claimFingerprint,
-        )?.id ?? rejection.claimId,
+        claims.find((claim) => {
+          const cited = claimCitedPassageIdsV1(claim, footnotes);
+          return (
+            (claim.passageIds.length > 0 &&
+              claimFingerprintV1(claim.text, claim.passageIds) === rejection.claimFingerprint) ||
+            (cited.length > 0 && claimFingerprintV1(claim.text, cited) === rejection.claimFingerprint)
+          );
+        })?.id ?? rejection.claimId,
       passageIds: rejection.passageIds,
       status: "decided",
       verdict: rejection.verdict,
@@ -181,7 +187,11 @@ export function standingClaimSupportHoldV1(input: {
   claimLedger: ClaimLedger | null;
 }): ClaimSupportRejectionV1[] {
   if (!input.ledger || input.ledger.mode !== "enabled") return [];
-  return standingRejectionsV1(input.ledger, claimsForCandidateV1(input.claimLedger, input.candidate));
+  return standingRejectionsV1(
+    input.ledger,
+    claimsForCandidateV1(input.claimLedger, input.candidate),
+    input.candidate,
+  );
 }
 
 /**

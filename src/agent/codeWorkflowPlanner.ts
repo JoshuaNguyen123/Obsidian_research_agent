@@ -74,6 +74,13 @@ export function selectCodeWorkspaceEditToolName(
   }
 
   if (
+    allowlist.has("code_workspace_apply_patch") &&
+    namesSeveralWorkspaceFilesToEditV1(text)
+  ) {
+    return "code_workspace_apply_patch";
+  }
+
+  if (
     /\b(patch|edit|modify|update|fix)\b/i.test(text) &&
     allowlist.has("code_workspace_patch") &&
     !/\b(create|add|new)\b[\s\S]{0,40}\b(file|module|script|class)\b/i.test(text)
@@ -91,6 +98,23 @@ export function selectCodeWorkspaceEditToolName(
     return "code_workspace_append";
   }
   return "code_workspace_create_file";
+}
+
+const CODE_FILE_PATH_PATTERN_V1 =
+  /(?<![\w./:-])(?:[\w-]+\/)*[\w-]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|pyi|rb|go|rs|java|kt|cs|cpp|cc|c|h|hpp|swift|php|json|ya?ml|toml|ini|md|css|scss|html?|sql|sh|ipynb)(?![\w/-]|\.[\w/])/giu;
+
+/**
+ * An ask to change files it names, two or more of them: the edit spans files,
+ * so the plan's edit is one multi-file patch (CODE-7) rather than a run of
+ * single-file writes, each its own approval. Naming one file, or asking only
+ * for new files, keeps the single-file writes.
+ */
+export function namesSeveralWorkspaceFilesToEditV1(prompt: string): boolean {
+  if (!/\b(?:patch|edit|modify|update|fix|change|rename|refactor)\b/iu.test(prompt)) return false;
+  const paths = new Set(
+    [...prompt.matchAll(CODE_FILE_PATH_PATTERN_V1)].map((match) => match[0].toLowerCase()),
+  );
+  return paths.size >= 2;
 }
 
 function isWorkspaceDirectoryCreationRequest(prompt: string): boolean {

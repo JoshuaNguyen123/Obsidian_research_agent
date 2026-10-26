@@ -201,6 +201,7 @@ import {
   type ScheduledMission,
 } from "./src/agent/missionScheduler";
 import { cleanupOldWorkspaces } from "./src/agent/codeWorkspace";
+import { isQueuedCodePreparedActionAllowedV1 } from "./src/agent/queuedCodePreparedActionV1";
 import {
   resolveRunRetentionPolicy,
   sweepAgentRunsRetentionBestEffort,
@@ -5355,7 +5356,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         preparedActionAuthority: {
           subject: authoritySubject,
           resolve: async ({ action, descriptor }) => {
-            if (!isQueuedCodePreparedActionAllowed({
+            if (!isQueuedCodePreparedActionAllowedV1({
               action,
               descriptor,
               runId: identity.runId,
@@ -5491,7 +5492,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     const prepared = await input.registry.prepare(createCall, input.context);
     if (!prepared.ok) throw new Error(prepared.error.message);
     const descriptor = input.registry.getDescriptor?.(createCall.name);
-    if (!descriptor || !isQueuedCodePreparedActionAllowed({
+    if (!descriptor || !isQueuedCodePreparedActionAllowedV1({
       action: prepared.action,
       descriptor,
       runId: input.runId,
@@ -17522,58 +17523,6 @@ function buildQueuedCodeObjective(candidate: LinearQueueCandidateV1): string {
     `Accepted research artifact fingerprint: ${item.acceptedResearchArtifactFingerprint}`,
     `Work item fingerprint: ${item.fingerprint}`,
   ].join("\n");
-}
-
-function isQueuedCodePreparedActionAllowed(input: {
-  action: PreparedAction;
-  descriptor: ToolDescriptor;
-  runId: string;
-  workspaceId: string;
-  profileKey: string;
-}): boolean {
-  const { action, descriptor } = input;
-  if (
-    action.runId !== input.runId ||
-    action.target.workspaceId !== input.workspaceId ||
-    action.target.repositoryProfileId !== input.profileKey ||
-    action.requiredConfirmations !== 1 ||
-    action.preview.warnings.length > 0 ||
-    action.normalizedArgs.requiresProfileRedetection === true ||
-    descriptor.effect === "destructive_mutation" ||
-    descriptor.capability.system !== action.target.system ||
-    descriptor.capability.resourceType !== action.target.resourceType
-  ) {
-    return false;
-  }
-  const allowed = new Map<string, {
-    system: "workspace" | "git";
-    resourceType: string;
-    actions: ReadonlySet<string>;
-  }>([
-    ["code_workspace_create", { system: "workspace", resourceType: "code_workspace", actions: new Set(["create"]) }],
-    ["code_workspace_mkdir", { system: "workspace", resourceType: "code_workspace", actions: new Set(["create"]) }],
-    ["code_workspace_create_file", { system: "workspace", resourceType: "code_workspace", actions: new Set(["create"]) }],
-    ["code_workspace_append", { system: "workspace", resourceType: "code_workspace", actions: new Set(["append"]) }],
-    ["code_workspace_write_expected", { system: "workspace", resourceType: "code_workspace", actions: new Set(["update"]) }],
-    ["write_workspace_file", { system: "workspace", resourceType: "code_workspace", actions: new Set(["update", "create"]) }],
-    ["code_workspace_patch", { system: "workspace", resourceType: "code_workspace", actions: new Set(["update"]) }],
-    ["replace_workspace_text", { system: "workspace", resourceType: "code_workspace", actions: new Set(["update"]) }],
-    ["code_workspace_move", { system: "workspace", resourceType: "code_workspace", actions: new Set(["move"]) }],
-    ["code_workspace_copy", { system: "workspace", resourceType: "code_workspace", actions: new Set(["create"]) }],
-    ["code_validate_fast", { system: "workspace", resourceType: "validation_run", actions: new Set(["validate"]) }],
-    ["code_validate_targeted", { system: "workspace", resourceType: "validation_run", actions: new Set(["validate"]) }],
-    ["code_validate_full", { system: "workspace", resourceType: "validation_run", actions: new Set(["validate"]) }],
-    ["code_repair_record_cycle", { system: "workspace", resourceType: "code_repair_checkpoint", actions: new Set(["update"]) }],
-    ["code_commit_verified", { system: "git", resourceType: "verified_local_commit", actions: new Set(["commit"]) }],
-  ]);
-  const expected = allowed.get(action.toolName);
-  return Boolean(
-    expected &&
-      descriptor.name === action.toolName &&
-      expected.system === descriptor.capability.system &&
-      expected.resourceType === descriptor.capability.resourceType &&
-      expected.actions.has(descriptor.capability.action),
-  );
 }
 
 function nextMonotonicIso(...previous: string[]): string {

@@ -96,8 +96,8 @@ function assertVerifiedCommitReceiptNamesCommit(
   assert.equal(commit.workspaceId, SCOPE.workspaceId);
 }
 
-test("normal exact repair proof commits only after fresh proof readback", async (t) => {
-  const harness = await createHarness(t, "src/index.ts");
+for (const expandedStaging of [false, true]) test(`exact repair proof with ${expandedStaging ? "1000 staged files" : "legacy staging"} commits only after fresh proof readback`, async (t) => {
+  const harness = await createHarness(t, "src/index.ts", false, false, expandedStaging);
   const passingFast = await validation("fast", "fast-sandbox", true, "fast-pass", 0, true, null, harness.validationBinding);
   harness.validations.set(passingFast.id, passingFast);
   const cycleAction = await prepareCycle(harness, passingFast, 1, 0);
@@ -695,6 +695,7 @@ async function createHarness(
   changedPath: string,
   includeWorkflow = false,
   hostResolvesDurableScope = false,
+  expandedStaging = false,
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-repair-runtime-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -742,6 +743,7 @@ async function createHarness(
     stagedFiles: [
       { path: "README.md", sha256: `sha256:${"9".repeat(64)}`, bytes: 12 },
       { path: changedPath, sha256: AFTER_HASH, bytes: 6 },
+      ...Array.from({ length: expandedStaging ? 998 : 0 }, (_, index) => ({ path: `src/unchanged-${index}.ts`, sha256: `sha256:${"9".repeat(64)}`, bytes: 12 })),
     ].sort((left, right) =>
       Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8")),
     ),
@@ -759,7 +761,8 @@ async function createHarness(
     files,
     fileContents: { "package.json": JSON.stringify({ scripts: { test: "node --test" } }) },
     runtimeDigests: { node: `sha256:${"5".repeat(64)}` },
-    allowedPaths: files,
+    allowedPaths: expandedStaging ? ["."] : files,
+    ...(expandedStaging ? { stagingProfile: "source-1000-v1" as const } : {}),
   });
   let namespace: CodeRepairCheckpointNamespaceV1 | null = null;
   const persistence: CallbackCheckpointPersistenceV1 = {

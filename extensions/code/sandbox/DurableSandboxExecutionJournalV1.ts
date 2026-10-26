@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { repositoryStagingFileLimitV1 } from "../repositories/RepositoryProfileV2";
 
 import type { JsonValueV1 } from "@agentic-researcher/core-api";
 import { canonicalJson } from "../../../packages/headless-runtime/src/canonicalize";
@@ -534,7 +535,8 @@ export function parseDurableSandboxValidationReceiptV1(
   }
   for (const key of ["stagedFiles", "importedArtifacts"] as const) {
     const entries = binding[key];
-    if (!Array.isArray(entries) || entries.length > 100) throw new Error(`Validation ${key} are invalid.`);
+    const maximum = key === "stagedFiles" ? repositoryStagingFileLimitV1(action.stagingProfile) : 100;
+    if (!Array.isArray(entries) || entries.length > maximum) throw new Error(`Validation ${key} are invalid.`);
     for (const entry of entries) {
       const artifact = exactRecord(entry, ["path", "sha256", "bytes"], `validation ${key} artifact`);
       safeRelativePath(artifact.path, `validation ${key} path`);

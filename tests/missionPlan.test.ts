@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
 import {
   createMissionPlan,
+  extractRelevanceTerms,
   getNextMissionPlanAction,
   isFinalOutputRelevant,
   isMissionPlanComplete,
@@ -204,6 +205,34 @@ test("final relevance prioritizes the research subject over procedural tool word
     ),
     JSON.stringify(verifyTask?.completionContract.relevanceTerms),
   );
+});
+
+test("relevance terms are what the questions ask, before the sentence that frames them", () => {
+  // Research Agent Platform ATR-15 comparison V6: the terms were the framing sentence's
+  // words. tests/missionGraphLegacyProjection.test.ts holds the answer this cost.
+  const questions = [
+    "1. What annual energy-use reduction did the pilot measure?",
+    "2. How many adults and sites did the cohort enroll, and does it establish results for children?",
+  ];
+  const framings = [
+    "Research these independent evidence questions using the primary reports listed below. Verify the source passages.",
+    // A longer framing sentence must not push the questions out of the eight terms.
+    "Research these independent evidence questions using the primary reports supplied below. Verify the source passages against the independent methodology sections, and note every limitation the authors state.",
+  ];
+  for (const framing of framings) {
+    const terms = extractRelevanceTerms([framing, ...questions].join("\n"));
+    for (const word of ["these", "questions", "using", "listed", "below", "what"]) {
+      assert.equal(terms.includes(word), false, `${word} is not what an answer is about: ${JSON.stringify(terms)}`);
+    }
+    for (const word of ["annual", "energy-use", "reduction", "pilot"]) {
+      assert.ok(terms.includes(word), `${word}: ${JSON.stringify(terms)}`);
+    }
+  }
+});
+
+test("a framing word still counts when the prompt has nothing else to say", () => {
+  assert.deepEqual(extractRelevanceTerms("List my tasks"), ["list", "tasks"]);
+  assert.ok(extractRelevanceTerms("Which tasks are overdue?").includes("tasks"));
 });
 
 test("compound code-ladder plans accept stage-progress prose as final relevance", () => {

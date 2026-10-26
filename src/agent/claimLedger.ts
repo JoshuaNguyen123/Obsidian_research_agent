@@ -59,6 +59,16 @@ export interface ClaimQuoteSpan {
   endChar?: number;
 }
 
+/**
+ * Why an extracted sentence is not a claim about the topic (JEV-5, second
+ * fix): a line of a source list, a bibliography entry, a note on how
+ * quotations or passage ids were handled, or the model talking to the reader.
+ * Such a sentence is exempt, and the claim-support check never asks about it,
+ * even when it carries a passage citation. On real drafts every sentence the
+ * decision model flagged was one of these (RAP live-e2e-2026-10-23).
+ */
+export type NonClaimKindV1 = "source_list" | "bibliography" | "quote_note" | "aside";
+
 export interface ResearchClaim {
   id: string;
   text: string;
@@ -67,6 +77,8 @@ export interface ResearchClaim {
   quoteSpans?: ClaimQuoteSpan[];
   subquestionId?: string;
   conflictIds?: string[];
+  /** Set when the sentence is exempt for not being a claim at all. */
+  nonClaim?: NonClaimKindV1;
   /**
    * [start, end) of this claim's sentence in the exact draft it was extracted
    * from. Runtime-only and deliberately never serialized: a resumed ledger has
@@ -332,6 +344,20 @@ export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
   );
 }
 
+/**
+ * Whether a prompt asks for passage-level grounding in words that cannot be
+ * about code (RAP CODE2-24). In a coding mission "quoted commas", "escaped
+ * quotes" and "verify the tests pass" describe the work, and the summary's
+ * proof is its receipts; only an explicit ask for citations, passages, a
+ * fact-check or deep research asks for cited passages there.
+ */
+export function hasExplicitSourceGroundingRequestV1(prompt: string): boolean {
+  const value = stripWriteVerificationPhrasesV1(prompt).replace(/\s+/g, " ");
+  return /\b(?:cite|cited|citation|citations|passage|passages|fact[-\s]?check|deep\s+research|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
+    value,
+  );
+}
+
 export function shouldRequireQuoteSpans(promptOrMode: string): boolean {
   const value = promptOrMode.replace(/\s+/g, " ").trim();
   // Negation is invisible to a keyword trigger: "in your own words (no
@@ -380,12 +406,16 @@ export function extractClaimsFromDraft(
     const baseId = `claim:s-${portableSha256Text(normalizeForMatch(text)).slice(0, 10)}`;
     const occurrence = (seenClaimIdCounts.get(baseId) ?? 0) + 1;
     seenClaimIdCounts.set(baseId, occurrence);
+    const nonClaim: NonClaimKindV1 | null = sentence.sourceList ? "source_list" : nonClaimKindV1(text);
     claims.push({
       id: occurrence === 1 ? baseId : `${baseId}-${occurrence}`,
       text,
+      ...(nonClaim ? { nonClaim } : {}),
       status:
+        nonClaim ||
         sentence.epistemicSection ||
         isExemptLimitationSentence(text) ||
+        isProcessStatementV1(text) ||
         isReceiptBackedClaimSentenceV1(text, options.receiptAnchors)
           ? "exempt"
           : "ungrounded",
@@ -963,6 +993,11 @@ function resolvePassageRefs(
 interface ClaimSentenceChunk {
   text: string;
   epistemicSection: boolean;
+  /**
+   * Under a Sources or References heading, or a line of the list a
+   * "**Sources …:**" label introduces: not a claim (`NonClaimKindV1`).
+   */
+  sourceList: boolean;
   /** [start, end) of the chunk in the ORIGINAL draft string. */
   start: number;
   end: number;
@@ -975,6 +1010,11 @@ function splitClaimSentences(draft: string): ClaimSentenceChunk[] {
   // ids and statuses derive from it); only the offsets index the raw bytes.
   const chunks: ClaimSentenceChunk[] = [];
   let epistemicSection = false;
+  // A Sources heading covers its whole section; a Sources label covers the
+  // list right under it, and ends at the first line that is not a list item,
+  // so a factual sentence written after the list is checked again.
+  let sourceListSection = false;
+  let sourceListBlock = false;
   const linePattern = /[^\n\r]+/gu;
   let lineMatch: RegExpExecArray | null;
   while ((lineMatch = linePattern.exec(draft)) !== null) {
@@ -1005,14 +1045,25 @@ function splitClaimSentences(draft: string): ClaimSentenceChunk[] {
         /^(?:limitations?|confidence|uncertainty|unanswered questions?|open questions?)\b/iu.test(
           heading[1].trim(),
         );
+      sourceListSection = SOURCE_LIST_HEADING_V1.test(stripEmphasisV1(heading[1]));
+      sourceListBlock = false;
       chunks.push({
         text: cleaned,
         epistemicSection: false,
+        sourceList: false,
         start: cleanedStart,
         end: cleanedEnd,
       });
       continue;
     }
+    const listItem = /^\s*(?:[-*•]|\d{1,3}[.)])\s+/u.test(rawLine);
+    const sourceLabel = isSourceListLeadV1(cleaned);
+    if (sourceLabel) {
+      sourceListBlock = true;
+    } else if (!listItem) {
+      sourceListBlock = false;
+    }
+    const sourceList = sourceListSection || sourceLabel || (sourceListBlock && listItem);
     let cursor = 0;
     for (const part of cleaned.split(/(?<=[.!?])\s+(?=[A-Z0-9“"([])/)) {
       const found = cleaned.indexOf(part, cursor);
@@ -1027,6 +1078,7 @@ function splitClaimSentences(draft: string): ClaimSentenceChunk[] {
       chunks.push({
         text,
         epistemicSection,
+        sourceList,
         start: cleanedStart + partStart + innerLead,
         end: cleanedStart + partStart + part.length - innerTrail,
       });
@@ -1066,6 +1118,169 @@ function isCandidateClaimSentence(text: string): boolean {
   }
   return tokenize(stripCitations(text)).length >= 3;
 }
+
+/**
+ * A sentence about the research or the note itself rather than about the
+ * world: what was searched, what could not be verified, what the gathered
+ * sources do not cover, how a figure or recording was read. It asserts nothing
+ * a passage could support, so judging it against one can only hold a correct
+ * note (D-135: "Could not verify: …" was held after one failed repair).
+ *
+ * Deliberately narrow. A sentence with a subject of its own is about that
+ * subject ("Two later trials could not confirm the effect" is a claim about the
+ * trials), and a disclaimer is recognised only where it opens the sentence or
+ * names the author, the note, or the gathered sources. Rules were written from
+ * the calibration drafts of the JEV-5 evaluation (tests/fixtures/decisionEval/
+ * claimDraftEvalSet.ts); the held-out drafts score them.
+ */
+export function isProcessStatementV1(text: string): boolean {
+  // The host's own unverified label is not the author's disclaimer: a
+  // sentence it is glued to is still that sentence, and still owes grounding.
+  const plain = stripCitations(text.split(UNVERIFIED_CLAIM_MARKER_V1).join(" "))
+    .replace(/\[\^[^\]]+\]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!plain) return false;
+  return (
+    PROCESS_STATEMENT_PATTERNS_V1.some((pattern) => pattern.test(plain)) ||
+    (SOURCE_SCOPE_PATTERN_V1.test(plain) && SOURCE_SCOPE_NEGATION_V1.test(plain))
+  );
+}
+
+const PROCESS_STATEMENT_PATTERNS_V1: readonly RegExp[] = [
+  // An unattributed disclaimer, often written as a label: "Could not verify: …",
+  // "Not independently verified: …", "Unable to confirm whether …".
+  /^(?:could\s+not|couldn['’]t|was\s+unable\s+to|unable\s+to|not\s+(?:independently\s+)?(?:verified|confirmed|checked)|unverified|unconfirmed)\b/iu,
+  // The author's own research actions, in the first person.
+  /^(?:i|we)\s+(?:could\s+not|couldn['’]t|did\s+not|didn['’]t|was\s+unable|were\s+unable|have\s+not|haven['’]t|cannot|can['’]t|searched|screened|reviewed|read|relied|looked|consulted|checked|found|limited|focused|used|excluded|included)\b/iu,
+  // The note describing itself.
+  /^(?:this|the)\s+(?:note|summary|answer|draft|write-?up)\s+(?:relies|covers|does|did|is|was|draws|uses|focuses|summari[sz]es|only|excludes|includes)\b/iu,
+  // What the gathered sources do not address.
+  /\bthe\s+(?:gathered\s+)?sources?\s+(?:did|do|does)\s+not\b/iu,
+  // How a figure, page or recording was read, which no passage states.
+  /\b(?:was|were)\s+(?:read|sampled|transcribed|extracted)\s+(?:from|at)\s+(?:the\s+)?(?:(?:figure|chart|image|page|pdf|recording|video|webinar|transcript)['’]s?\s+)?(?:figure|chart|image|page|pdf|recording|video|transcript|text\s+layer|timestamps?)\b/iu,
+];
+
+/** "… in the sources gathered", "… from the sources reviewed" … */
+const SOURCE_SCOPE_PATTERN_V1 =
+  /\b(?:in|from|among|during|by)\s+(?:the|these|this)\s+(?:sources?|search(?:es)?|research|session)(?:\s+(?:gathered|reviewed|fetched|consulted|read|available|used|searched))?\b/iu;
+/** … only when the sentence says something was missing or unclear there. */
+const SOURCE_SCOPE_NEGATION_V1 =
+  /\b(?:not|no|none|never|unclear|unknown|unable|absent|missing)\b|n['’]t\b/iu;
+
+const NON_CLAIM_KINDS_V1: readonly NonClaimKindV1[] = ["source_list", "bibliography", "quote_note", "aside"];
+
+/**
+ * Whether the claim-support check must leave an extracted sentence alone: it is
+ * not a claim (`nonClaim`, or one of the kinds read from its text alone), or
+ * it is a statement about the research itself (`isProcessStatementV1`).
+ */
+export function isNotATopicClaimV1(claim: { text: string; nonClaim?: NonClaimKindV1 }): boolean {
+  return Boolean(claim.nonClaim) || nonClaimKindV1(claim.text) !== null || isProcessStatementV1(claim.text);
+}
+
+/**
+ * The kinds of non-claim a sentence shows on its own, without the heading or
+ * label above it (`splitClaimSentences` adds those). Each rule needs the
+ * sentence to be shaped as a list entry, a note or an aside, and none fires on
+ * a sentence that asserts something with a verb of its own: "A citywide survey
+ * (https://…) found that …" and "Here is why the scale matters: reefs …" are
+ * claims, and are checked. Rules written from the calibration drafts in
+ * tests/fixtures/decisionEval/claimDraftSourceListSet.ts.
+ */
+export function nonClaimKindV1(text: string): NonClaimKindV1 | null {
+  const plain = stripEmphasisV1(
+    stripCitations(text.split(UNVERIFIED_CLAIM_MARKER_V1).join(" "))
+      .replace(/\[\^[^\]]+\]/gu, " ")
+      .replace(/`/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim(),
+  );
+  if (!plain) return null;
+  if (SOURCES_USED_SENTENCE_V1.test(plain)) return "source_list";
+  // \`stripCitations\` takes URLs and brackets out, which is what the rest
+  // wants and what a bibliography entry is made of: read it with them kept.
+  const withUrls = stripEmphasisV1(
+    text
+      .split(UNVERIFIED_CLAIM_MARKER_V1)
+      .join(" ")
+      .replace(new RegExp(PASSAGE_ID_PATTERN.source, "giu"), " ")
+      .replace(new RegExp(SIMPLE_PASSAGE_ID_PATTERN.source, "giu"), " ")
+      .replace(/\[\^[^\]]+\]/gu, " ")
+      .replace(/`/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim(),
+  );
+  if (isBibliographyLineV1(withUrls)) return "bibliography";
+  if (QUOTE_NOTE_V1.test(plain)) return "quote_note";
+  if (ASIDE_PATTERNS_V1.some((pattern) => pattern.test(plain))) return "aside";
+  return null;
+}
+
+/** Markdown emphasis and a blockquote marker around a line, which say nothing. */
+function stripEmphasisV1(text: string): string {
+  return text.replace(/^[\s>*_]+/u, "").replace(/[\s*_]+$/u, "").trim();
+}
+
+/** "Sources", "References and tiers", "Sources (fetched 2026-10-23)"; never "Sources of error". */
+const SOURCE_LIST_HEADING_V1 =
+  /^(?:sources?|references?|bibliography|works\s+cited|citations?|further\s+reading|reading\s+list)(?!\s+of\b)(?:\s+(?:and|&)\s+[\p{L}-]+(?:\s+[\p{L}-]+){0,2})?\s*(?:\([^)]*\))?\s*:?$/iu;
+
+/** A line that opens with a Sources label: "**Sources (all fetched; two tiers):**". */
+const SOURCE_LIST_LABEL_V1 =
+  /^(?:sources?|references?|bibliography|works\s+cited|citations?)(?!\s+of\b)\b[^.!?:]{0,160}:/iu;
+
+/** "Sources fetched on 2026-10-23, three URLs …", "All three sources were read …". */
+const SOURCES_USED_SENTENCE_V1 =
+  /^(?:(?:all|the|these|both)\s+)?(?:(?:two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+)?sources?\s+(?:were\s+|are\s+|have\s+been\s+)?(?:fetched|consulted|retrieved|accessed|used|gathered|read|reviewed|searched)\b/iu;
+
+function isSourceListLeadV1(line: string): boolean {
+  const plain = stripEmphasisV1(line);
+  return SOURCE_LIST_LABEL_V1.test(plain) || SOURCES_USED_SENTENCE_V1.test(plain);
+}
+
+const URL_V1 = /https?:\/\/[^\s)\]>]+/iu;
+const URLS_V1 = /https?:\/\/[^\s)\]>]+/giu;
+/** A verb that makes a sentence assert something, which a bibliography entry does not. */
+const CLAIM_VERB_V1 =
+  /\b(?:is|are|was|were|has|have|had|rose|rises|fell|falls|grew|grows|declined|declines|increased|increases|decreased|decreases|reduced|reduces|caused|causes|found|finds|show|shows|showed|shown|reported|reports|estimated|estimates|concluded|concludes|suggest|suggests|suggested|led|leads|lowered|lowers|raised|raises|killed|kills|affected|affects|cooled|cools|improved|improves|worsened|doubled|tripled|halved|exceeded|exceeds|says|said|states|stated|warns|warned|argues|argued)\b/iu;
+/** "Jamshed H, Steger FL, Bryan DR, et al." */
+const AUTHOR_LINE_V1 =
+  /^(?:[\p{Lu}][\p{L}'’-]+\s+[\p{Lu}]{1,3},\s*)+(?:[\p{Lu}][\p{L}'’-]+\s+[\p{Lu}]{1,3}|et\s+al)\.?$/u;
+
+/**
+ * A bibliography entry: a URL that opens the line or follows a title, a label
+ * or a separator, with only a description around it. A URL inside a sentence
+ * ("A survey (https://…) found …") is a citation in passing, and the sentence
+ * is still a claim.
+ */
+function isBibliographyLineV1(plain: string): boolean {
+  if (AUTHOR_LINE_V1.test(plain)) return true;
+  const url = URL_V1.exec(plain);
+  if (!url) return false;
+  const before = plain.slice(0, url.index).trim();
+  const after = plain.slice(url.index + url[0].length).replace(URLS_V1, " ");
+  if (before && !/(?:[:;.,—–]|\s-)$/u.test(before)) return false;
+  if (before.split(/\s+/u).length > 40) return false;
+  // Inside an open bracket the URL is cited in passing: "… a connector (passage, https://…)."
+  if ((before.match(/[([]/gu)?.length ?? 0) > (before.match(/[)\]]/gu)?.length ?? 0)) return false;
+  return !CLAIM_VERB_V1.test(before) && !CLAIM_VERB_V1.test(after);
+}
+
+/** "Passage IDs are copied verbatim …", "Note: quotations above are copied …". */
+const QUOTE_NOTE_V1 =
+  /^(?:note\s*[:—–-]\s*)?(?:(?:all|the|every|each|these|both)\s+)?(?:(?:direct|verbatim|exact)\s+)?(?:quot(?:ations?|es|ed\s+(?:fragments?|text|passages?|wordings?|sentences?|material|excerpts?|phrases?))|passage\s+(?:ids?|identifiers|tokens|references|offsets)|cited\s+passages?|excerpts?)\b(?:\s+[\p{L}'’-]+){0,4}?\s+(?:are|were|is|was|have\s+been|has\s+been|now)\b[^.;]{0,60}?\b(?:copied|taken|reproduced|quoted|verbatim|verify-?supported|verified|checked|exact|unaltered|unchanged|appear)\b/iu;
+
+/** The model talking to the reader about its own output. */
+const ASIDE_PATTERNS_V1: readonly RegExp[] = [
+  // An introduction that ends in a colon: "Here is the complete corrected note content:".
+  /^(?:here\s+(?:is|are)|below\s+(?:is|are)|the\s+following\s+(?:is|are))\b[^.!?]{0,160}:$/iu,
+  // "The summary below is …", "Below is the summary in its final form …".
+  /^(?:the\s+)?(?:summary|note|draft|answer|section|text|content|update)\s+below\s+(?:is|are)\b/iu,
+  /^below\s+(?:is|are)\s+(?:the|a|an|my)\s+(?:[\p{L}-]+\s+){0,3}?(?:summary|note|draft|answer|text|content|version|section)\b/iu,
+  // "I've revised the note so that …".
+  /^(?:i|we)(?:['’]ve|\s+have)?\s+(?:revised|corrected|updated|rewritten|rewrote|fixed|edited|removed|converted|replaced|reworded|restructured)\b/iu,
+];
 
 function isExemptLimitationSentence(text: string): boolean {
   return /\b(?:limitations?|confidence|uncertain(?:ty)?|may\s+vary|further\s+research(?:\s+is\s+needed)?|cannot\s+be\s+certain|with\s+(?:low|limited)\s+confidence|this\s+(?:summary|answer)\s+is\s+incomplete|evidence\s+is\s+(?:limited|incomplete|mixed))\b/i.test(
@@ -1113,6 +1328,15 @@ function extractQuoteSpans(
       quote,
     };
   });
+}
+
+/**
+ * Content terms a claim shares with a passage, citations stripped: the same
+ * measure the binder uses, exported so the claim-support planner ranks a
+ * claim's passages by exactly what bound them.
+ */
+export function claimPassageOverlapV1(claimText: string, passageText: string): number {
+  return lexicalOverlapScore(claimText, passageText);
 }
 
 function lexicalOverlapScore(left: string, right: string): number {
@@ -1182,6 +1406,7 @@ function serializeClaim(claim: ResearchClaim): Record<string, unknown> {
     ...(claim.conflictIds && claim.conflictIds.length > 0
       ? { conflictIds: [...claim.conflictIds] }
       : {}),
+    ...(claim.nonClaim ? { nonClaim: claim.nonClaim } : {}),
   };
 }
 
@@ -1226,6 +1451,7 @@ function normalizeClaim(value: unknown): ResearchClaim | null {
     12,
   );
   const subquestionId = getString(value.subquestionId);
+  const nonClaim = NON_CLAIM_KINDS_V1.find((kind) => kind === value.nonClaim);
   return {
     id: id.slice(0, 64),
     text: text.slice(0, 800),
@@ -1234,6 +1460,7 @@ function normalizeClaim(value: unknown): ResearchClaim | null {
     ...(quoteSpans.length > 0 ? { quoteSpans } : {}),
     ...(subquestionId ? { subquestionId: subquestionId.slice(0, 64) } : {}),
     ...(conflictIds.length > 0 ? { conflictIds } : {}),
+    ...(nonClaim ? { nonClaim } : {}),
   };
 }
 

@@ -10,6 +10,8 @@ import {
   getCurrentMissionCompositeLifecycleActionV1,
   getMissionCompositeLifecycleSpecV1,
   getMissionCompositeLifecycleStateV1,
+  getMissionOpenWorkSpecV1,
+  MISSION_OPEN_WORK_INPUT_KEY_V1,
   type MissionGraphV3,
 } from "../../packages/headless-runtime/src/missionGraphV3";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
@@ -153,6 +155,50 @@ export function isReadyMissionGraphSlotForToolV1(
   return (
     node.status === "ready" &&
     getMissionGraphNodeFrontierToolNames(node).includes(toolName)
+  );
+}
+
+/**
+ * The ready node a call in a parallel barrier would claim, given the nodes the
+ * barrier's earlier calls hold: the first ready node, in graph order, whose
+ * frontier expects the tool and that no earlier call holds. That is the node
+ * `MissionGraphSession.beginToolExecution` gives the call once the earlier
+ * calls have started, since a started node is running, not ready.
+ */
+export function nextReadyMissionGraphSlotForToolV1(
+  graph: MissionGraphV3,
+  toolName: string,
+  held: ReadonlySet<string>,
+): MissionGraphV3["nodes"][string] | null {
+  return (
+    Object.values(graph.nodes).find(
+      (node) => !held.has(node.id) && isReadyMissionGraphSlotForToolV1(node, toolName),
+    ) ?? null
+  );
+}
+
+/**
+ * True when a call has to wait outside a parallel barrier because the open
+ * node it would run in (a free coding pass's `code_free_work`) is held by an
+ * earlier call of the barrier. An open node runs one call at a time, whatever
+ * its tool: it is running for one execution, holds its resource locks for
+ * that execution, and counts its calls one by one. Counted per tool name, two
+ * different read tools each saw that one node as their own ready slot, so
+ * both joined the barrier and the second was refused at its start, which
+ * ended the run. A node that is not open is never one slot for several tools
+ * here, so guided and research plans batch exactly as before.
+ */
+export function missionGraphBarrierWaitsForOpenWorkV1(
+  graph: MissionGraphV3,
+  toolName: string,
+  held: ReadonlySet<string>,
+): boolean {
+  if (nextReadyMissionGraphSlotForToolV1(graph, toolName, held)) return false;
+  return Object.values(graph.nodes).some(
+    (node) =>
+      held.has(node.id) &&
+      getSafeMissionOpenWorkSpecV1(node) !== null &&
+      isReadyMissionGraphSlotForToolV1(node, toolName),
   );
 }
 
@@ -314,6 +360,13 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
    * is true. Never use this to reopen leftover Soft-union companions.
    */
   admittedCompanionToolNames?: readonly string[] | null;
+  /**
+   * Exactly AgentRunner's `adaptiveCodeInvestigationToolNames()`: the
+   * read-only workspace tools an exact coding plan admits beside its ready
+   * edit (`missionGraphAdaptiveCodeInvestigationToolNamesV1`). The authority
+   * materializes these as bounded dynamic reads, so a message may name them.
+   */
+  adaptiveCodeInvestigationToolNames?: readonly string[] | null;
 }): string[] {
   const clean = (names: readonly string[] | null | undefined): string[] => [
     ...new Set((names ?? []).map((name) => name.trim()).filter(Boolean)),
@@ -322,6 +375,9 @@ export function authoritativeRefusalFrontierToolNamesV1(input: {
   const candidates =
     input.candidateToolNames == null ? null : clean(input.candidateToolNames);
   const companionSet = new Set(clean(input.admittedCompanionToolNames));
+  for (const name of clean(input.adaptiveCodeInvestigationToolNames)) {
+    companionSet.add(name);
+  }
   const graph = input.graph;
   if (!graph) {
     // No graph means no MissionGraphSession, so `beginMissionGraphTool` returns
@@ -524,6 +580,18 @@ export function getMissionGraphNodeCurrentSelector(
   const action = getSafeMissionCompositeLifecycleActionV1(node);
   if (action) return action.selector;
   return getMissionGraphNodeSelector(node);
+}
+
+/**
+ * The open node of a free coding pass (CODE-18), or null. Its tools are a
+ * menu the model chooses from, not steps it owes.
+ */
+export function getSafeMissionOpenWorkSpecV1(
+  node: MissionGraphV3["nodes"][string],
+) {
+  return isRecord(node.inputs) && node.inputs[MISSION_OPEN_WORK_INPUT_KEY_V1]
+    ? getMissionOpenWorkSpecV1(node)
+    : null;
 }
 
 export function getSafeMissionCompositeLifecycleSpecV1(

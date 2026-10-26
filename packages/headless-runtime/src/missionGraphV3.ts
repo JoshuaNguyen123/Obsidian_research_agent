@@ -174,6 +174,29 @@ export interface MissionResourceLockRequirementV1 {
 
 export const MISSION_COMPOSITE_LIFECYCLE_INPUT_KEY_V1 = "lifecycle" as const;
 
+/**
+ * An open work node: one node whose tools the model may call in any order and
+ * any number of times within the node's own tool-call budget, until the host
+ * completes it or its budget ends. It is the one node of a free coding pass
+ * (`code_free_work`). Its closed literal names the exact tools; authority is
+ * per tool, as a composite lifecycle declares it per action: each effectful
+ * tool needs an envelope binding that allows its effect, held under an
+ * exclusive lock, and an open node never carries external authority.
+ */
+export const MISSION_OPEN_WORK_INPUT_KEY_V1 = "open_work" as const;
+
+export const MISSION_OPEN_WORK_KINDS_V1 = Object.freeze(["code_free_work"] as const);
+
+export type MissionOpenWorkKindV1 = (typeof MISSION_OPEN_WORK_KINDS_V1)[number];
+
+export interface MissionOpenWorkSpecV1 {
+  version: 1;
+  open: true;
+  kind: MissionOpenWorkKindV1;
+  /** The exact tools, sorted and unique; equal to the node's allowedTools. */
+  tools: string[];
+}
+
 export const MISSION_COMPOSITE_LIFECYCLE_STAGES_V1 = Object.freeze([
   "accepted_research",
   "linear_hierarchy",
@@ -1352,6 +1375,39 @@ export function getMissionCompositeLifecycleSpecV1(
   );
 }
 
+/** Returns the closed open-work literal, or null for any other node. */
+export function getMissionOpenWorkSpecV1(
+  node: Pick<MissionNodeV3, "id" | "inputs">,
+): MissionOpenWorkSpecV1 | null {
+  const input = node.inputs[MISSION_OPEN_WORK_INPUT_KEY_V1];
+  if (!input) return null;
+  if (input.kind !== "literal") {
+    fail("invalid_shape", `Mission node ${node.id} open work input must be a literal.`);
+  }
+  const path = `node ${node.id} open work`;
+  const source = record(input.value, path);
+  exactKeys(source, ["version", "open", "kind", "tools"], path);
+  if (source.version !== 1 || source.open !== true) {
+    fail("invalid_shape", `${path} must be an open work v1 literal.`);
+  }
+  if (
+    typeof source.kind !== "string" ||
+    !MISSION_OPEN_WORK_KINDS_V1.includes(source.kind as MissionOpenWorkKindV1)
+  ) {
+    fail("invalid_shape", `${path}.kind is not a supported open work kind.`);
+  }
+  const tools = stableIdArray(source.tools, `${path}.tools`, 1, 64);
+  if (!sameJson(tools, [...new Set(tools)].sort())) {
+    fail("invalid_shape", `${path}.tools must be sorted and unique.`);
+  }
+  return {
+    version: 1,
+    open: true,
+    kind: source.kind as MissionOpenWorkKindV1,
+    tools,
+  };
+}
+
 /** Reads and validates the durable per-action continuation cursor. Fresh
  * planner nodes begin at action zero with empty outputs. */
 export function getMissionCompositeLifecycleStateV1(
@@ -1694,12 +1750,15 @@ function validateNodeAuthority(
   });
   const effectfulTools = tools.filter((tool) => tool.effect !== "read");
   const lifecycle = getMissionCompositeLifecycleSpecV1(node);
+  const openWork = lifecycle ? null : getMissionOpenWorkSpecV1(node);
   if (lifecycle) {
     validateMissionCompositeLifecycleAuthorityV1(
       node,
       envelope,
       lifecycle,
     );
+  } else if (openWork) {
+    validateMissionOpenWorkAuthorityV1(node, envelope, openWork, tools);
   } else {
     for (const tool of effectfulTools) {
       if (tool.effect !== node.effect) {
@@ -1779,7 +1838,9 @@ function validateNodeAuthority(
       }
     }
   }
-  if (!lifecycle && node.budget.toolCalls < node.allowedTools.length) {
+  // An open node's tools are a menu to choose from, not calls it owes, so
+  // its budget need not cover each of them once.
+  if (!lifecycle && !openWork && node.budget.toolCalls < node.allowedTools.length) {
     fail(
       "budget_exceeded",
       `Mission node ${node.id} tool-call budget is smaller than its allowed tool set.`,
@@ -1794,6 +1855,97 @@ function validateNodeAuthority(
   const verifierId = node.completionContract.verifierId;
   if (verifierId && !envelope.verifiers.includes(verifierId)) {
     fail("unknown_executor", `Mission node ${node.id} uses unknown verifier ${verifierId}.`);
+  }
+}
+
+const OPEN_WORK_EFFECT_RANK_V1: Record<MissionAuthorityEffectV1, number> = {
+  read: 0,
+  mutation: 1,
+  execution: 2,
+  external_action: 3,
+};
+
+/**
+ * An open work node may call any of its tools, so its authority is checked
+ * per tool and never widened through one destination: it carries only its
+ * closed literal, no destination and no external action; its declared effect
+ * is the strongest of its tools; and every effectful tool must have an
+ * envelope binding that allows that effect, of a kind the tool accepts, held
+ * under an exclusive lock the node declares.
+ */
+function validateMissionOpenWorkAuthorityV1(
+  node: MissionNodeV3,
+  envelope: MissionCapabilityEnvelopeV1,
+  openWork: MissionOpenWorkSpecV1,
+  tools: MissionToolGrantV1[],
+): void {
+  if (
+    Object.keys(node.inputs).length !== 1 ||
+    !node.inputs[MISSION_OPEN_WORK_INPUT_KEY_V1]
+  ) {
+    fail(
+      "authority_widening",
+      `Open work node ${node.id} may carry only its closed open work literal.`,
+    );
+  }
+  if (node.destination !== null) {
+    fail(
+      "authority_widening",
+      `Open work node ${node.id} declares authority per tool, not through one widened destination.`,
+    );
+  }
+  if (!sameJson(node.allowedTools, openWork.tools)) {
+    fail(
+      "authority_widening",
+      `Open work node ${node.id} tool grants do not match its open work literal.`,
+    );
+  }
+  if (node.budget.externalActions !== 0) {
+    fail(
+      "budget_exceeded",
+      `Open work node ${node.id} cannot reserve external actions.`,
+    );
+  }
+  const executor = envelope.executors[node.executorId];
+  let strongest: MissionAuthorityEffectV1 = "read";
+  for (const tool of tools) {
+    if (tool.effect === "external_action") {
+      fail(
+        "authority_widening",
+        `Open work node ${node.id} cannot carry external-action tool ${tool.name}.`,
+      );
+    }
+    if (!executor?.allowedEffects.includes(tool.effect)) {
+      fail(
+        "authority_widening",
+        `Executor ${node.executorId} is not granted ${tool.effect} authority for ${tool.name}.`,
+      );
+    }
+    if (OPEN_WORK_EFFECT_RANK_V1[tool.effect] > OPEN_WORK_EFFECT_RANK_V1[strongest]) {
+      strongest = tool.effect;
+    }
+    if (tool.effect === "read") continue;
+    const locked = node.resourceLocks.some((lock) => {
+      const binding = envelope.bindings[lock.bindingId];
+      return (
+        lock.mode === "exclusive" &&
+        !!binding &&
+        binding.allowedEffects.includes(tool.effect) &&
+        (tool.bindingKinds.length === 0 || tool.bindingKinds.includes(binding.kind))
+      );
+    });
+    if (!locked) {
+      fail(
+        "authority_widening",
+        `Open work node ${node.id} has no exclusive binding lock that allows ${tool.effect} for ${tool.name}.`,
+      );
+    }
+  }
+  if (node.effect !== strongest) {
+    fail(
+      "authority_widening",
+      `Open work node ${node.id} effect ${node.effect} is not the strongest effect of its tools (${strongest}).`,
+    );
   }
 }
 
@@ -2577,6 +2729,16 @@ function assertNoAuthorityWidening(oldNode: MissionNodeV3, nextNode: MissionNode
     fail(
       "authority_widening",
       `Mission node ${oldNode.id} composite lifecycle actions are immutable.`,
+    );
+  }
+  if (
+    (oldNode.inputs[MISSION_OPEN_WORK_INPUT_KEY_V1] !== undefined ||
+      nextNode.inputs[MISSION_OPEN_WORK_INPUT_KEY_V1] !== undefined) &&
+    !sameJson(oldNode.inputs, nextNode.inputs)
+  ) {
+    fail(
+      "authority_widening",
+      `Mission node ${oldNode.id} open work tools are immutable.`,
     );
   }
   if (!sameJson(oldNode.destination, nextNode.destination)) {

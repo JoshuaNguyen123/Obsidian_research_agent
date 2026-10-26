@@ -36,7 +36,7 @@ test("workspace contribution factory replaces every new and legacy tool name", a
       contributions.map((item) => item.tool.name),
       [...CODE_WORKSPACE_TOOL_NAMES_V2],
     );
-    assert.equal(new Set(contributions.map((item) => item.tool.name)).size, 23);
+    assert.equal(new Set(contributions.map((item) => item.tool.name)).size, 24);
     for (const contribution of contributions) {
       assert.equal(contribution.descriptor.kind, "tool");
       assert.equal(contribution.tool.descriptor.capability.system === "workspace" || contribution.tool.descriptor.capability.system === "git", true);
@@ -1376,6 +1376,52 @@ test("workspace reconciliation resumes durable state and proves committed or not
     assert.equal(committed.receipt?.readback.status, "verified");
     const notApplied = await restarted.get("code_workspace_create_file")!.reconcile!(pendingAction, context);
     assert.equal(notApplied.outcome, "not_applied");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a trash reconciles from its durable trash record after a restart, for a single file and for a folder", async () => {
+  const fixture = await createFixture("trash-reconciliation");
+  try {
+    const initial = toolMap(createCodeWorkspaceToolContributionsV2({ manager: fixture.manager, repositoryProvisioner: fixture.repositories }));
+    const context = fixture.context("Tidy a restart-safe workspace.");
+    await prepareAndExecute(initial.get("code_workspace_create")!, { workspaceId: "trash-space" }, context);
+    await prepareAndExecute(initial.get("code_workspace_mkdir")!, { workspaceId: "trash-space", path: "notes" }, context);
+    for (const [filePath, content] of [["old.txt", "old words\n"], ["notes/a.txt", "a\n"], ["notes/b.txt", "bee\n"], ["kept.txt", "kept\n"]]) {
+      await prepareAndExecute(initial.get("code_workspace_create_file")!, { workspaceId: "trash-space", path: filePath, content }, context);
+    }
+    const trash = initial.get("code_workspace_trash")!;
+    const fileAction = await requirePrepared(trash, { workspaceId: "trash-space", path: "old.txt" }, context);
+    assert.equal(fileAction.normalizedArgs.expectedKind, "file");
+    assert.equal(fileAction.normalizedArgs.expectedBytes, Buffer.byteLength("old words\n"));
+    await trash.executePrepared!(fileAction, authorize(context, fileAction));
+    const folderAction = await requirePrepared(trash, { workspaceId: "trash-space", path: "notes" }, context);
+    assert.equal(folderAction.normalizedArgs.expectedKind, "directory");
+    await trash.executePrepared!(folderAction, authorize(context, folderAction));
+    // Prepared and approved, but the app stopped before it ran.
+    const pendingAction = await requirePrepared(trash, { workspaceId: "trash-space", path: "kept.txt" }, context);
+
+    const restartedManager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(fixture.root, "app-data"),
+      now: () => new Date("2026-07-12T21:00:01.000Z"),
+    });
+    const restarted = toolMap(createCodeWorkspaceToolContributionsV2({ manager: restartedManager, repositoryProvisioner: fixture.repositories }));
+    const reconcile = restarted.get("code_workspace_trash")!.reconcile!;
+    // A single file's prepared hash is its own, while its trash record holds
+    // the tree fingerprint over its path, hash and size: reconcile finds the
+    // record by the latter, as the patch's reconcile does.
+    const file = await reconcile(fileAction, context);
+    assert.equal(file.outcome, "committed", file.message);
+    assert.equal(file.receipt?.commitKind, "reconciled");
+    const folder = await reconcile(folderAction, context);
+    assert.equal(folder.outcome, "committed", folder.message);
+    const pending = await reconcile(pendingAction, context);
+    assert.equal(pending.outcome, "not_applied", pending.message);
+    // An action prepared before the size was bound is not guessed at.
+    const { expectedBytes: _unbound, ...withoutSize } = fileAction.normalizedArgs;
+    const older = await reconcile({ ...fileAction, normalizedArgs: withoutSize }, context);
+    assert.equal(older.outcome, "still_uncertain", older.message);
   } finally {
     await fixture.cleanup();
   }

@@ -44,6 +44,14 @@ export interface CodeRepairRequestV1 {
   maxCycles?: number;
   expectedArtifacts?: ExpectedArtifactV1[];
   protectedControlPaths?: string[];
+  /**
+   * Who the verified commit is by. Absent for the agent's own commits, which
+   * are always the host-pinned Agentic Researcher identity; present only for
+   * a person's commit (`PersonWorkspaceCommitRuntimeV1`), with author and
+   * committer the same person. A commit with a person's identity is never a
+   * publication handoff.
+   */
+  commitIdentity?: AgentGitCommitIdentityV1;
 }
 
 export interface NormalizedCodeRepairRequestV1

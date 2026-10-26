@@ -17,10 +17,12 @@ import type {
 } from "./actions";
 import type { AuthorityGrantV1 } from "./authority";
 import { descriptorAllowsPromptIssuedGrantV1 } from "./authority/grants";
+import { descriptorForPreparedActionV1 } from "./preparedActionDescriptorV1";
 import {
   hasCodeDeliverableIntent,
   hasExplicitCodeExecutionProhibition,
 } from "./codeDeliverableIntent";
+import { hasExplicitNoWebIntent } from "./evidenceIntent";
 
 export type PolicyAction = "allow" | "require_approval" | "block";
 
@@ -53,6 +55,8 @@ export interface ToolPolicyContext {
   scopeAllowed?: boolean;
   /** A grant already verified against this action by the authority evaluator. */
   matchingGrant?: AuthorityGrantV1 | null;
+  /** The person chose Auto-apply for this run (see `ActionPolicyContext`). */
+  workspaceAutoApply?: boolean;
   now?: Date;
 }
 
@@ -65,6 +69,13 @@ export interface ActionPolicyContext {
   matchingGrant?: AuthorityGrantV1 | null;
   isDesktop: boolean;
   writeAutonomy?: boolean;
+  /**
+   * The person chose Auto-apply for this run (CODE2-16, D-291): a move, a
+   * trash, and a patch that deletes or renames, inside a code workspace,
+   * go ahead without a card, because each is undone from the workspace's
+   * trash or the run's kept originals. Never set by the prompt.
+   */
+  workspaceAutoApply?: boolean;
   researchPhase?: ResearchPhaseDescriptor | null;
   now?: Date;
 }
@@ -111,6 +122,56 @@ export function isPromptDerivedAuthorityGrantV1(
  * has opted out of prompt-derived authority entirely, so it must fall through
  * to the exact approval its `fallback` names.
  */
+/**
+ * Whether write autonomy may cover this prepared action itself, beside what
+ * its descriptor allows. An action that asks for more than the ordinary single
+ * confirmation, or that changes a protected repository control (a manifest, a
+ * lockfile, a build script, a workflow or a hook: the classification's
+ * `requiresProfileRedetection` mark, which the unattended queue already
+ * refuses), asks for its exact approval whatever the run's autonomy, with the
+ * count it asks for without it. The count alone cannot say it: every prepared
+ * code workspace write names one confirmation, a protected exact-diff change
+ * as well as an ordinary edit. Like the descriptor predicate, the policy
+ * engine and the runner's one-shot grant both read this one function.
+ */
+export function preparedActionAllowsWriteAutonomyV1(
+  action: Pick<PreparedAction, "requiredConfirmations" | "normalizedArgs">,
+): boolean {
+  return (
+    (action.requiredConfirmations ?? 1) <= 1 &&
+    action.normalizedArgs?.requiresProfileRedetection !== true
+  );
+}
+
+/** The tools whose moves and deletes Auto-apply may cover inside a code workspace. */
+const WORKSPACE_AUTO_APPLY_TOOLS_V1: ReadonlySet<string> = new Set([
+  "code_workspace_move",
+  "code_workspace_trash",
+  "code_workspace_apply_patch",
+]);
+
+/**
+ * Whether the person's Auto-apply covers this descriptor (CODE2-16, D-291),
+ * read after `descriptorForPreparedActionV1` has judged a patch by its kind: a
+ * move or a trash of a code workspace's own files, asked for once, and never
+ * a file outside the workspace (an export names `host_directory`). What else
+ * keeps it asking is the prepared action's own say, through
+ * {@link preparedActionAllowsWriteAutonomyV1}: a protected repository control
+ * or a second confirmation. The policy engine and the runner's one-shot grant
+ * both read this one function.
+ */
+export function descriptorAllowsWorkspaceAutoApplyV1(descriptor: ToolDescriptor): boolean {
+  return (
+    WORKSPACE_AUTO_APPLY_TOOLS_V1.has(descriptor.name) &&
+    descriptor.capability.system === "workspace" &&
+    descriptor.capability.resourceType === "code_workspace" &&
+    (descriptor.capability.action === "move" || descriptor.capability.action === "trash") &&
+    (descriptor.effect === "reversible_mutation" || descriptor.effect === "destructive_mutation") &&
+    descriptor.risk !== "critical" &&
+    descriptor.approval.fallback === "exact"
+  );
+}
+
 export function descriptorAllowsWriteAutonomyPromptGrantV1(
   descriptor: ToolDescriptor,
 ): boolean {
@@ -139,6 +200,7 @@ export function evaluateToolPolicy(ctx: ToolPolicyContext): PolicyDecision {
       matchingGrant: ctx.matchingGrant,
       isDesktop: ctx.isDesktop,
       writeAutonomy: ctx.writeAutonomy,
+      workspaceAutoApply: ctx.workspaceAutoApply,
       researchPhase: ctx.researchPhase,
       now: ctx.now,
     });
@@ -214,7 +276,10 @@ export function evaluateToolPolicy(ctx: ToolPolicyContext): PolicyDecision {
  * missing security input is a block and there is no default allow fallback.
  */
 export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
-  const descriptor = ctx.descriptor;
+  // A tool whose call can make different kinds of change is judged by the
+  // kind its prepared action names (CODE-7 4b): a patch that deletes a file
+  // asks as a delete does, one that renames asks as a move does.
+  const descriptor = descriptorForPreparedActionV1(ctx.descriptor, ctx.preparedAction);
   if (!descriptor) {
     return block("Tool action descriptor is required.", [
       "descriptor_required",
@@ -346,11 +411,24 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
   if (
     action &&
     ctx.writeAutonomy &&
-    descriptorAllowsWriteAutonomyPromptGrantV1(descriptor)
+    descriptorAllowsWriteAutonomyPromptGrantV1(descriptor) &&
+    preparedActionAllowsWriteAutonomyV1(action)
   ) {
     return allow(
       "Scoped reversible mutation proceeds under write autonomy with a fingerprint-bound prepared action.",
       ["write_autonomy", "prepared_fingerprint"],
+    );
+  }
+
+  if (
+    action &&
+    ctx.workspaceAutoApply === true &&
+    descriptorAllowsWorkspaceAutoApplyV1(descriptor) &&
+    preparedActionAllowsWriteAutonomyV1(action)
+  ) {
+    return allow(
+      "A move or a delete inside the code workspace proceeds under the person's Auto-apply with a fingerprint-bound prepared action.",
+      ["workspace_auto_apply", "prepared_fingerprint"],
     );
   }
 
@@ -467,12 +545,22 @@ export function resolvePolicyRoutedIntent({
     writeToolExposed,
     prompt,
   });
-  const resolved = resolveRoutedMissionIntent({
+  const routed = resolveRoutedMissionIntent({
     mode,
     modelIntent,
     regexIntent,
     confidenceThreshold,
   });
+  // Read authority is additive, but not past what the prompt rules out: an
+  // explicit local-only scope outranks the model's opinion that the web would
+  // help, as it does on the decision path (`routedIntentFromAssessmentV1`).
+  // Without it a router model that read a code change in a workspace as web
+  // research added web evidence to a prompt that said "no web research", and
+  // the run spent its budget searching and failed its own citation check.
+  const resolved: ResolvedRouterIntent =
+    routed.intent.needsWebEvidence && hasExplicitNoWebIntent(prompt ?? "")
+      ? { ...routed, intent: { ...routed.intent, needsWebEvidence: false } }
+      : routed;
   if (
     mode === "authority" &&
     resolved.source === "model" &&

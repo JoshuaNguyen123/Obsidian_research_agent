@@ -1,7 +1,10 @@
 export {
   CodeRepairCoordinatorV1,
   codeRepairCheckpointIdV1,
+  expectedCommitIdentityV1,
   normalizeCodeRepairRequestV1,
+  normalizePersonCommitIdentityV1,
+  sameCommitIdentityV1,
   parseBoundCodeValidationReceiptV1,
   parseCodeRepairCheckpointV1,
   verifiedCommitApprovalFingerprintV1,
@@ -66,4 +69,17 @@ export {
   type FixedArgvRepairProofAdapterOptionsV1,
   type SpawnFixedArgvGitRunnerOptionsV1,
 } from "./GitRepairProofAdaptersV1";
+export {
+  PERSON_COMMIT_LEASE_OWNER_V1,
+  PersonWorkspaceCommitRuntimeV1,
+  type PersonCommitBlockCodeV1,
+  type PersonCommitIdentityInputV1,
+  type PersonCommitRefusalCodeV1,
+  type PersonWorkspaceBaseV1,
+  type PersonWorkspaceCommitDependenciesV1,
+  type PersonWorkspaceCommitInputV1,
+  type PersonWorkspaceCommitResultV1,
+  type PersonWorkspaceRevertInputV1,
+  type PersonWorkspaceRevertedV1,
+} from "./PersonWorkspaceCommitV1";
 export * from "./types";

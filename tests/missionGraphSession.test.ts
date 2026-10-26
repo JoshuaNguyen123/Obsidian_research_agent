@@ -1272,6 +1272,135 @@ test("consecutive repaired conventional checkpoints each insert a fresh receipt-
   assert.doesNotThrow(() => validateMissionGraphV3(afterRecoveryRepair));
 });
 
+test("a repair recorded behind a scratch workspace's repository promotion repeats the fast validation it follows", async () => {
+  const harness = createVaultHarness();
+  const missionId = "session-scratch-promoted-code-repair";
+  const names = [
+    "code_validate_fast",
+    "code_workspace_init_repository",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+  ];
+  const descriptors = names.map((name) =>
+    sessionLifecycleDescriptor(name, "workspace", "reversible_mutation"),
+  );
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective: "Execute the bounded session fixture mission.",
+    toolRegistry: registry,
+    allowedToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: 12,
+    maxWallClockMs: 120_000,
+    now: GRAPH_TIME,
+  });
+  const graph = (
+    await planMissionGraphV3({
+      mission: {
+        missionId,
+        objective: "Execute the bounded session fixture mission.",
+      },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const fast = requireExecution(
+    await session.beginToolExecution("code_validate_fast"),
+  );
+  await session.finishToolExecution(fast, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[fast.nodeId],
+      "4",
+      harness.nextTimestamp(),
+    ),
+    receipt: receiptFor(
+      session.graph.nodes[fast.nodeId],
+      "5",
+      harness.nextTimestamp(),
+    ),
+  });
+  const promotion = requireExecution(
+    await session.beginToolExecution("code_workspace_init_repository"),
+  );
+  const afterPromotion = await session.finishToolExecution(promotion, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[promotion.nodeId],
+      "6",
+      harness.nextTimestamp(),
+    ),
+    receipt: receiptFor(
+      session.graph.nodes[promotion.nodeId],
+      "7",
+      harness.nextTimestamp(),
+    ),
+  });
+  const repair = toolNode(afterPromotion, "code_repair_record_cycle");
+  assert.equal(repair.status, "ready");
+  assert.equal(
+    repair.dependencyIds.includes(fast.nodeId),
+    false,
+    "the fast validation is an ancestor of the repair, not its direct dependency",
+  );
+  const repairExecution = requireExecution(
+    await session.beginToolExecution("code_repair_record_cycle", {
+      allowDynamicReadContinuation: false,
+    }),
+  );
+  const beforeScheduleNodeIds = new Set(Object.keys(session.graph.nodes));
+  const scheduled = await session.scheduleRepairedFastValidationCycle(
+    repairExecution,
+  );
+  assert.equal(
+    Object.keys(scheduled.nodes).length,
+    beforeScheduleNodeIds.size + 2,
+  );
+  const repeatedFast = Object.values(scheduled.nodes).find(
+    (candidate) =>
+      !beforeScheduleNodeIds.has(candidate.id) &&
+      candidate.allowedTools.includes("code_validate_fast"),
+  );
+  const repeatedRepair = Object.values(scheduled.nodes).find(
+    (candidate) =>
+      !beforeScheduleNodeIds.has(candidate.id) &&
+      candidate.allowedTools.includes("code_repair_record_cycle"),
+  );
+  assert.ok(repeatedFast);
+  assert.ok(repeatedRepair);
+  assert.deepEqual(
+    repeatedFast.dependencyIds,
+    session.graph.nodes[fast.nodeId]?.dependencyIds,
+    "the repeated fast validation copies the one the repair recorded",
+  );
+  assert.ok(repeatedRepair.dependencyIds.includes(repeatedFast.id));
+  assert.ok(
+    toolNode(scheduled, "code_validate_targeted").dependencyIds.includes(
+      repeatedRepair.id,
+    ),
+  );
+  assert.doesNotThrow(() => validateMissionGraphV3(scheduled));
+});
+
 test("red full validation recovery repeats targeted validation after a correction", async () => {
   const harness = createVaultHarness();
   const missionId = "session-full-validation-recovery";

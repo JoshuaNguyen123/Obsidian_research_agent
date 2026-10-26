@@ -82,6 +82,10 @@ export const PROJECT_RECEIPT_TOOL_EVIDENCE_MAP_V1: Readonly<
     phase: "implement",
     evidenceKind: "workspace_mutation",
   },
+  code_workspace_apply_patch: {
+    phase: "implement",
+    evidenceKind: "workspace_mutation",
+  },
   code_workspace_copy: {
     phase: "implement",
     evidenceKind: "workspace_mutation",

@@ -8,6 +8,8 @@ import {
   getCurrentMissionCompositeLifecycleActionV1,
   getMissionCompositeLifecycleSpecV1,
   getMissionCompositeLifecycleStateV1,
+  getMissionOpenWorkSpecV1,
+  MISSION_OPEN_WORK_INPUT_KEY_V1,
   type MissionBlockerV1,
   type MissionCompositeLifecycleActionV1,
   type MissionEvidenceRefV1,
@@ -132,6 +134,155 @@ export interface MissionGraphToolExecution {
   toolName: string;
   lockLease: MissionGraphLockLease | null;
   lifecycleActionId?: string | null;
+}
+
+/**
+ * What an open node keeps between its calls, in its own outputs so that it
+ * survives a restart: how many calls it has made, the last call that wrote
+ * and the last targeted validation that passed (call numbers, from 1), and
+ * the failures it has seen. The node's own retry counters are reset after
+ * every call, as a composite lifecycle's are, because they count attempts at
+ * one action and an open node makes many; its failures are counted here.
+ */
+export interface MissionOpenWorkStateV1 {
+  calls: number;
+  lastWriteCall: number | null;
+  lastTargetedPassCall: number | null;
+  /** Failure fingerprints seen in this node, with how often each was seen. */
+  failures: Array<{ fingerprint: string; count: number }>;
+  /** The last call's failure, and how many calls in a row failed that way. */
+  consecutive: { fingerprint: string; count: number } | null;
+  /**
+   * What the node has spent of the budgets the host counts, as of its last
+   * call, across every segment of the run.
+   */
+  spent: MissionOpenWorkSpentV1;
+  /** The model's latest to-do list, and how many times it was recorded. */
+  plan: MissionOpenWorkPlanV1 | null;
+}
+
+export interface MissionOpenWorkSpentV1 {
+  modelCalls: number;
+  tokens: number;
+  ms: number;
+}
+
+export interface MissionOpenWorkPlanV1 {
+  revision: number;
+  items: Array<{ text: string; status: "pending" | "in_progress" | "done" }>;
+}
+
+const OPEN_WORK_PLAN_STATUSES: ReadonlySet<string> = new Set([
+  "pending",
+  "in_progress",
+  "done",
+]);
+
+export const MISSION_OPEN_WORK_STATE_OUTPUT_KEY_V1 = "open_work" as const;
+
+/** Failure fingerprints an open node remembers; the oldest go first. */
+export const MISSION_OPEN_WORK_MAX_FAILURES_V1 = 64;
+
+export function getMissionOpenWorkStateV1(
+  node: Pick<MissionNodeV3, "outputs">,
+): MissionOpenWorkStateV1 {
+  const raw = node.outputs[MISSION_OPEN_WORK_STATE_OUTPUT_KEY_V1];
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const count = (value: unknown): number | null =>
+    typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+  const failure = (value: unknown): { fingerprint: string; count: number } | null => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const entry = value as Record<string, unknown>;
+    const times = count(entry.count);
+    return typeof entry.fingerprint === "string" && times !== null && times > 0
+      ? { fingerprint: entry.fingerprint, count: times }
+      : null;
+  };
+  return {
+    calls: count(record.calls) ?? 0,
+    lastWriteCall: count(record.lastWriteCall),
+    lastTargetedPassCall: count(record.lastTargetedPassCall),
+    failures: Array.isArray(record.failures)
+      ? record.failures
+          .map(failure)
+          .filter((entry): entry is { fingerprint: string; count: number } => entry !== null)
+      : [],
+    consecutive: failure(record.consecutive),
+    spent: (() => {
+      const spent =
+        record.spent && typeof record.spent === "object" && !Array.isArray(record.spent)
+          ? (record.spent as Record<string, unknown>)
+          : {};
+      return {
+        modelCalls: count(spent.modelCalls) ?? 0,
+        tokens: count(spent.tokens) ?? 0,
+        ms: count(spent.ms) ?? 0,
+      };
+    })(),
+    plan: (() => {
+      const plan =
+        record.plan && typeof record.plan === "object" && !Array.isArray(record.plan)
+          ? (record.plan as Record<string, unknown>)
+          : null;
+      const revision = plan ? count(plan.revision) : null;
+      if (!plan || revision === null || revision < 1 || !Array.isArray(plan.items)) {
+        return null;
+      }
+      const items = plan.items.flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const entry = item as Record<string, unknown>;
+        return typeof entry.text === "string" &&
+          typeof entry.status === "string" &&
+          OPEN_WORK_PLAN_STATUSES.has(entry.status)
+          ? [{
+              text: entry.text,
+              status: entry.status as "pending" | "in_progress" | "done",
+            }]
+          : [];
+      });
+      return { revision, items };
+    })(),
+  };
+}
+
+/** True when a targeted validation passed after the open node's last write. */
+export function missionOpenWorkReadyToCompleteV1(
+  state: MissionOpenWorkStateV1,
+): boolean {
+  return (
+    state.lastTargetedPassCall !== null &&
+    (state.lastWriteCall === null ||
+      state.lastTargetedPassCall > state.lastWriteCall)
+  );
+}
+
+export function isMissionOpenWorkNodeV1(
+  node: Pick<MissionNodeV3, "id" | "inputs">,
+): boolean {
+  return node.inputs[MISSION_OPEN_WORK_INPUT_KEY_V1] !== undefined &&
+    getMissionOpenWorkSpecV1(node) !== null;
+}
+
+/** How a call inside an open node went, beyond ok. */
+export interface MissionOpenWorkCallV1 {
+  /** The call changed the workspace's files. */
+  write?: boolean;
+  /** A targeted validation that passed. */
+  targetedPassed?: boolean;
+  /** A validation that ran and came back red. */
+  validationFailed?: boolean;
+  /** What the node has spent so far, counted by the host. */
+  spent?: MissionOpenWorkSpentV1;
+  /** The to-do list this call recorded. */
+  plan?: MissionOpenWorkPlanV1;
+  /**
+   * The call failed as an earlier call in the same model response did. The model wrote both before it could read the
+   * first refusal, so the repeat is not a second attempt and leaves the failure counts as they were.
+   */
+  repeatInResponse?: boolean;
 }
 
 /**
@@ -771,6 +922,8 @@ export class MissionGraphSession {
       outputs?: Record<string, MissionJsonValueV1>;
       /** Conditional actions proved unnecessary by the just-finished result. */
       skipNextToolNames?: string[];
+      /** For a call inside an open node: what it did. */
+      openWork?: MissionOpenWorkCallV1;
     },
   ): Promise<MissionGraphV3> {
     return this.enqueueMutation(async () => {
@@ -779,6 +932,9 @@ export class MissionGraphSession {
         throw new Error(
           `Mission node ${node.id} is ${node.status}; expected running before result.`,
         );
+      }
+      if (isMissionOpenWorkNodeV1(node)) {
+        return this.finishOpenWorkCallUnlocked(node, execution, result);
       }
       const lifecycle = getMissionCompositeLifecycleSpecV1(node);
       const lifecycleState = getMissionCompositeLifecycleStateV1(node);
@@ -1070,6 +1226,287 @@ export class MissionGraphSession {
   }
 
   /**
+   * One call of an open node has returned. The node goes back to ready for the
+   * next call, keeping its evidence and receipts, until one of the stops that
+   * also bound a guided pass: the same validation failure fingerprint after it
+   * has survived two repair attempts (the repair cycle's own rule), the same
+   * tool failure twice in a row (the graph's rule), a terminal failure, or the
+   * node's tool-call budget. Attempts are counted per call, so a long node
+   * never runs into the per-node retry limit; failure fingerprints are kept.
+   */
+  private async finishOpenWorkCallUnlocked(
+    node: MissionNodeV3,
+    execution: MissionGraphToolExecution,
+    result: {
+      ok: boolean;
+      evidence?: MissionEvidenceRefV1;
+      receipt?: MissionReceiptRefV1;
+      failureFingerprint?: string;
+      failureMessage?: string;
+      terminalFailure?: boolean;
+      openWork?: MissionOpenWorkCallV1;
+    },
+  ): Promise<MissionGraphV3> {
+    const state = getMissionOpenWorkStateV1(node);
+    const call = state.calls + 1;
+    const fingerprint = result.ok ? null : result.failureFingerprint ?? null;
+    const failures = state.failures.map((failure) => ({ ...failure }));
+    let consecutive = state.consecutive ? { ...state.consecutive } : null;
+    let seen = 0;
+    if (fingerprint && result.openWork?.repeatInResponse === true) {
+      // RAP CODE2-24: the same refusal twice in one response is one attempt; the failure counts stay as they were.
+      seen = failures.find((failure) => failure.fingerprint === fingerprint)?.count ?? 0;
+    } else if (fingerprint) {
+      const existing = failures.find((failure) => failure.fingerprint === fingerprint);
+      if (existing) {
+        existing.count += 1;
+        seen = existing.count;
+      } else {
+        failures.push({ fingerprint, count: 1 });
+        seen = 1;
+      }
+      consecutive =
+        consecutive?.fingerprint === fingerprint
+          ? { fingerprint, count: consecutive.count + 1 }
+          : { fingerprint, count: 1 };
+    } else {
+      consecutive = null;
+    }
+    const next: MissionOpenWorkStateV1 = {
+      calls: call,
+      lastWriteCall:
+        result.ok && result.openWork?.write ? call : state.lastWriteCall,
+      lastTargetedPassCall:
+        result.ok && result.openWork?.targetedPassed
+          ? call
+          : state.lastTargetedPassCall,
+      failures: failures.slice(-MISSION_OPEN_WORK_MAX_FAILURES_V1),
+      consecutive,
+      spent: result.openWork?.spent
+        ? {
+            modelCalls: Math.max(0, Math.floor(result.openWork.spent.modelCalls)),
+            tokens: Math.max(0, Math.floor(result.openWork.spent.tokens)),
+            ms: Math.max(0, Math.floor(result.openWork.spent.ms)),
+          }
+        : state.spent,
+      plan:
+        result.ok && result.openWork?.plan
+          ? {
+              revision: result.openWork.plan.revision,
+              items: result.openWork.plan.items.map((item) => ({ ...item })),
+            }
+          : state.plan,
+    };
+    const consecutiveFailureCount = consecutive?.count ?? 0;
+    const validationFailed = result.openWork?.validationFailed === true;
+    const blocker: MissionBlockerV1 | null =
+      result.terminalFailure === true
+        ? {
+            code: "tool_failure_terminal",
+            message:
+              result.failureMessage ??
+              `Tool ${execution.toolName} failed without a safe repair.`,
+            requiredAction: "Inspect the failure evidence before resuming.",
+          }
+        : validationFailed && seen >= 3
+          ? {
+              code: "unchanged_failure",
+              message:
+                "The same validation failure fingerprint survived two repair attempts; further repair is stopped.",
+              requiredAction: "Inspect the failure evidence before resuming.",
+            }
+          : !result.ok && !validationFailed && consecutiveFailureCount >= 2
+            ? {
+                code: "tool_failure_repeated",
+                message:
+                  result.failureMessage ??
+                  `Tool ${execution.toolName} failed the same way twice.`,
+                requiredAction: "Inspect the failure evidence before resuming.",
+              }
+            : call >= node.budget.toolCalls
+              ? {
+                  code: "open_work_budget_exhausted",
+                  message: `The open work node used its ${node.budget.toolCalls} tool calls.`,
+                  requiredAction: "Continue with a larger budget, or finish the work by hand.",
+                }
+              : null;
+    const operations: MissionGraphPatchOperationV1[] = [
+      {
+        op: "record_attempt",
+        nodeId: node.id,
+        failureFingerprint: fingerprint,
+        observedAt: this.now(),
+      },
+    ];
+    // A call that repeats one the node already holds proof of adds nothing to it. A receipt is named by its prepared
+    // action, which is named by the action's arguments and the state it expects, so the same id is the same action
+    // against the same state; a repeat can only reconcile it, and its receipt differs from the first only in when it
+    // was taken and that it says so. Appending it failed the graph and ended the pass, so the first is kept.
+    const held = (items: ReadonlyArray<{ id: string }>, ref: { id: string }) => items.some((item) => item.id === ref.id);
+    if (result.evidence && !held(node.evidence, result.evidence)) {
+      operations.push({ op: "append_evidence", nodeId: node.id, evidence: result.evidence });
+    }
+    if (result.receipt && !held(node.receipts, result.receipt)) {
+      operations.push({ op: "append_receipt", nodeId: node.id, receipt: result.receipt });
+    }
+    operations.push(
+      {
+        op: "set_outputs",
+        nodeId: node.id,
+        outputs: {
+          ...node.outputs,
+          [MISSION_OPEN_WORK_STATE_OUTPUT_KEY_V1]: {
+            calls: next.calls,
+            lastWriteCall: next.lastWriteCall,
+            lastTargetedPassCall: next.lastTargetedPassCall,
+            failures: next.failures.map((failure) => ({ ...failure })),
+            consecutive: next.consecutive ? { ...next.consecutive } : null,
+            spent: { ...next.spent },
+            plan: next.plan
+              ? {
+                  revision: next.plan.revision,
+                  items: next.plan.items.map((item) => ({ ...item })),
+                }
+              : null,
+          },
+        },
+      },
+      {
+        op: "update_node",
+        nodeId: node.id,
+        changes: {
+          retries: {
+            maxAttempts: node.retries.maxAttempts,
+            attempts: 0,
+            failureFingerprints: [],
+            consecutiveFailureFingerprint: null,
+            consecutiveFailureCount: 0,
+          },
+        },
+      },
+      {
+        op: "set_status",
+        nodeId: node.id,
+        expectedStatus: "running",
+        status: blocker ? "blocked" : "ready",
+        blocker,
+      },
+    );
+    try {
+      return await this.applyUnlocked(
+        `Record ${execution.toolName} call ${call} of open node ${node.id}.`,
+        operations,
+      );
+    } finally {
+      if (execution.lockLease) {
+        await this.releaseNodeLocksUnlocked(execution.lockLease);
+      }
+    }
+  }
+
+  /**
+   * Complete an open node because the model said its work is done. Refused
+   * unless a targeted validation passed after the node's last write: the
+   * model's word alone does not end the node.
+   *
+   * `unchecked` hands the node to its closing steps without that pass, for a
+   * model that keeps saying it is done without running the check (RAP
+   * CODE2-24: one spent 200 turns saying so). It is refused unless a closing
+   * step still to run is a targeted validation, so the check is moved, never
+   * skipped: what the open node did is judged by the steps after it.
+   */
+  async completeOpenWork(input: {
+    nodeId: string;
+    evidence: MissionEvidenceRefV1;
+    unchecked?: boolean;
+  }): Promise<{ ok: true; graph: MissionGraphV3 } | { ok: false; reason: string }> {
+    return this.enqueueMutation(async () => {
+      const node = this.record.graph.nodes[input.nodeId];
+      if (!node || !isMissionOpenWorkNodeV1(node)) {
+        return { ok: false as const, reason: `${input.nodeId} is not an open work node.` };
+      }
+      if (node.status !== "ready") {
+        return { ok: false as const, reason: `Open work node ${node.id} is ${node.status}.` };
+      }
+      if (!missionOpenWorkReadyToCompleteV1(getMissionOpenWorkStateV1(node))) {
+        const checkedAfter = Object.values(this.record.graph.nodes).some(
+          (candidate) =>
+            candidate.id !== node.id &&
+            candidate.dependencyIds.includes(node.id) &&
+            candidate.status !== "complete" &&
+            candidate.status !== "cancelled" &&
+            candidate.allowedTools.includes("code_validate_targeted"),
+        );
+        if (!input.unchecked || !checkedAfter) {
+          return {
+            ok: false as const,
+            reason: input.unchecked
+              ? "No closing step runs a targeted validation, so the open work cannot be handed over unchecked."
+              : "No targeted validation has passed since the last edit.",
+          };
+        }
+      }
+      const operations: MissionGraphPatchOperationV1[] = [
+        { op: "set_status", nodeId: node.id, expectedStatus: "ready", status: "running", blocker: null },
+        { op: "append_evidence", nodeId: node.id, evidence: input.evidence },
+        { op: "set_status", nodeId: node.id, expectedStatus: "running", status: "verifying", blocker: null },
+        { op: "set_status", nodeId: node.id, expectedStatus: "verifying", status: "complete", blocker: null },
+      ];
+      const graph = this.record.graph;
+      const completed = new Set(
+        Object.values(graph.nodes)
+          .filter((candidate) => candidate.status === "complete")
+          .map((candidate) => candidate.id),
+      );
+      completed.add(node.id);
+      for (const candidate of Object.values(graph.nodes)) {
+        if (
+          candidate.status === "queued" &&
+          !isFastValidationAwaitingCorrection(graph, candidate.id) &&
+          candidate.dependencyIds.every((dependencyId) => completed.has(dependencyId))
+        ) {
+          operations.push({
+            op: "set_status",
+            nodeId: candidate.id,
+            expectedStatus: "queued",
+            status: "ready",
+            blocker: null,
+          });
+        }
+      }
+      return {
+        ok: true as const,
+        graph: await this.applyUnlocked(
+          `Complete open work node ${node.id}.`,
+          operations,
+        ),
+      };
+    });
+  }
+
+  /** End a ready open node on a budget the host counts (model calls, tokens, time). */
+  async blockOpenWork(input: {
+    nodeId: string;
+    blocker: MissionBlockerV1;
+  }): Promise<MissionGraphV3 | null> {
+    return this.enqueueMutation(async () => {
+      const node = this.record.graph.nodes[input.nodeId];
+      if (!node || !isMissionOpenWorkNodeV1(node) || node.status !== "ready") {
+        return null;
+      }
+      return this.applyUnlocked(`Stop open work node ${node.id}.`, [
+        {
+          op: "set_status",
+          nodeId: node.id,
+          expectedStatus: "ready",
+          status: "blocked",
+          blocker: input.blocker,
+        },
+      ]);
+    });
+  }
+
+  /**
    * Reconcile the required Markdown reflection action when the bounded GitHub
    * publisher already wrote and read back that same reflection. This is not a
    * generic completion escape hatch: it accepts only the reflection node, the
@@ -1291,13 +1728,31 @@ export class MissionGraphSession {
         return this.record.graph;
       }
 
-      const fastTemplate = repairTemplate.dependencyIds
-        .map((dependencyId) => this.record.graph.nodes[dependencyId])
-        .find(
-          (candidate) =>
-            candidate?.status === "complete" &&
-            candidate.allowedTools.includes("code_validate_fast"),
-        );
+      // The fast validation the repair records, nearest first. A scratch
+      // workspace's ladder puts code_workspace_init_repository between the
+      // fast validation and its repair record, so the fast node is an
+      // ancestor of the repair, not always its direct dependency.
+      let fastTemplate: MissionNodeV3 | undefined;
+      const visited = new Set<string>([repairTemplate.id]);
+      let frontier = [...repairTemplate.dependencyIds];
+      while (!fastTemplate && frontier.length > 0) {
+        const next: string[] = [];
+        for (const dependencyId of frontier) {
+          if (visited.has(dependencyId)) continue;
+          visited.add(dependencyId);
+          const candidate = this.record.graph.nodes[dependencyId];
+          if (!candidate || candidate.status === "cancelled") continue;
+          if (
+            candidate.status === "complete" &&
+            candidate.allowedTools.includes("code_validate_fast")
+          ) {
+            fastTemplate = candidate;
+            break;
+          }
+          next.push(...candidate.dependencyIds);
+        }
+        frontier = next;
+      }
       if (!fastTemplate) {
         throw new Error(
           `Repair node ${repairTemplate.id} has no completed fast-validation dependency to repeat.`,
@@ -2920,8 +3375,13 @@ export class MissionGraphSession {
   ): Promise<MissionGraphV3> {
     return this.enqueueMutation(async () => {
       const approved = resolution === true || resolution === "approved";
-      const denied = resolution === false || resolution === "denied";
       const node = this.requireExecutionNode(execution, "waiting_approval");
+      // An open node makes many calls; the person refusing one of them refuses
+      // that action, not the work. The node goes back to ready, and the action
+      // never happens unless it is asked for and approved again.
+      const denied =
+        (resolution === false || resolution === "denied") &&
+        !isMissionOpenWorkNodeV1(node);
       const graph = await this.applyUnlocked(
         approved
           ? `Resume approved mission node ${node.id}.`

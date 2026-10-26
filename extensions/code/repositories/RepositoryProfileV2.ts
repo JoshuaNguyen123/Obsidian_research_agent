@@ -1,9 +1,14 @@
 import { portableSha256Text } from "../../../packages/core-api/src/portableSha256";
 
 import type { RepositoryProfileV1 } from "../../../src/agent/repositories/RepositoryProfile";
-import { createNodeNpmValidationProfile } from "../../../src/agent/repositories/NodeNpmValidationProfile";
 
 export const REPOSITORY_PROFILE_V2_SCHEMA_VERSION = 2 as const;
+
+/** Host-selected only, following repository trust review. Omission preserves the legacy profile. */
+export type RepositoryStagingProfileV1 = "source-1000-v1";
+export function repositoryStagingFileLimitV1(profile?: RepositoryStagingProfileV1): number {
+  return profile === "source-1000-v1" ? 1000 : 100;
+}
 
 export type RepositoryEcosystemV2 =
   | "node"
@@ -86,6 +91,7 @@ export interface RepositoryProfileV2 {
   generatedOutputs: string[];
   requiredGitHubChecks: string[];
   mergePolicy: RepositoryMergePolicyV2;
+  stagingProfile?: RepositoryStagingProfileV1;
 }
 
 export interface RepositoryDetectionInputV2 {
@@ -100,6 +106,7 @@ export interface RepositoryDetectionInputV2 {
   allowedPaths?: readonly string[];
   generatedOutputs?: readonly string[];
   requiredGitHubChecks?: readonly string[];
+  stagingProfile?: RepositoryStagingProfileV1;
 }
 
 export interface RepositoryProfileAdapterV2 {
@@ -167,7 +174,7 @@ const COMMANDS_BY_ECOSYSTEM: Readonly<Record<RepositoryEcosystemV2, readonly str
 };
 
 const MANIFEST_BASENAMES = new Set([
-  "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml",
+  "package.json", "pyproject.toml", "setup.py", "setup.cfg", "Cargo.toml", "go.mod", "pom.xml",
   "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
   "CMakeLists.txt", "meson.build", "conanfile.py", "conanfile.txt", "vcpkg.json",
   "Directory.Build.props", "Directory.Build.targets", "global.json",
@@ -197,17 +204,19 @@ export function createRepositoryProfileV2(
 
 /** Parse the fully closed V2 contract. Unknown and missing keys fail closed. */
 export function parseRepositoryProfileV2(value: unknown): RepositoryProfileV2 {
+  const hasStagingProfile = typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, "stagingProfile");
   const record = exactRecord(
     value,
     [
       "schemaVersion", "key", "displayName", "repositoryRoot", "defaultBranch",
       "projects", "ecosystems", "allowedPaths", "protectedControls",
       "pinnedRuntimes", "validationCatalog", "generatedOutputs",
-      "requiredGitHubChecks", "mergePolicy",
+      "requiredGitHubChecks", "mergePolicy", ...(hasStagingProfile ? ["stagingProfile"] : []),
     ],
     "repository profile V2",
   );
   if (record.schemaVersion !== 2) fail("Unsupported RepositoryProfileV2 schema version.");
+  if (hasStagingProfile && record.stagingProfile !== "source-1000-v1") fail("Unsupported repository staging profile.");
   const projects = array(record.projects, "projects", 1, 64).map(parseProject);
   const ecosystems = uniqueEcosystems(record.ecosystems, "ecosystems");
   const projectEcosystems = new Set(projects.flatMap((project) => project.ecosystems));
@@ -304,6 +313,7 @@ export function parseRepositoryProfileV2(value: unknown): RepositoryProfileV2 {
     generatedOutputs: uniquePaths(record.generatedOutputs, "generatedOutputs", 0, 256, false),
     requiredGitHubChecks,
     mergePolicy,
+    ...(hasStagingProfile ? { stagingProfile: "source-1000-v1" as const } : {}),
   };
 }
 
@@ -325,6 +335,7 @@ export function detectRepositoryProfileV2(input: RepositoryDetectionInputV2): Re
   if (grouped.size === 0) {
     fail("No supported repository ecosystem marker was detected.");
   }
+  foldNestedPythonRequirements(grouped, files);
 
   const projects: RepositoryProjectV2[] = [];
   const runtimes = new Map<string, RepositoryPinnedRuntimeV2>();
@@ -393,6 +404,7 @@ export function detectRepositoryProfileV2(input: RepositoryDetectionInputV2): Re
       : [...adapterOutputs].sort(),
     requiredGitHubChecks: input.requiredGitHubChecks ?? [],
     mergePolicy: defaultRepositoryMergePolicyV2(),
+    ...(input.stagingProfile !== undefined ? { stagingProfile: input.stagingProfile } : {}),
   });
 }
 
@@ -479,6 +491,7 @@ export function detectSourceOnlyRepositoryProfileV2(
     generatedOutputs: [],
     requiredGitHubChecks: [...(input.requiredGitHubChecks ?? [])],
     mergePolicy: defaultRepositoryMergePolicyV2(),
+    ...(input.stagingProfile !== undefined ? { stagingProfile: input.stagingProfile } : {}),
   });
 }
 
@@ -629,7 +642,6 @@ function nodeAdapter(): RepositoryProfileAdapterV2 {
     ecosystem: "node",
     marker: (path) => basename(path) === "package.json",
     contribute(context) {
-      const legacy = createNodeNpmValidationProfile();
       const root = context.projectRoot;
       const lockfile = firstExisting(context.files, root, [
         "npm-shrinkwrap.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
@@ -650,16 +662,16 @@ function nodeAdapter(): RepositoryProfileAdapterV2 {
         runtime: runtimeFromPin(context, "node", "node", [".nvmrc", ".node-version"]),
         commands: [
           ...bootstrap,
-          ...legacy.validationCommands.map((entry, index) => command(
-            context,
-            index === 0 ? "fast" : "full",
-            `npm-${entry.args.at(-1) ?? index + 1}`,
-            entry.command,
-            entry.args,
-            "disabled",
-            null,
-            300_000,
-          )),
+          command(context, "fast", `${manager}-test`, manager, ["run", "test"], "disabled", null, 300_000),
+          command(context, "targeted", `${manager}-targeted-test`, manager, ["run", "test"], "disabled", null, 300_000),
+          // A build can succeed while tests are red. The exact trusted full
+          // command must run both checks against the same staged bytes. This
+          // fixed wrapper executes only inside the existing offline sandbox;
+          // no repository-supplied code is interpolated into it. Missing
+          // scripts/managers, child errors and signals all fail closed.
+          command(context, "full", `${manager}-test-build`, "node", [
+            "--input-type=commonjs", "-e", NODE_FULL_VALIDATION_SCRIPT, manager,
+          ], "disabled", null, 300_000),
         ],
         generatedOutputs: [atRoot(root, "dist")],
       };
@@ -667,10 +679,50 @@ function nodeAdapter(): RepositoryProfileAdapterV2 {
   };
 }
 
+// Keep each argv below the closed profile's 500-character limit. The outer
+// sandbox still enforces the combined 300-second deadline and process limit.
+const NODE_FULL_VALIDATION_SCRIPT = 'const {spawnSync}=require("node:child_process");const p=process.argv[1];for(const s of ["test","build"]){console.log("[validation] "+p+" run "+s);const r=spawnSync(p,["run",s],{shell:false,stdio:"inherit",timeout:300000,killSignal:"SIGKILL"});if(r.error||r.signal||r.status!==0)process.exit(Number.isInteger(r.status)&&r.status>0&&r.status<256?r.status:1)}';
+
+/**
+ * The files that declare a Python project, as opposed to `requirements.txt`,
+ * which lists what one needs. `setup.py` and `setup.cfg` are how a project
+ * was declared before `pyproject.toml`, and many still are (sympy, requests,
+ * scikit-learn, Exercism's Python track).
+ */
+const PYTHON_PROJECT_MANIFESTS: readonly string[] = ["pyproject.toml", "setup.py", "setup.cfg"];
+const PYTHON_MARKERS: readonly string[] = [
+  ...PYTHON_PROJECT_MANIFESTS, "requirements.txt", "uv.lock", "poetry.lock", "Pipfile.lock",
+];
+
+/**
+ * A directory whose only marker is a `requirements.txt` below a declared
+ * Python project is that project's file, not a project of its own: a
+ * `docs/requirements.txt` beside a root `setup.py` lists what the docs build
+ * needs. As a project it would be validated on its own, by a pytest run in a
+ * folder with no tests, which fails. The project above it still holds the
+ * folder, since a project's files are everything at or below its root.
+ */
+function foldNestedPythonRequirements(
+  grouped: Map<string, Set<RepositoryEcosystemV2>>,
+  files: readonly string[],
+): void {
+  const declared = (root: string) =>
+    PYTHON_PROJECT_MANIFESTS.some((name) => files.includes(atRoot(root, name)));
+  for (const [root, ecosystems] of [...grouped.entries()]) {
+    if (root === "." || ecosystems.size !== 1 || !ecosystems.has("python")) continue;
+    const markers = PYTHON_MARKERS.filter((name) => files.includes(atRoot(root, name)));
+    if (markers.length !== 1 || markers[0] !== "requirements.txt") continue;
+    const covered = [...grouped.keys()].some(
+      (other) => other !== root && isAtOrBelow(other, root) && grouped.get(other)!.has("python") && declared(other),
+    );
+    if (covered) grouped.delete(root);
+  }
+}
+
 function pythonAdapter(): RepositoryProfileAdapterV2 {
   return {
     ecosystem: "python",
-    marker: (path) => ["pyproject.toml", "requirements.txt", "uv.lock", "poetry.lock", "Pipfile.lock"].includes(basename(path)),
+    marker: (path) => PYTHON_MARKERS.includes(basename(path)),
     contribute(context) {
       const lock = firstExisting(context.files, context.projectRoot, ["uv.lock", "poetry.lock", "Pipfile.lock", "requirements.txt"]);
       let executable = "python";

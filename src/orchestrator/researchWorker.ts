@@ -5,6 +5,7 @@ import {
 } from "../agent/missionEvidence";
 import type { ClaimPassageRef } from "../agent/claimLedger";
 import { appendToolTranscript } from "../model/toolTranscript";
+import { settleCutDeliberationV1 } from "../model/cutDeliberation";
 import { serializeToolResultForModel } from "../model/toolResultPayload";
 import type {
   ModelChatMessage,
@@ -421,9 +422,10 @@ export async function runResearchWorker(input: {
     };
     // Prefer streamChat when streaming is enabled so graded think travels with
     // tools on the same Ollama-compatible turn (think + tools together).
-    const response = await chatResearcherTurn(observedModel.client, request, {
+    // A reply cut off while deliberating is no handoff: it is asked for again below.
+    const response = settleCutDeliberationV1(await chatResearcherTurn(observedModel.client, request, {
       enableStreaming: input.toolContext.settings?.enableStreaming !== false,
-    });
+    }));
     messages.push(response.message);
     if (saturationFinalize && response.toolCalls.length > 0) {
       // The loop already asked for a final handoff after evidence saturated.
