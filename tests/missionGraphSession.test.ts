@@ -51,15 +51,16 @@ import type { ToolExecutionContext, ToolRegistry } from "../src/tools/types";
 
 const GRAPH_TIME = new Date("2026-07-11T18:00:00.000Z");
 
-test("person-owned targeted validation recovers without inventing a repair-record authority",async()=>{
+for(const effect of ["execution","reversible_mutation"] as const)test(`person-owned targeted validation recovers without inventing a repair-record authority (${effect})`,async()=>{
  const harness=createVaultHarness(),names=["code_validate_fast","code_validate_targeted","code_validate_full"];
- const descriptors=new Map(names.map(name=>[name,sessionLifecycleDescriptor(name,"workspace","execution")]));
+ const descriptors=new Map(names.map(name=>[name,sessionLifecycleDescriptor(name,"workspace",effect)]));
  const registry:ToolRegistry={getDefinitions:()=>names.map(name=>({type:"function",function:{name,parameters:{type:"object"}}})),getDescriptor:name=>descriptors.get(name)??null,execute:async call=>({ok:true,toolName:call.name})};
  const missionId="person-validation-recovery",objective="Repair this selected workspace and run its test suite.";
  const host=await buildHostMissionGraphPlanV1({missionId,objective,toolRegistry:registry,allowedToolNames:names,plannedToolNames:names,maxToolCalls:16,maxWallClockMs:240000,now:GRAPH_TIME});
  const initial=(await planMissionGraphV3({mission:{missionId,objective},routerMode:"off",capabilityEnvelope:host.capabilityEnvelope,deterministicProposal:host.deterministicProposal,allowedToolDescriptors:host.allowedToolDescriptors,now:()=>GRAPH_TIME.toISOString()})).graph;
  const session=await MissionGraphSession.open({context:harness.context,initialGraph:initial});
- const complete=async(name:string)=>{const execution=requireExecution(await session.beginToolExecution(name));return session.finishToolExecution(execution,{ok:true,evidence:evidenceFor(session.graph.nodes[execution.nodeId],"a",harness.nextTimestamp()),receipt:receiptFor(session.graph.nodes[execution.nodeId],"b",harness.nextTimestamp())});};
+ let proof=0;
+ const complete=async(name:string)=>{const execution=requireExecution(await session.beginToolExecution(name));return session.finishToolExecution(execution,{ok:true,evidence:evidenceFor(session.graph.nodes[execution.nodeId],String(++proof),harness.nextTimestamp()),receipt:receiptFor(session.graph.nodes[execution.nodeId],String(++proof),harness.nextTimestamp())});};
  await complete("code_validate_fast");
  const targeted=requireExecution(await session.beginToolExecution("code_validate_targeted"));
  const result=await session.finishFailedValidationWithRecovery(targeted,{failureFingerprint:fp("c"),failureMessage:"Assertion failed in the project test.",evidence:evidenceFor(session.graph.nodes[targeted.nodeId],"c",harness.nextTimestamp()),receipt:receiptFor(session.graph.nodes[targeted.nodeId],"d",harness.nextTimestamp())});
@@ -67,7 +68,12 @@ test("person-owned targeted validation recovers without inventing a repair-recor
  assert.ok(Object.values(result.graph.nodes).every(node=>!node.allowedTools.includes("code_repair_record_cycle")));
  assert.equal((await session.beginToolExecution("code_validate_fast")).ok,false,"a fresh validation still requires a receipt-backed code correction");
  const corrected=await session.recordValidationRecoveryCorrection({toolName:"code_workspace_patch",path:"src/main.py",eligiblePaths:["src/main.py"],receiptId:"receipt-code-correction",receiptFingerprint:fp("d"),observedAt:harness.nextTimestamp()});assert.equal(corrected.recorded,true);
- await complete("code_validate_fast");assert.equal(toolNode(session.graph,"code_validate_targeted").status,"ready");
+ await complete("code_validate_fast");
+ const retry=requireExecution(await session.beginToolExecution("code_validate_targeted"));
+ const retryNode=session.graph.nodes[retry.nodeId];
+ await session.finishToolExecution(retry,{ok:true,evidence:evidenceFor(retryNode,"e",harness.nextTimestamp()),receipt:receiptFor(retryNode,"f",harness.nextTimestamp())});
+ await complete("code_validate_full");
+ assert.equal(session.graph.nodes[targeted.nodeId].status,"complete","the original validation authority is paid only by the complete fresh recovery proof");
  assert.equal(session.graph.capabilityEnvelope.fingerprint,initial.capabilityEnvelope.fingerprint);
  assert.doesNotThrow(()=>validateMissionGraphV3(session.graph));
 });

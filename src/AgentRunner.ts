@@ -2877,12 +2877,21 @@ export async function runAgentMission({
     codeWorkspaceCommitByPerson === true || (routedCodeProposalEnabled &&
     routedMissionIntent?.mode === "code_workflow" &&
     routedMissionIntent.needsCodeExecution === true);
-  const getActiveRoutedCodeToolNames = () =>
-    codeWorkspaceCommitByPerson === true
-      ? (getRequiredCodeWorkflowToolNames(activeIntentPrompt).length ? getRequiredCodeWorkflowToolNames(activeIntentPrompt) : ["code_sandbox_status","code_workspace_create","code_workspace_patch","code_validate_fast","code_validate_targeted","code_validate_full"])
-    : hasActiveRoutedCodeExecution()
-      ? getRoutedCodeWorkflowToolNames(activeIntentPrompt)
-      : [];
+  const getActiveRoutedCodeToolNames = () => {
+    if (codeWorkspaceCommitByPerson !== true) {
+      return hasActiveRoutedCodeExecution() ? getRoutedCodeWorkflowToolNames(activeIntentPrompt) : [];
+    }
+    const required = getRequiredCodeWorkflowToolNames(activeIntentPrompt);
+    const names = required.length ? [...required] : ["code_sandbox_status","code_workspace_create","code_workspace_patch","code_validate_fast","code_validate_targeted","code_validate_full"];
+    // A person-attached guided repair explicitly budgets one bounded investigation.
+    // Repetition uses the graph's existing same-authority continuation contract;
+    // it never adds a tool to an immutable capability envelope after planning.
+    if (codeAutonomyV1 === "guided" && !names.includes("code_sandbox_run")) {
+      const firstCheck = names.findIndex(name => name.startsWith("code_validate_"));
+      names.splice(firstCheck < 0 ? names.length : firstCheck, 0, "code_sandbox_run");
+    }
+    return names;
+  };
   // A code workflow works in a code workspace. Unless its prompt names the
   // open note itself, it neither reads that note first nor writes into it,
   // whatever words of the person's brief look like a note edit.
