@@ -273,6 +273,8 @@ export interface WorkspaceManagerOptionsV2 {
   pathAccess?: (manifest: Readonly<WorkspaceManifestV2>, relativePath: string, mutation: boolean) => boolean;
   /** Process-local host grouping for continuation segments of one undoable task. No execution authority is changed. */
   undoRunId?: (manifest: Readonly<WorkspaceManifestV2>, runId: string) => string;
+  /** The host may retain originals in managed workspaces too. Legacy hosts keep person-folder behavior. */
+  keepRunOriginals?: boolean;
   now?: () => Date;
   randomId?: () => string;
 }
@@ -404,6 +406,7 @@ export class WorkspaceManagerV2 {
   private writeChain = Promise.resolve();
   private readonly pathAccess: WorkspaceManagerOptionsV2["pathAccess"];
   private readonly undoRunId: WorkspaceManagerOptionsV2["undoRunId"];
+  private readonly keepRunOriginals: boolean;
 
   constructor(options: WorkspaceManagerOptionsV2 = {}) {
     this.applicationDataRoot = path.resolve(
@@ -415,6 +418,7 @@ export class WorkspaceManagerV2 {
     this.metadataRoot = path.join(this.applicationDataRoot, "workspaces-v2");
     this.pathAccess = options.pathAccess;
     this.undoRunId = options.undoRunId;
+    this.keepRunOriginals = options.keepRunOriginals === true;
     this.now = options.now ?? (() => new Date());
     this.randomId = options.randomId ?? (() => randomUUID());
   }
@@ -720,7 +724,7 @@ export class WorkspaceManagerV2 {
   async runOriginals(workspaceId: string, runId: string): Promise<WorkspaceRunOriginalsV2> {
     const manifest = await this.loadManifest(workspaceIdentifier(workspaceId));
     runId = this.originalsRunId(manifest, runId);
-    if (!manifest.personFolder) {
+    if (!manifest.personFolder && !this.keepRunOriginals) {
       throw new WorkspaceManagerErrorV2("workspace_not_person_folder", "Only a workspace in a person's own folder keeps a run's originals.");
     }
     const index = await this.readPreimageIndex(manifest, runId);
@@ -744,7 +748,7 @@ export class WorkspaceManagerV2 {
     return this.serializeWrite(async () => {
       const manifest = await this.applyExpiry(await this.loadManifest(workspaceIdentifier(workspaceId)));
       runId = this.originalsRunId(manifest, runId);
-      if (!manifest.personFolder) {
+      if (!manifest.personFolder && !this.keepRunOriginals) {
         throw new WorkspaceManagerErrorV2("workspace_not_person_folder", "Only a workspace in a person's own folder keeps a run's originals.");
       }
       if (manifest.lease) {
@@ -906,7 +910,7 @@ export class WorkspaceManagerV2 {
 
   /** The run now writing in a person's folder, or null (another workspace, or the person writing). */
   private writingRunOf(manifest: WorkspaceManifestV2): string | null {
-    if (!manifest.personFolder || !manifest.lease) return null;
+    if ((!manifest.personFolder && !this.keepRunOriginals) || !manifest.lease) return null;
     const owner = manifest.lease.ownerId;
     const runId = owner.startsWith("extension:") ? owner.slice("extension:".length) : owner;
     if (!runId || isPersonWorkspaceOwnerV2(runId)) return null;

@@ -1093,3 +1093,15 @@ test("continuation segments share durable originals while intervening human edit
  }finally{await rm(root,{recursive:true,force:true});}
 });
 
+test("the host can retain originals for managed workspaces without changing legacy hosts",async()=>{
+ const fixture=await fixtureManager("managed-undo");
+ try{
+  const manager=new WorkspaceManagerV2({applicationDataRoot:fixture.root,keepRunOriginals:true});
+  await manager.createScratchWorkspace({workspaceId:"managed",ownerRunId:"person:test"});let lease=(await manager.acquireLease("managed","person:test")).lease!.id;
+  await manager.createFile("managed",lease,"human.txt","prior human edit");await manager.releaseLease("managed",lease);
+  lease=(await manager.acquireLease("managed","extension:agent-task")).lease!.id;await manager.writeExpected("managed",lease,"human.txt","agent change",(await manager.read("managed","human.txt")).sha256);await manager.releaseLease("managed",lease);
+  const result=await manager.restoreRunOriginals("managed","agent-task");assert.deepEqual(result.restored,["human.txt"]);assert.equal((await manager.read("managed","human.txt")).content,"prior human edit");
+  const legacy=new WorkspaceManagerV2({applicationDataRoot:fixture.root});await assert.rejects(legacy.runOriginals("managed","agent-task"),/Only a workspace/u);
+ }finally{await fixture.cleanup();}
+});
+
