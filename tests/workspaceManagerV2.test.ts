@@ -1024,3 +1024,28 @@ function fp(character: string): string {
 function bytesFp(value: Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
+
+
+test("host path access bounds reads, search, listings and nested mutations without changing manifests", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "workspace-host-boundary-"));
+  try {
+    const folder = path.join(root,"project"); await mkdir(path.join(folder,"config"),{recursive:true});
+    await writeFile(path.join(folder,"main.py"),"print('public')");
+    await writeFile(path.join(folder,"config","secrets.json"),"PRIVATE_SENTINEL");
+    const manager = new WorkspaceManagerV2({applicationDataRoot:path.join(root,"data"),pathAccess:(_manifest,relative)=>!relative.endsWith("secrets.json")});
+    const manifest = await manager.registerPersonFolderWorkspace({workspaceId:"host-boundary",ownerRunId:"person:test",root:folder});
+    const before=serializeWorkspaceManifestV2(manifest);
+    await assert.rejects(manager.read(manifest.workspaceId,"config/secrets.json"),/host does not permit/u);
+    assert.equal((await manager.searchDetailed(manifest.workspaceId,"PRIVATE_SENTINEL")).results.length,0);
+    assert.deepEqual(await manager.list(manifest.workspaceId,"config"),[]);
+    assert.deepEqual(await manager.listMetadata(manifest.workspaceId,"config"),[]);
+    assert.ok(!(await manager.listTree(manifest.workspaceId,"",{recursive:true})).entries.some(row=>row.path.endsWith("secrets.json")));
+    const leased=await manager.acquireLease(manifest.workspaceId,"extension:bound",60000);
+    await assert.rejects(manager.writeExpected(manifest.workspaceId,leased.lease!.id,"config/secrets.json","new","sha256:"+createHash("sha256").update("PRIVATE_SENTINEL").digest("hex")),/host does not permit/u);
+    await assert.rejects(manager.copy(manifest.workspaceId,leased.lease!.id,"config","copy","sha256:"+"0".repeat(64)),/host does not permit/u);
+    await manager.releaseLease(manifest.workspaceId,leased.lease!.id);
+    assert.equal(await readFile(path.join(folder,"config","secrets.json"),"utf8"),"PRIVATE_SENTINEL");
+    assert.equal(JSON.parse(before).version,2);
+  } finally { await rm(root,{recursive:true,force:true}); }
+});
+

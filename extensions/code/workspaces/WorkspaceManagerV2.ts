@@ -267,6 +267,8 @@ export interface WorkspaceTreeListingV2 {
 
 export interface WorkspaceManagerOptionsV2 {
   applicationDataRoot?: string;
+  /** Host-owned additional boundary. Never persisted or supplied by a model. Omission preserves existing behavior. */
+  pathAccess?: (manifest: Readonly<WorkspaceManifestV2>, relativePath: string, mutation: boolean) => boolean;
   now?: () => Date;
   randomId?: () => string;
 }
@@ -394,6 +396,7 @@ export class WorkspaceManagerV2 {
   private readonly now: () => Date;
   private readonly randomId: () => string;
   private writeChain = Promise.resolve();
+  private readonly pathAccess: WorkspaceManagerOptionsV2["pathAccess"];
 
   constructor(options: WorkspaceManagerOptionsV2 = {}) {
     this.applicationDataRoot = path.resolve(
@@ -403,6 +406,7 @@ export class WorkspaceManagerV2 {
       throw new WorkspaceManagerErrorV2("unsafe_application_root", "Workspace application-data root cannot be a filesystem root.");
     }
     this.metadataRoot = path.join(this.applicationDataRoot, "workspaces-v2");
+    this.pathAccess = options.pathAccess;
     this.now = options.now ?? (() => new Date());
     this.randomId = options.randomId ?? (() => randomUUID());
   }
@@ -1550,6 +1554,7 @@ export class WorkspaceManagerV2 {
     const output: WorkspaceEntryMetadataV2[] = [];
     for (const name of names.sort((left, right) => left.localeCompare(right))) {
       const relative = target.relativePath ? `${target.relativePath}/${name}` : name;
+      if (this.pathAccess?.(manifest, relative, false) === false) continue;
       const safe = await this.resolveSafePath(manifest, relative, {
         mustExist: true,
         mutation: false,
@@ -1569,6 +1574,7 @@ export class WorkspaceManagerV2 {
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       if (entry.name.toLowerCase() === ".git") continue;
       const relative = target.relativePath ? `${target.relativePath}/${entry.name}` : entry.name;
+      if (this.pathAccess?.(manifest, relative, false) === false) continue;
       const safe = await this.resolveSafePath(manifest, relative, { mustExist: true, mutation: false });
       const stat = await fs.lstat(safe.absolutePath);
       if (stat.isFile()) {
@@ -1645,6 +1651,7 @@ export class WorkspaceManagerV2 {
     let stoppedReason: WorkspaceSearchReportV2["stoppedReason"] = walk.stoppedAtEntryCap ? "entry_cap" : null;
 
     for (const file of walk.files) {
+      if (this.pathAccess?.(manifest, file.path, false) === false) continue;
       if (Date.now() - startedAt > SEARCH_TIME_BUDGET_MS_V2) {
         stoppedReason = "time_budget";
         break;
@@ -1834,6 +1841,7 @@ export class WorkspaceManagerV2 {
           return;
         }
         const entryRelative = relative ? `${relative}/${name}` : name;
+        if (this.pathAccess?.(manifest, entryRelative, false) === false) continue;
         const absolute = path.join(folder, name);
         const stat = await fs.lstat(absolute).catch(() => null);
         if (!stat) continue;
@@ -2871,11 +2879,12 @@ export class WorkspaceManagerV2 {
     const target = relativePath
       ? await this.resolveSafePath(manifest, relativePath, { mustExist: true, mutation })
       : { absolutePath: manifest.canonicalRoot, relativePath: "" };
-    return scanAbsoluteTree(target.absolutePath, target.relativePath);
+    return scanAbsoluteTree(target.absolutePath, target.relativePath, (relative) => this.assertPathAccess(manifest, relative, mutation));
   }
 
   private async resolveSafePath(manifest: WorkspaceManifestV2, relativePath: string, options: { mustExist: boolean; mutation: boolean }): Promise<{ absolutePath: string; relativePath: string; exists: boolean; parentGuard: ParentGuard | null }> {
     const relative = assertWorkspaceRelativePathV2(relativePath);
+    this.assertPathAccess(manifest, relative, options.mutation);
     await this.assertWorkspaceRoot(manifest);
     const absolute = path.resolve(manifest.canonicalRoot, ...relative.split("/"));
     if (!inside(manifest.canonicalRoot, absolute)) throw new WorkspaceManagerErrorV2("path_escape", "Workspace path escaped its root.");
@@ -2900,6 +2909,10 @@ export class WorkspaceManagerV2 {
     const parent = path.dirname(absolute);
     const parentGuard = await captureParentGuard(parent, manifest.canonicalRoot);
     return { absolutePath: absolute, relativePath: relative, exists, parentGuard };
+  }
+
+  private assertPathAccess(manifest: WorkspaceManifestV2, relative: string, mutation: boolean): void {
+    if (this.pathAccess?.(manifest, relative, mutation) === false) throw new WorkspaceManagerErrorV2("host_path_denied", "The host does not permit this project path.");
   }
 
   private async assertWorkspaceRoot(manifest: WorkspaceManifestV2): Promise<void> {
@@ -3249,9 +3262,10 @@ async function hashFile(absolutePath: string): Promise<{ sha256: string; bytes: 
   return { sha256: sha256Bytes(bytes), bytes: bytes.byteLength };
 }
 
-async function scanAbsoluteTree(absoluteRoot: string, relativeRoot: string): Promise<{ files: Array<{ path: string; sha256: string; bytes: number }>; bytes: number; fingerprint: string }> {
+async function scanAbsoluteTree(absoluteRoot: string, relativeRoot: string, assertAccess?: (relative: string) => void): Promise<{ files: Array<{ path: string; sha256: string; bytes: number }>; bytes: number; fingerprint: string }> {
   const files: Array<{ path: string; sha256: string; bytes: number }> = [];
   let entriesVisited = 0;
+  if (relativeRoot) assertAccess?.(relativeRoot);
   const rootStat = await fs.lstat(absoluteRoot);
   if (rootStat.isSymbolicLink()) throw new WorkspaceManagerErrorV2("reparse_path", "Workspace tree contains a reparse point.");
   if (rootStat.isFile()) {
@@ -3269,6 +3283,7 @@ async function scanAbsoluteTree(absoluteRoot: string, relativeRoot: string): Pro
         }
         const absolute = path.join(folder, entry.name);
         const nextRelative = relative ? `${relative}/${entry.name}` : entry.name;
+        assertAccess?.(nextRelative);
         const stat = await fs.lstat(absolute);
         if (stat.isSymbolicLink()) throw new WorkspaceManagerErrorV2("reparse_path", "Workspace tree contains a symlink, junction, or reparse point.");
         if (stat.isDirectory()) await visit(absolute, nextRelative);
@@ -3474,3 +3489,4 @@ function isMissing(error: unknown): boolean { return Boolean(error && typeof err
 async function existsPath(value: string): Promise<boolean> { return fs.lstat(value).then(() => true, (error) => isMissing(error) ? false : Promise.reject(error)); }
 async function canonicalDirectory(value: string, label: string): Promise<string> { if (!path.isAbsolute(value)) throw new WorkspaceManagerErrorV2("invalid_absolute_path", `${label} must be absolute.`); const stat = await fs.lstat(value); if (!stat.isDirectory() || stat.isSymbolicLink()) throw new WorkspaceManagerErrorV2("unsafe_directory", `${label} is unsafe.`); return fs.realpath(value); }
 function defaultApplicationDataRoot(): string { if (process.platform === "win32") return path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "AgenticResearcher", "code"); if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Application Support", "AgenticResearcher", "code"); return path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "agentic-researcher", "code"); }
+
