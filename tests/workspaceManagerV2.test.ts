@@ -1030,7 +1030,7 @@ test("opaque changes share atomic preconditions, rollback and durable undo",asyn
  const fixture=await fixtureManager("opaque");
  try{
   const folder=path.join(fixture.root,"person");await mkdir(folder);await writeFile(path.join(folder,"old.bin"),new Uint8Array([0,255,1]));await writeFile(path.join(folder,"remove.txt"),"human");
-  const manager=fixture.manager;await manager.registerPersonFolderWorkspace({workspaceId:"opaque",ownerRunId:"person:test",root:folder});
+  const manager=new WorkspaceManagerV2({applicationDataRoot:path.join(fixture.root,"metadata"),now:fixture.now,randomId:fixture.randomId});await manager.registerPersonFolderWorkspace({workspaceId:"opaque",ownerRunId:"person:test",root:folder});
   const lease=(await manager.acquireLease("opaque","extension:opaque-run")).lease!.id;
   const before=await manager.readBytes("opaque","old.bin"),remove=await manager.read("opaque","remove.txt");
   await assert.rejects(manager.applyFileChanges("opaque",lease,[{kind:"write_bytes",path:"old.bin",bytes:new Uint8Array([0,2]),expectedSha256:before.sha256},{kind:"trash",path:"remove.txt",expectedSha256:fp("0")}]),/changed/u);
@@ -1052,7 +1052,7 @@ test("host path access bounds reads, search, listings and nested mutations witho
     await writeFile(path.join(folder,"config","secrets.json"),"PRIVATE_SENTINEL");
     await writeFile(path.join(folder,"image.bin"),new Uint8Array([0,255,1,2]));
     const manager = new WorkspaceManagerV2({applicationDataRoot:path.join(root,"data"),pathAccess:(_manifest,relative)=>!relative.endsWith("secrets.json")});
-    const manifest = await manager.registerPersonFolderWorkspace({workspaceId:"host-boundary",ownerRunId:"person:test",root:folder});
+    const {manifest} = await manager.registerPersonFolderWorkspace({workspaceId:"host-boundary",ownerRunId:"person:test",root:folder});
     const before=serializeWorkspaceManifestV2(manifest);
     await assert.rejects(manager.read(manifest.workspaceId,"config/secrets.json"),/host does not permit/u);
     await assert.rejects(manager.readBytes(manifest.workspaceId,"config/secrets.json"),/host does not permit/u);
