@@ -133,6 +133,7 @@ async function fixture(label: string, answer: { exitCode?: number; stdout?: stri
     manager,
     runtime,
     tool,
+    tools,
     ran,
     context,
     workspace,
@@ -368,14 +369,25 @@ test("each stream is bounded by the run's option: its start and its end, with th
 
 function approvedDependencies():HostSandboxDependenciesV1{return{fingerprint:SHA('d'),node:'__rap_dependencies__/node.cjs',python:'__rap_dependencies__/python.py',files:[{path:'__rap_dependencies__/node.cjs',bytes:new TextEncoder().encode('/* app-owned synthetic installer */')},{path:'__rap_dependencies__/python.py',bytes:new TextEncoder().encode('# app-owned synthetic installer')}]};}
 
+test("fresh dependency staging retains the empty command placeholder and prepares validation through its real tool",async()=>{
+ const f=await fixture('dependency-preparation',{},async()=>approvedDependencies());
+ try{
+  const empty=await f.workspace({},RUN,'empty-dependency-space'),prepared=await f.prepare({workspaceId:empty,argv:['python3','-c','print(42)']});assert.equal(prepared.ok,true,JSON.stringify(prepared));if(!prepared.ok)return;
+  await f.execute(prepared.action);assert.equal(f.ran.length,1);assert.ok(f.ran[0]!.staged.includes(CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1));
+  const workspaceId=await f.workspace({'main.py':'print(42)'},RUN,'validation-dependency-space');
+  const validation=await f.tools.get('code_validate_fast')!.prepare({workspaceId,repairRequestId:'dependency-validation'},f.context());assert.equal(validation.ok,true,JSON.stringify(validation));
+  assert.equal(validation.action.normalizedArgs.sandboxAction.stagingManifest.length,4);
+ }finally{await f.cleanup();}
+});
+
 test("host-approved dependency preludes bind fresh command staging and reject changed or missing approval before dispatch",async()=>{
  let dependencies:HostSandboxDependenciesV1|null=approvedDependencies(),lookups=0;const f=await fixture('dependency-command',{},async()=>{lookups++;return dependencies;});
  try{
   const workspaceId=await f.workspace({'main.js':'console.log(42)'});
   const invented=await f.prepare({workspaceId,argv:['node','main.js'],hostDependencies:approvedDependencies()});assert.equal(invented.ok,false);assert.equal(lookups,0);
   const prepared=await f.prepare({workspaceId,argv:['node','main.js']});assert.equal(prepared.ok,true,JSON.stringify(prepared));if(!prepared.ok)return;
-  const action=(prepared.action.normalizedArgs as any).sandboxAction;assert.equal(action.command.executable,'node');assert.equal(action.command.args[0],dependencies.node);assert.equal(action.network.mode,'disabled');assert.deepEqual(action.expectedArtifacts,[]);assert.equal(action.stagingManifest.length,3);
-  const completed=await f.execute(prepared.action);assert.equal(completed.mutationState,'applied');assert.equal(f.ran.length,1);assert.deepEqual(f.ran[0]!.staged,['__rap_dependencies__/node.cjs','__rap_dependencies__/python.py','main.js']);
+  const action=(prepared.action.normalizedArgs as any).sandboxAction;assert.equal(action.command.executable,'node');assert.equal(action.command.args[0],dependencies.node);assert.equal(action.network.mode,'disabled');assert.deepEqual(action.expectedArtifacts,[]);assert.equal(action.stagingManifest.length,4);
+  const completed=await f.execute(prepared.action);assert.equal(completed.mutationState,'applied');assert.equal(f.ran.length,1);assert.equal(f.ran[0]!.staged.length,4);assert.ok(f.ran[0]!.staged.some(file=>file.startsWith('__rap_dependencies__/command-')));
   const again=await f.prepare({workspaceId,argv:['node','main.js']});assert.equal(again.ok,true);if(!again.ok)return;
   dependencies.files[0].bytes[0]=42;await assert.rejects(f.execute(again.action),/dependency files changed/u);assert.equal(f.ran.length,1);
   dependencies=null;await assert.rejects(f.runtime.resolveSandboxCommandExecutionInput(action,f.context()),/no longer approved/u);assert.equal(f.ran.length,1);
@@ -388,7 +400,7 @@ test("fresh validation uses the same host prelude without treating app-owned fil
   const workspaceId=await f.workspace({'main.py':'print(42)'}),prepared=await f.runtime.resolveSandboxPreparationInput('validation_fast',workspaceId,f.context()),command=prepared.profile.validationCatalog.find(command=>command.id===prepared.commandId)!;
   assert.equal(command.executable,'python3');assert.deepEqual(command.args.slice(0,4),['-I',dependencies.python,'--execute',dependencies.fingerprint]);
   const action={...prepared,purpose:'validation_fast',profileKey:prepared.profile.key,command:{executable:command.executable,args:command.args,cwd:command.cwd,timeoutMs:command.timeoutMs},expectedArtifacts:[]} as any;
-  const staged=await f.runtime.resolveSandboxExecutionInput(action,f.context());assert.equal(staged.stagedFiles.length,3);assert.ok(staged.stagedFiles.some(file=>file.path==='main.py'));
+  const staged=await f.runtime.resolveSandboxExecutionInput(action,f.context());assert.equal(staged.stagedFiles.length,4);assert.ok(staged.stagedFiles.some(file=>file.path==='main.py'));
   dependencies={...dependencies,fingerprint:SHA('e')};await assert.rejects(f.runtime.resolveSandboxExecutionInput(action,f.context()),/current approved command/u);
  }finally{await f.cleanup();}
 });
@@ -400,6 +412,15 @@ test("source collisions and a host prelude outside its reserved folder are refus
   const collision=await f.prepare({workspaceId,argv:['node','main.js']});assert.equal(collision.ok,false);if(!collision.ok)assert.equal(collision.error.code,'sandbox_prepare_rejected_by_manager');
   assert.equal((await f.manager.read(workspaceId,'__rap_dependencies__/node.cjs')).content,'untrusted source');
   dependencies={...dependencies,files:[...dependencies.files,{path:'outside.txt',bytes:new Uint8Array([1])}]};const outside=await f.prepare({workspaceId,argv:['node','main.js']});assert.equal(outside.ok,false);assert.equal(f.ran.length,0);
+ }finally{await f.cleanup();}
+});
+
+test("a dependency prelude preserves original commands at the closed argv limits without enlarging those limits",async()=>{
+ const dependencies=approvedDependencies(),f=await fixture('dependency-long-argv',{},async()=>dependencies);
+ try{
+  const workspaceId=await f.workspace({'main.js':'console.log(42)'}),args=Array.from({length:64},(_,index)=>index?'x'.repeat(500):'-e'),prepared=await f.prepare({workspaceId,argv:['node',...args]});assert.equal(prepared.ok,true,JSON.stringify(prepared));if(!prepared.ok)return;
+  const normalized=prepared.action.normalizedArgs as any,action=normalized.sandboxAction;assert.deepEqual(normalized.sourceCommand.args,args);assert.ok(action.command.args.length<=64);assert.ok(action.command.args.every((arg:string)=>arg.length<=500));
+  await f.execute(prepared.action);assert.equal(f.ran.length,1);
  }finally{await f.cleanup();}
 });
 

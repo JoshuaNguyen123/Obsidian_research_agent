@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import {sandboxDependencyProfileV1,sandboxDependencyStagingV1,type HostSandboxDependenciesV1} from "./SandboxDependencyPreludeV1";
+import {sandboxDependencyProfileV1,sandboxDependencyStagingV1,sandboxDependenciesForCommandV1,type HostSandboxDependenciesV1} from "./SandboxDependencyPreludeV1";
 
 import type {
   ActionReceiptV1,
@@ -122,6 +122,7 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
   resolveCommandExecutionInput?(
     sandboxAction: PreparedSandboxActionV2,
     context: ScopedExtensionContextV1,
+    sourceCommand?:CodeSandboxRunCommandV1,
   ): Promise<{ stagedFiles: readonly SandboxStagedFileBytesV2[] }>;
   /** Persistence and exact readback must finish before validation success returns. */
   observeValidationReceipt?(input: {
@@ -801,10 +802,11 @@ function sandboxRunContribution(
             context,
           }),
         );
+        const dependencies=sandboxDependenciesForCommandV1(staging.hostDependencies,command);
         let profile: RepositoryProfileV2;
         try {
           profile = codeSandboxRunProfileV1(command, staging.runtimeDigest, staging.stagingProfile);
-          profile = sandboxDependencyProfileV1(profile,CODE_SANDBOX_RUN_COMMAND_ID_V1,staging.hostDependencies);
+          profile = sandboxDependencyProfileV1(profile,CODE_SANDBOX_RUN_COMMAND_ID_V1,dependencies);
         } catch (error) {
           // The profile parser's own words about the command, which the model wrote.
           return failure(
@@ -821,7 +823,7 @@ function sandboxRunContribution(
             workspaceId: staging.workspaceId,
             repairRequestId: null,
             workspaceManifestFingerprint: staging.workspaceManifestFingerprint,
-            stagingManifest: sandboxDependencyStagingV1(staging.stagingManifest,staging.hostDependencies),
+            stagingManifest: sandboxDependencyStagingV1(staging.stagingManifest,dependencies),
             environment: { ...CODE_SANDBOX_RUN_ENVIRONMENT },
             resources: { timeoutMs: command.timeoutMs },
           }),
@@ -839,7 +841,7 @@ function sandboxRunContribution(
             "The sandbox prepared this command with the network on or with files to bring back, so it is not offered.",
           );
         }
-        const action = commandPreparedAction(name, prepared.action, context, staging.notes);
+        const action = commandPreparedAction(name, prepared.action, context, staging.notes,dependencies?command:undefined);
         const journal = await preparationStageV2("sandbox_journal_unavailable", () =>
           options.executionJournal.recordPrepared({ runId: action.runId, action: prepared.action }),
         );
@@ -869,7 +871,11 @@ function sandboxRunContribution(
           "No hash-verifying workspace staging boundary is connected; native execution is not a fallback.",
         );
       }
-      const executionInput = await options.resolveCommandExecutionInput(sandboxAction, context);
+      const raw=action.normalizedArgs.sourceCommand as unknown as CodeSandboxRunCommandV1|undefined;
+      const sourceDecision=raw?codeSandboxRunPolicyV1({argv:[raw.executable,...(Array.isArray(raw.args)?raw.args:[])],cwd:raw.cwd,timeoutSeconds:raw.timeoutMs/1000}):null;
+      if(sourceDecision&&!sourceDecision.ok)throw new CodeSandboxContributionErrorV2('sandbox_command_refused','The prepared original command is no longer admissible.');
+      const sourceCommand=sourceDecision?.ok?sourceDecision.command:undefined;
+      const executionInput = await options.resolveCommandExecutionInput(sandboxAction, context,sourceCommand);
       try {
         const dispatch = await options.executionJournal.markDispatching({
           runId: action.runId,
@@ -943,8 +949,8 @@ function sandboxRunContribution(
           status: result.status === "verified" ? "passed" : "failed",
           operation: "sandbox_run",
           workspaceId: sandboxAction.workspaceId,
-          command: codeSandboxRunLineV1([sandboxAction.command.executable, ...sandboxAction.command.args]),
-          program: sandboxAction.command.executable,
+          command: codeSandboxRunLineV1([sourceCommand?.executable??sandboxAction.command.executable, ...(sourceCommand?.args??sandboxAction.command.args)]),
+          program: sourceCommand?.executable??sandboxAction.command.executable,
           cwd: sandboxAction.command.cwd,
           exitCode: result.receipt.exitCode,
           timedOut: stderr.timedOut,
@@ -992,15 +998,16 @@ function commandPreparedAction(
   sandboxAction: PreparedSandboxActionV2,
   context: ScopedExtensionContextV1,
   notes: readonly string[],
+  sourceCommand?:CodeSandboxRunCommandV1,
 ): PreparedActionV1 {
   const runId = context.missionId?.trim();
   if (!runId) {
     throw new CodeSandboxContributionErrorV2("mission_identity_required", "Prepared sandbox actions require a mission id.");
   }
   const toolCallId = context.operationId?.trim() || `${sandboxAction.commandId}:prepare`;
-  const normalizedArgs = { sandboxAction: sandboxAction as unknown as JsonValueV1 };
+  const normalizedArgs = { sandboxAction: sandboxAction as unknown as JsonValueV1,...(sourceCommand?{sourceCommand:sourceCommand as unknown as JsonValueV1}:{}) };
   const previewPayload = canonicalJson(normalizedArgs);
-  const line = codeSandboxRunLineV1([sandboxAction.command.executable, ...sandboxAction.command.args]);
+  const line = codeSandboxRunLineV1([sourceCommand?.executable??sandboxAction.command.executable, ...(sourceCommand?.args??sandboxAction.command.args)]);
   const staged = sandboxAction.stagingManifest.filter(
     (entry) => entry.path !== CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1,
   ).length;
@@ -1038,6 +1045,7 @@ function commandPreparedAction(
       },
       warnings: [
         "The network is off and no credential is given; nothing the program writes comes back to the workspace.",
+        ...(sourceCommand?["Already approved dependencies are set up offline first; install hooks and network access remain disabled."]:[]),
         ...boundedNotes,
       ],
       outboundBytes: Buffer.byteLength(previewPayload, "utf8"),
@@ -1392,7 +1400,7 @@ function corePreparedAction(
 
 function extractSandboxAction(action: PreparedActionV1): PreparedSandboxActionV2 {
   const normalized = requiredRecord(action.normalizedArgs, "normalizedArgs");
-  assertAllowedArgs(normalized, ["sandboxAction"]);
+  assertAllowedArgs(normalized, action.toolName === "code_sandbox_run" ? ["sandboxAction", "sourceCommand"] : ["sandboxAction"]);
   return parsePreparedSandboxActionV2(normalized.sandboxAction);
 }
 
