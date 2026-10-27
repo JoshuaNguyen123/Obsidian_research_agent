@@ -1032,10 +1032,14 @@ test("host path access bounds reads, search, listings and nested mutations witho
     const folder = path.join(root,"project"); await mkdir(path.join(folder,"config"),{recursive:true});
     await writeFile(path.join(folder,"main.py"),"print('public')");
     await writeFile(path.join(folder,"config","secrets.json"),"PRIVATE_SENTINEL");
+    await writeFile(path.join(folder,"image.bin"),new Uint8Array([0,255,1,2]));
     const manager = new WorkspaceManagerV2({applicationDataRoot:path.join(root,"data"),pathAccess:(_manifest,relative)=>!relative.endsWith("secrets.json")});
     const manifest = await manager.registerPersonFolderWorkspace({workspaceId:"host-boundary",ownerRunId:"person:test",root:folder});
     const before=serializeWorkspaceManifestV2(manifest);
     await assert.rejects(manager.read(manifest.workspaceId,"config/secrets.json"),/host does not permit/u);
+    await assert.rejects(manager.readBytes(manifest.workspaceId,"config/secrets.json"),/host does not permit/u);
+    await assert.rejects(manager.read(manifest.workspaceId,"image.bin"),/UTF-8|binary/u);
+    assert.deepEqual((await manager.readBytes(manifest.workspaceId,"image.bin")).bytes,new Uint8Array([0,255,1,2]));
     assert.equal((await manager.searchDetailed(manifest.workspaceId,"PRIVATE_SENTINEL")).results.length,0);
     assert.deepEqual(await manager.list(manifest.workspaceId,"config"),[]);
     assert.deepEqual(await manager.listMetadata(manifest.workspaceId,"config"),[]);

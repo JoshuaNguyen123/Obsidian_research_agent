@@ -1595,6 +1595,18 @@ export class WorkspaceManagerV2 {
     return readTextFile(target.absolutePath, target.relativePath);
   }
 
+  /** Host-only byte staging; the same path, link, hard-link and size boundary as text reads. */
+  async readBytes(workspaceId: string, relativePath: string): Promise<{ path: string; bytes: Uint8Array; sha256: string }> {
+    const manifest = await this.requireReadable(await this.loadManifest(workspaceId));
+    const target = await this.resolveSafePath(manifest, relativePath, { mustExist: true, mutation: false });
+    const stat = await fs.lstat(target.absolutePath);
+    assertSafeRegularFile(stat, target.relativePath, false);
+    if (stat.size > WORKSPACE_MAX_TEXT_BYTES_V2) throw new WorkspaceManagerErrorV2("file_too_large", "Workspace staged file exceeds 2 MiB.");
+    const bytes = await fs.readFile(target.absolutePath);
+    if (bytes.byteLength > WORKSPACE_MAX_TEXT_BYTES_V2) throw new WorkspaceManagerErrorV2("file_too_large", "Workspace staged file grew beyond 2 MiB while reading.");
+    return { path: target.relativePath, bytes: new Uint8Array(bytes), sha256: sha256Bytes(bytes) };
+  }
+
   async search(workspaceId: string, query: string, options: WorkspaceSearchOptionsV2 = {}): Promise<WorkspaceSearchResultV2[]> {
     const report = await this.searchDetailed(workspaceId, query, options);
     return report.results.map(({ before: _before, after: _after, ...hit }) => hit);
