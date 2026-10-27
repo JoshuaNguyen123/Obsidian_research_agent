@@ -1,4 +1,5 @@
 import { selectForegroundValidationCommand } from "./repositories/foregroundValidation";
+import {sandboxDependencyStagingV1,sandboxDependencyProfileV1,assertSandboxDependencyStagingV1,assertSandboxDependencyCommandV1,originalSandboxDependencyCommandV1,type HostSandboxDependenciesV1} from "./sandbox/SandboxDependencyPreludeV1";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -270,6 +271,8 @@ export interface CodeExtensionRuntimeOptionsV2 {
   sandboxRunner?: SandboxCommandRunnerV2;
   /** Provisional redacted output for the foreground host, never persisted. */
   onSandboxProgress?: (progress: Readonly<SandboxToolProgressV1>) => void;
+  /** Host-owned immutable setup bytes; never a model argument or implicit network permission. */
+  hostSandboxDependencies?:(workspaceId:string)=>Promise<HostSandboxDependenciesV1|null>;
   /**
    * Optional production repair tools assembled from narrow, verified adapters.
    * Omission is an explicit degraded capability, never a simulated commit path.
@@ -399,6 +402,7 @@ export class CodeExtensionRuntimeV2 {
   private readonly injectedSandboxManager: SandboxManagerV2 | null;
   private readonly sandboxRunner: SandboxCommandRunnerV2;
   private readonly onSandboxProgress: CodeExtensionRuntimeOptionsV2["onSandboxProgress"];
+  private readonly hostSandboxDependencies:CodeExtensionRuntimeOptionsV2["hostSandboxDependencies"];
   private repairContributions: ExtensionContributionV1[];
   private validationReceiptRegistry: DurableValidationReceiptRegistryV1 | null = null;
   private sandboxExecutionJournal: DurableSandboxExecutionJournalV1 | null = null;
@@ -433,6 +437,7 @@ export class CodeExtensionRuntimeV2 {
     this.injectedSandboxManager = options.sandboxManager ?? null;
     this.sandboxRunner = options.sandboxRunner ?? new SpawnSandboxCommandRunnerV2();
     this.onSandboxProgress = options.onSandboxProgress;
+    this.hostSandboxDependencies=options.hostSandboxDependencies;
     this.repairContributions = [...(options.repairContributions ?? [])];
     this.now = options.now ?? (() => new Date());
   }
@@ -813,6 +818,8 @@ export class CodeExtensionRuntimeV2 {
   }> {
     this.assertInitialized();
     const manifest = await this.workspaceManager.loadManifest(sandboxAction.workspaceId);
+    const dependencies=await this.hostSandboxDependencies?.(manifest.workspaceId)??null;
+    const dependencyFiles=this.hostSandboxDependencies&&(dependencies||sandboxAction.command.args.some(arg=>arg.startsWith('__rap_dependencies__/')))?assertSandboxDependencyStagingV1(sandboxAction.stagingManifest,dependencies):new Map<string,SandboxStagedFileBytesV2>();
     let profile: RepositoryProfileV2;
     if (manifest.kind === "scratch") {
       const runtimeDigest = this.verifiedSandboxRuntimeDigests(["python"]).python;
@@ -825,7 +832,7 @@ export class CodeExtensionRuntimeV2 {
       profile = createScratchPythonSandboxProfileV2({
         workspaceId: manifest.workspaceId,
         canonicalRoot: manifest.canonicalRoot,
-        stagingManifest: sandboxAction.stagingManifest,
+        stagingManifest: sandboxAction.stagingManifest.filter(entry=>!dependencyFiles.has(entry.path)),
         runtimeDigest,
         // Read the recorded proof; never probe here. Preparation already
         // decided which command this action is bound to, and a probe that
@@ -887,8 +894,10 @@ export class CodeExtensionRuntimeV2 {
         "Sandbox staging references an unknown trusted repository project.",
       );
     }
+    if(dependencies){const original=profile.validationCatalog.find(command=>command.id===sandboxAction.commandId&&command.projectId===sandboxAction.projectId);if(!original)throw new Error("The approved validation command is unavailable.");assertSandboxDependencyCommandV1(sandboxAction.command,original,dependencies);}
     const stagedFiles: SandboxStagedFileBytesV2[] = [];
     for (const entry of sandboxAction.stagingManifest) {
+      const dependency=dependencyFiles.get(entry.path);if(dependency){stagedFiles.push(dependency);continue;}
       const relativePath = assertWorkspaceRelativePathV2(entry.path);
       if (
         !project.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath)) &&
@@ -1087,6 +1096,7 @@ export class CodeExtensionRuntimeV2 {
       : null;
     const resolvedWorkspaceId = foregroundScope?.workspaceId ?? workspaceId;
     const manifest = await this.workspaceManager.loadManifest(resolvedWorkspaceId);
+    const dependencies=await this.hostSandboxDependencies?.(manifest.workspaceId)??null;
     let profile: RepositoryProfileV2;
     let projectId: string;
     let stagingRoots: string[];
@@ -1181,12 +1191,12 @@ export class CodeExtensionRuntimeV2 {
     }
     const project = profile.projects.find((candidate) => candidate.id === projectId)!;
     const command = selectForegroundValidationCommand(profile, project.id, purpose);
-    const stagingManifest = await collectSandboxStagingManifest(
+    const stagingManifest = sandboxDependencyStagingV1(await collectSandboxStagingManifest(
       this.workspaceManager,
       manifest.workspaceId,
       stagingRoots,
       profile.stagingProfile,
-    );
+    ),dependencies);
     for (const entry of stagingManifest) {
       const tracked = manifest.hashes.files[entry.path];
       if (
@@ -1223,6 +1233,7 @@ export class CodeExtensionRuntimeV2 {
       generatedOutputs: profile.generatedOutputs,
       command,
     });
+    profile=sandboxDependencyProfileV1(profile,command.id,dependencies);
     return {
       profile,
       projectId: project.id,
@@ -1327,6 +1338,7 @@ export class CodeExtensionRuntimeV2 {
     return {
       workspaceId: manifest.workspaceId,
       runtimeDigest,
+      ...(this.hostSandboxDependencies?{hostDependencies:await this.hostSandboxDependencies(manifest.workspaceId)}:{}),
       ...(stagingProfile ? { stagingProfile } : {}),
       workspaceManifestFingerprint: manifest.hashes.indexFingerprint,
       stagingManifest,
@@ -1341,6 +1353,9 @@ export class CodeExtensionRuntimeV2 {
   ): Promise<{ stagedFiles: readonly SandboxStagedFileBytesV2[] }> {
     this.assertInitialized();
     const manifest = await this.requireCommandWorkspaceV1(sandboxAction.workspaceId, context);
+    const dependencies=await this.hostSandboxDependencies?.(manifest.workspaceId)??null;
+    const dependencyFiles=this.hostSandboxDependencies&&(dependencies||sandboxAction.command.args.some(arg=>arg.startsWith('__rap_dependencies__/')))?assertSandboxDependencyStagingV1(sandboxAction.stagingManifest,dependencies):new Map<string,SandboxStagedFileBytesV2>();
+    if(dependencies)originalSandboxDependencyCommandV1(sandboxAction.command,dependencies);
     if (manifest.hashes.indexFingerprint !== sandboxAction.workspaceManifestFingerprint) {
       throw new CodeSandboxContributionErrorV2(
         "sandbox_workspace_manifest_drift",
@@ -1349,6 +1364,7 @@ export class CodeExtensionRuntimeV2 {
     }
     const stagedFiles: SandboxStagedFileBytesV2[] = [];
     for (const entry of sandboxAction.stagingManifest) {
+      const dependency=dependencyFiles.get(entry.path);if(dependency){stagedFiles.push(dependency);continue;}
       if (
         entry.path === CODE_SANDBOX_RUN_EMPTY_PLACEHOLDER_V1 &&
         entry.bytes === 0 &&

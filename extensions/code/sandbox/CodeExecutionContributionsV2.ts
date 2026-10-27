@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import {sandboxDependencyProfileV1,sandboxDependencyStagingV1,type HostSandboxDependenciesV1} from "./SandboxDependencyPreludeV1";
 
 import type {
   ActionReceiptV1,
@@ -651,6 +652,8 @@ const SANDBOX_TIMEOUT_MARKER_V1 = "sandbox_timeout=true";
 
 /** What the host staged for one command: the files as saved, and what it left out. */
 export interface CodeSandboxRunStagingV1 {
+  /** Process-local host approval only; this field never comes from a tool argument. */
+  hostDependencies?:HostSandboxDependenciesV1|null;
   workspaceId: string;
   /** The verified provider's runtime digest, which the one-command profile pins. */
   runtimeDigest: string;
@@ -801,6 +804,7 @@ function sandboxRunContribution(
         let profile: RepositoryProfileV2;
         try {
           profile = codeSandboxRunProfileV1(command, staging.runtimeDigest, staging.stagingProfile);
+          profile = sandboxDependencyProfileV1(profile,CODE_SANDBOX_RUN_COMMAND_ID_V1,staging.hostDependencies);
         } catch (error) {
           // The profile parser's own words about the command, which the model wrote.
           return failure(
@@ -817,7 +821,7 @@ function sandboxRunContribution(
             workspaceId: staging.workspaceId,
             repairRequestId: null,
             workspaceManifestFingerprint: staging.workspaceManifestFingerprint,
-            stagingManifest: staging.stagingManifest,
+            stagingManifest: sandboxDependencyStagingV1(staging.stagingManifest,staging.hostDependencies),
             environment: { ...CODE_SANDBOX_RUN_ENVIRONMENT },
             resources: { timeoutMs: command.timeoutMs },
           }),
