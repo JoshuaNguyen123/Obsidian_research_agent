@@ -46,3 +46,19 @@ export function notebookGraphExecutionScopeV1(input: {
       !/\b(?:run|execute|restart|reproduce)\b/iu.test(affirmative)) return false;
   return notebookExecutionPathV1(affirmative)===path;
 }
+
+
+/** Scheduling only: keep an owed exact notebook action inside existing total budgets.
+ * Preparation, graph authority and exact approval remain mandatory at dispatch. */
+export function notebookExecutionOwedBeforeFinalizationV1(input: {
+  node: Node | null | undefined; toolName: string; args: Record<string, unknown>;
+}): boolean {
+  const {node,toolName,args}=input;
+  return Boolean(node && ["run_notebook","run_notebook_cells"].includes(toolName) &&
+    node.executionHost === "obsidian_core" && node.effect === "execution" &&
+    ["ready","running"].includes(node.status) && node.allowedTools.length === 1 &&
+    node.allowedTools[0] === toolName && node.destination?.effect === "execution" &&
+    typeof node.destination.selector === "string" && node.destination.selector.endsWith(".ipynb") &&
+    args.path === node.destination.selector && typeof args.source_sha256 === "string" &&
+    /^sha256:[a-f0-9]{64}$/u.test(args.source_sha256));
+}

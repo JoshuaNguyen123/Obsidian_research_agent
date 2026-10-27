@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {notebookGraphExecutionScopeV1,notebookExecutionPathV1} from "../src/agent/notebookGraphExecutionScopeV1";
+import {notebookGraphExecutionScopeV1,notebookExecutionPathV1,notebookExecutionOwedBeforeFinalizationV1} from "../src/agent/notebookGraphExecutionScopeV1";
 import type {PreparedAction,ToolDescriptor} from "../src/agent/actions";
 import type {MissionBindingGrantV1} from "../src/agent/missionGraphV3";
 import {evaluateToolPolicy,deriveRoutedIntentFallback} from "../src/agent/policyEngine";
@@ -45,4 +45,15 @@ test("combined notebook editing and execution retain separate least-authority bi
  const binding=plan.capabilityEnvelope.bindings[execution.destination!.bindingId];assert.deepEqual([...binding.allowedEffects].sort(),["execution","read"]);
  assert.equal(notebookGraphExecutionScopeV1({...input,node:{...execution,status:"running"},binding}),true);
  assert.ok(!binding.allowedEffects.includes("mutation"));
+});
+
+
+test("finalization reserve cannot hide the active exact notebook execution",()=>{
+ const value=fixture(),pending=()=>notebookExecutionOwedBeforeFinalizationV1({node:value.node,toolName:value.toolName,args:value.action.normalizedArgs});
+ value.node!.status="ready";assert.equal(pending(),true);
+ for(const status of ["queued","complete","blocked"] as const){value.node!.status=status;assert.equal(pending(),false);}
+ value.node!.status="ready";value.action.normalizedArgs.path="other.ipynb";assert.equal(pending(),false);
+ value.action.normalizedArgs.path=value.action.target.path;value.action.normalizedArgs.source_sha256="unknown";assert.equal(pending(),false);
+ value.action.normalizedArgs.source_sha256=value.action.expectedTargetRevision;value.node!.allowedTools.push("edit_notebook");assert.equal(pending(),false);
+ assert.equal(notebookExecutionOwedBeforeFinalizationV1({node:null,toolName:value.toolName,args:value.action.normalizedArgs}),false);
 });

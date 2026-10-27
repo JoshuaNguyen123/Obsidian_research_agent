@@ -44,7 +44,7 @@ import { normalizeCodeReadBudgetCharsV1 } from "./model/codeWorkspacePayloadV1";
 import { descriptorForPreparedActionV1 } from "./agent/preparedActionDescriptorV1";
 import { normalizeCodeCommandOutputBudgetCharsV1 } from "./model/codeSandboxRunPayloadV1";
 import { codeWorkflowLeavesCurrentNoteAloneV1 } from "./agent/codeWorkflowCurrentNoteV1";
-import { notebookGraphExecutionScopeV1 } from "./agent/notebookGraphExecutionScopeV1";
+import { notebookGraphExecutionScopeV1, notebookExecutionOwedBeforeFinalizationV1 } from "./agent/notebookGraphExecutionScopeV1";
 import {
   isModelRequestTimeoutError,
   isTransientModelError,
@@ -22624,10 +22624,18 @@ export async function runAgentMission({
     );
     const pendingStreamingWritebackBeforeTool =
       hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
+    const activeNotebookNodeId = missionGraphSession?.getActiveNodeId();
+    const responseRequestsPendingNotebookExecution = responseToolCalls.some(call =>
+      notebookExecutionOwedBeforeFinalizationV1({
+        node: activeNotebookNodeId ? missionGraphSession?.graph.nodes[activeNotebookNodeId] : null,
+        toolName: call.name, args: call.arguments,
+      }),
+    );
     const shouldReserveFinalizationBeforeTool =
       responseToolCalls.length > 0 &&
       codeFreeOpenNodeV1()?.status !== "ready" &&
       !responseRequestsPendingRequiredWrite &&
+      !responseRequestsPendingNotebookExecution &&
       pendingRequiredWritesBeforeToolUse.length === 0 &&
       !pendingStreamingWritebackBeforeTool &&
       loopBudgetPlan.finalizationReserve > 0 &&
