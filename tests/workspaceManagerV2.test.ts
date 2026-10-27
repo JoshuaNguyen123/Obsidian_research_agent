@@ -1071,3 +1071,25 @@ test("host path access bounds reads, search, listings and nested mutations witho
   } finally { await rm(root,{recursive:true,force:true}); }
 });
 
+test("continuation segments share durable originals while intervening human edits stay held",async()=>{
+ const root=await mkdtemp(path.join(tmpdir(),"workspace-task-undo-")),folder=path.join(root,"project");await mkdir(folder);
+ const options={applicationDataRoot:path.join(root,"metadata"),undoRunId:(_manifest:unknown,runId:string)=>runId.startsWith("segment-")?"task-original":runId};
+ let manager=new WorkspaceManagerV2(options);
+ try{
+  await writeFile(path.join(folder,"stable.txt"),"prior human work\n");await writeFile(path.join(folder,"intervened.txt"),"before\n");
+  await manager.registerPersonFolderWorkspace({workspaceId:"task-undo",ownerRunId:"person:test",root:folder});
+  let lease=(await manager.acquireLease("task-undo","extension:segment-one")).lease!.id;
+  await manager.writeExpected("task-undo",lease,"stable.txt","agent one\n",(await manager.read("task-undo","stable.txt")).sha256);
+  await manager.writeExpected("task-undo",lease,"intervened.txt","agent one\n",(await manager.read("task-undo","intervened.txt")).sha256);await manager.releaseLease("task-undo",lease);
+  await writeFile(path.join(folder,"intervened.txt"),"human between segments\n");
+  lease=(await manager.acquireLease("task-undo","extension:segment-two")).lease!.id;
+  await manager.writeExpected("task-undo",lease,"stable.txt","agent two\n",(await manager.read("task-undo","stable.txt")).sha256);
+  await manager.writeExpected("task-undo",lease,"intervened.txt","human between segments\nagent addition\n",(await manager.read("task-undo","intervened.txt")).sha256);
+  await manager.createFile("task-undo",lease,"created.txt","new");await manager.releaseLease("task-undo",lease);
+  manager=new WorkspaceManagerV2(options);
+  const originals=await manager.runOriginals("task-undo","segment-two");assert.equal(originals.runId,"task-original");assert.equal(originals.entries.find(row=>row.path==="intervened.txt")!.unchangedSinceRun,false);
+  const restored=await manager.restoreRunOriginals("task-undo","segment-two");assert.deepEqual(restored.restored,["stable.txt"]);assert.deepEqual(restored.removed,["created.txt"]);assert.deepEqual(restored.skipped,[{path:"intervened.txt",reason:"human_edit_during_task"}]);
+  assert.equal(await readFile(path.join(folder,"stable.txt"),"utf8"),"prior human work\n");assert.equal(await readFile(path.join(folder,"intervened.txt"),"utf8"),"human between segments\nagent addition\n");
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+

@@ -271,6 +271,8 @@ export interface WorkspaceManagerOptionsV2 {
   applicationDataRoot?: string;
   /** Host-owned additional boundary. Never persisted or supplied by a model. Omission preserves existing behavior. */
   pathAccess?: (manifest: Readonly<WorkspaceManifestV2>, relativePath: string, mutation: boolean) => boolean;
+  /** Process-local host grouping for continuation segments of one undoable task. No execution authority is changed. */
+  undoRunId?: (manifest: Readonly<WorkspaceManifestV2>, runId: string) => string;
   now?: () => Date;
   randomId?: () => string;
 }
@@ -372,6 +374,8 @@ interface PreimageEntryV2 {
   keptAt: string;
   /** What the run left there: a SHA-256, null for absent; undefined until a write landed. */
   after?: string | null;
+  /** A later write observed an intervening human edit. Whole-file undo must preserve it. */
+  humanIntervened?: boolean;
 }
 
 interface PreimageIndexV2 {
@@ -399,6 +403,7 @@ export class WorkspaceManagerV2 {
   private readonly randomId: () => string;
   private writeChain = Promise.resolve();
   private readonly pathAccess: WorkspaceManagerOptionsV2["pathAccess"];
+  private readonly undoRunId: WorkspaceManagerOptionsV2["undoRunId"];
 
   constructor(options: WorkspaceManagerOptionsV2 = {}) {
     this.applicationDataRoot = path.resolve(
@@ -409,6 +414,7 @@ export class WorkspaceManagerV2 {
     }
     this.metadataRoot = path.join(this.applicationDataRoot, "workspaces-v2");
     this.pathAccess = options.pathAccess;
+    this.undoRunId = options.undoRunId;
     this.now = options.now ?? (() => new Date());
     this.randomId = options.randomId ?? (() => randomUUID());
   }
@@ -713,6 +719,7 @@ export class WorkspaceManagerV2 {
    */
   async runOriginals(workspaceId: string, runId: string): Promise<WorkspaceRunOriginalsV2> {
     const manifest = await this.loadManifest(workspaceIdentifier(workspaceId));
+    runId = this.originalsRunId(manifest, runId);
     if (!manifest.personFolder) {
       throw new WorkspaceManagerErrorV2("workspace_not_person_folder", "Only a workspace in a person's own folder keeps a run's originals.");
     }
@@ -721,7 +728,7 @@ export class WorkspaceManagerV2 {
     for (const [relative, entry] of Object.entries(index?.entries ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
       if (entry.after === undefined) continue;
       const now = await this.currentState(manifest, relative);
-      entries.push({ path: relative, existed: entry.existed, unchangedSinceRun: now === entry.after });
+      entries.push({ path: relative, existed: entry.existed, unchangedSinceRun: !entry.humanIntervened && now === entry.after });
     }
     return { workspaceId: manifest.workspaceId, runId, entries };
   }
@@ -736,6 +743,7 @@ export class WorkspaceManagerV2 {
   async restoreRunOriginals(workspaceId: string, runId: string): Promise<WorkspaceRunRestoreV2> {
     return this.serializeWrite(async () => {
       const manifest = await this.applyExpiry(await this.loadManifest(workspaceIdentifier(workspaceId)));
+      runId = this.originalsRunId(manifest, runId);
       if (!manifest.personFolder) {
         throw new WorkspaceManagerErrorV2("workspace_not_person_folder", "Only a workspace in a person's own folder keeps a run's originals.");
       }
@@ -755,6 +763,9 @@ export class WorkspaceManagerV2 {
           continue;
         }
         try {
+          if (entry.humanIntervened) {
+            result.skipped.push({ path: relative, reason: "human_edit_during_task" }); remaining[relative] = entry; continue;
+          }
           const now = await this.currentState(manifest, relative);
           if (now !== entry.after) {
             result.skipped.push({ path: relative, reason: "changed_since_run" });
@@ -842,7 +853,13 @@ export class WorkspaceManagerV2 {
     let changed = false;
     for (const relativeInput of relativePaths) {
       const relative = assertWorkspaceRelativePathV2(relativeInput);
-      if (index.entries[relative]) continue;
+      const previous = index.entries[relative];
+      if (previous) {
+        if (!previous.humanIntervened && await this.currentState(manifest, relative) !== (previous.after === undefined ? previous.sha256 : previous.after)) {
+          previous.humanIntervened = true; changed = true;
+        }
+        continue;
+      }
       const absolute = path.resolve(manifest.canonicalRoot, ...relative.split("/"));
       const stat = await fs.lstat(absolute).catch((error) => (isMissing(error) ? null : Promise.reject(error)));
       if (!stat) {
@@ -893,7 +910,11 @@ export class WorkspaceManagerV2 {
     const owner = manifest.lease.ownerId;
     const runId = owner.startsWith("extension:") ? owner.slice("extension:".length) : owner;
     if (!runId || isPersonWorkspaceOwnerV2(runId)) return null;
-    return runId;
+    return this.originalsRunId(manifest, runId);
+  }
+
+  private originalsRunId(manifest: WorkspaceManifestV2, runId: string): string {
+    return boundedText(this.undoRunId?.(manifest, runId) ?? runId, "undo run id", 256);
   }
 
   private preimageFolder(manifest: WorkspaceManifestV2, runId: string): string {
