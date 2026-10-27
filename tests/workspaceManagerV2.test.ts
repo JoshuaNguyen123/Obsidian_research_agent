@@ -1026,6 +1026,24 @@ function bytesFp(value: Uint8Array): string {
 }
 
 
+test("opaque changes share atomic preconditions, rollback and durable undo",async()=>{
+ const fixture=await fixtureManager("opaque");
+ try{
+  const folder=path.join(fixture.root,"person");await mkdir(folder);await writeFile(path.join(folder,"old.bin"),new Uint8Array([0,255,1]));await writeFile(path.join(folder,"remove.txt"),"human");
+  const manager=fixture.manager;await manager.registerPersonFolderWorkspace({workspaceId:"opaque",ownerRunId:"person:test",root:folder});
+  const lease=(await manager.acquireLease("opaque","extension:opaque-run")).lease!.id;
+  const before=await manager.readBytes("opaque","old.bin"),remove=await manager.read("opaque","remove.txt");
+  await assert.rejects(manager.applyFileChanges("opaque",lease,[{kind:"write_bytes",path:"old.bin",bytes:new Uint8Array([0,2]),expectedSha256:before.sha256},{kind:"trash",path:"remove.txt",expectedSha256:fp("0")}]),/changed/u);
+  assert.deepEqual((await manager.readBytes("opaque","old.bin")).bytes,before.bytes);
+  await manager.applyFileChanges("opaque",lease,[{kind:"write_bytes",path:"old.bin",bytes:new Uint8Array([0,2]),expectedSha256:before.sha256},{kind:"create_bytes",path:"new.bin",bytes:new Uint8Array([255,0])},{kind:"trash",path:"remove.txt",expectedSha256:remove.sha256}]);
+  assert.deepEqual((await manager.readBytes("opaque","new.bin")).bytes,new Uint8Array([255,0]));
+  await manager.releaseLease("opaque",lease);
+  await manager.restoreRunOriginals("opaque","opaque-run");
+  assert.deepEqual((await manager.readBytes("opaque","old.bin")).bytes,before.bytes);assert.equal((await manager.read("opaque","remove.txt")).content,"human");
+  await assert.rejects(manager.readBytes("opaque","new.bin"),/not.*exist|not.*found|missing/u);
+ }finally{await fixture.cleanup();}
+});
+
 test("host path access bounds reads, search, listings and nested mutations without changing manifests", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "workspace-host-boundary-"));
   try {

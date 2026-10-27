@@ -132,6 +132,8 @@ interface WorkspaceChangeCountV2 {
  * existing file is named by the hash it was read at.
  */
 export type WorkspaceFileChangeV2 =
+  | { kind: "write_bytes"; path: string; expectedSha256: string; bytes: Uint8Array }
+  | { kind: "create_bytes"; path: string; bytes: Uint8Array }
   | { kind: "write"; path: string; expectedSha256: string; content: string }
   | { kind: "create"; path: string; content: string }
   | { kind: "move"; path: string; destinationPath: string; expectedSha256: string; content: string }
@@ -3399,6 +3401,13 @@ function normalizeFileChange(change: WorkspaceFileChangeV2): NormalizedFileChang
     throw new WorkspaceManagerErrorV2("invalid_changes", "A file change must be an object.");
   }
   const relativePath = assertWorkspaceRelativePathV2(change.path);
+  if(change.kind === "create_bytes" || change.kind === "write_bytes") {
+    if(!(change.bytes instanceof Uint8Array) || change.bytes.byteLength > WORKSPACE_MAX_TEXT_BYTES_V2) throw new WorkspaceManagerErrorV2("invalid_changes", "Opaque file changes require bounded bytes.");
+    const bytes=new Uint8Array(change.bytes);
+    if(change.kind === "create_bytes") return {kind:"create",path:relativePath,expectedSha256:null,bytes};
+    if(!isSha256FingerprintV2(change.expectedSha256)) throw new WorkspaceManagerErrorV2("invalid_precondition", "The opaque change needs its prior SHA-256.");
+    return {kind:"write",path:relativePath,expectedSha256:change.expectedSha256,bytes};
+  }
   if (change.kind === "create") {
     return { kind: "create", path: relativePath, expectedSha256: null, bytes: textBytes(change.content) };
   }
