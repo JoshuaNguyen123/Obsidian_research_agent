@@ -44,6 +44,7 @@ import { normalizeCodeReadBudgetCharsV1 } from "./model/codeWorkspacePayloadV1";
 import { descriptorForPreparedActionV1 } from "./agent/preparedActionDescriptorV1";
 import { normalizeCodeCommandOutputBudgetCharsV1 } from "./model/codeSandboxRunPayloadV1";
 import { codeWorkflowLeavesCurrentNoteAloneV1 } from "./agent/codeWorkflowCurrentNoteV1";
+import { notebookGraphExecutionScopeV1 } from "./agent/notebookGraphExecutionScopeV1";
 import {
   isModelRequestTimeoutError,
   isTransientModelError,
@@ -14146,6 +14147,14 @@ export async function runAgentMission({
           (hostGraphNode.status === "running" ||
             hostGraphNode.status === "waiting_approval"),
       );
+      // A notebook run saves execution outputs, without granting general vault writes.
+      // This only admits the exact graph-bound execution to the approval policy.
+      const notebookExecutionScopeAuthorized = hostGraphScopeAuthorized && notebookGraphExecutionScopeV1({
+        prompt: activeIntentPrompt, toolName: toolCall.name, descriptor, action: preparedAction, node: hostGraphNode,
+        binding: hostGraphNode?.destination
+          ? missionGraphSession?.graph.capabilityEnvelope.bindings[hostGraphNode.destination.bindingId]
+          : null,
+      });
       const hostAuthorizedMemorySave =
         toolCall.name === "append_research_memory" &&
         canPlanResearchMemorySave() &&
@@ -14181,7 +14190,7 @@ export async function runAgentMission({
         scopeAllowed: exactVaultPathGraphTool || exactWorkspacePathGraphTool
           ? hostGraphScopeAuthorized && runnerScopeAuthorized
           : hostAuthorizedMemorySave || (hostScopeAuthorized && hostGraphScopeAuthorized) ||
-            runnerScopeAuthorized,
+            notebookExecutionScopeAuthorized || runnerScopeAuthorized,
         now: runToolContext.now?.() ?? new Date(),
       };
       let preparedPolicyDecision = evaluateToolPolicy(actionPolicyContext);
