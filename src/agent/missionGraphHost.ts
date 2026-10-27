@@ -38,6 +38,7 @@ import { CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME } from "../tools/projectIdeaBriefTo
 import { APPEND_JUPYTER_REFLECTION_TOOL_NAME } from "../tools/jupyterReflectionTool";
 import { extractExplicitJupyterNotebookPathsV1 } from "./jupyterReflectionIntent";
 import { CODE_FREE_WORK_NODE_ID_V1 } from "./codeFreeWorkV1";
+import { notebookExecutionPathV1 } from "./notebookGraphExecutionScopeV1";
 import {
   PROJECT_LIFECYCLE_STAGES,
   buildProjectLifecycleStageNodesV1,
@@ -1512,6 +1513,9 @@ function explicitVaultSelector(input: {
   objective: string;
   currentNotePath: string | null;
 }): string | null {
+  if (["run_notebook", "run_notebook_cells"].includes(input.toolName)) {
+    return notebookExecutionPathV1(input.objective);
+  }
   if (input.toolName === APPEND_JUPYTER_REFLECTION_TOOL_NAME) {
     return extractExplicitJupyterNotebookPathsV1(input.objective)[0] ?? null;
   }
