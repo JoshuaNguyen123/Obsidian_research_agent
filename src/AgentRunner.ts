@@ -6684,7 +6684,8 @@ export async function runAgentMission({
     if (!missionGraphSession) return;
     const node = missionGraphSession.graph.nodes[execution.nodeId];
     if (!node) return;
-    const validationFailed = hasFailedCodeValidationStatus(toolName, result);
+    const validationFailed = hasFailedCodeValidationStatus(toolName, result) ||
+      hasFailedNotebookExecutionStatusV1(toolName, result);
     const ok = result.ok && !validationFailed;
     // RAP CODE2-24: no repair record exists inside the open node, so a status
     // read finding none is an answer and carries no failure fingerprint: two of
@@ -6952,7 +6953,10 @@ export async function runAgentMission({
         },
       });
     }
-    const graphFailureMessage = repairCycleBlocked
+    const notebookExecutionFailed = hasFailedNotebookExecutionStatusV1(toolName, result);
+    const graphFailureMessage = notebookExecutionFailed
+      ? "Notebook execution failed. Inspect its saved traceback; successful reproduction is still required."
+      : repairCycleBlocked
       ? "Fast validation remained red after the third bounded repair cycle."
       : validationStatusFailed
         ? "Validation completed red; a passing cycle is still required."
@@ -41849,6 +41853,14 @@ async function executeToolWithMetrics({
  * Red `code_validate_fast` must advance (sandbox ran; next node records repair).
  * Red targeted/full must not advance toward commit.
  */
+function hasFailedNotebookExecutionStatusV1(
+  toolName: string,
+  result: Pick<ToolExecutionResult, "ok" | "output">,
+): boolean {
+  return (toolName === "run_notebook" || toolName === "run_notebook_cells") &&
+    result.ok && isRecord(result.output) && result.output.status === "failed";
+}
+
 function hasFailedCodeValidationStatus(
   toolName: string,
   result: Pick<ToolExecutionResult, "ok" | "output">,
@@ -41876,6 +41888,9 @@ export function resolveToolOutcomeMemoryDispositionV1(
   toolName: string,
   result: Pick<ToolExecutionResult, "ok" | "output" | "error">,
 ): { ok: boolean; errorCode: string | undefined } {
+  if (hasFailedNotebookExecutionStatusV1(toolName, result)) {
+    return { ok: false, errorCode: "notebook_execution_failed" };
+  }
   if (hasFailedCodeValidationStatus(toolName, result)) {
     return { ok: false, errorCode: "validation_red" };
   }
@@ -42129,6 +42144,7 @@ export function resolveMissionGraphToolResultOk(
     ok:
       result.ok &&
       !repairCycleTerminalFailure &&
+      !hasFailedNotebookExecutionStatusV1(toolName, result) &&
       !validationStatusFailed &&
       !repairCycleNotPassed,
     validationStatusFailed,

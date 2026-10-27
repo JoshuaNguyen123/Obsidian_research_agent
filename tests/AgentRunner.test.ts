@@ -30625,3 +30625,17 @@ test("patch-only recovery rereads then offers its existing prepared mutation aut
   graph.nodes.edit.status = "queued";
   assert.deepEqual(constrainValidationRecoveryWorkspaceToolsV1(input).map(tool => tool.function.name), ["code_workspace_write_expected"], "a patch that has not completed is not a repeat template");
 });
+
+
+test("notebook exceptions preserve transport receipts but cannot advance completion or success memory", () => {
+  for (const name of ["run_notebook", "run_notebook_cells"]) {
+    const failed = { ok: true as const, output: { status: "failed", verified: false } };
+    assert.equal(resolveMissionGraphToolResultOk(name, failed).ok, false);
+    assert.equal(resolveMissionGraphToolResultOk(name, failed).validationStatusFailed, false, "notebook failure does not enter the coding validator recovery graph");
+    assert.deepEqual(resolveToolOutcomeMemoryDispositionV1(name, failed), {ok:false,errorCode:"notebook_execution_failed"});
+    const executed = {ok:true as const,output:{status:"executed",verified:false}};
+    assert.equal(resolveMissionGraphToolResultOk(name, executed).ok, true);
+    assert.deepEqual(resolveToolOutcomeMemoryDispositionV1(name, executed), {ok:true,errorCode:undefined});
+  }
+  assert.equal(resolveMissionGraphToolResultOk("inspect_notebook", {ok:true,output:{status:"failed"}}).ok,true,"unrelated inspection fields do not impersonate execution outcomes");
+});
