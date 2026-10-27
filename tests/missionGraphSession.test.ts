@@ -53,7 +53,11 @@ const GRAPH_TIME = new Date("2026-07-11T18:00:00.000Z");
 
 test("person-owned targeted validation recovers without inventing a repair-record authority",async()=>{
  const harness=createVaultHarness(),names=["code_validate_fast","code_validate_targeted","code_validate_full"];
- const initial=await graphFor({missionId:"person-validation-recovery",allowedTools:names,plannedTools:names,maxToolCalls:16,maxWallClockMs:240000});
+ const descriptors=new Map(names.map(name=>[name,sessionLifecycleDescriptor(name,"workspace","execution")]));
+ const registry:ToolRegistry={getDefinitions:()=>names.map(name=>({type:"function",function:{name,parameters:{type:"object"}}})),getDescriptor:name=>descriptors.get(name)??null,execute:async call=>({ok:true,toolName:call.name})};
+ const missionId="person-validation-recovery",objective="Repair this selected workspace and run its test suite.";
+ const host=await buildHostMissionGraphPlanV1({missionId,objective,toolRegistry:registry,allowedToolNames:names,plannedToolNames:names,maxToolCalls:16,maxWallClockMs:240000,now:GRAPH_TIME});
+ const initial=(await planMissionGraphV3({mission:{missionId,objective},routerMode:"off",capabilityEnvelope:host.capabilityEnvelope,deterministicProposal:host.deterministicProposal,allowedToolDescriptors:host.allowedToolDescriptors,now:()=>GRAPH_TIME.toISOString()})).graph;
  const session=await MissionGraphSession.open({context:harness.context,initialGraph:initial});
  const complete=async(name:string)=>{const execution=requireExecution(await session.beginToolExecution(name));return session.finishToolExecution(execution,{ok:true,evidence:evidenceFor(session.graph.nodes[execution.nodeId],"a",harness.nextTimestamp()),receipt:receiptFor(session.graph.nodes[execution.nodeId],"b",harness.nextTimestamp())});};
  await complete("code_validate_fast");
