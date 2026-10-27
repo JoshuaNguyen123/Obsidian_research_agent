@@ -1692,6 +1692,13 @@ async function bindingForDescriptor(
 }
 
 function bindingIdForDescriptor(descriptor: ToolDescriptor): string | null {
+  // Notebook execution remains a separate exact-approval grant when the same
+  // mission also edits cells. Never union mutation into its execution binding.
+  if (descriptor.capability.system === "vault" &&
+      descriptor.capability.resourceType === "notebook" &&
+      graphEffect(descriptor) === "execution") {
+    return "binding-vault-notebook-execution";
+  }
   return ["vault", "browser", "workspace", "git", "linear", "github"].includes(
     descriptor.capability.system,
   )

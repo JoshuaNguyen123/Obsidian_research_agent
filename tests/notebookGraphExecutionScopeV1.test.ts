@@ -34,3 +34,15 @@ test("notebook execution resolves one explicit destination and refuses ambiguous
 test("the real host graph binds notebook execution to its named path instead of a generic vault selector",async()=>{
  const input=fixture(),registry=new DefaultToolRegistry([{name:input.toolName,description:'Run the notebook.',parameters:{type:'object',properties:{}},descriptor:input.descriptor,execute:async()=>''}]);const plan=await buildHostMissionGraphPlanV1({missionId:'notebook-run',objective:input.prompt,toolRegistry:registry,allowedToolNames:[input.toolName],plannedToolNames:[input.toolName],currentNotePath:null,maxToolCalls:4,maxWallClockMs:30000});const node=Object.values(plan.deterministicProposal.nodes).find(node=>node.allowedTools.includes(input.toolName));assert.equal(node?.destination?.selector,input.action.target.path);assert.equal(node?.destination?.effect,'execution');
 });
+
+
+test("combined notebook editing and execution retain separate least-authority bindings",async()=>{
+ const input=fixture(),editDescriptor:ToolDescriptor={...input.descriptor,name:"edit_notebook",capability:{system:"vault",resourceType:"notebook",action:"update"},effect:"mutation"};
+ const registry=new DefaultToolRegistry([input.descriptor,editDescriptor].map(descriptor=>({name:descriptor.name,description:"Notebook action.",parameters:{type:"object",properties:{}},descriptor,execute:async()=>""})));
+ const plan=await buildHostMissionGraphPlanV1({missionId:"notebook-repair-run",objective:"Edit Research/analysis.ipynb and run it.",toolRegistry:registry,allowedToolNames:["edit_notebook",input.toolName],plannedToolNames:["edit_notebook",input.toolName],currentNotePath:null,maxToolCalls:8,maxWallClockMs:30000});
+ const graph=plan.deterministicProposal,execution=Object.values(graph.nodes).find(node=>node.allowedTools.includes(input.toolName))!,edit=Object.values(graph.nodes).find(node=>node.allowedTools.includes("edit_notebook"))!;
+ assert.ok(execution&&edit);assert.notEqual(execution.destination?.bindingId,edit.destination?.bindingId);
+ const binding=plan.capabilityEnvelope.bindings[execution.destination!.bindingId];assert.deepEqual([...binding.allowedEffects].sort(),["execution","read"]);
+ assert.equal(notebookGraphExecutionScopeV1({...input,node:{...execution,status:"running"},binding}),true);
+ assert.ok(!binding.allowedEffects.includes("mutation"));
+});
