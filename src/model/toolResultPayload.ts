@@ -411,6 +411,23 @@ function slimOutputForModel(
   }
   let lossy = false;
   const keep: Record<string, unknown> = {};
+  if (["edit_notebook", "run_notebook", "run_notebook_cells"].includes(toolName)) {
+    // Preserve execution meaning and the next CAS source identity, without
+    // forwarding arbitrary notebook metadata or unbounded cell values.
+    for (const key of ["status", "source_sha256", "verified", "exit_code", "executed", "next", "note", "stderr"]) {
+      const value = output[key];
+      if (typeof value === "string") {
+        keep[key] = truncateText(value, 2_000);
+        lossy ||= value.length > 2_000;
+      } else if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
+        keep[key] = value;
+      }
+    }
+    if (Array.isArray(output.executedCells)) {
+      keep.executedCells = output.executedCells.filter(value => Number.isSafeInteger(value) && value >= 0).slice(0, 500);
+      lossy ||= output.executedCells.length > 500;
+    }
+  }
   for (const key of [
     "operation",
     "path",

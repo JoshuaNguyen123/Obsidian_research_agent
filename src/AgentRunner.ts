@@ -17659,7 +17659,7 @@ export async function runAgentMission({
       markOperationGoalsForTool({
         operationGoals,
         toolName: recordedToolCall.name,
-        ok: result.ok,
+        ok: result.ok && !hasFailedNotebookExecutionStatusV1(toolCall.name, result),
         streamingWritebackKind,
       });
     }
@@ -17703,8 +17703,11 @@ export async function runAgentMission({
     }
 
     if (result.ok) {
-      successfulToolNames.push(toolCall.name);
-      currentSegmentSuccessfulToolNames.push(toolCall.name);
+      const notebookExecutionFailed = hasFailedNotebookExecutionStatusV1(toolCall.name, result);
+      if (!notebookExecutionFailed) {
+        successfulToolNames.push(toolCall.name);
+        currentSegmentSuccessfulToolNames.push(toolCall.name);
+      }
       if (missionLedger) {
         setLedgerLastSafeStep(
           missionLedger,
@@ -17713,14 +17716,13 @@ export async function runAgentMission({
         );
       }
       await recordLedgerToolResult(toolCall.name, result, step);
-      const successMessage = emitToolSuccessStatus(
-        toolCall.name,
-        result.output,
-        events,
-      );
+      const successMessage = notebookExecutionFailed
+        ? "Notebook execution failed. Inspect the saved cell traceback before correcting and rerunning it."
+        : emitToolSuccessStatus(toolCall.name, result.output, events);
+      if (notebookExecutionFailed) events.onStatus?.(successMessage);
       events.onToolDone?.({
         ...toolEventBase,
-        ok: true,
+        ok: !notebookExecutionFailed,
         message: successMessage,
         output: result.output,
       });

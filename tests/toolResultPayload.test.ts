@@ -440,3 +440,13 @@ test("an oversized external result keeps its trust marker in the metadata-only f
   assert.equal(parsed.trust, UNTRUSTED_EXTERNAL_CONTENT_TRUST);
   assert.equal(typeof parsed.guard, "string");
 });
+
+
+test("notebook execution payload retains failure meaning and bounded source identity",()=>{
+ const revision="sha256:"+"a".repeat(64);
+ for(const name of ["run_notebook","run_notebook_cells"]){
+  const result=JSON.parse(serializeToolResultForModel({ok:true,toolName:name,output:{status:"failed",path:"analysis.ipynb",source_sha256:revision,verified:false,exit_code:1,executedCells:[0,1],next:"Inspect the saved traceback.",stderr:"x".repeat(5000),privateMetadata:{secret:"must-not-cross"}}}));
+  assert.equal(result.output.status,"failed");assert.equal(result.output.source_sha256,revision);assert.equal(result.output.verified,false);assert.equal(result.output.exit_code,1);assert.deepEqual(result.output.executedCells,[0,1]);assert.ok(result.output.stderr.length<2200);assert.equal(result.output.privateMetadata,undefined);assert.ok(result.truncated);
+ }
+ const edit=JSON.parse(serializeToolResultForModel({ok:true,toolName:"edit_notebook",output:{status:"edited",path:"analysis.ipynb",source_sha256:revision,executed:false}}));assert.equal(edit.output.source_sha256,revision);assert.equal(edit.output.executed,false);
+});
