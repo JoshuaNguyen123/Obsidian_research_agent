@@ -362,7 +362,7 @@ export interface WorkspaceRunRestoreV2 {
   /** Files the run made, removed. */
   removed: string[];
   /** Files left as they are, and why. */
-  skipped: Array<{ path: string; reason: "changed_since_run" | "original_damaged" | "unwritable" }>;
+  skipped: Array<{ path: string; reason: "changed_since_run" | "human_edit_during_task" | "original_damaged" | "unwritable" }>;
 }
 
 interface PreimageEntryV2 {
