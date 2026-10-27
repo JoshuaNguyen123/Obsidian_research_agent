@@ -2874,18 +2874,20 @@ export async function runAgentMission({
   let routedModelFailureReason: string | null = null;
   let routedMissionIntent: RoutedMissionIntent | null = null;
   const hasActiveRoutedCodeExecution = () =>
-    routedCodeProposalEnabled &&
+    codeWorkspaceCommitByPerson === true || (routedCodeProposalEnabled &&
     routedMissionIntent?.mode === "code_workflow" &&
-    routedMissionIntent.needsCodeExecution === true;
+    routedMissionIntent.needsCodeExecution === true);
   const getActiveRoutedCodeToolNames = () =>
-    hasActiveRoutedCodeExecution()
+    codeWorkspaceCommitByPerson === true
+      ? (getRequiredCodeWorkflowToolNames(activeIntentPrompt).length ? getRequiredCodeWorkflowToolNames(activeIntentPrompt) : ["code_sandbox_status","code_workspace_create","code_workspace_patch","code_validate_fast","code_validate_targeted","code_validate_full"])
+    : hasActiveRoutedCodeExecution()
       ? getRoutedCodeWorkflowToolNames(activeIntentPrompt)
       : [];
   // A code workflow works in a code workspace. Unless its prompt names the
   // open note itself, it neither reads that note first nor writes into it,
   // whatever words of the person's brief look like a note edit.
   const codeWorkflowLeavesCurrentNoteAlone = () =>
-    codeWorkflowLeavesCurrentNoteAloneV1(
+    codeWorkspaceCommitByPerson === true || codeWorkflowLeavesCurrentNoteAloneV1(
       activeIntentPrompt,
       getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0 ||
         hasActiveRoutedCodeExecution(),
@@ -3630,7 +3632,7 @@ export async function runAgentMission({
     missionIntent,
     toolContext: runToolContext,
     enableStreaming,
-    forceChatOnly: shouldForceCurrentPromptChatOnly(),
+    forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
   });
   if (
     shouldForceCurrentPromptChatOnly() ||
@@ -3652,7 +3654,7 @@ export async function runAgentMission({
     missionIntent,
     toolContext: runToolContext,
     enableStreaming,
-    forceChatOnly: shouldForceCurrentPromptChatOnly(),
+    forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
   });
   if (
     noteOutputPlan.destination === "chat" &&
@@ -3962,8 +3964,8 @@ export async function runAgentMission({
     ...args: Parameters<typeof getRequiredWriteToolNames>
   ): string[] =>
     codeWorkspaceCommitByPerson === true
-      ? getRequiredWriteToolNames(...args).filter(
-          (name) => !PERSON_COMMITTED_CODE_TOOLS_V1.has(name),
+      ? getActiveRoutedCodeToolNames().filter(
+          (name) => allowedToolNames.has(name) && !PERSON_COMMITTED_CODE_TOOLS_V1.has(name) && toolRegistry.getDescriptor?.(name)?.effect !== "read",
         )
       : getRequiredWriteToolNames(...args);
   let requiredWriteTools = isBufferedNewNoteOutput(
@@ -4933,7 +4935,7 @@ export async function runAgentMission({
       missionIntent,
       toolContext: runToolContext,
       enableStreaming,
-      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+      forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
     });
     runToolContext = bindPlannedNewNoteOutputAuthority({
       toolContext: runToolContext,
@@ -7158,7 +7160,7 @@ export async function runAgentMission({
       missionIntent,
       toolContext: runToolContext,
       enableStreaming,
-      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+      forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
     });
     runToolContext = bindPlannedNewNoteOutputAuthority({
       toolContext: runToolContext,
@@ -11354,7 +11356,7 @@ export async function runAgentMission({
             markerId: reflectionRootMarkerId,
             initiatingNotePath: boundInitiatingNotePath,
             workingMode: runToolContext.settings?.workingMode,
-            forceChatOnly: shouldForceCurrentPromptChatOnly(),
+            forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
             persistence: reflectionPersistence.state,
             codeExamples: verifiedReflectionCodeExamples,
           })

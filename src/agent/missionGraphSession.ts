@@ -2025,10 +2025,10 @@ export class MissionGraphSession {
                 candidate.allowedTools.includes("code_validate_fast"),
             ),
         )
-        .at(-1);
-      if (!repairTemplate || !fastTemplate) {
+        .at(-1) ?? completedAncestors.filter(candidate=>candidate.allowedTools.includes("code_validate_fast")).at(-1);
+      if (!fastTemplate) {
         throw new Error(
-          `${execution.toolName} recovery requires completed fast-validation and repair-record ancestors.`,
+          `${execution.toolName} recovery requires a completed fast-validation ancestor.`,
         );
       }
       const targetedTemplate =
@@ -2058,15 +2058,15 @@ export class MissionGraphSession {
       const requestedBudget: MissionNodeBudgetV1 = {
         toolCalls:
           fastTemplate.budget.toolCalls +
-          repairTemplate.budget.toolCalls +
+          (repairTemplate?.budget.toolCalls ?? 0) +
           (targetedTemplate?.budget.toolCalls ?? 0),
         externalActions:
           fastTemplate.budget.externalActions +
-          repairTemplate.budget.externalActions +
+          (repairTemplate?.budget.externalActions ?? 0) +
           (targetedTemplate?.budget.externalActions ?? 0),
         wallClockMs:
           fastTemplate.budget.wallClockMs +
-          repairTemplate.budget.wallClockMs +
+          (repairTemplate?.budget.wallClockMs ?? 0) +
           (targetedTemplate?.budget.wallClockMs ?? 0),
       };
       const reserveNode = findContinuationReserveNode(this.record.graph);
@@ -2090,7 +2090,7 @@ export class MissionGraphSession {
         `validation-recovery-targeted-${idSuffix}`.slice(0, 128);
       for (const nodeId of [
         fastNodeId,
-        repairNodeId,
+        ...(repairTemplate ? [repairNodeId] : []),
         ...(targetedTemplate ? [targetedNodeId] : []),
       ]) {
         if (this.record.graph.nodes[nodeId]) {
@@ -2123,7 +2123,7 @@ export class MissionGraphSession {
         verification: null,
         blocker: null,
       };
-      const repairNode: MissionNodeV3 = {
+      const repairNode: MissionNodeV3 | null = repairTemplate ? {
         ...clone(repairTemplate),
         id: repairNodeId,
         dependencyIds: [
@@ -2149,7 +2149,7 @@ export class MissionGraphSession {
         receipts: [],
         verification: null,
         blocker: null,
-      };
+      } : null;
       const targetedNode: MissionNodeV3 | null = targetedTemplate
         ? {
             ...clone(targetedTemplate),
@@ -2157,7 +2157,7 @@ export class MissionGraphSession {
             dependencyIds: [
               ...new Set([
                 ...targetedTemplate.dependencyIds,
-                repairNodeId,
+                repairNode?.id ?? fastNodeId,
               ]),
             ].sort(),
             objective:
@@ -2174,10 +2174,10 @@ export class MissionGraphSession {
             blocker: null,
           }
         : null;
-      const nextDependencyId = targetedNode?.id ?? repairNode.id;
+      const nextDependencyId = targetedNode?.id ?? repairNode?.id ?? fastNodeId;
       operations.push(
         { op: "add_node", node: fastNode },
-        { op: "add_node", node: repairNode },
+        ...(repairNode ? [{ op: "add_node" as const, node: repairNode }] : []),
         ...(targetedNode
           ? [{ op: "add_node" as const, node: targetedNode }]
           : []),
@@ -2205,7 +2205,7 @@ export class MissionGraphSession {
               failureFingerprint: result.failureFingerprint,
               failedAt: this.now(),
               fastNodeId,
-              repairNodeId,
+              repairNodeId: repairNode?.id ?? null,
               targetedNodeId: targetedNode?.id ?? null,
               correction: null,
             },

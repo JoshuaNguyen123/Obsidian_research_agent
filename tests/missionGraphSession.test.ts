@@ -51,6 +51,23 @@ import type { ToolExecutionContext, ToolRegistry } from "../src/tools/types";
 
 const GRAPH_TIME = new Date("2026-07-11T18:00:00.000Z");
 
+test("person-owned targeted validation recovers without inventing a repair-record authority",async()=>{
+ const harness=createVaultHarness(),names=["code_validate_fast","code_validate_targeted","code_validate_full"];
+ const initial=await graphFor({missionId:"person-validation-recovery",allowedTools:names,plannedTools:names,maxToolCalls:16,maxWallClockMs:240000});
+ const session=await MissionGraphSession.open({context:harness.context,initialGraph:initial});
+ const complete=async(name:string)=>{const execution=requireExecution(await session.beginToolExecution(name));return session.finishToolExecution(execution,{ok:true,evidence:evidenceFor(session.graph.nodes[execution.nodeId],"a",harness.nextTimestamp()),receipt:receiptFor(session.graph.nodes[execution.nodeId],"b",harness.nextTimestamp())});};
+ await complete("code_validate_fast");
+ const targeted=requireExecution(await session.beginToolExecution("code_validate_targeted"));
+ const result=await session.finishFailedValidationWithRecovery(targeted,{failureFingerprint:fp("c"),failureMessage:"Assertion failed in the project test.",evidence:evidenceFor(session.graph.nodes[targeted.nodeId],"c",harness.nextTimestamp()),receipt:receiptFor(session.graph.nodes[targeted.nodeId],"d",harness.nextTimestamp())});
+ assert.equal(result.scheduled,true);
+ assert.ok(Object.values(result.graph.nodes).every(node=>!node.allowedTools.includes("code_repair_record_cycle")));
+ assert.equal((await session.beginToolExecution("code_validate_fast")).ok,false,"a fresh validation still requires a receipt-backed code correction");
+ const corrected=await session.recordValidationRecoveryCorrection({toolName:"code_workspace_patch",path:"src/main.py",eligiblePaths:["src/main.py"],receiptId:"receipt-code-correction",receiptFingerprint:fp("d"),observedAt:harness.nextTimestamp()});assert.equal(corrected.recorded,true);
+ await complete("code_validate_fast");assert.equal(toolNode(session.graph,"code_validate_targeted").status,"ready");
+ assert.equal(session.graph.capabilityEnvelope.fingerprint,initial.capabilityEnvelope.fingerprint);
+ assert.doesNotThrow(()=>validateMissionGraphV3(session.graph));
+});
+
 test("beginToolExecution recovers an orphaned running node back to ready", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({
