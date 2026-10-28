@@ -44,6 +44,7 @@ import { normalizeCodeReadBudgetCharsV1 } from "./model/codeWorkspacePayloadV1";
 import { descriptorForPreparedActionV1 } from "./agent/preparedActionDescriptorV1";
 import { normalizeCodeCommandOutputBudgetCharsV1 } from "./model/codeSandboxRunPayloadV1";
 import { codeWorkflowLeavesCurrentNoteAloneV1 } from "./agent/codeWorkflowCurrentNoteV1";
+import { notebookGraphExecutionScopeV1, notebookExecutionOwedBeforeFinalizationV1 } from "./agent/notebookGraphExecutionScopeV1";
 import {
   isModelRequestTimeoutError,
   isTransientModelError,
@@ -2874,18 +2875,29 @@ export async function runAgentMission({
   let routedModelFailureReason: string | null = null;
   let routedMissionIntent: RoutedMissionIntent | null = null;
   const hasActiveRoutedCodeExecution = () =>
-    routedCodeProposalEnabled &&
+    codeWorkspaceCommitByPerson === true || (routedCodeProposalEnabled &&
     routedMissionIntent?.mode === "code_workflow" &&
-    routedMissionIntent.needsCodeExecution === true;
-  const getActiveRoutedCodeToolNames = () =>
-    hasActiveRoutedCodeExecution()
-      ? getRoutedCodeWorkflowToolNames(activeIntentPrompt)
-      : [];
+    routedMissionIntent.needsCodeExecution === true);
+  const getActiveRoutedCodeToolNames = () => {
+    if (codeWorkspaceCommitByPerson !== true) {
+      return hasActiveRoutedCodeExecution() ? getRoutedCodeWorkflowToolNames(activeIntentPrompt) : [];
+    }
+    const required = getRequiredCodeWorkflowToolNames(activeIntentPrompt);
+    const names = required.length ? [...required] : ["code_sandbox_status","code_workspace_create","code_workspace_patch","code_validate_fast","code_validate_targeted","code_validate_full"];
+    // A person-attached guided repair explicitly budgets one bounded investigation.
+    // Repetition uses the graph's existing same-authority continuation contract;
+    // it never adds a tool to an immutable capability envelope after planning.
+    if (codeAutonomyV1 === "guided" && !names.includes("code_sandbox_run")) {
+      const firstCheck = names.findIndex(name => name.startsWith("code_validate_"));
+      names.splice(firstCheck < 0 ? names.length : firstCheck, 0, "code_sandbox_run");
+    }
+    return names;
+  };
   // A code workflow works in a code workspace. Unless its prompt names the
   // open note itself, it neither reads that note first nor writes into it,
   // whatever words of the person's brief look like a note edit.
   const codeWorkflowLeavesCurrentNoteAlone = () =>
-    codeWorkflowLeavesCurrentNoteAloneV1(
+    codeWorkspaceCommitByPerson === true || codeWorkflowLeavesCurrentNoteAloneV1(
       activeIntentPrompt,
       getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0 ||
         hasActiveRoutedCodeExecution(),
@@ -3630,7 +3642,7 @@ export async function runAgentMission({
     missionIntent,
     toolContext: runToolContext,
     enableStreaming,
-    forceChatOnly: shouldForceCurrentPromptChatOnly(),
+    forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
   });
   if (
     shouldForceCurrentPromptChatOnly() ||
@@ -3652,7 +3664,7 @@ export async function runAgentMission({
     missionIntent,
     toolContext: runToolContext,
     enableStreaming,
-    forceChatOnly: shouldForceCurrentPromptChatOnly(),
+    forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
   });
   if (
     noteOutputPlan.destination === "chat" &&
@@ -3962,8 +3974,8 @@ export async function runAgentMission({
     ...args: Parameters<typeof getRequiredWriteToolNames>
   ): string[] =>
     codeWorkspaceCommitByPerson === true
-      ? getRequiredWriteToolNames(...args).filter(
-          (name) => !PERSON_COMMITTED_CODE_TOOLS_V1.has(name),
+      ? getActiveRoutedCodeToolNames().filter(
+          (name) => allowedToolNames.has(name) && !PERSON_COMMITTED_CODE_TOOLS_V1.has(name) && toolRegistry.getDescriptor?.(name)?.effect !== "read",
         )
       : getRequiredWriteToolNames(...args);
   let requiredWriteTools = isBufferedNewNoteOutput(
@@ -4933,7 +4945,7 @@ export async function runAgentMission({
       missionIntent,
       toolContext: runToolContext,
       enableStreaming,
-      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+      forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
     });
     runToolContext = bindPlannedNewNoteOutputAuthority({
       toolContext: runToolContext,
@@ -6672,7 +6684,8 @@ export async function runAgentMission({
     if (!missionGraphSession) return;
     const node = missionGraphSession.graph.nodes[execution.nodeId];
     if (!node) return;
-    const validationFailed = hasFailedCodeValidationStatus(toolName, result);
+    const validationFailed = hasFailedCodeValidationStatus(toolName, result) ||
+      hasFailedNotebookExecutionStatusV1(toolName, result);
     const ok = result.ok && !validationFailed;
     // RAP CODE2-24: no repair record exists inside the open node, so a status
     // read finding none is an answer and carries no failure fingerprint: two of
@@ -6940,7 +6953,10 @@ export async function runAgentMission({
         },
       });
     }
-    const graphFailureMessage = repairCycleBlocked
+    const notebookExecutionFailed = hasFailedNotebookExecutionStatusV1(toolName, result);
+    const graphFailureMessage = notebookExecutionFailed
+      ? "Notebook execution failed. Inspect its saved traceback; successful reproduction is still required."
+      : repairCycleBlocked
       ? "Fast validation remained red after the third bounded repair cycle."
       : validationStatusFailed
         ? "Validation completed red; a passing cycle is still required."
@@ -7158,7 +7174,7 @@ export async function runAgentMission({
       missionIntent,
       toolContext: runToolContext,
       enableStreaming,
-      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+      forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
     });
     runToolContext = bindPlannedNewNoteOutputAuthority({
       toolContext: runToolContext,
@@ -11354,7 +11370,7 @@ export async function runAgentMission({
             markerId: reflectionRootMarkerId,
             initiatingNotePath: boundInitiatingNotePath,
             workingMode: runToolContext.settings?.workingMode,
-            forceChatOnly: shouldForceCurrentPromptChatOnly(),
+            forceChatOnly: shouldForceCurrentPromptChatOnly() || codeWorkspaceCommitByPerson === true,
             persistence: reflectionPersistence.state,
             codeExamples: verifiedReflectionCodeExamples,
           })
@@ -14135,6 +14151,14 @@ export async function runAgentMission({
           (hostGraphNode.status === "running" ||
             hostGraphNode.status === "waiting_approval"),
       );
+      // A notebook run saves execution outputs, without granting general vault writes.
+      // This only admits the exact graph-bound execution to the approval policy.
+      const notebookExecutionScopeAuthorized = hostGraphScopeAuthorized && notebookGraphExecutionScopeV1({
+        prompt: activeIntentPrompt, toolName: toolCall.name, descriptor, action: preparedAction, node: hostGraphNode,
+        binding: hostGraphNode?.destination
+          ? missionGraphSession?.graph.capabilityEnvelope.bindings[hostGraphNode.destination.bindingId]
+          : null,
+      });
       const hostAuthorizedMemorySave =
         toolCall.name === "append_research_memory" &&
         canPlanResearchMemorySave() &&
@@ -14170,7 +14194,7 @@ export async function runAgentMission({
         scopeAllowed: exactVaultPathGraphTool || exactWorkspacePathGraphTool
           ? hostGraphScopeAuthorized && runnerScopeAuthorized
           : hostAuthorizedMemorySave || (hostScopeAuthorized && hostGraphScopeAuthorized) ||
-            runnerScopeAuthorized,
+            notebookExecutionScopeAuthorized || runnerScopeAuthorized,
         now: runToolContext.now?.() ?? new Date(),
       };
       let preparedPolicyDecision = evaluateToolPolicy(actionPolicyContext);
@@ -17635,7 +17659,7 @@ export async function runAgentMission({
       markOperationGoalsForTool({
         operationGoals,
         toolName: recordedToolCall.name,
-        ok: result.ok,
+        ok: result.ok && !hasFailedNotebookExecutionStatusV1(toolCall.name, result),
         streamingWritebackKind,
       });
     }
@@ -17679,8 +17703,11 @@ export async function runAgentMission({
     }
 
     if (result.ok) {
-      successfulToolNames.push(toolCall.name);
-      currentSegmentSuccessfulToolNames.push(toolCall.name);
+      const notebookExecutionFailed = hasFailedNotebookExecutionStatusV1(toolCall.name, result);
+      if (!notebookExecutionFailed) {
+        successfulToolNames.push(toolCall.name);
+        currentSegmentSuccessfulToolNames.push(toolCall.name);
+      }
       if (missionLedger) {
         setLedgerLastSafeStep(
           missionLedger,
@@ -17689,14 +17716,13 @@ export async function runAgentMission({
         );
       }
       await recordLedgerToolResult(toolCall.name, result, step);
-      const successMessage = emitToolSuccessStatus(
-        toolCall.name,
-        result.output,
-        events,
-      );
+      const successMessage = notebookExecutionFailed
+        ? "Notebook execution failed. Inspect the saved cell traceback before correcting and rerunning it."
+        : emitToolSuccessStatus(toolCall.name, result.output, events);
+      if (notebookExecutionFailed) events.onStatus?.(successMessage);
       events.onToolDone?.({
         ...toolEventBase,
-        ok: true,
+        ok: !notebookExecutionFailed,
         message: successMessage,
         output: result.output,
       });
@@ -22600,10 +22626,18 @@ export async function runAgentMission({
     );
     const pendingStreamingWritebackBeforeTool =
       hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
+    const activeNotebookNodeId = missionGraphSession?.getActiveNodeId();
+    const responseRequestsPendingNotebookExecution = responseToolCalls.some(call =>
+      notebookExecutionOwedBeforeFinalizationV1({
+        node: activeNotebookNodeId ? missionGraphSession?.graph.nodes[activeNotebookNodeId] : null,
+        toolName: call.name, args: call.arguments,
+      }),
+    );
     const shouldReserveFinalizationBeforeTool =
       responseToolCalls.length > 0 &&
       codeFreeOpenNodeV1()?.status !== "ready" &&
       !responseRequestsPendingRequiredWrite &&
+      !responseRequestsPendingNotebookExecution &&
       pendingRequiredWritesBeforeToolUse.length === 0 &&
       !pendingStreamingWritebackBeforeTool &&
       loopBudgetPlan.finalizationReserve > 0 &&
@@ -41829,6 +41863,14 @@ async function executeToolWithMetrics({
  * Red `code_validate_fast` must advance (sandbox ran; next node records repair).
  * Red targeted/full must not advance toward commit.
  */
+function hasFailedNotebookExecutionStatusV1(
+  toolName: string,
+  result: Pick<ToolExecutionResult, "ok" | "output">,
+): boolean {
+  return (toolName === "run_notebook" || toolName === "run_notebook_cells") &&
+    result.ok && isRecord(result.output) && result.output.status === "failed";
+}
+
 function hasFailedCodeValidationStatus(
   toolName: string,
   result: Pick<ToolExecutionResult, "ok" | "output">,
@@ -41856,6 +41898,9 @@ export function resolveToolOutcomeMemoryDispositionV1(
   toolName: string,
   result: Pick<ToolExecutionResult, "ok" | "output" | "error">,
 ): { ok: boolean; errorCode: string | undefined } {
+  if (hasFailedNotebookExecutionStatusV1(toolName, result)) {
+    return { ok: false, errorCode: "notebook_execution_failed" };
+  }
   if (hasFailedCodeValidationStatus(toolName, result)) {
     return { ok: false, errorCode: "validation_red" };
   }
@@ -42109,6 +42154,7 @@ export function resolveMissionGraphToolResultOk(
     ok:
       result.ok &&
       !repairCycleTerminalFailure &&
+      !hasFailedNotebookExecutionStatusV1(toolName, result) &&
       !validationStatusFailed &&
       !repairCycleNotPassed,
     validationStatusFailed,

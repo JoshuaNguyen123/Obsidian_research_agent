@@ -114,6 +114,13 @@ export const CODE_FREE_MENU_V1 = Object.freeze([
   "code_validate_fast",
   "code_validate_targeted",
   "code_sandbox_run",
+  "code_environment_status",
+  "code_environment_execute",
+  "code_environment_poll",
+  "code_environment_stop",
+  "code_environment_changes",
+  "code_environment_adopt",
+  "code_environment_preview",
   "code_repair_status",
   "recall_tool_result",
   CODE_PLAN_UPDATE_TOOL_NAME_V1,
@@ -139,6 +146,7 @@ export const PERSON_COMMITTED_CODE_TOOLS_V1: ReadonlySet<string> = new Set([
  * "append") was planned as a guided pass, not the open node.
  */
 export const CODE_FREE_WRITE_TOOLS_V1: ReadonlySet<string> = new Set([
+  "code_environment_adopt",
   "code_workspace_create_file",
   "code_workspace_append",
   "code_workspace_write_expected",

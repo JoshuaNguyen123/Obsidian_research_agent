@@ -1024,3 +1024,84 @@ function fp(character: string): string {
 function bytesFp(value: Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
+
+
+test("opaque changes share atomic preconditions, rollback and durable undo",async()=>{
+ const fixture=await fixtureManager("opaque");
+ try{
+  const folder=path.join(fixture.root,"person");await mkdir(folder);await writeFile(path.join(folder,"old.bin"),new Uint8Array([0,255,1]));await writeFile(path.join(folder,"remove.txt"),"human");
+  const manager=new WorkspaceManagerV2({applicationDataRoot:path.join(fixture.root,"metadata"),now:fixture.now,randomId:fixture.randomId});await manager.registerPersonFolderWorkspace({workspaceId:"opaque",ownerRunId:"person:test",root:folder});
+  const lease=(await manager.acquireLease("opaque","extension:opaque-run")).lease!.id;
+  const before=await manager.readBytes("opaque","old.bin"),remove=await manager.read("opaque","remove.txt");
+  await assert.rejects(manager.applyFileChanges("opaque",lease,[{kind:"write_bytes",path:"old.bin",bytes:new Uint8Array([0,2]),expectedSha256:before.sha256},{kind:"trash",path:"remove.txt",expectedSha256:fp("0")}]),/changed/u);
+  assert.deepEqual((await manager.readBytes("opaque","old.bin")).bytes,before.bytes);
+  await manager.applyFileChanges("opaque",lease,[{kind:"write_bytes",path:"old.bin",bytes:new Uint8Array([0,2]),expectedSha256:before.sha256},{kind:"create_bytes",path:"new.bin",bytes:new Uint8Array([255,0])},{kind:"trash",path:"remove.txt",expectedSha256:remove.sha256}]);
+  assert.deepEqual((await manager.readBytes("opaque","new.bin")).bytes,new Uint8Array([255,0]));
+  await manager.releaseLease("opaque",lease);
+  await manager.restoreRunOriginals("opaque","opaque-run");
+  assert.deepEqual((await manager.readBytes("opaque","old.bin")).bytes,before.bytes);assert.equal((await manager.read("opaque","remove.txt")).content,"human");
+  await assert.rejects(manager.readBytes("opaque","new.bin"),/not.*exist|not.*found|missing/u);
+ }finally{await fixture.cleanup();}
+});
+
+test("host path access bounds reads, search, listings and nested mutations without changing manifests", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "workspace-host-boundary-"));
+  try {
+    const folder = path.join(root,"project"); await mkdir(path.join(folder,"config"),{recursive:true});
+    await writeFile(path.join(folder,"main.py"),"print('public')");
+    await writeFile(path.join(folder,"config","secrets.json"),"PRIVATE_SENTINEL");
+    await writeFile(path.join(folder,"image.bin"),new Uint8Array([0,255,1,2]));
+    const manager = new WorkspaceManagerV2({applicationDataRoot:path.join(root,"data"),pathAccess:(_manifest,relative)=>!relative.endsWith("secrets.json")});
+    const {manifest} = await manager.registerPersonFolderWorkspace({workspaceId:"host-boundary",ownerRunId:"person:test",root:folder});
+    const before=serializeWorkspaceManifestV2(manifest);
+    await assert.rejects(manager.read(manifest.workspaceId,"config/secrets.json"),/host does not permit/u);
+    await assert.rejects(manager.readBytes(manifest.workspaceId,"config/secrets.json"),/host does not permit/u);
+    await assert.rejects(manager.read(manifest.workspaceId,"image.bin"),/UTF-8|binary/u);
+    assert.deepEqual((await manager.readBytes(manifest.workspaceId,"image.bin")).bytes,new Uint8Array([0,255,1,2]));
+    assert.equal((await manager.searchDetailed(manifest.workspaceId,"PRIVATE_SENTINEL")).results.length,0);
+    assert.deepEqual(await manager.list(manifest.workspaceId,"config"),[]);
+    assert.deepEqual(await manager.listMetadata(manifest.workspaceId,"config"),[]);
+    assert.ok(!(await manager.listTree(manifest.workspaceId,"",{recursive:true})).entries.some(row=>row.path.endsWith("secrets.json")));
+    const leased=await manager.acquireLease(manifest.workspaceId,"extension:bound",60000);
+    await assert.rejects(manager.writeExpected(manifest.workspaceId,leased.lease!.id,"config/secrets.json","new","sha256:"+createHash("sha256").update("PRIVATE_SENTINEL").digest("hex")),/host does not permit/u);
+    await assert.rejects(manager.copy(manifest.workspaceId,leased.lease!.id,"config","copy","sha256:"+"0".repeat(64)),/host does not permit/u);
+    await manager.releaseLease(manifest.workspaceId,leased.lease!.id);
+    assert.equal(await readFile(path.join(folder,"config","secrets.json"),"utf8"),"PRIVATE_SENTINEL");
+    assert.equal(JSON.parse(before).version,2);
+  } finally { await rm(root,{recursive:true,force:true}); }
+});
+
+test("continuation segments share durable originals while intervening human edits stay held",async()=>{
+ const root=await mkdtemp(path.join(tmpdir(),"workspace-task-undo-")),folder=path.join(root,"project");await mkdir(folder);
+ const options={applicationDataRoot:path.join(root,"metadata"),undoRunId:(_manifest:unknown,runId:string)=>runId.startsWith("segment-")?"task-original":runId};
+ let manager=new WorkspaceManagerV2(options);
+ try{
+  await writeFile(path.join(folder,"stable.txt"),"prior human work\n");await writeFile(path.join(folder,"intervened.txt"),"before\n");
+  await manager.registerPersonFolderWorkspace({workspaceId:"task-undo",ownerRunId:"person:test",root:folder});
+  let lease=(await manager.acquireLease("task-undo","extension:segment-one")).lease!.id;
+  await manager.writeExpected("task-undo",lease,"stable.txt","agent one\n",(await manager.read("task-undo","stable.txt")).sha256);
+  await manager.writeExpected("task-undo",lease,"intervened.txt","agent one\n",(await manager.read("task-undo","intervened.txt")).sha256);await manager.releaseLease("task-undo",lease);
+  await writeFile(path.join(folder,"intervened.txt"),"human between segments\n");
+  lease=(await manager.acquireLease("task-undo","extension:segment-two")).lease!.id;
+  await manager.writeExpected("task-undo",lease,"stable.txt","agent two\n",(await manager.read("task-undo","stable.txt")).sha256);
+  await manager.writeExpected("task-undo",lease,"intervened.txt","human between segments\nagent addition\n",(await manager.read("task-undo","intervened.txt")).sha256);
+  await manager.createFile("task-undo",lease,"created.txt","new");await manager.releaseLease("task-undo",lease);
+  manager=new WorkspaceManagerV2(options);
+  const originals=await manager.runOriginals("task-undo","segment-two");assert.equal(originals.runId,"task-original");assert.equal(originals.entries.find(row=>row.path==="intervened.txt")!.unchangedSinceRun,false);
+  const restored=await manager.restoreRunOriginals("task-undo","segment-two");assert.deepEqual(restored.restored,["stable.txt"]);assert.deepEqual(restored.removed,["created.txt"]);assert.deepEqual(restored.skipped,[{path:"intervened.txt",reason:"human_edit_during_task"}]);
+  assert.equal(await readFile(path.join(folder,"stable.txt"),"utf8"),"prior human work\n");assert.equal(await readFile(path.join(folder,"intervened.txt"),"utf8"),"human between segments\nagent addition\n");
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test("the host can retain originals for managed workspaces without changing legacy hosts",async()=>{
+ const fixture=await fixtureManager("managed-undo");
+ try{
+  const manager=new WorkspaceManagerV2({applicationDataRoot:fixture.root,keepRunOriginals:true});
+  await manager.createScratchWorkspace({workspaceId:"managed",ownerRunId:"person:test"});let lease=(await manager.acquireLease("managed","person:test")).lease!.id;
+  await manager.createFile("managed",lease,"human.txt","prior human edit");await manager.releaseLease("managed",lease);
+  lease=(await manager.acquireLease("managed","extension:agent-task")).lease!.id;await manager.writeExpected("managed",lease,"human.txt","agent change",(await manager.read("managed","human.txt")).sha256);await manager.releaseLease("managed",lease);
+  const result=await manager.restoreRunOriginals("managed","agent-task");assert.deepEqual(result.restored,["human.txt"]);assert.equal((await manager.read("managed","human.txt")).content,"prior human edit");
+  const legacy=new WorkspaceManagerV2({applicationDataRoot:fixture.root});await assert.rejects(legacy.runOriginals("managed","agent-task"),/Only a workspace/u);
+ }finally{await fixture.cleanup();}
+});
+
