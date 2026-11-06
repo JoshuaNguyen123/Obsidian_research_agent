@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { withPreparedActionFingerprint } from "../src/agent/actions";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
+import { isIntentGateMessage } from "../src/agent/toolIntentGate";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
 import { DEFAULT_TEMPLATE_SEEDS } from "../src/tools/vaultTools";
 import {
@@ -230,6 +231,45 @@ test("registry marks invalid mutation arguments as definitely not applied", asyn
   assert.equal(result.mutationState, "not_applied");
   assert.ok(Array.isArray(result.error?.details?.violations));
   assert.equal(mock.content.has("Designs/invalid.canvas"), false);
+});
+
+test("registry marks vault intent-gate refusals as definitely not applied", async () => {
+  // An intent gate refuses before its tool touches the vault. The refusal has to
+  // reach the mutation journal as not applied: a plain Error was journaled
+  // reconcile_required, which left the run impossible to continue.
+  const registry = createDefaultToolRegistry();
+  const prompt = "What does this note say about the budget?";
+  const calls = [
+    { name: "create_file", arguments: { path: "Projects/new.md", content: "# New" } },
+    { name: "create_folder", arguments: { path: "Projects/New folder" } },
+    { name: "append_file", arguments: { path: "Projects/example.md", text: "More" } },
+    { name: "move_path", arguments: { fromPath: "Projects/example.md", toPath: "Projects/moved.md" } },
+  ];
+  for (const call of calls) {
+    const mock = createMockContext({ prompt });
+    const before = new Map(mock.content);
+    const result = await registry.execute(call, mock.context);
+    assert.equal(result.ok, false, call.name);
+    assert.equal(result.error?.code, "intent_required", call.name);
+    assert.equal(result.mutationState, "not_applied", call.name);
+    // The words are unchanged, so the runner's intent-gate corrective still fires.
+    assert.ok(isIntentGateMessage(result.error?.message), call.name);
+    assert.deepEqual(mock.content, before, call.name);
+  }
+
+  for (const call of [
+    { name: "replace_file", arguments: { path: "Projects/example.md", text: "Replaced" } },
+    { name: "delete_path", arguments: { path: "Projects/example.md" } },
+  ]) {
+    const mock = createMockContext({ prompt });
+    const prepared = await registry.prepare!(call, {
+      ...mock.context,
+      runId: `test-run-${call.name}`,
+      operationId: `test-op-${call.name}`,
+    });
+    assert.equal(prepared.ok, false, call.name);
+    assert.equal(prepared.ok ? null : prepared.error.code, "intent_required", call.name);
+  }
 });
 
 test("registry returns structured not-applied violations for invalid raw Canvas geometry", async () => {

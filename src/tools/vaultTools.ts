@@ -2916,9 +2916,22 @@ interface TemplateFillResult {
   placeholders: string[];
 }
 
+/**
+ * An intent gate runs before its tool reads or writes anything, so its refusal
+ * is definitely not applied. Saying so keeps the mutation journal from recording
+ * the call as `reconcile_required`: a plain Error is read as a failure after
+ * execution started, and a run whose journal holds one cannot be continued.
+ * `intent_required` is the code the code tools' intent gates already use.
+ */
+function intentRefusal(message: string): ToolExecutionError {
+  return new ToolExecutionError("intent_required", message, {
+    mutationState: "not_applied",
+  });
+}
+
 function assertTemplateIntent(context: ToolExecutionContext, toolName: string) {
   if (!TEMPLATE_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to ask about templates.`);
+    throw intentRefusal(`${toolName} requires the user to ask about templates.`);
   }
 }
 
@@ -2997,7 +3010,7 @@ function assertTemplateCreateIntent(
     !TEMPLATE_CREATE_INTENT_PATTERN.test(context.originalPrompt) ||
     TEMPLATE_OUTPUT_CREATE_INTENT_PATTERN.test(context.originalPrompt)
   ) {
-    throw new Error(`${toolName} requires the user to explicitly ask to create, make, or save a template.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to create, make, or save a template.`);
   }
 }
 
@@ -3006,7 +3019,7 @@ function assertTemplateFillIntent(
   toolName: string,
 ) {
   if (!TEMPLATE_FILL_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to fill, use, apply, complete, populate, or render a template.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to fill, use, apply, complete, populate, or render a template.`);
   }
 }
 
@@ -3015,7 +3028,7 @@ function assertTemplateSeedIntent(
   toolName: string,
 ) {
   if (!TEMPLATE_SEED_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to seed, install, create, make, or add default starter templates.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to seed, install, create, make, or add default starter templates.`);
   }
 }
 
@@ -3030,42 +3043,42 @@ function assertCreateIntent(
     typeof requestedPath === "string" &&
     requestedPath === context.plannedNoteOutputPath;
   if (!CREATE_INTENT_PATTERN.test(context.originalPrompt) && !hostPlannedNewNoteCreate) {
-    throw new Error(`${toolName} requires the user to explicitly ask to create a file or folder.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to create a file or folder.`);
   }
 }
 
 function assertAppendIntent(context: ToolExecutionContext, toolName: string) {
   if (hasExplicitNoNoteWriteIntent(context.originalPrompt)) {
-    throw new Error(
+    throw intentRefusal(
       `${toolName} is refused because the user forbade writing or editing notes.`,
     );
   }
   if (!APPEND_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to append, save, write, add, insert, or update a note or file.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to append, save, write, add, insert, or update a note or file.`);
   }
 }
 
 function assertReplaceIntent(context: ToolExecutionContext, toolName: string) {
   if (!hasAuthorizedCurrentNoteReplaceIntent(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to rewrite, replace, reset, clean up, start fresh, overwrite, expand an under-target draft, or edit/revise the existing note.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to rewrite, replace, reset, clean up, start fresh, overwrite, expand an under-target draft, or edit/revise the existing note.`);
   }
 }
 
 function assertRestoreIntent(context: ToolExecutionContext, toolName: string) {
   if (!RESTORE_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to undo, restore, revert, or roll back the current note from a backup.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to undo, restore, revert, or roll back the current note from a backup.`);
   }
 }
 
 function assertMoveIntent(context: ToolExecutionContext, toolName: string) {
   if (!MOVE_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to move, rename, or relocate a path.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to move, rename, or relocate a path.`);
   }
 }
 
 function assertDeletePathIntent(context: ToolExecutionContext, toolName: string) {
   if (!DELETE_PATH_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to delete, remove, or trash a path.`);
+    throw intentRefusal(`${toolName} requires the user to explicitly ask to delete, remove, or trash a path.`);
   }
 }
 
