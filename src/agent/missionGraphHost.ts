@@ -1338,6 +1338,9 @@ function plannedReadPrerequisiteIds(
         ? new Set(["web_search"])
         : toolName === CREATE_PROJECT_IDEA_BRIEF_TOOL_NAME
           ? new Set(["web_fetch"])
+          : // The page's text is read after the page is open, whatever effect the host reports for the open (COMP-4).
+            toolName === "browser_extract_markdown"
+            ? new Set(["browser_open_page"])
       : new Set<string>();
   // Repeated exact workspace reads must be serialized so a same-name frontier
   // always resolves to one graph selector. Other read lifecycles retain their
