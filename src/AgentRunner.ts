@@ -278,6 +278,7 @@ import {
   planLoopBudget,
   type LoopBudgetPlan,
 } from "./agent/loopPlanner";
+import { browserNavigationPlanV1 } from "./agent/browserMissionPlan";
 import {
   applyResearchPhaseToLoopDecision,
   decideNextLoopAction,
@@ -5428,11 +5429,19 @@ export async function runAgentMission({
           ...runnerOwnedToolNames,
           ...postAcceptanceToolNames,
         ]);
+        // A browser ask that names a page owes the open and the page's text; the page pays the web evidence its
+        // address implies, so the web ladder below is not planned for it (browserMissionPlan.ts, COMP-4).
+        const browserNavigationPlan = browserNavigationPlanV1({
+          prompt: activeIntentPrompt,
+          browserToolsEnabled: runToolContext.settings?.browserToolsEnabled === true,
+          offeredToolNames: currentlyRunnableGraphToolNames,
+        });
         const bootstrapLoopBudget = planLoopBudget({
           prompt: activeIntentPrompt,
           route: runPlan.route,
           generated: analyzeGeneratedOutputPrompt(activeIntentPrompt),
           configuredMaxSteps: runToolContext.settings?.maxAgentSteps,
+          browserNavigation: browserNavigationPlan,
         });
         const bootstrapResearchPlan = proofBoundProviderLifecycle
           ? null
@@ -5457,7 +5466,11 @@ export async function runAgentMission({
         const plannedResearchGraphToolNames = researchLadderToolNamesForPromptV1(
           activeIntentPrompt,
           requiredGraphFetchCount,
-        ).filter((name) => graphAllowedToolNames.includes(name));
+        ).filter(
+          (name) =>
+            graphAllowedToolNames.includes(name) &&
+            !browserNavigationPlan.replacesWebLadder,
+        );
         for (const name of plannedResearchGraphToolNames) {
           currentlyRunnableGraphToolNames.add(name);
         }
@@ -7439,12 +7452,20 @@ export async function runAgentMission({
     enableStreaming,
   });
   const generatedOutputPolicy = analyzeGeneratedOutputPrompt(activeIntentPrompt);
+  // The page a browser ask names pays the web evidence its address implies (browserMissionPlan.ts, COMP-4): the loop budget,
+  // the web-tool requirement and the operation goals all read this one plan.
+  const browserNavigationForRun = browserNavigationPlanV1({
+    prompt: activeIntentPrompt,
+    browserToolsEnabled: runToolContext.settings?.browserToolsEnabled === true,
+    offeredToolNames: allowedToolNames,
+  });
   let loopBudgetPlan = planLoopBudget({
     prompt: activeIntentPrompt,
     route: runPlan.route,
     generated: generatedOutputPolicy,
     configuredMaxSteps: getConfiguredMaxAgentSteps(runToolContext.settings),
     requestedSteps: parseExplicitModelStepTarget(activeIntentPrompt),
+    browserNavigation: browserNavigationForRun,
   });
   const proofBoundProviderLifecycle =
     runPlan.executionTier !== "direct_chat" &&
@@ -8129,6 +8150,7 @@ export async function runAgentMission({
     researchPlan,
     streamingWritebackKind,
     proofBoundProviderLifecycle,
+    webLadderReplaced: browserNavigationForRun.replacesWebLadder,
   });
   if (currentNoteContext !== null) {
     markOperationGoalDone(operationGoals, "read_current_note");
@@ -19012,6 +19034,7 @@ export async function runAgentMission({
     }
 
     return getMissingRequiredWebToolNames({
+      webLadderReplaced: browserNavigationForRun.replacesWebLadder,
       prompt: activeIntentPrompt,
       allowedToolNames,
       executedWebSearchTool,
@@ -22602,6 +22625,7 @@ export async function runAgentMission({
     }
 
     const missingRequiredWebToolsBeforeToolUse = getMissingRequiredWebToolNames({
+      webLadderReplaced: browserNavigationForRun.replacesWebLadder,
       prompt: activeIntentPrompt,
       allowedToolNames,
       executedWebSearchTool,
@@ -23774,6 +23798,7 @@ export async function runAgentMission({
           }
 
           const missingWebToolsBeforeWriteback = getMissingRequiredWebToolNames({
+            webLadderReplaced: browserNavigationForRun.replacesWebLadder,
             prompt: activeIntentPrompt,
             allowedToolNames,
             executedWebSearchTool,
@@ -23922,6 +23947,7 @@ export async function runAgentMission({
       }
 
       const missingWebTools = getMissingRequiredWebToolNames({
+        webLadderReplaced: browserNavigationForRun.replacesWebLadder,
         prompt: activeIntentPrompt,
         allowedToolNames,
         executedWebSearchTool,
@@ -26534,6 +26560,7 @@ export async function runAgentMission({
       requiredWriteTools,
     );
     const missingRequiredWebToolsAfterToolUse = getMissingRequiredWebToolNames({
+      webLadderReplaced: browserNavigationForRun.replacesWebLadder,
       prompt: activeIntentPrompt,
       allowedToolNames,
       executedWebSearchTool,
@@ -32571,6 +32598,7 @@ function createMissionOperationGoals({
   researchPlan,
   streamingWritebackKind,
   proofBoundProviderLifecycle = false,
+  webLadderReplaced = false,
 }: {
   prompt: string;
   allowedToolNames: Set<string>;
@@ -32578,6 +32606,7 @@ function createMissionOperationGoals({
   researchPlan?: ResearchPlan | null;
   streamingWritebackKind: StreamingWritebackKind | null;
   proofBoundProviderLifecycle?: boolean;
+  webLadderReplaced?: boolean;
 }): MissionOperationGoals {
   const goals = Object.fromEntries(
     ALL_OPERATION_GOALS.map((goal) => [goal, "not_requested" as const]),
@@ -32590,6 +32619,7 @@ function createMissionOperationGoals({
 
   if (!proofBoundProviderLifecycle) {
     for (const toolName of getMissingRequiredWebToolNames({
+      webLadderReplaced,
       prompt,
       allowedToolNames,
       executedWebSearchTool: false,
@@ -34794,6 +34824,7 @@ function getMissingRequiredWebToolNames({
   executedWebFetchTool,
   researchPlan,
   missionEvidence = [],
+  webLadderReplaced = false,
 }: {
   prompt: string;
   allowedToolNames: Set<string>;
@@ -34801,7 +34832,12 @@ function getMissingRequiredWebToolNames({
   executedWebFetchTool: boolean;
   researchPlan?: ResearchPlan | null;
   missionEvidence?: MissionEvidence[];
+  /** A browser ask's page open pays the web evidence its address implies, so no web tool is owed (COMP-4). */
+  webLadderReplaced?: boolean;
 }): string[] {
+  if (webLadderReplaced) {
+    return [];
+  }
   const minFetchedSources = researchPlan?.sourceRequirements.minFetchedSources ?? 0;
   const fetchedSourceCount = countFetchedWebSources(missionEvidence);
   const requiresWeb =

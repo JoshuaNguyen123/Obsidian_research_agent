@@ -25,6 +25,7 @@ import { hasWordCountIntent } from "./wordCountIntent";
 import type { RunBudgetProfile, RunBudgetRoute } from "./runBudget";
 import { getRunBudgetProfile, resolveConfiguredMaxAgentSteps } from "./runBudget";
 import type { GeneratedOutputPolicy } from "./generatedOutputPolicy";
+import type { BrowserNavigationPlanV1 } from "./browserMissionPlan";
 
 export interface LoopBudgetPlan {
   hardCap: number;
@@ -41,10 +42,12 @@ export function planLoopBudget(input: {
   generated: GeneratedOutputPolicy;
   configuredMaxSteps?: number | null;
   requestedSteps?: number | null;
+  /** The page open this ask owes (COMP-4); see browserMissionPlan.ts. Decided by the runner, which knows the menu and the setting. */
+  browserNavigation?: BrowserNavigationPlanV1;
 }): LoopBudgetPlan {
   const hardCap = resolveConfiguredMaxAgentSteps(input.configuredMaxSteps);
   const routeProfile = getRunBudgetProfile(input.route);
-  const expectedTools = getExpectedTools(input.prompt, input.generated);
+  const expectedTools = getExpectedTools(input.prompt, input.generated, input.browserNavigation);
   const finalizationReserve = getFinalizationReserve(hardCap);
   const requestedToolBudget =
     typeof input.requestedSteps === "number" && Number.isFinite(input.requestedSteps)
@@ -74,6 +77,25 @@ export function planLoopBudget(input: {
 }
 
 function getExpectedTools(
+  prompt: string,
+  generated: GeneratedOutputPolicy,
+  browserNavigation?: BrowserNavigationPlanV1,
+): string[] {
+  const base = getBaseExpectedTools(prompt, generated);
+  if (!browserNavigation || browserNavigation.toolNames.length === 0) return base;
+  // A browser ask that names a page owes the open, then the page's text. The page pays the web evidence its address implies,
+  // so the web ladder is dropped unless the ask wants research beyond the page; then the ladder stays and the page follows.
+  const withoutLadder = base.filter((name) => name !== "web_search" && name !== "web_fetch");
+  return [
+    ...new Set(
+      browserNavigation.replacesWebLadder
+        ? [...browserNavigation.toolNames, ...withoutLadder]
+        : [...base, ...browserNavigation.toolNames],
+    ),
+  ];
+}
+
+function getBaseExpectedTools(
   prompt: string,
   generated: GeneratedOutputPolicy,
 ): string[] {
